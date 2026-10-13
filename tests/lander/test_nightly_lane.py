@@ -1,6 +1,5 @@
 """nightly.py through the real lane: checking()'s reuse of a pass the job's own store holds on the same merge tree,
-Lane.nightly on a plan, the Δ re-plan leaving a moved check out of the rerun set, and file_row's one row against a fake
-cc-board. The lane cases reuse test_lane's hermetic Fixture (fake gh, bare origin, every state path in a tmp dir). Run:
+Lane.nightly on a plan, and file_row's one row against a fake cc-board. The lane cases reuse test_lane's hermetic Fixture (fake gh, bare origin, every state path in a tmp dir). Run:
 python3 -m unittest discover -s core/tests/lander -t core/tests/lander -p 'test_nightly_lane.py'
 """
 import os
@@ -155,26 +154,6 @@ class StoreRelease(Case):
         s.release = "rel-x"
         s.put("demo-1", T.Result(check="a", tree="t" * 40, status=T.PASSED, release="other"))
         self.assertEqual(s.get("demo-1", "a", "t" * 40).release, s.release)
-
-
-class Replan(Case):
-    def test_a_moved_check_the_replan_adds_is_not_rerun(self):
-        # as test_lane's test_checks_grew_runs_the_new_ones, where `new` does run: here it runs nightly instead
-        self.moving("new")
-        self.pr(1, {"a/x": "n\n"})
-        J.submit("demo", 1)
-        planner = TL.Planner()
-
-        def hook(name, n):
-            if n == 1:
-                self.push("main", {"b/y": "moved\n"})
-                planner.owners["new"] = "a/"
-        u, _ = self.land(planner=planner, runner=TL.Runner(hook=hook))
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a"])
-        j = self.job()
-        self.assertEqual(j.extra["rerun"], [])
-        self.assertEqual((j.plan.checks, j.plan.extra.get("nightly")), (["a"], ["new"]))
-        self.assertEqual(j.state, T.DEPLOY_PENDING)
 
 
 FAKE_BOARD = r'''#!PYTHON -SI

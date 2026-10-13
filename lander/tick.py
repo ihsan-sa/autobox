@@ -442,10 +442,11 @@ def tip_plan(root, base, head, files, fallback=""):
     return T.Plan(checks=sorted(box), klass=p.klass, extra={"tip": sorted(box)})
 
 
-def make_check(root, runner=None, fallback=""):
+def make_check(root, runner=None, fallback="", first=True):
     """-> check(name, sha) -> Result: the check as the manifest at `sha` defines it, run on that commit's tree on the
     box by U2's runner. A check that commit's manifest lacks passes there (a bisect reaching back before it was
-    added)."""
+    added). With `first` (the default: the tip run and main health) the runner gets first=True, so the check takes
+    a FIRST CLAIM slot (admission); the nightly sweep is not main health and passes first=False."""
     from lander import manifest as MF
     from lander import run as R
     runner = runner or R.run
@@ -461,7 +462,10 @@ def make_check(root, runner=None, fallback=""):
         tree = R.tree_of(root, sha)
         if not tree:
             return T.Result(check=name, tree=sha, status=T.UNRUNNABLE, extra={"why": f"no tree for {sha[:12]}"})
-        return runner(c, tree, "box" if "box" in c.where else c.where[0], repo_root=root, cwd=m.cwd.get(name, ""))
+        # brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot, ahead of
+        # ordinary PR checks, so health can't starve"
+        return runner(c, tree, "box" if "box" in c.where else c.where[0], repo_root=root, cwd=m.cwd.get(name, ""),
+                      **({"first": True} if first else {}))
     return check
 
 
@@ -574,8 +578,7 @@ def nightly(repo, units) -> list:
 
 def flag_waited(repos, cards, now=None) -> list:
     """Brief: "have the lander's tick flag once when the oldest due job has waited over 60 min". For each repo, the
-    due job (Lane.due: not at rest, no hold still running), less any parked behind a due job (parked_behind), with the
-    oldest queued_at; queued more than
+    due job (Lane.due: not at rest, no hold still running) with the oldest queued_at; queued more than
     cards.WAIT_FLAG_SECS ago (queued_at is to the second, so seconds are compared, and exactly 60 min is not over)
     -> cards.waited, which says it once per queuing and at most once per repo per WAIT_FLAG_SECS. A job with no
     queued_at has no age and is never flagged.
@@ -596,9 +599,7 @@ def flag_waited(repos, cards, now=None) -> list:
         return lines
     for r in (repos if cards else []):
         try:
-            jobs = J.lane_jobs(r)
-            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in jobs
-                    if L.Lane.due(j) and not parked_behind(j, jobs)]
+            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in J.lane_jobs(r) if L.Lane.due(j)]
             aged = [(at, j) for at, j in aged if at]
             if not aged:
                 continue
@@ -666,17 +667,6 @@ def retry_cards(repos, cards) -> None:
                 cards.positions(r, J.lane_jobs(r))
         except Exception as e:  # noqa: BLE001 — as flag_waited: one repo's fault is logged, never the tick's end
             E.log("tick-fault", r, None, f"cards: {type(e).__name__}: {e}")
-
-
-def parked_behind(job, jobs):
-    """Brief (planning seat, 10-13): "A parked job's waited line should name what it's parked on, or not fire while its
-    blocker is open" (#922, parked on #1128, was flagged as "Nothing stopped it"). The due job in `jobs` that queued
-    `job` is parked on (extra["parked"]["on"]), while it is due and the park is younger than WAIT_CAP; else None. Past
-    WAIT_CAP the lane plans the job anyway, so from then on it is flagged again, and cards.waited names the park."""
-    park = job.extra.get("parked")
-    if job.state != T.QUEUED or not isinstance(park, dict) or L.Lane.overdue(job, "parked_since"):
-        return None
-    return next((j for j in jobs if j.pr == park.get("on") and j.key != job.key and L.Lane.due(j)), None)
 
 
 def spawn_lane(repo):

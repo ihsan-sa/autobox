@@ -19,8 +19,8 @@ held across a fetch or the merge's critical section, never across a check or a r
     paths_in(root, rev, paths)               which of the paths are in rev's tree; read VERIFIED
     has_workflows(root, rev)                 rev's tree has a GitHub Actions workflow; read VERIFIED
     sealed(root, *revs)           a scratch repo holding only the revs, fetched from the checkout (see SEALED)
-    changed(root, a, b)           `diff --name-only --no-renames -z a b`, each path as it is, read sealed
-    pr_changed(root, base, head)  changed() from the merge-base of base and head, both found sealed
+    pr_changed(root, base, head)  `diff --name-only --no-renames -z` from the merge-base of base and head to head,
+                                  each path as it is, both found sealed
     protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads, sealed
     host_tree(root) -> Tree       which host repo a worker's tree belongs to, read as files; at(root) pins git to it
     worktree_tree(t) · fenced_names(t, a, b)    a working copy's tree, and a diff, built FENCED (see FENCED)
@@ -309,24 +309,6 @@ def merge_tree(root, base, head, env=None):
             if got.returncode:
                 raise GitError(f"git index-pack {tree[:12]}: {got.stderr.decode(errors='replace')[-300:]}")
         return tree, []
-
-
-def clash(root, a, b, env=None) -> list:
-    """The paths where two PR heads would not merge cleanly with each other ([] when they do): the same lines, or
-    hunks close enough that git will not rebase one over the other. Read sealed(), and nothing is written back to the
-    checkout. Any doubt raises GitError, which the lane reads as an overlap."""
-    with sealed(root, a, b) as ((rc, out), run):
-        if run is None:
-            raise GitError(f"git could not read {a[:12]} and {b[:12]} sealed: {str(out).strip()[-300:]}")
-        senv = dict(blind_env(), GIT_DIR=run.git_dir)
-        p = _bytes(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", *out], senv)
-        lines = p.stdout.decode(errors="replace").split("\0")
-        got = sorted({x for x in lines[1:] if x}) if p.returncode == 1 else []
-        if got:
-            return got
-        if p.returncode != 0 or not SHA_RE.fullmatch(lines[0].strip()):   # a conflict naming no path is a doubt
-            raise GitError(f"git merge-tree {a[:12]} {b[:12]}: {p.stderr.decode(errors='replace')[-300:]}")
-        return []
 
 
 def _bytes(argv, env, input=None, cwd=None, timeout=600):
@@ -907,19 +889,11 @@ def _names(run, a, b) -> list:
     return sorted({p for p in out.split("\0") if p})
 
 
-def changed(root, a, b, env=None) -> list:
-    """Every path between a and b, read sealed(); --ignore-submodules=none so a .gitmodules `ignore = all` cannot hide
-    a gitlink from the plan, the walls and the protected paths. `env` is taken for the callers' sake: the fetch is
-    local and needs no token."""
-    with sealed(root, a, b) as ((rc, out), run):
-        if run is None:
-            raise GitError(f"git could not read {a[:12]}..{b[:12]} sealed: {str(out).strip()[-300:]}")
-        return _names(run, *out)
-
-
 def pr_changed(root, base, head, env=None) -> list:
-    """Every path the change touches: changed() from the merge-base of base and head, found in the same sealed repo,
-    so no replace ref, graft or commit-graph of the checkout's can move it onto the branch."""
+    """Every path the change touches, from the merge-base of base and head to head, read sealed(); --ignore-submodules=none
+    (_names) so a .gitmodules `ignore = all` cannot hide a gitlink from the plan, the walls and the protected paths. The
+    merge-base is found in the same sealed repo, so no replace ref, graft or commit-graph of the checkout's can move it
+    onto the branch. `env` is taken for the callers' sake: the fetch is local and needs no token."""
     with sealed(root, base, head) as ((rc, out), run):
         if run is None:
             raise GitError(f"git could not read {base[:12]}...{head[:12]} sealed: {str(out).strip()[-300:]}")

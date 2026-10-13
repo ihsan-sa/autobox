@@ -514,12 +514,13 @@ def laptop_argv(check, tree, cwd, dest=""):
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
         label: str = "lander.0", changed: list | None = None, alone: bool = False, base_tree: str = "",
-        state: str | None = None, express: bool = False, lane: bool = False) -> T.Result:
+        state: str | None = None, express: bool = False, lane: bool = False, first: bool = False) -> T.Result:
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
     files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen. lane: a landing
-    lane's run, whose slot ticket goes before a worker's (admission)."""
+    lane's run, whose slot ticket goes before a worker's (admission). first: main health's or a main-red fix's run,
+    whose ticket goes ahead of every younger one (admission FIRST CLAIM)."""
     t0 = time.monotonic()
 
     def res(st, why, **kw):
@@ -542,7 +543,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         return res(T.UNRUNNABLE, str(e))
     try:
         if kind != "laptop":
-            return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane)
+            return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane, first)
         # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
         # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
         # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
@@ -556,7 +557,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         passed += [f"{d}: not reached lately" for d in dests if d not in awake]
         r, took = None, False
         for dest in awake:
-            r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane)
+            r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane, first)
             why = str(r.extra.get("why", ""))
             if r.status != T.UNRUNNABLE or stopped() or not (r.extra.get("not_sent") or r.extra.get("never_started")):
                 if r.extra.get("never_started") != "unreached":
@@ -579,7 +580,8 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
-def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane) -> T.Result:
+def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,
+             first=False) -> T.Result:
     """One run of `check` at `where` (on the runner `dest` when that is the laptop kind); Result.runner names the
     runner that took it: `laptop:<user@host>:-` off the box."""
     kind = where.split(":")[0]
@@ -598,7 +600,8 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         # the laptop's work is the laptop's: it takes no slot of the box's; nor does an express run (lane EXPRESS)
         free = kind == "laptop" or (express and not alone)
         held = contextlib.nullcontext() if free else A.slot(state or REC.state_dir(), alone=alone,
-                                                            who=f"{check.name}@{tree_sha[:8]}", lane=lane)
+                                                            who=f"{check.name}@{tree_sha[:8]}", lane=lane,
+                                                            first=first)
         with held:
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
@@ -860,13 +863,14 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
              fallback: str = "", box_only: bool = False, runners: bool = False, cancel=None, express: bool = False,
-             lane: bool = False, caged: bool = False, main=None) -> dict:
+             lane: bool = False, caged: bool = False, main=None, first: bool = False) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
     threading.Event the lane sets to stop the plan; every execute() on this thread polls it. express: the lane's
     EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all.
-    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). runners=True from the lane
+    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). first=True from the lane for
+    a main-red fix: its box runs take the first claim on a slot (run's `first`). runners=True from the lane
     only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
     caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
     rest run on the box only. main: {check: status} of main's own record on exactly base_tree (health.at), which
@@ -876,14 +880,14 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
                          only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, runners=runners,
-                         express=express, lane=lane, caged=caged, main=main or {})
+                         express=express, lane=lane, caged=caged, main=main or {}, first=first)
     finally:
         _STOP.event = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
               quarantine_text, runner, only, record_reds, fallback, box_only, express, lane, caged=False,
-              runners=False, main=None):
+              runners=False, main=None, first=False):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
@@ -913,7 +917,8 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
                           main=(main or {}).get(name, ""),
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0",
-                          **({"express": True} if express else {}), **({"lane": True} if lane else {}))
+                          **({"express": True} if express else {}), **({"lane": True} if lane else {}),
+                          **({"first": True} if first else {}))
         gone = gone or laptop_gone({name: out[name]})
     return out
 

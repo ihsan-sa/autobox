@@ -261,7 +261,7 @@ def run(repo: str, check=None) -> list:
         m = M.load(root, sha, fallback=fb)
     except M.ManifestError as e:
         return [f"[{repo}] nightly: the manifest at {sha[:12]} does not parse: {e}"]
-    check = check or TK.make_check(root, fallback=fb)
+    check = check or TK.make_check(root, fallback=fb, first=False)
     lines = []
     for n in moved(repo, m):
         r = check(n, sha)

@@ -256,8 +256,9 @@ class RealUnits(TL.Fixture):
         self.assertEqual(RV.would_read(j, comments)[0], False)
 
     def test_a_plan_that_turns_lander_class_when_main_moves_goes_to_lander_self(self):
-        """A reach.tsv the first base generated need not be what the moved base generates: the Δ re-plan's class
-        decides, and a lander one is not merged. The same PR whose re-plan stays leaf merges (the kept case)."""
+        """A reach.tsv the first base generated need not be what the moved base generates: a re-plan at the moved
+        main is read for its class alone (a gate), and a lander one is not merged. The same PR whose re-plan stays
+        leaf merges (the kept case)."""
         for klass, want in ((T.LANDER, T.QUERY), (T.LEAF, T.DEPLOY_PENDING)):
             with self.subTest(klass=klass):
                 self.setUp()
@@ -282,6 +283,50 @@ class RealUnits(TL.Fixture):
                 if klass == T.LANDER:
                     self.assertEqual(u["cards"].calls[0][3], "lander-self")
                     self.assertEqual(u["deploy"].calls, [])
+
+    def test_a_plan_that_turns_security_when_main_moves_is_not_merged_without_perms_read(self):
+        """Security read of #1334: main takes a LANDING-security.toml rule over the PR's file while its checks run.
+        The re-plan at the moved main is paid with security named, so the merge waits for perms' own record at this
+        head and digest (a query for the planning seat with none); with that record it merges, no read bought."""
+        for recorded, want in ((False, T.QUERY), (True, T.DEPLOY_PENDING)):
+            with self.subTest(recorded=recorded):
+                self.setUp()
+                perms = os.path.join(self.tmp, "perms-state")
+                p = mock.patch.object(RV, "PERMS_STATE", perms)   # never the box's real perms records
+                p.start()
+                self.addCleanup(p.stop)
+                head = self.pr(1, {"a/x": "good\n"})
+                self.git(self.work, "fetch", "-q", "origin")
+                d = RV.digest_of(self.work, "origin/main", head)
+                if recorded:
+                    path = RV.perms_reads_path("demo")
+                    os.makedirs(os.path.dirname(path))
+                    with open(path, "w") as f:
+                        json.dump([{"repo": "demo", "pr": 1, "head": head, "change": d}], f)
+                    os.chmod(path, 0o600)
+                J.submit("demo", 1)
+                fixture, calls = self, []
+
+                class Moving:
+                    @staticmethod
+                    def plan(root, base, head, files, **kw):
+                        calls.append(base)
+                        p = PLAN.plan(root, base, head, files, **kw)
+                        if len(calls) == 1:   # the first plan, unpaid: main moves on while its checks run
+                            fixture.main({"tests/LANDING-security.toml": 'paths = ["a/**"]\n'})
+                        return p
+                with mock.patch.object(RV, "_buy", side_effect=AssertionError("a read was bought")):
+                    u, lines = self.land(planner=Moving)
+                j = self.job()
+                self.assertEqual(j.state, want, lines)
+                self.assertTrue(j.plan.paid)
+                self.assertEqual(j.plan.extra.get("security"), ["a/x"])
+                if recorded:
+                    self.assertEqual((j.extra["verdict"]["verdict"], j.extra["verdict"].get("read")), (T.LAND, "perms"))
+                else:
+                    self.assertEqual(u["deploy"].calls, [])
+                    self.assertEqual(u["cards"].calls[0][3], "planning")
+                    self.assertIn("security-reads.json holds no record", j.extra["why"])
 
     def test_a_land_recorded_at_an_older_head_is_not_used(self):
         head = self.pr(1, {"c/w": "paid\n"})
@@ -439,7 +484,7 @@ class RealUnits(TL.Fixture):
                 "c/a b.txt": ("none", "100644", "spaced"), "c/new\nline.txt": ("none", "100644", "newline"),
                 "c/img.png": ("none", "100644", "binary, not shown"),
                 "c/gone.txt": ("100644", "none", "deleted by this change")}
-        files = G.changed(self.work, base, head)
+        files = G.pr_changed(self.work, base, head)
         self.assertEqual(sorted(files), sorted(want))
         self.assertEqual(sorted(PLAN.changed(self.work, base, head)), sorted(want))
         block = RV.merged_files(self.work, base, head, files)
@@ -576,7 +621,7 @@ class RealUnits(TL.Fixture):
 
     def test_a_gitmodules_ignore_all_cannot_hide_a_gitlink_from_the_plan_or_the_read(self):
         """main's .gitmodules says `ignore = all` for s, and a PR adds gitlink s beside a text file. The checkout's
-        own `git diff --name-only` drops s; G.changed still lists it, and the read gets s FLAGGED as a submodule even
+        own `git diff --name-only` drops s; G.pr_changed still lists it, and the read gets s FLAGGED as a submodule even
         when the job's file list (an older lane's) left it out."""
         self.main({".gitmodules": '[submodule "s"]\n\tpath = s\n\turl = ./x\n\tignore = all\n'})
         self.push("track/row-1", {"f": "text\n"})
@@ -588,7 +633,7 @@ class RealUnits(TL.Fixture):
         self.git(self.work, "fetch", "-q", "origin")
         base = self.git(self.work, "rev-parse", "origin/main")
         self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "f")   # the checkout's git hides s
-        self.assertEqual(G.changed(self.work, base, head), ["f", "s"])
+        self.assertEqual(G.pr_changed(self.work, base, head), ["f", "s"])
         self.assertEqual(RV.files_of(self.work, base, head), ["f", "s"])
         nolimit = os.path.join(self.tmp, "nolimit")
         os.makedirs(nolimit)
@@ -665,8 +710,6 @@ class RealUnits(TL.Fixture):
         self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "")   # it bites the checkout's git
         with self.assertRaises(G.GitError):
             G.pr_changed(self.work, base, head)
-        with self.assertRaises(G.GitError):
-            G.changed(self.work, base, head)
         self.assertEqual((RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)), ("", []))
         self.assertFalse(G.protected_same(self.work, ["p"], base, head))
         self.assertIn("git could not show the diff", M.walls(self.work, base, head, ["f"]))
@@ -717,7 +760,7 @@ class RealUnits(TL.Fixture):
         self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "f")   # it bites the checkout's git
         self.assertEqual(self.git(self.work, "diff", "--quiet", approved, head, "--", "prot"), "")
         self.assertEqual(G.pr_changed(self.work, base, head), ["f", "p", "prot/rule"])
-        self.assertEqual(G.changed(self.work, approved, head), ["f", "p", "prot/rule"])
+        self.assertEqual(G.pr_changed(self.work, approved, head), ["f", "p", "prot/rule"])
         self.assertFalse(G.protected_same(self.work, ["prot"], approved, head))
         self.assertTrue(G.protected_same(self.work, ["b"], approved, head))   # the unchanged rule still carries
 
@@ -731,7 +774,6 @@ class RealUnits(TL.Fixture):
         self.git(self.work, "config", "diff.relative", "true")
         self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "")   # it bites the checkout's git
         self.assertEqual(G.pr_changed(self.work, base, head), ["f", "prot/rule"])
-        self.assertEqual(G.changed(self.work, base, head), ["f", "prot/rule"])
         self.assertEqual(RV.files_of(self.work, base, head), ["f", "prot/rule"])
         self.assertFalse(G.protected_same(self.work, ["prot"], base, head))
 
@@ -890,9 +932,9 @@ class RealUnits(TL.Fixture):
                              "tagger a <a@b> 0 +0000\n\nt\n").stdout.strip()
         self.assertEqual(self.git(self.work, "rev-parse", f"{tag}^{{commit}}"), head)   # it bites the checkout's git
         with self.assertRaises(G.GitError):
-            G.changed(self.work, base, tag)
+            G.pr_changed(self.work, base, tag)
         with self.assertRaises(G.GitError):
-            G.changed(self.work, tag.upper(), base)
+            G.pr_changed(self.work, tag.upper(), base)
         with G.sealed(self.work, tag) as ((rc, out), run):
             self.assertIsNone(run, out)
         # the same tag's bytes filed under a commit's id; git refuses to peel it, and it must stay refused
@@ -902,9 +944,9 @@ class RealUnits(TL.Fixture):
         os.chmod(loose, 0o644)
         shutil.copyfile(os.path.join(common, "objects", tag[:2], tag[2:]), loose)
         with self.assertRaises(G.GitError):
-            G.changed(self.work, base, forged)
-        self.assertEqual(G.changed(self.work, base, head), ["new"])   # a commit id and a name still read as before
-        self.assertEqual(G.changed(self.work, "origin/main", head), ["new"])
+            G.pr_changed(self.work, base, forged)
+        self.assertEqual(G.pr_changed(self.work, base, head), ["new"])   # a commit id and a name still read as before
+        self.assertEqual(G.pr_changed(self.work, "origin/main", head), ["new"])
 
     def test_the_merge_is_made_once_per_base_and_head(self):
         """merge_tree builds a sealed copy under the git lock, seconds each: the job's recorded tree is reused while

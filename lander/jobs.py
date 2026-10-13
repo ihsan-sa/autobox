@@ -651,8 +651,7 @@ def first(repo: str, pr) -> dict:
 
 def arrival(job: T.Job) -> tuple:
     """The job's place in arrival order, put-first aside: oldest queued_at first, an unstamped one after every
-    stamped one, a tie by path. lane.overlapping() reads "older" from it, so putting a job first never lets it pass
-    an older job that shares its files."""
+    stamped one, a tie by path."""
     at = E.epoch_of(job.extra.get("queued_at", ""))
     return (0, at, job_path(job.repo, job.pr)) if at else (1, 0, job_path(job.repo, job.pr))
 

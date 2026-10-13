@@ -1,5 +1,5 @@
-"""One lane per repo: intake, the job machine (checks side by side), Δ revalidation, the merge (one at a time) and
-its tree proof.
+"""One lane per repo: intake, the job machine (every queued PR's checks side by side), the look at a moved main, the
+merge (one at a time) and its tree proof.
 
     lander queue <repo|h--t> <pr> [--chat C --ts T --who W --approved-by UID --no-start --light]
     lander queue --task <repo> <row>
@@ -24,11 +24,12 @@ exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc don
 THE LIGHT LANE (light.py has who qualifies): at each queued turn of a PR in the repo's own lane, Lane.light() asks
 light.why_not (no file on a list the lander guards a landing by) and then reviewer.land_recorded (a LAND recorded at
 the head and digest) and keeps the answer in extra["light"]: True (`stage <repo>#<pr> light`, once per head), or
-why not. A light job is not parked on an overlap, plans only its static and hermetic checks (light.trim, at
-planned; a plan that keeps none is not light), goes before every due job but one put first, is handed back when a
-check is blocked by main (since the ratchet, reds it refused to call main's), moves its base to main without a Δ re-plan when main moves at mergeable and the new base still lets it go light (the merge's
-merge-tree still proves it clean), and is handed back on a conflict with its base found after it was planned
-(checking, the merge) instead of a park or a repair round. Everything else (the door, the compiled-file refusal, GitHub CI, the pinned merge and its proof) is as below.
+why not. A light job plans only its static and hermetic checks (light.trim, at
+planned; a plan that keeps none is not light), goes before every due job but one put first or one whose plan holds a check main is red on, is handed back when a
+check is blocked by main (since the ratchet, reds it refused to call main's), moves its base to main without main_moved's re-check when main moves at mergeable and the new base still lets it go
+light (the merge's merge-tree still proves it clean; when it does not, main_moved re-checks it as any job and its
+full plan's checks the trim left out run before the merge), and is handed back on a conflict with its base found after it was
+planned (checking, the merge) instead of a repair round. Everything else (the door, the compiled-file refusal, GitHub CI, the pinned merge and its proof) is as below.
 
 THE LANE (Lane.run) takes <repo>.lock (busy: return — the running lane re-reads), drains the inbox, and steps each
 job until it rests (held until not_before, query, done, deploy-pending, handed back) or waits on a check, re-reading
@@ -37,15 +38,15 @@ land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour P
 a checking job hands its next check to the lane's pool and the lane goes on to other jobs, and so does a job whose
 review read is due (at most REVIEW_SLOTS reads at once): a read takes up to READ_TIMEOUT per reader, and while it ran on
 the lane's thread no finished check was recorded and no free slot filled (10-13: 3 of 5 slots free for hours, 39 jobs
-checking). Its verdict is acted on at the job's next turn; everything else — the gh facts, planning, the Δ re-plan and
-the merge — happens on the lane's own thread, so merges stay serial and pinned. Each pass hands the queue to
+checking). Its verdict is acted on at the job's next turn; everything else — the gh facts, planning, the look at a moved main
+and the merge — happens on the lane's own thread, so merges stay serial and pinned. Each pass hands the queue to
 cards.positions on a thread of its own (Lane.cards_pass), so a slow Slack holds neither; the lane's end waits up to
 CARDS_WAIT for those cards. The lane keeps at most
 A.slots_now() checks in flight (A.slots(): LANDER_SLOTS from cc-config, else what the host's cores and memory hold,
 read again each minute; 2 while the box is overloaded(), 1 under memory pressure) on the box, and up to
 A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide admission slot, so another repo's lane can
 hold this one's check at the door. A job holds one check at a time on the box while another due job wants its first
-there (one queued and not parked, planned, or checking with none on the box); when none does, its checks the runners
+there (one queued, planned, or checking with none on the box); when none does, its checks the runners
 do not take fill every free box slot, but only while run.spill() is quiet (no admission ticket waits, so another
 lane's or a worker's check is not pushed back) and never in a member's lane. A job held or handed back
 has its other checks in flight stopped. Its checks that may leave the box run on the laptop side by side (any check
@@ -64,24 +65,21 @@ one-line PR must not wait behind every aged heavy one). So a small PR waits for 
 one slot, besides the first check of each heavy PR queued LANDER_HEAVY_WAIT before it, and for none when a slot is
 free. NO PR
 WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplanned and unexplained): a job queued
-LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy.
+LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy, but a
+main-red fix (below).
 PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
-first; place() says who put it there. An older job that clashes with it still goes first, unless that job's park
-holds nobody (OVERLAP below).
-OVERLAP FROM THE START: a queued job that clashes with a job already planned, checking or mergeable, or with an older
-job parked itself whose park still holds, is not planned yet (`waits for PR #N`, said once; its first park stamps
-parked_since; `stage <repo>#<pr> parked on=<n>` is logged whenever <n> changes): it is planned from main once that
-one has merged or left, so two changes that overlap don't both burn CPU. Two jobs CLASH when they share a file and
-their heads do not merge cleanly with each other (git merge-tree of the two heads: the same lines, or hunks too
-close to rebase); a shared file whose hunks merge cleanly is no overlap, and a head not read yet or a git that
-will not answer is one.
-A parked job's park holds a newer job only while the PR it waits for is in flight or has just left: one parked on a
-held PR (a person's hold, a red main) or on a job parked itself holds nobody, so the first ready job goes first and
-chains of parks are one deep (a query leaves the lane, so a park on it ends at the parked job's next turn). A job
-parked LANDER_WAIT_CAP or longer is planned anyway (10-04: ~40 jobs behind one 55-check PR, most sharing no file
-with it). Overlap found later is
-the Δ re-plan's (mergeable, below). Each turn of the loop first records the checks that finished, so a freed slot
-is seen while parked jobs keep the turn list full, and a job held during the pass has a turn again once its
+first; place() says who put it there.
+MAIN-RED FIX FIRST (brief, 10-13: "A PR whose plan includes a check that is red on main, and that is green on the PR,
+jumps the queue: it's checked and merged first"): after the jobs put first, a job whose plan holds a check main's
+record holds red (health.red, read once per pass; none in a member's lane) goes before every other, overdue or not;
+its checks start with those red ones, and every check it runs takes a FIRST CLAIM slot (admission.py; brief, 10-13:
+"give main health's checks and a main-red fix's checks first claim on a free slot, ahead of ordinary PR checks, so
+health can't starve").
+EVERY QUEUED PR AT ONCE (brief, 10-13: "Every queued PR gets its checks planned and run at once on merge-tree(base,
+head), up to the slot limit. No PR parks because another PR touches the same files, is held, is conflicted, or shares
+only a doc."): a queued job is planned at its turn whatever the other jobs change or wait on; only its own conflict
+with main (CONFLICT below) stops it. Each turn of the loop first records the checks that finished, so a freed slot
+is seen while queued jobs keep the turn list full, and a job held during the pass has a turn again once its
 not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft -> held 15 min; a conflict -> CONFLICT
@@ -98,10 +96,10 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              reads the approval record
              (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
-             -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
+             -> query, route "owner". plan(); klass
              lander -> query "lander-self"; then nightly.trim takes out the checks that run nightly instead (not on
              a member's lane), and health.trim the checks main's own record holds red that the change owns no
-             path of (extra main_red; not on a member's lane). The Δ re-plan trims both ways the same. A check
+             path of (extra main_red; not on a member's lane). A check
              main's record holds on this very base tree stands for its base run in run.judge.
   checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
              through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
@@ -110,8 +108,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              holds a pass of on this very tree from this release (`stage … reused gate= tree=`). RE-READ: every RECHECK_SECS while it
              checks, and at its next turn after an `again` request, the job reads the PR's state and head; not OPEN or
              a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
-             back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so nothing parked
-             on it waits on checks for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
+             back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so no check
+             runs on for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
              it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED (a red run.judge
              saw twice on the same tree) -> handback; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
              a red whose failing cases are all red on the base too (run.no_new_reds, the ratchet) passes, with
@@ -132,20 +130,25 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it. A read whose job leaves
              checking (or its digest) mid-read keeps its REVIEW_SLOTS place until it ends, and is charged then.
-  mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
-             reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
-             "lander-self"; non-empty -> checking with only those, each one not in FULL_CHECKS, defined at the head
-             as on main, with no file of its run line in the PR, and whose green runs in the queue log all took at
+  mergeable  the head moved -> queued. main moved -> main_moved (brief, 10-13: "At merge time, re-check only when
+             merge-tree finds a text conflict with current main, or main is red on a check the PR's plan includes.
+             Otherwise merge on the verdict it already has."): merge-tree(main, head) conflicts -> CONFLICT below;
+             checks of its plan main's record holds red -> checking with only those, each one not in FULL_CHECKS,
+             defined at the head as on main, with no file of its run line in the PR, and whose green runs in the queue log all took at
              most EXPRESS_SECS run EXPRESS (EXPRESS_SLOTS lane-wide beside width(), no admission slot, so a
              seconds-long rerun does not queue behind suites; none while A.mem_loaded());
-             empty -> base_sha = main and merge. GITHUB CI comes next (gh.ci_state at the head):
+             a re-plan at main read for its class and its read (gates): lander class -> query "lander-self"; paid
+             there -> its paid and security carried onto the plan, and with no LAND at this digest (perms' record
+             when security is named) -> checking, where review() reads it; the plan is otherwise not adopted and
+             adds no rerun (a job no longer light adopts it whole); otherwise base_sha = main, no check run again.
+             GITHUB CI comes next (gh.ci_state at the head):
              red -> handback naming each failed check; "starved" (every red is a job GitHub cancelled because no
              hosted runner took it) -> gh.rerun of those runs and held CI_WAIT_SECS, at most STARVED_RERUNS times
              at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
              the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. THE MERGE (S1),
-             all under the git lock: fetch; main_before must be base_sha (else back to Δ); expected =
+             all under the git lock: fetch; main_before must be base_sha (else main_moved again); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
              fetch; the tip's tree must equal expected, else the tip is `unvalidated` (no deploy request; `stage …
@@ -162,9 +165,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              (no merge_attempt) reads the PR's state, head and base first: not OPEN, a head that is not job.head
              or a base that is not the base_ref it was read on -> queued instead, which ends a closed PR (done rc=1)
              or a merged one (merged, by=before) and starts a new head or base afresh; gh unreadable -> stays held another HOLD_SECS; a GitHub backoff -> waits for it.
-CONFLICT (a conflict with the base found at queued, checking or the merge; Lane.conflict, repair.py): a conflicting
-file that a planned, checking or mergeable PR also changes parks the job behind that PR; otherwise repair.start
-dispatches one rebase round to the PR's own row and the job is held until the branch moves, and a PR nothing will
+CONFLICT (a conflict with the base found at queued, checking, main_moved or the merge; Lane.conflict, repair.py):
+repair.start dispatches one rebase round to the PR's own row and the job is held until the branch moves, and a PR nothing will
 repair (no row, a member's, ROUNDS rounds failed) is handed back to "planning" (a member's to "#<h>").
 HANDBACK writes handed/<repo>-<pr>.json (7 days; after a red check it also names the check and head that were red)
 and REMOVES the job file (N12). A re-queue after it is stamped when it came, red or not, at that head or another, so a
@@ -265,11 +267,10 @@ MOVES_BEFORE_HOLD = 5    # main moving under the merge this many times in one st
 GH_PR_FILES = 100        # gh lists at most this many files; at or over it git names them all
 FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body"
 PRE_MERGE = (T.QUEUED, T.PLANNED, T.CHECKING)
-ACTIVE = (T.PLANNED, T.CHECKING, T.MERGEABLE)   # planned from a base and not merged yet: what a new job may overlap
 SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
 # …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
 FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split())
-# EXPRESS: a check a mergeable job reruns only because main moved (revalidate) and that is not one of FULL_CHECKS runs
+# EXPRESS: a check a mergeable job reruns only because main moved (main_moved) and that is not one of FULL_CHECKS runs
 # at once, beside the box's width() and with no admission slot, at most this many lane-wide (2026-10-02/03: #905 was
 # sent back four times for a 0 s core-identity rerun that waited hours behind half-hour suites, while main moved again)
 EXPRESS_SLOTS = int(os.environ.get("LANDER_EXPRESS_SLOTS") or 1)
@@ -277,15 +278,11 @@ EXPRESS_SLOTS = int(os.environ.get("LANDER_EXPRESS_SLOTS") or 1)
 # one with no green run there (a new or renamed check) waits for a slot like any other
 EXPRESS_SECS = float(os.environ.get("LANDER_EXPRESS_SECS") or 120)
 EXPRESS_TAIL = 1 << 20
-# a job parked on an overlap is retried when the job it waits for moves (unblocked), not at every wake; within this many
-# seconds of its last read of GitHub it is checked against the files that read gave, with no new call (a head moved
-# meanwhile is read at the first such turn after this runs out, or at once when it is queued again)
-PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
-# idea panel, 10-04: "no PR waits more than 24 h in a lane without a landing attempt". A job parked this long is planned
-# despite its overlap (the Δ re-plan at mergeable catches a real one), and one queued this long takes a slot first
+# idea panel, 10-04: "no PR waits more than 24 h in a lane without a landing attempt". A job queued this long takes a
+# slot first
 WAIT_CAP = float(os.environ.get("LANDER_WAIT_CAP") or 86400)
 # brief, 10-13: "end the starvation of heavy plans". A heavy job queued this long ago counts as small, so it takes its
-# turn in arrival order beside the small ones (#943, 38 checks, ran none for 3 h behind small and parked jobs)
+# turn in arrival order beside the small ones (#943, 38 checks, ran none for 3 h behind small jobs)
 HEAVY_WAIT = float(os.environ.get("LANDER_HEAVY_WAIT") or 3600)
 # review reads the lane's pool runs at once (each up to review.READ_TIMEOUT per reader); a job past its checks waits for
 # a place like a check does. One keeps the reads, and their spend, as serial as when they ran on the lane's thread
@@ -310,7 +307,7 @@ class Flight:
         self.future, self.pr, self.name, self.head, self.base, self.tree = future, pr, name, head, base, tree
         self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
         self.stop = stop   # a threading.Event; set: run.execute kills the check (the job left this head)
-        self.express = express   # a Δ rerun's (EXPRESS): it counts against EXPRESS_SLOTS, not the box's slots
+        self.express = express   # a rerun's after main moved (EXPRESS): it counts against EXPRESS_SLOTS, not the box's slots
 
 
 class Reading:
@@ -582,16 +579,13 @@ class Lane:
         self.fallback = MF.host_fallback(repo)   # the release's landing-repos/<repo>.toml; "" when the repo has none
         self.lines = []
         self.tried = set()
-        self.waiting = set()     # tried and waiting on a slot or an overlapping job: tried again when either moves
+        self.waiting = set()     # tried and waiting on a slot: tried again when one frees
         self.refused = set()     # tried and refused a turn by a GitHub backoff or a box hold: tried again when it ends
         self.inflight = {}       # (job key, check) -> Flight: every check the lane has in the pool
         self.laptop_down = 0.0   # when the laptop last gave no answer: the box takes its checks for LAPTOP_REST
         self.tips = {}           # {"sha", "m"}: the base branch tip's manifest, for where a check may run
         self.origin = {}         # {branch: sha}: what origin last sent for each branch this lane fetched
-        self.said = set()        # (job, job it waits for): said once
-        self.parked = set()      # queued jobs waiting on an overlapping one
-        self.park_on = {}        # parked job key -> (key, state, head) of the job it waits for when it parked
-        self.clash_of = {}       # (head, head) sorted -> True when the two do not merge cleanly (clashes)
+        self.reds = set()        # the checks main's record holds red (main_reds), read once per pass of the loop
         self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
         self.tried_q = {}        # job key -> (queued_at, head) when its turn ended: another is a re-queue or a push
         self.pool = None
@@ -655,7 +649,7 @@ class Lane:
                     self.reap(POLL)
                 return moved
             if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
-                self.reap(0)   # a finished check is recorded (its slot freed) even while parked jobs keep todo full
+                self.reap(0)   # a finished check is recorded (its slot freed) even while queued jobs keep todo full
                 continue       # and a promote that came while it ran is seen before any job moves on
             for ln in J.drain(self.repo):
                 self.say(ln)
@@ -666,14 +660,12 @@ class Lane:
                 if r.future.done() and not r.seen:
                     r.seen = True
                     tried.discard(k)
-            heads = {j.head for j in jobs if j.head}   # a pair of heads no job holds any more is never asked again
-            self.clash_of = {p: v for p, v in self.clash_of.items() if p[0] in heads and p[1] in heads}
+            self.reds = self.main_reds()
             for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
                 # run out, (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
                 # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept, or
-                # (c) it was queued again since or has a new head (a push): its queued_at or head differs, or (d) it is
-                # parked and the job it waits for has moved, unless a GitHub backoff or the box holds it, for (b)'s
-                # reason: step() moves no queued job during a backoff, or (e) its turn was refused by a backoff or a box
+                # (c) it was queued again since or has a new head (a push): its queued_at or head differs, or (d) its
+                # turn was refused by a backoff or a box
                 # hold that has ended: nothing else lets it back while checks run, so it sat silent until the lane
                 # process ended. A move or a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
                 # since a re-queue may share its one-second stamp. Without these a re-queue drained in this pass sat
@@ -683,8 +675,6 @@ class Lane:
                 if (j.state == T.HELD and self.due(j) and self.tried_nb.get(j.key) != j.extra.get("not_before")) \
                         or (self.reread_due(j) and not self.box_hold(j)) \
                         or self.tried_q.get(j.key) != self.queued_mark(j) \
-                        or (j.key in self.parked and self.unblocked(j, jobs) and not GH.backoff()
-                            and not self.box_hold(j)) \
                         or (j.key in self.refused and not GH.backoff() and not self.box_hold(j)):
                     tried.discard(j.key)
                     self.refused.discard(j.key)
@@ -695,14 +685,17 @@ class Lane:
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
             free = self.slot_free()
-            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then any job not still parked,
+            # one put first (queue --first), then one whose plan holds a check main's record holds red (brief, 10-13:
+            # "A PR whose plan includes a check that is red on main, and that is green on the PR, jumps the queue:
+            # it's checked and merged first"), then a job in the lane WAIT_CAP or longer,
             # then the oldest small job (a heavy one queued HEAVY_WAIT or longer ago counts as small until its first
             # check runs), else the oldest heavy one; and of those, while a slot is free, a checking job with a check
             # left first (brief, 10-13: "while a check slot is free and some checking job has a check left to run, the
             # lane starts that check before it spends time replanning queued or parked jobs")
-            job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), j.extra.get("light") is not True,
+            reds = self.reds
+            job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), not (j.plan and set(j.plan.checks) & reds),
+                                           j.extra.get("light") is not True,
                                            not self.overdue(j, "queued_at"),
-                                           self.still_parked(j, jobs),
                                            self.heavy(j) and not (self.overdue(j, "queued_at", HEAVY_WAIT)
                                                                   and not self.started(j)),
                                            not (free and self.check_left(j))))
@@ -723,24 +716,19 @@ class Lane:
                 self.wake(but=job.key)   # a job moved or took a slot: whatever waited on it looks again
 
     def wake(self, but=""):
-        """The jobs waiting on a slot or a read look again; a parked job does not: the loop gives it a turn when the job
-        it waits for has moved (unblocked)."""
-        self.tried -= self.waiting - self.parked - {but}
-        self.waiting &= {but} | self.parked
+        """The jobs waiting on a slot or a read look again."""
+        self.tried -= self.waiting - {but}
+        self.waiting &= {but}
 
-    def unblocked(self, job, jobs) -> bool:
-        """brief, 10-13: "A parked job is replanned only when its blocker changed (merged, moved or left the lane), not
-        on every wake": the job `job` parked on has left the lane or has another state or head than when it parked, or
-        `job` has been parked WAIT_CAP or longer (overlapping() then lets it be planned)."""
-        key, state, head = self.park_on.get(job.key) or ("", "", "")
-        on = next((j for j in jobs if j.key == key), None)
-        return on is None or (on.state, on.head) != (state, head) or self.overdue(job, "parked_since")
-
-    def still_parked(self, job, jobs) -> bool:
-        """`job` is queued and parked, and this lane has not seen the job it waits for move (one parked before the lane
-        started has not)."""
-        return job.state == T.QUEUED and (job.key in self.parked or isinstance(job.extra.get("parked"), dict)) \
-            and not (job.key in self.park_on and self.unblocked(job, jobs))
+    def main_reds(self) -> set:
+        """The checks main's own record holds red (health.red); none in a member's lane, whose main the box's health
+        does not run, and none when the record will not read."""
+        if self.member:
+            return set()
+        try:
+            return set(HL.red(self.repo))
+        except Exception:  # noqa: BLE001 — an unread record orders nothing first, never stops the lane
+            return set()
 
     def check_left(self, job) -> bool:
         """A checking job with a check of its plan neither recorded nor in the pool."""
@@ -762,7 +750,7 @@ class Lane:
         return n < (A.LAPTOP_SLOTS if laptop else self.width())
 
     def express(self, job) -> list:
-        """The checks of `job` still to run that go EXPRESS: the ones revalidate named at this very base and head,
+        """The checks of `job` still to run that go EXPRESS: the ones main_moved named at this very base and head,
         and none while the box is under memory pressure (admission is down to one slot then: parallel checks have
         run it out of memory), so those wait for a slot like any other check."""
         x = job.extra.get("express") or {}
@@ -942,8 +930,7 @@ class Lane:
 
     @staticmethod
     def overdue(job, field, cap=None) -> bool:
-        """The stamp in job.extra[field] (queued_at: in the lane; parked_since: parked) is `cap` (WAIT_CAP) or more
-        ago."""
+        """The stamp in job.extra[field] (queued_at: in the lane) is `cap` (WAIT_CAP) or more ago."""
         at = E.epoch_of(job.extra.get(field) or "")
         return bool(at) and time.time() - at >= (WAIT_CAP if cap is None else cap)
 
@@ -953,7 +940,7 @@ class Lane:
 
     def spare_box(self, job) -> bool:
         """A box slot free now is spare for `job`'s second (third…) check: no other due job of this pass wants its
-        first one — a queued job not parked, a planned one, or a checking one with a check left to start and none on
+        first one — a queued job, a planned one, or a checking one with a check left to start and none on
         the box. (brief, 10-13: "every free slot runs a pending check"; three of five slots sat free for hours while
         39 jobs were checking, each held to one box check.) Never in a member's lane (perms, 10-13: a member PR ran 3
         checks at once where main runs 1, its tickets ahead of the owner's worker greens), and only while this host
@@ -963,9 +950,7 @@ class Lane:
         for j in self.jobs:
             if j.key == job.key or not self.due(j) or j.state == T.HELD:
                 continue
-            if j.state == T.QUEUED and not (j.key in self.parked or isinstance(j.extra.get("parked"), dict)):
-                return False
-            if j.state == T.PLANNED:
+            if j.state in (T.QUEUED, T.PLANNED):
                 return False
             if j.state == T.CHECKING and j.plan:
                 mine = [k for k in self.inflight if k[0] == j.key]
@@ -974,86 +959,11 @@ class Lane:
                     return False
         return not RUN.spill()   # last: it reads the admission slots
 
-    def overlapping(self, job):
-        """A job whose change really overlaps this one's and goes first, or None: one already planned, checking or
-        mergeable, or an older one parked itself whose park still holds this one (parked_live) — so a newer PR never
-        jumps an older one it clashes with, and clashing PRs keep their arrival order. A shared file is an overlap only
-        when the two heads clash in it (clashes). None for a job parked WAIT_CAP or longer: it is planned anyway, and the
-        Δ re-plan at mergeable reruns what a real overlap reaches."""
-        if self.overdue(job, "parked_since"):
-            return None
-        mine, since = set(job.files), J.arrival(job)
-        jobs = J.lane_jobs(self.repo)
-        for j in jobs:   # "older" by arrival, not lane order: a job put first still waits (PUT FIRST)
-            if j.key == job.key or not mine & set(j.files):
-                continue
-            if (j.state in ACTIVE or (J.arrival(j) < since and self.parked_live(j, jobs))) and self.clashes(job, j):
-                return j
-        return None
-
-    def clashes(self, job, other) -> bool:
-        """brief, 10-12: "park only on real overlap: hunks that touch the same lines, or a file both sides change in a
-        way that won't rebase cleanly, not just the same file name". True when the two heads do not merge cleanly
-        (G.clash), and on any doubt: a head not read yet, or git that will not say. Kept per pair of heads, which never
-        change, so a parked job asks git once per job it meets, not at every wake."""
-        if not (job.head and other.head):
-            return True
-        pair = tuple(sorted((job.head, other.head)))
-        if pair not in self.clash_of:
-            try:
-                with self.lock():
-                    self.clash_of[pair] = bool(G.clash(self.root, *pair, env=self.genv))
-            except G.GitError as e:
-                self.say(f"PR #{job.pr} and PR #{other.pr}: git could not say whether they clash, so they do: {e}")
-                self.clash_of[pair] = True
-        return self.clash_of[pair]
-
-    @staticmethod
-    def parked_live(job, jobs) -> bool:
-        """`job` is queued and parked, and its park still holds back a newer job that clashes with it: the PR it waits
-        for is in flight, or has just left (it is planned next, in arrival order). FIRST READY FIRST (brief, 10-12: "a PR
-        held for a person, waiting on a query or behind a red main never blocks a later PR that is ready"): a park on a
-        held PR, or on a job parked itself, holds nobody else (10-12: #961 held main-red, #1082 parked on it, and #1121,
-        put first to fix that red, parked on #1082; ~12 PRs sat behind #1065 down chains of parks). A query leaves the
-        lane, so a park on one is a park on a PR that has left, and the parked job's next turn plans it."""
-        if job.state != T.QUEUED or not isinstance(job.extra.get("parked"), dict):
-            return False
-        on = next((j for j in jobs if j.pr == job.extra["parked"].get("on")), None)
-        return not (on is not None and (on.state == T.HELD
-                                        or (on.state == T.QUEUED and isinstance(on.extra.get("parked"), dict))))
-
-    def park(self, job, other, read):
-        """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
-        the time, and its later turns (unblocked) check them without a new call until PARK_FRESH runs out. The first
-        park stamps parked_since (never refreshed until it is planned). A queue.log line says whom it waits for each
-        time that changes: the first park, a park on another PR, a park after a hold dropped the last one; a park
-        again on the same PR writes none."""
-        self.waiting.add(job.key)
-        self.parked.add(job.key)
-        self.park_on[job.key] = (other.key, other.state, other.head)
-        first = not job.extra.get("parked_since")
-        if first:
-            job.extra["parked_since"] = E.stamp()
-        park = job.extra.get("parked")
-        moved = not isinstance(park, dict) or park.get("on") != other.pr
-        if moved and not read and isinstance(park, dict):   # parked_live follows "on": it names the PR this job waits for now
-            park["on"] = other.pr
-        if read:
-            job.extra["parked"] = {"at": time.time(), "head": job.head, "on": other.pr}
-        if read or first or moved:
-            J.save(job)
-        if first or moved:
-            E.stage(job.repo, job.pr, "parked", on=other.pr)
-        if (job.key, other.key) not in self.said:
-            self.said.add((job.key, other.key))
-            self.say(f"PR #{job.pr} waits for PR #{other.pr}: both change "
-                     f"{sorted(set(job.files) & set(other.files))[0]}")
-
     def box_hold(self, job):
         return box_hold(self.member or self.repo, job)
 
     def advance(self, job):
-        if job.state == T.QUEUED and job.key not in self.parked and not job.extra.get("parked"):   # staged once
+        if job.state == T.QUEUED:
             E.stage(job.repo, job.pr, "lane")
         for _ in range(MAX_STEPS):
             if not self.due(job):
@@ -1084,7 +994,6 @@ class Lane:
             return
         # perms, 10-13: "after a handback or a main-red hold, the job's other checks keep running for nothing"
         self.stop_checks(job)
-        job.extra.pop("parked", None)   # a held job's files are read again when it comes back
         # perms, 10-12: "only the early holds keep the place, and that keep must be bounded": past PLACE_HOLDS holds
         # the place goes, or a job held for days would come back overdue and go ahead of everyone
         holds = int(job.extra.get("holds") or 0) + 1
@@ -1139,22 +1048,14 @@ class Lane:
         self.say(f"PR #{job.pr} is a query for {route}: {why}")
 
     def conflict(self, job, paths):
-        """`job` conflicts with its base in `paths` (repair.py has the round). A conflicting file that a PR already
-        planned, checking or mergeable also changes waits for that PR, as an overlap from the start does (park): it
-        is repaired once that one has merged or left, so it is not repaired twice. Otherwise the repair unit answers:
-        a round launched or running holds the job; nothing that will repair it hands it back to the planning seat
-        (a member's to its own channel) with one message, and a push to the branch re-queues it."""
+        """`job` conflicts with its base in `paths` (repair.py has the round). The repair unit answers: a round
+        launched or running holds the job; nothing that will repair it hands it back to the planning seat (a member's
+        to its own channel) with one message, and a push to the branch re-queues it."""
         base = job.extra.get("base_ref") or "main"
         why = f"PR #{job.pr} conflicts with {base}: {J.path_names(paths)}"   # a path is the branch's: shown clean
         # brief 10-13: "If it can't merge cleanly, hand it back. Don't park it." A queued job's flag is an older head's
         if job.extra.get("light") is True and job.state != T.QUEUED:
             return self.handback(job, f"{why} — rebase it and queue it again")
-        other = next((j for j in J.lane_jobs(self.repo)
-                      if j.key != job.key and j.state in ACTIVE and set(paths) & set(j.files)), None)
-        if other:
-            if job.state != T.QUEUED:
-                J.move(job, T.QUEUED, f"{why} — waits for PR #{other.pr}")
-            return self.park(job, other, read=True)
         if not self.unit("repair"):
             return self.hold(job, f"{why} — rebase it")
         kind, words = self.call("repair", "start", self, job, paths)
@@ -1189,11 +1090,6 @@ class Lane:
         return got
 
     def queued(self, job):
-        park = job.extra.get("parked")
-        if isinstance(park, dict) and job.files and time.time() - float(park.get("at") or 0) < PARK_FRESH:
-            other = self.overlapping(job)
-            if other:   # still waiting: no GitHub call, no fetch; it is read afresh before it is ever planned
-                return self.park(job, other, read=False)
         facts, why = GH.pr_facts(self.root, job.pr, FIELDS, self.token)
         if facts is None:
             return self.hold(job, f"gh could not read PR #{job.pr}: {why}", kind="box")
@@ -1257,14 +1153,10 @@ class Lane:
         why = self.door(job)
         if why:
             return self.query(job, why, "owner")
-        # brief 10-13: "No host checks, no e2e, no main-red hold, no overlap parking" for a light job
-        other = None if self.light(job) else self.overlapping(job)
-        if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
-            return self.park(job, other, read=True)
-        self.parked.discard(job.key)
-        self.park_on.pop(job.key, None)
-        for k in ("parked", "parked_since"):
-            job.extra.pop(k, None)
+        # brief, 10-13: "Every queued PR gets its checks planned and run at once on merge-tree(base, head), up to the
+        # slot limit. No PR parks because another PR touches the same files, is held, is conflicted, or shares only a
+        # doc."
+        self.light(job)   # extra["light"] at this head: planned() trims a light job's plan
         if not self.unit("planner"):
             return self.hold(job, "planner is not installed", kind="box")
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
@@ -1377,9 +1269,9 @@ class Lane:
             return None
         todo = [n for n in (job.plan.checks if job.plan else []) if n not in job.results]
         red = (job.extra.get("main_red") or {}).get("check")
-        if red in todo:   # the check main was red on goes first: while main is still red, one check says so
-            todo.remove(red)
-            todo.insert(0, red)
+        # the check main was red on goes first (while main is still red, one check says so), then any check main's
+        # record holds red now: a main-red fix proves its fix before the rest of its plan
+        todo.sort(key=lambda n: (n != red, n not in self.reds))
         if todo:
             # the laptop's slots first (every check of the plan that may leave the box, several PRs' at once), the
             # box's beside them (one check per job there); a check waits only for a place of its own kind
@@ -1416,6 +1308,9 @@ class Lane:
                 todo = [n for n in todo if n not in again]
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
             main = {} if self.member else HL.at(self.repo, base_tree)   # main's own record on this base (health.py)
+            # brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot, ahead of
+            # ordinary PR checks, so health can't starve": a job whose plan holds a check main is red on
+            fix = bool(set(job.plan.checks) & self.reds)
             for n in todo:
                 c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
                 express = n in fast and self.express_room()
@@ -1442,7 +1337,8 @@ class Lane:
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
                                        only=[n], fallback=self.fallback, cancel=stop, lane=True,
                                        **({"runners": True} if laptop else kw),
-                                       **({"express": True} if express else {}), **({"main": main} if main else {}))
+                                       **({"express": True} if express else {}), **({"main": main} if main else {}),
+                                       **({"first": True} if fix else {}))
                 self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop,
                                                      express)
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
@@ -1538,7 +1434,7 @@ class Lane:
         prior = job.extra.get("verdict")
         pv = T.Verdict.from_dict(prior) if isinstance(prior, dict) and prior else None
         if pv and landed_at(job, pv.to_dict()):
-            return True   # a LAND already read at this very digest (a Δ rerun): no second read
+            return True   # a LAND already read at this very digest (a rerun after main moved): no second read
         if not self.unit("reviewer"):
             self.hold(job, "reviewer is not installed", kind="box")
             return False
@@ -1616,18 +1512,19 @@ class Lane:
             if main_now != job.base_sha and job.extra.get("light") is True:
                 # asked again at the new base: a policy main took since may now list one of its files
                 why = LT.why_not(self.root, main_now, job.files, protected_rules(self.repo), self.fallback)
-                if why:
-                    job.extra["light"] = why   # not light any more: the Δ re-plan below, as for any job
+                if why:   # not light any more: main_moved adopts the full plan at main_now (and sends it for the
+                    job.extra["light"] = why   # read it now needs), then the checks the light trim left out run
+                    if not self.main_moved(job, main_now, adopt=True):   # (rule 2 keeps the verdicts it has; it
+                        return                                            # never lowers which checks a PR must pass)
+                    left = [n for n in job.plan.checks if n not in job.results]
+                    if left:
+                        job.extra["rerun"] = left
+                        return J.move(job, T.CHECKING, why="no longer light: check " + ", ".join(left))
                 else:
                     job.base_sha = main_now   # brief 10-13: "merge at the head right away"; merge() proves it clean
                     J.save(job)
-            if main_now != job.base_sha:
-                rerun = self.revalidate(job, main_now)
-                # a reach.tsv the old base's merge tree generated need not be what the new one generates
-                if job.plan.klass == T.LANDER:
-                    return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
-                if rerun:
-                    return J.move(job, T.CHECKING, why="main moved: rerun " + ", ".join(job.extra.get("rerun") or []))
+            if main_now != job.base_sha and not self.main_moved(job, main_now):
+                return
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
             if self.merge(job) != "moved":
@@ -1692,28 +1589,60 @@ class Lane:
         job.extra[key] = {"head": job.head, "n": n}
         return n
 
-    def revalidate(self, job, main_now):
-        """Δ re-plan (S2). True when something must run again (only those checks' results are dropped)."""
-        delta = G.changed(self.root, job.base_sha, main_now, env=self.genv)
+    def main_moved(self, job, main_now, adopt=False) -> bool:
+        """main moved from job.base_sha to main_now under a mergeable job (brief, 10-13: "At merge time, re-check only
+        when merge-tree finds a text conflict with current main, or main is red on a check the PR's plan includes.
+        Otherwise merge on the verdict it already has. A text conflict goes to the existing repair or handback path, as
+        now."). A conflict -> conflict(), False. A re-plan at main_now is read for its class and its read, gates:
+        lander class -> query "lander-self", False. Paid there (a paid_review or LANDING-security.toml rule main took
+        since) -> its paid and security carried onto job.plan, which never lowers them; and with no LAND at this
+        digest the merge may stand on (landed_at, which wants perms' record when security is named) -> back to
+        checking, where review() reads it, False: the old revalidate's "a plan that became paid with no LAND at this
+        digest must go through the review too" (security read of #1334). adopt (a job no longer light): job.plan
+        becomes that re-plan, so the checks the light trim left out run too; otherwise it is not adopted and adds no
+        rerun. Checks of its plan main's record holds red (main_reds) -> their results dropped, base_sha = main_now,
+        back to checking with only those (extra rerun; EXPRESS for the ones not in FULL_CHECKS, defined at the head
+        as on main and short in the queue log), False. Otherwise base_sha = main_now and True: it goes on to GitHub's
+        CI and the merge, with no check run again."""
+        with self.lock():
+            tree, conflicts = G.merge_tree(self.root, main_now, job.head, env=self.genv)
+        if tree is None:
+            self.conflict(job, conflicts)
+            return False
+        # the plan decides which lane lands it and whether a read must stand behind the merge, gates; rule 2 decides
+        # what reruns. A reach.tsv or policy the old base had need not be what the new one has: a re-plan at main_now
+        # that turns lander class is not merged here, and one that turns paid is not merged without its read.
         new = self.call("planner", "plan", self.root, main_now, job.head, job.files, fallback=self.fallback)
-        new = self.main_red(job, main_now, self.nightly(main_now, new))
-        own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta, fallback=self.fallback).checks
-        old = set(job.plan.checks if job.plan else [])
-        rerun = sorted((set(new.checks) - old) | (set(new.checks) & set(own)))
-        # EXPRESS: only what this re-plan sends back, at this base and head, never a whole suite, only a short check
+        if new.klass == T.LANDER:
+            self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
+            return False
+        if adopt or job.plan is None:
+            job.plan = new
+        elif new.paid:
+            job.plan.paid = True
+            if new.extra.get("security"):
+                job.plan.extra["security"] = sorted(set(job.plan.extra.get("security") or [])
+                                                    | set(new.extra["security"]))
+        reds = sorted(self.main_reds() & set(job.plan.checks if job.plan else []))
+        job.base_sha = main_now
+        pv = job.extra.get("verdict") or {}
+        if not reds and new.paid and not landed_at(job, pv):
+            J.move(job, T.CHECKING, why="main moved and its plan there wants a read: "
+                                        + ("a security reader's" if job.plan.extra.get("security")
+                                           else "no LAND is recorded at this digest"))
+            return False
+        if not reds:
+            J.save(job)
+            return True
+        for n in reds:
+            job.results.pop(n, None)
+        job.extra["rerun"] = reds
         job.extra["express"] = {"on": [main_now, job.head],
                                 "checks": self.quick(job.repo, self.unchanged(job, main_now,
-                                                                              [n for n in rerun
+                                                                              [n for n in reds
                                                                                if n not in FULL_CHECKS]))}
-        # a plan that became paid with no LAND at this digest must go through the review too
-        pv = job.extra.get("verdict") or {}
-        job.plan, job.base_sha = new, main_now
-        needs_read = new.paid and not landed_at(job, pv)
-        for n in rerun:
-            job.results.pop(n, None)
-        job.extra["rerun"] = rerun
-        J.save(job)
-        return bool(rerun) or needs_read
+        J.move(job, T.CHECKING, why=f"main moved and is red on {', '.join(reds)}: rerun {', '.join(reds)}")
+        return False
 
     def merge(self, job):
         pin = job.head   # door() made approved_head equal it when a protected path is hit; else it is stale

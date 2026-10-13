@@ -34,6 +34,7 @@ from lander import cards as C  # noqa: E402
 from lander import events as E  # noqa: E402
 from lander import gh as GH  # noqa: E402
 from lander import git as G  # noqa: E402
+from lander import health as HL  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
 from lander import manifest as MF  # noqa: E402
@@ -220,11 +221,13 @@ class Runner:
         self.status, self.hook, self.calls, self.missing = dict(status or {}), hook, [], set(missing)
         self.notes = dict(notes or {})   # {name: the Outcome's note}, as run.judge says it (a flake's "flaky: …")
         self.plan_kw = []   # (only, express, lane) of each run_plan call
+        self.firsts = []    # (pr, only, first) of each run_plan call: first is the admission's first claim (rule 4)
 
     def run_plan(self, root, m, plan, files, head_tree, base_tree="", *, member="", only=None, **kw):
         """lander.run.run_plan's shape: {name: Outcome}; a name in `missing` is one the manifest lacks."""
         from lander import run as RUN
         self.plan_kw.append((tuple(only or ()), kw.get("express", False), kw.get("lane", False)))
+        self.firsts.append((kw.get("pr"), tuple(only or ()), bool(kw.get("first"))))
         out = {}
         for n in plan.checks:
             if only and n not in only:
@@ -459,6 +462,14 @@ class Fixture(unittest.TestCase):
 
     def job(self, pr=1, repo="demo"):
         return J.load(repo, pr)
+
+    def main_red(self, *names, repo="demo"):
+        """main's own record (health.py) holds `names` red at origin/main's tip."""
+        path = HL.path(repo)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"tip": self.origin_rev("main"),
+                       "checks": {n: {"status": T.FAILED, "at": E.stamp(time.time())} for n in names}}, f)
 
 
 # --- the cases -----------------------------------------------------------------------------------------------------
@@ -1986,8 +1997,8 @@ class Machine(Fixture):
 
 
 class Repair(Fixture):
-    """A conflict with main mends itself (repair.py): one rebase round per conflict, parked behind a PR that changes
-    the same file, and ONE message to the planning seat when nothing will repair it."""
+    """A conflict with main mends itself (repair.py): one rebase round per conflict, and ONE
+    message to the planning seat when nothing will repair it."""
 
     def setUp(self):
         super().setUp()
@@ -2083,26 +2094,6 @@ class Repair(Fixture):
         self.assertEqual(self.gos(), [])
         self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
         self.assertIn("no row owns it", cards.calls[-1][2])
-
-    def test_a_conflict_on_a_file_a_planned_pr_changes_parks_behind_it_then_repairs(self):
-        other = self.held_job(2, files=("a/x", "c/z"))
-        j = self.held_job(1, files=("a/x", "b/y"))
-        lane = L.Lane("demo", self.units(repair=RP))
-        lane.conflict(j, ["a/x"])
-        self.assertEqual((j.state, j.extra["parked"]["on"]), (T.QUEUED, 2))
-        self.assertEqual(self.gos(), [])
-        # a conflict on a file the other PR does not change is not parked: it is repaired now
-        k = self.held_job(3, files=("b/y",))
-        lane.conflict(k, ["b/y"])
-        self.assertEqual(k.state, T.HELD)
-        self.assertEqual([c[2] for c in self.gos()], ["row-3"])
-        # once PR 2 has left, PR 1 is repaired
-        J.move(other, T.HANDBACK, "gone")
-        J.remove(other)
-        j = self.held_job(1, files=("a/x", "b/y"))
-        lane.conflict(j, ["a/x"])
-        self.assertEqual(j.state, T.HELD)
-        self.assertEqual([c[2] for c in self.gos()], ["row-3", "row-1"])
 
     def conflicting_push(self, text):
         """The round's worker pushed, but the head still conflicts; its re-queue goes through the request path."""
@@ -2478,20 +2469,11 @@ class Merge(Fixture):
         self.assertEqual([c[0] for c in u["runner"].calls], ["a"])
         j = self.job()
         self.assertEqual(j.state, T.DEPLOY_PENDING)
-        self.assertEqual(j.extra["rerun"], [])
+        self.assertNotIn("rerun", j.extra)
         self.assertNotIn("tip", j.extra)            # the proof held: merge-tree on the main read before the call
         self.assertEqual(len(self.box()["merges"]), 1)
 
-    def test_overlapping_delta_reruns_only_owned(self):
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
-        J.submit("demo", 1)
-        hook = lambda name, n: self.push("main", {"a/other": "m\n"}) if n == 2 else None  # noqa: E731
-        u, _ = self.land(runner=Runner(hook=hook))
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "b", "a"])
-        self.assertNotEqual(u["runner"].calls[0][1], u["runner"].calls[2][1])   # rerun on the new merge tree
-        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
-
-    def test_checks_grew_runs_the_new_ones(self):
+    def test_a_check_main_gained_after_the_pr_was_checked_is_not_rerun_at_merge(self):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
         planner = Planner()
@@ -2501,8 +2483,10 @@ class Merge(Fixture):
                 self.push("main", {"b/y": "moved\n"})
                 planner.owners["new"] = "a/"
         u, _ = self.land(planner=planner, runner=Runner(hook=hook))
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "new"])
-        self.assertEqual(self.job().extra["rerun"], ["new"])
+        self.assertEqual([c[0] for c in u["runner"].calls], ["a"])   # rule 2: the verdict it has stands
+        j = self.job()
+        self.assertEqual((j.state, j.plan.checks), (T.DEPLOY_PENDING, ["a"]))
+        self.assertNotIn("rerun", j.extra)
 
     def test_tree_proof_ok_vs_mismatch(self):
         self.pr(1, {"a/x": "n\n"})
@@ -2630,6 +2614,166 @@ class Merge(Fixture):
         u, _ = self.land(runner=Runner(hook=hook))
         self.assertEqual(self.job(2).head, self.git(self.work, "rev-parse", "track/row-2"))
         self.assertIn("queued", [h["state"] for h in self.job(2).history[1:]])
+
+
+class Together(Runner):
+    """A runner whose each check waits (at most `wait` s) for another check to be running beside it, and counts the
+    most it saw running at once."""
+
+    def __init__(self, wait=1.0, **kw):
+        super().__init__(**kw)
+        self.wait, self.now, self.peak, self.cv = wait, 0, 0, threading.Condition()
+
+    def run(self, check, tree, where):
+        with self.cv:
+            self.now += 1
+            self.peak = max(self.peak, self.now)
+            self.cv.notify_all()
+            self.cv.wait_for(lambda: self.now > 1, timeout=self.wait)
+        try:
+            return super().run(check, tree, where)
+        finally:
+            with self.cv:
+                self.now -= 1
+
+
+class AtOnce(Fixture):
+    """Brief, 10-13: "(1) every queued PR is planned and checked at once, no parking. (2) At merge time, re-check only
+    when merge-tree finds a text conflict with current main, or main is red on a check the PR's plan includes.
+    Otherwise merge on the verdict it already has. (3) A PR whose plan includes a check that is red on main jumps the
+    queue. (4) A main-red fix's checks take first claim on a free slot." Each case asserts what is kept and what is not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(L, "POLL", 0.05)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def merged_order(self):
+        return [int(argv[2]) for argv in self.box().get("merges", [])]
+
+    def ci_moves_main(self, files, red=()):
+        """At the first GitHub CI look of PR #1, main moves (`files`), and main's record holds `red` red."""
+        moved, real = [], L.Lane.ci_green
+
+        def ci_green(lane, job):
+            if job.pr == 1 and not moved:
+                moved.append(self.push("main", files))
+                if red:
+                    self.main_red(*red)
+            return real(lane, job)
+        return moved, mock.patch.object(L.Lane, "ci_green", ci_green)
+
+    def test_two_prs_changing_the_same_lines_are_checked_side_by_side(self):
+        for width, peak in ((2, 2), (1, 1)):   # kept: both in flight at once; one slot: one at a time
+            with self.subTest(width=width):
+                self.setUp()
+                self.pr(1, {"a/x": "one\n"})
+                self.pr(2, {"a/x": "two\n"})   # the same line of the same file
+                J.submit("demo", 1)
+                J.submit("demo", 2)
+                runner = Together()
+                with mock.patch.object(L.Lane, "width", lambda lane: width):
+                    _, lines = self.land(runner=runner)
+                self.assertEqual(runner.peak, peak, lines)
+                self.assertEqual(sorted(c[0] for c in runner.calls), ["a", "a"])
+                self.assertFalse([ln for ln in lines if "waits for PR" in ln])   # nobody parked
+                merged = self.merged_order()   # one merges, and the other then conflicts with the main it made
+                self.assertEqual(len(merged), 1)
+                self.assertIn("conflicts with main: a/x", self.job(3 - merged[0]).extra["why"])
+
+    def test_a_clean_pr_merges_on_its_verdict_after_main_moved(self):
+        # kept: main moved, no red record; and main red only on a check outside the plan: the same, no rerun
+        for red in ((), ("b",)):
+            with self.subTest(red=red):
+                self.setUp()
+                self.pr(1, {"a/x": "n\n"})
+                J.submit("demo", 1)
+                moved, patch = self.ci_moves_main({"c/z": "moved\n"}, red)
+                with patch:
+                    u, lines = self.land()
+                j = self.job()
+                self.assertEqual([c[0] for c in u["runner"].calls], ["a"], lines)
+                self.assertEqual((j.state, j.base_sha), (T.DEPLOY_PENDING, moved[0]))
+                self.assertNotIn("rerun", j.extra)
+                self.assertNotIn(T.CHECKING, [h["state"] for h in j.history][3:])   # it never went back
+                self.assertEqual(self.merged_order(), [1])
+
+    def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
+        with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to
+            json.dump({"tracks": {"row-1": {"status": "review"}}}, f)
+        self.pr(1, {"a/x": "pr\n"})
+        J.submit("demo", 1)
+        _, patch = self.ci_moves_main({"a/x": "main\n"})   # kept: the same line on main
+        with patch:
+            u, _ = self.land(repair=RP)
+        j = self.job()
+        self.assertEqual(self.merged_order(), [])
+        self.assertEqual(j.state, T.HELD)
+        self.assertIn("conflicts with main: a/x — rebase round 1 of 2 dispatched in row-1", j.extra["why"])
+        self.assertEqual([c[0] for c in u["runner"].calls], ["a"])   # a conflict reruns nothing itself
+        self.setUp()   # suppressed: main moved on another file, so it merges
+        self.pr(1, {"a/x": "pr\n"})
+        J.submit("demo", 1)
+        _, patch = self.ci_moves_main({"b/y": "main\n"})
+        with patch:
+            self.land(repair=RP)
+        self.assertEqual((self.job().state, self.merged_order()), (T.DEPLOY_PENDING, [1]))
+
+    def test_main_red_on_a_planned_check_reruns_that_check_alone(self):
+        for red, again in (("b", ["b"]), ("c", [])):   # kept: b is in the plan; suppressed: c is not
+            with self.subTest(red=red):
+                self.setUp()
+                self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+                J.submit("demo", 1)
+                _, patch = self.ci_moves_main({"docs/r.md": "moved\n"}, (red,))
+                with patch:
+                    u, lines = self.land()
+                j = self.job()
+                calls = [c[0] for c in u["runner"].calls]
+                self.assertEqual(sorted(calls), sorted(["a", "b"] + again), lines)
+                self.assertEqual((j.state, sorted(j.results)), (T.DEPLOY_PENDING, ["a", "b"]))
+                whys = [h.get("why") for h in j.history]
+                if again:
+                    self.assertIn("main moved and is red on b: rerun b", whys)
+                    self.assertEqual(j.extra["rerun"], ["b"])
+                else:
+                    self.assertNotIn("rerun", j.extra)
+
+    def checked_both(self, red):
+        """#1 (a/x, plan [a]) queued before #2 (b/y, plan [b]); main's record holds `red` red; both planned with no
+        slot yet, then the lane runs with one slot. -> the runner"""
+        self.push("main", {"tests/LANDING.toml": Express.MANIFEST})
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        if red:
+            self.main_red(*red)
+        with mock.patch.object(L.Lane, "width", lambda lane: 0):   # planned, no check started
+            self.land()
+        self.assertEqual((self.job(1).state, self.job(2).state), (T.CHECKING, T.CHECKING))
+        runner = Runner()
+        with one_slot():
+            self.land(runner=runner)
+        return runner
+
+    def test_a_main_red_fix_is_checked_and_merged_before_an_older_pr(self):
+        runner = self.checked_both(("b",))   # kept: #2's plan holds b, which main is red on
+        self.assertEqual([c[0] for c in runner.calls], ["b", "a"])
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.setUp()
+        runner = self.checked_both(())      # suppressed: main is green, the older goes first
+        self.assertEqual([c[0] for c in runner.calls], ["a", "b"])
+        self.assertEqual(self.merged_order(), [1, 2])
+
+    def test_a_main_red_fixs_check_takes_the_first_claim_and_an_ordinary_one_does_not(self):
+        runner = self.checked_both(("b",))
+        self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), True)])
+        self.setUp()
+        runner = self.checked_both(())
+        self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), False)])
 
 
 class HostFallback(Fixture):
@@ -3518,8 +3662,8 @@ class SmallFirst(Fixture):
         with mock.patch.object(L, "SMALL_CHECKS", 1), one_slot():
             u, _ = self.land()
         self.assertEqual(self.merged_order(), [2, 1])
-        # #1's first check, #2's only one, #1's rest, then #1's `a` again: #2's merge moved a/ under it (the Δ re-plan)
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "a", "b", "c", "a"])
+        # #1's first check, #2's only one, #1's rest; #2's merge moved main under #1, which is not red: no rerun
+        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "a", "b", "c"])
         self.assertEqual((self.job(1).state, self.job(2).state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
 
     def test_a_heavy_pr_put_first_goes_before_a_small_one(self):
@@ -3563,8 +3707,8 @@ class SmallFirst(Fixture):
         with mock.patch.object(L, "SMALL_CHECKS", 3), one_slot():   # three checks is still small: oldest first
             u, _ = self.land(runner=first_check_waits(self, lambda: self.job(2).state != T.QUEUED))
         self.assertEqual(self.merged_order(), [1, 2])
-        # #1's suite, then #2's `a`, and `a` again: #1's merge moved a/ under #2 while its check ran (the Δ re-plan)
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "b", "c", "a", "a"])
+        # #1's suite, then #2's `a`; #1's merge moved main under #2, which is not red: no rerun
+        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "b", "c", "a"])
 
     def test_a_small_pr_queued_mid_suite_goes_in_after_the_running_check(self):
         self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
@@ -3600,8 +3744,8 @@ class SmallFirst(Fixture):
             u, _ = self.land()
         self.assertEqual(self.merged_order(), [1, 2])
         # #2 is planned while #1's first check runs (that is how the lane learns it is heavy), then waits: the older
-        # heavy job gets each free slot until its suite is done; #1's merge moved b/ under #2, so its `b` runs again
-        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "b", "b", "c", "b"])
+        # heavy job gets each free slot until its suite is done; #1's merge moved main under #2, not red: no rerun
+        self.assertEqual([c[0] for c in u["runner"].calls], ["a", "b", "b", "c"])
 
 
 class Gate(Runner):
@@ -3633,11 +3777,6 @@ class Parallel(Fixture):
         r = mock.patch.object(L.RUN, "spill", return_value="load 50.0 on 20 cores (at least 2x)")
         r.start()
         self.addCleanup(r.stop)
-        # these PRs add a shared file with the same bytes, which git merges cleanly: every shared file clashes here,
-        # and RealOverlap below proves the clash rule itself on hunks that do and do not meet
-        c = mock.patch.object(L.Lane, "clashes", lambda self, job, other: True)
-        c.start()
-        self.addCleanup(c.stop)
 
     def merged_order(self):
         return [int(argv[2]) for argv in self.box()["merges"]]
@@ -3895,16 +4034,6 @@ class Parallel(Fixture):
         lane.drop_reads([one, two])
         self.assertEqual(lane.pending_reads(), [])
 
-    def test_a_parked_job_leaves_a_free_slot_spare(self):
-        # 28 jobs sat parked live: one parked waits on another PR, not on a slot, so it holds no slot back
-        lane, me, (q,) = self.spare_lane(T.QUEUED)
-        self.assertFalse(lane.spare_box(me))   # queued, not parked: it wants its first slot
-        q.extra["parked"] = {"at": time.time(), "head": q.head, "on": 1}
-        self.assertTrue(lane.spare_box(me))
-        q.extra.pop("parked")
-        lane.parked.add(q.key)                 # parked in this lane's own pass
-        self.assertTrue(lane.spare_box(me))
-
     def test_a_checking_job_with_no_box_check_keeps_the_slot_from_a_second_one(self):
         lane, me, (c,) = self.spare_lane(T.CHECKING)
         self.assertFalse(lane.spare_box(me))   # a check left and none on the box: it wants a box slot
@@ -4113,192 +4242,6 @@ class Parallel(Fixture):
         # 8-30 min on 1-2 box slots while the laptop answered `free 6`)
         self.assertEqual(self.placed("every admission slot on this host is held"), ["runners"] * 3)
 
-    def test_a_pr_overlapping_one_in_flight_waits_and_is_planned_after_it_merges(self):
-        # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(2, {"b/y": "n\n"})
-        self.pr(3, {"c/z": "n\n"})   # shares nothing: it does not wait
-        for n in (1, 2, 3):
-            J.submit("demo", n)
-        planner = Planner()
-        u, lines = self.land(planner=planner, runner=first_check_waits(self, lambda: self.job(3).state != T.QUEUED))
-        self.assertIn("[demo] PR #2 waits for PR #1: both change b/y", lines)
-        self.assertNotIn("PR #3 waits", " ".join(lines))
-        self.assertEqual(self.merged_order().index(1) < self.merged_order().index(2), True)
-        tip1 = self.job(1).extra["tip_sha"]
-        # planned first from #1's merge, never from main before it (a Δ re-plan may follow if #3 merges between)
-        self.assertEqual([c[0] for c in planner.calls if c[2] == ("b/y",)][0], tip1)
-        self.assertEqual(len([ln for ln in lines if "PR #2 waits" in ln]), 1)            # said once
-        self.assertEqual(self.log().count("stage demo#2 lane"), 1)                         # staged once
-        self.assertEqual(self.job(2).state, T.DEPLOY_PENDING)
-
-    def test_an_older_parked_pr_is_not_jumped_by_a_newer_one_sharing_a_file(self):
-        # review 2026-09-29: #2 (a/x, b/y) parks behind #1 (a/x); #3 (b/y only) must not be planned ahead of #2,
-        # or #2 waits on #3, then on the next newer PR, for as long as they arrive
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(3, {"b/y": "n\n"})
-        for n in (1, 2, 3):
-            J.submit("demo", n)
-        _, lines = self.land(runner=first_check_waits(self, lambda: self.job(3).extra.get("parked_since")))
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertIn("[demo] PR #3 waits for PR #2: both change b/y", lines)
-        self.assertEqual(self.merged_order(), [1, 2, 3])
-        self.assertEqual([self.job(n).state for n in (1, 2, 3)], [T.DEPLOY_PENDING] * 3)
-        self.assertNotIn("parked", self.job(2).extra)
-
-    def facts_calls(self, pr):
-        """Run the lane counting its `gh pr view` reads of PR `pr` from queued() (FIELDS)."""
-        real, n = GH.pr_facts, [0]
-
-        def counting(root, num, fields, *a, **k):
-            if int(num) == pr and fields == L.FIELDS:
-                n[0] += 1
-            return real(root, num, fields, *a, **k)
-        with mock.patch.object(GH, "pr_facts", counting):
-            _, lines = self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/", "e": "e/"}),
-                                 runner=first_check_waits(self, lambda: self.job(pr).extra.get("parked_since"), 0.3))
-        return n[0], lines
-
-    def test_a_parked_pr_is_not_read_from_github_at_every_wake(self):
-        # review 2026-09-29: each wake re-ran queued() for every parked job, and many parked jobs reach GH backoff
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n", "d/w": "n\n", "e/v": "n\n"})   # five checks: five wakes
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        calls, lines = self.facts_calls(2)
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertEqual(calls, 2)   # the read that parked it, and the read before it is planned
-        self.assertEqual(self.merged_order(), [1, 2])
-
-    def test_a_parked_pr_with_a_stale_read_has_no_turn_until_the_pr_it_waits_for_moves(self):
-        # brief, 10-13: "A parked job is replanned only when its blocker changed (merged, moved or left the lane), not
-        # on every wake": #1's five checks are five wakes, and none of them gives #2 a turn, stale read or not
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n", "d/w": "n\n", "e/v": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        with mock.patch.object(L, "PARK_FRESH", 0):
-            calls, _ = self.facts_calls(2)
-        self.assertEqual(calls, 2)   # the read that parked it, and the read once #1 had merged
-        self.assertEqual(self.merged_order(), [1, 2])
-
-    def test_a_free_slot_starts_a_checking_jobs_next_check_before_parked_jobs_are_replanned(self):
-        # brief, 10-13: "while a check slot is free and some checking job has a check left to run, the lane starts that
-        # check before it spends time replanning queued or parked jobs" (#1189 ran check-sh at 03:15, then nothing
-        # until 05:47, while every wake replanned the parked PRs ahead of its heavy plan)
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})   # heavy: a, b
-        self.pr(2, {"c/z": "n\n", "d/w": "n\n"})   # heavy: c, d
-        for n in (3, 4, 5):                         # each parks on #1
-            self.pr(n, {"a/x": "n\n", f"e{n}/v": "n\n"})
-        for n in (1, 2, 3, 4, 5):
-            J.submit("demo", n)
-        events, lock, real = [], threading.Lock(), L.Lane.queued
-
-        def queued(lane, job):   # a turn of a queued job: a park, or a replan
-            with lock:
-                events.append(("turn", job.pr, (self.job(1).state, self.job(2).state)))
-            return real(lane, job)
-
-        def hook(name, n):
-            if n <= 2:   # the first checks of #1 and #2 run until #3-#5 are parked, so they end with the parks made
-                end = time.time() + 10
-                while not all(self.job(p).extra.get("parked_since") for p in (3, 4, 5)) and time.time() < end:
-                    time.sleep(0.02)
-            with lock:
-                events.append(("check", name))
-        planner = Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/", **{f"e{n}": f"e{n}/" for n in (3, 4, 5)}})
-        with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "SMALL_CHECKS", 1), \
-                mock.patch.object(L, "PARK_FRESH", 0), mock.patch.object(L.Lane, "queued", queued):
-            u, lines = self.land(planner=planner, runner=Runner(hook=hook))
-        self.assertIn("[demo] PR #3 waits for PR #1: both change a/x", lines)
-        firsts = [e for e in events if e[0] == "check"][:2]
-        self.assertEqual(sorted(e[1] for e in firsts), ["a", "c"])
-        # the suppressed case: no parked job has a turn between the first checks ending and #1's and #2's next ones
-        after = events[events.index(firsts[-1]) + 1:]
-        seconds = [i for i, e in enumerate(after) if e[0] == "check" and e[1] in ("b", "d")]
-        self.assertEqual(len(seconds), 2, events)
-        self.assertEqual([e for e in after[:max(seconds)] if e[0] == "turn" and e[1] in (3, 4, 5)], [], events)
-        # and no parked job is replanned while #1, the job it waits for, still checks: one turn each, the park
-        while_checking = [e[1] for e in events if e[0] == "turn" and e[1] in (3, 4, 5) and e[2][0] == T.CHECKING]
-        self.assertEqual(sorted(while_checking), [3, 4, 5], events)
-        # the kept case: once #1 has moved, the parked jobs are planned and land
-        self.assertEqual(self.merged_order()[:2], [1, 2])
-        self.assertEqual(sorted(self.merged_order()), [1, 2, 3, 4, 5])
-
-    def test_a_parked_pr_whose_head_moved_is_planned_and_pinned_at_the_new_head(self):
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        new = []
-
-        def hook(name, n):   # while #2 is parked on #1, a push moves #2 off a/x
-            if n == 1:
-                end = time.time() + 10
-                while not (J.load("demo", 2).extra or {}).get("parked") and time.time() < end:
-                    time.sleep(0.02)
-                new.append(self.push("track/row-2", {"c/z": "n\n"}))
-        planner = Planner()
-        _, lines = self.land(planner=planner, runner=Runner(hook=hook))
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertEqual(self.job(2).head, new[0])
-        self.assertEqual([c[1] for c in planner.calls if c[2] == ("c/z",)], [new[0]])
-        pin = self.box()["merges"][-1]
-        self.assertEqual(pin[pin.index("--match-head-commit") + 1], new[0])
-
-    def blocker_moves_while(self, hold, counted):
-        """#2 parks on #1; then, while #1's check runs, `hold()` turns a box hold on and #1 is held by hand, so #2's
-        blocker has moved while the lane may not move #2. `counted` (a module and a name) is wrapped to count its
-        calls and to raise past 500, so a lane that spins fails the case rather than hanging it. -> (calls, lines)"""
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        calls, real = [0], getattr(*counted)
-
-        def counting(*a, **k):
-            calls[0] += 1
-            if calls[0] > 500:
-                raise AssertionError("the lane spun on the parked job")
-            return real(*a, **k)
-
-        def hook(name, n):
-            if n == 1:
-                end = time.time() + 10
-                while not (J.load("demo", 2).extra or {}).get("parked") and time.time() < end:
-                    time.sleep(0.02)
-                hold()
-                job = J.load("demo", 1)
-                J.move(job, T.HELD, "held by hand")
-                job.extra.update(held_from=T.QUEUED, hold="box", not_before=E.stamp(time.time() + 900))
-                J.save(job)
-                time.sleep(0.5)   # ~10 passes at POLL 0.05 before the check ends and the lane may stop
-        with mock.patch.object(*counted, counting):
-            _, lines = self.land(runner=Runner(hook=hook))
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertEqual(self.job(2).state, T.QUEUED)
-        return calls[0], lines
-
-    def test_a_parked_pr_whose_blocker_moved_during_a_pause_sleeps_rather_than_spinning(self):
-        # review, 10-13: an unblocked parked job was let back in every pass while the box held it, refused before it
-        # moved, so todo never emptied and reap(POLL) never slept
-        held = threading.Event()
-        with mock.patch.object(L, "paused", lambda target: held.is_set()):
-            calls, lines = self.blocker_moves_while(held.set, (L, "box_hold"))
-        self.assertLess(calls, 50, "the lane spun on the parked job")
-        self.assertLessEqual(sum("PR #2: demo is paused" in ln for ln in lines), 1, lines[-3:])
-
-    def test_a_parked_pr_whose_blocker_moved_during_a_github_backoff_sleeps_rather_than_spinning(self):
-        # review, 10-13: step() leaves a queued job where it is during a backoff, so the unblocked parked job had a
-        # turn every pass, unslept
-        def backoff():
-            J.write_atomic(GH.backoff_path(), {"until": time.time() + 600, "fails": 1})
-            self.addCleanup(os.unlink, GH.backoff_path())
-        calls, lines = self.blocker_moves_while(backoff, (L.Lane, "step"))
-        self.assertLess(calls, 50, "the lane spun on the parked job")
-        self.assertLessEqual(sum("PR #2: GitHub backoff" in ln for ln in lines), 1, lines[-3:])
-
     def test_a_queued_pr_refused_by_a_github_backoff_gets_its_turn_when_the_backoff_ends(self):
         # brief, 10-13 cause 2: a queued job that used its turn without moving waited in `tried`; one refused by a
         # backoff had nothing to let it back while another PR's check ran, so it sat queued until the lane ended
@@ -4359,9 +4302,9 @@ class Parallel(Fixture):
 
 
 class Express(Fixture):
-    """A check a mergeable PR runs again only because main moved goes at once, beside the box slot another PR's check
-    holds (2026-10-02/03: #905 went back to checking four times for a 0 s rerun that then waited hours behind
-    half-hour suites, and main moved again meanwhile)."""
+    """A check a mergeable PR runs again only because main moved and is red on it goes at once, beside the box slot
+    another PR's check holds (2026-10-02/03: #905 went back to checking four times for a 0 s rerun that then waited
+    hours behind half-hour suites, and main moved again meanwhile)."""
 
     def setUp(self):
         super().setUp()
@@ -4374,7 +4317,7 @@ class Express(Fixture):
 
     def race(self, wait=20, pr2=None, first=False):
         """#2's `b` and #1's `a` start side by side; #1's holds its slot (a Gate) until #2 merges. At #2's first CI
-        look the box narrows to one slot and main moves under b/, so #2 must run `b` again. pr2: more files #2
+        look the box narrows to one slot and main moves, red on `b`, so #2 must run `b` again. pr2: more files #2
         changes. first: #2 is put first (queue --first). -> the runner"""
         self.push("main", {"tests/LANDING.toml": self.MANIFEST})
         self.pr(1, {"a/x": "n\n"})
@@ -4383,13 +4326,17 @@ class Express(Fixture):
         J.submit("demo", 1)
         if first:
             J.put_first("demo", 2, "seat")
-        runner = Gate(lambda: (self.job(1).extra or {}).get("tree"), wait=wait)
+        def green_again(name, n):   # main's health goes green with #2's rerun of b: a later move reruns nothing
+            if name == "b" and [c[0] for c in runner.calls].count("b") == 2:
+                self.main_red()
+        runner = Gate(lambda: (self.job(1).extra or {}).get("tree"), wait=wait, hook=green_again)
         narrow, real_ci, real_merge = [], L.Lane.ci_green, GH.merge
 
         def ci_green(lane, job):
             if job.pr == 2 and not narrow:
                 narrow.append(True)
                 self.push("main", {"b/z": "main moved\n"})
+                self.main_red("b")
             return real_ci(lane, job)
 
         def merge(*a, **k):
@@ -4400,7 +4347,7 @@ class Express(Fixture):
                 mock.patch.object(L.Lane, "ci_green", ci_green), mock.patch.object(GH, "merge", merge):
             self.land(runner=runner)
         self.assertEqual([c[0] for c in runner.calls].count("b"), 2)
-        self.assertIn("main moved: rerun b", [h.get("why") for h in self.job(2).history])
+        self.assertIn("main moved and is red on b: rerun b", [h.get("why") for h in self.job(2).history])
         return runner
 
     def merged_order(self):
@@ -4424,7 +4371,6 @@ class Express(Fixture):
         with mock.patch.object(L, "FULL_CHECKS", ("b",)):
             runner = self.race(wait=1)
         self.assertTrue(runner.timed_out, "#2's rerun of a full suite took no slot")
-        self.assertEqual(self.merged_order(), [1, 2])   # #1's check let the slot go first
         self.assertEqual(self.job(2).extra["express"]["checks"], [])
 
     def test_no_express_under_memory_pressure(self):
@@ -4433,13 +4379,11 @@ class Express(Fixture):
         with mock.patch.object(L.A, "mem_loaded", return_value=True):
             runner = self.race(wait=1)
         self.assertTrue(runner.timed_out, "#2's rerun went express under memory pressure")
-        self.assertEqual(self.merged_order(), [1, 2])
 
     def test_a_long_or_unrecorded_check_is_not_express(self):
         with mock.patch.object(L, "EXPRESS_SECS", -1):   # b's green run (0 s) is longer than this
             runner = self.race(wait=1)
         self.assertTrue(runner.timed_out, "#2's rerun of a long check took no slot")
-        self.assertEqual(self.merged_order(), [1, 2])
         self.assertEqual(self.job(2).extra["express"]["checks"], [])
         self.assertEqual(L.Lane.quick("demo", ["never-ran"]), [])   # a check with no green run in the log
         self.assertEqual(L.Lane.quick("other", ["b"]), [])           # nor another repo's run of the same name
@@ -4471,8 +4415,7 @@ class Starving(Fixture):
 
     def setUp(self):
         super().setUp()
-        for p in (mock.patch.object(L.Lane, "width", lambda self: 3), mock.patch.object(L, "POLL", 0.05),
-                  mock.patch.object(L.Lane, "clashes", lambda self, job, other: True)):   # as Parallel's
+        for p in (mock.patch.object(L.Lane, "width", lambda self: 3), mock.patch.object(L, "POLL", 0.05)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -4487,33 +4430,6 @@ class Starving(Fixture):
             job = self.job(n)
             job.extra[field] = E.stamp(time.time() - ago)
             J.save(job)
-
-    def test_a_transitive_chain_parked_past_the_cap_is_planned_and_a_young_one_still_waits(self):
-        # #3 waits on #2, which waits on #1: #3 shares no file with #1. Parked a day, both are planned from main
-        self.pr(1, {"a/x": "n\n", "c/z": "n\n"})
-        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(3, {"b/y": "n\n"})
-        self.pr(4, {"c/z": "n\n"})   # parked only now: it still waits
-        for n in (1, 2, 3, 4):
-            J.submit("demo", n)
-        self.seed(L.WAIT_CAP + 60, "parked_since", 2, 3)
-        main = self.origin_rev("main")
-        planner = Planner()
-
-        def hook(name, n):   # #1's first check runs until #4 has had its turn, so #1 is in flight throughout
-            if n == 1:
-                end = time.time() + 10
-                while not (self.job(4).extra.get("parked_since") or self.job(4).state != T.QUEUED) \
-                        and time.time() < end:
-                    time.sleep(0.02)
-        _, lines = self.land(planner=planner, runner=Runner(hook=hook))
-        self.assertNotIn("PR #2 waits", " ".join(lines))
-        self.assertNotIn("PR #3 waits", " ".join(lines))
-        self.assertIn("[demo] PR #4 waits for PR #1: both change c/z", lines)
-        self.assertEqual(self.merged_order(), [2, 3, 1, 4])   # both landed while #1, the chain's root, still ran
-        self.assertEqual([c[0] for c in planner.calls if c[2] == ("a/x", "b/y")][0], main)
-        self.assertEqual([self.job(n).state for n in (1, 2, 3, 4)], [T.DEPLOY_PENDING] * 4)
-        self.assertNotIn("parked_since", self.job(3).extra)   # planned: a later park starts its own day
 
     def test_a_job_held_in_the_pass_is_stepped_again_once_its_hold_runs_out(self):
         self.pr(1, {"a/x": "n\n"})
@@ -4710,166 +4626,6 @@ class Starving(Fixture):
         self.assertEqual(self.merged_order(), [2, 1])
         self.assertEqual([c[0] for c in u["runner"].calls][0], "c")
 
-    def test_a_pr_put_first_still_waits_for_an_older_parked_one_that_shares_its_files(self):
-        # #2 parks on #1 (a/x); #3 is put first and shares b/y with #2: it waits for #2, not past it
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(3, {"b/y": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-
-        def parked(n, or_moved=False):
-            j = self.job(n)
-            return j is not None and bool(j.extra.get("parked_since") or (or_moved and j.state != T.QUEUED))
-
-        def hook(name, n):   # #1's check runs until #2 has parked and #3, put first meanwhile, has had its turn
-            if n != 1:
-                return
-            end = time.time() + 10
-            while not parked(2) and time.time() < end:
-                time.sleep(0.02)
-            J.submit("demo", 3)
-            J.put_first("demo", 3, "seat")
-            while not parked(3, or_moved=True) and time.time() < end:
-                time.sleep(0.02)
-        _, lines = self.land(runner=Runner(hook=hook))
-        self.assertIn("[demo] PR #3 waits for PR #2: both change b/y", lines)
-        self.assertEqual(self.merged_order(), [1, 2, 3])
-
-    def test_a_park_on_a_held_or_parked_pr_holds_nobody_and_a_newer_one_is_planned(self):
-        # 10-12: #961 held main-red; #1082 parked on it; #1121, put first to fix that red, parked on #1082. Brief 10-12:
-        # "a PR held for a person, waiting on a query or behind a red main never blocks a later PR that is ready"
-        def job(pr, state, files, ago, on=None):
-            j = T.Job(repo="demo", pr=pr, head="e" * 40, base_sha="d" * 40, files=list(files), state=state,
-                      extra={"queued_at": E.stamp(time.time() - ago)})
-            if on:
-                j.extra.update(parked={"at": time.time(), "head": j.head, "on": on}, parked_since=E.stamp())
-            J.save(j)
-            return j
-        root = job(1, T.CHECKING, ("a/x",), 300)
-        job(2, T.QUEUED, ("a/x", "b/y"), 200, on=1)
-        new = job(3, T.QUEUED, ("b/y",), 100)
-        J.put_first("demo", 3, "seat")
-        lane = L.Lane("demo", self.units())
-        self.assertEqual(lane.overlapping(new).pr, 2)   # #2's park is live while #1 checks: #3 still waits
-        plain = job(5, T.QUEUED, ("b/y",), 50)            # and so does one not put first: arrival order
-        self.assertEqual(lane.overlapping(plain).pr, 2)
-        root.state = T.HELD
-        J.save(root)
-        self.assertIsNone(lane.overlapping(new))        # #1 held: #2 waits for nobody, so #3 goes
-        self.assertIsNone(lane.overlapping(plain))      # first ready first, put first or not
-        J.remove(plain)
-        mid = job(4, T.QUEUED, ("c/z",), 250, on=1)     # #2 parked on #4, itself parked: a chain holds nobody
-        root.state = T.CHECKING
-        J.save(root)
-        two = self.job(2)
-        two.extra["parked"]["on"] = 4
-        J.save(two)
-        self.assertIsNone(lane.overlapping(new))
-        J.remove(mid)
-        self.assertEqual(lane.overlapping(new).pr, 2)   # #4 gone (merged or closed): #2 is planned next, #3 waits
-
-    def test_a_newer_job_re_queued_waits_for_the_older_one_parked_on_it(self):
-        # #2 checked first and #1 parked on it; #2 came back queued (no park): #2 must not pass #1 (HANDBACK: [2, 1])
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        self.seed(300, "queued_at", 1)
-        self.seed(200, "queued_at", 2)
-        one, two = self.job(1), self.job(2)
-        one.files = two.files = ["a/x"]
-        one.extra.update(parked={"at": time.time(), "head": one.head, "on": 2}, parked_since=E.stamp())
-        J.save(one)
-        J.save(two)
-        lane = L.Lane("demo", self.units())
-        self.assertEqual(lane.overlapping(self.job(2)).pr, 1)   # #1's park on #2 still holds the newer #2 back
-        self.assertIsNone(lane.overlapping(self.job(1)))        # #2 is newer and not in flight: #1 goes
-        self.land()
-        self.assertEqual(self.merged_order(), [1, 2])
-
-    def test_a_re_park_without_a_read_moves_on_to_the_pr_it_waits_for_now(self):
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        self.pr(3, {"a/x": "n\n"})
-        for n in (1, 2, 3):
-            J.submit("demo", n)
-        with J.lane_lock("demo"):
-            J.drain("demo")
-        lane = L.Lane("demo", self.units())
-        job, one, two = self.job(3), self.job(1), self.job(2)
-        job.files = one.files = two.files = ["a/x"]
-        lane.park(job, one, read=True)
-        self.assertEqual(self.job(3).extra["parked"]["on"], 1)
-        at = self.job(3).extra["parked"]["at"]
-        lane.park(self.job(3), two, read=False)
-        self.assertEqual(self.job(3).extra["parked"]["on"], 2)    # saved: parked_live reads the PR it waits for now
-        self.assertEqual(self.job(3).extra["parked"]["at"], at)   # not a read: the files' read time stays
-        self.assertEqual(self.log().count("stage demo#3 parked"), 2)   # whom it waits for changed: said again
-        self.assertIn("stage demo#3 parked on=2", self.log())
-        lane.park(self.job(3), two, read=False)
-        self.assertEqual(self.log().count("stage demo#3 parked"), 2)   # the same PR again: no line
-
-    def test_a_park_after_a_hold_writes_its_line_again(self):
-        # a hold drops the park but keeps parked_since: the next park on the same PR is a new wait, and says so
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n"})
-        for n in (1, 2):
-            J.submit("demo", n)
-        with J.lane_lock("demo"):
-            J.drain("demo")
-        lane = L.Lane("demo", self.units())
-        job, one = self.job(2), self.job(1)
-        job.files = one.files = ["a/x"]
-        lane.park(job, one, read=True)
-        lane.park(self.job(2), one, read=False)
-        self.assertEqual(self.log().count("stage demo#2 parked on=1"), 1)
-        lane.hold(self.job(2), "a test hold")
-        back = self.job(2)
-        self.assertNotIn("parked", back.extra)
-        self.assertIn("parked_since", back.extra)
-        back.state = T.QUEUED
-        lane.park(back, one, read=True)
-        self.assertEqual(self.log().count("stage demo#2 parked on=1"), 2)
-
-    def test_the_lane_plans_a_put_first_job_past_a_park_on_a_held_pr(self):
-        # #1 held (main-red, its hold not run out); #2 parked on it; #3, put first, shares b/y with #2 and goes first
-        self.pr(1, {"a/x": "n\n"})
-        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
-        self.pr(3, {"b/y": "n\n"})
-        for n in (1, 2, 3):
-            J.submit("demo", n)
-        self.seed(300, "queued_at", 1)
-        self.seed(200, "queued_at", 2)
-        self.seed(100, "queued_at", 3)
-        one = self.job(1)
-        one.state = T.HELD
-        one.extra["not_before"] = E.stamp(time.time() + 3600)
-        J.save(one)
-        two = self.job(2)
-        two.files = ["a/x", "b/y"]
-        two.extra.update(parked={"at": time.time(), "head": two.head, "on": 1}, parked_since=E.stamp())
-        J.save(two)
-        J.put_first("demo", 3, "seat")
-        _, lines = self.land()
-        self.assertNotIn("PR #3 waits", " ".join(lines))
-        self.assertEqual(self.merged_order(), [3, 2])
-        self.assertEqual(self.job(1).state, T.HELD)
-
-    def test_the_first_park_writes_one_queue_log_line(self):
-        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})   # three checks: several wakes while #2 waits
-        self.pr(2, {"a/x": "n\n"})
-        self.pr(3, {"b/y2": "n\n"})   # not parked: no line
-        for n in (1, 2, 3):
-            J.submit("demo", n)
-        _, lines = self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/"}),
-                             runner=first_check_waits(self, lambda: self.job(3).state != T.QUEUED))
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertEqual(self.log().count("stage demo#2 parked on=1"), 1)
-        self.assertNotIn("stage demo#3 parked", self.log())
-        self.assertEqual(self.job(2).state, T.DEPLOY_PENDING)
-
-
 class SpawnLaneTest(unittest.TestCase):
     def test_the_new_lane_is_its_own_unit_not_a_child_of_the_tick(self):
         # a child left in the tick's unit would be killed with it when the tick ends, mid-job
@@ -4928,7 +4684,8 @@ class Stoppable(Runner):
 class Rereads(Fixture):
     """A checking job re-reads its PR's state and head every RECHECK_SECS and after an `again`, and stops its checks
     when the PR merged, closed or moved on (10-04: #794 merged at 16:47Z while still checking and held 57 parked jobs
-    for 40+ min; ai-ee #99 checked a stale head for 50 min after a push). Each case queues its own PRs."""
+    for 40+ min, under the parking rule since dropped; ai-ee #99 checked a stale head for 50 min after a push). Each
+    case queues its own PRs."""
 
     def setUp(self):
         super().setUp()
@@ -4949,17 +4706,12 @@ class Rereads(Fixture):
         p.start()
         self.addCleanup(p.stop)
 
-    def test_a_pr_merged_mid_check_stops_its_checks_ends_merged_and_unparks_the_next(self):
+    def test_a_pr_merged_mid_check_stops_its_checks_and_ends_merged(self):
         self.pr(1, {"a/x": "one\n"})
-        self.pr(2, {"a/x": "two\n"})   # shares a/x with #1, so it parks on it
+        self.pr(2, {"b/y": "two\n"})
         J.submit("demo", 1)
         J.submit("demo", 2)
-        def merge_once_two_parks():   # GitHub merges #1 only after #2 has parked on it
-            end = time.time() + 10
-            while not (self.job(2).extra or {}).get("parked") and time.time() < end:
-                time.sleep(0.02)
-            self.merged_on_github.set()
-        runner = Stoppable(merge_once_two_parks)
+        runner = Stoppable(self.merged_on_github.set)   # GitHub merges #1 while its check runs
         with mock.patch.object(L, "RECHECK_SECS", 1):
             _, lines = self.land(runner=runner)
         self.assertTrue(runner.stopped, "#1's check ran on after its PR merged")
@@ -4969,9 +4721,7 @@ class Rereads(Fixture):
         self.assertIn("the PR is merged while it was checking", j1.history[-3]["why"])
         self.assertEqual(j1.history[-2].get("by"), "before")
         self.assertEqual([int(a[2]) for a in self.box()["merges"]], [2])   # the lane never merged #1 itself
-        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
-        self.assertIn("[demo] PR #1: check a finished for a head or base the job has left; not recorded", lines)
-        self.assertEqual(sorted(j2.results), ["a"])   # #2's check was not stopped: it ran and was recorded
+        self.assertEqual(sorted(j2.results), ["b"])   # #2's check was not stopped: it ran and was recorded
 
     def test_a_push_mid_check_says_again_and_the_old_heads_check_is_stopped(self):
         old = self.pr(1, {"a/x": "one\n"})
@@ -5027,54 +4777,6 @@ class Rereads(Fixture):
         self.assertLess(calls[0], 100, "the lane spun on the held job")   # ~20 passes at POLL 0.05; the spin made 1000s
         self.assertLessEqual(sum("is paused" in ln for ln in lines), 1, lines[-3:])
         self.assertEqual(self.job().state, T.CHECKING)
-
-
-class RealOverlap(Fixture):
-    """Brief, 10-12: "park only on real overlap: hunks that touch the same lines, or a file both sides change in a way
-    that won't rebase cleanly, not just the same file name". Real git: each case pushes its own base and heads."""
-
-    def setUp(self):
-        super().setUp()
-        for p in (mock.patch.object(L.Lane, "width", lambda self: 3), mock.patch.object(L, "POLL", 0.05)):
-            p.start()
-            self.addCleanup(p.stop)
-        self.lines = [f"line {i}\n" for i in range(40)]
-        self.push("main", {"a/x": "".join(self.lines)})
-
-    def edit(self, at, word):
-        got = list(self.lines)
-        got[at] = f"{word}\n"
-        return {"a/x": "".join(got)}
-
-    def test_hunks_far_apart_in_a_shared_file_do_not_park(self):
-        self.pr(1, self.edit(0, "one"))
-        self.pr(2, self.edit(39, "two"))   # the same file, forty lines away: it rebases cleanly
-        for n in (1, 2):
-            J.submit("demo", n)
-        _, lines = self.land(runner=first_check_waits(self, lambda: self.job(2).state != T.QUEUED))
-        self.assertNotIn("PR #2 waits", " ".join(lines))
-        self.assertNotIn("parked", self.log())
-        self.assertEqual(sorted(int(a[2]) for a in self.box()["merges"]), [1, 2])
-
-    def test_hunks_on_the_same_line_park(self):
-        self.pr(1, self.edit(0, "one"))
-        self.pr(3, self.edit(0, "three"))   # the same line: it waits for #1
-        for n in (1, 3):
-            J.submit("demo", n)
-        _, lines = self.land(runner=first_check_waits(self, lambda: self.job(3).extra.get("parked_since")))
-        self.assertIn("[demo] PR #3 waits for PR #1: both change a/x", lines)
-        self.assertIn("stage demo#3 parked on=1", self.log())
-
-    def test_git_that_will_not_answer_is_a_clash(self):
-        lane = L.Lane("demo", self.units())
-        one = T.Job(repo="demo", pr=1, head=self.pr(1, self.edit(0, "one")), files=["a/x"])
-        two = T.Job(repo="demo", pr=2, head=self.pr(2, self.edit(39, "two")), files=["a/x"])
-        lane.fetch("track/row-1", "track/row-2")     # what queued() does before it asks
-        self.assertFalse(lane.clashes(one, two))   # the suppressed case: these two merge cleanly
-        one.head, two.head = "1" * 40, "2" * 40     # objects git has never seen
-        self.assertTrue(lane.clashes(one, two))
-        two.head = ""                              # a head not read yet
-        self.assertTrue(lane.clashes(one, two))
 
 
 class FlakeRetry(Fixture):

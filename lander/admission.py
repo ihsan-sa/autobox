@@ -55,6 +55,13 @@ own release or by a crash, the next waiter finds it dead and removes it, as any 
 the lane for a release whose admission does not read LANDER_PROVE_HOLD, because that release's sweep would wait
 behind the hold until the cap.
 
+FIRST CLAIM (brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot, ahead of
+ordinary PR checks, so health can't starve"). slot(first=True) takes a lane-style ticket backdated FIRST_BACK seconds,
+so it goes ahead of every lane or worker ticket younger than FIRST_BACK and behind a PROVE HOLD, which lander-self
+names up to its HOLD_BACK (3600 s) back: FIRST_BACK stays below that. Its callers are tick.make_check (the tip run's and
+main health's checks) and the lane's checks of a job whose plan holds a check main's record holds red. It is still a
+TICKET, so TICKET_CAP and a dead holder treat it as any other.
+
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
@@ -116,6 +123,7 @@ PSI_DIR = os.environ.get("LANDER_PSI_DIR") or "/proc/pressure"
 LOADAVG = os.environ.get("LANDER_LOADAVG") or "/proc/loadavg"
 WAIT_SAY = float(os.environ.get("LANDER_WAIT_SAY", "600") or 600)
 TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
+FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below lander-self's HOLD_BACK of 3600
 
 
 def psi(kind: str, root: str = PSI_DIR) -> float:
@@ -233,11 +241,13 @@ TICKET = re.compile(r"[0-9+][0-9]{19}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: 
 BAD = (errno.ELOOP, errno.ENXIO, errno.EACCES, errno.EPERM)   # a symlink, a socket, an unreadable file: not a ticket
 
 
-def _ticket(qdir: str, lane: bool = False):
+def _ticket(qdir: str, lane: bool = False, first: bool = False):
     """Join the queue: a file named by when the wait began, flocked for as long as this process waits. It is locked
     before it is given its listed name, so nobody sees it unlocked and takes it for a dead one. A lane's name starts
-    `+` (LANES FIRST), which sorts before a digit and still reads as the same number."""
-    name = f"{'+' if lane else '0'}{time.time_ns():019d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    `+` (LANES FIRST), which sorts before a digit and still reads as the same number. first: a lane's name, its time
+    FIRST_BACK seconds back (FIRST CLAIM)."""
+    born = time.time_ns() - (FIRST_BACK * 10**9 if first else 0)
+    name = f"{'+' if lane or first else '0'}{born:019d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     tmp = os.path.join(qdir, f".new-{name}")
     f = open(tmp, "a")
     fcntl.flock(f, fcntl.LOCK_EX)
@@ -361,10 +371,12 @@ def _whose(name: str) -> str:
 
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
-         k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False):
+         k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False,
+         first: bool = False):
     """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
     in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
-    on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST)."""
+    on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST).
+    first=True: main health's or a main-red fix's check (FIRST CLAIM)."""
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
@@ -374,7 +386,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     held: list = []
     gate = None   # the ALONE GATE: exclusive for an alone run, shared beside another's slot
     told: set = set()
-    mine, tf = _ticket(q, lane)
+    mine, tf = _ticket(q, lane, first)
     try:
         while True:
             want = range(1, total + 1) if alone else range(1, slots_now(psi_root, total, loadavg) + 1)

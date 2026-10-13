@@ -180,6 +180,24 @@ class Tick(unittest.TestCase):
         self.tick()                                                               # idempotent: nothing again
         self.assertEqual(self.installs(), [sha])
 
+    def test_main_healths_checks_take_the_first_claim_and_the_nightly_sweeps_do_not(self):
+        # brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot"
+        from lander import nightly as N
+        got = []
+
+        def runner(c, tree, where, **kw):
+            got.append(kw.get("first"))
+            return T.Result(check=c.name, tree=tree, status=T.PASSED)
+        self.assertEqual(TK.make_check(self.root, runner=runner)("smoke", self.first).status, T.PASSED)
+        self.assertEqual(got, [True])   # kept: the tip run and main health
+        TK.make_check(self.root, runner=runner, first=False)("smoke", self.first)
+        self.assertEqual(got, [True, None])   # suppressed: no first claim asked
+        with mock.patch.object(D, "applied", return_value=self.first), \
+                mock.patch.object(D, "root_of", return_value=self.root), \
+                mock.patch.object(TK, "make_check", return_value=lambda n, sha: None) as made:
+            N.run("demo")
+        self.assertIs(made.call_args.kwargs["first"], False)   # the nightly sweep is not main health
+
     def test_a_red_tip_holds_the_deploy_and_reverts_the_proven_breaker(self):
         D.record_applied("demo", self.first)
         bad = self.merged({"app/BROKEN": "x\n"}, subject="breaks the smoke check")

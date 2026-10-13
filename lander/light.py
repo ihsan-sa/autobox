@@ -12,9 +12,10 @@ list and the list, which `lander queue --light` prints and the lane keeps in job
 WHAT IT NEEDS: a LAND recorded at the PR's head and digest (review.land_recorded: any seat's `lander record`, or an
 earlier read), and its plan's static and hermetic checks (trim(); no host, box, timing or e2e- check) green on the
 merge tree. A plan that widened to default_checks (widened()), or keeps no check that way, is not light (lane.planned).
-WHAT THE LANE DOES WITH IT (lane.py): no overlap park; a check the runner calls blocked by main (since the ratchet,
-reds it refused to call main's) hands it back, never a hold and never a kept result; it goes before every other due job; when main moves under it the base moves with it and nothing is
-re-planned; a conflict with the base hands it back, never a park or a repair round. A red check hands it back as
+WHAT THE LANE DOES WITH IT (lane.py): a check the runner calls blocked by main (since the ratchet,
+reds it refused to call main's) hands it back, never a hold and never a kept result; it goes before every other due job but one put first or one whose plan holds a check main is red on; when main
+moves under it the base moves with it and nothing is re-checked; a conflict with the base hands it back, never a
+repair round. A red check hands it back as
 any red does. Host checks run on main's tip after the merge, as every merged range's do.
 """
 from __future__ import annotations

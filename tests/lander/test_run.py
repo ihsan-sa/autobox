@@ -1700,6 +1700,34 @@ class Admission(unittest.TestCase):
         self.assertEqual(A._ahead(q, "~")[:2], (1, os.path.basename(lane.name)))
         self.assertFalse(os.path.exists(q_hold))
 
+    def test_a_first_ticket_goes_before_older_lane_and_worker_waits_and_behind_a_prove_hold(self):
+        # FIRST CLAIM (brief, 10-13: main health's and a main-red fix's checks get "first claim on a free slot, ahead of
+        # ordinary PR checks"): its ticket is a lane's, FIRST_BACK s back, which is less than a prove hold's 3600 s
+        import time
+        now = time.time_ns()
+        st = self.lanes_first_queue(f"+{now - 120 * 10**9:019d}-4242-0000beef")   # a lane's check, 2 min in
+        q = os.path.join(st, "slots", "queue")
+        worker = open(os.path.join(q, f"{now - 600 * 10**9:020d}-4343-0000cafe"), "a")   # a worker's, 10 min in
+        fcntl.flock(worker, fcntl.LOCK_EX)
+        self.addCleanup(worker.close)
+        said = []   # suppressed: an ordinary lane check waits behind the older lane ticket
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append, lane=True):
+                pass
+        self.assertIn("1 waiting ahead of it, the oldest pid 4242", said[0])
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True,
+                    first=True) as held:   # kept: the first claim goes ahead of both
+            self.assertEqual(held, [1])
+        hold = open(os.path.join(q, f"+{now - 3600 * 10**9:019d}-4545-0000a0a0"), "a")   # a prove hold, 3600 s back
+        fcntl.flock(hold, fcntl.LOCK_EX)
+        self.addCleanup(hold.close)
+        said = []
+        with self.assertRaises(TimeoutError):   # and behind a prove hold
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append, first=True):
+                pass
+        self.assertIn("1 waiting ahead of it, the oldest pid 4545", said[0])
+        self.assertLess(A.FIRST_BACK, 3600)
+
     def test_a_stopped_waiter_is_passed_after_the_cap_and_said(self):
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))

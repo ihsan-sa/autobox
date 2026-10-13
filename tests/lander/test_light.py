@@ -234,6 +234,24 @@ class LightLane(TL.Fixture):
         self.assertEqual(self.job().extra["light"], "it touches a/x, on the lander's paid_review list")
         self.assertIn("suite", [c[0] for c in rv.calls])   # re-planned the normal way
 
+    def test_main_making_it_paid_with_no_check_left_still_gets_its_read(self):
+        """Security read of #1334: no longer light at the merge, with every check of the full plan already run, it
+        merged on the light LAND alone. Its re-plan at the moved main is paid, so it goes back for the read first."""
+        self.write(self.fb, {"demo.toml": self.FB.split("\n\n[[check]]\nname = \"suite\"")[0]})   # lint, only
+        def hook(name, n):   # main's policy puts a/** on paid_review while the light PR's check runs
+            self.push("main", {"tests/LANDING-policy.toml": '[paths]\npaid_review = ["b/**", "a/**"]\n'})
+        head = self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        rv, reviewer = TL.Runner(hook=hook), Reviewer(TL.V(T.LAND, head=head[:12]))
+        reviewer.verdicts = [TL.V(T.LAND)]
+        self.land(planner=P, runner=rv, reviewer=reviewer)
+        j = self.job()
+        self.assertEqual([c[0] for c in rv.calls], ["lint"])   # nothing left to run
+        self.assertEqual(j.extra["light"], "it touches a/x, on the lander's paid_review list")
+        self.assertTrue(j.plan.paid)
+        self.assertEqual([c[0] for c in reviewer.calls], ["review"])   # read before the merge
+        self.assertEqual(j.state, T.DEPLOY_PENDING)
+
     def test_a_members_pr_is_never_light(self):
         lane = L.Lane("demo", self.units(reviewer=Reviewer(TL.V(T.LAND))))
         lane.member = "alice"

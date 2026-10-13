@@ -34,9 +34,8 @@ Lane.conflict asks start(lane, job, paths) and acts on what it answers, (kind, w
 A path is the branch's to name, so every one shown (the brief, the why, the board note) goes through jobs.path_names:
 control characters out, each cut short, five at most.
 
-Parking behind another PR is the lane's, before it asks here (Lane.conflict): a conflict on a file that a PR already
-planned, checking or mergeable also changes waits for that PR, as an overlap from the start does, and is repaired once
-that one has merged or left.
+No conflict waits behind another PR (Lane.conflict): every conflict of a job that is not light comes here, whatever
+else in the lane touches the same files.
 """
 from __future__ import annotations
 
