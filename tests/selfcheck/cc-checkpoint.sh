@@ -83,10 +83,14 @@ SH
   said(){ ( cd "$1" && "$bin/cc-checkpoint" --remote 2>&1 >/dev/null | grep -c "remote $2 (.*) is not origin" ); }
   rm -f "${d:?}/.cc/own-remote.said"
   eq "workspace project: the contradicting remote is named on stderr" "$(said "$d" proj1)" 1
-  k "$(grep -q 'remote proj1 (https://example.test/org/proj1.git) is not origin' "$d/.cc/own-remote.said" && echo 0 || echo 1)" "…naming the remote and its url" "$(cat "$d/.cc/own-remote.said" 2>/dev/null)"
+  k "$(grep -q 'remote proj1 (example.test/org/proj1) is not origin' "$d/.cc/own-remote.said" && echo 0 || echo 1)" "…naming the remote and its url" "$(cat "$d/.cc/own-remote.said" 2>/dev/null)"
   eq "…and not again on the next turn" "$(said "$d" proj1)" 0
   git -C "$d" remote set-url proj1 https://example.test/org/proj1b.git
   eq "…but a different url for it is said again" "$(said "$d" proj1)" 1
+  # …by its url_key only: a url can carry a token, and this line is kept in .cc and printed on every hook's stderr.
+  d=$(mkwt ws1/tk origin https://example.test/org/first.git tk https://bot:SECRETTOKEN8@example.test/org/tk.git); printf 'ws1\ntk\n' > "$d/.cc/track"
+  tko=$( cd "$d" && "$bin/cc-checkpoint" --remote 2>&1 >/dev/null )
+  k "$(grep -q 'remote tk (example.test/org/tk) is not origin' <<<"$tko" && ! grep -q SECRETTOKEN8 <<<"$tko" && ! grep -q SECRETTOKEN8 "$d/.cc/own-remote.said" && echo 0 || echo 1)" "token: the contradicting remote is named without its password" "$tko $(cat "$d/.cc/own-remote.said" 2>/dev/null)"
   # THE PUSH DESTINATIONS, not the fetch url (review of #1031): a track-named remote with origin's url and a pushurl
   # elsewhere, or a second pushurl elsewhere, still sends the branch to another repository. Origin, and said.
   d=$(mkwt ws1/pu1 origin https://example.test/org/first.git pu1 https://example.test/org/first.git); printf 'ws1\npu1\n' > "$d/.cc/track"
@@ -226,7 +230,7 @@ SH
   k "$(grep -q 'put back' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err names the duplicate remote" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
   k "$(grep -q 'put back' "$NOTES" && echo 0 || echo 1)" "and so does the board" "$(cat "$NOTES")"
   ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )   # the next turn: the duplicate is remembered, not cycled
-  k "$(grep -qxF "$T/aliasC2.git" "$d/.cc/evict.same" && echo 0 || echo 1)" "the duplicate remote is remembered in evict.same" "$(cat "$d/.cc/evict.same" 2>/dev/null)"
+  k "$(grep -qxF "$(same_key "$T/aliasC2.git")" "$d/.cc/evict.same" && echo 0 || echo 1)" "the duplicate remote is remembered in evict.same" "$(cat "$d/.cc/evict.same" 2>/dev/null)"
   k "$(grep -c 'put back' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and is not deleted and put back again the turn after" "$(cat "$NOTES")"
   k "$(has "$oc2" track/projC2 && echo 0 || echo 1)" "and the branch is still in the project's own repository" "gone from $oc2"
   # A delete the other repository REFUSES (GitHub: its default branch; here receive.denyDeletes) is said, once.
@@ -236,6 +240,163 @@ SH
   k "$(has "$ti" track/projI && echo 0 || echo 1)" "a refused delete leaves the branch where it was" "gone from $ti"
   k "$(grep -q 'refused' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err says the delete was refused" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
   k "$(grep -c 'refused' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and the board hears it" "$(cat "$NOTES")"
+  # BY PUSH DESTINATION, NEVER BY FETCH URL (lander, #1118). `push --delete` goes to a remote's pushurl, so who is
+  # own, who is the mirror and what is probed are all asked of where each remote pushes, not of its url.
+  # (a) the mirror's pushurl is the branch's real home and its url is a repository of no interest: another remote
+  # reading that home is the mirror under another name, and the branch is not deleted from it.
+  ws ws9; oq=$(bare ownPuQ); mq=$(bare mirPuQ); xq=$(bare elsePuQ)
+  d=$(mkproj ws9/projQ origin "$oq" projQ "$xq" mirq "$mq"); git -C "$d" config remote.projQ.pushurl "$mq"
+  git -C "$d" push -q projQ track/projQ; git -C "$d" rev-parse HEAD > "$d/.cc/mirrored"   # mirrored already, so no re-push hides a delete
+  runp "$d"
+  k "$(has "$mq" track/projQ && echo 0 || echo 1)" "pushurl: the mirror's push destination keeps the branch under another remote's name" "deleted from $mq"
+  k "$(grep -q 'removed from' "$NOTES" && echo 1 || echo 0)" "pushurl: and nothing is reported as removed" "$(cat "$NOTES")"
+  # (b) the project's own remote fetches from one repository and pushes to another; a sibling remote reading that
+  # push destination is the project's own repository, and its branch is neither deleted nor deleted-and-put-back.
+  orr=$(bare ownPuR); zr=$(bare readPuR)
+  d=$(mkproj ws9/projR origin "$zr" sibr "$orr"); git -C "$d" config remote.origin.pushurl "$orr"
+  git -C "$d" push -q "$zr" track/projR; runp "$d"
+  k "$(has "$orr" track/projR && echo 0 || echo 1)" "pushurl: the own remote's push destination is not evicted through a sibling's name" "deleted from $orr"
+  k "$(grep -q 'removed from\|put back' "$NOTES" && echo 1 || echo 0)" "pushurl: and nothing was deleted and put back either" "$(cat "$NOTES")"
+  # (c) a genuine contaminated sibling whose url and pushurl differ: the branch is probed and deleted where the
+  # sibling PUSHES, and the repository its url names is not touched (it holds somebody's tip of its own here).
+  os=$(bare ownPuS); fs=$(bare fetchPuS); ps=$(bare pushPuS)
+  d=$(mkproj ws9/projS origin "$os" sibs "$fs"); git -C "$d" config remote.sibs.pushurl "$ps"
+  git -C "$d" push -q "$ps" track/projS
+  ss=$(mkwt "$T/strayPuS"); git -C "$ss" symbolic-ref HEAD refs/heads/track/projS
+  echo stray > "$ss/stray.txt"; git -C "$ss" add -A; git -C "$ss" -c user.name=t -c user.email=t@t commit -q -m stray
+  git -C "$ss" push -q "$fs" track/projS; fss=$(git -C "$fs" rev-parse track/projS)
+  runp "$d"
+  k "$(has "$ps" track/projS && echo 1 || echo 0)" "pushurl: a contaminated sibling loses the branch at its push destination" "still on $ps"
+  eq "pushurl: and the repository its fetch url names is left as it was" "$(git -C "$fs" rev-parse track/projS 2>/dev/null)" "$fss"
+  k "$(grep -q 'removed from pushpus' "$NOTES" && echo 0 || echo 1)" "pushurl: and the board names the push destination" "$(cat "$NOTES")"
+  # (d) a sibling with two pushurls, one of them the project's own: only the other one loses the branch.
+  ot=$(bare ownPuT); pt=$(bare pushPuT)
+  d=$(mkproj ws9/projT origin "$ot" sibt "$pt"); git -C "$d" config --add remote.sibt.pushurl "$pt"; git -C "$d" config --add remote.sibt.pushurl "$ot"
+  git -C "$d" push -q "$pt" track/projT; runp "$d"
+  k "$(has "$ot" track/projT && ! has "$pt" track/projT && echo 0 || echo 1)" "pushurl: of two push destinations only the sibling's loses the branch" "own=$(has "$ot" track/projT && echo y) sib=$(has "$pt" track/projT && echo y)"
+  k "$(grep -q 'put back' "$NOTES" && echo 1 || echo 0)" "pushurl: and the project's own one was never deleted and put back" "$(cat "$NOTES")"
+  # …AND ONLY WHERE GIT DOES NOT REWRITE THE URL AGAIN (security read of #1118). get-url has applied the rewrite
+  # rules once; a url handed back to git is rewritten a second time, by pushInsteadOf for `push` and by insteadOf
+  # for `ls-remote`. (e) Two chained pushInsteadOf rules (B->A, A->own) and a sibling whose url is B: the probe
+  # asked A, the delete landed on the project's own repository, and the self-heal re-push closed its open PR.
+  ou=$(bare ownPuU); au=$(bare aPuU); buu="$T/bPuU.git"
+  d=$(mkproj ws9/projU origin "$ou" sibu "$buu"); git -C "$d" push -q "$au" track/projU
+  git -C "$d" config "url.$au.pushInsteadOf" "$buu"; git -C "$d" config "url.$ou.pushInsteadOf" "$au"
+  runp "$d"
+  k "$(grep -q 'removed from\|put back' "$NOTES" && echo 1 || echo 0)" "rewrite: a delete git would send somewhere else is not made, nor put back" "$(cat "$NOTES")"
+  k "$(grep -q 'is rewritten to' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "rewrite: and evict.err says where the push would have gone" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  # (f) a sibling's pushurl that ls-remote rewrites again (insteadOf X->Y, Y->own): never probed, never deleted.
+  ov=$(bare ownPuV); xv="$T/xPuV.git"; yv="$T/yPuV.git"
+  d=$(mkproj ws9/projV origin "$ov" sibv "$T/nonePuV.git"); git -C "$d" config remote.sibv.pushurl "$xv"
+  git -C "$d" config "url.$yv.insteadOf" "$xv"; git -C "$d" config --add "url.$ov.insteadOf" "$yv"
+  runp "$d"
+  k "$(grep -q 'removed from\|put back' "$NOTES" && echo 1 || echo 0)" "rewrite: a sibling url ls-remote reads elsewhere is not probed or deleted" "$(cat "$NOTES")"
+  k "$(grep -q 'rewrites to another url when it reads it — left alone' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "rewrite: and evict.err names it" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  # (g) the project's own push url is one ls-remote rewrites again, so the self-heal could not ask it: no eviction.
+  og=$(bare ownPuG); qg=$(bare qPuG); rg=$(bare rPuG); sg=$(bare sibPuG)
+  d=$(mkproj ws9/projG origin "$og" sibg "$sg"); git -C "$d" config remote.origin.pushurl "$T/pPuG.git"
+  git -C "$d" config "url.$qg.insteadOf" "$T/pPuG.git"; git -C "$d" config --add "url.$rg.insteadOf" "$qg"
+  git -C "$d" push -q "$og" track/projG; git -C "$d" push -q "$sg" track/projG
+  runp "$d"
+  k "$(has "$sg" track/projG && echo 0 || echo 1)" "rewrite: with its own url unaskable, nothing is taken out of a sibling" "deleted from $sg"
+  k "$(grep -q 'could not be asked' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "rewrite: and evict.err says why" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  # (h) a push url beginning with '-' is an option to git, not a url: `--upload-pack=<cmd>` ran <cmd> as the owner
+  # when it was probed (security read of #1118). It is never handed to git, and it is said.
+  ow=$(bare ownPuW); tw=$(bare sibPuW)
+  d=$(mkproj ws9/projW origin "$ow" sibw "$tw"); git -C "$d" push -q "$tw" track/projW
+  git -C "$d" config remote.sibw.pushurl "--upload-pack=touch $T/PWNED-ls #"; git -C "$d" config --add remote.sibw.pushurl "--receive-pack=touch $T/PWNED-push #"
+  runp "$d"
+  k "$([ -e "$T/PWNED-ls" ] || [ -e "$T/PWNED-push" ] && echo 1 || echo 0)" "dash: a push url that is really an option is never run" "$(printf '%s ' "$T"/PWNED-*)"
+  k "$(grep -c "beginning with '-'" "$d/.cc/evict.err" 2>/dev/null | grep -qx 2 && echo 0 || echo 1)" "dash: and evict.err names each one" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  # (i) a sibling naming the MIRROR under a spelling url_key cannot unify (a symlink here) took the mirror's branch,
+  # and nothing put it back, since .cc/mirrored already recorded that head (security read of #1118).
+  ox=$(bare ownPuX); mx=$(bare mirPuX); ln -s "$mx" "$T/mirlinkPuX.git"
+  d=$(mkproj ws9/projX origin "$ox" projX "$mx" sibx "$T/mirlinkPuX.git")
+  git -C "$d" push -q projX track/projX; git -C "$d" rev-parse HEAD > "$d/.cc/mirrored"
+  runp "$d"
+  k "$(has "$mx" track/projX && echo 0 || echo 1)" "mirror alias: a delete through another spelling of the mirror is put back" "gone from $mx"
+  k "$(grep -qxF "$(same_key "$T/mirlinkPuX.git")" "$d/.cc/evict.same" 2>/dev/null && echo 0 || echo 1)" "mirror alias: and that remote is remembered in evict.same" "$(cat "$d/.cc/evict.same" 2>/dev/null)"
+  k "$(grep -q "mirror projX under another spelling" "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "mirror alias: and evict.err names the mirror" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  : > "$NOTES"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(has "$mx" track/projX && ! grep -q 'put back\|removed from' "$NOTES" && echo 0 || echo 1)" "mirror alias: and the next turn neither deletes nor puts it back again" "$(cat "$NOTES")"
+  # (j) a mirror that never got the branch does not make a real sibling its alias: the sibling is cleaned as ever.
+  oy=$(bare ownPuY); my=$(bare mirPuY); sy=$(bare sibPuY)
+  d=$(mkproj ws9/projY origin "$oy" projY "$my" siby "$sy"); git -C "$d" push -q "$sy" track/projY
+  git -C "$d" rev-parse HEAD > "$d/.cc/mirrored"   # recorded, yet not there: what an emptied mirror looks like from here
+  runp "$d"
+  k "$(has "$sy" track/projY && echo 1 || echo 0)" "mirror alias: a sibling is still cleaned when the mirror never held the branch" "still on $sy"
+  k "$(grep -qxF "$(same_key "$sy")" "$d/.cc/evict.same" 2>/dev/null && echo 1 || echo 0)" "mirror alias: and it is not mistaken for the mirror" "$(cat "$d/.cc/evict.same" 2>/dev/null)"
+  # THE DRY RUN'S "To" LINE HAS NO USER IN IT (security read of #1118, round 3). git prints the url without its user
+  # or password, so `git@host:path`, `ssh://git@host/…` and `https://user:TOKEN@host/…` never equalled it: an ssh
+  # sibling was never cleaned again, and a url carrying a token went into evict.err and onto the board whole. A fake
+  # ssh stands in for the network here: it ignores the host and every option and runs the command git hands it.
+  printf '#!/usr/bin/env bash\nfor a; do c=$a; done; exec sh -c "$c"\n' > "$T/fakessh"; chmod +x "$T/fakessh"
+  sshp(){ ( export GIT_SSH_COMMAND="$T/fakessh" GIT_SSH_VARIANT=ssh; runp "$1" ); }
+  notok(){ ! grep -rq "$1" "$NOTES" "$2/.cc" 2>/dev/null; }   # $1 a password, $2 the worktree: in no note and no state file
+  ws ws10
+  # (k) the scp form, and (l) ssh:// with a user: both are cleaned as any other sibling, and the board names them.
+  osk=$(bare ownSshK); ssk=$(bare sibSshK)
+  d=$(mkproj ws10/projSK origin "$osk" sibk "git@localhost:$ssk"); git -C "$d" push -q "$ssk" track/projSK
+  sshp "$d"
+  k "$(has "$ssk" track/projSK && echo 1 || echo 0)" "ssh: a sibling in scp form (git@host:path) loses the branch" "still on $ssk: $(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(grep -q 'removed from sibsshk' "$NOTES" && echo 0 || echo 1)" "ssh: and the board names it" "$(cat "$NOTES")"
+  osl=$(bare ownSshL); ssl=$(bare sibSshL)
+  d=$(mkproj ws10/projSL origin "$osl" sibl "ssh://git@localhost$ssl"); git -C "$d" push -q "$ssl" track/projSL
+  sshp "$d"
+  k "$(has "$ssl" track/projSL && echo 1 || echo 0)" "ssh: a sibling at ssh://git@host/path loses the branch" "still on $ssl: $(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(grep -q 'removed from sibsshl' "$NOTES" && echo 0 || echo 1)" "ssh: and the board names it" "$(cat "$NOTES")"
+  # (m) a password in a sibling's url: cleaned the same way, and the password is in no note and no file of .cc.
+  osm=$(bare ownSshM); ssm=$(bare sibSshM)
+  d=$(mkproj ws10/projSM origin "$osm" sibm "ssh://bot:SECRETTOKEN1@localhost$ssm"); git -C "$d" push -q "$ssm" track/projSM
+  sshp "$d"
+  k "$(has "$ssm" track/projSM && echo 1 || echo 0)" "token: a sibling whose url carries a password loses the branch" "still on $ssm: $(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(notok SECRETTOKEN1 "$d" && echo 0 || echo 1)" "token: and the password is written nowhere" "$(grep -r SECRETTOKEN1 "$NOTES" "$d/.cc" 2>/dev/null)"
+  # (n) as (e), the url push rewrites again carrying a password: left alone and said, without the password.
+  osn=$(bare ownSshN); asn=$(bare aSshN); tsn="ssh://bot:SECRETTOKEN2@localhost$asn"
+  d=$(mkproj ws10/projSN origin "$osn" sibn "$T/bSshN.git"); git -C "$d" push -q "$asn" track/projSN
+  git -C "$d" config "url.$tsn.pushInsteadOf" "$T/bSshN.git"; git -C "$d" config "url.$osn.pushInsteadOf" "$tsn"
+  sshp "$d"
+  k "$(has "$asn" track/projSN && grep -q 'is rewritten to' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "token: a delete push would send elsewhere is not made, and is said" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(notok SECRETTOKEN2 "$d" && echo 0 || echo 1)" "token: without the password" "$(grep -r SECRETTOKEN2 "$NOTES" "$d/.cc" 2>/dev/null)"
+  # (o) as (f), a sibling's push url with a password that ls-remote rewrites again.
+  oso=$(bare ownSshO); tso="ssh://bot:SECRETTOKEN3@localhost$T/xSshO.git"
+  d=$(mkproj ws10/projSO origin "$oso" sibo "$T/noneSshO.git"); git -C "$d" config remote.sibo.pushurl "$T/pSshO.git"
+  git -C "$d" config "url.$tso.insteadOf" "$T/pSshO.git"; git -C "$d" config --add "url.$oso.insteadOf" "$tso"
+  sshp "$d"
+  k "$(grep -q 'rewrites to another url when it reads it — left alone' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "token: a sibling url ls-remote reads elsewhere is said" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(notok SECRETTOKEN3 "$d" && echo 0 || echo 1)" "token: without the password" "$(grep -r SECRETTOKEN3 "$NOTES" "$d/.cc" 2>/dev/null)"
+  # (p) as (g), the project's own push url carries a password and ls-remote rewrites it again.
+  osg=$(bare ownSshG); rsg=$(bare rSshG); ssg=$(bare sibSshG); tsg="ssh://bot:SECRETTOKEN4@localhost$osg"
+  d=$(mkproj ws10/projSG origin "$osg" sibg "$ssg"); git -C "$d" config remote.origin.pushurl "$T/pSshG.git"
+  git -C "$d" config "url.$tsg.insteadOf" "$T/pSshG.git"; git -C "$d" config --add "url.$rsg.insteadOf" "$tsg"
+  git -C "$d" push -q "$ssg" track/projSG
+  sshp "$d"
+  k "$(has "$ssg" track/projSG && grep -q 'could not be asked' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "token: with its own url unaskable nothing is taken, and that is said" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(notok SECRETTOKEN4 "$d" && echo 0 || echo 1)" "token: without the password" "$(grep -r SECRETTOKEN4 "$NOTES" "$d/.cc" 2>/dev/null)"
+  # (q) a delete refused through a url with a password: said, with git's own words, without the password.
+  osq=$(bare ownSshQ); ssq=$(bare sibSshQ); git -C "$ssq" config receive.denyDeletes true
+  d=$(mkproj ws10/projSQ origin "$osq" sibq "ssh://bot:SECRETTOKEN5@localhost$ssq"); git -C "$d" push -q "$ssq" track/projSQ
+  sshp "$d"
+  k "$(has "$ssq" track/projSQ && grep -q 'refused' "$d/.cc/evict.err" 2>/dev/null && echo 0 || echo 1)" "token: a refused delete is said" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(notok SECRETTOKEN5 "$d" && echo 0 || echo 1)" "token: without the password" "$(grep -r SECRETTOKEN5 "$NOTES" "$d/.cc" 2>/dev/null)"
+  # (r) a self-alias reached through a url with a password: put back, and evict.same remembers it by a hash of its
+  # url_key, never the url. The rows above never reached this path, which is the only one that writes evict.same.
+  osr=$(bare ownSshR); ln -s "$osr" "$T/aliasSshR.git"; tsr="ssh://bot:SECRETTOKEN6@localhost$T/aliasSshR.git"
+  d=$(mkproj ws10/projSR origin "$osr" sibr "$tsr")
+  sshp "$d"
+  k "$(has "$osr" track/projSR && grep -q 'put back' "$NOTES" && echo 0 || echo 1)" "token: a self-alias with a password is put back" "$(cat "$NOTES")"
+  eq "token: and evict.same holds only the hash of its url_key" "$(cat "$d/.cc/evict.same" 2>/dev/null)" "$(same_key "$tsr")"
+  k "$(notok SECRETTOKEN6 "$d" && echo 0 || echo 1)" "token: and the password is written nowhere" "$(grep -r SECRETTOKEN6 "$NOTES" "$d/.cc" 2>/dev/null)"
+  ( export GIT_SSH_COMMAND="$T/fakessh" GIT_SSH_VARIANT=ssh; : > "$NOTES"; cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(has "$osr" track/projSR && ! grep -q 'put back\|removed from' "$NOTES" && echo 0 || echo 1)" "token: and the next turn does not cycle it" "$(cat "$NOTES")"
+  # (s) an evict.same written before this, holding the raw url: still honoured, and rewritten to the hash.
+  oss=$(bare ownSshS); ln -s "$oss" "$T/aliasSshS.git"; tss="ssh://bot:SECRETTOKEN7@localhost$T/aliasSshS.git"
+  d=$(mkproj ws10/projSS origin "$oss" sibs "$tss"); git -C "$d" push -q "$oss" track/projSS; printf '%s\n' "$tss" > "$d/.cc/evict.same"
+  sshp "$d"
+  k "$(has "$oss" track/projSS && ! grep -q 'put back\|removed from' "$NOTES" && echo 0 || echo 1)" "legacy: a raw url in evict.same is still a known alias, never cycled" "$(cat "$NOTES")"
+  eq "legacy: and it is rewritten to the hash, password and all gone" "$(cat "$d/.cc/evict.same" 2>/dev/null)" "$(same_key "$tss")"
+  # …and git's words are cut free of a password before they are kept: a refusal or a mirror error quotes them.
+  eq "token: a url's user and password are dropped from git's words" "$(no_userinfo <<<"fatal: unable to access 'https://bot:TOK@github.com/o/r.git/': x; git@host:o/r")" "fatal: unable to access 'https://github.com/o/r.git/': x; git@host:o/r"
   # Not a member workspace: its remotes are its own business and nothing is ever taken out of them.
   od=$(bare ownD); td=$(bare otherD)
   d=$(mkproj myrepo2/t2 origin "$od" t2 "$td"); git -C "$d" push -q t2 track/t2
@@ -257,6 +418,30 @@ SH
   # …and the very next run, now holding a lease of its own, heals the workspace as before.
   : > "$NOTES"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
   k "$(grep -q 'put back' "$NOTES" && echo 0 || echo 1)" "…and once a host lease is on record the self-alias is handled normally" "$(cat "$NOTES")"
+  # ── the project's mirror: a track-named remote that is not origin's repository gets every commit, fast-forward only ──
+  # ece298a's pll: origin delivers, and the project's own repository must carry every revision too (2026-10-12).
+  com(){ echo "$2" >> "$1/work.txt"; git -C "$1" -c user.name=t -c user.email=t@t commit -qam "$2"; }
+  ws ws8; om=$(bare ownMr8); mm=$(bare mirMr8)
+  d=$(mkproj ws8/projM origin "$om" projM "$mm"); git -C "$d" push -q projM track/projM   # the mirror already holds the branch, a commit behind after the next one
+  com "$d" m2; runp "$d"
+  eq "mirror: the delivery goes to origin" "$(git -C "$om" rev-parse track/projM 2>/dev/null)" "$(git -C "$d" rev-parse HEAD)"
+  eq "mirror: and the project's own remote is fast-forwarded to the same commit" "$(git -C "$mm" rev-parse track/projM 2>/dev/null)" "$(git -C "$d" rev-parse HEAD)"
+  k "$(grep -q 'removed from' "$NOTES" && echo 1 || echo 0)" "mirror: and the owner-present eviction does not delete the branch from it" "$(cat "$NOTES")"
+  eq "mirror: the commit it got is recorded" "$(cat "$d/.cc/mirrored" 2>/dev/null)" "$(git -C "$d" rev-parse HEAD)"
+  # A mirror holding a commit this branch lacks is refused, never forced, and said once for that commit.
+  x=$(git -C "$d" commit-tree -p HEAD -m theirs "$(git -C "$d" rev-parse 'HEAD^{tree}')"); git -C "$d" push -qf projM "$x:refs/heads/track/projM"
+  com "$d" m3; runp "$d"; rc=$?
+  eq "mirror: a mirror somebody else wrote to is not forced" "$(git -C "$mm" rev-parse track/projM)" "$x"
+  eq "mirror: while origin still gets the commit, and the push still succeeds" "rc=$rc $(git -C "$om" rev-parse track/projM)" "rc=0 $(git -C "$d" rev-parse HEAD)"
+  k "$(grep -q '^note ws8 projM github: track/projM not mirrored to projM' "$NOTES" && echo 0 || echo 1)" "mirror: and the board is told" "$(cat "$NOTES")"
+  k "$(grep -q "^$(git -C "$d" rev-parse HEAD) " "$d/.cc/mirror.refused" 2>/dev/null && echo 0 || echo 1)" "mirror: the refusal is kept against that commit" "$(cat "$d/.cc/mirror.refused" 2>/dev/null)"
+  runp "$d"
+  eq "mirror: the same commit refused again is not said again" "$(cat "$NOTES")" ""
+  # Not a member workspace: a track-named remote of its own is the repo's business, and nothing is mirrored to it.
+  op=$(bare ownMr9); mp=$(bare mirMr9)
+  d=$(mkproj myrepo9/t9 origin "$op" t9 "$mp"); git -C "$d" push -q t9 track/t9; t9a=$(git -C "$d" rev-parse HEAD)
+  com "$d" p2; runp "$d"
+  eq "mirror: a box repo's track-named remote is left alone" "$(git -C "$op" rev-parse track/t9 2>/dev/null) $(git -C "$mp" rev-parse track/t9)" "$(git -C "$d" rev-parse HEAD) $t9a"
   # ── no push waits for a person ──────────────────────────────────────────────────────────────────────
   # The 2026-09-07 hang: a member track with no credential sat 6h38m inside git-remote-https on a username
   # prompt, on a stdin no unattended run can answer. Both halves of the rule are checked, each on its own
@@ -716,6 +901,7 @@ SH
   mkdir -p "$HOME/dev/ws5/evilwt/.cc"; printf 'victimws\nevilL\n' > "$HOME/dev/ws5/evilwt/.cc/track"
   echo evil > "$HOME/dev/ws5/evilwt/work.txt"; git -C "$HOME/dev/ws5/evilwt" add -A
   git -C "$HOME/dev/ws5/evilwt" -c user.name=t -c user.email=t@t commit -q -m evil
+  ( cd / && "$bin/cc-checkpoint" --sweep >/dev/null 2>&1 )   # the origin just added is the workspace's, so ws5's projects now deliver there and mirror to their own remotes: let that tick pass first
   ln -s "$HOME/dev/ws5/evilwt" "$HOME/.cc/worktrees/ws5/evilL"
   : > "$CALLS"; : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
   k "$(grep -q 'ws5/evilL: refusing to push from' <<<"$sw" && echo 0 || echo 1)" "sweep: an entry that is a symlink, not the track's own directory, is skipped" "$sw"
@@ -754,6 +940,20 @@ SH
   k "$(has "$osv" track/projV && echo 0 || echo 1)" "sweep: a project's commit reaches its own repository" "$sw"
   k "$(has "$otv" track/projV && echo 0 || echo 1)" "sweep: and no branch is deleted from the workspace's other repositories" "gone from $otv"
   k "$({ [ -e "$dv/.cc/evict.err" ] || [ -e "$HOME/.cc/push-state/ws5/projV/evict.err" ]; } && echo 1 || echo 0)" "sweep: nor is an eviction so much as attempted from a timer" "$(cat "$dv/.cc/evict.err" "$HOME/.cc/push-state/ws5/projV/evict.err" 2>/dev/null)"
+  # THE MIRROR FROM THE TIMER: the project's own remote gets each commit too, and one origin already has is still sent.
+  mkws ws7; o7=$(bare ownMr7); m7=$(bare mirMr7); d7=$(mkwork ws7/projP origin "$o7" projP "$m7")
+  : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a project's commit reaches origin and its mirror" "$(git -C "$o7" rev-parse track/projP 2>/dev/null) $(git -C "$m7" rev-parse track/projP 2>/dev/null)" "$(git -C "$d7" rev-parse HEAD) $(git -C "$d7" rev-parse HEAD)"
+  k "$(grep -q "ws7/projP: mirrored $(git -C "$d7" rev-parse --short=7 HEAD) to projP" <<<"$sw" && echo 0 || echo 1)" "sweep: and says both" "$sw"
+  # pll on 2026-10-12: origin holds the head and the lease says so, while the mirror is a commit behind.
+  echo q2 >> "$d7/work.txt"; git -C "$d7" -c user.name=t -c user.email=t@t commit -qam q2; git -C "$d7" push -q origin track/projP
+  git -C "$d7" rev-parse HEAD > "$HOME/.cc/push-state/ws7/projP/pushed"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a mirror behind an origin that is current is caught up" "$(git -C "$m7" rev-parse track/projP)" "$(git -C "$d7" rev-parse HEAD)"
+  k "$(grep -q 'ws7/projP: mirrored' <<<"$sw" && echo 0 || echo 1)" "sweep: and that is said" "$sw"
+  : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws7' <<<"$sw$(cat "$CALLS")" && echo 1 || echo 0)" "sweep: both current — nothing pushed, nothing said, no token minted for it" "$sw $(cat "$CALLS")"
+  git -C "$HOME/dev/ws7" remote remove origin   # out of the way of the cases below: a remote is the repository's, so it would outlive this case
   # A LINK PLANTED AT A STATE FILE. --push writes .cc/push.err.tmp as the OWNER, and ~/.cc/worktrees/<h> is bound
   # read-write into the member's boundary at this same path: a link there aims that write at any file the owner can
   # write, every five minutes with nobody present (review of #225).

@@ -11,8 +11,8 @@
 #                          them (land_queue: a track in review with a PR, in a workspace `cc lands` says holds the grant,
 #                          is queued to cc-land once per PR and head, and only at a head the host's own lease says is
 #                          on the remote — never one a push skipped or failed for): every member workspace track whose HEAD is
-#                          not what it last pushed gets `--push` run from its worktree, with that workspace's own
-#                          credential. cc-checkpoint.timer runs it every 5 min (config/units.json): inside a workspace's
+#                          not what it last pushed — or whose project mirror has not got that HEAD (mirror_push) —
+#                          gets `--push` run from its worktree, with that workspace's own credential. cc-checkpoint.timer runs it every 5 min (config/units.json): inside a workspace's
 #                          boundary the Stop hook commits but cannot push — the credential is host-only by design
 #                          (cc-sandbox) — and only a worker's loop (cc-loop) pushed from out here, so two commits an
 #                          interactive member session made sat on the box until a person pushed by hand (2026-09-04).
@@ -88,9 +88,16 @@
 # finished there does not sit on a local branch nobody else can see — never one per task (2026-10-05).
 # Inside the member's boundary it is `origin` or nothing (pick_remote says when); a track-named remote pointing anywhere but origin's repository (its url or a push url) is never taken, in there or out here. A repository that could not be
 # made is nowhere to push; the reason is in .cc/create.err and the next turn tries again. After a push succeeds, the branch is REMOVED from any other repository the workspace
-# remotes name, so opening a project's repository shows that project and not its neighbours (owner,
+# remotes name but the project's mirror (below), so opening a project's repository shows that project and not its neighbours (owner,
 # 2026-09-04). Only a tip that is an ancestor of what was just pushed is removed; anything else is left and
 # named in .cc/evict.err — never push.err, which means the push failed (review of #217). Nothing is created, and nothing removed, for anything but a member workspace's project.
+# AND THAT TRACK-NAMED REMOTE IS THE PROJECT'S MIRROR (mirror_push). On the host, once a member track's push to origin
+# lands, the same branch goes to the remote named after the track too when its urls are not origin's, FAST-FORWARD
+# ONLY: a plain push, never forced, so a mirror somebody else wrote to refuses and is said once per commit on the
+# board (.cc/mirror.refused) and a mirror that did not answer is tried again (.cc/mirror.err). It is never the
+# delivery, so it moves no lease and no PR, fails no `cc done`, and evict_elsewhere never deletes the branch from it.
+# ece298a's pll project lives in origin AND its own pll repository, which the member wants carrying every revision;
+# the push went to origin alone, so pll fell a commit behind and the seat pushed it by hand (2026-10-12).
 # AND IT SAYS WHOSE IT IS: a project's branch is cut from the workspace's default branch, so it arrives
 # carrying the WORKSPACE's README and the project's repository opens on a page about the workspace. While that
 # README still opens with the workspace's own name — nobody having written a word of it for this project — the
@@ -145,7 +152,7 @@ bound_hit(){   # $1 a git_unattended exit code, $2 the file its stderr went to. 
 # what is REALLY on the remote, so a refusal means exactly one thing: something this worktree did not write is on
 # that branch. That is never overwritten and never swallowed — see lease_refused.
 # WHERE THIS FILE KEEPS ITS STATE — $ST, and EVERY name it writes: pushed, adopted, push.err, push.err.tmp, push.rejected,
-# checkpoint.err, create.err, create.err.tmp, base-seed, evict.err, evict.err.tmp, evict.same. All of them are written with shell
+# checkpoint.err, create.err, create.err.tmp, base-seed, evict.err, evict.err.tmp, evict.same, mirrored, mirror.err, mirror.refused. All of them are written with shell
 # redirections, and a redirection FOLLOWS A SYMLINK — while ~/.cc/worktrees/<h> stays bound read-WRITE in the
 # member's live boundary, so a session looping `ln -sf ~/.ssh/authorized_keys .cc/push.err.tmp` wins the window
 # between any check and the write on one of the 288 daily ticks and has the host truncate that file as the owner
@@ -232,13 +239,41 @@ own_remote_ok(){   # the remote named after the track may be pushed to only if i
   tp=$(push_keys "$WSTRACK"); op=$(push_keys origin)
   [ "$(url_key "$tu")" = "$(url_key "$ou")" ] && [ "$tp" = "$op" ] && return 0
   [ "${1:-}" = quiet ] && return 1
-  msg="cc-checkpoint: remote $WSTRACK ($(git remote get-url --push --all "$WSTRACK" 2>/dev/null | paste -sd' ')) is not origin's repository ($(git remote get-url --push --all origin 2>/dev/null | paste -sd' ')): delivering to origin"
+  # Each destination by its url_key, never as written: a url can carry a token, and this line is kept and printed.
+  msg="cc-checkpoint: remote $WSTRACK ($(paste -sd' ' <<<"$tp")) is not origin's repository ($(paste -sd' ' <<<"$op")): delivering to origin"
   # SAID ONCE, not every turn: this runs on the Stop hook and the five-minute sweep for as long as the remote exists,
   # so the line is kept in .cc/own-remote.said and only a different remote or url says it again (as push_rejected).
   [ -n "$ST" ] && [ "$(cat "$ST/own-remote.said" 2>/dev/null)" = "$msg" ] && return 1
   [ -n "$ST" ] && printf '%s\n' "$msg" > "$ST/own-remote.said" 2>/dev/null
   echo "$msg" >&2
   return 1; }
+mirror_remote(){   # cwd = worktree root, $WSTRACK set → the project's mirror remote on stdout, or 1 when there is none.
+  # It is the remote named after the track — the owner's binding, in ~/dev/<h>/.git/config, which the member cannot
+  # write — when origin is there to take the delivery and the two are not one repository (own_remote_ok). Never from
+  # inside the member's boundary, which has no credential and pushes to origin or nothing.
+  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 1
+  [ -n "$WSTRACK" ] && git remote get-url "$WSTRACK" >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1 || return 1
+  own_remote_ok quiet && return 1
+  printf '%s\n' "$WSTRACK"; }
+mirror_push(){   # $1 = the branch just delivered to $remote, cwd = worktree root, $ST set.  Always 0: the delivery already happened.
+  # Brief: "also push, fast-forward only, to a worktree's project remote when one is configured for that track".
+  # Only a member workspace's project delivered to origin has one; a commit already mirrored is not pushed again.
+  local mr head err why
+  [ -n "$workspace" ] && [ "$remote" = origin ] || return 0
+  mr=$(mirror_remote) || return 0
+  head=$(git rev-parse -q --verify "refs/heads/$1" 2>/dev/null) || return 0
+  [ "$(cat "$ST/mirrored" 2>/dev/null)" = "$head" ] && return 0
+  local -a c=(); mapfile -t c < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$mr" 2>/dev/null)" "$workspace" 2>/dev/null)
+  # No `+` and no lease on the refspec: git refuses anything but a fast-forward (or a create), which is the rule.
+  if err=$(git_unattended "${c[@]}" push -q "$mr" "refs/heads/$1:refs/heads/$1" 2>&1); then
+    printf '%s\n' "$head" > "$ST/mirrored"; rm -f "$ST/mirror.err" "$ST/mirror.refused"; return 0; fi
+  why=$(tr '\n' ' ' <<<"$err" | no_userinfo | cut -c1-200); [ -n "$why" ] || why="the push to $mr did not finish within ${PUSH_TIMEOUT}s"
+  if grep -q '\[rejected\]\|\[remote rejected\]' <<<"$err"; then   # a refusal: no retry moves it until a person looks or a new commit lands
+    [ "$(cut -d' ' -f1 "$ST/mirror.refused" 2>/dev/null)" = "$head" ] \
+      || "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $1 not mirrored to $mr at ${head:0:7} — $mr refused it and nothing was forced (a mirror takes fast-forwards only): $why" >/dev/null 2>&1
+    printf '%s %s\n' "$head" "$why" > "$ST/mirror.refused"; rm -f "$ST/mirror.err"
+  else printf '%s %s\n' "$head" "$why" > "$ST/mirror.err"; fi   # no network, no credential, the bound: the next push or sweep tick tries again
+  return 0; }
 pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push · 1 there is not
   local url
   # A MEMBER WORKSPACE FIRST, and only then that workspace's own rules: the track-named remote below belongs
@@ -348,6 +383,11 @@ url_key(){   # one repository, however its url is spelled: case, .git, a trailin
   u=${u#ssh://}; u=${u#https://}; u=${u#http://}; u=${u#git://}; u=${u#*@}
   case "$u" in *:*/*) u=${u/:/\/} ;; esac   # git@host:org/repo → host/org/repo
   printf '%s\n' "$u"; }
+no_userinfo(){   # stdin → stdout with the user and password cut out of every scheme:// url in it. A remote's url can
+  # carry a token, and git's own words about a push are kept in .cc and put on the board (security read of #1118).
+  sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1#g'; }
+same_key(){   # $1 a url → the line .cc/evict.same remembers it by: a hash of its url_key, so no token is ever kept there
+  url_key "$1" | sha256sum | cut -c1-64; }
 base_branch(){   # the project's base branch, cwd = worktree root. The board's, and never a track, whoever names it:
   # origin/HEAD is only what a REMOTE calls its default, and for a repository the box made that is the first branch
   # pushed into it. Same rule and same order as cc's default_branch().
@@ -467,7 +507,7 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   # not, or one whose object this worktree does not have, is left alone and written to .cc/evict.err — a file of
   # its own, replaced each run: push.err means the push FAILED, and a note there after a push that succeeded lit
   # `push!` for ever (review of #217).
-  local branch="$1" had_lease="${2:-}" own o url sha name
+  local branch="$1" had_lease="${2:-}" own o url sha name mr
   # …BUT NOT FROM A TIMER. This ends in `git push --delete` against another repository, and the sweep pushes and
   # NOTHING ELSE (header above): a branch removed unattended every five minutes is the one destructive remote
   # action nobody is present for. A workspace still heals itself on the next `cc done` or owner-present turn,
@@ -479,36 +519,99 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   # would re-run the delete+repush over a self-alias and close its open PR, the #217 hole (round 9 of #225). The
   # first push records the lease and heals nothing; the next owner-present run, holding a lease of its own, does.
   [ -n "$had_lease" ] || return 0
-  own=$(url_key "$(git remote get-url "$remote" 2>/dev/null)"); [ -n "$own" ] || return 0
+  # BY PUSH DESTINATION, NEVER BY FETCH URL: `git push --delete` goes to a remote's pushurl, and its url can be a
+  # different repository altogether. Compared by url, a remote whose url was elsewhere let the project's own
+  # repository (a pushurl of $remote) or its mirror's lose the branch, and a probe of the url asked a repository
+  # the delete never reaches (lander, #1118). So every decision below — who is own, who is the mirror, what is
+  # probed, where the delete goes, what evict.same remembers — is made per push url (`get-url --push --all`), and
+  # the probe and the delete name that url itself, so they cannot ask one repository and delete from another.
+  # …AND ONLY A URL GIT DOES NOT REWRITE AGAIN. get-url has applied insteadOf/pushInsteadOf once already, and a
+  # url handed back to git is rewritten a second time: `push` by pushInsteadOf, `ls-remote` by insteadOf only. With
+  # two chained rules the probe asked one repository and the delete landed on the project's own, and the self-heal
+  # re-push closed its open PR (security read of #1118). So a sibling's url is taken only when both of them land on
+  # it unchanged (ls-remote --get-url, and the "To" line of a dry-run of the very delete), and the project's own urls,
+  # which the self-heal asks with ls-remote, only when ls-remote lands on them unchanged; anything else is said.
+  # The "To" line is compared by url_key: git prints it without the user or password, so `git@host:org/x` or a url
+  # carrying a token never equalled it and an ssh sibling was never cleaned again. And every line said here names a
+  # url only by its url_key, never as written: a url can carry a token, and these lines go onto the board (security
+  # read of #1118, round 3).
+  own=$(push_keys "$remote"); [ -n "$own" ] || return 0
+  local mk='' pu ok mok to bad=''; mr=$(mirror_remote) && mk=$(push_keys "$mr")
+  local -a ownu=() rem=() miru=() mc=() mhad=(); mapfile -t ownu < <(git remote get-url --push --all "$remote" 2>/dev/null)
+  [ -z "$mk" ] || { mapfile -t miru < <(git remote get-url --push --all "$mr" 2>/dev/null)
+    mapfile -t mc < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$mr" 2>/dev/null)" "$workspace" 2>/dev/null); }
   rm -f "$ST/evict.err.tmp"
-  for o in $(git remote); do
-    url=$(git remote get-url "$o" 2>/dev/null)
-    [ "$(url_key "$url")" != "$own" ] || continue
-    grep -qxF "$url" "$ST/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
+  # evict.same REMEMBERS A HASH OF THE URL_KEY, never the url, which can carry a token (security read of #1118, round
+  # 3). A file written before that holds raw urls: each such line is rewritten to its hash here, so it is still known.
+  if [ -s "$ST/evict.same" ] && grep -qvxE '[0-9a-f]{64}' "$ST/evict.same"; then
+    local sl sk; sk=$(while IFS= read -r sl; do
+      if [[ $sl =~ ^[0-9a-f]{64}$ ]]; then printf '%s\n' "$sl"; elif [ -n "$sl" ]; then same_key "$sl"; fi
+    done < "$ST/evict.same" | LC_ALL=C sort -u)
+    printf '%s\n' "$sk" > "$ST/evict.same"; fi
+  # A URL BEGINNING WITH '-' IS AN OPTION to git, not a url: `--upload-pack=<cmd>` as a pushurl ran <cmd> as the
+  # owner the moment it was probed (security read of #1118). Every git call below that takes a url puts `--` before
+  # it, and a sibling's that begins with '-' is not handed to git at all.
+  for pu in "${ownu[@]}" "${miru[@]}"; do [ "$(git ls-remote --get-url -- "$pu" 2>/dev/null)" = "$pu" ] || bad="$pu"; done
+  if [ -n "$bad" ]; then
+    printf '%s %s\n' "$(date -u +%FT%TZ)" "nothing was taken out of any other repository: $remote pushes to $(url_key "$bad"), which git rewrites to another url when it reads it, so whether a delete took the branch from this project could not be asked. Write that url as git ends up using it." >> "$ST/evict.err.tmp"
+  else mapfile -t rem < <(git remote); fi
+  for o in "${rem[@]}"; do
+   while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    case $url in -*) printf '%s %s\n' "$(date -u +%FT%TZ)" "$o has a push url beginning with '-', which git would read as an option — left alone. Fix that remote by hand." >> "$ST/evict.err.tmp"; continue;; esac
+    grep -qxF -- "$(url_key "$url")" <<<"$own" && continue
+    [ -z "$mk" ] || ! grep -qxF -- "$(url_key "$url")" <<<"$mk" || continue   # the project's own mirror (mirror_push) holds this branch by design
+    grep -qxF -- "$(same_key "$url")" "$ST/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
+    if [ "$(git ls-remote --get-url -- "$url" 2>/dev/null)" != "$url" ]; then
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o pushes to $(url_key "$url"), which git rewrites to another url when it reads it — left alone. Write that url as git ends up using it." >> "$ST/evict.err.tmp"
+      continue; fi
     local -a c=(); mapfile -t c < <("$BIN/cc-gh-token" gitargs "$url" "$workspace" 2>/dev/null)
-    sha=$(git_unattended "${c[@]}" ls-remote --heads "$o" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
+    sha=$(git_unattended "${c[@]}" ls-remote --heads -- "$url" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
     [ -n "$sha" ] || continue   # it does not have this branch, or it could not be asked: nothing to remove either way
     if ! git merge-base --is-ancestor "$sha" "$branch" 2>/dev/null; then
       printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch at $sha, which is not in this branch — left alone. This project pushes to $remote; move or delete that branch by hand." >> "$ST/evict.err.tmp"
       continue; fi
     name=$(url_key "$url"); name=${name##*/}   # the normalised url, so a trailing / does not leave the note naming nothing
+    to=$(git_unattended "${c[@]}" push --dry-run --porcelain --delete -- "$url" "refs/heads/$branch" 2>/dev/null | sed -n 's/^To //p' | head -1)
+    [ -n "$to" ] || continue   # the dry run could not be made: where the delete would go is unknown, so nothing is deleted
+    if [ "$(url_key "$to")" != "$(url_key "$url")" ]; then
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o pushes to $(url_key "$url"), but a push there is rewritten to $(url_key "$to") — left alone, since that is not where the branch was found. Write that url as git ends up using it." >> "$ST/evict.err.tmp"
+      continue; fi
+    # THE MIRROR IS ASKED TOO (security read of #1118): a sibling naming it under a spelling url_key cannot unify
+    # takes its branch, and mirror_push never puts back a head .cc/mirrored already records. Only a mirror url that
+    # holds the branch now is asked after, so a mirror that never got it does not make every sibling its alias.
+    mhad=(); for pu in "${miru[@]}"; do
+      still=$(git_unattended "${mc[@]}" ls-remote --heads -- "$pu" "refs/heads/$branch" 2>/dev/null) && [ -n "$still" ] && mhad+=("$pu"); done
     # A delete the other repository REFUSES — GitHub refuses a repository's default branch, and an empty repository
     # takes its default from the first branch pushed into it, which can be the sibling's — is the case that leaves
     # the contamination in place, so it is said, not swallowed (review of #217).
-    if ! err=$(git_unattended "${c[@]}" push -q "$o" --delete "refs/heads/$branch" 2>&1); then
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$ST/evict.err.tmp"
+    if ! err=$(git_unattended "${c[@]}" push -q --delete -- "$url" "refs/heads/$branch" 2>&1); then
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | no_userinfo | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$ST/evict.err.tmp"
       continue; fi
     # A URL IS NOT A REPOSITORY'S IDENTITY. The same repository under a spelling url_key cannot unify (ssh and
     # https, a symlink) has just had its branch deleted out from under it — so ask the project's own remote
     # whether the branch is still there, and if the answer is that it is gone, put it back and say so (review of
-    # #217). An ask that failed says nothing either way and changes nothing.
-    still=$(git_unattended "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null); src=$?
-    if [ "$src" = 0 ] && [ -z "$still" ]; then
-      git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
-      printf '%s\n' "$url" >> "$ST/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$ST/evict.err.tmp"
+    # #217). Asked where $remote PUSHES, every one of them: that is where the branch was put and where a delete
+    # through an alias took it from. An ask that failed says nothing either way and changes nothing.
+    ok=1; mok=1
+    for pu in "${ownu[@]}"; do
+      still=$(git_unattended "${cred[@]}" ls-remote --heads -- "$pu" "refs/heads/$branch" 2>/dev/null) && [ -z "$still" ] && ok=''
+    done
+    for pu in "${mhad[@]}"; do
+      still=$(git_unattended "${mc[@]}" ls-remote --heads -- "$pu" "refs/heads/$branch" 2>/dev/null) && [ -z "$still" ] && mok=''
+    done
+    if [ -z "$ok" ] || [ -z "$mok" ]; then
+      [ -n "$ok" ] || git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
+      [ -n "$mok" ] || { rm -f "$ST/mirrored"; mirror_push "$branch"; }   # the record says it is there, and it is not
+      same_key "$url" >> "$ST/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
+      if [ -z "$ok" ]; then
+        printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$ST/evict.err.tmp"
+      else
+        printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's mirror $mr under another spelling — its branch was put back there and that remote is skipped from now on. Keep one remote for it." >> "$ST/evict.err.tmp"
+      fi
       continue; fi
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $branch removed from ${name:-$o} — this project's work is in its own repository now, not that one" >/dev/null 2>&1
+   done < <(git remote get-url --push --all "$o" 2>/dev/null)
   done
   # The two cases that need a person — a branch left in a sibling repository, a duplicate remote — are heard the
   # way a delete is: on the board, once per change and not every turn (the file carries a timestamp per run, so it
@@ -551,7 +654,7 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
   git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
-  [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+  [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; mirror_push "$branch"; return 0; }
   bound_hit "$prc" "$ST/push.err.tmp"   # killed at the bound: git said nothing, so the reason is written here
   grep -qE 'non-fast-forward|fetch first' "$ST/push.err.tmp" || { mv "$ST/push.err.tmp" "$ST/push.err"; push_rejected; return 1; }   # not a divergence: a plainly broken push (no network, no permission, the remote refusing it)
   lease=$(cat "$ST/pushed" 2>/dev/null)
@@ -578,11 +681,11 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # turns a refusal into a force.
   if [ -n "$lease" ] && remote_gone "$branch"; then
     git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
-    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; mirror_push "$branch"; return 0; }
     bound_hit "$prc" "$ST/push.err.tmp"; mv "$ST/push.err.tmp" "$ST/push.err"; push_rejected; return 1; fi
   if [ -n "$lease" ]; then
     git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
-    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; mirror_push "$branch"; return 0; }
     bound_hit "$prc" "$ST/push.err.tmp"
     mv "$ST/push.err.tmp" "$ST/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$ST/push.err" && return 2
@@ -840,7 +943,7 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
     # dangling link is caught FIRST: -e is false through one.
     local wt="$1" f
     [ -d "$wt/.cc" ] && [ ! -L "$wt/.cc" ] || { echo "$wt/.cc is not a directory of its own"; return 1; }
-    for f in pushed adopted push.err push.err.tmp push.rejected create.err create.err.tmp evict.err evict.err.tmp evict.same base-seed; do
+    for f in pushed adopted push.err push.err.tmp push.rejected create.err create.err.tmp evict.err evict.err.tmp evict.same base-seed mirrored mirror.err mirror.refused; do
       [ ! -L "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is a symlink"; return 1; }
       [ ! -e "$wt/.cc/$f" ] || [ -f "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is not a plain file"; return 1; }
     done
@@ -864,6 +967,12 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       echo "$h/$t: PR #$prn would not queue — ${o//$'\n'/ }"
       "$BIN/cc-board" note "$h" "$t" "landing: PR #$prn would not queue — $(tail -1 <<<"$o" | cut -c1-200)" >/dev/null 2>&1
     fi
+    return 0; }
+  mirror_said(){   # $1 handle · $2 track · $3 host state dir · $4 mirror remote · $5 mirror.err's reason before the push — the mirror's outcome, one line
+    local m; m=$(cat "$3/mirrored" 2>/dev/null)
+    if [ -n "$m" ] && [ ! -e "$3/mirror.err" ] && [ ! -e "$3/mirror.refused" ]; then echo "$1/$2: mirrored ${m:0:7} to $4"
+    elif [ -e "$3/mirror.refused" ]; then echo "$1/$2: not mirrored to $4 — refused, not forced: $(cut -d' ' -f2- "$3/mirror.refused")"
+    elif [ -e "$3/mirror.err" ] && [ "$(cut -d' ' -f2- "$3/mirror.err")" != "$5" ]; then echo "$1/$2: not mirrored to $4 yet — $(cut -d' ' -f2- "$3/mirror.err"); the next tick tries again"; fi
     return 0; }
   for mk in "$HOME"/dev/*/.cc/member-workspace; do
     [ -f "$mk" ] || continue
@@ -907,14 +1016,20 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       sd="$HOME/.cc/push-state/$h/$t"; mkdir -p "$sd" 2>/dev/null || continue
       head=$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null) || continue
       [ "$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)" = "track/$t" ] || continue   # --push's own rule; its refusal is the hook's to record, not a line here every 5 min
-      was=$(cat "$sd/pushed" 2>/dev/null); [ "$was" = "$head" ] && continue   # what it last pushed IS its head: nothing to do, and no token minted
+      was=$(cat "$sd/pushed" 2>/dev/null)
+      # What it last pushed IS its head: nothing to do, and no token minted — unless the project has a mirror
+      # (mirror_push) that has not got this commit and has not refused it, which this tick then pushes alone.
+      # mirror_remote reads the remotes out of ~/dev/<h>/.git/config, behind the wall above, as the push does.
+      mr=$(cd "$wt" && WSTRACK="$t" mirror_remote 2>/dev/null) || mr=''
+      mdue=; [ -n "$mr" ] && [ "$(cat "$sd/mirrored" 2>/dev/null)" != "$head" ] && [ "$(cut -d' ' -f1 "$sd/mirror.refused" 2>/dev/null)" != "$head" ] && mdue=1
+      [ "$was" = "$head" ] && [ -z "$mdue" ] && continue
       # AND A REFUSED LEASE IS NOT TRIED AGAIN FOR THE SAME COMMIT. --push says one three ways every time it runs, so
       # a branch something else wrote to would say it 288 times a day with nobody present, and no retry is going to
       # change that until a person looks. The marker goes down before the push carrying this head; a push that lands
       # takes it away. ONLY a refused lease keeps it: a push that failed for a reason that may pass — DNS, a 5xx, a
       # credential that could not be minted — clears the head below, because one blip must not leave a member's
       # commit sitting on the box for ever, which is the bug this file exists to close (security review of #225).
-      [ "$(cut -d' ' -f1 "$HOME/.cc/sweep/$h/$t" 2>/dev/null)" = "$head" ] && continue
+      [ "$was" != "$head" ] && [ "$(cut -d' ' -f1 "$HOME/.cc/sweep/$h/$t" 2>/dev/null)" = "$head" ] && continue
       prev=$(cat "$HOME/.cc/sweep/$h/$t" 2>/dev/null)   # what was said last time: the mark below overwrites it, and a retry still must not repeat itself
       # AND NEVER UNDERNEATH AN IN-FLIGHT `cc done` ON THE SAME TRACK. `cc done` holds $sd/done.lock across its
       # checkpoint, its push and its PR (core/bin/cc), and both write the same $sd/push.err.tmp and $sd/pushed: a tick
@@ -925,6 +1040,10 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       exec 7>"$sd/done.lock" || continue
       if ! flock -n 7; then exec 7>&-
         echo "$h/$t: skipped this tick — a 'cc done' is running for this track and holds its state; the next tick picks it up"; continue; fi
+      merr=$(cut -d' ' -f2- "$sd/mirror.err" 2>/dev/null)   # what the mirror said last time, so a failure that repeats is not said every tick
+      if [ "$was" = "$head" ]; then   # ORIGIN ALREADY HAS IT, only the mirror is behind: the push to origin is a no-op and no marker is touched
+        (cd "$wt" && env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp" CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sd" "$BIN/cc-checkpoint" --push >/dev/null 2>&1 7>&-)
+        mirror_said "$h" "$t" "$sd" "$mr" "$merr"; exec 7>&-; continue; fi
       mark "$h" "$t" ''
       # PUSH ONLY: CC_CHECKPOINT_NO_CREATE stops pick_remote short of `cc-gh-token create` and seed_base short of
       # `cc-gh-token default`, so a timer neither makes a repository in the owner's org under a name a member
@@ -939,6 +1058,7 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       # that has one and had just been pushed to (review round 11 of #225).
       now=$(cat "$sd/pushed" 2>/dev/null)
       if [ -n "$now" ] && [ "$now" != "$was" ]; then echo "$h/$t: pushed ${now:0:7}"; rm -f "$HOME/.cc/sweep/$h/$t"
+        [ -z "$mr" ] || mirror_said "$h" "$t" "$sd" "$mr" "$merr"
       elif [ "$rc" = 3 ]; then
         # DIVERGED WITH NO HOST LEASE. The push was NOT forced and nothing was overwritten. A track from before #225
         # kept its lease in <wt>/.cc/pushed, which this timer will not read; the sweep cannot tell that from a real
