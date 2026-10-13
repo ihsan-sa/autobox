@@ -14,6 +14,17 @@
             opened under 10 min ago (its seat may queue it itself) or over 48 h ago, and any PR with a job, a rest
             file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
             a refusal is not undone by a sweep.
+  ended     for each repo with a job stopped in query (rest/) or held, at most every $LANDER_ENDED_SECS (900) per repo:
+            GitHub is asked what became of each such PR, with no lock held. A held job the lane itself tried to
+            merge (merge_attempt set, or held from past queued/planned/checking) is left to the lane, which proves it.
+            MERGED (lander-self landed it, or a person merged it by hand) -> merged, with the lane's own
+            `stage <repo>#<pr> merged` line (by=outside, sha= the merge commit, merged_at= GitHub's mergedAt), then
+            done and `done` rc 0, both written in one save into rest/ (a lane never finds it live at merged); CLOSED
+            -> done and `done` rc 1. The locks are taken only to move a job, which is read again under them: a query
+            moves under the rest lock; a held job is the lane's, so it moves only while no lane runs (the lane lock,
+            never waited on). Nothing is posted, closed on a board or deployed for it:
+            the tip catch-up deploys main. One repo's fault is said and logged (tick-fault), never the tick's end.
+            `lander settle-merged <repo> <pr> [--by WHO]` runs the same for one PR at once (lander-self land calls it).
   deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
             deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
@@ -177,6 +188,100 @@ def sweep_strays(repos) -> list:
             lines.append(f"[{repo}] PR #{n} was open with no landing record — " +
                          (f"queued it ({said})" if qrc == 0 else f"queueing it failed: {said}"))
     return lines
+
+
+# what the `ended` step looks at: a job stopped for a person, or held, whose PR may have been merged around the lane
+ENDED_WATCH = (T.QUERY, T.HELD)
+
+
+def watched(job) -> bool:
+    """A query job, or a held one the lane has not yet tried to merge: one the lane itself merged (merge_attempt set
+    at its hold, or held from past PRE_MERGE) is left to the lane's own path, which proves it, closes its row, posts
+    it and deploys it."""
+    if job is None or job.state not in ENDED_WATCH:
+        return False
+    # handback on #1250: "Skip held jobs that have merge_attempt set, or whose held_from is outside PRE_MERGE"
+    return job.state != T.HELD or (not job.extra.get("merge_attempt")
+                                   and job.extra.get("held_from", T.QUEUED) in L.PRE_MERGE)
+
+
+def ended_jobs(repo="") -> dict:
+    """{repo: [pr, …]} of every query job at rest and every held job watched() keeps (of `repo`, when named)."""
+    got = {}
+    for p in sorted(glob.glob(f"{J.rest_dir()}/*.json")) + J.job_files():
+        j = J.load_path(p)
+        if not watched(j) or (repo and j.repo != repo) or os.path.basename(p) != f"{j.key}.json":
+            continue
+        if j.pr not in got.setdefault(j.repo, []):
+            got[j.repo].append(j.pr)
+    return got
+
+
+def settle_ended(repo, prs, by="outside", wait=False) -> list:
+    """Move each of `prs` that is a watched() job and whose PR GitHub says MERGED to merged then done, CLOSED to
+    done (tick docstring, `ended`). GitHub is asked first with no lock held (a gh call may take 60 s, and a lane
+    that starts meanwhile must not find its lock taken); the locks are then taken only to move a job, and each job
+    is read again under them. wait: wait for the rest lock (one PR, asked by hand) instead of skipping."""
+    h = M.member_of(repo)[0]
+    token = M.gh_token(h, repo) if h else None
+    root, lines, ended = J.repo_root(repo), [], {}
+    for pr in prs:
+        if not watched(J.load(repo, pr)):
+            continue
+        facts, why = GH.pr_facts(root, pr, "state,mergedAt,mergeCommit", token, 60)
+        if facts is None:
+            lines.append(f"[{repo}] PR #{pr}: gh could not say whether it merged — {why}")
+        elif facts.get("state") in ("MERGED", "CLOSED"):
+            ended[pr] = facts
+    if not ended:
+        return lines
+    with contextlib.ExitStack() as st:
+        lane = st.enter_context(J.lane_lock(repo))   # a held job is the lane's: it moves only while no lane runs
+        if not st.enter_context(J.rest_lock(repo, wait=wait)):
+            return lines   # a drain or a settle holds it; the next tick looks again
+        for pr, facts in ended.items():
+            job = J.load(repo, pr)   # the lane or a re-queue may have moved it while GitHub was asked
+            if not watched(job) or (job.state == T.HELD and not lane):
+                continue
+            was = job.state
+            if facts["state"] == "MERGED":
+                mc = facts.get("mergeCommit")
+                oid = str(mc.get("oid") or "") if isinstance(mc, dict) else ""
+                J.move(job, T.MERGED, why=f"merged outside the lane, by {by}", defer=True, by=by, sha=oid[:12],
+                       merged_at=facts.get("mergedAt") or "")   # one save with done: a lane never sees it merged
+                J.move(job, T.DONE, why="merged outside the lane: no deploy of its own, the tip catch-up deploys main")
+                E.log("done", repo, pr, rc=0)
+                lines.append(f"[{repo}] PR #{pr}: merged on GitHub ({by}) — {was} -> merged -> done")
+            else:
+                J.move(job, T.DONE, why="the PR is closed")
+                E.log("done", repo, pr, rc=1)
+                lines.append(f"[{repo}] PR #{pr}: closed on GitHub — {was} -> done")
+    return lines
+
+
+def sweep_ended(repo="") -> list:
+    """The tick's `ended` step: settle_ended for each repo's query and held jobs, at most every LANDER_ENDED_SECS."""
+    lines = []
+    for r, prs in ended_jobs(repo).items():
+        try:
+            if J.REPO_RE.fullmatch(r) and due_every(C.state("tip", f"{r}.ended"), "LANDER_ENDED_SECS"):
+                lines += settle_ended(r, prs)
+        except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
+            E.log("tick-fault", r, None, f"ended: {type(e).__name__}: {e}")
+            lines.append(f"[{r}] the ended sweep failed: {type(e).__name__}: {e}")
+    return lines
+
+
+def cmd_settle_merged(argv) -> int:
+    pos, opts = L.split_opts(argv, "--by")
+    by = opts.get("--by", "") or "outside"
+    if len(pos) != 2 or not J.REPO_RE.fullmatch(pos[0]) or not pos[1].isdigit() \
+            or not re.fullmatch(r"[A-Za-z0-9._@-]{1,40}", by):
+        return L.refuse("usage: lander settle-merged <repo> <pr> [--by WHO]")
+    lines = settle_ended(pos[0], [int(pos[1])], by=by, wait=True)
+    for ln in lines or [f"[{pos[0]}] PR #{pos[1]}: no query or held job whose PR ended — nothing moved"]:
+        print(ln)
+    return 0
 
 
 def retry_deploys(repos) -> list:
@@ -447,6 +552,7 @@ def cmd_tick(argv) -> int:
     else:
         lines += sweep_handed()
         lines += sweep_strays(known_repos(repo))
+        lines += sweep_ended(repo)
         repos = [repo] if repo else J.all_repos()   # a push or a stray may have queued a new repo
         for r in repos:
             if J.running(r):
@@ -464,4 +570,6 @@ def cmd_tick(argv) -> int:
 
 
 COMMANDS = {"tick": (cmd_tick, "resume lanes, poll handed PRs, run the tip and deploy it: [--repo R] [--detach] "
-                               "[--rearm]")}
+                               "[--rearm]"),
+            "settle-merged": (cmd_settle_merged, "move <repo> <pr>'s query or held job to merged (or done) once GitHub "
+                                                 "says it merged (or closed) [--by WHO]")}

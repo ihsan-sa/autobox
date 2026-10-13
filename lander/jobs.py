@@ -222,8 +222,9 @@ NEXT = {
     T.MERGED: {T.DEPLOY_PENDING, T.DONE},
     T.DEPLOY_PENDING: {T.DEPLOYED, T.DONE, T.HELD},
     T.DEPLOYED: {T.DONE},
-    T.HELD: {T.QUEUED, T.PLANNED, T.CHECKING, T.MERGEABLE, T.DEPLOY_PENDING, T.QUERY, T.HANDBACK, T.DONE},
-    T.QUERY: {T.QUEUED, T.DONE},
+    # held or query -> merged: GitHub says the PR merged around the lane (lander-self, a hand merge; tick `ended`)
+    T.HELD: {T.QUEUED, T.PLANNED, T.CHECKING, T.MERGEABLE, T.MERGED, T.DEPLOY_PENDING, T.QUERY, T.HANDBACK, T.DONE},
+    T.QUERY: {T.QUEUED, T.MERGED, T.DONE},
     T.HANDBACK: {T.QUEUED, T.DONE},
     T.DONE: {T.QUEUED},
 }
@@ -278,9 +279,10 @@ def remove(job: T.Job) -> None:
     drop_first(job.repo, job.pr)
 
 
-def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
+def move(job: T.Job, state: str, why: str = "", defer: bool = False, **kv) -> T.Job:
     """One edge of NEXT: refused (ValueError, nothing written) when it is not one. kv go on the history entry and
-    the `stage` line (sha=, by=, proof=)."""
+    the `stage` line (sha=, by=, proof=). defer: the job file is not written; the next move writes both edges in its
+    one save, so no reader sees the state between them (tick `ended`: merged then done, never a live `merged`)."""
     T.check_enum("state", state, T.JOB_STATES)
     if state not in NEXT.get(job.state, ()):
         raise ValueError(f"{job.key}: {job.state} -> {state} is not an edge the lander takes")
@@ -288,7 +290,8 @@ def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
              **{k: v for k, v in kv.items() if v not in (None, "")}}
     job.history.append(entry)
     job.state = state
-    save(job)
+    if not defer:
+        save(job)
     if state in RESTING:   # a put-first is good for one landing (jobs.first)
         drop_first(job.repo, job.pr)
     if state == T.MERGED:   # its rebase rounds are over; a close keeps them, so a reopen does not buy more

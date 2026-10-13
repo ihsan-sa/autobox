@@ -447,6 +447,7 @@ class Lane:
         self.parked = set()      # queued jobs waiting on an overlapping one
         self.clash_of = {}       # (head, head) sorted -> True when the two do not merge cleanly (clashes)
         self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
+        self.tried_q = {}        # job key -> (queued_at, head) when its turn ended: another is a re-queue or a push
         self.pool = None
 
     def say(self, text):
@@ -510,12 +511,17 @@ class Lane:
             heads = {j.head for j in jobs if j.head}   # a pair of heads no job holds any more is never asked again
             self.clash_of = {p: v for p, v in self.clash_of.items() if p[0] in heads and p[1] in heads}
             for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
-                # run out, or (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
-                # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept
+                # run out, (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
+                # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept, or
+                # (c) it was queued again since or has a new head (a push): its queued_at or head differs. A move or
+                # a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
+                # since a re-queue may share its one-second stamp. Without these a re-queue drained in this pass sat
+                # in `tried` until the lane process ended (#1226, #1228, #1234)
                 if j.key not in tried:
                     continue
                 if (j.state == T.HELD and self.due(j) and self.tried_nb.get(j.key) != j.extra.get("not_before")) \
-                        or (self.reread_due(j) and not self.box_hold(j)):
+                        or (self.reread_due(j) and not self.box_hold(j)) \
+                        or self.tried_q.get(j.key) != self.queued_mark(j):
                     tried.discard(j.key)
             todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
@@ -529,12 +535,16 @@ class Lane:
                                            self.heavy(j)))
             tried.add(job.key)
             self.tried_nb[job.key] = job.extra.get("not_before")
+            self.tried_q[job.key] = self.queued_mark(job)
             why = self.box_hold(job)
             if why:
                 self.say(f"PR #{job.pr}: {why}")
                 continue
             before = (job.state, len(job.history), len(self.inflight))
             self.advance(job)
+            self.tried_q[job.key] = self.queued_mark(job)   # what its own turn wrote (a plan's head) is no re-queue
+            if job.state in J.ENDED:   # it left the lane: only a re-queue brings it back, and that gets a turn
+                tried.discard(job.key)
             if (job.state, len(job.history), len(self.inflight)) != before:
                 self.wake(but=job.key)   # a job moved or took a slot: whatever waited on it looks again
 
@@ -659,6 +669,11 @@ class Lane:
         for (key, _), f in self.inflight.items():
             if key == job.key:
                 f.stop.set()
+
+    @staticmethod
+    def queued_mark(job) -> tuple:
+        """What only a re-queue or a new head changes: a move or a hold leaves it alone."""
+        return str(job.extra.get("queued_at") or ""), job.head
 
     def due(self, job):
         return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))

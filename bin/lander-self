@@ -22,7 +22,10 @@ A planning seat runs it by hand; the lander never installs itself.
         side, also inside bwrap. A job the current release plans and the candidate cannot is a refusal.
         Exit 0 passed, 1 refused, 3 could not run.
     lander-self land <repo> <pr> [--repo-dir DIR]
-        check, then `gh pr merge --squash --match-head-commit <head> --delete-branch`. It does not promote.
+        check, then `gh pr merge --squash --match-head-commit <head> --delete-branch`. It does not promote. Then
+        it runs the current release's `lander settle-merged <repo> <pr> --by lander-self` (its own process), which
+        moves the PR's query job to merged and writes the lane's merged line; a release without that command, or
+        none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
     lander-self promote [REV] [--repo DIR] [--pr N]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
         plus the repo's tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
@@ -1193,7 +1196,23 @@ def cmd_land(args, opts):
     if rc != 0:
         return die(f"land: the merge did not go through: {(out + err).strip()[-300:]}")
     print(f"lander-self: merged {args[0]}#{args[1]} at {head[:12]}; `lander-self promote` switches the lander to it")
+    print(f"  {settle_merged(args[0], args[1])}")
     return 0
+
+
+def settle_merged(repo, pr, run=sh):
+    """The lane stopped this PR as a query for lander-self: the current release's `lander settle-merged` moves its job
+    to merged and writes the lane's merged line. Its own process, so no lander code runs in this one. A release
+    without the command, or none, leaves it to the tick's `ended` sweep, which does the same; never a failure."""
+    cur = link_target("current")
+    cli = os.path.join(cur, "core", "lander", "cli.py") if cur else ""
+    if not cli or not os.path.isfile(cli):
+        return "no current release to tell; the lander's tick moves the job once it runs"
+    rc, out, err = run([sys.executable, "-P", cli, "settle-merged", repo, str(pr), "--by", "lander-self"], timeout=180)
+    said = (out + err).strip().splitlines()
+    if rc != 0:
+        return f"the lander did not take the merge ({(said or ['exit ' + str(rc)])[-1][-200:]}); its tick moves the job"
+    return said[-1] if said else "the lander took the merge"
 
 
 # --- selfcheck -----------------------------------------------------------------------------------------------------
@@ -1447,6 +1466,7 @@ def selfcheck():
         rollback_legacy_cases(case, t)
         prove_cases(case, t, real_names)
         status_lane_cases(case, t)
+        settle_merged_cases(case)
         globals()["names_under"] = real_names
         if old_sysrun is None:
             os.environ.pop("LANDER_SYSTEMD_RUN", None)
@@ -1751,6 +1771,38 @@ def status_lane_cases(case, t):
     out = buf.read()
     case("status marks a lane on current", re.search(r"^lane fresh .* current$", out, re.M) and cur)
     case("status marks a lane on an old release STALE", re.search(r"^lane old .* on 0ld STALE$", out, re.M))
+
+
+def settle_merged_cases(case):
+    """land tells the current release's lander of the merge, in a process of its own; no release is no failure."""
+    global ROOT
+    keep = ROOT
+    calls = []
+
+    def run(rc, out):
+        def f(argv, timeout=600):
+            calls.append(argv)
+            return rc, out, ""
+        return f
+    with tempfile.TemporaryDirectory() as t:
+        ROOT = os.path.join(t, "lander")
+        try:
+            os.makedirs(ROOT)
+            said = settle_merged("r", "7", run(0, "x"))
+            case("settle-merged: no current release is left to the tick, nothing run", "tick" in said and not calls)
+            rel = os.path.join(ROOT, "releases", "abc")
+            os.makedirs(os.path.join(rel, "core", "lander"))
+            open(os.path.join(rel, "core", "lander", "cli.py"), "w").close()
+            os.symlink(rel, os.path.join(ROOT, "current"))
+            said = settle_merged("r", "7", run(0, "[r] PR #7: merged on GitHub (lander-self) — query -> merged -> done\n"))
+            case("settle-merged: the current release's cli runs it for the PR, by lander-self",
+                 calls and calls[-1][1:] == ["-P", os.path.join(rel, "core", "lander", "cli.py"), "settle-merged",
+                                            "r", "7", "--by", "lander-self"] and "query -> merged" in said)
+            said = settle_merged("r", "7", run(2, "lander: unknown command settle-merged\n"))
+            case("settle-merged: a release without the command leaves it to the tick",
+                 "did not take" in said and "unknown command" in said and "tick" in said)
+        finally:
+            ROOT = keep
 
 
 def _raises(f):

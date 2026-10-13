@@ -99,6 +99,7 @@ LOG_EVENT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\t(?:(queued|reque
                           r"|stage ([\w.-]+)#(\d+) (\w+)(.*))")
 # A green `gate` line's fields, in the order stage() writes them, each one whole: only `note=` (free text) may follow
 # secs, so a name or note that spells `ok=yes secs=1` cannot pass for a green run or lend a red one its length
+MERGED_AT_RE = re.compile(r" merged_at=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)(?: |$)")
 GATE_RE = re.compile(r" gate=([\w.-]+) ok=yes secs=(\d+)(?: note=.*)?$")
 
 
@@ -106,7 +107,9 @@ def lead_times(lines, since=0.0, repo=""):
     """{"first", "last", "lane", "gates": {gate: [...]}} in seconds, from queue.log lines. A PR's lead time runs
     from a `queued` line to the `stage … merged` (or, in older logs, `done … rc=0|3|4`) that landed it: `first` from
     its first queue, `last` from the queue (or requeue) that landed it, `lane` that queue to the first lane after it,
-    `gates` each green gate's own run. Only landings merged at or after `since`, only `repo`'s when named."""
+    `gates` each green gate's own run. A merged line's merged_at= (GitHub's own stamp, which tick's `ended` step
+    writes for a merge made around the lane) is when it merged, not the line's own stamp. Only landings merged at or
+    after `since`, only `repo`'s when named."""
     first, last, lane_at, got = {}, {}, {}, {"first": [], "last": [], "lane": [], "gates": {}}
     for ln in lines:
         m = LOG_EVENT_RE.match(ln)
@@ -130,6 +133,8 @@ def lead_times(lines, since=0.0, repo=""):
             if g:   # a green run's own length: a red or stopped one ended early and would flatter the figure
                 got["gates"].setdefault(g.group(1), []).append(int(g.group(2)))
         elif (kind == "merged" or (kind == "done" and rc in ("0", "3", "4"))) and key in last:
+            ma = MERGED_AT_RE.search(rest)   # a merge the lane found later (tick `ended`) is timed at GitHub's merge
+            at = epoch_of(ma.group(1)) if kind == "merged" and ma else at
             if at >= since:
                 got["first"].append(at - first[key])
                 got["last"].append(at - last[key])

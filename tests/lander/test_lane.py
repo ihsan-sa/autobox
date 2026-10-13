@@ -3815,6 +3815,36 @@ class Starving(Fixture):
         self.assertEqual(self.job(3).state, T.HELD)
         self.assertEqual(len([ln for ln in lines if ln.startswith("[demo] PR #3 held")]), 1)
 
+    def test_a_handed_back_pr_queued_again_gets_its_turn_in_the_same_lane(self):
+        """raised-a-handed-pr-requeued-never-gets-a-turn: #1226, #1228 and #1234 were handed back by their read,
+        queued again, and sat in the lane's `tried` set until the lane process restarted. Here #2's read hands it back
+        in its own turn and it is queued again while #1's check still runs: it must merge in this same lane run."""
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        requeued = []
+
+        class Reads(Reviewer):   # #2's first read hands it back; every other read lands
+            def review(self, job):
+                self.calls.append(("review", job.pr))
+                return V(T.HANDBACK_VERDICT, blocking=["bug"]) if job.pr == 2 and not requeued else V(T.LAND)
+
+            def delta_review(self, job, prior):
+                return self.review(job)
+
+        def hook(name, n):   # #1's check runs until #2 is handed back, then #2 is queued again
+            end = time.time() + 10
+            while name == "a" and not requeued and time.time() < end:
+                if self.job(2) is None and os.path.exists(J.handed_path("demo", 2)):
+                    J.submit("demo", 2)
+                    requeued.append(True)
+                    break
+                time.sleep(0.02)
+        for n in (1, 2):
+            J.submit("demo", n)
+        self.land(planner=Planner(paid=True), reviewer=Reads(), runner=Runner(hook=hook))
+        self.assertEqual(requeued, [True])                     # handed back, then queued again mid-lane
+        self.assertEqual(sorted(self.merged_order()), [1, 2])  # and the re-queue had its turn before the lane ended
+
     def test_a_finished_check_is_recorded_while_other_jobs_wait_their_turn(self):
         self.pr(1, {"a/x": "n\n"})
         self.pr(2, {"b/y": "n\n"})
