@@ -24,8 +24,8 @@ the number again. "You cant keep getting stuck in one small way of implementing 
 outside the system or framework." So the number is read for the seat, and the door to another attempt asks it to
 step outside first.
 
-State: ~/.cc/goals.json (CC_GOALS), written under a lock. Boards are read from ~/.cc/boards/<repo>.json
-(CC_GOAL_BOARDS); cc-notify and cc-msg beside this bin (CC_GOAL_NOTIFY, CC_GOAL_MSG). A measure that fails or
+State: ~/.cc/goals.json (CC_GOALS), written under a lock. Boards are read through `cc-board json`, under
+$CC_GOAL_HOME (default ~); cc-notify and cc-msg beside this bin (CC_GOAL_NOTIFY, CC_GOAL_MSG). A measure that fails or
 prints no number is a line on stderr and no reading; it is tried again on the next check. It asks no model.
 """
 import calendar, contextlib, fcntl, json, os, subprocess, sys, tempfile, time
@@ -33,7 +33,7 @@ import calendar, contextlib, fcntl, json, os, subprocess, sys, tempfile, time
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))
 GOALS = os.environ.get("CC_GOALS") or f"{HOME}/.cc/goals.json"
-BOARDS = os.environ.get("CC_GOAL_BOARDS") or f"{HOME}/.cc/boards"
+BOARD_HOME = os.environ.get("CC_GOAL_HOME") or HOME   # whose ~/.cc/boards `cc-board json` reads
 NOTIFY = os.environ.get("CC_GOAL_NOTIFY") or f"{BIN}/cc-notify"
 MSG = os.environ.get("CC_GOAL_MSG") or f"{BIN}/cc-msg"
 MEASURE_S = int(os.environ.get("CC_GOAL_MEASURE_S") or 300)
@@ -102,9 +102,11 @@ def better(g, v):
 
 def landed_at(repo, row):
     """When the board's row was landed (its first "landed by" note), or None."""
-    try:
-        t = (json.load(open(f"{BOARDS}/{repo}.json")).get("tracks") or {}).get(row) or {}
-    except (OSError, ValueError):
+    try:                                               # through `cc-board json`: no sibling opens a board itself
+        p = subprocess.run([f"{BIN}/cc-board", "json", repo], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL, env={**os.environ, "HOME": BOARD_HOME})
+        t = (json.loads(p.stdout).get("tracks") or {}).get(row) or {} if p.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
     for n in t.get("notes") or []:
         if str(n.get("msg", "")).startswith(("landed by", "milestone landed by")):
@@ -225,7 +227,7 @@ def main(argv):
 
 
 def selfcheck():
-    global GOALS, BOARDS, NOTIFY, MSG
+    global GOALS, BOARD_HOME, NOTIFY, MSG
     import io
     ok = bad = 0
 
@@ -238,9 +240,9 @@ def selfcheck():
 
     def fixture():
         """Each case's own: an empty goal file, a board, a measure file, stub notify/msg that write one line each."""
-        global GOALS, BOARDS, NOTIFY, MSG
+        global GOALS, BOARD_HOME, NOTIFY, MSG
         d = tempfile.mkdtemp(prefix="cc-goal-sc.")
-        GOALS, BOARDS = f"{d}/goals.json", d
+        GOALS, BOARD_HOME = f"{d}/goals.json", d
         for name in ("notify", "msg"):
             with open(f"{d}/{name}", "w") as f:
                 f.write(f'#!/bin/sh\necho "$*" >> {d}/told\n')
@@ -253,7 +255,8 @@ def selfcheck():
                                                      {"ts": t, "msg": "landed by cc-land: PR #1"}]}
                   for r, t in landed.items()}
         tracks["open-row"] = {"status": "running", "notes": [{"ts": "2026-01-01T00:00:00Z", "msg": "dispatched"}]}
-        json.dump({"tracks": tracks}, open(f"{d}/r.json", "w"))
+        os.makedirs(f"{d}/.cc/boards", exist_ok=True)
+        json.dump({"tracks": tracks}, open(f"{d}/.cc/boards/r.json", "w"))
 
     def value(d, v):
         open(f"{d}/m", "w").write(f"{v}\n")

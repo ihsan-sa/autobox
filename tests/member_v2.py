@@ -29,6 +29,23 @@ def selfcheck(m):
         return sp.run([str(a) for a in command], stdin=sp.DEVNULL, stdout=sp.PIPE,
                       stderr=sp.PIPE, timeout=GUARD, **kwargs)
 
+    # THE BOX'S OWN SERVICES, by the kernel's cgroup line: the tunnel connector's pasta is non-dumpable and held every
+    # inventory while it ran (2026-10-13). Each line below is its own fixture; the kept side and the suppressed side.
+    units, svc = {"box-tunnel.service", "box-site@.service"}, "0::/user.slice/user-1000.slice/user@1000.service"
+    check(m.boxunit(f"{svc}/app.slice/box-tunnel.service\n", 1000, units) == "box-tunnel.service"
+          and m.boxunit(f"{svc}/app.slice/box-site@a.service\n", 1000, units) == "box-site@a.service",
+          "a task in one of the box's own services, or an instance of its template, is placed by its cgroup")
+    for line, what in ((f"{svc}/app.slice/tmux-spawn-1.scope", "a scope"),
+                       (f"{svc}/app.slice/other.service", "a service the box did not install"),
+                       (f"{svc}/app.slice/box-tunnel.service/sub", "a sub-cgroup of a box service"),
+                       (f"{svc}/app.slice/x/box-tunnel.service", "a non-slice parent"),
+                       ("0::/user.slice/user-1001.slice/user@1001.service/app.slice/box-tunnel.service",
+                        "another UID's manager"),
+                       ("0::/../app.slice/box-tunnel.service", "a path inside a cgroup namespace"),
+                       (f"1:name=systemd:/\n{svc}/app.slice/box-tunnel.service", "a second hierarchy line")):
+        check(m.boxunit(line + "\n", 1000, units) is None, f"{what} is not one of the box's services")
+    check(any(m.UNITS.glob("*.service")), "the launcher's own tree holds the box's unit files", m.UNITS)
+
     # THE FIXTURE VAULT IS NOT IN TMPDIR. The inventory walks every live namespace on the box and refuses one that binds
     # V or any parent of it, as it must. TMPDIR is shared scratch that other sandboxes bind into (a landing's --tree
     # checkout lives there), so a vault under it refused the good record whenever an unrelated one bound a parent

@@ -121,6 +121,32 @@ def counted(info, key):
     return None if found is None else int(found[1])
 
 
+UNITS = BIN.parent.parent / "config/systemd-user"
+
+
+def boxunit(text, uid, units):
+    # The box's own systemd user service a task runs in, read from /proc/<tid>/cgroup, or None. The brief: "Decide it
+    # by a property a member cannot forge, e.g. the process's cgroup or systemd unit under the owner's user manager".
+    # The kernel writes that file and it reads without a ptrace check, so it answers for a non-dumpable task too. A
+    # task enters a service's cgroup only when the user manager starts it there or by a write to that cgroup's
+    # cgroup.procs, and no sandbox on this box has /sys or the manager's bus in /run/user; a task that can reach
+    # either already runs any host command as this user (systemd-run), so this gives it nothing it lacks. Only the
+    # unified hierarchy's one line, under this UID's manager, through slices only, naming a service whose unit file
+    # (or template, for name@instance) is in UNITS: the tree this launcher itself runs from. A path relative to a
+    # cgroup namespace ("/.."), a scope, a sub-cgroup of a service or another UID's manager is None.
+    lines = text.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("0::/"):
+        return None
+    parts = lines[0][3:].split("/")[1:]
+    if parts[:3] != ["user.slice", f"user-{uid}.slice", f"user@{uid}.service"] or len(parts) < 4:
+        return None
+    *slices, name = parts[3:]
+    if not all(s.endswith(".slice") for s in slices) or not re.fullmatch(r"[A-Za-z0-9_.:-]+(@[A-Za-z0-9_.:-]*)?\.service", name):
+        return None
+    stem, at, _ = name.removesuffix(".service").partition("@")
+    return name if (f"{stem}@.service" if at else name) in units else None
+
+
 class Unsettled(ValueError):
     """The pass met a shape that can carry a hold past it; another pass decides, and the last one refuses."""
 
@@ -159,13 +185,16 @@ def inventory(v):
     # after two clean passes in a row see the same candidate tasks. PASSES unsettled passes refuse: a case the walk
     # cannot settle is not clear, and an exception under the walk is an unsettled pass, never a crash. A live
     # task that will not be read is unsettled too, not a refusal on sight: another selfcheck's non-dumpable case
-    # lives for one walk, and if it is still there at the last pass, V is not clear. The
+    # lives for one walk, and if it is still there at the last pass, V is not clear. One exception, decided by the
+    # kernel's cgroup and not by any name: a non-candidate whose only unread parts are its descriptors and mappings and
+    # which runs in one of the box's own systemd user services (boxunit), such as the tunnel connector's pasta. The
     # residue: a namespace that cannot name V but was handed a descriptor on it (inherited, or by SCM_RIGHTS) and
     # outruns the walk; a descriptor queued in a socket a host task holds; a chain whose reaper is outside every candidate (a sandbox
     # without its own pid namespace, which no session is); two live tasks that time a hand-off of a descriptor between
     # this walk's reads of each in two passes running; and an io_uring whose own descriptor was registered
     # (IORING_REGISTER_RING_FDS) and then closed, which nothing in /proc shows; kernel.io_uring_disabled closes
-    # that one, and it is a host setting.
+    # that one, and it is a host setting. And a non-dumpable task in one of the box's own services that runs code the
+    # box did not write (a lesson site's sandbox) and was handed a descriptor on V: its descriptors go unread.
     def mounts(proc):
         rows = []
         for line in (proc / "mountinfo").read_text().splitlines():
@@ -174,6 +203,10 @@ def inventory(v):
             rows.append((fields[2], Path(unescape(fields[3])), Path(unescape(fields[4])), fields[fields.index("-") + 1]))
         return rows
     own = os.readlink("/proc/self/ns/mnt")
+    units = {p.name for p in UNITS.glob("*.service")}
+    # The walk's own service is never one of the box's OTHER sandboxes: what this launcher's own unit starts (a
+    # selfcheck's planted cases, a session it launched) is read like anything else.
+    mine = boxunit(Path("/proc/self/cgroup").read_text(), os.getuid(), units)
     ancestors = {(s.st_dev, s.st_ino) for p in (v, *v.parents) for s in (p.stat(),)}
     vdev = v.stat().st_dev
     dev, root, at, _ = max((m for m in mounts(Path("/proc/self")) if within(v, m[2])), key=lambda m: len(str(m[2])))
@@ -274,6 +307,17 @@ def inventory(v):
             # non-dumpable process is live, and refuses.
             if gone(p):
                 return None
+            # THE BOX'S OWN LONG-LIVED SANDBOXES. pasta isolates itself (an empty tmpfs root, then PR_SET_DUMPABLE 0),
+            # so the tunnel connector's pasta held every provision and launch, and four suites red, for as long as it
+            # ran (2026-10-13). A task whose descriptors and mappings alone refuse, whose mount table did not reach V
+            # and which runs in one of the box's own services (boxunit), not this walk's own, is read: what it holds
+            # is its unit file's doing. Its name and argv decide nothing; a candidate, or any other step, still refuses.
+            if step in ("fd/", "maps") and exc.errno == errno.EACCES and not candidate:
+                try:
+                    if boxunit((p / "cgroup").read_text(), os.getuid(), units) not in (None, mine):
+                        return False
+                except OSError:
+                    pass
             raise Unsettled(f"live namespace {p.name} cannot be inspected ({why(exc, step)})") from None
         for line in maps:
             fields = line.split(maxsplit=5)

@@ -394,6 +394,28 @@ def cmd_selfcheck():
         check("…a unit function or a whole unit the world lacks is a ReplayLeak naming it, not a held job",
               "reviewer.nothing," in leak_of(lambda: _digest_unit(core).nothing)
               and "its tip unit" in leak_of(lambda: answering(lambda lane, name: None)(None, "tip")))
+        lmods = {n: importlib.import_module(f"lander.{n}") for n in ("types", "events", "jobs", "git", "gh", "manifest",
+                                                                      "run", "admission", "members", "records", "lane")}
+        saved = {n: dict(vars(m)) for n, m in lmods.items()}
+        unit_was, wroot = lmods["lane"].Lane.unit, tempfile.mkdtemp(prefix="cc-replay-compiled-")
+        try:
+            ln = lmods["lane"]
+            with tripwire(core):
+                raw = leak_of(lambda: ln.compiled("/nonexistent", "a", "h1")) if hasattr(ln, "compiled") else None
+            stand_in(lmods, LanderWorld({"prs": [], "medians": {"review": 1}, "until": "1970-01-01T00:00:00Z"}, lmods,
+                                        VClock(0, 1), 0, wroot), VClock(0, 1))
+            got = [[]] if not hasattr(ln, "compiled") else []
+            with tripwire(core):
+                if hasattr(ln, "compiled"):
+                    leak_of(lambda: got.append(ln.compiled("/nonexistent", "a", "h1")))
+        finally:
+            for n, m in lmods.items():
+                vars(m).update(saved[n])
+            lmods["lane"].Lane.unit = unit_was
+            shutil.rmtree(wroot, ignore_errors=True)
+        check("…lane.compiled, where the lander has it, is answered with no compiled files ([], never None), not its "
+              "sealed git: unstubbed it is a ReplayLeak under the tripwire",
+              got == [[]] and (raw is None or ("lane.compiled:" in raw and "`git " in raw)))
         check("…and a replay of this checkout's lander called nothing the world does not answer (the line above names it)",
               a.returncode == 0)
         # history's load reaches the candidate's own admission: three PRs side by side on a calm box, and on a box
