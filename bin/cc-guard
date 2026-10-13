@@ -2881,6 +2881,288 @@ W64
   unset GERR; kill "$seat68" 2>/dev/null
   ok "the permission seat's state is fenced like ~/.cc/state/arch — a redirect, cp, rm, a glob, an rm of the directory above it and the Write tool are all refused from anywhere but the live seat, which may still write its own" $r
 
+  # 68b. EVERY SEAT'S LAUNCH SCRIPT IS IN THE SAME FENCE (perms, 2026-10-13). The live perms seat was started from
+  #     ~/.cc/state/hs/launch/perms.sh, which reads perms.argv and perms.env beside it, and every seat has its
+  #     <target>.sh/.argv/.env/.cwd/.pass there. Before the fence a planning seat and an orch passed every shape
+  #     below, and a worker passed every Bash one; a rewritten perms.sh is what the next unsandboxed seat runs.
+  #     Its own fixture: a launch dir of its own, a seat of its own, and three tiers each refused and each kept.
+  r=0; GERR=$T/gerr68b; L68=$H/.cc/state/hs/launch; mkdir -p "$L68" "$H/dev/ctl" "$H/.cc/state/hsx"
+  printf 'exec claude\n' > "$L68/perms.sh"; printf 'x\n' > "$L68/perms.argv"
+  for tier in planning orch worker; do
+    case $tier in   # an orch is the ungated tier too, in the repo's checkout; what tells it apart is its alias
+      planning) c=$H/dev/ctl; e=(); c2=${T2:+$T2/home/dev/ctl};;
+      orch) c=$H/dev/ctl; e=(CC_SLACK_ALIAS=ctl@architect); c2=${T2:+$T2/home/dev/ctl};;
+      worker) c=$WT; e=(CC_ROLE=worker); c2=${T2:+$T2/home/.cc/worktrees/demo/t1};;
+    esac
+    for x in "echo x > $L68/perms.sh" "echo x >> $L68/perms.sh" "echo x | tee $L68/perms.sh" "cp /dev/null $L68/perms.sh" \
+             "mv $T/x68b $L68/perms.sh" "sed -i s/claude/sh/ $L68/perms.sh" "ln -sf $T/x68b $L68/perms.sh" "echo x > $L68/perms.argv" \
+             "ln -sfn $T/evil68b $H/.cc/state/hs" "rm -rf $H/.cc/state/hs" "cd $H/.cc/state && echo x > hs/launch/perms.sh" "D=$H/.cc/state; echo x > \$D/hs/launch/perms.sh"; do
+      : > "$GERR"; got=$(g Bash "$(J "$x")" "$c" "${e[@]}")
+      { [ "$got" = 2 ] && grep -qF "writing a seat's launch script" "$GERR"; } || { r=1; echo "      $tier: not refused as a launch-script write (rc $got): $x — $(head -c 80 "$GERR")"; }
+    done
+    # …and RUNNING the dir's writer passes: hs-clone (~/dev/handoff/bin) writes it with open() inside its own process,
+    # and the hs session runs it as a program, so a fence that refused these would break every seat's recovery
+    for x in "cat $L68/perms.sh" "ls -la $L68" "echo x > $H/.cc/state/hsx/f" "hs-clone capture ctl@architect" \
+             "$H/dev/handoff/bin/hs-clone launch perms" "cd $H/dev/handoff && bin/hs-clone capture perms"; do   # a read, a sibling name and hs-clone pass
+      got=$(g Bash "$(J "$x")" "$c" "${e[@]}"); [ "$got" = 0 ] || { r=1; echo "      $tier: refused what is no launch-script write (rc $got): $x"; }
+    done
+    if [ -n "$T2" ]; then   # the Write tool waves /tmp through as scratch, so its fixture home sits outside /tmp
+      L2=$T2/home/.cc/state/hs/launch; mkdir -p "$L2" "$c2/.cc"; [ "$tier" = worker ] && : > "$c2/.cc/track"; : > "$L2/perms.sh"
+      for tl in Write Edit; do
+        : > "$GERR"; got=$(GH=$T2/home g "$tl" "$(jq -n --arg f "$L2/perms.sh" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c2" "${e[@]}")
+        { [ "$got" = 2 ] && grep -qF "writing a seat's launch script" "$GERR"; } || { r=1; echo "      $tier: the $tl tool into the launch dir was not refused as one (rc $got) — $(head -c 80 "$GERR")"; }
+      done
+    else r=1; echo "      no fixture home outside /tmp to test the Write tool against"; fi
+  done
+  [ "$(cat "$L68/perms.sh")" = "exec claude" ] || { r=1; echo "      the fixture's perms.sh changed — a refusal above did not actually hold"; }
+  # …and the permission seat itself still writes there: a flagged claude, detached, in its own state directory
+  mkdir -p "$H/.cc/state/demo68b/perms"
+  (cd "$H/.cc/state/demo68b/perms" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+  sleep 0.3; seat68b2=""
+  for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+    [ "$(readlink "/proc/$cand/cwd")" = "$H/.cc/state/demo68b/perms" ] && { seat68b2=$cand; break; }
+  done
+  if [ -n "$seat68b2" ]; then got=$(g Bash "$(J "echo x > $L68/perms.argv")" "$T" CC_GUARD_ROOT_PID=$seat68b2)
+    [ "$got" = 0 ] || { r=1; echo "      the permission seat's own write to the launch dir was refused: rc $got"; }
+    kill "$seat68b2" 2>/dev/null
+  else r=1; echo "      no detached fixture claude to test the seat's own write against"; fi
+  unset GERR
+  ok "every seat's launch script (~/.cc/state/hs) is fenced from a planning seat, an orch and a worker — a redirect, append, tee, cp, mv, sed -i, a symlink over the script or the dir, rm and the Write and Edit tools — while a read and a sibling dir pass and the permission seat may still write it" $r
+
+  # 68c. A SEAT'S TRANSCRIPT IS A LAUNCH INPUT, AND NO TIER WRITES IT (perms, 2026-10-13). hs-clone relaunches each
+  #     seat with --resume <sid>, so a line planted in ~/.claude/projects/<proj>/<sid>.jsonl is that seat's own turn
+  #     on relaunch. Before the fence a planning seat and an orch passed every shape below, and a worker every Bash
+  #     one. A session's notes in <proj>/memory are still its own to write, and a read passes.
+  #     Its own fixture: a home of its own outside /tmp (the write rules wave /tmp through), with its own transcripts.
+  r=0; GERR=$T/gerr68c
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H3=$T2/h68c; mkdir -p "$H3/bin" "$H3/dev/ctl" "$H3/dev/demo" "$H3/.cc/worktrees/demo/t1/.cc"; : > "$H3/.cc/worktrees/demo/t1/.cc/track"
+    cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H/bin/cc-failures" "$H3/bin/"
+    pj=$(printf '%s' "$H3/dev/ctl" | tr '/.' '--'); P68=$H3/.claude/projects/$pj; mkdir -p "$P68/s1/subagents"
+    printf '{}\n' > "$P68/s1.jsonl"; printf '{}\n' > "$P68/s1/subagents/a1.jsonl"
+    for tier in planning orch worker; do
+      case $tier in
+        planning) c=$H3/dev/ctl; e=(); mem=$P68/memory;;
+        orch) c=$H3/dev/ctl; e=(CC_SLACK_ALIAS=ctl@architect); mem=$P68/memory;;
+        worker) c=$H3/.cc/worktrees/demo/t1; e=(CC_ROLE=worker); mem=$H3/.claude/projects/$(printf '%s' "$H3/dev/demo" | tr '/.' '--')/memory;;
+      esac
+      for tf in "$P68/s1.jsonl" "$P68/s1/subagents/a1.jsonl"; do
+        for x in "echo {} > $tf" "echo {} >> $tf" "echo {} | tee -a $tf" "cp /dev/null $tf" "mv $T/x68c $tf" "sed -i s/a/b/ $tf" "ln -sf $T/x68c $tf"; do
+          : > "$GERR"; got=$(GH=$H3 g Bash "$(J "$x")" "$c" "${e[@]}")
+          { [ "$got" = 2 ] && grep -qF "writing a session transcript" "$GERR"; } || { r=1; echo "      $tier: not refused as a transcript write (rc $got): $x — $(head -c 80 "$GERR")"; }
+        done
+        for tl in Write Edit; do
+          : > "$GERR"; got=$(GH=$H3 g "$tl" "$(jq -n --arg f "$tf" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c" "${e[@]}")
+          { [ "$got" = 2 ] && grep -qF "writing a session transcript" "$GERR"; } || { r=1; echo "      $tier: the $tl tool into a transcript was not refused as one (rc $got) — $(head -c 80 "$GERR")"; }
+        done
+      done
+      # the dir over them, a glob, and a relative name after a cd: the transcript dirs are all named -home-…
+      for x in "ln -sfn $T/evil68c $P68" "echo {} >> $H3/.claude/projects/*/s1.jsonl" "cd $H3/.claude/projects && echo {} >> $pj/s1.jsonl" \
+               "cd $H3/.claude/projects && echo {} | tee -a -- $pj/s1.jsonl"; do
+        : > "$GERR"; got=$(GH=$H3 g Bash "$(J "$x")" "$c" "${e[@]}")
+        { [ "$got" = 2 ] && grep -qF "writing a session transcript" "$GERR"; } || { r=1; echo "      $tier: not refused as a transcript write (rc $got): $x — $(head -c 80 "$GERR")"; }
+      done
+      # kept: a read of a transcript, and the session's own notes through the Write and Edit tools
+      got=$(GH=$H3 g Bash "$(J "tail -1 $P68/s1.jsonl")" "$c" "${e[@]}"); [ "$got" = 0 ] || { r=1; echo "      $tier: reading a transcript was refused (rc $got)"; }
+      for tl in Write Edit; do
+        got=$(GH=$H3 g "$tl" "$(jq -n --arg f "$mem/MEMORY.md" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c" "${e[@]}")
+        [ "$got" = 0 ] || { r=1; echo "      $tier: the $tl tool into its own memory was refused (rc $got)"; }
+      done
+    done
+    [ "$(cat "$P68/s1.jsonl")" = "{}" ] || { r=1; echo "      the fixture's transcript changed — a refusal above did not actually hold"; }
+  fi
+  unset GERR
+  ok "a session transcript (~/.claude/projects/<proj>/*.jsonl, subagents included) is fenced from a planning seat, an orch and a worker — a redirect, append, tee, cp, mv, sed -i, a symlink, a glob, a -home-… name after a cd and the Write and Edit tools — while a read passes and each session still writes its own memory" $r
+
+  # 68d. THE PERMISSION SEAT'S MEMORY AND EVERY SHELL STARTUP FILE ARE LAUNCH INPUTS, AND NO OTHER CALLER WRITES THEM
+  #     (perms, 2026-10-13). Perms' MEMORY.md loads into every perms start, and a session sources its shell snapshot
+  #     before every Bash call (a login shell reads ~/.bashrc and the rest). Before the fence a planning seat and an
+  #     orch passed every shape below on each of them, and a worker every Bash one, even with its cwd in the seat's dir.
+  #     Kept: the seat writing its own memory from its own state dir, a planning seat's own memory, a read, and
+  #     core/install.sh (it appends to ~/.bashrc) run as a program. Its own fixture: a home outside /tmp and a seat.
+  r=0; GERR=$T/gerr68d
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H4=$T2/h68d; SD4=$H4/.cc/state/demo/perms; mkdir -p "$H4/bin" "$H4/dev/ctl" "$H4/dev/demo" "$H4/.cc/worktrees/demo/t1/.cc" "$SD4" "$H4/.claude/shell-snapshots"
+    : > "$H4/.cc/worktrees/demo/t1/.cc/track"; cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H/bin/cc-failures" "$H4/bin/"
+    PM4=$H4/.claude/projects/$(printf '%s' "$SD4" | tr '/.' '--')/memory; mkdir -p "$PM4"; printf 'seat\n' > "$PM4/MEMORY.md"
+    for lf in .bashrc .profile .bash_profile .bash_login .claude/shell-snapshots/snapshot-bash-1.sh; do printf '#\n' > "$H4/$lf"; done
+    for tier in planning orch worker; do
+      case $tier in
+        planning) c=$H4/dev/ctl; e=(); own=$H4/.claude/projects/$(printf '%s' "$H4/dev/ctl" | tr '/.' '--')/memory;;
+        orch) c=$H4/dev/ctl; e=(CC_SLACK_ALIAS=ctl@architect); own=$H4/.claude/projects/$(printf '%s' "$H4/dev/ctl" | tr '/.' '--')/memory;;
+        worker) c=$H4/.cc/worktrees/demo/t1; e=(CC_ROLE=worker); own=$H4/.claude/projects/$(printf '%s' "$H4/dev/demo" | tr '/.' '--')/memory;;
+      esac
+      for lf in "$PM4/MEMORY.md" "$H4/.bashrc" "$H4/.profile" "$H4/.bash_profile" "$H4/.bash_login" "$H4/.claude/shell-snapshots/snapshot-bash-1.sh"; do
+        case "$lf" in "$PM4"/*) why="writing the permission seat's project dir";; *) why="writing a shell startup file";; esac
+        for x in "echo x > $lf" "echo x >> $lf" "echo x | tee -a $lf" "cp /dev/null $lf" "mv $T/x68d $lf" "sed -i s/a/b/ $lf" "ln -sf $T/x68d $lf"; do
+          : > "$GERR"; got=$(GH=$H4 g Bash "$(J "$x")" "$c" "${e[@]}")
+          { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } || { r=1; echo "      $tier: not refused as $why (rc $got): $x — $(head -c 80 "$GERR")"; }
+        done
+        for tl in Write Edit; do
+          : > "$GERR"; got=$(GH=$H4 g "$tl" "$(jq -n --arg f "$lf" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c" "${e[@]}")
+          { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } || { r=1; echo "      $tier: the $tl tool was not refused as $why (rc $got): $lf — $(head -c 80 "$GERR")"; }
+        done
+      done
+      # a cwd is no pass: any session can `cd` into the seat's dir, and the next call carries that cwd
+      : > "$GERR"; got=$(GH=$H4 g Write "$(jq -n --arg f "$PM4/MEMORY.md" '{file_path:$f,content:"x"}')" "$SD4" "${e[@]}")
+      { [ "$got" = 2 ] && grep -qF "writing the permission seat's project dir" "$GERR"; } || { r=1; echo "      $tier: a Write into the seat's memory from the seat's cwd, by a non-seat, passed (rc $got)"; }
+      # …and `cp /tmp/d/.bashrc ~/` writes ~/.bashrc as surely as naming it
+      : > "$GERR"; got=$(GH=$H4 g Bash "$(J "cp $T/d68d/.bashrc $H4/")" "$c" "${e[@]}")
+      { [ "$got" = 2 ] && grep -qF "writing a shell startup file" "$GERR"; } || { r=1; echo "      $tier: cp of a .bashrc into the home was not refused (rc $got)"; }
+      # kept: its own memory, a read, and the one tool that writes ~/.bashrc, run as a program
+      for tl in Write Edit; do
+        got=$(GH=$H4 g "$tl" "$(jq -n --arg f "$own/MEMORY.md" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c" "${e[@]}")
+        [ "$got" = 0 ] || { r=1; echo "      $tier: the $tl tool into its own memory was refused (rc $got)"; }
+      done
+      for x in "cat $H4/.bashrc $PM4/MEMORY.md" "bash $H4/dev/ctl/core/install.sh" "core/install.sh"; do
+        got=$(GH=$H4 g Bash "$(J "$x")" "$c" "${e[@]}"); [ "$got" = 0 ] || { r=1; echo "      $tier: refused what writes no launch input (rc $got): $x"; }
+      done
+    done
+    # …and the seat itself still writes its own memory: a flagged claude, detached, with its state dir as its cwd
+    (cd "$SD4" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+    sleep 0.3; seat68d=""
+    for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+      [ "$(readlink "/proc/$cand/cwd")" = "$SD4" ] && { seat68d=$cand; break; }
+    done
+    if [ -n "$seat68d" ]; then
+      got=$(GH=$H4 g Write "$(jq -n --arg f "$PM4/MEMORY.md" '{file_path:$f,content:"x"}')" "$SD4" CC_GUARD_ROOT_PID=$seat68d)
+      [ "$got" = 0 ] || { r=1; echo "      the permission seat's Write into its own memory was refused: rc $got"; }
+      got=$(GH=$H4 g Bash "$(J "echo x >> $H4/.bashrc")" "$SD4" CC_GUARD_ROOT_PID=$seat68d)   # …but not a startup file
+      [ "$got" = 2 ] || { r=1; echo "      the permission seat's append to ~/.bashrc passed: rc $got"; }
+      kill "$seat68d" 2>/dev/null
+    else r=1; echo "      no detached fixture claude to test the seat's own write against"; fi
+    [ "$(cat "$H4/.bashrc")" = "#" ] || { r=1; echo "      the fixture's .bashrc changed — a refusal above did not actually hold"; }
+  fi
+  unset GERR
+  ok "the permission seat's project memory and every shell startup file (~/.bashrc, ~/.profile, ~/.bash_profile, ~/.bash_login, ~/.claude/shell-snapshots) are fenced from a planning seat, an orch and a worker, from the seat's own cwd too, while the seat writes its own memory, each session its own, and core/install.sh still runs" $r
+
+  # 68e. A SESSION'S HOOK ENV FILES ARE SOURCED INTO ITS BASH CALLS, AND NO TIER WRITES THEM (perms item 5,
+  #     2026-10-13). Claude Code writes ~/.claude/session-env/<session-id>/ (CLAUDE_ENV_FILE) from hook processes and
+  #     sources it into that session's Bash commands, as it does the shell snapshot. Before the fence a planning seat
+  #     and an orch passed every shape below, removal included, and a worker every write. A read still passes.
+  #     Its own fixture: a home outside /tmp with one session's env dir.
+  r=0; GERR=$T/gerr68e
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H5=$T2/h68e; SE5=$H5/.claude/session-env/0b6e-sid; mkdir -p "$H5/bin" "$H5/dev/ctl" "$H5/.cc/worktrees/demo/t1/.cc" "$SE5"
+    : > "$H5/.cc/worktrees/demo/t1/.cc/track"; cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H/bin/cc-failures" "$H5/bin/"; printf '#\n' > "$SE5/hook-1.sh"
+    for tier in planning orch worker; do
+      case $tier in
+        planning) c=$H5/dev/ctl; e=();;
+        orch) c=$H5/dev/ctl; e=(CC_SLACK_ALIAS=ctl@architect);;
+        worker) c=$H5/.cc/worktrees/demo/t1; e=(CC_ROLE=worker);;
+      esac
+      ef=$SE5/hook-1.sh
+      for x in "echo x > $ef" "echo x >> $ef" "echo x | tee -a $ef" "cp /dev/null $ef" "mv $T/x68e $ef" "sed -i s/a/b/ $ef" "ln -sf $T/x68e $ef" \
+               "cp $T/x68e.sh -t $SE5" "echo x > $H5/.claude/session-env/*/hook-1.sh" "rm -f $ef" "rm -rf $SE5" "rm -rf $H5/.claude/session-env"; do
+        : > "$GERR"; got=$(GH=$H5 g Bash "$(J "$x")" "$c" "${e[@]}")
+        # a worker's rm -rf outside its tree meets the recursive-delete rule first, on main as here: rc 2 is the answer
+        case "$tier:$x" in worker:rm\ -rf*) [ "$got" = 2 ] || { r=1; echo "      worker: not refused (rc $got): $x"; }; continue;; esac
+        { [ "$got" = 2 ] && grep -qF "writing a shell startup file" "$GERR"; } || { r=1; echo "      $tier: not refused as a session env write (rc $got): $x — $(head -c 80 "$GERR")"; }
+      done
+      for tl in Write Edit; do
+        : > "$GERR"; got=$(GH=$H5 g "$tl" "$(jq -n --arg f "$ef" '{file_path:$f,old_string:"a",new_string:"x",content:"x"}')" "$c" "${e[@]}")
+        { [ "$got" = 2 ] && grep -qF "writing a shell startup file" "$GERR"; } || { r=1; echo "      $tier: the $tl tool into session-env was not refused as one (rc $got) — $(head -c 80 "$GERR")"; }
+      done
+      got=$(GH=$H5 g Bash "$(J "cat $ef; ls $SE5")" "$c" "${e[@]}"); [ "$got" = 0 ] || { r=1; echo "      $tier: reading session-env was refused (rc $got)"; }
+    done
+    [ "$(cat "$SE5/hook-1.sh")" = "#" ] || { r=1; echo "      the fixture's env file changed — a refusal above did not actually hold"; }
+  fi
+  unset GERR
+  ok "a session's hook env files (~/.claude/session-env/<id>/) are fenced from a planning seat, an orch and a worker — a redirect, append, tee, cp, cp -t, mv, sed -i, a symlink, a glob, rm and the Write and Edit tools — while a read passes" $r
+
+  # 68f. THE PERMS HANDBACK AT 29572d21, AND A CLAUDE STARTED IN THE SEAT'S DIRECTORY (perms, 2026-10-13). Each row
+  #     below passed on that head: a brace naming two startup files, a literal launch-input path in a python, perl or
+  #     node one-liner, truncate and rm of one, and a claude started with the call's cwd in the seat's dir or by a
+  #     …/perms path a variable splits. Kept: the over-blocks it found (a repo's own tests/fixtures/.profile after an
+  #     unresolvable cd, `cp CLAUDE.md ~/.claude/`), a file in ~/.cc/state/hs outside launch/, `source ~/.bashrc`, a
+  #     plain interpreter, a commit message that says claude, and the seat writing its memory from a subdir.
+  #     The planning read of 955e52c8 adds a flag with no space after it (python3 -c"…"), node -p, awk and gawk
+  #     writing, and launch-dir spellings the fold must open (state//hs, state/./hs, state/x/../hs, hs/., hs/x/..);
+  #     those rows name run.sh, because a name with "perms" in it trips the older gate and proves nothing.
+  #     Its own fixture: a home outside /tmp, a seat dir and a flagged fixture claude of its own.
+  r=0; GERR=$T/gerr68f
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H6=$T2/h68f; SD6=$H6/.cc/state/demo/perms; mkdir -p "$H6/bin" "$H6/dev/ctl/tests/fixtures" "$H6/.cc/worktrees/demo/t1/.cc" "$SD6/sub" "$H6/.cc/state/hs/launch"
+    : > "$H6/.cc/worktrees/demo/t1/.cc/track"; cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H/bin/cc-failures" "$H6/bin/"
+    PM6=$H6/.claude/projects/$(printf '%s' "$SD6" | tr '/.' '--')/memory; mkdir -p "$PM6" "$H6/.claude/projects/-p"
+    for lf in .bashrc .profile .bash_profile; do printf '#\n' > "$H6/$lf"; done
+    for tier in planning orch worker; do
+      case $tier in
+        planning) c=$H6/dev/ctl; e=();;
+        orch) c=$H6/dev/ctl; e=(CC_SLACK_ALIAS=ctl@architect);;
+        worker) c=$H6/.cc/worktrees/demo/t1; e=(CC_ROLE=worker);;
+      esac
+      # recurring-defect-ok: pause-hold-missing — selfcheck refusal fixtures name claude launches; nothing here launches
+      while IFS='|' read -r why cw x; do
+        [ -n "$x" ] || continue; [ "$cw" = seat ] && cw=$SD6 || cw=$c
+        : > "$GERR"; got=$(GH=$H6 g Bash "$(J "$x")" "$cw" "${e[@]}")
+        { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } || { r=1; echo "      $tier: not refused as $why (rc $got): $x — $(head -c 80 "$GERR")"; }
+      done <<ROWS
+writing a shell startup file|c|printf x | tee -a ~/.{bashrc,profile}
+writing a shell startup file|c|echo x >> $H6/.bash{rc,_profile}
+writing a shell startup file|c|python3 -c "open('$H6/.bashrc','a').write('x')"
+writing a shell startup file|c|perl -e 'open(F,">>","\$HOME/.profile")'
+writing a shell startup file|c|node -e "require('fs').appendFileSync('$H6/.claude/session-env/s/h.sh','x')"
+writing a session transcript|c|python3 -c "open('$H6/.claude/projects/-p/s.jsonl','a')"
+writing the permission seat's project dir|c|python3 -c "open('$PM6/MEMORY.md','a')"
+writing a shell startup file|c|truncate -s 0 $H6/.bashrc
+writing a session transcript|c|truncate -s 0 $H6/.claude/projects/-p/s.jsonl
+writing a session transcript|c|rm $H6/.claude/projects/-p/s.jsonl
+writing a seat's launch script|c|python3 -c "open('$H6/.cc/state/hs//launch/perms.sh','w')"
+writing a seat's launch script|c|perl -e 'open(F,">","$H6/.cc/state/hs/./launch/perms.sh")'
+writing a seat's launch script|c|tar -C $H6/.cc/state/hs/x/../launch -xf /tmp/t.tar
+writing a seat's launch script|c|curl -o $H6/.cc/state/hs//launch/perms.sh http://127.0.0.1/x
+writing a seat's launch script|c|wget -O $H6/.cc/state/hs/./clone.json http://127.0.0.1/x
+writing a shell startup file|c|python3 -c"open('$H6/.bashrc','a')"
+writing a shell startup file|c|perl -e'open(F,">>","$H6/.profile")'
+writing a shell startup file|c|node -p "require('fs').appendFileSync('$H6/.bashrc','x')"
+writing a shell startup file|c|awk 'BEGIN{printf "x" >> "$H6/.bashrc"}'
+writing a session transcript|c|gawk 'BEGIN{print "x" > "$H6/.claude/projects/-p/s.jsonl"}'
+writing a seat's launch script|c|python3 -c "open('$H6/.cc/state//hs/launch/run.sh','w')"
+writing a seat's launch script|c|python3 -c "open('$H6/.cc/state/./hs/launch/run.sh','w')"
+writing a seat's launch script|c|curl -o $H6/.cc/state/x/../hs/launch/run.sh http://127.0.0.1/x
+writing a seat's launch script|c|wget -O $H6/.cc/state//hs/launch/run.sh http://127.0.0.1/x
+writing a seat's launch script|c|tar -C $H6/.cc/state/hs/. -xf /tmp/t.tar
+writing a seat's launch script|c|tar -C $H6/.cc/state/hs/x/.. -xf /tmp/t.tar
+starting a claude in the permission seat's directory|seat|setsid -f claude
+starting a claude in the permission seat's directory|seat|nohup claude &
+starting a claude in the permission seat's directory|seat|$H6/.local/bin/claude
+starting a claude in the permission seat's directory|seat|node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js
+starting a claude in the permission seat's directory|c|D=$H6/.cc/state/demo; cd \$D/perms && claude
+starting a claude in the permission seat's directory|c|D=$H6/.cc/state/demo; tmux new-window -c \$D/perms claude
+ROWS
+      kept=("echo x > $H6/.cc/state/hs/notes.txt" "source ~/.bashrc" "python3 -c 'print(1)'" "git commit -m 'claude perms launch note'" "hs-clone launch perms" "claude -p hi"
+            "python3 -c \"open('$H6/.cc/state/hs/other/n.txt','w')\"" "grep x $H6/.claude/projects/-p/*.jsonl | awk '{print}'"
+            "python3 tool.py $H6/.claude/projects/-p/s.jsonl" "awk '{print}' ~/.profile" "source ~/.bashrc && python3 tool.py"
+            "awk '\$1>3' $H6/.claude/projects/-p/s.jsonl" "cat $H6/.cc/state//hs/launch/run.sh" "echo x > $H6/.cc/state/hs/x/../other/n.txt")
+      # the over-blocks are the ungated tier's: a worker meets the relative-path and outside-its-tree rules for its own reasons
+      [ "$tier" = worker ] || kept+=("cd \"\$(git rev-parse --show-toplevel)\" && echo x > tests/fixtures/.profile" "cp CLAUDE.md $H6/.claude/")
+      for x in "${kept[@]}"; do
+        : > "$GERR"; got=$(GH=$H6 g Bash "$(J "$x")" "$c" "${e[@]}"); [ "$got" = 0 ] || { r=1; echo "      $tier: refused what is kept (rc $got): $x — $(head -c 80 "$GERR")"; }
+      done
+    done
+    # …and the seat writes its own memory from a SUBDIR of its dir: the memory is keyed on the seat process's cwd
+    (cd "$SD6" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+    sleep 0.3; seat68f=""
+    for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+      [ "$(readlink "/proc/$cand/cwd")" = "$SD6" ] && { seat68f=$cand; break; }
+    done
+    if [ -n "$seat68f" ]; then
+      got=$(GH=$H6 g Write "$(jq -n --arg f "$PM6/MEMORY.md" '{file_path:$f,content:"x"}')" "$SD6/sub" CC_GUARD_ROOT_PID=$seat68f)
+      [ "$got" = 0 ] || { r=1; echo "      the seat's Write into its own memory from a subdir was refused: rc $got"; }
+      got=$(GH=$H6 g Bash "$(J "setsid -f claude")" "$SD6" CC_GUARD_ROOT_PID=$seat68f)   # the seat itself may start one
+      [ "$got" = 0 ] || { r=1; echo "      the seat's own claude launch was refused: rc $got"; }
+      kill "$seat68f" 2>/dev/null
+    else r=1; echo "      no detached fixture claude to test the seat's own write against"; fi
+    [ "$(cat "$H6/.bashrc")" = "#" ] || { r=1; echo "      the fixture's .bashrc changed — a refusal above did not actually hold"; }
+  fi
+  unset GERR
+  ok "the perms handback's holes are closed at every tier — a brace over startup files, a literal launch-input path in a python, perl or node one-liner, truncate and rm of one, and a claude started in the seat's dir — while its over-blocks pass, the rest of ~/.cc/state/hs is writable, and the seat writes its memory from a subdir" $r
+
   # 69. A BUILDER THE NON-LIVE SEAT STARTED BEFORE THE CUTOVER STILL PUSHES (row raised-a-nonlive-seats-builder-
   #     strands-its-fix). 2026-09-30: during a planning handoff the old seat's builder finished a gated fix, and its
   #     commit-and-push was refused because its calls carry the parent's session id; the live successor's retry
@@ -5344,10 +5626,16 @@ secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HO
 # WHO THE SEAT IS COMES FROM THE PROCESS, never from anything a model can type: the nearest `claude` above this hook,
 # its own argv carrying --dangerously-skip-permissions, and no second `claude` above it — a session that launches a
 # child claude with the flag (the one way a gated tier could forge the yes) has its own claude over the child.
+# EVERY SEAT'S LAUNCH SCRIPT SITS IN THE SAME FENCE: ~/.cc/state/hs/launch holds <target>.sh/.argv/.env/.cwd/.pass,
+# and the next perms seat (or any seat) is started from that script, unsandboxed, so whoever rewrites it chooses
+# what that session runs. ~/.cc/state/hs/launch[/…] and hs/clone.json are fenced, and so is ~/.cc/state/hs itself
+# as a target (a symlink planted there would redirect the launch dir); the rest of hs is not (perms, over-blocking). Its writer is hs-clone (~/dev/handoff/bin, outside this repo), which the hs session
+# RUNS: `hs-clone capture|launch <target>` names no path here, so it passes, and its Python open() calls are inside
+# that process, where no hook sees them. A redirect, cp or Write into the dir is refused; the seat's own, as above.
 # $CC_GUARD_ROOT_PID is the test hook, as for the kill fence, and here it is honoured only in a HOME that is not the
 # account's own: the selfcheck runs in a fixture HOME, and a session that starts a child with a fake HOME has already
 # left every path fence in this file (they are all spelled from $HOME) and holds no credentials to run it with.
-psk=""
+psk=""; psd=""
 pseat(){   # rc 0 = this call comes from the permission seat
   [ -n "$psk" ] && { [ "$psk" = 1 ]; return; }
   local p="" n=0 home
@@ -5367,32 +5655,76 @@ pseat(){   # rc 0 = this call comes from the permission seat
   # else is not the seat, however it was launched (security re-review: `setsid -f claude --dangerously-…` passed).
   local d; d=$(readlink "/proc/$p/cwd" 2>/dev/null)
   case "$d" in "$HOME"/.cc/state/?*/perms) case "${d#"$HOME"/.cc/state/}" in */*/*) return 1;; esac;; *) return 1;; esac
+  psd=$d   # the seat's own dir, from its process: linput keys its memory on this, which a `cd` in a call cannot move
   n=0; local q; q=$(kppid "$p")
   while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
     [ "$(cat "/proc/$q/comm" 2>/dev/null)" = claude ] && return 1
     q=$(kppid "$q"); n=$((n+1)); done
   psk=1; return 0; }
-pstate(){   # rc 0 = the absolute, resolved path $1 is the seat's state: ~/.cc/state/<one name>/perms[/…] or its handoff files
+pstate(){   # rc 0 = the absolute, resolved path $1 is the seat's state: ~/.cc/state/<one name>/perms[/…], its handoff files, or the seats' launch scripts (~/.cc/state/hs, hs/launch[/…], hs/clone.json)
   local r
+  case "$1" in "$HOME"/.cc/state/hs|"$HOME"/.cc/state/hs/launch|"$HOME"/.cc/state/hs/launch/*|"$HOME"/.cc/state/hs/clone.json) return 0;; esac
   case "$1" in "$HOME"/.cc/state/handoff/perms.json|"$HOME"/.cc/state/handoff/perms.json.tmp|"$HOME"/.cc/state/handoff/perms.brief) return 0;; esac
   case "$1" in "$HOME"/.cc/state/?*/perms|"$HOME"/.cc/state/?*/perms/*) r=${1#"$HOME"/.cc/state/}; r=${r#*/}
     case "$r" in perms|perms/*) return 0;; esac;; esac
   return 1; }
 pabove(){   # rc 0 = $1 is a directory with the seat's state INSIDE it: removing or moving it takes the state with it
   local s
-  for s in "$HOME"/.cc/state/*/perms "$HOME"/.cc/state/handoff/perms.json "$HOME"/.cc/state/handoff/perms.brief; do
+  for s in "$HOME"/.cc/state/*/perms "$HOME"/.cc/state/handoff/perms.json "$HOME"/.cc/state/handoff/perms.brief "$HOME"/.cc/state/hs/launch "$HOME"/.cc/state/hs/clone.json; do
     [ -e "$s" ] || continue; case "$s" in "$1"/*) return 0;; esac; done
   return 1; }
 # pstate/pseat/pabove above are the primitives; wtgt and rmtgt below fold them into the same write/remove scan
 # that already fences ~/dev, ~/bin and ~/.cc/state/arch, so every shape those two already catch (a redirect, a
 # cp/mv/tee/sed/dd/git target, an rm/rmdir/unlink/find -delete, and the glob form of each) reaches the perms fence
 # too, rather than a third parallel scanner a future edit to wtgt/rmtgt could silently stop matching.
-pdeny(){ never "writing the permission seat's state ($phit) — only that seat writes ~/.cc/state/<repo>/perms and its handoff record, because whoever writes its brief.md controls the next permission-skipping session; reading it is fine"; }
+pdeny(){ case "$phit" in "$HOME"/.cc/state/hs|"$HOME"/.cc/state/hs/*|*'~/.cc/state/hs '*) never "writing a seat's launch script ($phit) — ~/.cc/state/hs/launch holds the script, argv and env every seat (the permission seat included) is started from, so whoever writes it chooses what the next unsandboxed session runs; only the permission seat writes there, and reading it is fine";; esac
+  never "writing the permission seat's state ($phit) — only that seat writes ~/.cc/state/<repo>/perms and its handoff record, because whoever writes its brief.md controls the next permission-skipping session; reading it is fine"; }
 # A COMMAND THAT NAMES THE SEAT'S STATE AND IS NOT A PLAIN READ IS REFUSED, whatever writes it. The scan in wtgt
 # judges targets it can resolve, and a `$D/brief.md`, a python open(), os.link, touch or link names the file in a way
 # it cannot (security re-review: each passed). pmention reads the command as typed; pread passes only statements
 # whose first word is on a read-only list (not rg: its --pre runs a command), with no redirect into a file and no substitution to run something else.
-pmention(){ grep -qE '\.cc/state/[^/[:space:]]+/perms([/'\''"[:space:];&|)]|$)|\.cc/state/handoff/perms\.(json|brief)|\.cc/state.*[^[:alnum:]_.-]perms/(brief\.md|ledger\.md|\.claude)' <<<"$1"; }
+# Every match below reads pfold's text: the command as typed and, under it, a copy with //, /./ and x/../ folded,
+# and a /. or /x/.. ending a word too, so .cc/state//hs, hs/./launch and `tar -C hs/.` name the dir they open
+# (planning reads of 3e5dfc54 and 955e52c8). The typed line stays in, so nothing the fold changes gets through.
+pfold(){ printf '%s\n' "$1"; sed -E ':a; s#//+#/#g; s#/\./#/#g; s#/[^/[:space:]'\''"]+/\.\./#/#g; s#/\.(['\''"[:space:];&|)]|$)#\1#g; s#/[^/[:space:]'\''"]+/\.\.(['\''"[:space:];&|)]|$)#\1#g; ta' <<<"$1"; }
+pmention(){ grep -qE '\.cc/state/[^/[:space:]]+/perms([/'\''"[:space:];&|)]|$)|\.cc/state/handoff/perms\.(json|brief)|\.cc/state.*[^[:alnum:]_.-]perms/(brief\.md|ledger\.md|\.claude)' <<<"$1" || hsmention "$1"; }
+hsmention(){   # …the seats' launch scripts, named as typed or split by a variable ($1 is pfold's text)
+  grep -qE '\.cc/state/hs/?(['\''"[:space:];&|)]|$)|\.cc/state/hs/(launch|clone\.json)|\.cc/state.*[^[:alnum:]_.-]hs/(launch|clone\.json)' <<<"$1"; }
+# WHAT A SEAT READS AS ITS OWN WHEN IT STARTS OR RUNS A COMMAND IS A LAUNCH INPUT TOO (perms, 2026-10-13), and
+# linput fences three kinds of it ($lkind says which, for ldeny):
+#  t  A TRANSCRIPT. hs-clone relaunches every seat with --resume <sid>, so the turns in ~/.claude/projects/<proj>/
+#     <sid>.jsonl (and its subagents/*.jsonl) become that seat's own. Claude Code writes them outside any tool call
+#     and hs-clone only reads them, so every *.jsonl under ~/.claude/projects is fenced from EVERY tier, the
+#     permission seat included, and so are ~/.claude/projects and each <proj> dir as a target (a symlink or mv
+#     there swaps the whole set). ~/.claude itself is not: `cp CLAUDE.md ~/.claude/` writes the owner's own file, and
+#     a source named projects, session-env or shell-snapshots copied into it is judged under it (the cp rule). Composes with #940's perms-transcript rows: this one refuses first.
+#  m  THE PERMISSION SEAT'S PROJECT DIR, memory included: its MEMORY.md and the files it links load into every perms
+#     start. Brief: "Keep memory open only for the caller's OWN project … Fence the perms project directory (glob
+#     *-cc-state-*-perms, memory included) from every caller whose cwd isn't that seat's directory." A call's cwd
+#     moves with any typed `cd`, so the one caller let through is the seat itself (pseat), and the dir is matched
+#     against the slug of the seat PROCESS's cwd ($psd), which a `cd` into a subdir does not move.
+#     Every other <proj>/memory stays open: sessions save their notes there with Write (case 12).
+#  s  A SHELL STARTUP FILE. Every Bash call first sources the session's ~/.claude/shell-snapshots/snapshot-bash-*.sh,
+#     and a login shell reads ~/.bashrc, ~/.profile, ~/.bash_profile and ~/.bash_login, so a line appended to one
+#     runs inside the next session that starts, the seat's included. Claude Code writes the snapshots itself; the
+#     one writer of ~/.bashrc here is core/install.sh, which is RUN, names no such path, and so passes.
+#     ~/.claude/session-env/<session-id>/ is the same kind (perms item 5): Claude Code writes hook env files there
+#     (CLAUDE_ENV_FILE) and sources them into that session's Bash commands. Hooks write it as processes, never as
+#     tool calls, so it is fenced from every tier, and removing it or the ~/.claude above it is refused too (rmtgt).
+# Reading any of them passes. A python open() into one is not caught: the scan reads shell shapes, like the rest.
+linput(){   # rc 0 = the absolute, resolved path $1 is one of those, not the caller's own; sets lkind and lhit
+  lhit=$1; lkind=s
+  case "$1" in "$HOME"/.bashrc|"$HOME"/.profile|"$HOME"/.bash_profile|"$HOME"/.bash_login|"$HOME"/.claude/shell-snapshots|"$HOME"/.claude/shell-snapshots/*|"$HOME"/.claude/session-env|"$HOME"/.claude/session-env/*) return 0;; esac
+  lkind=t
+  case "$1" in "$HOME"/.claude/projects|"$HOME"/.claude/projects/*.jsonl) return 0;; esac
+  case "$1" in "$HOME"/.claude/projects/*) ;; *) return 1;; esac
+  local m=${1#"$HOME"/.claude/projects/}; m=${m%%/*}
+  case "$m" in *-cc-state-*-perms) lkind=m; pseat && [ "$(printf '%s' "$psd" | tr '/.' '--')" = "$m" ] && return 1; return 0;; esac
+  [ "$1" = "$HOME/.claude/projects/$m" ]; }
+ldeny(){ case "$lkind" in
+    s) never "writing a shell startup file ($lhit) — ~/.claude/shell-snapshots/*.sh and ~/.claude/session-env/<session-id>/* are sourced into every Bash call a session makes, and ~/.bashrc, ~/.profile, ~/.bash_profile and ~/.bash_login run in every shell a seat starts, so a line written there runs as that seat; Claude Code and core/install.sh (run as a program) write them. Reading is fine";;
+    m) never "writing the permission seat's project dir ($lhit) — its memory loads into every permission-seat start, so a line written there is text that seat reads as its own; only that seat, from its own state dir, writes it. Reading is fine, and your own project's memory is yours to write";;
+    *) never "writing a session transcript ($lhit) — ~/.claude/projects/<proj>/*.jsonl is what a seat resumes from on relaunch, so a line written there becomes that seat's own turn; only Claude Code writes them. Reading is fine, and a session's notes under <proj>/memory are its own to write";; esac; }
 pread(){
   local s w
   case "$1" in *'$('*|*'`'*|*'<('*|*'>('*) return 1;; esac
@@ -5405,9 +5737,51 @@ pread(){
     case "$w" in cat|head|tail|grep|egrep|ls|stat|wc|jq|diff|cmp|realpath|readlink|test|'['|cd|pwd|md5sum|sha256sum|file|du|echo|true|cc-lib) ;; *) return 1;; esac
   done < <(sed -E 's/\|\||&&|[;|&]/\n/g' <<<"$s")
   return 0; }
-if [ "$tool" = Bash ] && grep -qF 'perms' <<<"$inp"; then
-  praw=$(jq -r '.tool_input.command // ""' <<<"$inp")
-  pmention "$praw" && ! pread "$praw" && ! pseat && { phit="a command naming it that is not a plain read"; pdeny; }
+if [ "$tool" = Bash ]; then
+  praw=$(jq -r '.tool_input.command // ""' <<<"$inp"); pfd=$(pfold "$praw")
+  grep -qE 'perms|state/hs' <<<"$pfd" && pmention "$pfd" && ! pread "$praw" && ! pseat && { phit="a command naming it that is not a plain read"
+    hsmention "$pfd" && phit="a command naming ~/.cc/state/hs that is not a plain read"; pdeny; }
+fi
+# A LAUNCH INPUT NAMED IN AN INTERPRETER ONE-LINER is the same text door as pmention's (perms handback, MEDIUM):
+# `python3 -c "open('/home/u/.bashrc','a')"` names the file in a way wtgt never parses. Only a command that runs an
+# interpreter on an inline program (-c, -e, --eval, a heredoc) is read, so `source ~/.bashrc`, a grep piped to awk
+# and `python3 tool.py x.jsonl` still read; a one-liner that only READS a transcript by its literal path is refused
+# too, and runs as a script instead.
+lmention(){ grep -qE '(~|\$HOME|\$\{HOME\}|/home/[^/[:space:]]+)/\.(bashrc|profile|bash_profile|bash_login)([^[:alnum:]_.-]|$)|\.claude/(shell-snapshots|session-env)|\.claude/projects/[^[:space:]'\''"]*\.jsonl|\.claude/projects/[^/[:space:]'\''"]*-cc-state-[^/[:space:]'\''"]*-perms' <<<"$1" \
+  || grep -qF -e "$HOME/.bashrc" -e "$HOME/.profile" -e "$HOME/.bash_profile" -e "$HOME/.bash_login" <<<"$1"; }   # …and this HOME, spelled out
+linterp(){   # rc 0 = an interpreter runs a program given inline (-c, -e, -p, --eval, php -r, or a heredoc), the flag spaced
+  # from it or not (python3 -c"…", perl -e'…'); a script it runs is not read here. awk's program is always inline, so
+  # awk and gawk count when that program can write: print into a file, a pipe to or from a quoted command, system(),
+  # or gawk's -i inplace. `grep … | awk '{print}'` and `awk '{print}' ~/.profile` read, and pass.
+  grep -qE '(^|[;&|(`[:space:]/])((python[0-9.]*|perl|node|ruby|deno|bun|lua|tclsh)([[:space:]][^;&|]*)?[[:space:]]-[A-Za-z]*[ceEp]([[:space:]'\''"]|$)|(python[0-9.]*|perl|node|ruby|deno|bun|lua|tclsh)([[:space:]][^;&|]*)?[[:space:]]--(eval|print)|php([[:space:]][^;&|]*)?[[:space:]]-r([[:space:]'\''"]|$)|(python[0-9.]*|perl|node|ruby|php|lua|tclsh)[[:space:]]*(-[[:space:]]*)?<<)' <<<"$1" && return 0
+  sed -E 's/[0-9]*>&[0-9-]//g; s/[0-9&]*>>? *\/dev\/null//g' <<<"$1" \
+    | grep -qE '(^|[;&|(`[:space:]/])[gmn]?awk([[:space:]].*)?[[:space:]](.*printf?.*>|.*\|[[:space:]]*"|.*"[[:space:]]*\||.*system[[:space:]]*\(|-i[[:space:]]*inplace|.*--include[=[:space:]]*inplace)'; }
+# A CLAUDE STARTED IN THE PERMISSION SEAT'S DIRECTORY passes pseat's cwd test (perms, next round, (a)): from a call
+# whose cwd is that dir, `setsid -f claude`, `nohup claude`, a path to it or its cli.js all passed, and so did
+# `D=~/.cc/state/<r>; cd $D/perms && claude` and `tmux new-window -c $D/perms claude`. So from every tier but the
+# seat itself, a command that starts a claude is refused when the call's cwd is a seat dir or it names a …/perms path.
+# A launcher word (setsid, nohup, tmux, node, env, …) leads the statement, or claude does; a commit message saying
+# "claude" leads with git and is not a launch.
+claunch(){
+  local s w
+  while IFS= read -r s; do
+    s=${s#"${s%%[![:space:]]*}"}
+    while [[ "$s" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+(.*)$ ]]; do s=${BASH_REMATCH[1]}; done
+    w=${s%%[[:space:]]*}; w=${w//[\"\']/}; w=${w##*/}
+    case "$w" in claude|cli.js) return 0;;
+      setsid|nohup|exec|env|timeout|stdbuf|nice|tmux|screen|node|npx|sudo|script|systemd-run|bash|sh|daemonize)
+        grep -qE '(^|[[:space:]/"'\''])(claude|cli\.js|claude-code)([[:space:]"'\'']|$)' <<<"$s" && return 0;; esac
+  done < <(sed -E 's/\|\||&&|[;|&(]|\$\(/\n/g' <<<"$1")
+  return 1; }
+if [ "$tool" = Bash ]; then
+  lraw=$(jq -r '.tool_input.command // ""' <<<"$inp"); lfd=$(pfold "$lraw")
+  linterp "$lraw" && lmention "$lfd" && ! pread "$lraw" && { lhit="a literal path in an interpreter one-liner"; lkind=s
+    grep -qE '\.jsonl' <<<"$lfd" && lkind=t; grep -qE -- '-cc-state-[^/[:space:]]*-perms' <<<"$lfd" && lkind=m; ldeny; }
+  if claunch "$lraw" && ! pread "$lraw"; then
+    lsd=""; case "$cwd" in "$HOME"/.cc/state/?*/perms|"$HOME"/.cc/state/?*/perms/*) lsd=1;; esac
+    grep -qE '/perms/?([[:space:]'\''";&|)]|$)' <<<"$lfd" && lsd=1
+    [ -n "$lsd" ] && ! pseat && never "starting a claude in the permission seat's directory (the call's cwd, or a …/perms path it names) — a claude there passes the seat check and writes the seat's state, so only the owner starts one, through the seat's own launcher"
+  fi
 fi
 [ -n "$pfonly" ] && case "$tool" in Bash|Edit|Write|MultiEdit|NotebookEdit) ;; *) exit 0;; esac   # nothing else reaches the seat's state
 case "$tool" in
@@ -5806,14 +6180,29 @@ case "$tool" in
     # one: does a fenced path begin with it. An exact path is unchanged — it means itself and nothing else.
     wspan(){ local t=$1 p; shift          # rc 0 = the cut prefix $t spans one of the fenced roots $@; $hit says which
       for p; do case "$p" in "$t"*) hit=$p; return 0;; esac; done; return 1; }
+    # A GLOB OVER A LAUNCH INPUT (linput): $1 the resolved cut prefix, $2 that prefix as typed, $3 the whole name.
+    # A prefix that could still grow into a startup file or ~/.claude/projects is refused; one inside a <proj> dir
+    # is judged on that dir (the seat's) and on its tail, which a .jsonl, a glob or a .. could make a transcript.
+    lglob(){ local p m r tail=${3:${#2}}; lhit=$3
+      for p in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.claude/shell-snapshots" "$HOME/.claude/session-env"; do
+        case "$p" in "$1"*) lkind=s; ldeny;; esac; done
+      case "$1" in "$HOME"/.claude/shell-snapshots/*|"$HOME"/.claude/session-env/*) lkind=s; ldeny;; esac
+      lkind=t; case "$HOME/.claude/projects" in "$1"*) ldeny;; esac
+      case "$1" in "$HOME"/.claude/projects/*) ;; *) return 0;; esac
+      r=${1#"$HOME"/.claude/projects/}; m=${r%%/*}
+      [ "$r" = "$m" ] && case "$2" in */) ;; *) ldeny;; esac   # the <proj> name itself is cut: it could be any, the seat's too
+      linput "$HOME/.claude/projects/$m/memory" && ldeny
+      lkind=t; case "$tail" in *.jsonl|*..*) ldeny;; esac
+      case "${3##*/}" in *['*?[']*) case "$1/" in "$HOME/.claude/projects/$m/memory/"*) ;; *) ldeny;; esac;; esac
+      return 0; }
     # THE UNGATED TIER'S RELATIVE WRITE AFTER A `cd` THIS CANNOT RESOLVE: refused only when some part of the name, glob
     # and all, could be the seat's state or climb out of where it landed. That tier can edit this file in ~/dev, so
     # its fence guards against a mistake, not an adversary, and a planning seat's `cd "$(git rev-parse …)"` stays free.
     prel(){ local c n; local -a parts; IFS=/ read -ra parts <<<"$1"
-      for c in "${parts[@]}"; do for n in perms brief.md ledger.md .claude perms.json perms.brief ..; do
+      for c in "${parts[@]}"; do for n in perms brief.md ledger.md .claude perms.json perms.brief .. shell-snapshots session-env; do
         # shellcheck disable=SC2053  # $c unquoted on purpose: a glob in the name is matched as a glob
         [[ $n == $c ]] && return 0; done; done; return 1; }
-    wtgt(){ local t=${1%\`} g=""   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
+    wtgt(){ local t=${1%\`} g="" tf tq   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
       # A GLOB IS NOT AN UNRESOLVABLE NAME. It is a name with a tail this cannot see, and the head of it says
       # where the write LANDS: `cp /dev/null ~/bin/cc-guar?` truncated a live binary while this waved it
       # through for carrying a `?` (6th adversarial review of #243). The literal prefix is judged; `~/bin/x?`
@@ -5823,7 +6212,8 @@ case "$tool" in
       # called unresolvable and waved through (5th adversarial review of #243). It is a boundary, not a name.
       # shellcheck disable=SC2088  # a literal ~ in a case pattern is the point: it is being expanded by hand
       case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
-      case "$t" in *['*?[']*) g=1; t=${t%%[*?[]*};; esac   # …so the glob is cut off and its prefix judged, both ways (wspan)
+      tf=$t; case "$t" in *['*?[{']*) g=1; t=${t%%[*?[{]*};; esac   # …so the glob (a brace too) is cut off and its prefix judged, both ways (wspan)
+      tq=$t   # the cut prefix as typed: a trailing / says its last name is whole (linput's glob rule)
       case "$t" in ''|-*|*['$`']*) return 1;; /*) ;;
         *) [ -n "$wbase" ] || { [ -n "$pfonly" ] && ! prel "${1%\`}" && return 1; never "writing to a relative path after a \`cd\` this cannot resolve — where it would land is unknown, so it is refused rather than guessed"; }
            t=$wbase/$t;; esac
@@ -5849,8 +6239,10 @@ case "$tool" in
       # belongs to and nobody else — except the "one process" here is the live bypass seat (pseat), not a fixed
       # in_root check, because the seat is not launched as a normal track. See pstate/pseat, defined above.
       pstate "$t" && { pseat && return 1; phit=$t; pdeny; }
+      [ -z "$g" ] && linput "$t" && ldeny   # every tier: see linput
+      [ -n "$g" ] && lglob "$t" "$tq" "$tf"
       [ -n "$g" ] && { [ -z "$pfonly" ] && wspan "$t" "$HOME/dev/" "$HOME/bin" "$HOME/.cc/try" "$HOME/.cc/state/arch" "$HOME/.cc/lander" "$HOME/.cc/state/land" "$HOME/.cc/config" && return 0
-        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
+        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms "$HOME"/.cc/state/hs/launch "$HOME"/.cc/state/hs/clone.json; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
       return 1; }
     wdeny(){ never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs, ~/bin symlinks into it, ~/.cc/try is cc-try's overlay ahead of ~/bin on every PATH, ~/.cc/lander is the lander release every landing runs, ~/.cc/state/land is its queue, ~/.cc/config says who reviews it, and ~/.cc/state/arch is the ledger for what has already been sent outward — a track writes its worktree, /tmp and the rest of its own ~/.cc/state dir, and the rest arrives as a PR"; }
     # DELETING THE RECORD IS THE OTHER HALF OF WRITING IT, and the fence above only covered writing. cc-arch reads
@@ -5864,14 +6256,19 @@ case "$tool" in
       # Here an argument this cannot reduce is LEFT ALONE: the set being fenced is one directory, not a tree.
       # shellcheck disable=SC2088  # a literal ~ in a case pattern is the point: it is being expanded by hand
       case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
-      case "$t" in *['*?[']*) g=1; t=${t%%[*?[]*};; esac  # a glob is a name with a tail this cannot see; wspan judges it both ways
+      case "$t" in *['*?[{']*) g=1; t=${t%%[*?[{]*};; esac  # a glob (or a brace) is a name with a tail this cannot see; wspan judges it both ways
       case "$t" in ''|-*|*['$`']*) return 1;; /*) ;; *) [ -n "$wbase" ] || return 1; t=$wbase/$t;; esac
       t=$(realpath -m -- "$t" 2>/dev/null) || return 1
       [ -z "$pfonly" ] && case "$t" in "$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*|"$HOME"/.cc/try|"$HOME"/.cc/try/*) hit=$t; return 0;; esac
       pstate "$t" && { pseat && return 1; phit=$t; pdeny; }
       if ! pseat && pabove "$t"; then phit=$t; pdeny; fi
+      # a session's hook env files (linput, kind s): removing them, or the ~/.claude above them, from every tier
+      case "$t" in "$HOME"/.claude|"$HOME"/.claude/session-env|"$HOME"/.claude/session-env/*) lhit=$t; lkind=s; ldeny;; esac
+      # …and every launch input: `truncate -s 0 ~/.bashrc` or an rm of a transcript reaches this scan, not wtgt's
+      [ -z "$g" ] && linput "$t" && ldeny
+      [ -n "$g" ] && case "$HOME/.claude/session-env" in "$t"*) lhit=$1; lkind=s; ldeny;; esac
       [ -n "$g" ] && { [ -z "$pfonly" ] && wspan "$t" "$HOME/.cc/state/arch" "$HOME/.cc/try" && return 0
-        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
+        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms "$HOME"/.cc/state/hs/launch "$HOME"/.cc/state/hs/clone.json; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
       return 1; }
     rmdeny(){ case "$hit" in "$HOME"/.cc/try|"$HOME"/.cc/try/*) never "removing cc-try's live state ($hit): its overlay, checkouts and ledger say what is live ahead of ~/bin and what the digest shows, and only cc-try itself writes or removes them; \`cc-try off\` takes a try back out";; esac
       never "removing the record of what has already been sent outward ($hit): ~/.cc/state/arch holds cc-arch's cursor and its ledger, and a shell that deletes either one makes the box re-pin to the branch head and drop a declared architecture revision without saying so. The rest of ~/.cc/state is a track's own, to write and to delete"; }
@@ -5883,10 +6280,12 @@ case "$tool" in
       realpath -m -- "$t" 2>/dev/null || return 1; }
     wscan(){   # the three write shapes over one piece of the haystack, every relative target against $wbase
       local txt=$1 t inv v x dst skip ef n verb hl; local -a a files dirs
-      while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$txt" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
+      # A REDIRECT TARGET IS NEVER AN OPTION: every transcript dir is named -home-…, so `cd ~/.claude/projects &&
+      # echo x >> -home-…/s.jsonl` passed as a `-` word. It goes to wtgt as ./-home-…, and so does an operand after `--`.
+      while IFS= read -r t; do case "$t" in -*) t=./$t;; esac; wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$txt" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
       while IFS= read -r inv; do
         [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
-        v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; dst=""; skip=""; files=(); n=0; ef=""
+        v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; dst=""; skip=""; files=(); n=0; ef=""; eo=""
         case "$v" in
           # THE DESTINATION IS NOT ALWAYS THE LAST WORD. Reading only the last one, any trailing word moved the
           # target out of sight: `cp a ~/bin/cc-guard 2>/dev/null` judged `2>/dev/null`, and `sh -c 'cp $1
@@ -5902,10 +6301,13 @@ case "$tool" in
               cp) for x in "${a[@]}"; do case "$x" in -l|--link|-[!-]*l*) hl=1;; esac; done;; esac
             for x in "${a[@]}"; do
               if [ -n "$skip" ]; then dst=$x; skip=""; continue; fi
+              [ -n "$eo" ] && case "$x" in -*) x=./$x;; esac
+              case "$x" in --) [ -n "$eo" ] || { eo=1; continue; };; esac
               case "$x" in -t|--target-directory) skip=1;; --target-directory=*) dst=${x#*=};;
                 -*) ;; *) n=$((n+1)); { [ "$n" -gt 1 ] || [ -n "$hl" ]; } && files+=("$x");; esac; done
             [ -z "$dst" ] || { [ -n "$hl" ] && files+=("$dst") || files=("$dst"); };;
-          tee) for x in "${a[@]}"; do case "$x" in -*) ;; *) files+=("$x");; esac; done;;
+          tee) for x in "${a[@]}"; do if [ -n "$eo" ]; then case "$x" in -*) x=./$x;; esac; files+=("$x"); continue; fi
+              case "$x" in --) eo=1;; -*) ;; *) files+=("$x");; esac; done;;
           sed) case " ${a[*]} " in *" -i"*|*" --in-place"*) ;; *) continue;; esac   # without -i sed writes nothing
             for x in "${a[@]}"; do case "$x" in -e|-f|--expression|--file) ef=1;; esac; done
             for x in "${a[@]}"; do   # the script is the first bare arg unless -e/-f carried it; the rest are files
@@ -5914,6 +6316,11 @@ case "$tool" in
           dd) for x in "${a[@]}"; do case "$x" in of=*) files+=("${x#of=}");; esac; done;;
         esac
         for x in "${files[@]}"; do wtgt "$x" && wdeny; done
+        # …and INTO A DIRECTORY the source keeps its name: `cp /tmp/d/.bashrc ~/` writes ~/.bashrc, so a source
+        # named like a launch input (linput) is judged again under each target
+        case "$v" in cp|mv|ln|install|rsync) for w in "${a[@]}"; do case "${w%/}" in */projects|projects|*/session-env|session-env|*/shell-snapshots|shell-snapshots) w=${w%/};; esac
+          case "${w##*/}" in .bashrc|.profile|.bash_profile|.bash_login|*.jsonl|snapshot-bash-*|projects|session-env|shell-snapshots)
+          for x in "${files[@]}"; do [ "$x" = "$w" ] || { wtgt "${x%/}/${w##*/}" && wdeny; }; done;; esac; done;; esac
       done < <(grep -oE "$AT"'([^ ]*/)?(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+[^;&|]*' <<<"$txt")
       while IFS= read -r inv; do   # git -C ~/dev/<repo> checkout|apply|stash|… rewrites that tree as surely as cp does
         [[ $inv =~ (^|[^A-Za-z0-9_.-])git[[:space:]]+(.*)$ ]] || continue; read -r -a a <<<"${BASH_REMATCH[2]}"; skip=""; dirs=(); verb=""
@@ -6178,6 +6585,7 @@ case "$tool" in
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ AND a symlink resolve before the match: ~/bin/x IS ~/dev/<repo>/core/bin/x, and so is a symlink farm in /tmp
     if pstate "$fp" && ! pseat; then phit=$fp; pdeny; fi   # every tier, and before in_root: a root that covers ~/.cc/state is no exemption
+    linput "$fp" && ldeny   # every tier: a transcript, the seat's memory and a shell startup file are launch inputs
     [ -n "$pfonly" ] && exit 0   # the ungated tier meets this one path check and nothing else
     if ! in_root "$fp"; then case "$fp" in    # inside the worktree (rule 5: the marker root, not the cwd) / the member's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
