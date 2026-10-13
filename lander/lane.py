@@ -668,7 +668,8 @@ class Lane:
         hands over the queue as it is then. A queue unchanged since the last hand-over sends nothing. `wait`: seconds
         the lane's end waits for the cards (CARDS_WAIT), so a PR that just left gets its last edit; a fault is
         logged `unsaid`, never the lane's, and leaves the queue unmarked, so the next pass hands it over again (Opus
-        read, 10-13: a faulted pass was not retried until the queue moved)."""
+        read, 10-13: a faulted pass was not retried until the queue moved). So does a pass whose positions() returns
+        False: an edit the box-wide cap or a Slack 429 held goes out on a later pass."""
         if not self.unit("cards"):
             return
         seen = [(j.pr, j.state, j.extra.get("queued_at")) for j in jobs]
@@ -679,8 +680,8 @@ class Lane:
 
         def say():
             try:
-                self.call("cards", "positions", self.repo, jobs)
-                self.carded = seen
+                if self.call("cards", "positions", self.repo, jobs) is not False:
+                    self.carded = seen
             except UnitFault as e:
                 E.log("unsaid", self.repo, None, str(e)[:160])
 

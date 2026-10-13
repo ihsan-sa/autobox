@@ -876,6 +876,72 @@ def _selfcheck():
                 vr = json.load(fh)["documents"]["001-0001"]["revisions"]
             ok("a member view carries no filer, while the register has it",
                vr and not any("filer" in x for x in vr) and reg["documents"]["001-0001"]["revisions"][0].get("filer"))
+            # related files (a register of its own): added and removed by number, an old number taken as the moved one,
+            # and a member's view names only the related documents it can see
+            ROOT = os.path.join(t, "r-rel")
+            for i in (1, 2, 3):
+                run("file", mkpdf(src, f"rl{i}", f"Rel {i}"), "--project", "Rel", "--kind", "work", "--title", f"R{i}")
+            reg = load()
+            for nm in ("001-0001", "001-0002"):
+                reg["documents"][nm]["visibility"].append(wid)
+            save(reg)
+            run("move", "001-0003", "Rel2", "--kind", "work")
+            rc, o = run("related", "001-0001", "001-0002", "001-0003")
+            rel = load()["documents"]["001-0001"].get("related")
+            with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+                vrel = json.load(fh)["documents"]["001-0001"].get("related")
+            ok("related adds by number, an old number as the one it moved to, and a member's view drops one it cannot see",
+               rc == 0 and rel == ["001-0002", "002-0001"] and vrel == ["001-0002"]
+               and "001-0001\t002-0001\tadded" in o and "001-0003 is 002-0001" in o)
+            rcs, _ = run("related", "001-0001", "001-0001")
+            rcu, _ = run("related", "001-0001", "009-0009")
+            rcr, _ = run("related", "001-0001", "--remove", "001-0003", "--remove", "009-0009")
+            ok("related refuses the document itself, an unknown number and a --remove it does not hold, nothing changed",
+               rcs == rcu == rcr == 2 and load()["documents"]["001-0001"].get("related") == rel)
+            rc, o = run("related", "001-0001", "--remove", "002-0001")
+            rcl, ol = run("related", "001-0001")
+            rc2, _ = run("related", "001-0001", "--remove", "001-0002")
+            ok("related --remove takes one off and leaves the rest; the last one gone leaves no related field",
+               rc == 0 and "002-0001\tremoved" in o and ol.strip() == "001-0001\t001-0002\tR2"
+               and rc2 == 0 and "related" not in load()["documents"]["001-0001"])
+            # a related document that moves after it was added: the list stored its old number
+            run("related", "001-0001", "001-0002")
+            run("move", "001-0002", "Rel2", "--kind", "work")
+            stored = load()["documents"]["001-0001"].get("related")
+            rcl, ol = run("related", "001-0001")
+            ok("related lists an entry stored under a moved document's old number as its current one, and saves nothing",
+               stored == ["001-0002"] and rcl == 0 and ol.strip() == "001-0001\t002-0002\tR2"
+               and load()["documents"]["001-0001"].get("related") == ["001-0002"])
+            rco, oo = run("related", "001-0001", "--remove", "001-0002")
+            gone_old = "related" not in load()["documents"]["001-0001"]
+            reg = load()
+            reg["documents"]["001-0001"]["related"] = ["001-0002"]
+            save(reg)
+            rcn, on = run("related", "001-0001", "--remove", "002-0002")
+            ok("related --remove takes off an entry stored under a moved document's old number, by either number",
+               rco == 0 and "002-0002\tremoved" in oo and gone_old
+               and rcn == 0 and "002-0002\tremoved" in on and "related" not in load()["documents"]["001-0001"])
+            # a retired related document: --remove takes its stored number off, and a later add drops it when saving
+            reg = load()
+            reg["documents"]["001-0001"]["related"] = ["001-0002", "009-0009"]
+            save(reg)
+            rcg, og = run("related", "001-0001", "001-0003")
+            ok("related drops a retired (gone) entry when saving an add",
+               rcg == 0 and load()["documents"]["001-0001"].get("related") == ["002-0002", "002-0001"])
+            reg = load()
+            reg["documents"]["001-0001"]["related"] = ["009-0009"]
+            save(reg)
+            rcx, ox = run("related", "001-0001", "--remove", "009-0009")
+            ok("related --remove takes off a stored number whose document is gone",
+               rcx == 0 and "009-0009\tremoved" in ox and "related" not in load()["documents"]["001-0001"])
+            # a member's view follows a moved related document: the stored old number shows as the current one
+            reg = load()
+            reg["documents"]["001-0001"]["related"] = ["001-0002"]
+            save(reg)
+            write_views(reg, {wid})
+            with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+                vm = json.load(fh)["documents"]["001-0001"].get("related")
+            ok("a member view maps a related number through moved_from", vm == ["002-0002"])
             # the compile gate (a register of its own): a fake DOCS_SOURCE_CHECK honouring the JSON contract fails a
             # main holding BROKEN, a NEEDLUA one on any engine but lualatex, and exits 3 on CANTRUN
             ROOT = os.path.join(t, "r-gate")

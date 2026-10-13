@@ -526,9 +526,9 @@ class QueuedCards(Stubbed):
         C.positions("demo", jobs)
         self.assertEqual(self.argvs("cc-slack post"), [
             ["cc-slack", "post", "--route", "[demo] PR #7 queued", "--id", f"land:demo:7:queued@{Q}",
-             "[demo] PR #7 is queued to land: 1 of 2 in the lane, its checks are running."],
+             "[demo] PR #7 is queued to land: place 1 in the lane, its checks are running."],
             ["cc-slack", "post", "--route", "[demo] PR #8 queued", "--id", f"land:demo:8:queued@{Q2}",
-             "[demo] PR #8 is queued to land: 2 of 2 in the lane, waiting its turn."]])   # PR #6 is at rest: no card
+             "[demo] PR #8 is queued to land: place 2 in the lane, waiting its turn."]])   # PR #6 is at rest: no card
         C.positions("demo", jobs)
         self.assertEqual(len(self.argvs("cc-slack")), 2)   # nothing moved, so nothing is posted or edited
 
@@ -538,7 +538,7 @@ class QueuedCards(Stubbed):
         self.ledger(8, Q2, "1.8")
         C.positions("demo", self.jobs((7, Q, T.DEPLOY_PENDING), (8, Q2, T.PLANNED)))
         self.assertEqual(self.argvs("cc-slack edit"), [
-            ["cc-slack", "edit", "C1", "1.8", "[demo] PR #8 is queued to land: 1 of 1 in the lane, planned, its checks "
+            ["cc-slack", "edit", "C1", "1.8", "[demo] PR #8 is queued to land: place 1 in the lane, planned, its checks "
              "next."],
             ["cc-slack", "edit", "C1", "1.7", "[demo] PR #7 has left the landing queue: merged."]])
         self.assertEqual(len(self.argvs("cc-slack post")), 2)   # edits, never a second post
@@ -553,7 +553,7 @@ class QueuedCards(Stubbed):
         self.ledger(7, Q, "1.7")
         C.positions("demo", self.jobs((7, Q, T.MERGEABLE)))
         self.assertEqual(self.argvs("cc-slack edit"), [
-            ["cc-slack", "edit", "C1", "1.7", "[demo] PR #7 is queued to land: 1 of 1 in the lane, checks green, "
+            ["cc-slack", "edit", "C1", "1.7", "[demo] PR #7 is queued to land: place 1 in the lane, checks green, "
              "merging next."]])
 
     def test_a_chat_landing_is_carded_in_its_thread_and_a_members_in_its_updates_channel(self):
@@ -565,6 +565,72 @@ class QueuedCards(Stubbed):
         self.assertEqual([a[:6] for a in self.argvs("cc-slack post")], [
             ["cc-slack", "post", "-c", "C9", "--thread", "5.5"],
             ["cc-slack", "post", "-c", "#h-updates", "--id", f"land:h--t:8:queued@{Q}"]])
+
+    def test_a_pr_joining_behind_edits_no_card_and_a_place_change_does(self):
+        """10-13: a card that counted the lane was edited for every PR that joined behind it, and Slack said 429."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+        self.assertEqual(self.argvs("cc-slack edit"), [])   # PR #7's place and stage are as they were
+        self.ledger(8, Q2, "1.8")
+        C.positions("demo", self.jobs((8, Q2, T.QUEUED), (7, Q, T.QUEUED)))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.8", "1.7"])   # both places changed
+
+    def test_card_edits_are_capped_box_wide_and_a_held_edit_goes_on_a_later_pass(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q2, "1.8")
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.PLANNED))))
+            self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7"])   # one, the cap held PR #8's
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))   # PR #8 left: its edit is held too
+            self.assertEqual(len(self.argvs("cc-slack edit")), 1)
+        self.assertEqual(sorted(C.read_json(C._queued_path("demo"), {})), [f"land:demo:7:queued@{Q}",
+                                                                           f"land:demo:8:queued@{Q2}"])
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1061.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING))))   # a minute on: the slot is free
+        self.assertEqual(self.argvs("cc-slack edit")[1],
+                         ["cc-slack", "edit", "C1", "1.8", "[demo] PR #8 has left the landing queue: out of the lane."])
+        self.assertEqual(list(C.read_json(C._queued_path("demo"), {})), [f"land:demo:7:queued@{Q}"])
+
+    def test_a_429_holds_every_card_edit_for_its_retry_after_and_the_edit_goes_after(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q2, "1.8")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: HTTP Error 429: Too Many Requests (Retry-After: 30)"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.CHECKING))))
+        self.assertEqual(len(self.argvs("cc-slack edit")), 1)   # the 429 stopped the pass's second edit
+        self.assertEqual(C.read_json(C._edits_path(), {})["until"], 1030.0)
+        self.answer({})
+        with mock.patch.object(C.time, "time", return_value=1029.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.CHECKING))))
+        self.assertEqual(len(self.argvs("cc-slack edit")), 1)   # still inside the back-off: nothing goes
+        with mock.patch.object(C.time, "time", return_value=1030.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.CHECKING))))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "1.7", "1.8"])
+
+    def test_a_429_naming_no_retry_after_waits_edit_backoff(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: HTTP Error 429: Too Many Requests"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertEqual(C.read_json(C._edits_path(), {})["until"], 1000.0 + C.EDIT_BACKOFF)
+
+    def test_a_card_cc_slack_will_not_edit_is_skipped_and_never_tried_again(self):
+        """#1188, #1272: "refusing — not a message this bot posted" was retried."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q2, "1.8")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.QUEUED))))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7"])
+        self.answer({})
+        C.positions("demo", self.jobs((7, Q, T.MERGEABLE), (8, Q2, T.CHECKING)))
+        C.positions("demo", self.jobs((8, Q2, T.CHECKING)))   # PR #7 leaves: no last edit either
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "1.8", "1.8"])   # PR #8's still go
+        self.assertEqual(list(C.read_json(C._queued_path("demo"), {})), [f"land:demo:8:queued@{Q2}"])
 
     def test_a_cards_pass_waits_for_another_holding_the_repos_cards_lock(self):
         import fcntl

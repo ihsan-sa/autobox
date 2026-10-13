@@ -104,6 +104,14 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         repo). A NEW REVISION CARRIES the one before's files (each marked carried_from), except a name its own
         --attach gives, and carries none when it --describes a different board revision than the one before did;
         stderr says which it carried or left. Prints `<number>\t<name>\tattached|unchanged|replaced|removed`.
+    cc-docs related <PPP-NNNN> [<PPP-NNNN>…] [--remove <PPP-NNNN>]…
+        RELATED FILES: links from a document's page to other library documents, never copies, kept on the document
+        (not a revision) as related: [PPP-NNNN]. Each number named is added, and each --remove taken off; a number
+        a document was filed as before a `move` is taken as the one it is now. Refused, with nothing changed: the
+        document itself, a number the register does not have, and a --remove the list does not hold. With no number
+        it prints the list. The library shows each to a reader only when that reader can open the document it names,
+        so a member never sees the title of one they cannot. Prints `<number>\t<related>\tadded|unchanged|removed`,
+        or `<number>\t<related>\t<title>` a line for the list.
         For each document's current revision that keeps no source, or keeps a LaTeX one with no .source.json, or one
         that fails DOCS_SOURCE_CHECK (a pass cached in checks.json is not compiled again), keeps what its recorded
         --source finds now, by the same rules and the same check as `file`; an existing tarball that fails again is
@@ -224,7 +232,7 @@ a PDF or --source outside the workspace's own trees (~/dev/<h>, its track worktr
 is not a PDF, and one over 64 MiB; reads the PDF from one fd so it cannot be swapped between the check and the
 read; and ignores --kind. A project an owner's maker names that is not the member's files under the member's own
 instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold`, `retire`,
-`move`, `attach`, `backfill-sources`, `check`, `link`, `pdf` and `gone` are refused inside, and so is `file --attach`.
+`move`, `attach`, `related`, `backfill-sources`, `check`, `link`, `pdf` and `gone` are refused inside, and so is `file --attach`.
 
 QUARANTINE: a workspace marked quarantined (~/.cc/members/<h>/quarantined, a regular file; `cc-lib quarantine <h>`)
 files nothing. `file` is refused when the project is its member project, --member names it, the asking workspace is it,
@@ -448,6 +456,10 @@ def write_views(reg, ids):
         docs = {n: dict(d, revisions=[{k: v for k, v in r.items() if k not in ("public_token", "filer")}
                                       for r in d["revisions"]])
                 for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
+        for d in docs.values():
+            # a related document the workspace cannot see is not named in its view
+            if d.get("related"):
+                d["related"] = list(dict.fromkeys(m for m in (moved_to(reg, n) for n in d["related"]) if m in docs))
         blobs = set()
         for d in docs.values():
             for r in d["revisions"]:
@@ -2093,6 +2105,67 @@ def cmd_attach(a):
     return 0
 
 
+# ── related files ──────────────────────────────────────────────────────────────────────────────────────────
+def current_number(reg, num):
+    """The document num names now: itself, or the one a `move` took it to (moved_from), or Refused."""
+    if NUM.match(num or "") and not NUM.match(num).group(3):
+        if num in reg["documents"]:
+            return num
+        for n, d in reg["documents"].items():
+            if num in (d.get("moved_from") or ()):
+                print(f"cc-docs: {num} is {n} since it moved", file=sys.stderr)
+                return n
+    raise Refused(f"no document {num!r}: give PPP-NNNN")
+
+
+def moved_to(reg, num):
+    """A stored number as the document holds it now: the one whose moved_from names it, else num unchanged. Quiet,
+    and never refuses, so a related list kept from before a `move` lists, compares and saves as the current one."""
+    if num in reg["documents"]:
+        return num
+    return next((n for n, d in reg["documents"].items() if num in (d.get("moved_from") or ())), num)
+
+
+def cmd_related(a):
+    said = []
+    with Lock():
+        reg = load()
+        d = get_doc(reg, current_number(reg, a.number))
+        lst = []
+        for n in d.get("related") or ():
+            n = moved_to(reg, n)
+            if n not in lst:
+                lst.append(n)
+        if not a.others and not a.remove:
+            for n in lst:
+                print(f"{d['number']}\t{n}\t{(reg['documents'].get(n) or {}).get('title', '(gone)')}")
+            return 0
+        for raw in a.remove or ():
+            # a stored number whose document was retired no longer resolves: it is still taken off by that number
+            n = moved_to(reg, raw) if moved_to(reg, raw) in lst else current_number(reg, raw)
+            if n not in lst:
+                raise Refused(f"{d['number']} has no related {n}")
+            lst.remove(n)
+            said.append((n, "removed"))
+        for raw in a.others:
+            n = current_number(reg, raw)
+            if n == d["number"]:
+                raise Refused(f"{n} cannot be related to itself")
+            said.append((n, "unchanged" if n in lst else "added"))
+            if n not in lst:
+                lst.append(n)
+        lst = [n for n in lst if n in reg["documents"]]   # a retired document is dropped when saving
+        if lst:
+            d["related"] = lst
+        else:
+            d.pop("related", None)
+        save(reg)
+        write_views(reg, set(d["visibility"]) - {"owner"})
+    for n, what in said:
+        print(f"{d['number']}\t{n}\t{what}")
+    return 0
+
+
 # ── a text revision's PDF ────────────────────────────────────────────────────────────────────────────────────
 def cmd_pdf(a):
     """The PDF of a revision filed without one (a Markdown revision whose PDF a renderer makes after filing), filed the
@@ -3299,6 +3372,10 @@ def main(argv):
     p.add_argument("files", nargs="*")
     p.add_argument("--replace", action="store_true")
     p.add_argument("--remove", action="append")
+    p = sub.add_parser("related")
+    p.add_argument("number")
+    p.add_argument("others", nargs="*")
+    p.add_argument("--remove", action="append")
     p = sub.add_parser("pdf")
     p.add_argument("number")
     p.add_argument("pdf")
@@ -3354,14 +3431,14 @@ def main(argv):
         return across(a)
     try:
         if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move", "attach",
-                                    "backfill-sources", "check", "link", "pdf", "gone"):
+                                    "related", "backfill-sources", "check", "link", "pdf", "gone"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
         if a.cmd == "member":
             return cmd_member(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
-                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach, "pdf": cmd_pdf,
+                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach, "related": cmd_related, "pdf": cmd_pdf,
                 "backfill-sources": cmd_backfill, "check": cmd_check, "link": cmd_link, "gone": cmd_gone}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)

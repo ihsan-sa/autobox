@@ -1225,6 +1225,25 @@ class Machine(Fixture):
         L.Lane.cards_pass(lane, jobs, wait=5)
         self.assertEqual(len(calls), 2)   # and once through, an unchanged queue is not handed over again
 
+    def test_a_cards_pass_with_an_edit_held_is_handed_the_same_queue_again(self):
+        """A card edit the box-wide cap or a Slack 429 held (positions -> False) goes on a later pass."""
+        calls = []
+
+        class Held:
+            def positions(self, repo, jobs):
+                calls.append(repo)
+                return len(calls) > 1
+
+        lane = types.SimpleNamespace(repo="demo", carding=None, carded=None, unit=lambda n: Held(),
+                                     call=lambda n, fn, *a: L.Lane.call(lane, n, fn, *a))
+        jobs = [T.Job(repo="demo", pr=1, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": "x"})]
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(lane.carded, None)   # an edit was held, so the queue is left unmarked
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(len(calls), 2)   # so the same queue went again
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(len(calls), 2)   # and once through, an unchanged queue is not handed over again
+
     def test_a_local_branch_named_origin_main_is_not_main(self):
         """refs/heads/origin/<b> (a worker's `git branch origin/main`) must never stand in for origin's <b>."""
         head = self.pr(1, {"a/x": "n\n"})

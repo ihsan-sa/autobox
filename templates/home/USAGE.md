@@ -153,6 +153,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
                                          or words prints the current revision's file; `--attach F` (repeatable) or
                                          `cc-docs attach PPP-NNNN F…` keeps supporting files beside it (Gerbers, BOM,
                                          a zip), downloadable from its page; `cc-docs --help`
+    cc-docs related PPP-NNNN N… [--remove N]…   links on its page to other library documents (never copies), shown to a reader only where they can open them
     library.json in a repo                names a document's Markdown and rebuild command: the library keeps the .md, and each edited revision comes back as a PR on library/<rev>
     cc-docs link <number> [--kind private --to A | --kind public]   the link a PDF goes out as (signed-in by default);
                                          `file` and `cc-mail send` turn a filed PDF into it and refuse an unfiled one

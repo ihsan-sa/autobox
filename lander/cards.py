@@ -1,7 +1,8 @@
 """What the lander tells people, and the few box calls the U3 modules share.
 
 A CARD is one message about one job. `positions(repo, jobs)` gives each job in the queue one card saying where it
-stands (`<i> of <n> in the lane`, its stage) and edits it as the job moves, then once more when it leaves;
+stands (`place <i> in the lane`, its stage) and edits it when its place or stage changes, then once more when it leaves;
+those edits are capped box-wide (EDITS_PER_MIN), wait out a Slack 429, and skip a card cc-slack will not edit;
 `waited(job, secs, now)` files one planner request when the tick finds the oldest due job past WAIT_FLAG_SECS, at
 most one per repo (per member, across its lanes) per WAIT_FLAG_SECS; `held(repo, now)` notes a box hold, from which that age counts.
 `landed(job)` turns the PR's #approvals card to landed and says the merge where someone is listening;
@@ -432,33 +433,86 @@ def ledger(pid):
     return "", ""
 
 
+EDITS_PER_MIN = 12    # queued-card edits a minute, box-wide across every lane (10-13: ~10/min from one lane drew 429s)
+EDIT_BACKOFF = 60     # seconds every card edit waits after a 429 that names no Retry-After
+NOT_OURS = "not a message this bot posted"
+
+
+def _edits_path():
+    return state("cards", "edits.json")
+
+
+def _edit_slot(now):
+    """May a queued-card edit go now? Not while a 429's back-off runs (`until`), nor once EDITS_PER_MIN edits went out
+    in the last 60 s; else the edit is counted and True. cards/edits.json is shared by every lane, under its own lock."""
+    with _flock("edits.lock"):
+        d = read_json(_edits_path(), {}) or {}
+        if now < float(d.get("until") or 0):
+            return False
+        recent = [t for t in (d.get("at") or []) if now - float(t) < 60]
+        if len(recent) >= EDITS_PER_MIN:
+            return False
+        d["at"] = recent + [now]
+        write_json(_edits_path(), d)
+        return True
+
+
+def _back_off(out, now):
+    """Slack said 429: every card edit waits Retry-After seconds when the answer names it, else EDIT_BACKOFF."""
+    m = re.search(r"retry[-_ ]after\D{0,3}(\d+)", out, re.I)
+    secs = int(m.group(1)) if m else EDIT_BACKOFF
+    with _flock("edits.lock"):
+        d = read_json(_edits_path(), {}) or {}
+        d["until"] = max(float(d.get("until") or 0), now + secs)
+        write_json(_edits_path(), d)
+    return secs
+
+
 def _edit(pid, text, repo, pr):
-    """Rewrite the card posted under `pid`. One not out yet (pending a retry, or held by cc-slack's engagement gate)
-    has nothing to edit, and is left."""
+    """Rewrite the card posted under `pid`. -> "done" when it is edited or has nothing to edit (not out yet: pending a
+    retry, or held by cc-slack's engagement gate); "later" when the cap or a 429's back-off holds it, so the caller
+    keeps it for the next pass; "skip" when cc-slack refuses it as not this bot's (#1188, #1272), which no retry
+    changes, so it is never tried again; any other failure is logged and not retried."""
     chat, ts = ledger(pid)
     if not ts:
-        return
+        return "done"
+    now = time.time()
+    if not _edit_slot(now):
+        return "later"
     rc, out = sh([slack(), "edit", chat, ts, text], timeout=120)
-    if rc != 0:
-        log("unsaid", repo, pr, id=pid, edit="yes", why=out.strip()[-120:].replace("\n", " "))
+    if rc == 0:
+        return "done"
+    why = out.strip()[-120:].replace("\n", " ")
+    if NOT_OURS in out:
+        log("unsaid", repo, pr, id=pid, edit="skipped", why=why)
+        return "skip"
+    if "Error 429" in out or "ratelimited" in out:   # cc-slack edit prints "HTTP Error 429: Too Many Requests"
+        log("unsaid", repo, pr, id=pid, edit="later", backoff=_back_off(out, now), why=why)
+        return "later"
+    log("unsaid", repo, pr, id=pid, edit="yes", why=why)
+    return "done"
 
 
 def positions(repo, jobs):
     """A QUEUED PR SAYS WHERE IT STANDS (brief: "post a queued card with the PR's position and update it as it
     moves"). `jobs` is the lane's list (jobs.lane_jobs: put first, then arrival); those not at rest are the queue.
-    Each gets one card, `[<repo>] PR #<n> is queued to land: <i> of <n> in the lane, <stage>.`, posted once under
-    `land:<repo>:<pr>:queued@<queued_at>` (queued_where) and edited in place (`cc-slack edit`) when its words change.
-    A card whose job left the queue gets one last edit saying how, and its record goes. cards/queued-<repo>.json keeps
-    what each card last said, so a queue that has not moved sends nothing; it is read and written under the repo's
+    Each gets one card, `[<repo>] PR #<n> is queued to land: place <i> in the lane, <stage>.`, posted once under
+    `land:<repo>:<pr>:queued@<queued_at>` (queued_where) and edited in place (`cc-slack edit`) only when its place or
+    stage changes (10-13: a card that also counted the lane was edited for every PR that joined behind it, and the
+    edits drew Slack 429s). A card whose job left the queue gets one last edit saying how, and its record goes.
+    Edits go through _edit: one the box-wide cap or a 429 holds stays unrecorded and goes on a later pass; a card
+    cc-slack refuses as not this bot's is marked and never edited again. cards/queued-<repo>.json keeps each card's
+    place and stage, so a queue that has not moved sends nothing; it is read and written under the repo's
     own cards lock (lanes/<repo>.cards), so a lane's cards thread still running after its lane lock went (CARDS_WAIT
     ran out) and the next lane's never lose each other's write. No model call. The lane calls it on a thread of its
-    own (Lane.carding), so a slow Slack never holds a landing."""
+    own (Lane.carding), so a slow Slack never holds a landing.
+    -> False when an edit was held for later, so the lane hands the same queue over again; else True."""
     from lander import jobs as J
     os.makedirs(J.lanes_dir(), exist_ok=True)
     fd = os.open(J.lane_file(repo, "cards"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        _positions(repo, jobs, J)
+        return _positions(repo, jobs, J)
     finally:
         os.close(fd)
 
@@ -466,30 +520,38 @@ def positions(repo, jobs):
 def _positions(repo, jobs, J):
     said = read_json(_queued_path(repo), {}) or {}
     live = [j for j in jobs if j.state not in J.RESTING]
-    mine, moved = set(), False
+    mine, moved, later = set(), False, False
     for i, job in enumerate(live, 1):
         pid = producer_id(job, "queued")
         mine.add(pid)
-        text = (f"[{job.repo}] PR #{job.pr} is queued to land: {i} of {len(live)} in the lane, "
-                f"{STAGE_WORDS.get(job.state, job.state)}.")
         last = said.get(pid)
-        if last and last.get("text") == text:
+        if last and (last.get("place"), last.get("state")) == (i, job.state):
             continue
-        if last:
-            _edit(pid, text, job.repo, job.pr)
-        else:
+        text = (f"[{job.repo}] PR #{job.pr} is queued to land: place {i} in the lane, "
+                f"{STAGE_WORDS.get(job.state, job.state)}.")
+        how = "skip" if last and last.get("noedit") else _edit(pid, text, job.repo, job.pr) if last else ""
+        if how == "later":
+            later = True
+            continue
+        if not last:
             post(job, "queued", text, queued_where(job))
-        said[pid], moved = {"repo": job.repo, "pr": job.pr, "text": text}, True
+        said[pid], moved = {"repo": job.repo, "pr": job.pr, "place": i, "state": job.state,
+                            **({"noedit": True} if how == "skip" else {})}, True
     state_of = {producer_id(j, "queued"): j.state for j in jobs}
     for pid, last in list(said.items()):
         if last.get("repo") != repo or pid in mine:
             continue
-        how = LEFT_WORDS.get(state_of.get(pid), "out of the lane")
-        _edit(pid, f"[{repo}] PR #{last.get('pr')} has left the landing queue: {how}.", repo, last.get("pr"))
+        left = LEFT_WORDS.get(state_of.get(pid)) or last.get("left") or "out of the lane"
+        if not last.get("noedit") and _edit(pid, f"[{repo}] PR #{last.get('pr')} has left the landing queue: {left}.",
+                                            repo, last.get("pr")) == "later":
+            later, moved = True, moved or last.get("left") != left
+            last["left"] = left   # the job may be gone from the list by the next pass
+            continue
         del said[pid]
         moved = True
     if moved:   # the lane calls this every pass: an unmoved queue writes nothing either
         write_json(_queued_path(repo), said)
+    return not later
 
 
 def _waited_path():
