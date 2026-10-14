@@ -488,6 +488,20 @@ orch_record(){   # written ONCE at start: the orch this loop was dispatched by, 
   if [ -z "$r" ]; then r=$(seat_windows | awk -F@ -v a="$a" 'NF==2 && $2==a && $1!="" {print $1}'); [ "$(grep -c . <<<"$r")" = 1 ] || r=""; fi
   ORCH_KEY="${r:+$r@}$a"; printf '%s\n' "$ORCH_KEY" > "$ST/orch"
   mkdir -p "$hd" 2>/dev/null && printf '%s@%s\n' "${r:-$repo}" "$a" > "$hd/${ST##*/}" 2>/dev/null; return 0; }
+dispatch_receipt(){   # WHO SENT THIS TRACK OFF, one line in the hop receipts (~/.cc/receipts/<UTC day>.jsonl, CC_RECEIPTS_DIR), for
+                      # cc-live's who-talks-to-whom: {at, t, stage:"sent", via:"dispatch", from, to:"<repo>/<track>", loop}, written
+                      # at start whether or not an alias was set. `from` is the dispatcher's window (CC_DISPATCH_WIN), else the
+                      # key orch_record settled on, else none; a member's is `member` and so is its track, counted, never named.
+                      # stage "sent" is a stage cc-receipts checks nothing on. Best effort: it never fails or prints. A suite
+                      # fixture's repo (_cctest*, _selfcheck*) leaves none, as in cc-msg: the e2e suites run under the real HOME.
+  local d="${CC_RECEIPTS_DIR:-$HOME/.cc/receipts}" from="${CC_DISPATCH_WIN:-${ORCH_KEY:-}}" to="$repo/$track"
+  case "$repo" in _cctest*|_selfcheck*) return 0;; esac
+  if [ "${CC_MEMBER_SANDBOX:-}" = 1 ] || [ "${CC_ROLE:-}" = member ] || [ -f "$HOME/dev/$repo/.cc/member-workspace" ]; then
+    from=member; to=member; fi
+  { mkdir -p "$d" && jq -cn --arg at "$(date -u +%FT%TZ)" --argjson t "$(date +%s)" --arg from "$from" --arg to "$to" \
+      --argjson loop "${MAXI:-0}" '{at:$at,t:$t,stage:"sent",via:"dispatch",to:$to,loop:$loop}
+                                    + (if $from != "" then {from:$from} else {} end)' >> "$d/$(date -u +%F).jsonl"; } 2>/dev/null
+  return 0; }
 ORCH_KEY=""   # what orch_record wrote, held by THIS process: $ST/orch is writable by the worker, so the file is trusted less
 stop_target(){   # the broker key a stop goes to: "a track dispatched by an orch has its stop notice addressed to that orch's alias,
                  # the repo seat only when none is recorded" (the brief). A record `<orchrepo>@<alias>` is used as it is; a bare alias
@@ -1139,6 +1153,20 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   # the full key when an orch dispatched, gone when the repo seat did.
   CC_SLACK_ALIAS=myorch CC_ORCH_REPO=lessons orch_record; t 'the host-side dispatch record holds the orch key, outside $ST' "$(cat "$d/.dispatch/st7")" lessons@myorch
   CC_SLACK_ALIAS='' CC_DISPATCH_WIN=demo orch_record; t '…and goes when the repo seat dispatched' "$(test -e "$d/.dispatch/st7" || echo gone)" gone
+  # THE DISPATCH RECEIPT (messages-record-their-sender): who sent the track off, with or without an alias, into the
+  # fixture's own receipts dir; a member's is counted, not named; a dir that cannot be written fails nothing.
+  local rd="$d/rcpt"; rm -rf "$rd"
+  repo=demo track=t7 MAXI=3 CC_RECEIPTS_DIR="$rd" CC_SLACK_ALIAS='' CC_DISPATCH_WIN=demo dispatch_receipt
+  t 'a dispatch from a repo seat, no alias, leaves a sent receipt naming that window, the track and the loop count' \
+    "$(jq -c '[.stage,.via,.from,.to,.loop]' "$rd"/*.jsonl 2>/dev/null)" '["sent","dispatch","demo","demo/t7",3]'
+  rm -rf "$rd"; CC_RECEIPTS_DIR="$rd" CC_DISPATCH_WIN='' ORCH_KEY=study-coach@video dispatch_receipt
+  t '…and with no window, the orch key orch_record settled on' "$(jq -r .from "$rd"/*.jsonl 2>/dev/null)" study-coach@video
+  rm -rf "$rd"; CC_RECEIPTS_DIR="$rd" CC_MEMBER_SANDBOX=1 CC_DISPATCH_WIN=ada dispatch_receipt
+  t '…and a member dispatch is counted as member, never named' "$(jq -c '[.from,.to]' "$rd"/*.jsonl 2>/dev/null)" '["member","member"]'
+  rm -rf "$rd"; repo=_cctest9 CC_RECEIPTS_DIR="$rd" CC_DISPATCH_WIN=demo dispatch_receipt
+  t '…and a suite fixture repo (_cctest*) leaves none' "$(test -e "$rd" && echo written || echo none)" none
+  rm -rf "$rd"; : > "$d/rfile"; out=$(CC_RECEIPTS_DIR="$d/rfile/r" CC_DISPATCH_WIN=demo dispatch_receipt 2>&1); rc=$?
+  t '…and a receipt that cannot be written fails nothing and says nothing' "$rc|$out" "0|"
   # A DONE REACHES THE ORCH, ONCE (done_card + done_heard, driven as the pair the loop runs). Kept: an orch recorded hears
   # it by its own key in ONE broker call — done_card's — and the log says its seat is live; a second inject made it hear
   # every DONE twice (review of #635, findings 2 and 19). No orch: the repo seat's one line. Reported: a recorded orch
@@ -1188,7 +1216,7 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   ORCH_KEY=""   # …and no orch recorded either
   : > "$brec"
   rm -rf "$ST"; unset ST
-  grep -q '^orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN' "$0"; t 'and the loop writes that record at start and unsets the variable before the worker runs' "$?" 0
+  grep -q '^orch_record; dispatch_receipt; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN' "$0"; t 'and the loop writes that record and its dispatch receipt at start, and unsets the variable before the worker runs' "$?" 0
   grep -qF 'CC_DISPATCH_WIN=$([ -n "${TMUX_PANE:-}" ] && tmux display-message -p -t "$TMUX_PANE"' "$realbin/cc" && grep -q 'CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
   ( repo=_cctest99999; tell_planner "$bl" ); t "a suite's \`_cc<suite><pid>\` scratch repo has no session to wake" "$?" 1
   t "…and a fixture's stops never reach the box's own broker state" "$(wc -c < "$brec")" 0
@@ -1872,7 +1900,7 @@ mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/tas
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
 log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
-orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
+orch_record; dispatch_receipt; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
 pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
 trap 'say_io pidrm "$ST" $$' EXIT   # only a loop.pid that is still this loop's, and never through a link (say_io)
 [ -e "$ST/stop" ] && { rm -f "$ST/stop"; log "a stop file from before this dispatch was cleared — re-dispatching overrides it"; }

@@ -7,6 +7,9 @@ usage: cc-receipts check [--record] [--as-of UTC] [--json]   the invariants belo
                                                             red to the failure ledger once (cc-reconcile's tick does).
        cc-receipts sample [--days N] [--as-of UTC]          every owner message of the last N days (7), who it was
                                                             routed to and which session answered it, and how fast
+       cc-receipts sendmessage-hook                         the PostToolUse hook on SendMessage (claude-settings.json):
+                                                            reads the hook's JSON on stdin, writes one `sent` receipt,
+                                                            always exits 0 and prints nothing
        cc-receipts selfcheck
 
 THE RECEIPTS are ~/.cc/receipts/<YYYY-MM-DD>.jsonl (CC_RECEIPTS_DIR elsewhere; UTC days), one JSON line per hop,
@@ -22,6 +25,12 @@ receipt() and cc-msg's receipt(); the stages they write:
              the session that made it — `<target>` or `<target>@<alias>`, the key `cc-slack seat` prints
   queued     cc-msg spooled a message for a window (chat `msg:<window>`, ts the spool line's hash)
   event      cc-msg said something about a window's spool (its msg.log kinds: dialog-told, hung-restarted, …)
+THE SENDER RECORDS, for cc-live's who-talks-to-whom. No invariant below reads them, so none is ever stuck:
+  sent       via sendmessage: the hook below, {from: the sending session's name in its Claude Code sessions file,
+             to: the tool's `to`}; via dispatch: cc-loop at start, {from: the dispatcher's window, to: <repo>/<track>,
+             loop}
+  posted     cc-slack post(): every post Slack took, keyed by its own (chat, ts), session the window that posted it
+A member's session is counted, never named: its name is written as `member`.
 
 THE INVARIANTS (pure functions of the receipts and the time; each red names a ledger kind):
   owner-reply/unanswered       an owner message has no reply, file or reaction in its thread within
@@ -226,12 +235,54 @@ def sample(recs, now, days):
     return rows
 
 
+def session_name(sid, home=None):
+    """The name Claude Code gave session `sid`, from its sessions/<pid>.json; None when no file says."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home or os.path.expanduser("~"), ".claude")
+    for p in glob.glob(os.path.join(base, "sessions", "*.json")):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and sid and d.get("sessionId") == sid and d.get("name"):
+            return str(d["name"])
+    return None
+
+
+def sendmessage_hook(raw):
+    """One `sent` receipt for a SendMessage call: {at, t, stage:"sent", via:"sendmessage", from, to}. Best effort: any
+    failure writes nothing, and the caller exits 0 whatever happens here."""
+    try:
+        ev = json.loads(raw or "{}")
+        to = (ev.get("tool_input") or {}).get("to")
+        if not isinstance(to, str) or not to:
+            return
+        member = os.environ.get("CC_MEMBER_SANDBOX") == "1" or os.environ.get("CC_ROLE") == "member"
+        frm = "member" if member else session_name(ev.get("session_id"))
+        now = time.time()
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "t": round(now, 3), "stage": "sent",
+               "via": "sendmessage", "to": to}
+        if frm:
+            rec["from"] = frm
+        os.makedirs(DIR, exist_ok=True)
+        with open(f"{DIR}/{time.strftime('%Y-%m-%d', time.gmtime(now))}.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def opt(argv, name, dflt=None):
     return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else dflt
 
 
 def main(argv):
     cmd = argv[0] if argv else ""
+    if cmd == "sendmessage-hook":       # first, before anything that can fail: a hook never fails or delays the tool
+        try:
+            sendmessage_hook(sys.stdin.read(1 << 20))
+        except Exception:
+            pass
+        return 0
     try:
         as_of = parse_utc(opt(argv, "--as-of")) if opt(argv, "--as-of") else time.time()
     except ValueError:
@@ -407,6 +458,38 @@ def selfcheck():
         ok(n == 1, f"two ticks over one unanswered message write one ledger record (got {n})")
         ok("already" in b.stdout, "…and the second tick says the record is already there")
         ok([os.path.basename(p) for p in led] == ["web.jsonl"], "the record's scope is the routed session's repo")
+        # THE SENDMESSAGE HOOK (messages-record-their-sender), run as Claude Code runs it, against a fixture HOME and
+        # receipts dir: it names the sender from its sessions file, counts a member, and a write that fails still exits 0
+        H = os.path.join(T, "home")
+        os.makedirs(os.path.join(H, ".claude", "sessions"))
+        with open(os.path.join(H, ".claude", "sessions", "42.json"), "w") as f:
+            json.dump({"pid": 42, "sessionId": "sid-1", "name": "box@arch"}, f)
+        base_env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CC_MEMBER_SANDBOX", "CC_ROLE")}
+        hook = lambda ev, rd, **e: subprocess.run([os.path.realpath(__file__), "sendmessage-hook"], input=ev,
+                                                  env=dict(base_env, HOME=H, CC_RECEIPTS_DIR=rd, **e),
+                                                  capture_output=True, text=True, timeout=30)
+        sent = lambda rd: [json.loads(ln) for p in glob.glob(f"{rd}/*.jsonl") for ln in open(p)]
+        ev = json.dumps({"session_id": "sid-1", "tool_name": "SendMessage", "tool_input": {"to": "perms", "message": "hi"}})
+        h1 = hook(ev, f"{T}/hk1")
+        ok(h1.returncode == 0 and h1.stdout == "" and [(r["stage"], r["via"], r.get("from"), r["to"]) for r in sent(f"{T}/hk1")]
+           == [("sent", "sendmessage", "box@arch", "perms")],
+           "the SendMessage hook writes one sent receipt naming the session (its sessions file) and the recipient")
+        ok(load(time.time() + 5, d=f"{T}/hk1") != [] and check(load(time.time() + 5, d=f"{T}/hk1"), time.time() + 86400) == [],
+           "…which cc-receipts loads and never calls stuck or undelivered")
+        hook(ev, f"{T}/hk2", CC_MEMBER_SANDBOX="1")
+        ok([r.get("from") for r in sent(f"{T}/hk2")] == ["member"], "…a member's session is counted as member, never named")
+        h3 = hook(ev.replace("sid-1", "sid-unknown"), f"{T}/hk3")
+        ok(h3.returncode == 0 and [("from" in r, r["to"]) for r in sent(f"{T}/hk3")] == [(False, "perms")],
+           "…a session no sessions file names is written with no from, not a guess")
+        open(f"{T}/hkfile", "w").close()
+        h4, h5 = hook(ev, f"{T}/hkfile/r"), hook("not json", f"{T}/hk5")
+        ok(h4.returncode == 0 and h4.stdout + h4.stderr == "" and h5.returncode == 0 and h5.stdout + h5.stderr == ""
+           and not os.path.exists(f"{T}/hk5"),
+           "…and a receipt dir that cannot be written, or input that is not the hook's JSON, exits 0 and says nothing")
+        # THE OTHER SENDER RECORDS, as cc-loop and cc-slack write them: no invariant reads them, however old
+        dsp = {"stage": "sent", "via": "dispatch", "from": "box", "to": "box/t1", "loop": 3, "t": T0}
+        pst = {"stage": "posted", "via": "slack", "chat": "C1", "ts": "5.5", "thread": "5.5", "session": "web", "t": T0}
+        ok(check([dsp, pst], T0 + 86400) == [], "a dispatch or posted record is never a red, however old")
         bad = subprocess.run([os.path.realpath(__file__), "check", "--as-of", "yesterday"], env=env,
                              capture_output=True, text=True, timeout=60)
         ok(bad.returncode == 2 and "--as-of wants" in bad.stderr and "Traceback" not in bad.stderr,

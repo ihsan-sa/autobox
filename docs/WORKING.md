@@ -30,8 +30,8 @@ may take on is this file's:
   review-into-work round — ask `cc-tier allows explore` before dispatching one of those, and `cc-tier allows
   goals` before a goals turn.
 - **autonomous** — as until now: discover, fix, explore.
-Never blocked by any tier: answering the owner, a task he asked for, a landing already past its gates, or
-recording to a board — a finding, a raised- row, a backlog note. A tier
+Never blocked by any spend tier: answering the owner, a task he asked for, a landing already past its gates, or
+recording to a board — a finding, a raised- row, a backlog note. A spend-tier
 flip signals no running iteration — it finishes, and the next one asks. Read it: `cc-tier`, `cc digest`, Home.
 
 ## the standard

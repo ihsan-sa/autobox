@@ -7669,6 +7669,42 @@ def run_selfcheck():
             check("receipts: a session's `cc-slack post -c '#web' --thread <ts>` writes `answered` in that thread naming "
                   "the session; a top-level post and one from no session write none",
                   rcPo == [0, 0, 0] and rcpPo == [("C-web", "9.9", "9.9", "web", "post")])
+            # EVERY POST SLACK TAKES SAYS WHO POSTED IT (messages-record-their-sender): `posted`, keyed by the post's own
+            # ts, with the poster's window; a member is counted as member; a receipt that cannot be written changes
+            # nothing post() returns. Each case its own receipts dir and its own cached poster.
+            realPw = {k: globals()[k] for k in ("api", "RECEIPTS", "_POSTER")}
+            envPw = {k: os.environ.get(k) for k in ("CC_MEMBER_SANDBOX", "CC_ROLE", "TMUX_PANE")}
+            try:
+                shutil.rmtree(RECEIPTS, ignore_errors=True)
+                globals()["api"] = lambda method, token, **kw: {"ts": "9.96", "channel": kw.get("channel")}
+                cfgPw = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+                for k in envPw:
+                    os.environ.pop(k, None)
+                globals()["_POSTER"] = ["web/t1"]                 # a session in window web/t1, as tmux would name it
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rPw = post(cfgPw, "C-web", "hello", thread="9.0", mail=False)
+                pw = [(r["chat"], r["ts"], r["thread"], r.get("session")) for f in sorted(os.listdir(RECEIPTS))
+                      for r in map(json.loads, open(f"{RECEIPTS}/{f}")) if r["stage"] == "posted"] if os.path.isdir(RECEIPTS) else []
+                globals()["_POSTER"] = []; os.environ["CC_MEMBER_SANDBOX"] = "1"; os.environ["TMUX_PANE"] = "%1"
+                pwMem = poster_window()
+                globals()["_POSTER"] = []; os.environ.pop("CC_MEMBER_SANDBOX"); os.environ.pop("TMUX_PANE")
+                pwNone = poster_window()
+                fPw = tempfile.mkstemp(prefix="_selfcheck_rcpt_")[1]
+                globals()["RECEIPTS"] = f"{fPw}/r"                # under a FILE: no dir can be made there
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rPwBad = post(cfgPw, "C-web", "hello again", thread="9.0", mail=False)
+                os.unlink(fPw)
+            finally:
+                globals().update(realPw)
+                for k, v in envPw.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            check("receipts: every post Slack takes leaves `posted` with its chat, ts and thread and the poster's window; "
+                  "a member's session is `member`, no tmux is no name, and an unwritable receipt dir changes nothing post() returns",
+                  pw == [("C-web", "9.96", "9.0", "web/t1")] and pwMem == "member" and pwNone is None
+                  and rPw == (1, "9.96") and rPwBad == (1, "9.96"))
             # A REPLAYED `--id` WRITES NO SECOND RECEIPT (review of #1001 claimed it did): submit() answers the replay
             # `already` with the first ts, cmd_post returns before answered(), so an old answer can never cover a
             # newer unanswered owner message in the thread.

@@ -287,7 +287,7 @@ def selfcheck():
     rc = ui(scr, feed, clock=lambda: now + 2, tones={}, timing=timing, old=lambda s, k: opened.append(chr(k)))
     shots = scr.shots
     case("home draws first, with the footer on the last row",
-         shots[0].splitlines()[0].startswith("cc-live ·") and shots[0].splitlines()[-1].startswith("↑↓ move"))
+         shots[0].splitlines()[0].startswith("hive ·") and shots[0].splitlines()[-1].startswith("↑↓ move"))
     case("↓ then Enter opens the second project, with its fields and what its door doesn't publish",
          any(s.startswith("demo  (o/demo)  from txt") and "not published by" in s
              for s in shots))
@@ -301,5 +301,6 @@ def selfcheck():
     print(f"cc-live: a key redrew in {worst:.1f} ms at worst ({len(timing)} keys); limit {limit} ms ({why})")
     case(f"every key redraws in under {limit} ms ({why})", timing and worst < limit)
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"cc-live selfcheck: {ok} passed, {bad} failed")
+    # hive is a link to this file, and check.sh wants the tally under the name it ran
+    print(f"{os.path.basename(sys.argv[0]) or 'cc-live'} selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0

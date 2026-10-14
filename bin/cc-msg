@@ -351,10 +351,18 @@ unsent(){   # $1 window id  $2 the text as typed → 0 while the input box still
 sdir(){ printf '%s/%s' "$STATE" "$1"; }
 lock(){ mkdir -p "$(sdir "$1")"; printf '%s/.inbox.lock' "$(sdir "$1")"; }
 
+# WHO SENT IT, for the spool line's `from` (and so its queued receipt): the sender's own tmux window — its broker key,
+# `<repo>`, `<repo>/<track>` or `<repo>@<alias>` — then the orch alias its shell exports, then the calling process's name
+# as before. A member's session is counted, never named: its line says `member`. Best effort: no tmux is the next one.
+sender(){ local w=""
+  if [ "${CC_MEMBER_SANDBOX:-}" = 1 ] || [ "${CC_ROLE:-}" = member ]; then printf member; return 0; fi
+  [ -n "${TMUX_PANE:-}" ] && w=$(timeout 2 tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null | tr -d '\n')
+  printf '%s' "${w:-${CC_SLACK_ALIAS:-$(ps -o comm= -p $PPID 2>/dev/null | tr -d ' \n')}}"; }
+
 spool_add(){  # $1 window  $2 text — under the lock, so a drain never rewrites the file mid-append. Prints the line.
   local sp line from out now
   sp="$(sdir "$1")/inbox.spool"
-  from=${CC_MSG_FROM:-$(ps -o comm= -p $PPID 2>/dev/null | tr -d ' \n')}; from=${from:-cc-msg}
+  from=${CC_MSG_FROM:-$(sender)}; from=${from:-cc-msg}
   now=$(date -u +%s)
   line=$(jq -cn --arg at "$(date -u +%FT%TZ)" --arg from "$from" --arg text "$2" \
                 '{at:$at,from:$from,text:$text}') || return 1
@@ -1333,7 +1341,8 @@ case "$1" in
                   printf '%s\n' "$c" > "$CC_FAKE_SWAP_N"                        # what it left is what a key lands in
                   [ "$c" = "$CC_FAKE_SWAP_AFTER" ] && printf '%s\n' "${CC_FAKE_SWAP_TO:-}" > "$CC_FAKE_SCREEN"
                 fi;;
-  display-message) if [ -s "$CC_FAKE_MODE_F" ]; then cat "$CC_FAKE_MODE_F"; else printf '%s\n' "${CC_FAKE_MODE:-0}"; fi;;
+  display-message) case "$*" in *'#W'*) printf '%s\n' "${CC_FAKE_SENDER_WIN:-}"; exit 0;; esac   # the SENDER's window name
+                  if [ -s "$CC_FAKE_MODE_F" ]; then cat "$CC_FAKE_MODE_F"; else printf '%s\n' "${CC_FAKE_MODE:-0}"; fi;;
   send-keys)    shift; printf '%s\n' "$*" >> "$CC_FAKE_KEYS"
                 # `?*`: an EMPTY literal send types nothing, so real tmux puts no character on the pane either
                 # THE INPUT BOX: under CC_FAKE_SWALLOW=N the text lands ON the prompt line ('> text', as the TUI draws
@@ -1479,6 +1488,28 @@ STUB
     "…and a retry inside the dedup window, already queued, leaves no second queued receipt"
   rm -rf "${T:?}/.cc/receipts"; receipt queued _cctest5/m1 '{"text":"x"}'; receipt event _selfcheck9 "" dialog-told
   k "$(nt test -d "$T/.cc/receipts")" "…and a suite fixture's window (_cctest*, _selfcheck*) leaves none"
+  # WHO SENT IT (messages-record-their-sender): the sender's tmux window, then its orch alias, then the process name;
+  # a member is counted, never named; and a receipt that cannot be written never stops the message. Each case its
+  # own scratch receipts, and CC_MSG_FROM (the suite's own name) taken off so the default is what is read.
+  sfrom(){ jq -r 'select(.stage == "queued") | .from' "$T"/.cc/receipts/*.jsonl 2>/dev/null; }
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM TMUX_PANE=%9 CC_FAKE_SENDER_WIN=demo/t9 CC_SLACK_ALIAS=arch "$T/bin/cc-msg" "$W" "from a pane" >/dev/null
+  k "$(t test "$(sfrom)" = demo/t9)" "a message sent from a tmux pane records that window as its sender, before the alias"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM -u TMUX_PANE CC_SLACK_ALIAS=arch "$T/bin/cc-msg" "$W" "from an orch shell" >/dev/null
+  k "$(t test "$(sfrom)" = arch)" "…with no pane, the orch alias its shell exports"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM -u TMUX_PANE -u CC_SLACK_ALIAS "$T/bin/cc-msg" "$W" "from a script" >/dev/null
+  k "$(t sh -c "f=\$(jq -r 'select(.stage == \"queued\") | .from' '$T'/.cc/receipts/*.jsonl); [ -n \"\$f\" ] && [ \"\$f\" != demo/t9 ] && [ \"\$f\" != arch ]")" \
+    "…with neither, the calling process's name, as before"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM TMUX_PANE=%9 CC_FAKE_SENDER_WIN=ada-ws CC_MEMBER_SANDBOX=1 "$T/bin/cc-msg" "$W" "from a member" >/dev/null
+  k "$(t test "$(sfrom)" = member)" "…and a member's session is counted as member, never named"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"; : > "$T/notadir"
+  out=$(env -u CC_MSG_FROM TMUX_PANE=%9 CC_FAKE_SENDER_WIN=demo/t9 CC_RECEIPTS_DIR="$T/notadir/r" "$T/bin/cc-msg" "$W" "receipt fails" 2>&1); rc=$?
+  k "$(t sh -c "[ $rc = 0 ] && [ -z '$out' ] && grep -qF 'receipt fails' '$T/keys'")" \
+    "…and a receipt that cannot be written leaves the message delivered, silently, exit 0"
+  rm -f "$T/notadir"
 
   # (1a) A NAME MID-HANDOFF: with an overlap record for the window the text goes to cc-slack, which knows the live
   # side, and nothing is typed; held there reads "queued"; no record, or cc-slack's own typing, is the keyboard

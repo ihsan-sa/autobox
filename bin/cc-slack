@@ -87,7 +87,7 @@ The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!r
 ~/.cc/state/owner-words.jsonl is the owner's own words: a line per message he sends where the daemon hears him, and per edit or deletion of one. It is a cache, not evidence: cc-infer fetches a cited message from Slack itself, and reads a deletion here as revoking every goal citing it.
 ~/.cc/state/home.json is the box's one live view and the dashboard reads it: rewritten every 30 s and within 2 s of any event, leading with what needs the owner, then running/idle counts, the backlog, the channels, load, handoff count, audit and boot. There is no Slack App Home tab: the daemon publishes a one-line pointer to the dashboard once at start and never again.
 While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused. The muted one is never delivered to, even alone: a message with no live side subscribed is held and handed over at the cutover (cc-handoff's `{"cutover"}` word, or the 30 s tick) or at the live side's hello. At the cutover the successor also gets what the predecessor was handed from 10 min before the overlap and never answered (no box post in its thread, no box reaction but 👀 on it, no 👍 from a woken turn), with a line saying so. An orch is a seat of its own: it reads its own record, `<repo>@<alias>`, never the repo's.
-Every hop of a person's message leaves one receipt line in ~/.cc/receipts/<day>.jsonl (CC_RECEIPTS_DIR): received with the session its route picked, each delivery try and its result (a track's hand-on to its repo or parent seat says where it went), an expiry, and the reply, file, Slack-accepted reaction or 👍, or threaded `post -c`, that answered it with the session that made it. `cc-receipts check` reads them; nothing here does.
+Every hop of a person's message leaves one receipt line in ~/.cc/receipts/<day>.jsonl (CC_RECEIPTS_DIR): received with the session its route picked, each delivery try and its result (a track's hand-on to its repo or parent seat says where it went), an expiry, and the reply, file, Slack-accepted reaction or 👍, or threaded `post -c`, that answered it with the session that made it. Every post Slack takes also leaves `posted` (its chat and ts, and the tmux window that posted it), so cc-live can draw who talks where. `cc-receipts check` reads them; nothing here does.
 See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
@@ -1100,7 +1100,8 @@ def receipt(stage, chat, ts, thread=None, **f):
     """One line per hop of an inbound message, keyed by (chat, ts) of the message, under RECEIPTS/<YYYY-MM-DD>.jsonl:
     `received` (who said it, which session the route picked), `delivery` (what deliver() did with it, per try),
     `expired` (a queued message aged out, and the thread was told) and `answered` (a reply, reaction or file in its
-    thread, stamped with the session that made it). cc-receipts reads them and checks the invariants; nothing here
+    thread, stamped with the session that made it); and `posted`, every post Slack took, keyed by the post's own ts,
+    with the window that posted it (poster_window). cc-receipts reads them and checks the invariants; nothing here
     decides anything. One os.write of one line on an O_APPEND fd; best-effort, a failure is one log line."""
     if not chat or not ts:
         return
@@ -1119,6 +1120,25 @@ def receipt(stage, chat, ts, thread=None, **f):
             os.close(fd)
     except Exception as e:
         log(f"receipt: {stage} {chat} {ts}: {e!r}")
+
+_POSTER = []
+def poster_window():
+    """Who is posting, for the `posted` receipt: this process's tmux window (its broker key), "member" for a member's
+    session (counted, never named), else None (the daemon under systemd, a cron script). Asked once per process, with
+    a short timeout; any failure is None, never an error."""
+    if not _POSTER:
+        w = None
+        if os.environ.get("CC_MEMBER_SANDBOX") == "1" or os.environ.get("CC_ROLE") == "member":
+            w = "member"
+        elif os.environ.get("TMUX_PANE"):
+            try:
+                r = subprocess.run(["tmux", "display-message", "-p", "-t", os.environ["TMUX_PANE"], "#W"],
+                                   capture_output=True, text=True, timeout=2, stdin=subprocess.DEVNULL)
+                w = (r.stdout.strip() or None) if r.returncode == 0 else None
+            except Exception:
+                w = None
+        _POSTER.append(w)
+    return _POSTER[0]
 
 def seat_name(target, alias=None):
     """The session a receipt names: `<target>` or `<target>@<alias>`, the same key cc-slack seat prints."""
@@ -1356,6 +1376,8 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
             raise
         first, where = first or r.get("ts"), where or r.get("channel")
     outbox("post", chat, thread, text)
+    if first:                        # who posted where, for cc-live's who-talks-to-whom; cc-receipts checks nothing on it
+        receipt("posted", where or chat, first, thread, session=poster_window())
     if first and (owner_asked(cfg, chat, text) if ask is None else ask):
         try:                         # the post went out; a ledger that cannot be written never unsends it
             owner_ask_open(cfg, where or chat, thread, first, text)   # a DM sent to his user id is recorded under its D… id
