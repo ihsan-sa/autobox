@@ -107,6 +107,27 @@ for _ in $(seq 1 20); do grep -q 'cc-room: '"$REPO"'/rq1 queued' ~/.cc/state/$RE
   && ! ls ~/.cc/state/$REPO/rq1/runs/*.json >/dev/null 2>&1; } \
   && ok "no room: --go says 'worker queued' and why, its window waits in cc-room admit, and no iteration runs" \
   || bad "queued --go: check rc=$rq0 go rc=$rq1 '$(cat "$T/rq1.out")' log: $(tail -2 ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null | tr '\n' ' ')"
+# A QUEUED LAUNCH IS HONEST ABOUT ITSELF: the row says queued, not running; a second --go and a --say reach its brief
+# without touching its place in the queue; and a window whose wait died is reported and replaced, not called live.
+rqw=$(wins "$REPO/rq1")
+[ "$("$B/cc-board" get $REPO rq1 status)" = queued ] && ok "a queued --go leaves the row queued, not running" \
+  || bad "queued --go set the row to $("$B/cc-board" get $REPO rq1 status)"
+CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "Also do the rq1 extra." >"$T/rq1b.out" 2>&1; rq1b=$?
+CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --say "And mind the rq1 edge." >"$T/rq1s.out" 2>&1; rq1s=$?
+{ [ "$rq1b" = 0 ] && grep -q 'queued and not started' "$T/rq1b.out" && [ "$rq1s" = 3 ] && grep -q 'queued and not started' "$T/rq1s.out" \
+  && grep -q 'Also do the rq1 extra' ~/.cc/state/$REPO/rq1/task.md && grep -q 'And mind the rq1 edge' ~/.cc/state/$REPO/rq1/task.md \
+  && [ "$(wins "$REPO/rq1")" = "$rqw" ]; } \
+  && ok "a second --go (0) and a --say (3) on a queued worker go on top of its brief, and its window keeps its place" \
+  || bad "queued go rc=$rq1b '$(cat "$T/rq1b.out")' say rc=$rq1s '$(cat "$T/rq1s.out")' window $rqw → $(wins "$REPO/rq1")"
+pkill -P "$(tmux list-panes -t "$rqw" -F '#{pane_pid}' | head -1)"   # the wait dies; the window falls through to its shell
+for _ in $(seq 1 20); do [ -z "$(pgrep -P "$(tmux list-panes -t "$rqw" -F '#{pane_pid}' | head -1)")" ] && break; sleep 0.5; done
+"$B/cc" $REPO rq1 --say "lost?" >"$T/rq1d.out" 2>&1; rq1d=$?
+CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "" >"$T/rq1r.out" 2>&1; rq1r=$?
+{ [ "$rq1d" = 1 ] && grep -q 'queued launch ended before the worker started' "$T/rq1d.out" \
+  && [ "$rq1r" = 0 ] && grep -q 'queued launch ended before the worker started — replacing' "$T/rq1r.out" && grep -q 'worker queued, not started' "$T/rq1r.out" \
+  && [ -n "$(wins "$REPO/rq1")" ] && [ "$(wins "$REPO/rq1")" != "$rqw" ]; } \
+  && ok "a queued launch whose wait died is reported (--say 1) and a relaunch replaces its window instead of calling it live" \
+  || bad "dead queue: say rc=$rq1d '$(cat "$T/rq1d.out")' go rc=$rq1r '$(cat "$T/rq1r.out")'"
 for id in $(wins "$REPO/rq1"); do tmux kill-window -t "$id"; done
 # A ROOM CHECK THAT CRASHES (any exit but 0 or 1) FAILS OPEN: before, `full` came out empty, cc said "worker
 # started", and `admit` crashed the same way in the window — nothing ran and nothing said so. Now the loop starts

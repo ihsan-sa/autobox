@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""cc-perms-shadow — run a candidate permission decider beside perms on the asks perms has already decided, and log both.
+
+  cc-perms-shadow run --candidate CMD [--repo R] [--ledger PATH] [--log PATH] [--since ISO] [--max N] [--timeout S]
+  cc-perms-shadow show [--repo R] [--log PATH]
+  cc-perms-shadow selfcheck
+
+A SHADOW, NOTHING MORE. It reads perms' refusal ledger read-only, hands each decided ask to the candidate, and appends
+one line to its OWN log. It never acts on a verdict, never decides a refusal, never edits a rule, and never writes the
+ledger or anything else perms keeps. The one thing it writes outside its log is a failure line (below).
+
+THE SOURCE is the ledger cc-refusals keeps: <CC_REFUSALS_ROOT or ~/.cc/state>/<repo>/perms/refusals.jsonl, the same
+resolution cc-refusals uses. --ledger PATH names another file. One JSON object per line:
+  {kind:"refusal", id, at, source, window, session, tool, input, reason, key}   what the classifier refused the seat
+  {kind:"decision", id, at, decision:"grant"|"decline", note, by}             what perms decided about it
+Only refusals with a decision are run; an undecided one waits for a later run. --since ISO skips refusals recorded
+before it; --max N stops after N candidate calls (the rest wait for the next run).
+
+THE PERMS VERDICT is the decision mapped to the candidate's words: grant -> grant, decline -> refuse. The ledger has
+no ask-owner decision; any other word it ever holds is logged as it stands.
+
+THE CANDIDATE gets what cc-perms-eval sends it, one JSON object on stdin:
+  {"id", "date", "ask", "asker", "origin", "kind", "reaches", "reversible", "money", "evidence"}
+filled from the refusal, and where the refusal does not say, conservatively: ask is "<tool>: <input>"; date is the
+refusal's `at`; asker is "planning seat" (the only session cc-refusals records); origin, kind, reaches and reversible
+are the record's own field when it has one, else "unknown" (never "box" unless the record says so); money is the
+record's own boolean, else null; evidence is empty, because the classifier's reason argues against the ask, not for
+it. The candidate prints {"verdict": "grant"|"refuse"|"ask-owner", "level", "reason"}. A candidate that times out
+(--timeout, default 180s), cannot start, or prints no such object is logged with shadow verdict "error", which is
+never read as a grant.
+
+THE LOG is <CC_STATE or ~/.cc/state>/<repo>/shadow-decider/log.jsonl, or --log PATH. One line per ask:
+  {"id", "perms", "shadow", "level", "reason", "error", "backstop", "ts"}
+An id already in the log is skipped, so `run` can be called again and again (by a timer, later) and each ask is run
+once. Runs hold a lock beside the log, so two at once don't both run an ask.
+
+THE BACKSTOP. A shadow grant is flagged (`backstop` in its log line names why) when the ask's text crosses any of
+cc-infer's hard lines (hard_lines(), every line, as the decider's --gate infer reads them), or when perms declined it
+and its note crosses a hard line or names the backstop or the owner. Each flag writes one failure line:
+`cc-failures record --once --scope <repo> --kind perms-shadow/backstop-grant --link source=perms-shadow:<id>`, so
+the same ask is never recorded twice. CC_PERMS_SHADOW_FAILURES names another cc-failures (a test's fake).
+
+THE REPO defaults to the one this bin/ is checked out under in ~/dev or ~/.cc/worktrees (cc-replay-moments' ctl()).
+
+`run` prints one line per ask it ran and a count; it exits 0, 1 when a backstop grant was flagged, 2 on usage.
+`show` prints the agree/disagree counts and the latest disagreements.
+"""
+import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+USAGE = __doc__.split("\n\n")[1]
+KIND = "perms-shadow/backstop-grant"
+PERMS_MAP = {"grant": "grant", "decline": "refuse"}
+
+
+def ctl():
+    """The repo this bin/ is checked out under in ~/dev or ~/.cc/worktrees, else "box"."""
+    for root in (f"{HOME}/dev", f"{HOME}/.cc/worktrees"):
+        rel = os.path.relpath(HERE, root)
+        if not rel.startswith(".."):
+            return rel.split(os.sep)[0]
+    return "box"
+
+
+def default_ledger(repo):
+    root = os.environ.get("CC_REFUSALS_ROOT") or os.path.join(HOME, ".cc", "state")
+    return os.path.join(root, repo, "perms", "refusals.jsonl")
+
+
+def default_log(repo):
+    root = os.environ.get("CC_STATE") or os.path.join(HOME, ".cc", "state")
+    return os.path.join(root, repo, "shadow-decider", "log.jsonl")
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, os.path.realpath(path)))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+_MODS = {}
+
+
+def infer():
+    if "infer" not in _MODS:
+        _MODS["infer"] = load_module("cc_infer", os.environ.get("CC_PERMS_SHADOW_INFER") or os.path.join(HERE, "cc-infer"))
+    return _MODS["infer"]
+
+
+def evalmod():
+    if "eval" not in _MODS:
+        _MODS["eval"] = load_module("cc_perms_eval", os.path.join(HERE, "cc-perms-eval"))
+    return _MODS["eval"]
+
+
+def read_ledger(path):
+    """(refusals by id, decisions by id), read-only. Lines that don't parse are passed over."""
+    refs, decs = {}, {}
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                continue
+            if r.get("kind") == "refusal":
+                refs.setdefault(r["id"], r)
+            elif r.get("kind") == "decision":
+                decs.setdefault(r["id"], r)   # cc-refusals refuses a second decision; the first stands
+    return refs, decs
+
+
+def to_input(r):
+    """The refusal as cc-perms-eval's candidate input; unknowns stay unknown."""
+    inp = r.get("input")
+    inp = inp if isinstance(inp, str) else json.dumps(inp, ensure_ascii=False)
+    s = lambda k: r[k] if isinstance(r.get(k), str) and r[k] else "unknown"
+    return {"ask": f"{r.get('tool') or 'unknown'}: {inp}", "asker": "planning seat", "origin": s("origin"),
+            "kind": s("ask_kind"), "reaches": s("reaches"), "reversible": s("reversible"),
+            "money": r["money"] if isinstance(r.get("money"), bool) else None, "evidence": []}
+
+
+def crossed(text, kind=None, money=None):
+    """The hard lines the text crosses, as 'name on word' strings (cc-infer's hard_lines(), every line)."""
+    m = infer()
+    a = {"ask": text, "kind": kind, "money": money}
+    return [f"{n} on {w!r}" for n, w in m.hard_lines(a, m.fold(text))]
+
+
+def backstop_why(inp, perms, note):
+    hits = crossed(inp["ask"], inp.get("kind"), inp.get("money"))
+    if hits:
+        return "the ask crosses " + "; ".join(hits)
+    if perms != "grant":
+        nh = crossed(note or "")
+        if nh:
+            return f"perms said {perms}, its note on a hard line: " + "; ".join(nh)
+        if re.search(r"\b(backstop|owner)\b", note or "", re.I):
+            return f"perms said {perms}, its note naming the backstop or the owner"
+    return ""
+
+
+def failures_cmd():
+    c = os.environ.get("CC_PERMS_SHADOW_FAILURES")
+    return shlex.split(c) if c else [os.path.join(HERE, "cc-failures")]
+
+
+def raise_failure(repo, rid, why, reason):
+    cmd = failures_cmd() + [
+        "record", "--once", "--scope", repo, "--kind", KIND, "--writer", "cc-perms-shadow", "--detector", "box",
+        "--detector-evidence", "cc-perms-shadow run compared the candidate with the backstop",
+        "--observed", f"the shadow decider granted refusal {rid}: {why}"[:1000] + (f" (its reason: {reason[:300]})" if reason else ""),
+        "--expected", "a decider never grants an ask on a backstop line; it goes to the owner or is refused",
+        "--link", f"source=perms-shadow:{rid}"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        if p.returncode != 0:
+            print(f"cc-perms-shadow: {rid} backstop grant not recorded: "
+                  f"{((p.stderr or p.stdout).strip().splitlines() or ['cc-failures failed'])[-1]}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"cc-perms-shadow: {rid} backstop grant not recorded: {e.__class__.__name__}", file=sys.stderr)
+
+
+def logged_ids(path):
+    out = set()
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                try:
+                    out.add(json.loads(ln)["id"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+    return out
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(cmd, repo, ledger, log, since=None, max_n=None, timeout=180.0):
+    """Returns (lines written, backstop flags)."""
+    refs, decs = read_ledger(ledger)
+    os.makedirs(os.path.dirname(os.path.abspath(log)), exist_ok=True)
+    written, flags = [], 0
+    with open(log + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        seen = logged_ids(log)
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "a", encoding="utf-8") as out:
+            for rid, r in sorted(refs.items(), key=lambda kv: str(kv[1].get("at", ""))):
+                d = decs.get(rid)
+                if not d or rid in seen or (since and str(r.get("at", "")) < since):
+                    continue
+                if max_n is not None and len(written) >= max_n:
+                    break
+                inp = to_input(r)
+                perms = PERMS_MAP.get(d.get("decision"), str(d.get("decision")))
+                ans, err, _ = evalmod().call(cmd, {"id": rid, "date": str(r.get("at") or ""), "input": inp}, timeout)
+                shadow = (ans or {}).get("verdict", "error")
+                why = backstop_why(inp, perms, str(d.get("note") or "")) if shadow == "grant" else ""
+                row = {"id": rid, "perms": perms, "shadow": shadow, "level": str((ans or {}).get("level", "")),
+                       "reason": str((ans or {}).get("reason", ""))[:500], "error": err[:300], "backstop": why,
+                       "ts": now()}
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                out.flush()
+                written.append(row)
+                print(f"{rid}\tperms {perms}\tshadow {shadow}" + (f"\tBACKSTOP: {why}" if why else ""))
+                if why:
+                    flags += 1
+                    raise_failure(repo, rid, why, row["reason"])
+    print(f"cc-perms-shadow: {len(written)} run, {flags} backstop grant(s)")
+    return written, flags
+
+
+def show(log, last=10):
+    rows = []
+    if os.path.isfile(log):
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                try:
+                    rows.append(json.loads(ln))
+                except ValueError:
+                    continue
+    err = [x for x in rows if x.get("shadow") == "error"]
+    ran = [x for x in rows if x.get("shadow") != "error"]
+    agree = [x for x in ran if x.get("shadow") == x.get("perms")]
+    dis = [x for x in ran if x.get("shadow") != x.get("perms")]
+    looser = [x for x in dis if x.get("shadow") == "grant"]
+    print(f"{len(rows)} asks: {len(agree)} agree, {len(dis)} disagree ({len(looser)} granted where perms did not), "
+          f"{len(err)} errors, {sum(1 for x in rows if x.get('backstop'))} backstop grants")
+    for x in dis[-last:]:
+        print(f"  {x.get('id')} perms {x.get('perms')} shadow {x.get('shadow')}"
+              + (f" BACKSTOP" if x.get("backstop") else "") + f": {str(x.get('reason', ''))[:120]}")
+    return 0
+
+
+def arg(argv, flag, default=None):
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 >= len(argv):
+            raise SystemExit(f"cc-perms-shadow: {flag} needs a value\n{USAGE}")
+        v = argv[i + 1]
+        del argv[i:i + 2]
+        return v
+    return default
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] not in (["run"], ["show"]):
+        print(USAGE, file=sys.stderr)
+        return 2
+    sub, argv = argv[0], argv[1:]
+    repo = arg(argv, "--repo") or ctl()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", repo) or repo in (".", ".."):
+        print(f"cc-perms-shadow: bad repo {repo!r}", file=sys.stderr)
+        return 2
+    log = arg(argv, "--log") or default_log(repo)
+    if sub == "show":
+        if argv:
+            print(f"cc-perms-shadow: unknown arguments {argv}\n{USAGE}", file=sys.stderr)
+            return 2
+        return show(log)
+    cand = arg(argv, "--candidate")
+    ledger = arg(argv, "--ledger") or default_ledger(repo)
+    since, mx, to = arg(argv, "--since"), arg(argv, "--max"), arg(argv, "--timeout", "180")
+    if not cand or argv:
+        print(f"cc-perms-shadow: {'unknown arguments ' + str(argv) if argv else '--candidate is required'}\n{USAGE}",
+              file=sys.stderr)
+        return 2
+    if not os.path.isfile(ledger):
+        print(f"cc-perms-shadow: no ledger at {ledger}; nothing to run", file=sys.stderr)
+        return 0
+    try:
+        mx, to = (int(mx) if mx is not None else None), float(to)
+    except ValueError:
+        print(USAGE, file=sys.stderr)
+        return 2
+    _, flags = run(shlex.split(cand), repo, ledger, log, since, mx, to)
+    return 1 if flags else 0
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-perms-shadow.py, run in THIS namespace. Defining them replaces this one."""
+    path = os.path.join(os.path.dirname(HERE), "tests", "selfcheck", "cc-perms-shadow.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -15,7 +15,13 @@
 #                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
 #                             without room (`cc-room check`: CC_WORKER_CAP loops running, five-hour usage ahead of its
 #                             clock, or the box overloaded) the launch is QUEUED, not refused: it says why in one line and
-#                             starts by itself later; a cc-room that crashes is skipped with one line (fail open)
+#                             starts by itself later; a cc-room that crashes is skipped with one line (fail open).
+#                             A queued launch leaves the row `queued` (cc-loop sets it running when it starts), and a
+#                             second --go on it puts its note on top of the brief and keeps its place in the queue
+#                             (--go "" adds nothing; --loop/--budget/--model stay as queued). A window with no loop in it
+#                             — a queued launch whose wait died — is replaced, and the line says which it was
+#                             a brief with a cost line (`Cost:`, `Budget:`, `Estimated cost:` …) is checked against
+#                             --budget × --loop: one line when the launch allows less, or over three times more
 #                             the instruction is a covering note ADDED ABOVE any existing brief, never over it
 #                             a note that prescribes the STEPS is refused here, by cc-brief's arithmetic over its
 #                             shape. CC_BRIEF_FORCE=1 sends it as typed and records that. What other live tracks
@@ -31,8 +37,8 @@
 #                                            headless --go worker after its next tool call (cc-loop say). Exit 0 only once a
 #                                            turn took it; 1 nothing runs there, nothing sent · 2 a live worker loop whose spool
 #                                            would not take it (its lock held, or a planted name), nothing sent and no pane typed at ·
-#                                            3 kept, not yet heard · 4 the session is at a model wall · 5 typed, no turn started —
-#                                            each says why on stderr
+#                                            3 kept, not yet heard (a queued --go worker: the text goes on top of its brief) ·
+#                                            4 the session is at a model wall · 5 typed, no turn started — each says why on stderr
 #   A MEMBER WORKSPACE'S SESSION (cc __runmember, and its handoff successor) runs on CC_MEMBER_MODEL (claude-sonnet-5): it routes
 #   and answers, and its tracks are --go workers on CC_WORKER_MODEL; before 2026-09-18 it inherited the interactive primary (Fable[1m]).
 #   --go and --say are both REFUSED while the project is parked (`cc-pause on <repo>`, or `!pause` in its channel);
@@ -503,6 +509,42 @@ attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-cli
 win_id(){ tmux list-windows -t "$SESSION" -F '#{window_id} #W' 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}'; }   # address windows by id: names with . or / break -t main:<name>
 have_window(){ [ -n "$(win_id "$1")" ]; }
 pane_live(){ local p; p=$(tmux list-panes -t "$(win_id "$1")" -F '#{pane_pid}' 2>/dev/null | head -1); [ -n "$p" ] && pgrep -P "$p" >/dev/null 2>&1; }   # wrapper bash always shows as pane cmd; a session/worker = it has a child
+# WHAT A TRACK WINDOW HOLDS, read off its process tree rather than "has a child": a queued --go window has one too
+# (`cc-room admit`, waiting), and so can a shell left behind when that wait died. Both were "a live session", so a
+# second --go and a relaunch were refused, and the queue's death went unreported (raised-queued-launch-dies).
+# loop = a cc-loop, a claude or a `cc __run*` under the pane · queued = only `cc-room admit` (it execs the loop
+# itself, so once admitted the same pid reads as cc-loop) · idle = neither · nothing = no such window.
+pane_kind(){   # $1 the pane's pid; stdin `pid ppid args` lines (ps) → loop|queued|idle. Pure, so `cc selfcheck` feeds it lines.
+  awk -v root="$1" '{ pid[NR]=$1; pp[NR]=$2; $1=""; $2=""; a[NR]=$0 }
+    END { sub_[root]=1; do { ch=0; for (i=1;i<=NR;i++) if ((pp[i] in sub_) && !(pid[i] in sub_)) { sub_[pid[i]]=1; ch=1 } } while (ch)
+          l=0; q=0; for (i=1;i<=NR;i++) { if (!(pid[i] in sub_) || pid[i]==root) continue
+            if (a[i] ~ /cc-room[^ ]* admit /) q=1
+            else if (a[i] ~ /(^|[ \/])(cc-loop|claude)( |$)/ || a[i] ~ / __run/) l=1 }
+          print (l ? "loop" : (q ? "queued" : "idle")) }'
+}
+win_state(){ local w p; w=$(win_id "$1"); [ -n "$w" ] || return 0   # an empty -t lists the caller's own window
+  p=$(tmux list-panes -t "$w" -F '#{pane_pid}' 2>/dev/null | head -1); [ -n "$p" ] || return 0
+  ps -e -o pid=,ppid=,args= 2>/dev/null | pane_kind "$p"; }
+queue_died(){   # $1 repo $2 track → 0 when the row's last note is cc's own from a queued launch: it waited and never started
+  "$BOARD" get "$1" "$2" notes 2>/dev/null | python3 -I -c 'import sys, ast
+try: n = [x.get("msg", "") for x in ast.literal_eval(sys.stdin.read().strip() or "[]")]
+except Exception: sys.exit(1)
+sys.exit(0 if n and n[-1].startswith(("worker queued", "instruction added to the queued")) else 1)'; }
+# THE BRIEF'S OWN COST LINE AGAINST THE LAUNCH (raised-budget-vs-brief): a brief saying about $70 and 8 h went out as
+# 1 iteration at $8, and nothing said so. The brief's cost line is one that opens with a label — `Cost:`, `Budget:`,
+# `Estimated cost:`, `Spend:` (a list marker or heading before it is fine) — and its largest $ figure is compared with
+# --budget × --loop; a launch under it, or over three times it, is said in one line. Prose that merely mentions a
+# dollar figure is not a cost line. Never a refusal: the dispatcher may mean it, and cc-loop extends a loop that is still committing.
+brief_cost(){   # stdin the brief → the brief's dollar figure, or nothing. Pure; the inflight block is the board's, not the brief's.
+  awk '/<!-- cc-brief:inflight -->/{skip=1} /<!-- \/cc-brief:inflight -->/{skip=0; next} skip{next}
+    tolower($0) ~ /^[-*#> ]*(estimated |rough |expected )?(cost|budget|spend)[a-z ()*]*:/ { s=$0; while (match(s, /\$ ?[0-9]+(\.[0-9]+)?/)) { v=substr(s, RSTART, RLENGTH); gsub(/[$ ]/, "", v); if (v+0 > m) m=v+0; s=substr(s, RSTART+RLENGTH) } }
+    END { if (m > 0) print m }'
+}
+cost_says(){   # $1 the brief's figure $2 budget per iteration $3 iterations → one line when they disagree, else nothing
+  awk -v c="$1" -v b="$2" -v n="$3" 'BEGIN { w=b*n; if (c=="" || w<=0) exit
+    if (w < c) printf "cc: the brief puts its cost at about $%s, but this launch allows $%.2f (%s × $%s) — add --loop/--budget if it should get that far\n", c, w, n, b
+    else if (w > 3*c) printf "cc: the brief puts its cost at about $%s, and this launch allows $%.2f (%s × $%s), over three times that\n", c, w, n, b }'
+}
 # CC'S OWN GIT RUNS EXECUTE NOTHING OF THE REPO. Creating a worktree is plumbing, not a checkout somebody asked for, and
 # for a MEMBER workspace the repo's contents are written from inside a boundary: a post-checkout hook there would run out
 # here as the owner. cc-sandbox holds .git/config and .git/hooks read-only inside; this is the same wall from the outside.
@@ -549,12 +591,12 @@ usage(){ sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d'; }   # the whole heade
 # takes it once the worktree exists. Between them another owner can only ever get in FIRST, and then the claim
 # below refuses too. The task UUID goes on the marker's third line as a lookup hint; nothing reads authority off it.
 claim_check(){ "$BIN/cc-task" check "$repo" "$track" --executor "$1" || exit 1; }   # $1 = subagent|worker
-claim_track(){   # $1 = subagent|worker
+claim_track(){   # $1 = subagent|worker · $2 = the row's status (running; queued for a --go that waits in cc-room)
   local record
   # cc-task writes the marker as part of claiming — atomically, and refusing a link at a name the worktree's own
   # session could have planted (write_marker there says why a shell redirect into $wt/.cc is not safe).
   record=$("$BIN/cc-task" claim "$repo" "$track" --executor "$1") || exit 1
-  "$BOARD" status "$repo" "$track" running >/dev/null || exit 1   # a claimed row is never left queued
+  "$BOARD" status "$repo" "$track" "${2:-running}" >/dev/null || exit 1   # a claimed row is never left queued, unless its launch is
   # PRESENCE, WHICH THE CLAIM IS NOT — until cc-reconcile reads the record (milestone 5) the row still has to
   # say who is on it in the one language reconcile speaks. A SUBAGENT is no process the box can see, so the
   # session's own window stands for it, exactly as `cc board set … agent me` has always done; without it the row
@@ -727,6 +769,14 @@ say_to(){   # $1 repo $2 track $3 window $4 text → the exit code `cc --say` re
   # rc 2 is a LIVE loop whose spool would not take it (lock held past its wait, or a planted name): passed on as 2 with
   # cc-loop's reason, never read as "no loop", which typed at the worker's shell and lost the reason (review of #635, 16).
   [ "$rc" = 1 ] || { if [ "$rc" = 0 ]; then echo "$lo"; else echo "$lo" >&2; fi; return "$rc"; }
+  # A QUEUED WORKER HAS NO TURN YET, BUT IT HAS A BRIEF (raised-queued-worker-cannot-take-more-instructions): the
+  # text goes on top of task.md, which the loop reads when cc-room lets it start — kept, not yet heard, so 3.
+  case "$(win_state "$3")" in
+    queued) ( repo="$1" track="$2" text="$4"; write_brief ) >&2 || return 1
+            echo "cc: $1/$2 is queued and not started — added on top of its brief, which it reads when it starts" >&2; return 3 ;;
+    idle) if queue_died "$1" "$2"; then echo "cc: $1/$2's queued launch ended before the worker started — nothing was sent (relaunch it with: cc $1 $2 --go \"\")" >&2
+          else echo "cc: $3 has a window but no session or worker loop in it — nothing was sent (relaunch it with: cc $1 $2 --go \"\")" >&2; fi; return 1 ;;
+  esac
   have_window "$3" && pane_live "$3" || { echo "cc: no running session or worker loop in $3 — nothing was sent (open it with: cc $1 $2, or dispatch one with --go)" >&2; return 1; }
   "$BIN/cc-msg" --turn "$3" "$4"
 }
@@ -764,6 +814,7 @@ selfcheck(){
   local n=0 bad=0 rc D W R P M S trk mn orch none_t none_m none_o ctlm othm w line ft dup=0 dupw=0 dupr=0 dupp=0 dupm=0 dupl=0 wpid
   t(){ n=$((n+1)); [ "$2" = 0 ] && return 0; bad=$((bad+1)); printf 'FAIL %s\n' "$1"; }
   has(){ [ -n "$2" ] || return 1; case "$1" in *"$2"*) return 0;; esac; return 1; }
+  eq(){ [ "$1" = "$2" ]; }   # a command, so the `t … $?` after it reads its answer (SC2319)
   carries(){ has "$1" "$D"; }
   writes(){ has "$1" "$W"; }
   raises(){ has "$1" "$R"; }
@@ -1278,13 +1329,41 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   mkdir -p "$T/sb"; for w in cc-loop cc-msg cc-notify; do
     printf '#!/bin/bash\necho "%s $*" >> "%s/sb.log"; echo "%s said"; exit "$(cat "%s/%s.rc" 2>/dev/null || echo 0)"\n' "$w" "$T" "$w" "$T" "$w" > "$T/sb/$w"; chmod +x "$T/sb/$w"; done
   sayc(){ : > "$T/sb.log"; echo "$1" > "$T/cc-loop.rc"; echo "$2" > "$T/cc-msg.rc"
-    ( BIN="$T/sb"; SAYW="$3"; have_window(){ [ "$SAYW" = live ]; }; pane_live(){ [ "$SAYW" = live ]; }; say_to r t "$3" hi ) 2>"$T/err" >/dev/null; }
+    ( BIN="$T/sb"; SAYW="$3"; have_window(){ [ "$SAYW" = live ]; }; pane_live(){ [ "$SAYW" = live ]; }
+      win_state(){ case "$SAYW" in live) echo loop;; queued|idle) echo "$SAYW";; esac; }; queue_died(){ [ -f "$T/qd" ]; }
+      write_brief(){ echo "$repo/$track: $text" >> "$T/brief"; }; say_to r t "$3" hi ) 2>"$T/err" >/dev/null; }
   sayc 0 0 dead; rc=$?; [ "$rc" = 0 ] && ! grep -q '^cc-msg' "$T/sb.log"; t "cc --say: a running --go worker's loop takes it (exit 0) and no pane is typed at" $?
   sayc 3 0 dead; [ "$?" = 3 ] && grep -q 'cc-loop said' "$T/err"; t "…a loop that kept it for its next tool call is 3, saying so on stderr" $?
   sayc 1 0 live; [ "$?" = 0 ] && grep -q '^cc-msg --turn live hi' "$T/sb.log"; t "…no loop but a live pane: cc-msg --turn types it, exit 0 once a turn took it" $?
-  sayc 1 4 live; [ "$?" = 4 ]; t "…the pane's model wall (cc-msg 4) is passed on, not turned into 0" $?
+  sayc 1 4 live; eq "$?" 4; t "…the pane's model wall (cc-msg 4) is passed on, not turned into 0" $?
   sayc 1 0 dead; [ "$?" = 1 ] && grep -q 'nothing was sent' "$T/err" && ! grep -q '^cc-msg' "$T/sb.log"; t "…a dead target (no loop, no live pane) is 1, says nothing was sent, and types nothing" $?
   sayc 2 0 live; [ "$?" = 2 ] && grep -q 'cc-loop said' "$T/err" && ! grep -q '^cc-msg' "$T/sb.log"; t "…a live loop whose spool would not take it (cc-loop 2) is 2 with its reason, and the pane is not typed at" $?
+  # A QUEUED --go WORKER (cc-room admit, no loop yet) takes the text into its brief; a window whose queue died says so.
+  rm -f "$T/brief" "$T/qd"; sayc 1 0 queued; [ "$?" = 3 ] && grep -qx 'r/t: hi' "$T/brief" && grep -q 'queued and not started' "$T/err" && ! grep -q '^cc-msg' "$T/sb.log"
+  t "cc --say on a queued worker: the text goes on top of its brief (3, kept and not yet heard) and no pane is typed at" $?
+  rm -f "$T/brief"; touch "$T/qd"; sayc 1 0 idle; [ "$?" = 1 ] && grep -q "queued launch ended before the worker started" "$T/err" && [ ! -e "$T/brief" ] && ! grep -q '^cc-msg' "$T/sb.log"
+  t "…a window whose queued launch died is 1, says the queue ended, and adds nothing to the brief" $?
+  rm -f "$T/qd"; sayc 1 0 idle; [ "$?" = 1 ] && grep -q 'no session or worker loop in it' "$T/err" && ! grep -q 'queued launch' "$T/err"
+  t "control: an idle window that was never queued is 1 without blaming a queue" $?
+  # pane_kind reads the pane's own subtree: what runs under it, not anywhere on the box.
+  pk(){ printf '%b' "$2" | pane_kind "$1"; }
+  eq "$(pk 100 '100 1 bash\n101 100 /usr/bin/python3 /b/cc-room admit r/t --log /s/loop.log -- /b/cc-loop r t --max-iter 1\n')" queued; rc=$?
+  t "pane_kind: a pane waiting in cc-room admit is queued, though the loop's name is on admit's command line" "$rc"
+  eq "$(pk 100 '100 1 bash\n101 100 bash /b/cc-loop r t --max-iter 1\n102 101 claude -p x\n')" loop; rc=$?
+  t "…the same pid once admit has exec'd the loop is a loop" "$rc"
+  eq "$(pk 100 '100 1 bash\n101 100 bash /b/cc __run r t c\n')" loop; rc=$?; t "…an interactive session's cc __run is a loop" "$rc"
+  eq "$(pk 100 '100 1 bash\n200 1 bash /b/cc-loop r u --max-iter 1\n201 1 /usr/bin/python3 /b/cc-room admit r/v -- /b/cc-loop r v\n')" idle; rc=$?
+  t "…a bare shell is idle, whatever runs in other panes" "$rc"
+  eq "$(pk 100 '100 1 bash\n101 100 sleep 9\n')" idle; rc=$?; t "…and a shell with some other child is idle too, not a live session" "$rc"
+  # THE BRIEF'S COST LINE against --budget × --loop.
+  bc(){ printf '%b' "$1" | brief_cost; }
+  eq "$(bc 'Goal: x\nCost: about $70 and 8 h\n')" 70; rc=$?; t "brief_cost: a 'Cost:' line gives its figure" "$rc"
+  eq "$(bc '- **Budget:** ~$25 an iteration, $70 in all\n')" 70; rc=$?; t "…the largest figure on a labelled line, markdown and all" "$rc"
+  eq "$(bc 'a brief that says about $70 and 8 h launched with 1 iteration and $8\n')" ""; rc=$?; t "control: prose that mentions dollars is not a cost line" "$rc"
+  eq "$(bc 'Cost: $30\n<!-- cc-brief:inflight -->\nCost: $500\n<!-- /cc-brief:inflight -->\n')" 30; rc=$?; t "…and the board's inflight block is not the brief's" "$rc"
+  cost_says 70 8 1 | grep -q 'about \$70, but this launch allows \$8.00 (1 × \$8)'; t "cost_says: a launch under the brief's figure says so" $?
+  [ -z "$(cost_says 70 25 3)" ] && [ -z "$(cost_says 70 70 1)" ] && [ -z "$(cost_says "" 8 1)" ]; rc=$?; t "…a launch that covers it, matches it, or a brief with no cost line, says nothing" "$rc"
+  cost_says 20 25 3 | grep -q 'over three times'; t "…and one over three times the brief's figure says that" $?
   rdy(){ : > "$T/sb.log"; echo "$1" > "$T/cc-msg.rc"; echo "$2" > "$T/cc-notify.rc"
     ( BIN="$T/sb"; OWNW="${3:-}"; own_window(){ echo "$OWNW"; }; ready_tell r t "${4-pushed to origin}" "${5-origin}" ) 2>"$T/err" >"$T/out"; }
   rdy 0 0; [ "$?" = 0 ] && grep -q '^cc-msg --turn r READY TO LAND' "$T/sb.log" && ! grep -q '^cc-notify' "$T/sb.log"; t "cc done on a session row: the repo's planning turn takes READY TO LAND (0), no request filed" $?
@@ -1876,7 +1955,21 @@ case "$mode" in
   go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
          # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
          write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}" ${REPAIR:+--repair}; fi
-       if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+       ws=$(win_state "$win")
+       if [ "$ws" = loop ]; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+       if [ "$ws" = queued ]; then   # A SECOND --go ON A QUEUED LAUNCH ADDS TO ITS BRIEF and keeps its place in the queue
+         "$BIN/cc-pause" is "$repo" 2>/dev/null && { echo "cc: $repo is paused — \`cc-pause off $repo\` first"; exit 1; }
+         [ ${#XTRA[@]} -gt 0 ] || [ "$LOOPN" != 1 ] && echo "cc: --loop/--budget/--model apply when a launch is made; this one was queued with its own (cc rm $repo $track and --go again to change them)"
+         if [ -z "$text" ]; then echo "cc: $repo/$track is already queued — it starts on its own when there is room; nothing was added"; exit 0; fi
+         write_brief || exit 1
+         "$BOARD" note "$repo" "$track" "instruction added to the queued worker's brief" >/dev/null
+         echo "cc: $repo/$track is queued and not started — your note is on top of its brief, which it reads when it starts"; exit 0; fi
+       # A WINDOW WITH NO LOOP IN IT IS REPLACED, and what it was is said: a queued launch whose wait died left a shell
+       # that read as a live session, and the relaunch was refused (raised-queued-launch-dies).
+       if [ "$ws" = idle ]; then
+         if queue_died "$repo" "$track"; then echo "cc: $repo/$track's queued launch ended before the worker started — replacing its window"
+           "$BOARD" note "$repo" "$track" "queued launch ended before the worker started; relaunched" >/dev/null
+         else echo "cc: $win has no session or worker loop in it — replacing it"; fi; fi
        if member_workspace "$repo"; then member_credential "$repo" "$track" || exit 1; fi   # before the cap: nothing is charged for a launch that cannot happen
        member_gate "$repo" || exit 1
        if "$BIN/cc-pause" is "$repo" 2>/dev/null; then   # the project is parked: `cc-pause off` is the only thing that starts a worker for it
@@ -1898,7 +1991,30 @@ case "$mode" in
        # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
        [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] && repair_reserve   # after every door above: a held launch reserves nothing
        write_brief || exit 1
-       [ -n "$CLAIM" ] && claim_track worker   # the claim exists before the worker can write a line
+       # ROOM FOR ONE MORE (cc-room): fewer than CC_WORKER_CAP loops running, and the five-hour window not ahead of
+       # its clock by more than CC_WORKER_PACE_MARGIN. Without it the launch is QUEUED, not refused: the window opens
+       # with the loop behind `cc-room admit`, which waits (no claude, no model call) and starts it by itself once
+       # there is room — the pid it execs keeps the slot for the loop's whole life. On 2026-09-27 ~30 workers started
+       # in an hour and the box ran out of memory. Interactive seats and landings never come through here.
+       # ASKED BEFORE THE CLAIM, so the row says what the launch is: `queued` until cc-loop starts and sets it running
+       # itself, never `running` for a window that is only waiting (raised-board-shows-queued-worker-as-running).
+       # FAIL OPEN: a check that crashes (any exit but 0 or 1, cc-room missing included) is not "no room" and not
+       # "room" either — the loop starts WITHOUT the admit wrapper, which would crash the same way in the window and
+       # leave a track nobody runs and nobody hears about; one line here and in loop.log says admission was skipped.
+       # `admit` fails open by itself as well (cc-room: any error before the exec runs the command anyway).
+       # CC_ROOM names another cc-room, for a suite's crash fixture only.
+       roombin="${CC_ROOM:-$BIN/cc-room}"
+       full=$("$roombin" check 2>/dev/null); rrc=$?
+       case $rrc in
+         0) full=""; room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
+         1) room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
+         *) full=""; room=""
+            echo "cc: worker admission failed (cc-room check exit $rrc); starting $repo/$track without it" | tee -a "$st/loop.log" >&2 ;;
+       esac
+       [ -n "$CLAIM" ] && claim_track worker ${full:+queued}   # the claim exists before the worker can write a line
+       # THE BRIEF'S COST LINE (cost_says says when it speaks); the default per iteration is cc-loop's own, as in member_gate
+       pb=8; prev=""; if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && pb="$a"; prev="$a"; done; fi
+       cost_says "$(brief_cost < "$st/task.md" 2>/dev/null)" "$pb" "$LOOPN"
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
          [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue
          echo "cc: killing orphaned worker pid $pid in $wt" | tee -a "$st/loop.log"
@@ -1926,30 +2042,12 @@ case "$mode" in
          # CC_PEER_SPOOL/REPO/TRACK: a worker the hub placed on this host (`cc-peer serve`), whose board, notify and DONE
          # calls go to that spool for the hub to drain; off this list they would act on this host's own board and Slack.
          [ -n "${!v:-}" ] && pre="$pre$(printf '%s=%q ' "$v" "${!v}")"; done
-       # ROOM FOR ONE MORE (cc-room): fewer than CC_WORKER_CAP loops running, and the five-hour window not ahead of
-       # its clock by more than CC_WORKER_PACE_MARGIN. Without it the launch is QUEUED, not refused: the window opens
-       # with the loop behind `cc-room admit`, which waits (no claude, no model call) and starts it by itself once
-       # there is room — the pid it execs keeps the slot for the loop's whole life. On 2026-09-27 ~30 workers started
-       # in an hour and the box ran out of memory. Interactive seats and landings never come through here.
-       # FAIL OPEN: a check that crashes (any exit but 0 or 1, cc-room missing included) is not "no room" and not
-       # "room" either — the loop starts WITHOUT the admit wrapper, which would crash the same way in the window and
-       # leave a track nobody runs and nobody hears about; one line here and in loop.log says admission was skipped.
-       # `admit` fails open by itself as well (cc-room: any error before the exec runs the command anyway).
-       # CC_ROOM names another cc-room, for a suite's crash fixture only.
-       roombin="${CC_ROOM:-$BIN/cc-room}"
-       full=$("$roombin" check 2>/dev/null); rrc=$?
-       case $rrc in
-         0) full=""; room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
-         1) room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
-         *) full=""; room=""
-            echo "cc: worker admission failed (cc-room check exit $rrc); starting $repo/$track without it" | tee -a "$st/loop.log" >&2 ;;
-       esac
        if member_workspace "$repo"; then   # the loop itself runs INSIDE the boundary; cc-loop's own cc-sandbox call is then a no-op (CC_MEMBER_SANDBOX=1 inside: a nested bwrap is refused) — one wall, not two. The host records its stop after (cc-loop member-stop): the ledger is not bound inside
          tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%s%q member %q %q -- cc-loop %q %q --max-iter %q%s; %s%q member-stop %q %q $?; echo; echo %q; exec bash' "$pre$room" "$BIN/cc-sandbox" "$repo" "$track" "$repo" "$track" "$LOOPN" "$xq" "$pre" "$BIN/cc-loop" "$repo" "$track" '[worker finished — shell stays]')"
        else
          tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %s%q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$room" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        fi
-       [ -n "$CLAIM" ] && claim_end "worker launched"   # the window is up: the loop owns the row from here, not this process
+       [ -n "$CLAIM" ] && claim_end "$([ -n "$full" ] && echo "worker queued" || echo "worker launched")"   # the window is up: the loop (or the queue that starts it) owns the row from here, not this process
        wm=""; k=0; while [ "$k" -lt "${#XTRA[@]}" ]; do [ "${XTRA[$k]}" = --model ] && wm="${XTRA[$((k+1))]:-}"; k=$((k+1)); done
        unlock
        if [ -n "$full" ]; then
