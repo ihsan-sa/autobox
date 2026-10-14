@@ -268,100 +268,102 @@ def selfcheck():
         print(("ok   " if cond else "FAIL ") + name)
 
     d = tempfile.mkdtemp(prefix="hr-")
-    seat_dir = os.path.join(d, "projects", "-home-u-dev-r")
-    work_dir = os.path.join(d, "projects", "-home-u--cc-worktrees-r-t")
-    state = os.path.join(d, "state")
-    os.makedirs(seat_dir)
-    os.makedirs(work_dir)
-    os.makedirs(os.path.join(state, "r", "t", "runs"))
-    with open(os.path.join(state, "r", "t", "runs", "20261012T000000Z-1.json"), "w") as f:
-        json.dump({"session_id": "wk"}, f)                                           # cc-loop's iteration record
-    now = time.time()
-    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-    t0 = now - 7200
-
-    def write(dirn, sid, points, ep="cli"):
-        with open(os.path.join(dirn, sid + ".jsonl"), "w") as f:
-            f.write(json.dumps(dict({"type": "user", "timestamp": iso(t0), "message": {"content": "go"}},
-                                    **({"entrypoint": ep} if ep else {}))) + "\n")
-            for i, (dt, c) in enumerate(points):
-                f.write(json.dumps({"type": "assistant", "timestamp": iso(t0 + dt * 60), "requestId": f"{sid}{i}",
-                                    "message": {"model": "m", "usage": {"cache_read_input_tokens": c}, "content": []}}) + "\n")
-
-    write(seat_dir, "slow", [(0, 100000), (10, 131000), (50, 151000), (60, 201000)])   # 40 min from the v2 line to the band
-    write(seat_dir, "fast", [(0, 100000), (10, 131000), (15, 151000)])                 # 5 min: no sweep catches it
-    write(seat_dir, "mid", [(0, 100000), (10, 131000), (25, 151000)])                  # 15 min: only a lucky sweep phase
-    write(seat_dir, "calm", [(0, 100000), (10, 140000)])                               # over the v2 line, never the band
-    write(seat_dir, "short", [(0, 100000), (10, 120000)])                              # its record said the band; this can't
-    write(seat_dir, "empty", [])                                                       # no assistant turn at all
-    write(seat_dir, "hl", [(0, 160000)], ep="sdk-cli")                                 # headless, outside any worktree
-    write(work_dir, "wk", [(0, 160000)], ep=None)                                      # a loop's iteration, by its record
-    write(work_dir, "tseat", [(0, 100000), (10, 131000), (50, 151000)])                # an interactive track seat
-    write(work_dir, "anon", [(0, 160000)], ep=None)                                    # no evidence either way
-    fl = os.path.join(d, "failures.json")
-    ctx_recs = [{"kind": B.KINDS[0], "ts": iso(t0), "links": {"session": s}}
-                for s in ("slow", "mid", "wk", "gone", "hl", "tseat", "anon", "short", "empty")]
-    with open(fl, "w") as f:
-        json.dump(ctx_recs + [
-                   {"kind": B.KINDS[0], "ts": iso(t0), "links": {"source": "spend-context:fast:2026-10-12"}},
-                   {"kind": B.KINDS[1], "ts": iso(t0), "cost": ["packet_bytes=155000"]},
-                   {"kind": B.KINDS[2], "ts": iso(t0), "text": "the brief said '== journal == (none)' for the "
-                    "lessons-site orch; the journal existed at ~/.cc/state/lessons/lessons-site-handover.md"},
-                   {"kind": B.KINDS[2], "ts": iso(t0), "text": "no path named here"},
-                   {"kind": B.KINDS[2], "ts": iso(t0), "observed": "the successor read no journal",
-                    "evidence": ["it was at ~/.cc/state/r/o-handover.md all along"]},
-                   {"kind": B.KINDS[0], "ts": iso(now - 30 * 86400), "links": {"session": "slow"}},
-                   {"kind": "other/kind", "ts": iso(t0)}], f)
-    env0 = {k: os.environ.pop(k, None) for k in ("CC_SPEND_CONTEXT_BAND", "CC_HANDOFF_V2_HEADROOM")}
     try:
-        m = replay(14, fl, [os.path.join(d, "projects")], now=now, state=state)
-    finally:
-        for k, v in env0.items():
-            if v is not None:
-                os.environ[k] = v
-    cs = {c.get("session"): c for c in m["cases"] if c["kind"] == B.KINDS[0]}
-    s0, s1, s2 = (m["summary"][k] for k in B.KINDS)
-    ok("only the three kinds inside the window are replayed", (s0["records"], s1["records"], s2["records"]) == (10, 1, 3))
-    ok("a session found by links.session or by the sid in links.source has its transcript",
-       cs["slow"]["transcript"] and cs["fast"]["transcript"] and not cs["gone"]["transcript"])
-    ok("a seat with 40 minutes from the v2 line to the band is replayed right; the old line isn't, it came after",
-       cs["slow"]["v2_right"] and cs["slow"]["v2_gap_min"] == 40.0 and not cs["slow"]["old_right"]
-       and cs["slow"]["old_gap_min"] == -10.0)
-    ok("a seat that crossed both inside one sweep is not replayed right, at either phase",
-       not cs["fast"]["v2_right"] and not cs["fast"]["v2_right_best"])
-    ok("a gap longer than the overlap but shorter than sweep plus overlap is right only at the best phase",
-       not cs["mid"]["v2_right"] and cs["mid"]["v2_right_best"])
-    ok("a worker is known by its cc-loop iteration record, not by where its transcript sits, and no rule is credited",
-       cs["wk"].get("worker") and "iteration record" in cs["wk"]["why"] and "v2_right" not in cs["wk"])
-    ok("...or by a headless entrypoint, even outside a worktree",
-       cs["hl"].get("worker") and "sdk-cli" in cs["hl"]["why"] and "v2_right" not in cs["hl"])
-    ok("an interactive track seat under a worktree is a seat, and is replayed like one",
-       not cs["tseat"].get("worker") and cs["tseat"]["v2_right"] and cs["tseat"]["v2_gap_min"] == 40.0)
-    ok("a session with no loop record and no entrypoint is a gap, neither excluded as a worker nor replayed",
-       cs["anon"].get("gap") and not cs["anon"].get("worker") and "v2_right" not in cs["anon"])
-    ok("a transcript with no turn at the band, or no assistant turn at all, is a gap and right for neither system",
-       cs["short"].get("gap") == "no turn at the band in the transcript"
-       and cs["empty"].get("gap") == "no assistant turns in the transcript"
-       and not any(cs[k].get(f) for k in ("short", "empty") for f in ("v2_right", "old_right", "v2_right_best")))
-    ok("the context summary counts right, best-phase right, workers, the replayed and each gap",
-       (s0["v2_right"], s0["v2_right_best"], s0["old_right"], s0["with_transcript"], s0["worker"], s0["replayed"])
-       == (2, 3, 0, 9, 2, 4)
-       and s0["gaps"] == {"no transcript for the session": 1, "no loop record and no entrypoint in the transcript": 1,
-                          "no turn at the band in the transcript": 1, "no assistant turns in the transcript": 1})
-    pc = [c for c in m["cases"] if c["kind"] == B.KINDS[1]][0]
-    ok("a packet record is replayed right by the 18 kB cap, with the old bytes kept",
-       s1["v2_right"] == 1 and pc["old_bytes"] == 155000 and pc["v2_bytes_max"] < B.PACKET_BAND)
-    rc = [c for c in m["cases"] if c["kind"] == B.KINDS[2]]
-    ok("the catalogued -handover.md miss maps to its orch and v2 reads that path; a record naming no path isn't right",
-       rc[0]["v2_right"] and rc[0]["target"] == "lessons@lessons-site" and not rc[1]["v2_right"])
-    ok("...and a ledger record's path is read from its observed and evidence fields, where cc-failures keeps the text",
-       rc[2]["v2_right"] and rc[2]["target"] == "r@o" and s2["v2_right"] == 2)
-    ok("rotations: seven seat transcripts by evidence, five reach the v2 line and one the old line; the two workers "
-       "aren't seats and the one with no evidence is counted unknown",
-       m["rotations"] == {"seat_transcripts": 7, "v2_line_reached": 5, "old_line_reached": 1, "unknown_role": 1})
-    ok("a track's progress.md maps to the track, a planning journal to the bare repo",
-       target_of("~/.cc/state/r/t/progress.md") == "r/t" and target_of("~/.cc/state/r/planning-handoff.md") == "r")
-    shutil.rmtree(d, ignore_errors=True)
+        seat_dir = os.path.join(d, "projects", "-home-u-dev-r")
+        work_dir = os.path.join(d, "projects", "-home-u--cc-worktrees-r-t")
+        state = os.path.join(d, "state")
+        os.makedirs(seat_dir)
+        os.makedirs(work_dir)
+        os.makedirs(os.path.join(state, "r", "t", "runs"))
+        with open(os.path.join(state, "r", "t", "runs", "20261012T000000Z-1.json"), "w") as f:
+            json.dump({"session_id": "wk"}, f)                                           # cc-loop's iteration record
+        now = time.time()
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        t0 = now - 7200
+
+        def write(dirn, sid, points, ep="cli"):
+            with open(os.path.join(dirn, sid + ".jsonl"), "w") as f:
+                f.write(json.dumps(dict({"type": "user", "timestamp": iso(t0), "message": {"content": "go"}},
+                                        **({"entrypoint": ep} if ep else {}))) + "\n")
+                for i, (dt, c) in enumerate(points):
+                    f.write(json.dumps({"type": "assistant", "timestamp": iso(t0 + dt * 60), "requestId": f"{sid}{i}",
+                                        "message": {"model": "m", "usage": {"cache_read_input_tokens": c}, "content": []}}) + "\n")
+
+        write(seat_dir, "slow", [(0, 100000), (10, 131000), (50, 151000), (60, 201000)])   # 40 min from the v2 line to the band
+        write(seat_dir, "fast", [(0, 100000), (10, 131000), (15, 151000)])                 # 5 min: no sweep catches it
+        write(seat_dir, "mid", [(0, 100000), (10, 131000), (25, 151000)])                  # 15 min: only a lucky sweep phase
+        write(seat_dir, "calm", [(0, 100000), (10, 140000)])                               # over the v2 line, never the band
+        write(seat_dir, "short", [(0, 100000), (10, 120000)])                              # its record said the band; this can't
+        write(seat_dir, "empty", [])                                                       # no assistant turn at all
+        write(seat_dir, "hl", [(0, 160000)], ep="sdk-cli")                                 # headless, outside any worktree
+        write(work_dir, "wk", [(0, 160000)], ep=None)                                      # a loop's iteration, by its record
+        write(work_dir, "tseat", [(0, 100000), (10, 131000), (50, 151000)])                # an interactive track seat
+        write(work_dir, "anon", [(0, 160000)], ep=None)                                    # no evidence either way
+        fl = os.path.join(d, "failures.json")
+        ctx_recs = [{"kind": B.KINDS[0], "ts": iso(t0), "links": {"session": s}}
+                    for s in ("slow", "mid", "wk", "gone", "hl", "tseat", "anon", "short", "empty")]
+        with open(fl, "w") as f:
+            json.dump(ctx_recs + [
+                       {"kind": B.KINDS[0], "ts": iso(t0), "links": {"source": "spend-context:fast:2026-10-12"}},
+                       {"kind": B.KINDS[1], "ts": iso(t0), "cost": ["packet_bytes=155000"]},
+                       {"kind": B.KINDS[2], "ts": iso(t0), "text": "the brief said '== journal == (none)' for the "
+                        "lessons-site orch; the journal existed at ~/.cc/state/lessons/lessons-site-handover.md"},
+                       {"kind": B.KINDS[2], "ts": iso(t0), "text": "no path named here"},
+                       {"kind": B.KINDS[2], "ts": iso(t0), "observed": "the successor read no journal",
+                        "evidence": ["it was at ~/.cc/state/r/o-handover.md all along"]},
+                       {"kind": B.KINDS[0], "ts": iso(now - 30 * 86400), "links": {"session": "slow"}},
+                       {"kind": "other/kind", "ts": iso(t0)}], f)
+        env0 = {k: os.environ.pop(k, None) for k in ("CC_SPEND_CONTEXT_BAND", "CC_HANDOFF_V2_HEADROOM")}
+        try:
+            m = replay(14, fl, [os.path.join(d, "projects")], now=now, state=state)
+        finally:
+            for k, v in env0.items():
+                if v is not None:
+                    os.environ[k] = v
+        cs = {c.get("session"): c for c in m["cases"] if c["kind"] == B.KINDS[0]}
+        s0, s1, s2 = (m["summary"][k] for k in B.KINDS)
+        ok("only the three kinds inside the window are replayed", (s0["records"], s1["records"], s2["records"]) == (10, 1, 3))
+        ok("a session found by links.session or by the sid in links.source has its transcript",
+           cs["slow"]["transcript"] and cs["fast"]["transcript"] and not cs["gone"]["transcript"])
+        ok("a seat with 40 minutes from the v2 line to the band is replayed right; the old line isn't, it came after",
+           cs["slow"]["v2_right"] and cs["slow"]["v2_gap_min"] == 40.0 and not cs["slow"]["old_right"]
+           and cs["slow"]["old_gap_min"] == -10.0)
+        ok("a seat that crossed both inside one sweep is not replayed right, at either phase",
+           not cs["fast"]["v2_right"] and not cs["fast"]["v2_right_best"])
+        ok("a gap longer than the overlap but shorter than sweep plus overlap is right only at the best phase",
+           not cs["mid"]["v2_right"] and cs["mid"]["v2_right_best"])
+        ok("a worker is known by its cc-loop iteration record, not by where its transcript sits, and no rule is credited",
+           cs["wk"].get("worker") and "iteration record" in cs["wk"]["why"] and "v2_right" not in cs["wk"])
+        ok("...or by a headless entrypoint, even outside a worktree",
+           cs["hl"].get("worker") and "sdk-cli" in cs["hl"]["why"] and "v2_right" not in cs["hl"])
+        ok("an interactive track seat under a worktree is a seat, and is replayed like one",
+           not cs["tseat"].get("worker") and cs["tseat"]["v2_right"] and cs["tseat"]["v2_gap_min"] == 40.0)
+        ok("a session with no loop record and no entrypoint is a gap, neither excluded as a worker nor replayed",
+           cs["anon"].get("gap") and not cs["anon"].get("worker") and "v2_right" not in cs["anon"])
+        ok("a transcript with no turn at the band, or no assistant turn at all, is a gap and right for neither system",
+           cs["short"].get("gap") == "no turn at the band in the transcript"
+           and cs["empty"].get("gap") == "no assistant turns in the transcript"
+           and not any(cs[k].get(f) for k in ("short", "empty") for f in ("v2_right", "old_right", "v2_right_best")))
+        ok("the context summary counts right, best-phase right, workers, the replayed and each gap",
+           (s0["v2_right"], s0["v2_right_best"], s0["old_right"], s0["with_transcript"], s0["worker"], s0["replayed"])
+           == (2, 3, 0, 9, 2, 4)
+           and s0["gaps"] == {"no transcript for the session": 1, "no loop record and no entrypoint in the transcript": 1,
+                              "no turn at the band in the transcript": 1, "no assistant turns in the transcript": 1})
+        pc = [c for c in m["cases"] if c["kind"] == B.KINDS[1]][0]
+        ok("a packet record is replayed right by the 18 kB cap, with the old bytes kept",
+           s1["v2_right"] == 1 and pc["old_bytes"] == 155000 and pc["v2_bytes_max"] < B.PACKET_BAND)
+        rc = [c for c in m["cases"] if c["kind"] == B.KINDS[2]]
+        ok("the catalogued -handover.md miss maps to its orch and v2 reads that path; a record naming no path isn't right",
+           rc[0]["v2_right"] and rc[0]["target"] == "lessons@lessons-site" and not rc[1]["v2_right"])
+        ok("...and a ledger record's path is read from its observed and evidence fields, where cc-failures keeps the text",
+           rc[2]["v2_right"] and rc[2]["target"] == "r@o" and s2["v2_right"] == 2)
+        ok("rotations: seven seat transcripts by evidence, five reach the v2 line and one the old line; the two workers "
+           "aren't seats and the one with no evidence is counted unknown",
+           m["rotations"] == {"seat_transcripts": 7, "v2_line_reached": 5, "old_line_reached": 1, "unknown_role": 1})
+        ok("a track's progress.md maps to the track, a planning journal to the bare repo",
+           target_of("~/.cc/state/r/t/progress.md") == "r/t" and target_of("~/.cc/state/r/planning-handoff.md") == "r")
+    finally:                                       # a case that raises must not leave its hr- dir behind
+        shutil.rmtree(d, ignore_errors=True)
     print(f"handoff_replay selfcheck: {passed} passed, {failed} failed")
     return 1 if failed else 0
 

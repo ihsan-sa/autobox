@@ -145,7 +145,9 @@ CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT, CC_HANDOFF_GONE_CON
 CC_HANDOFF_AGENT_MAX, CC_HANDOFF_ROTATE_RETRY, CC_HANDOFF_SKILL_MAX (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS,
 CC_HANDOFF_SKILLS (test hooks) ·
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
-CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
+CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB) ·
+CC_HANDOFF_V2=1 (opt-in, off by default: --brief, the --rotate line and the cutover row come from cc-handoff-v2,
+the rebuilt parts; docs/rebuilds/handoff-and-context.md says what each one changes and why).
 """
 import fcntl, glob, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time, uuid
 
@@ -474,7 +476,7 @@ def live_side(rec):
     return "successor" if rec.get("live") == "successor" else "predecessor"
 
 
-def ledger(rec, kind, why=""):
+def ledger(rec, kind, why="", extra=None):
     """One countable line per phase — the handoff count stays a `wc -l`. `phases` in the record is what makes
     it once and not once per retry; an abandoned record is deleted, so a second --abandon is a no-op."""
     if kind in rec.setdefault("phases", []):
@@ -489,6 +491,7 @@ def ledger(rec, kind, why=""):
            "session_id": (rec.get(live_side(rec)) or {}).get("session_id")}
     if why:
         row["why"] = why
+    row.update(extra or {})
     with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
         f.write(json.dumps(row) + "\n")
     return True
@@ -1237,7 +1240,7 @@ def ready(target=None, forced=False):
     rec["phase"] = "cutover"
     rec["cutover"] = time.time()
     staying = f"the predecessor is staying for {len(held)} subagent(s)" if held else "the predecessor is retiring"
-    ledger(rec, "overlap-forced" if forced else "overlap-cutover")
+    ledger(rec, "overlap-forced" if forced else "overlap-cutover", extra=v2_cutover(rec))
     write(rec)
     derive(rec, first)
     tell_slack(target)                             # after the names move: the successor is live, so it is delivered to
@@ -1726,7 +1729,10 @@ def pane_claude(wid):
     return ""
 
 
-def measure_seat(target, sid, alone, since=0):
+SWEEP_BUDGET = 45   # seconds of seat measuring per v2 sweep, under cc-reconcile's 60 s cap on the whole sweep
+
+
+def measure_seat(target, sid, alone, since=0, timeout=90):
     """cc-context's --json for that seat, or None when it cannot be measured. By its session id when it has
     one; a track with none by its address (the board's id, else its worktree's transcript); any other seat with
     none by its checkout (`cc-context <repo>`, the newest session there) and ONLY when it is alone in it — a
@@ -1747,7 +1753,7 @@ def measure_seat(target, sid, alone, since=0):
         return None
     try:
         r = subprocess.run([os.path.join(BIN, "cc-context")] + argv + ["--json"], capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, timeout=90)
+                           stdin=subprocess.DEVNULL, timeout=timeout)
         m = json.loads(r.stdout) if r.returncode == 0 else None
     except Exception:
         return None
@@ -1785,6 +1791,10 @@ def rotate():
             continue                               # a loop's window: its iteration is its own handoff (WORKER_REFUSAL)
         seats.append((name, wid) + seat)
     opened = skilled = 0
+    nv = v2()
+    deferred = None
+    if nv:
+        seats = nv.sweep_order(sys.modules[__name__], seats)   # from where the last sweep ran out of budget
     for target, wid, sid, cwd, started in seats:
         stamp = os.path.join(HANDOFF, slug(target) + ".rotated")
         try:
@@ -1792,7 +1802,13 @@ def rotate():
                 continue                           # the box opened one inside the retry window: expired or not, not again yet
         except OSError:
             pass
-        m = measure_seat(target, sid, peers.get(cwd, 0) == 1, started)
+        if nv and time.time() - now > SWEEP_BUDGET:
+            deferred = target                      # v2: cc-reconcile kills the sweep at 60 s; the rest go first next tick
+            break
+        m = measure_seat(target, sid, peers.get(cwd, 0) == 1, started,
+                         **({"timeout": max(int(SWEEP_BUDGET - (time.time() - now)), 1)} if nv else {}))
+        if nv and m:                               # v2: the spend band minus headroom, and the decision recorded
+            m["rotate"], m["rotate_line"] = nv.decide(sys.modules[__name__], target, m), nv.rotate_line()[0]
         # "a seat over the hard line is handed off ... a seat under the line is untouched" (the brief): cc-context's
         # `rotate` is that judgement, and nothing else here reads a number
         if not m or not m.get("rotate"):
@@ -1814,13 +1830,18 @@ def rotate():
             pass
         journal(target, f"rotated by the box: {why}")
         opened += 1
+    if nv:
+        nv.sweep_cursor(sys.modules[__name__], deferred)
     # "make the rotation sweep find a past-the-line seat by its pid/session file when the pane id is missing,
     # instead of skipping it silently ... When a seat can't be rotated, it should say so once in the planning
     # seat's events" (the brief, 2026-10-12)
     for pid, sid, cwd in paneless_seats(owned):
         if os.path.exists(os.path.join(HANDOFF, f"unrotatable-{sid}")):
             continue                               # said once already: not measured again
-        m = measure_seat("", sid, False)
+        if nv and time.time() - now > SWEEP_BUDGET:
+            break                                  # v2: the same 45 s budget as the windowed seats; the rest wait a tick
+        m = measure_seat("", sid, False,
+                         **({"timeout": max(int(SWEEP_BUDGET - (time.time() - now)), 1)} if nv else {}))
         if m and m.get("rotate"):
             unrotatable(pid, sid, cwd, m)
     return opened + skilled
@@ -2318,9 +2339,40 @@ def prs(repo):
                cwd=where, fail=f"(unavailable: gh could not list the open PRs of {repo})")
 
 
+def v2():
+    """cc-handoff-v2, the rebuilt parts (docs/rebuilds/handoff-and-context.md), when CC_HANDOFF_V2=1; else None and
+    the old path runs unchanged. Loaded from beside this file, so a selfcheck's copy loads its own."""
+    if os.environ.get("CC_HANDOFF_V2") != "1":
+        return None
+    import importlib.machinery
+    import importlib.util
+    p = os.path.join(BIN, "cc-handoff-v2")
+    spec = importlib.util.spec_from_loader("cc_handoff_v2", importlib.machinery.SourceFileLoader("cc_handoff_v2", p))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def v2_cutover(rec):
+    """The cutover row's v2 fields (the packet, the successor's context: what the next baseline needs and no
+    transcript may still hold), or None with v2 off. A v2 that fails to load or raises costs the row its two fields
+    and one stderr line, never the cutover: --ready must still reach write(rec)."""
+    try:
+        nv = v2()
+        return nv.cutover_fields(sys.modules[__name__], rec) if nv else None
+    except Exception as e:
+        print(f"cc-handoff: cc-handoff-v2 gave no cutover fields ({type(e).__name__}: {e}); the cutover goes on without them",
+              file=sys.stderr)
+        return None
+
+
 def brief(target):
     """--brief: ONE packet, in the order a successor needs it, so it does not rebuild it a tool call at a
-    time. Read-only and best-effort throughout — this must never be the thing that fails a handoff."""
+    time. Read-only and best-effort throughout — this must never be the thing that fails a handoff.
+    CC_HANDOFF_V2=1 prints the rebuilt packet instead (cc-handoff-v2: a byte budget per section)."""
+    nv = v2()
+    if nv:
+        return nv.brief(sys.modules[__name__], target)
     repo = parts(target)[0]
     rec = read(target)
     journal, jlabel = journal_view(journal_for(target))

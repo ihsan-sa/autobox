@@ -8,7 +8,7 @@ def run_selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude, SKILLS, skill_names, can_reload, tell_slack
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude, SKILLS, skill_names, can_reload, tell_slack, v2
     real_out = out
     real_held = worker_held      # the real one: every case below rebinds worker_held to a stub
     _real_can_reload = can_reload
@@ -563,6 +563,67 @@ def run_selfcheck():
                 if json.loads(l)["target"] == addr][-1]["repo"] == "k1")
             ok(f"{ARTICLE[what]}: it retires, and the predecessor's window goes with it",
                retire(addr) == 0 and addr + OLD not in wins and wins.get(addr) == r["successor"]["tmux"])
+
+        # ---- THE CUTOVER ROW UNDER v2, and a v2 that breaks (the Opus read of #1215): with CC_HANDOFF_V2=1 the row
+        # carries the kept packet's bytes and the successor's context; a v2 that fails to load or raises in
+        # cutover_fields costs the row those two fields and one stderr line, never the cutover itself. Each case is its
+        # own handoff, so none leans on another's record or ledger row.
+        import contextlib as _cl, io as _sio
+        v2env, real_v2, real_measure = os.environ.get("CC_HANDOFF_V2"), v2, measure_seat
+
+        def cut_row(t, before=None):
+            wins[t] = "@" + t
+            start(t)
+            os.environ["CC_HANDOFF"] = read(t)["id"]
+            if before:
+                before(read(t))
+            err = _sio.StringIO()
+            with _cl.redirect_stderr(err):
+                rc = ready(t)
+            os.environ.pop("CC_HANDOFF", None)
+            row = [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
+                   if json.loads(l)["target"] == t and json.loads(l)["kind"] == "overlap-cutover"]
+            return rc, read(t), (row or [{}])[-1], [ln for ln in err.getvalue().splitlines() if "cc-handoff-v2" in ln]
+
+        def kept_packet(r):
+            os.makedirs(os.path.join(HANDOFF, "packets"), exist_ok=True)
+            with open(os.path.join(HANDOFF, "packets", r["id"] + ".md"), "w") as fh:
+                fh.write("P" * 4321)
+
+        try:
+            os.environ["CC_HANDOFF_V2"] = "1"
+            measure_seat = lambda target, sid, alone, since=0, timeout=90: {"used": 61234} if sid else None
+            rc, r, row, err = cut_row("vone", kept_packet)
+            ok("v2 on: the cutover row carries packet_bytes (the kept packet) and ready_ctx (the successor's context)",
+               rc == 0 and r["phase"] == "cutover" and row.get("packet_bytes") == 4321 and row.get("ready_ctx") == 61234
+               and err == [])
+
+            def no_module():
+                raise FileNotFoundError("cc-handoff-v2")
+            v2 = no_module
+            rc, r, row, err = cut_row("vtwo")
+            ok("a cc-handoff-v2 that fails to load: --ready still cuts over and writes the record, its row has no v2 "
+               "fields, and stderr has one line naming it",
+               rc == 0 and r["phase"] == "cutover" and live_side(r) == "successor" and row.get("kind") == "overlap-cutover"
+               and "packet_bytes" not in row and len(err) == 1 and "FileNotFoundError" in err[0])
+
+            class Raises:
+                @staticmethod
+                def cutover_fields(h, rec):
+                    raise KeyError("successor")
+            v2 = lambda: Raises
+            rc, r, row, err = cut_row("vthree")
+            ok("...and one whose cutover_fields raises: the same, the cutover goes on without the two fields",
+               rc == 0 and r["phase"] == "cutover" and live_side(r) == "successor" and "ready_ctx" not in row
+               and len(err) == 1 and "KeyError" in err[0])
+        finally:
+            v2, measure_seat = real_v2, real_measure
+            os.environ.pop("CC_HANDOFF_V2", None) if v2env is None else os.environ.__setitem__("CC_HANDOFF_V2", v2env)
+            os.environ.pop("CC_HANDOFF", None)
+            for t in ("vone", "vtwo", "vthree"):
+                clear(t)
+                for w in (t, t + OLD, t + NEXT):
+                    wins.pop(w, None)
 
         # TWO LIVE SESSIONS IN ONE WORKTREE ARE TWO HANDOFFS. `k1` and `k1@dash` share a repo, a checkout and a
         # Slack channel; only the alias tells them apart. Under one key an overlap open on either would refuse
@@ -1301,15 +1362,34 @@ def run_selfcheck():
                 return "· a1  OPEN-ASK-TEXT [t9]\n· a2  SECOND-OPEN-ASK\n"
             return ""
 
+        # The same rows as the board JSON CC_HANDOFF_V2=1 reads in-process (cc-handoff-v2 reads no cc-board text). Under
+        # v2 the cases that pinned a part docs/rebuilds/handoff-and-context.md rewrote assert the rewrite instead, on
+        # these same rows; each says what changed.
+        on_v2 = os.environ.get("CC_HANDOFF_V2") == "1"
+        os.makedirs(os.path.join(bh, ".cc", "boards"), exist_ok=True)
+        with open(os.path.join(bh, ".cc", "boards", "r9.json"), "w") as fh:
+            json.dump({"repo": "r9", "tracks": {
+                "t9": {"status": "running", "title": "AN-OPEN-ROW", "pr": 5, "instructions": "LIVE-TASK-CUT\nLIVE-WRAP-CUT",
+                       "notes": [{"ts": "2026-01-02T00:00:00Z", "msg": "LIVE-NOTE-KEPT"}]},
+                "t7": {"status": "queued", "title": "A-QUEUED-ROW", "held": "QUEUED-HELD-KEPT behind #309 \u2014 do not start",
+                       "held_by": "@3", "instructions": "QUEUED-TASK-CUT\nQUEUED-WRAP-CUT",
+                       "notes": [{"ts": "2026-01-02T00:00:00Z", "msg": "QUEUED-NOTE-CUT"}]},
+                "t8": {"status": "merged", "title": "A-FINISHED-ROW", "held": "FINISHED-HELD-CUT", "held_by": "@9",
+                       "instructions": "FINISHED-TASK-CUT\nFINISHED-WRAP-CUT",
+                       "notes": [{"ts": "2026-01-02T00:00:00Z", "msg": "FINISHED-NOTE-CUT"}]},
+                "t6": {"status": "queued", "title": "A-TASK-ONLY-ROW", "instructions": "LAST-TASK-CUT"}}}, fh)
+
         import contextlib, io as _io
         buf = _io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = brief("r9/t9")
         b = buf.getvalue()
         text, nread, anchor = tail_entry(jpath)
-        ok("--brief prints every section",
-           rc == 0 and all(h in b for h in ("== journal", "== board", "== land", "== workers",
-                                            "== open PRs", "== scope", "== who")))
+        ok("--brief prints every section" + (" (v2: workers became yours, open PRs dropped)" if on_v2 else ""),
+           rc == 0 and all(h in b for h in (("== yours", "== journal", "== board", "== land", "== still out", "== scope",
+                                             "== who") if on_v2 else
+                                            ("== journal", "== board", "== land", "== workers",
+                                             "== open PRs", "== scope", "== who"))))
         ok("...the journal section is the LAST 'journal at N%' entry and the dated lines after it",
            "KEPT-ENTRY" in b and "DATED-LINE-AFTER-IT" in b and "the LAST one" in b
            and anchor == "last 'journal at N%' entry")
@@ -1335,31 +1415,38 @@ def run_selfcheck():
            "AN-OPEN-ROW" in b and "LIVE-NOTE-KEPT" in b
            and not any(s in b for s in ("A-FINISHED-ROW", "FINISHED-TASK-CUT", "FINISHED-NOTE-CUT")))
         ok("...and a FINISHED row's wrapped task text goes with it: unindented, it used to read as a new board "
-           "header, reset the drop and leak the line into the packet",
-           "FINISHED-WRAP-CUT" not in b and "r9  base:main  /x" in b)
+           "header, reset the drop and leak the line into the packet"
+           + (" (v2: no board text is printed, so the board section is counts)" if on_v2 else ""),
+           "FINISHED-WRAP-CUT" not in b and ("not yours: 2 queued" in b if on_v2 else "r9  base:main  /x" in b))
         ok("...every row loses its `task:` line and the lines that text wraps onto, live row and queued row alike, "
            "while both keep the header above it — and the packet names the command that has the task text whole",
            not any(s in b for s in ("LIVE-TASK-CUT", "LIVE-WRAP-CUT", "QUEUED-TASK-CUT", "QUEUED-WRAP-CUT"))
-           and "AN-OPEN-ROW" in b and "A-QUEUED-ROW" in b and "cc board get r9 <row> instructions" in b)
+           and "AN-OPEN-ROW" in b and ("2 queued" in b if on_v2 else "A-QUEUED-ROW" in b)
+           and "cc board get r9 <row> instructions" in b)
         ok("...and a QUEUED row is its header alone: the successor is told the row exists, not what is under it, "
-           "while a running row beside it keeps its notes",
-           "A-QUEUED-ROW" in b and "[queued]" in b and "QUEUED-NOTE-CUT" not in b and "LIVE-NOTE-KEPT" in b)
+           "while a running row beside it keeps its notes" + (" (v2: a row not this seat's is a count)" if on_v2 else ""),
+           ("2 queued" in b if on_v2 else "A-QUEUED-ROW" in b and "[queued]" in b)
+           and "QUEUED-NOTE-CUT" not in b and "LIVE-NOTE-KEPT" in b)
         ok("...except a hold a person put on it: a queued row's `held (<who>): <reason>` line survives with the header "
            "(the packet is the only place a successor is offered it), and a finished row's hold goes with the row",
            "held (@3): QUEUED-HELD-KEPT" in b and "do not start" in b and "FINISHED-HELD-CUT" not in b)
         ok("...and cc-board's footer after a row whose task line was the last thing under it is kept as the board's "
-           "own line, not dropped as that row's wrapped task text",
-           "(1 finished \u2014 cc board show r9 --all)" in b and "A-TASK-ONLY-ROW" in b and "LAST-TASK-CUT" not in b)
+           "own line, not dropped as that row's wrapped task text"
+           + (" (v2: no footer to keep; the board section names the command for the rest)" if on_v2 else ""),
+           ("`cc board show r9`" in b if on_v2 else "(1 finished \u2014 cc board show r9 --all)" in b and "A-TASK-ONLY-ROW" in b)
+           and "LAST-TASK-CUT" not in b)
         ok("...a live lane names its window, its PR and its waiter pid, and the queue its job and stage",
            "lane7" in b and "@70" in b and "PR 7" in b and "4242" in b and "PR 5" in b and "stage gates" in b)
         ok("...a live worker is one line, the last of its loop.log", "LAST-LOOP-LINE" in b and "older line" not in b)
-        ok("...the open PRs, the predecessor's window, tmux id and session are all in it",
-           "track/t9" in b and "MERGEABLE" in b
+        ok("...the open PRs, the predecessor's window, tmux id and session are all in it"
+           + (" (v2: the seat's own row carries its PR; the repo's PR list is dropped)" if on_v2 else ""),
+           ("AN-OPEN-ROW  PR 5" in b if on_v2 else "track/t9" in b and "MERGEABLE" in b)
            and "main:r9/t9" in b and "@9" in b and "sid-9" in b and "id b0" in b)
         ok("...and the open asks are the asks themselves, not a bare count",
            "OPEN-ASK-TEXT" in b and "a1" in b and "SECOND-OPEN-ASK" in b and "a2" in b)
-        ok("...and the helpers are asked once each, for this repo only — cc-scope with `list`, not `count`",
-           [c[-2:] for c in calls if c[0].endswith("cc-board")] == [["show", "r9"]]
+        ok("...and the helpers are asked once each, for this repo only — cc-scope with `list`, not `count`"
+           + (" (v2: the board is read in-process, cc-board isn't asked)" if on_v2 else ""),
+           [c[-2:] for c in calls if c[0].endswith("cc-board")] == ([] if on_v2 else [["show", "r9"]])
            and [c[-2:] for c in calls if c[0].endswith("cc-scope")] == [["list", "r9"]])
         # ---- the packet's size, into the failures ledger: its own ledger dir, the band either side of this packet
         env0 = {k: os.environ.get(k) for k in ("CC_FAILURES", "CC_BRIEF_PACKET_BAND")}
@@ -1427,8 +1514,9 @@ def run_selfcheck():
         # WHERE gh IS ASKED IS PART OF THE ANSWER. It resolves a repo from its cwd, and --brief is run from
         # wherever the caller stands: from another repo's checkout that printed that repo's PRs under this
         # one's heading, and from a dir that is no checkout it printed none — read as "nothing is open".
-        ok("gh is asked inside the target's own checkout, not wherever the caller happens to be",
-           ghcwd == [os.path.join(DEV, "r9")])
+        ok("gh is asked inside the target's own checkout, not wherever the caller happens to be"
+           + (" (v2: the PR list is dropped, so gh isn't asked from anywhere)" if on_v2 else ""),
+           ghcwd == ([] if on_v2 else [os.path.join(DEV, "r9")]))
         ok("...a target with no checkout to ask in says so, and never shows an empty PR list",
            prs("r-none").startswith("(unavailable:") and "r-none" in prs("r-none"))
         ok("...and a helper that could not run says so too, while one that ran is passed through",
@@ -1452,7 +1540,7 @@ def run_selfcheck():
         def seat_of(wid):
             return seatd.get(wid)
 
-        def measure_seat(target, sid, alone, since=0):
+        def measure_seat(target, sid, alone, since=0, timeout=90):
             mcalls.append((target, sid, alone))
             msince[target] = since              # the seat's own start, which the real one hands cc-context as --since
             if not sid and not alone and not target.split("@")[0].count("/"):
@@ -1470,7 +1558,8 @@ def run_selfcheck():
         try:
             os.environ["CC_HANDOFF_OVERLAP_MAX"] = "1200"
             seat("rt1/over", "sid-over", used=250000, rotate=True)      # "a seat over the hard line is handed off"
-            seat("rt1/under", "sid-under", used=199999, rotate=False)   # "a seat under the line is untouched"
+            seat("rt1/under", "sid-under", used=129999 if os.environ.get("CC_HANDOFF_V2") == "1" else 199999,
+                 rotate=False)                                         # "a seat under the line is untouched" (v2's line is 130k)
             n0 = len(msgs)
             ok("a bare --sweep (a bare cc-reconcile's) measures nothing and opens nothing: rotation is --rotate's, the tick's --apply",
                sweep() == 0 and not mcalls and read("rt1/over") is None and "rt1/over~next" not in wins)
@@ -1595,6 +1684,43 @@ def run_selfcheck():
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+            # ---- V2'S BOUNDED SWEEP: a seat whose measurement always runs out the sweep's budget must not starve the
+            # seats after it, as it did when every sweep restarted from the same order (review of #1215). The budget is
+            # cut to a hair and one seat's measurement sleeps past it; the cursor hands the next sweep to the seats it
+            # deferred, and wraps back to the slow one after them.
+            v2env, budget0, seat0, stub_measure = os.environ.get("CC_HANDOFF_V2"), SWEEP_BUDGET, dict(seatd), measure_seat
+            seatd.clear()
+            for n in ("rv/a-slow", "rv/b", "rv/c"):
+                seat(n, "sid-" + n[3:], used=1000)
+
+            def measure_seat(target, sid, alone, since=0, timeout=90):
+                if target == "rv/a-slow":
+                    time.sleep(0.12)
+                return stub_measure(target, sid, alone, since, timeout)
+
+            os.environ["CC_HANDOFF_V2"] = "1"
+            globals()["SWEEP_BUDGET"] = 0.05
+            try:
+                rv = lambda: [c[0] for c in mcalls if c[0].startswith("rv/")]
+                mcalls.clear(); sweep(True)
+                first = rv()
+                cpath = os.path.join(HANDOFF, "rotate-cursor.json")
+                kept = json.load(open(cpath)).get("next") if os.path.exists(cpath) else None
+                mcalls.clear(); sweep(True)
+                second = rv()
+                ok("v2: a sweep whose first seat runs out the budget measures it alone, and the next sweep starts at "
+                   "the seat it deferred, wrapping to the slow one last",
+                   first == ["rv/a-slow"] and second == ["rv/b", "rv/c", "rv/a-slow"])
+                ok("...the deferred seat is kept as the cursor while it waits, and cleared once a sweep measured every seat",
+                   kept == "rv/b" and not os.path.exists(cpath))
+            finally:
+                measure_seat = stub_measure
+                globals()["SWEEP_BUDGET"] = budget0
+                os.environ.pop("CC_HANDOFF_V2", None) if v2env is None else os.environ.__setitem__("CC_HANDOFF_V2", v2env)
+                seatd.clear(); seatd.update(seat0)
+                for n in ("rv/a-slow", "rv/b", "rv/c"):
+                    wins.pop(n, None)
 
             # ---- A SEAT NO WINDOW HOLDS: the brief (2026-10-12) — "make the rotation sweep find a past-the-line seat
             # by its pid/session file when the pane id is missing, instead of skipping it silently. When a seat can't
