@@ -31,6 +31,7 @@
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
   cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide. `fix` grants something lasting on one kind of card only: on a member workspace's WebFetch or WebSearch card, `yes <id> fix` (here or the owner's in Slack) grants that workspace the web (`cc-sandbox web`) and the card gets ⚙️; on any other card a fix is a plain yes, and the thread says nothing lasting was written. With the web grant, from its next launch those two tools are no ask rule, and auto mode judges each call. It re-reads the session's pane: a dialog still standing unchanged after the answer went out is reported as not landed (exit 1, the prompt stays open), never as delivered.
   cc-slack retire <C…>… [--to <#chan|C…>] [--dry-run]   archive channels BY ID (never by name or suffix) after recording each in ~/.cc/slack/retired.json with where its posts go now (--to, else the log lane #<box>-updates). Refuses #alerts, #approvals, the log lane, the vitals store, a member's channel and a channel a live seat routes to. --dry-run archives nothing and prints, per id, its name, whether it is archived already, and where a post aimed at it would land.
+  cc-slack engine add <C…> [--name N] | rm <C…> | list   channels the dispatch engine owns, BY ID (~/.cc/slack/engine.json): this daemon hears nothing there — no session, no dir made for its name, no reply, no ! command — while the bot stays in it, since the engine reads it with the same token. A queue its folder already holds (a paused project's) is left as it is.
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
   cc-slack unarchive <C…> [--superseded-by <C…>]   bring an archived sub-orch channel back and route it again; with --superseded-by a newer live channel stays the orch's home, and the old one keeps its history with one pinned line pointing there.
@@ -1885,6 +1886,14 @@ def log_lane(cfg):
     repo has no -updates twin of its own. Twins are no longer made for the owner's repos (comms-only-read-channels-
     remain), so this is the lane the box keeps; the owner leaves it and nobody is paged there."""
     return (cfg.get("SLACK_LOG_LANE") or updates_name(BOX)).lstrip("#").lower()
+
+ENGINE = "engine.json"             # {chat id: {name, at, by}}: channels the dispatch engine owns; this daemon hears nothing there (engine_owned)
+
+def engine_owned(chat):
+    """True for a channel the dispatch engine owns (`cc-slack engine add`). Keyed by id alone, never by name, so a
+    channel someone makes under an owned one's name is still routed as before. Read fresh every use, like routes.json:
+    the members seat adds a channel on its go-live day and the running daemon leaves it alone from the next event."""
+    return bool(chat) and chat in load_table(ENGINE)
 
 TWINS = "twins.json"               # {chat id: {name, at}}: the -updates twins the box itself made, under the name it made them
 
@@ -6057,7 +6066,9 @@ class Daemon:
         return "owner" if uid and uid == self.cfg.get("SLACK_OWNER_ID") else "member"
 
     def route(self, chat, ctype):
-        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` only when it is the twin the box recorded (own_twin), since anyone can make a channel of that name. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one. A channel of a mirror workspace (SLACK_MIRROR_<N>) routes by its routes.json id entry alone, never by its name."""
+        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` only when it is the twin the box recorded (own_twin), since anyone can make a channel of that name. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a channel the dispatch engine owns (engine_owned, ahead of every other route), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one. A channel of a mirror workspace (SLACK_MIRROR_<N>) routes by its routes.json id entry alone, never by its name."""
+        if engine_owned(chat):                           # the engine's channel: no route at all, so the name fallback below never makes its dir
+            return None
         e = load_orchs().get(chat)                       # a sub-orch's channel: every message there belongs to that orch (chan_alias)
         if e:
             return e.get("target") if not e.get("archived") and valid_target(e.get("target")) else None
@@ -6275,6 +6286,8 @@ class Daemon:
         while len(self.seen) > 500:
             self.seen.popitem(last=False)
         user, chat, ctype, ts = ev.get("user"), ev["channel"], ev.get("channel_type"), ev["ts"]
+        if engine_owned(chat):                             # the engine answers here: nothing said, no ! command, no session, no dir
+            return
         thread = ev.get("thread_ts") or ts
         text = SENT_USING_RE.sub("", (ev.get("text") or "").strip())   # claude.ai's Slack connector appends "*Sent using* Claude"
         is_bot = bool(ev.get("bot_id") or user == self.bot_user)
@@ -10400,6 +10413,37 @@ def cmd_archive(argv):
     print(f"{'archived' if ok else 'could NOT archive'} {cid}" + (f" (#{orchs[cid].get('name')})" if cid in orchs else ""))
     return 0 if ok else 1
 
+def cmd_engine(argv):
+    """engine add <C…> [--name N] | rm <C…> | list — the channels the dispatch engine owns (ENGINE, engine_owned), by
+    id. Writes the table only: the bot stays in the channel, nothing is archived, and a queue already held for its
+    folder is not touched. Exit 2 usage, 1 for an id that is not a channel id or (rm) is not on the list."""
+    verb, rest = (argv[0] if argv else ""), argv[1:]
+    usage = "cc-slack engine add <C…> [--name N] | rm <C…> | list"
+    table = load_table(ENGINE)
+    if verb == "list" and not rest:
+        for cid, rec in sorted(table.items()):
+            print(f"{cid}\t#{rec.get('name') or '?'}\tsince {rec.get('at') or '?'}")
+        return 0
+    name = None
+    if verb == "add" and len(rest) == 3 and rest[1] == "--name":
+        name = rest[2].lstrip("#")
+    elif verb not in ("add", "rm") or len(rest) != 1:
+        print(usage, file=sys.stderr); return 2
+    cid = rest[0]
+    if not re.fullmatch(r"[CG][A-Z0-9]{6,}", cid):       # by id alone: a name could be anyone's channel
+        print(f"cc-slack engine: {cid} is not a channel id (C…)", file=sys.stderr); return 1
+    if verb == "rm":
+        if cid not in table:
+            print(f"cc-slack engine: {cid} is not on the engine's list", file=sys.stderr); return 1
+        del table[cid]
+        save_table(ENGINE, table, indent=1, sort_keys=True)
+        print(f"{cid} is this daemon's again: its next message routes as before"); return 0
+    rec = table.get(cid) or {}
+    table[cid] = {"name": name or rec.get("name") or "", "at": rec.get("at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "by": rec.get("by") or os.environ.get("CC_SLACK_TARGET") or os.environ.get("USER") or ""}
+    save_table(ENGINE, table, indent=1, sort_keys=True)
+    print(f"{cid} is the engine's: this daemon starts no session and makes no dir for it from its next event"); return 0
+
 def cmd_unarchive(argv):
     """unarchive <C…> [--superseded-by <C…>] — undo an archive the box should not have made (2026-09-26: a SIGKILLed orch
     archived its live channel). conversations.unarchive, then the routing table says open again. With --superseded-by
@@ -11811,6 +11855,8 @@ def main(argv):
         return cmd_archive(rest)
     elif cmd == "unarchive":
         return cmd_unarchive(rest)
+    elif cmd == "engine":
+        return cmd_engine(rest)
     elif cmd == "manifest":
         return cmd_manifest(rest)
     elif cmd == "selfcheck":

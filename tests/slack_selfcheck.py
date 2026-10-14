@@ -7416,6 +7416,54 @@ def run_selfcheck():
         check("a second message to the same channel re-uses the dir: no re-provision, no second notice, still delivered",
               load_provisioned()["newthing"]["at"] == atP and [t for t, _ in delivP] == ["newthing", "newthing"]
               and len(saidP) == 1)
+        # ---- A CHANNEL THE DISPATCH ENGINE OWNS IS NOT THIS DAEMON'S (engine-channels-leave-the-old-daemon, 10-14):
+        # #fund, #help and the rest have no routes.json line, so route() fell back to ~/dev/<name> and made the dir
+        # again when it was gone. On engine.json, by id, the daemon hears nothing there; off it, nothing changes.
+        namesP["CENG"], namesP["CENGR"] = "engthing", "myrepo"
+        save_table(ENGINE, {"CENG": {"name": "engthing"}, "CENGR": {"name": "myrepo"}})
+        delivP.clear(); saidP.clear()
+        provE = sorted(load_provisioned())
+        dmP.on_event(evP("CENG", "hello?", "5.1"))
+        dmP.on_event(evP("CENG", "!help", "5.2"))
+        dmP.on_event(evP("CENGR", "is the engine up?", "5.3"))
+        check("engine: a name-routed channel on the engine's list routes nowhere and its message makes no dir, starts no "
+              "session and says nothing, a ! command included — even when ~/dev/<name> exists",
+              (dmP.route("CENG", "channel"), dmP.route("CENGR", "channel")) == (None, None)
+              and not os.path.exists(f"{devP}/engthing") and sorted(load_provisioned()) == provE
+              and not delivP and not saidP)
+        delivP.clear(); saidP.clear()                    # this case counts only its own delivery
+        dmP.on_event(evP("CREPO", "and you?", "5.4"))
+        check("engine: a name-routed channel NOT on the list still routes to its folder and is delivered there",
+              dmP.route("CREPO", "channel") == "myrepo" and [t for t, _ in delivP] == ["myrepo"] and not saidP)
+        real_pausedE, deliverE = paused, dmP.deliver
+        try:
+            globals()["paused"] = lambda t: t == "myrepo"
+            del dmP.deliver                              # the real deliver: a paused target's message goes to its queue
+            heldE = (time.time() - QUEUE_TTL - 60, {"type": "message", "content": "held for unpause"}, None)
+            dmP.queues["myrepo"].clear(); dmP.queues["myrepo"].append(heldE)
+            dmP.on_event(evP("CENGR", "still there?", "5.5"))
+            expE = dmP.expire_queues()
+            dmP.on_event(evP("CREPO", "queued?", "5.6"))
+            qE = [p.get("content") for _, p, _ in dmP.queues["myrepo"]]
+            check("engine: a paused project keeps its queue — the list adds nothing to it and drops nothing from it, "
+                  "the TTL sweep spares it, and a paused channel off the list still queues its message",
+                  not expE and qE[0] == "held for unpause" and len(qE) == 2 and "queued?" in (qE[1] or ""))
+        finally:
+            globals()["paused"] = real_pausedE
+            dmP.deliver = deliverE
+            dmP.queues.pop("myrepo", None); dmP.save_queues()   # on disk too: a later Daemon loads queue.json
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/{ENGINE}")
+        delivP.clear(); saidP.clear()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rcE = [cmd_engine(["add", "C0ENGTEST1", "--name", "#fund"]), cmd_engine(["add", "fund"]),
+                   cmd_engine(["rm", "C0NOTONIT"]), cmd_engine(["frob"])]
+            tabE = load_table(ENGINE)
+            rcE.append(cmd_engine(["rm", "C0ENGTEST1"]))
+        check("engine: `cc-slack engine add` records a channel by id under its plain name and `rm` takes it off; a name "
+              "for an id, an id not on the list and an unknown verb are refused",
+              rcE == [0, 1, 1, 2, 0] and list(tabE) == ["C0ENGTEST1"] and tabE["C0ENGTEST1"]["name"] == "fund"
+              and engine_owned("C0ENGTEST1") is False and load_table(ENGINE) == {})
         for c, txt in (("CAP", "[repo] PR #1: x"), ("CAL", "boot"), ("CBAD", "hello"), ("D1", "hi")):
             dmP.on_event(evP(c, txt, f"1.{c}", "im" if c == "D1" else "channel"))
         dmP.on_event(evP("CDEADP", "anyone there?", "1.9"))
