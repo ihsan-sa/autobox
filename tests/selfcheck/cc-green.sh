@@ -431,6 +431,24 @@ EOS
   k "$(t test ! -e "$D/stD.pid")" "…and its check never started"
   touch "$D/sgit/go"; rm -rf "$D2"
 
+  # THE WORKER SANDBOX'S SHAPE: only the control repo's core/bin is bound there, as ~/bin, so no tests/ sits beside
+  # it. A copy of this bin with nothing beside it stands in for that. With the checkout carrying core/tests/green.sh,
+  # `start` finds the worktree's own and its run goes; with none, it exits 2 and nothing is started (2026-10-14: it
+  # said "No such file", then "started", and two workers each waited out an iteration on a run that never began).
+  mkdir -p "$D/sb/bin"; cp "$SELF" "$BIN/cc-nosignal" "$D/sb/bin/"
+  D2=$(mktemp -d); R=$(newrepo sbown); mkdir -p "$R/core/tests"; cp "$TESTS/green.sh" "$R/core/tests/"
+  ( cd "$R" && git add -A && git commit -qm tests )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$D/sb/bin/cc-green" start 2>&1 ); rc=$?
+  k "$(t test "$rc" = 0 -a -n "$(grep 'started lander check' <<<"$out")")" "a bin with no tests/ beside it, in a checkout carrying core/tests/green.sh, starts its run, exit 0"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$D/sb/bin/cc-green" wait 60 ) >/dev/null 2>&1
+  k "$(t test "$(cat "$D/sbown.args" 2>/dev/null)" = "check $(git -C "$R" rev-parse --show-toplevel)")" "…and that run ran the checkout's lander check"
+  rm -rf "$D2"
+  D2=$(mktemp -d); R=$(newrepo sbnone)
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$D/sb/bin/cc-green" start 2>&1 ); rc=$?
+  k "$(t test "$rc" = 2 -a -n "$(grep 'no tests/green.sh .* nothing was started' <<<"$out")")" "a bin with no tests/ beside it, in a checkout with none either, exits 2 and says nothing was started"
+  k "$(t test -z "$(grep 'started lander check' <<<"$out")" -a ! -e "$D/sbnone.args" -a -z "$(ls -A "$D2")")" "…and claims no run, runs no check and leaves no run state"
+  rm -rf "$D2"
+
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
   out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
