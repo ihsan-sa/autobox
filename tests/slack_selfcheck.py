@@ -23,6 +23,16 @@ def run_selfcheck():
     # usable as a health probe and a ledger check-cmd.
     scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")
     real_effects = Effects("selfcheck", dev=scratch_dev).install()
+    # NOR DOES THE BOX'S OWN WORKSPACE TABLE (10-14: with SLACK_WORKSPACES in the host's config, a case that read it
+    # through load_cfg asked Slack which workspace its fixture chat was in, and the run went red on the host alone).
+    # Every case sees a table with no other workspace unless it registers its own, as the workspace cases do.
+    cfg_source = {"load": load_cfg}
+    def fixture_cfg():
+        cfg = {k: v for k, v in cfg_source["load"]().items() if k != "SLACK_WORKSPACES"}
+        register_workspaces(cfg)
+        return cfg
+    globals()["load_cfg"] = fixture_cfg
+    register_workspaces({})
 
     def as_posted(cfg, text, kw):
         """What post() puts on the wire for a say() stub's text: the 🔒 head under decision=True, both owner marks off
@@ -10408,6 +10418,17 @@ def run_selfcheck():
     check("selfcheck: the home.json of a fixture view landed under the redirected DIR, never in the live ~/.cc/state "
           "(a fixture view reached a reader as the owner's own once, 2026-09-01)",
           os.path.exists(f"{DIR}/home.json") and json.load(open(f"{DIR}/home.json"))["state"].get("box") == "abox")
+    hostish = {"SLACK_BOT_TOKEN": "xoxb-a", "SLACK_WORKSPACES": "m", "SLACK_BOT_TOKEN_M": "xoxb-m", "SLACK_APP_TOKEN_M": "xapp-m"}
+    was_src, cfg_source["load"] = cfg_source["load"], (lambda: (register_workspaces(hostish), dict(hostish))[1])
+    try:
+        pinned_cfg = load_cfg()
+        pinned_ws = dict(WS["extra"])
+    finally:
+        cfg_source["load"] = was_src
+        register_workspaces({})
+    check("selfcheck: a config naming another workspace, as the host's does, reaches no case — load_cfg is still the "
+          "run's own at the end and registers no workspace but the default",
+          globals()["load_cfg"] is fixture_cfg and "SLACK_WORKSPACES" not in pinned_cfg and pinned_ws == {})
     denied = list(EFFECTS.denied)
     real_effects.install()
     subprocess.run(["rm", "-rf", scratch_dev])
@@ -12281,6 +12302,10 @@ def run_selfcheck():
                 cid = "CMNEW" + str(len(chansM[token]))
                 chansM[token][cid] = kw["name"]
                 return {"channel": {"id": cid}}
+            if method == "chat.postMessage":
+                return {"ok": True, "ts": "7.0", "channel": kw.get("channel")}
+            if method == "conversations.history":
+                return {"messages": []}
             return {"ok": True}
         os.makedirs(f"{devW}/hq", exist_ok=True)
         dirM = tempfile.mkdtemp(prefix="cc-slack-mirror-")
@@ -12316,6 +12341,91 @@ def run_selfcheck():
                   and not member_chat("salt", "CMHQ", "hq-face") and not member_chat("salt", "CAHQ", "hq")
                   and not member_chat("hq", "CMHQ", "hq-face") and member_chat("salt", "CASALT", "salt")
                   and not member_chat("salt", "", "home"))
+            # A MEMBER SESSION REACHES ITS MIRROR CHANNELS BY THEIR NAMES THERE (10-14: a member's session was told
+            # "#home is not one of <h>'s channels" and the planning seat posted its intros by hand). Each case
+            # its own request on the socket's own check and call, so one passing never carries another.
+            peerM = (os.getpid(), os.getuid(), None)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                callsM.clear()
+                whyHomeM = dmM.refuse_reason({"reply": "#home", "text": "hello"}, "salt", peerM)
+                rHomeM = dmM.member_verb("salt", {"reply": "#home", "text": "hello", "target": "salt"}, "reply")
+                postsM = [(t, kw.get("channel")) for m, t, kw in callsM if m == "chat.postMessage"]
+            check("member mirror: a member session's post to #home, a mirror channel routed to it, passes the socket's "
+                  "check and goes into that channel with the mirror's token",
+                  whyHomeM == "" and rHomeM.get("ok") and postsM == [("xoxb-m", "CMHOME")])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                refusedM = [dmM.refuse_reason({v: c, "text": "x"}, "salt", peerM)
+                            for v, c in (("reply", "#hq-face"), ("history", "#hq-face"), ("reply", "#hq"), ("reply", "CMHQ"))]
+                otherM = dmM.refuse_reason({"reply": "#home", "text": "x"}, "hq", peerM)
+                callsM.clear()
+                lateM = dmM.member_verb("hq", {"reply": "#home", "text": "x"}, "reply")
+                latePostsM = [m for m, t, kw in callsM if m == "chat.postMessage"]
+            check("member mirror: a mirror channel routed to another target (#hq-face), a default-workspace channel "
+                  "(#hq) and the same by id are refused, and #home is refused to a workspace it is not routed to",
+                  all("is not one of salt's channels" in r for r in refusedM) and "is not one of hq's channels" in otherM)
+            check("member mirror: a #name the call cannot find among the workspace's mirror channels is refused there "
+                  "too, never looked up in the default workspace and posted",
+                  lateM.get("ok") is False and "is not one of hq's channels" in lateM.get("error", "") and latePostsM == [])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                whyListM = dmM.refuse_reason({"channels": ""}, "salt", peerM)
+                rListM = dmM.member_verb("salt", {"channels": ""}, "channels")
+            listM = (rListM.get("text") or "").splitlines()
+            check("member mirror: `channels` from a member socket lists its own lanes and its mirror channels by their "
+                  "names there, with their routes, and nothing routed elsewhere",
+                  whyListM == "" and rListM.get("ok") and "CASALT #salt -> salt" in listM
+                  and "CMHOME #home -> salt" in listM and "CMRUG #rug-finder -> salt/rug" in listM
+                  and not any("hq" in l for l in listM))
+            # A POST INTO THE MIRROR NEVER CARRIES THE BOX'S NAME (owner, 10-14: a mirror's posts were signed
+            # "<box>-box · <box>"): no username there, so the app's own name shows, or SLACK_DISPLAY_NAME_<N>; the
+            # default workspace keeps its signature. Each post its own call, read off its own chat.postMessage.
+            def unameM(cfg, chat):
+                callsM.clear()
+                plain = os.environ.pop("CC_SLACK_PLAIN_NAME", None)
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        post(cfg, chat, "hello", username=display_name("salt/rug"), mail=False, ask=False)
+                finally:
+                    if plain is not None:
+                        os.environ["CC_SLACK_PLAIN_NAME"] = plain
+                return [kw.get("username") for m, t, kw in callsM if m == "chat.postMessage"]
+            check("member mirror: a post to a mirror chat carries no '<box>-box' username, the app's own name shows; "
+                  "SLACK_DISPLAY_NAME_<N> is used when set; a default-workspace post keeps its signature",
+                  unameM(cfgM, "CMHOME") == [None]
+                  and unameM(dict(cfgM, SLACK_DISPLAY_NAME_M="Acme"), "CMRUG") == ["Acme"]
+                  and unameM(cfgM, "CASALT") == [display_name("salt/rug")])
+            ws_remember("chan", "CMHOME", "m")
+            callsM.clear()
+            unSeenM, unHomeM = post_username(cfgM, "CMUNSEEN", "box · salt"), post_username(cfgM, "CMHOME", "box · salt")
+            check("member mirror: naming a post asks Slack nothing — a chat in the cached workspace map is that "
+                  "workspace's, one not in it is the default's — so a post makes no conversations.info of its own",
+                  unSeenM == "box · salt" and unHomeM is None and callsM == [])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                callsM.clear()
+                rBcM = dmM.member_verb("salt", {"reply": "#home", "text": "<!channel> <!here|here> <!everyone> hi",
+                                                "target": "salt"}, "reply")
+                bcM = [kw.get("text") or "" for m, t, kw in callsM if m == "chat.postMessage"]
+                callsM.clear()
+                dmM.member_verb("salt", {"reply": "#salt", "text": "<!here> own lane", "target": "salt"}, "reply")
+                ownM = [kw.get("text") or "" for m, t, kw in callsM if m == "chat.postMessage"]
+            check("member mirror: a member's reply into a mirror channel pages nobody — <!channel>, <!here> and "
+                  "<!everyone> go out as plain words — and a reply into its own lane is not rewritten",
+                  rBcM.get("ok") and len(bcM) == 1 and "<!" not in bcM[0] and "@\u200bchannel" in bcM[0]
+                  and "@\u200bhere" in bcM[0] and "@\u200beveryone" in bcM[0] and ownM and "<!here>" in ownM[0])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                callsM.clear()
+                missM = [resolve_channel(cfgM, "nosuch-m") for _ in range(3)]
+                listsMissM = sum(m == "conversations.list" for m, t, kw in callsM)
+                chansM["xoxb-a"]["CANOSUCH"] = "nosuch-m"
+                api("conversations.join", "xoxb-a", channel="CANOSUCH")
+                joinedM = resolve_channel(cfgM, "nosuch-m")
+                callsM.clear()
+                [resolve_channel(cfgM, "gone-m") for _ in range(2)]
+                os.unlink(f"{DIR}/channels.json")
+                resolve_channel(cfgM, "gone-m")
+                listsGoneM = sum(m == "conversations.list" for m, t, kw in callsM)
+            check("member mirror: a #name no list has is remembered for a minute, so asking again and again lists "
+                  "once; a channel the bot then joins, or a channel table rewritten, is looked up again",
+                  missM == [None, None, None] and listsMissM == 1 and joinedM == "CANOSUCH" and listsGoneM == 2)
             check("workspaces (mirror): the approver's id there counts as the member — instructions in its channels — "
                   "the member's own id still does, and an employee's never does",
                   member_user("salt", "UAPPR") and member_user("salt", "UOLD") and not member_user("salt", "UEMP")

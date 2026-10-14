@@ -15,7 +15,7 @@
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>      rewrite or delete one of the bot's own posts (signed ones too).
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md      pin a message; replace a channel's canvas.
   cc-slack revisit [--json]           the threads the owner 📌'd to come back to: when, channel, root line, link (no daemon needed).
-  cc-slack status | channels [--for <repo>] | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>      --for lists one project's channels: its two lanes, any legacy #<repo>--<track> channels, its sub-orch channels.
+  cc-slack status | channels [--for <repo>] | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>      --for lists one project's channels: its two lanes, any legacy #<repo>--<track> channels, its sub-orch channels. Inside a member workspace's boundary (no token there) `channels`, `history` and `thread` go through the member socket: its own channels and the mirror channels routes.json sends it (SLACK_MIRROR_<N>), each by its name there (#home), read and posted with that workspace's token; a channel of anyone else's is refused.
   cc-slack member add <@user>…        give each a private #<handle> (+ -updates) with the owner in it and ~/dev/<handle>; idempotent, the owner is exempt. A new handle `cc-sandbox handle` refuses (the box's own ~/.cc/state dirs, a repo's) is refused, and so is one it cannot ask.
   cc-slack member instructions <handle>     put the member instructions into that workspace's README (appending if it already has one).
   cc-slack member register <handle> [<@user>]   put a workspace no join flow made (cc-sandbox convert) on record in members.json from the channel pair it already has; creates nothing.
@@ -384,8 +384,12 @@ class Effects:
 
 def api(method, token, **params):
     """The Slack Web API, through the adapter — see Effects. A call made with the default bot token that names a
-    chat or a user of another workspace goes out with that workspace's token (ws_token)."""
-    return EFFECTS.api(method, ws_token(method, token, params), **params)
+    chat or a user of another workspace goes out with that workspace's token (ws_token). A call that can put a channel
+    on the bot's list forgets every remembered #name miss (NAME_MISSES), so a channel just made resolves at once."""
+    r = EFFECTS.api(method, ws_token(method, token, params), **params)
+    if method in ("conversations.create", "conversations.join", "conversations.unarchive", "conversations.rename"):
+        NAME_MISSES.clear()
+    return r
 
 EFFECTS = Effects.real()
 
@@ -401,6 +405,8 @@ EFFECTS = Effects.real()
 # routes.json entry (`cc-slack workspace route|channel|employee`), under whatever plain name it has. A reply goes back
 # to the chat it was asked in, with that chat's token (ws_token). SLACK_APPROVER_ID_<N> is the user id there whose word
 # counts as the member's (member_user); SLACK_INVITE_<N> ("U… U…") is invited to every channel the box makes there.
+# A post into any of them never carries the box's name or a track (post_username): SLACK_DISPLAY_NAME_<N> when set,
+# else no username, so the app's own name shows.
 WS = {"bot": None, "extra": {}, "chan": {}, "user": {}, "loaded": False}
 WS_LOCK = threading.Lock()
 WS_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
@@ -680,6 +686,13 @@ def perm_field(v, n, inline=True):
     s = (s[:n] + "…") if len(s) > n else s      # capped BEFORE escaping: a cut must never land inside an entity
     s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("](", "] (")
     return MENTION_RE.sub(lambda m: m.group(1) + "@\u200b" + m.group(2), s)
+
+BROADCAST_RE = re.compile(r"<!(here|channel|everyone)(?:\|[^>]*)?>")
+
+def no_broadcast(text):
+    """`text` with Slack's channel-wide pings (<!channel>, <!here>, <!everyone>) turned into plain words, the way
+    perm_field defangs a 🔐 field: what is left reads as @channel and pages nobody."""
+    return BROADCAST_RE.sub(lambda m: "@\u200b" + m.group(1), text or "")
 
 def mrkdwn(text):
     """Minimal Markdown → Slack mrkdwn (outside fenced code blocks)."""
@@ -1269,6 +1282,24 @@ def retired_note(name, thread):
     """The head of a line said in a retired channel's new home: whose it was, and that it lost its thread."""
     return f"(for #{name}, archived{', was a thread reply' if thread else ''}) "
 
+def cached_workspace(chat):
+    """chat_workspace from what is already known (workspaces.json, a route's channel recorded there) with no API call:
+    a chat not cached yet, or cached under a workspace no longer configured, is the default's."""
+    if not WS["extra"] or not chat or chat.startswith("#") or chat == "local":
+        return ""
+    with WS_LOCK:
+        got = ws_cache()["user" if chat[:1] in ("U", "W") else "chan"].get(chat)
+    return got if got in WS["extra"] else ""
+
+def post_username(cfg, chat, username):
+    """The username= a post to `chat` goes out with: `username` in the default workspace; in another workspace never
+    the box name or a track (display_name), but SLACK_DISPLAY_NAME_<N> when set, else None so the app's own name shows.
+    The workspace is the cached one (cached_workspace): naming a post never makes a Slack call of its own."""
+    name = cached_workspace(chat) if username else ""
+    if not name:
+        return username
+    return cfg.get(f"SLACK_DISPLAY_NAME_{name.upper().replace('-', '_')}") or None
+
 def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=None, decision=False, ask=None,
          rerouted=False, landed=None):
     """Post mrkdwn text (chunked) as the bot; no token means outbox log only. Returns (n_chunks, first_ts).
@@ -1291,7 +1322,7 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
         outbox("post", chat, thread, text)
         return 0, None
     first = where = None
-    uname = None if os.environ.get("CC_SLACK_PLAIN_NAME") == "1" else username
+    uname = None if os.environ.get("CC_SLACK_PLAIN_NAME") == "1" else post_username(cfg, chat, username)
     md = json.dumps({"event_type": "cc_submit", "event_payload": {"id": meta}}) if meta else None
     for c in chunks(linkify_mentions(cfg, mrkdwn(text), chat, decision=decision)):
         try:
@@ -4992,7 +5023,7 @@ class Daemon:
         return {"ok": True, "name": display_name(seat[0], seat[1]), "own": own,
                 "seat": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
 
-    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject")
+    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject", "channels")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover")
 
     def verbs_of(self, first):
@@ -5031,8 +5062,10 @@ class Daemon:
                 pass                    # names no channel: cc-docs files under this socket's workspace, from its own trees (member_docs)
             elif verb == "subject":
                 pass                    # names no channel: cc-subject starts the run for this socket's workspace (run_subject)
+            elif verb == "channels":
+                pass                    # names no channel: lists this socket's workspace's own (member_channels)
             elif verb in self.MEMBER_VERBS:
-                chat = str(first[verb])
+                chat = self.member_mirror_chat(member, str(first[verb]))
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
                 if chat != "local" and (chat.startswith("D") or not member_chat(member, "" if chat.startswith("#") else chat, name)):
                     return f"{chat} is not one of {member}'s channels"
@@ -5049,6 +5082,56 @@ class Daemon:
             if verb in self.MEMBER_VERBS:
                 return f"{verb} is a member-socket verb"
         return ""
+
+    def member_mirrors(self, h):
+        """{name: id} of the mirror channels routed to workspace `h` (member_chat by id: a channel of a Slack workspace
+        bound to `h` whose routes.json entry is `h` or one of its targets), each under its name there (#home,
+        #rug-finder). Nothing of another workspace, and no default-workspace channel, is ever in it."""
+        out = {}
+        for cid in load_routes() or {}:
+            if cid[:1] in ("C", "G") and member_chat(h, cid, ""):
+                name = self.chan_name(cid)
+                if name != cid:
+                    out.setdefault(name.lower(), cid)
+        return out
+
+    def member_mirror_chat(self, h, chat):
+        """A member's `#name` that is one of its mirror channels, as that channel's id, so the check and the call both
+        see the mirror's channel and its token (ws_token) — never a same-named channel resolve_channel would find in the
+        default workspace. The workspace's own names (#<h>, #<h>--<x>) win, and anything else comes back as it was."""
+        if not chat.startswith("#") or member_chat_ok(h, chat[1:]):
+            return chat
+        return self.member_mirrors(h).get(chat[1:].lower(), chat)
+
+    def member_channels(self, h):
+        """`cc-slack channels` inside a boundary: the workspace's own channels, one `<id> #<name> -> <target>` a line —
+        its named lanes the bot is in, then the mirror channels routed to it. Kept a minute per workspace, so a member
+        asking again and again does not spend the box's conversations.list rate limit."""
+        kept = self.__dict__.setdefault("member_lists", {})     # {handle: (at, text)}, this daemon's own
+        hit = kept.get(h)
+        if hit and time.time() - hit[0] < 60:
+            return hit[1]
+        rows = []
+        ws = ws_of_name(h)
+        tok = WS["extra"][ws]["bot"] if ws else self.cfg.get("SLACK_BOT_TOKEN")
+        if tok:
+            try:
+                cur = None
+                while True:
+                    r = api("conversations.list", tok, types="public_channel,private_channel", exclude_archived="true",
+                            limit="200", cursor=cur)
+                    rows += [(ch["id"], ch["name"], (load_routes() or {}).get(ch["id"]) or (main_lane(ch["name"]) or ch["name"]).replace("--", "/", 1))
+                             for ch in r.get("channels", ()) if ch.get("is_member") and member_chat_ok(h, ch.get("name"))]
+                    cur = (r.get("response_metadata") or {}).get("next_cursor") or None
+                    if not cur:
+                        break
+            except Exception as e:
+                log(f"channels {h}: list failed ({e!r})")
+        routes = load_routes() or {}
+        rows += [(cid, name, routes.get(cid)) for name, cid in sorted(self.member_mirrors(h).items())]
+        text = "\n".join(f"{cid} #{name} -> {t}" for cid, name, t in rows) or f"no channels of {h} found"
+        kept[h] = (time.time(), text)
+        return text
 
     def member_verb(self, h, first, verb):
         """The scoped Slack calls a boundary cannot make itself (no token inside). `verb` is the one refuse_reason
@@ -5068,7 +5151,13 @@ class Daemon:
             return res
         if verb == "ask":       # the workspace's question to the planning seat, posted out here where the seat reads (relay_ask)
             return self.relay_ask(h, str(first[verb] or ""), str(first.get("text") or ""))
-        chat = str(first[verb]); target = str(first.get("target") or h)
+        if verb == "channels":
+            return {"ok": True, "text": self.member_channels(h)}
+        chat = self.member_mirror_chat(h, str(first[verb])); target = str(first.get("target") or h)
+        if chat.startswith("#") and not member_chat_ok(h, chat[1:]):
+            # refuse_reason passed it as a mirror channel, and it is not one now (a route changed between the two):
+            # resolve_channel would find a same-named channel of the default workspace, which nothing ever checked
+            return {"ok": False, "error": f"{chat} is not one of {h}'s channels"}
         if chat.startswith("#"):
             chat = resolve_channel(self.cfg, chat[1:]) or chat
         if workspace_of(target) != h:
@@ -5102,6 +5191,8 @@ class Daemon:
                 asked = owner_ask(f"{h}: a member session needs a decision", perm_field(text, 1500, inline=False), frm=h,
                                   where=f"#{self.names.get(chat) or chat}" + (f" thread {thread}" if thread else ""))
                 dec = False
+            if chat in self.member_mirrors(h).values():
+                text = no_broadcast(text)   # a mirror channel is another workspace's room: nobody there is paged at once
             missed = unresolved_mentions(self.cfg, text, chat if chat != "local" else None, decision=dec)
             n, _ = post(self.cfg, chat, text, thread, username=display_name(target), ts=ts or None, decision=dec)
             if n:
@@ -5135,7 +5226,8 @@ class Daemon:
                 log(f"file {h}: {path} refused: {e}")
                 return {"ok": False, "error": f"{first.get('path')} is not a regular file the box can read under the workspace — nothing sent"}
             try:   # the mail door, when the thread answers a mail, is handed the checked name and opens it once itself
-                fid, _ = upload_file(self.cfg, f"/proc/self/fd/{fd}", chat, first.get("thread_ts") or None, comment=first.get("text") or None,
+                fid, _ = upload_file(self.cfg, f"/proc/self/fd/{fd}", chat, first.get("thread_ts") or None,
+                                     comment=(no_broadcast(str(first.get("text") or "")) if chat in self.member_mirrors(h).values() else first.get("text")) or None,
                                      title=first.get("title") or None, ts=str(first.get("ts") or "") or None, name=os.path.basename(path),
                                      mail_path=path, library=False)   # a member's PDF uploads as before
             except UploadRefused as e:
@@ -9531,7 +9623,19 @@ def project_channels(cfg, repo):
             break
     return sorted(out, key=lambda p: p[1])
 
+def member_sock_cli(what, req):
+    """A CLI read inside a member boundary (CC_MEMBER_SANDBOX=1): there is no token in there, so the member socket
+    makes the call, scoped to the workspace's own channels and its mirror channels (Daemon.member_verb)."""
+    try:
+        r = sock_request(req, timeout=60)
+    except Exception as e:
+        print(f"cc-slack {what}: the member socket did not answer ({e.__class__.__name__})", file=sys.stderr); return 3
+    print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
+    return 0 if r.get("ok") else 1
+
 def cmd_channels(argv=()):
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1" and not argv:
+        return member_sock_cli("channels", {"channels": ""})
     cfg = load_cfg()
     argv = list(argv)
     if "--for" in argv:
@@ -11176,8 +11280,19 @@ def cmd_manifest(argv):
           f"                3) on the box: cc slack setup --bot xoxb-… --app xapp-… --owner-email <email>; cc slack on; cc slack mkchannel <repo> …")
     return 0
 
+NAME_MISSES, NAME_MISS_S = {}, 60   # {(channels file, #name): (when a full list did not have it, the file's stamp)}
+
+def table_stamp(path):
+    """The channel table's mtime, or None with no table: a remembered miss holds only while the table it was read
+    against is the one on disk (ensure_channel unlinks it on every channel it makes)."""
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
 def resolve_channel(cfg, name):
-    """#name → channel id (only channels the bot is a member of); cached on disk for an hour. A name a member
+    """#name → channel id (only channels the bot is a member of); cached on disk for an hour, and a miss for a minute
+    (NAME_MISSES) so a name asked for again and again lists once. A name a member
     workspace of another Slack workspace owns (ws_of_name) is looked up in that workspace alone, cached apart.
 
     The same rebuild writes channels-about.json beside it: each channel's purpose, or its topic when it has no
@@ -11194,6 +11309,9 @@ def resolve_channel(cfg, name):
             return c[name]         # a cached id of a channel since retired is a miss: re-list, which skips archived ones
     except Exception:
         c = {}
+    miss = NAME_MISSES.get((path, name))
+    if miss and time.time() - miss[0] < NAME_MISS_S and miss[1] == table_stamp(path):
+        return None                # just listed and not there: asked again and again, it would spend the rate limit
     cur, found, about, made = None, {}, {}, []
     try:
         while True:
@@ -11220,6 +11338,8 @@ def resolve_channel(cfg, name):
         json.dump(about, open(about_path, "w"))
     except Exception:
         pass
+    if name not in found:
+        NAME_MISSES[(path, name)] = (time.time(), table_stamp(path))
     return found.get(name)
 
 def channel_about(ch):
@@ -11379,6 +11499,8 @@ def cmd_accept_dialog(win, seconds=180):
 def cmd_history(argv):
     if not (1 <= len(argv) <= 2):
         print("cc-slack history <#chan|C…|D…> [n]   (default 20, max 100)", file=sys.stderr); return 2
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":
+        return member_sock_cli("history", {"history": argv[0], "n": argv[1] if len(argv) == 2 else None})
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack history: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
@@ -11392,6 +11514,8 @@ def cmd_history(argv):
 def cmd_thread(argv):
     if not (2 <= len(argv) <= 3):
         print("cc-slack thread <#chan|C…> <ts> [n]   (default full thread, max 50)", file=sys.stderr); return 2
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":
+        return member_sock_cli("thread", {"thread": argv[0], "ts": argv[1], "n": argv[2] if len(argv) == 3 else None})
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack thread: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
