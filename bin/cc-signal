@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""cc-signal — the one way a box tool signals a process it did not just spawn.
+
+  cc-signal [--sig TERM|KILL|HUP|INT] [--group] [--ticks N] PID   signal PID (or its whole group) if it is safe
+  cc-signal ticks PID                                             print PID's start time in ticks, for --ticks
+  cc-signal selfcheck                                             fixtures only
+
+Exit 0 when the signal went, or the process is already gone; 1 when it was refused, with the reason on stderr;
+2 on a usage error. A refusal sends nothing at all.
+
+WHY IT EXISTS. On 2026-10-01 and again on 2026-10-03 something SIGTERMed the systemd user manager, which starts
+exit.target and takes every session, worker and service with it. A pid taken from a record or a /proc scan can
+be stale or plain wrong — a delivery claim once recorded the manager itself as its owner — and a group kill
+reaches every process in the group. So a pid from anywhere but a fresh fork goes through here, and it refuses:
+
+  - pid 1 or below, and a group id of 1 or below;
+  - any systemd process (comm `systemd` or `(sd-pam)`, or an executable named `systemd`), and with --group any
+    group that has one in it — the manager leads its own group and session;
+  - with --ticks, a pid whose start time is not the one recorded: the kernel handed that pid to someone else.
+
+With --group and the target in this tool's own caller's group, only the pid is signalled, never the group: the
+caller would otherwise kill itself and whoever ran it.
+
+NOTHING GOES OUT BY NUMBER. A pid is only a name until the signal lands, and between the check and a kill(2) the
+process can exit and the kernel can hand its pid to someone else — the user manager included. So the pid is opened
+as a pidfd FIRST, everything above is read from /proc after that, and the signal goes through the pidfd: if the
+process the checks read has gone, the pidfd says so and nothing is sent. A group is never killpg'd; each member is
+opened, checked and signalled through its own pidfd (see signal_group). With no pidfd_open on this kernel or
+Python, nothing is sent and the exit is 1: there is no fallback to a plain kill.
+
+A GROUP IS PINNED BEFORE THE FIRST SIGNAL (review of #963). A group's number is a pid too: once every member has
+exited, the kernel can give it to a new group. So every member is listed and opened before anything is sent, and
+those pidfds are signalled even when the leader has already gone. A later listing, which picks up forks, is trusted
+only while one pinned member is still alive in the group, because the kernel never reuses a group's number while
+the group has a member.
+"""
+import errno, os, signal, subprocess, sys, tempfile, time
+
+SYSTEMD = ("systemd", "(sd-pam)")
+ROUNDS = 5   # how many times a group is listed again for members that joined it while it was being signalled
+
+
+def stat(pid, proc="/proc"):
+    """(pgid, start_ticks) of pid, or None when it is gone."""
+    try:
+        fields = open(f"{proc}/{pid}/stat").read().rsplit(")", 1)[1].split()
+        return int(fields[2]), int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_systemd(pid, proc="/proc"):
+    try:
+        comm = open(f"{proc}/{pid}/comm").read().strip()
+    except OSError:
+        comm = ""
+    try:
+        exe = os.path.basename(os.readlink(f"{proc}/{pid}/exe")).removesuffix(" (deleted)")   # a systemd upgraded under it
+    except OSError:
+        exe = ""
+    return comm in SYSTEMD or exe == "systemd"
+
+
+def verdict(pid, ticks=None, group=False, mine=None, proc="/proc"):
+    """→ ("gone"|"pid"|"group"|"refuse", why). `mine` is the caller's own group, never signalled as a group."""
+    if pid <= 1:
+        return "refuse", f"pid {pid} is init or not a process"
+    st = stat(pid, proc)
+    if st is None:
+        return "gone", f"pid {pid} is gone"
+    pg, start = st
+    if ticks is not None and start != ticks:
+        return "refuse", f"pid {pid} started at {start} ticks, not the {ticks} recorded: it is another process now"
+    if is_systemd(pid, proc):
+        return "refuse", f"pid {pid} is a systemd process"
+    if not group:
+        return "pid", ""
+    if pg <= 1:
+        return "refuse", f"pid {pid} is in group {pg}"
+    if pg == mine:
+        return "pid", ""
+    for other in os.listdir(proc):
+        if other.isdigit() and (stat(other, proc) or (None,))[0] == pg and is_systemd(other, proc):
+            return "refuse", f"group {pg} of pid {pid} holds systemd process {other}"
+    return "group", str(pg)
+
+
+def members(pg, proc="/proc"):
+    """[(pid, start_ticks)] of every process /proc shows in group pg right now."""
+    out = []
+    for p in os.listdir(proc):
+        st = stat(p, proc) if p.isdigit() else None
+        if st and st[0] == pg:
+            out.append((int(p), st[1]))
+    return out
+
+
+def opened(pid):
+    """A pidfd for pid, or None when it is gone. OSError when this kernel or Python has no pidfd_open."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise OSError(errno.ENOSYS, "this Python has no pidfd_open")
+    try:
+        return os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+
+
+def through(fd, sig):
+    """Signal the process fd holds. False when it has exited: the pid it had is not touched."""
+    try:
+        signal.pidfd_send_signal(fd, sig)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def checked(pid, start, pg, proc="/proc"):
+    """(fd, rc) for a listed member: opened first, then read, so the checks are of the process the fd holds. fd is
+    None when it is gone, has left pg or changed start time (skipped), or is a systemd process (refused, rc 1)."""
+    fd, rc = None, 0
+    try:
+        fd = opened(pid) if pid > 1 else None
+        if fd is not None and stat(pid, proc) != (pg, start):
+            print(f"cc-signal: skipped {pid}: no longer the member of group {pg} that was listed", file=sys.stderr)
+            os.close(fd); fd = None
+        elif fd is not None and is_systemd(pid, proc):
+            print(f"cc-signal: refused {pid} in group {pg}: a systemd process", file=sys.stderr)
+            os.close(fd); fd, rc = None, 1
+    except OSError as e:   # inside the try, so one member's EINVAL or ENOSYS never ends the pass for the rest
+        print(f"cc-signal: {pid}: {e}", file=sys.stderr)
+        if fd is not None:
+            os.close(fd)
+        fd, rc = None, 1
+    return fd, rc
+
+
+def pin(pg, proc="/proc", skip=()):
+    """([(pid, start, fd)], rc): every member of pg opened and checked NOW, before any signal is sent."""
+    out, rc = [], 0
+    for pid, start in members(pg, proc):
+        if (pid, start) in skip:
+            continue
+        fd, r = checked(pid, start, pg, proc)
+        rc |= r
+        if fd is not None:
+            out.append((pid, start, fd))
+    return out, rc
+
+
+def anchored(anchors, pg, proc="/proc"):
+    """True while one pinned member is alive and still in pg with its listed start, so pg is still the original
+    group. A group's number is never reused while the group has a member."""
+    for pid, start, fd in anchors:
+        try:
+            signal.pidfd_send_signal(fd, 0)
+        except OSError:
+            continue
+        if stat(pid, proc) == (pg, start):
+            return True
+    return False
+
+
+def signal_group(pg, sig, pinned=(), anchors=(), proc="/proc", rounds=ROUNDS):
+    """Signal each pinned member of group pg through its own pidfd, never with killpg, then the forks that joined.
+    `pinned` is pin()'s list, opened before the caller's first signal; `anchors` adds pidfds already signalled (the
+    leader), which count only toward the group's identity. One member that fails is named on stderr and the rest
+    still get the signal.
+
+    A process that joins the group after the pinning (a member forking as it gets the signal) is caught by listing
+    the group again and taking only new (pid, start) pairs. A listing goes ahead only while anchored() holds, and
+    each new member is signalled only if the group is still anchored after it was read, so a number the kernel gave
+    to a replacement group is never expanded into. It stops when a pass finds nobody new, or when no pinned member
+    is left to vouch for the group. A group still gaining members after `rounds` passes is a fork loop, and that
+    is reported (exit 1) rather than chased."""
+    rc, anchors = 0, list(anchors) + list(pinned)
+    seen = {(p, s) for p, s, _ in anchors}
+    for _, _, fd in pinned:
+        through(fd, sig)
+    for _ in range(rounds):
+        if not anchored(anchors, pg, proc):
+            return rc
+        new = [m for m in members(pg, proc) if m not in seen]
+        if not new:
+            return rc
+        for pid, start in new:
+            seen.add((pid, start))
+            fd, r = checked(pid, start, pg, proc)
+            rc |= r
+            if fd is None:
+                continue
+            try:
+                if anchored(anchors, pg, proc):   # read after the member: pg was the original group when it was in it
+                    through(fd, sig)
+            finally:
+                os.close(fd)
+    print(f"cc-signal: group {pg} was still gaining members after {rounds} passes", file=sys.stderr)
+    return 1
+
+
+def send(pid, sig, ticks=None, group=False, proc="/proc"):
+    if pid <= 1:
+        print(f"cc-signal: refused: pid {pid} is init or not a process", file=sys.stderr)
+        return 1
+    try:
+        fd = opened(pid)   # BEFORE any check: the checks below then read the process this holds, or see it gone
+    except OSError as e:
+        print(f"cc-signal: refused: no pidfd for {pid} ({e}), and a signal by number could reach another process",
+              file=sys.stderr)
+        return 1
+    if fd is None:
+        return 0
+    pinned = []
+    try:
+        st = stat(pid, proc)   # read with the pidfd open, and kept: a leader that exits after this still has a group
+        kind, why = verdict(pid, ticks, group, os.getpgid(0), proc)
+        if kind == "refuse":
+            print(f"cc-signal: refused: {why}", file=sys.stderr)
+            return 1
+        if kind == "gone" or st is None:
+            return 0
+        if kind == "pid":
+            through(fd, sig)
+            return 0
+        pinned, rc = pin(int(why), proc, skip={(pid, st[1])})   # every member opened BEFORE the leader's signal
+        through(fd, sig)   # a leader already gone is no reason to leave its pinned members running
+        return signal_group(int(why), sig, pinned, anchors=[(pid, st[1], fd)], proc=proc) | rc
+    except OSError as e:
+        print(f"cc-signal: {pid}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        os.close(fd)
+        for _, _, f in pinned:
+            os.close(f)
+
+
+def selfcheck():
+    n = 0
+
+    def ok(what, cond):
+        nonlocal n
+        print(("  ok   " if cond else "  FAIL ") + what)
+        n += not cond
+    print("cc-signal selfcheck")
+    with tempfile.TemporaryDirectory(prefix="ccsignal-sc-") as proc:
+        def fake(pid, comm, pg, ticks=100):   # a /proc entry: just the two files verdict reads
+            os.makedirs(f"{proc}/{pid}", exist_ok=True)
+            open(f"{proc}/{pid}/comm", "w").write(comm + "\n")
+            rest = ["S", "1", str(pg), str(pg)] + ["0"] * 15 + [str(ticks)]
+            open(f"{proc}/{pid}/stat", "w").write(f"{pid} ({comm}) " + " ".join(rest) + "\n")
+        fake(500, "systemd", 500, 3100272)
+        fake(502, "(sd-pam)", 500)
+        fake(600, "claude", 600, 777)
+        fake(601, "bash", 600)
+        fake(700, "claude", 700)
+        ok("the user manager is refused even by its exact recorded pid and start time",
+           verdict(500, 3100272, proc=proc)[0] == "refuse")
+        ok("…and so is its (sd-pam) helper", verdict(502, proc=proc)[0] == "refuse")
+        ok("pid 1 and pid 0 are refused before anything is read", verdict(1, proc=proc)[0] == "refuse"
+           and verdict(0, group=True, proc=proc)[0] == "refuse")
+        ok("a worker in its own group is signalled as a group", verdict(600, 777, True, proc=proc) == ("group", "600"))
+        ok("a pid whose start time is not the recorded one is refused: it is another process now",
+           verdict(600, 778, True, proc=proc)[0] == "refuse")
+        ok("a group that holds a systemd process is refused even through a non-systemd member",
+           (fake(503, "bash", 500), verdict(503, group=True, proc=proc)[0])[1] == "refuse")
+        ok("…while that same member alone, without --group, is not", verdict(503, proc=proc)[0] == "pid")
+        ok("the caller's own group is never signalled as a group, only the pid",
+           verdict(700, group=True, mine=700, proc=proc)[0] == "pid")
+        ok("a pid that is gone reads as gone, not as a refusal", verdict(999, 5, True, proc=proc)[0] == "gone")
+        fake(504, "renamed", 504)
+        os.symlink("/usr/lib/systemd/systemd (deleted)", f"{proc}/504/exe")
+        ok("a systemd whose binary was upgraded under it (exe 'systemd (deleted)') is still refused, whatever its comm",
+           verdict(504, proc=proc)[0] == "refuse")
+    # Through a pidfd, in-process, on processes this selfcheck spawned. os.kill and os.killpg are swapped for a
+    # recorder that sends nothing, so a send by number shows up as a call and never reaches a pid the kernel reused.
+    g, real_kill, killpg, real_open = globals(), os.kill, os.killpg, getattr(os, "pidfd_open", None)
+    sent, log, kids = [], [], []
+
+    def spawn():
+        return subprocess.Popen(["sleep", "60"], start_new_session=True)
+
+    def gone(pid):
+        for _ in range(50):
+            try:
+                if open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] in "ZX":
+                    return True
+            except OSError:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def case(what, run):
+        saved = {k: g.get(k) for k in ("verdict", "stat", "members")}
+        os.kill = lambda *a: sent.append(("kill", a))
+        os.killpg = lambda *a: sent.append(("killpg", a))
+        sent.clear(); log.clear()
+        err = None
+        try:
+            cond = run()
+        except Exception as e:
+            cond, err = False, f"{type(e).__name__}: {e}"
+        finally:
+            os.kill, os.killpg = real_kill, killpg
+            if real_open:
+                os.pidfd_open = real_open
+            for k, v in saved.items():
+                g.pop(k, None) if v is None else g.update({k: v})
+        ok(what, cond and not sent)
+        if err:
+            print(f"       {err}")
+
+    def ticks_after_open():
+        c = spawn()
+        kids.append(c)
+        t, real_stat = stat(c.pid)[1], stat
+        if real_open:
+            os.pidfd_open = lambda pid, *a: (log.append(("open", pid)), real_open(pid, *a))[1]
+        g["stat"] = lambda pid, proc="/proc": (log.append(("stat", int(pid))), real_stat(pid, proc))[1]
+        rc = send(c.pid, signal.SIGTERM, t + 1, True)
+        first = next((i for i, e in enumerate(log) if e == ("open", c.pid)), None)
+        return rc == 1 and c.poll() is None and first is not None and ("stat", c.pid) in log[first:]
+    case("a pid whose start time is not the recorded one is refused, and that start time is read with the pidfd "
+         "already open, so it is the time of the process a signal would reach", ticks_after_open)
+
+    def reaped_before_send():
+        c = spawn()
+        t, real_verdict = stat(c.pid)[1], verdict
+
+        def racing(*a, **k):
+            v = real_verdict(*a, **k)
+            real_kill(c.pid, signal.SIGKILL)   # it passed every check, then exits and is reaped before the send
+            c.wait()
+            return v
+        g["verdict"] = racing
+        return send(c.pid, signal.SIGTERM, t) == 0
+    case("a process reaped between its checks and the send gets nothing, and nothing is sent to its pid by number",
+         reaped_before_send)
+
+    def no_pidfd():
+        c = spawn()
+        kids.append(c)
+
+        def nosys(*a):
+            raise OSError(errno.ENOSYS, "Function not implemented")
+        os.pidfd_open = nosys
+        return send(c.pid, signal.SIGTERM, stat(c.pid)[1]) == 1 and c.poll() is None
+    case("with no pidfd_open the signal is refused (exit 1) and no plain kill stands in for it", no_pidfd)
+
+    def stale_member():
+        lead = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exec sleep 60"], start_new_session=True,
+                                stdout=subprocess.PIPE, text=True)
+        child, decoy = int(lead.stdout.readline()), spawn()
+        kids.extend((lead, decoy))
+        listed = [(p, stat(p)[1]) for p in (lead.pid, child, decoy.pid)]   # the decoy is listed but is not in the group
+        g["members"] = lambda pg, proc="/proc": listed
+        rc = send(lead.pid, signal.SIGTERM, listed[0][1], True)
+        try:
+            lead.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return rc == 0 and lead.poll() is not None and gone(child) and decoy.poll() is None
+    case("a group is signalled member by member: a listed member that fails its own check (here, not in the group "
+         "when opened) is skipped and left running, while the rest of the group is ended", stale_member)
+
+    def systemd_member():
+        x, y = spawn(), spawn()
+        kids.extend((x, y))
+        with tempfile.TemporaryDirectory(prefix="ccsignal-grp-") as fp:
+            for pid, comm in ((x.pid, "systemd"), (y.pid, "sleep")):   # real pids, a /proc that puts both in group 900
+                os.makedirs(f"{fp}/{pid}")
+                open(f"{fp}/{pid}/comm", "w").write(comm + "\n")
+                rest = ["S", "1", "900", "900"] + ["0"] * 15 + [str(stat(pid)[1])]
+                open(f"{fp}/{pid}/stat", "w").write(f"{pid} ({comm}) " + " ".join(rest) + "\n")
+            pinned, rc = pin(900, fp)
+            rc |= signal_group(900, signal.SIGTERM, pinned, proc=fp)
+            for _, _, f in pinned:
+                os.close(f)
+        y.wait(timeout=10)
+        return rc == 1 and x.poll() is None and y.poll() is not None
+    case("a member that is a systemd process at its own check is refused, exit 1, and the others still get the signal",
+         systemd_member)
+
+    def forking_group():
+        top = int(open("/proc/sys/kernel/pid_max").read()) + 1000   # no process can hold these pids
+        a = spawn()   # alive and alone in its own group, so the group stays anchored and never gets the signal
+        kids.append(a)
+        calls, fd = [], real_open(a.pid)
+        g["members"] = lambda pg, proc="/proc": (calls.append(1), [(top + len(calls), 5)])[1]
+        try:
+            return signal_group(a.pid, signal.SIGTERM, anchors=[(a.pid, stat(a.pid)[1], fd)], rounds=3) == 1 \
+                and len(calls) == 3 and a.poll() is None
+        finally:
+            os.close(fd)
+    case("a group still gaining members after every pass is reported (exit 1), not chased forever", forking_group)
+
+    def reused_group():
+        old, new = spawn(), spawn()   # old is the group that was pinned; new now holds the number being listed
+        kids.append(new)
+        t, fd, calls = stat(old.pid)[1], real_open(old.pid), []
+        real_kill(old.pid, signal.SIGKILL)
+        old.wait()
+        g["members"] = lambda pg, proc="/proc": (calls.append(1), [(new.pid, stat(new.pid)[1])])[1]
+        try:
+            return signal_group(new.pid, signal.SIGTERM, anchors=[(old.pid, t, fd)]) == 0 \
+                and not calls and new.poll() is None
+        finally:
+            os.close(fd)
+    case("once every pinned member is gone the group is not listed again, so a replacement group that got its "
+         "number is never signalled", reused_group)
+
+    def departing_leader():
+        lead = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exec sleep 60"], start_new_session=True,
+                                stdout=subprocess.PIPE, text=True)
+        child, real_verdict = int(lead.stdout.readline()), verdict
+        kids.append(lead)
+
+        def racing(*a, **k):
+            v = real_verdict(*a, **k)
+            real_kill(lead.pid, signal.SIGKILL)   # it passed every check, then exits and is reaped before the send
+            lead.wait()
+            return v
+        g["verdict"] = racing
+        return send(lead.pid, signal.SIGTERM, stat(lead.pid)[1], True) == 0 and gone(child)
+    case("a leader reaped after its checks still has its surviving group member signalled", departing_leader)
+    for k in kids:   # whatever a case left running, killed by pid only while it is still this selfcheck's unreaped child
+        if k.poll() is None:
+            real_kill(k.pid, signal.SIGKILL)
+        k.wait()
+    # The real path, on processes this selfcheck spawned: never on anything it found.
+    me = [sys.executable, __file__]
+    victim = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    t = subprocess.run(me + ["ticks", str(victim.pid)], capture_output=True, text=True).stdout.strip()
+    wrong = subprocess.run(me + ["--group", "--ticks", str(int(t or 0) + 1), str(victim.pid)], capture_output=True, text=True)
+    time.sleep(0.2)
+    ok("a real child with a wrong start time is refused (exit 1) and still running",
+       wrong.returncode == 1 and victim.poll() is None)
+    right = subprocess.run(me + ["--group", "--ticks", t, str(victim.pid)], capture_output=True, text=True)
+    try:
+        victim.wait(timeout=10)
+        died = True
+    except subprocess.TimeoutExpired:
+        victim.kill()
+        died = False
+    ok("…and with its own start time it is ended, group and all", right.returncode == 0 and died)
+    ok("a pid already gone exits 0", subprocess.run(me + [str(victim.pid)]).returncode == 0)
+    ok("pid 1 is refused for real, exit 1", subprocess.run(me + ["--sig", "HUP", "1"], capture_output=True).returncode == 1)
+    print(f"cc-signal selfcheck: {n} failed")
+    return 1 if n else 0
+
+
+def main(argv):
+    if argv == ["selfcheck"]:
+        return selfcheck()
+    if len(argv) == 2 and argv[0] == "ticks" and argv[1].isdigit():
+        st = stat(int(argv[1]))
+        if st:
+            print(st[1])
+        return 0 if st else 1
+    sig, ticks, group, args = signal.SIGTERM, None, False, list(argv)
+    try:
+        while args and args[0].startswith("--"):
+            a = args.pop(0)
+            if a == "--group":
+                group = True
+            elif a == "--sig":
+                sig = getattr(signal, "SIG" + args.pop(0).upper().removeprefix("SIG"))
+                if sig not in (signal.SIGTERM, signal.SIGKILL, signal.SIGHUP, signal.SIGINT):
+                    raise ValueError
+            elif a == "--ticks":
+                ticks = int(args.pop(0))
+            else:
+                raise ValueError
+        if len(args) != 1:
+            raise ValueError
+        pid = int(args[0])
+    except (ValueError, IndexError, AttributeError):
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    return send(pid, sig, ticks, group)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

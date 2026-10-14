@@ -1222,6 +1222,7 @@ def selfcheck():
         json.dump({}, open(seenp, "w"))
 
         victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
+        STARTS[victim.pid] = start_ticks(victim.pid)                           # as the scan would have recorded it
         ended = end_it([victim.pid])
         try:
             victim.wait(timeout=10)
@@ -1235,6 +1236,7 @@ def selfcheck():
         lead = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exec sleep 60"], start_new_session=True,
                                 stdout=subprocess.PIPE, text=True)
         member = int(lead.stdout.readline())
+        STARTS[member] = start_ticks(member)
         end_it([member])
         time.sleep(0.3)
         try:
@@ -1258,6 +1260,51 @@ def selfcheck():
            "named systemd run with --user is", not keeper(fakes[0].pid) and not keeper(fakes[1].pid) and keeper(fakes[2].pid))
         for fp in fakes:
             fp.kill(); fp.wait()
+        held = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        STARTS[held.pid] = (start_ticks(held.pid) or 0) + 1   # the scan saw some other process at this pid
+        refused = not end_it([held.pid])
+        time.sleep(0.2)
+        ok("a pid whose start time is not the one the scan saw is refused and left running",
+           refused and held.poll() is None)
+        held.kill(); held.wait()
+        STARTS.pop(held.pid, None)
+        held = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        STARTS.pop(held.pid, None)   # the scan never saw it, or saw it change under its reads
+        refused = not end_it([held.pid])
+        time.sleep(0.2)
+        ok("a pid the scan recorded no start time for is not signalled: it is skipped, not read afresh and compared "
+           "with itself", refused and held.poll() is None)
+        held.kill(); held.wait()
+        loop = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "cc-loop", "_ccsc", "scan"])
+        try:
+            want = None
+            for _ in range(50):   # until its argv is the exec'd one the scan reads
+                if b"cc-loop" in open(f"/proc/{loop.pid}/cmdline", "rb").read():
+                    want = start_ticks(loop.pid)
+                    break
+                time.sleep(0.05)
+            seen = procs()[4].get("_ccsc/scan", [])
+            ok("the scan records a cc-loop with the start time it had before its argv was read",
+               seen == [loop.pid] and STARTS.get(loop.pid) == want is not None)
+            STARTS.pop(loop.pid, None)
+            real_ticks, reads = start_ticks, []
+
+            def moved(pid):   # the second read, after argv and cwd, sees another process at this pid
+                t = real_ticks(pid)
+                if int(pid) == loop.pid:
+                    reads.append(t)
+                    return t + (len(reads) - 1)
+                return t
+            globals()["start_ticks"] = moved
+            try:
+                seen = procs()[4].get("_ccsc/scan", [])
+            finally:
+                globals()["start_ticks"] = real_ticks
+            ok("a pid whose start time changes between the read before its argv and the read after is dropped from "
+               "the scan, and no start time is kept for it", seen == [] and loop.pid not in STARTS and len(reads) == 2)
+        finally:
+            loop.kill(); loop.wait()
+            STARTS.pop(loop.pid, None)
         other = subprocess.Popen(["sleep", "300"])
         fx, own = f"_cctest{other.pid}", f"_cctest{os.getpid()}"
         try:

@@ -40,8 +40,8 @@
 # Slack post: ~/.cc/state/<repo>/<track>/slack-post.md (`thread` or #channel on line 1, `file: <path>` optional, text below; the loop posts it once at DONE)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
 # Self-review: templates/self-review.md — the six kinds of finding the landing review keeps stopping PRs for. The worker
-#             prompt carries it verbatim (selfrev_block, inlined because a sandboxed worker has core/bin bound and not
-#             core/templates), and the worker reads its own `git diff origin/<base>` against it before STATUS: DONE.
+#             prompt carries its six headings (selfrev_block, inlined because a sandboxed worker has core/bin bound and
+#             not core/templates), and the worker reads its own `git diff origin/<base>` against them before STATUS: DONE.
 # A REFUSAL OR A REROUTE IS NEVER SILENTLY RETRIED. When cc-model classifies the run as `refusal` — the classifier
 # stopped the turn, or a model that is withdrawn or suspended answered as a different one — the same model asked
 # again gives the same answer, so the loop moves to the next model on the cc-model chain (`cc-model next`; the order
@@ -316,11 +316,16 @@ dispatch_block(){   # → that shared text with a leading space, or NOTHING if t
                     # Inlined for selfrev_block's reason too: a sandboxed worker has core/bin bound and not core/config.
   local d; d=$(cat "$DISPATCH" 2>/dev/null); [ -n "$d" ] || return 0; printf ' %s' "$d"; }
 WRITING="$(dirname "$BIN")/config/writing-prompt.md"   # the box's one writing block — written ONCE, in core/, for every session kind and the Slack tool
-writing_block(){   # → that shared rule with a leading space, or NOTHING if the file is missing, like dispatch_block.
-                   # A worker writes to him too: the BLOCKED line, the board note and the journal a handoff is read
-                   # from. `cc selfcheck` covers the other three prompt variants; this one is built here, so the
-                   # case for it is below.
-  local w; w=$(cat "$WRITING" 2>/dev/null); [ -n "$w" ] || return 0; printf ' %s' "$w"; }
+WRITING_REF="$(dirname "$BIN")/config/writing-ref-prompt.md"   # the pointer to that block, for a worker that already loads ~/CLAUDE.md
+worker_writing_block(){   # → the writing rule as THIS worker needs it. On the host it loads ~/CLAUDE.md, which carries the
+                          # block, so it gets the pointer. Inside a sandbox (CC_WORKER_SANDBOX, or a member workspace's
+                          # boundary) no ~/CLAUDE.md exists, so it gets the block's first paragraph and its last line, the
+                          # guide cc-sandbox binds as ~/WRITING.md: paragraphs of the same file, never a copy.
+  local w
+  if [ "${CC_WORKER_SANDBOX:-}" = 1 ] || [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
+    w=$(awk 'BEGIN{RS=""} NR==1{print; print ""} {l=$0} END{if(NR>1)print l}' "$WRITING" 2>/dev/null)
+  else w=$(cat "$WRITING_REF" 2>/dev/null); fi
+  [ -n "$w" ] || return 0; printf ' %s' "$w"; }
 RAISE="$(dirname "$BIN")/config/raise-prompt.md"   # how a session raises a problem with the box itself — written ONCE, in core/, for every session kind
 raise_block(){   # → that shared rule with a leading space, or NOTHING if the file is missing, like the two above.
                  # A worker trips over the framework more than anyone: it runs unattended, hits a tool that lied or
@@ -345,6 +350,11 @@ library_block(){   # → that shared rule with a leading space, or NOTHING if th
                    # question, a PR body — each is read by a person later. `cc selfcheck` covers the other kinds;
                    # this prompt is built here, so the case for it is below.
   local l; l=$(cat "$LIBRARY" 2>/dev/null); [ -n "$l" ] || return 0; printf ' %s' "$l"; }
+ASK="$(dirname "$BIN")/config/ask-prompt.md"   # WHOM TO ASK — the perms session among them, so the box's own workers only
+ask_block(){   # → that rule with a leading space, or NOTHING if the file is missing or this worker runs inside a member
+               # workspace's boundary: "a member workspace may not" ask perms (~/COMMS.md), and its seat is its route.
+  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 0
+  local a; a=$(cat "$ASK" 2>/dev/null); [ -n "$a" ] || return 0; printf ' %s' "$a"; }
 JOURNAL_CAP=6000   # bytes of journal an iteration's prompt carries — the same six thousand the byte tail carried
 journal_block(){   # $1 the journal → THE CHECKPOINT VIEW of it (cc-lib view): the newest whole entries that fit the cap, latest
                    # last, under a header that says how many of how many are shown and how to reach the rest (`cc-lib ask`).
@@ -355,15 +365,16 @@ journal_block(){   # $1 the journal → THE CHECKPOINT VIEW of it (cc-lib view):
   tail -c "$JOURNAL_CAP" "$1"; }
 selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
                    # checklist is missing. The worker reads the diff against it before STATUS: DONE, so the review
-                   # stops fewer PRs for what the worker could have seen itself. It is inlined rather than linked
-                   # because a sandboxed worker (cc-sandbox) has core/bin bound and no core/templates, and a prompt
-                   # that points at a path the worker cannot open is worse than one that says nothing.
+                   # stops fewer PRs for what the worker could have seen itself. Its six headings are inlined rather
+                   # than linked because a sandboxed worker (cc-sandbox) has core/bin bound and no core/templates, and
+                   # a prompt that points at a path the worker cannot open is worse than one that says nothing; the
+                   # prose under each heading stays in the file, and the cc-green steps are said here in one line.
   [ -r "$CHECKLIST" ] || return 0
-  printf " Before you append 'STATUS: DONE', re-read \`git diff origin/%s\` against the LANDING SELF-REVIEW below and fix what it finds — it is templates/self-review.md, so an entry that is wrong is fixed THERE, not in this copy.\n\n%s\n" \
-    "$1" "$(cat "$CHECKLIST")"; }
+  printf " Before you append 'STATUS: DONE', read \`git diff origin/%s\` against the LANDING SELF-REVIEW (templates/self-review.md; an entry that is wrong is fixed THERE) and fix what it finds:%s Then hand over a tree a suite has passed on: \`cc-green start\`, then end the iteration: the loop waits on the run with no model call and journals its exit and log for the next iteration (\`cc-green stop\` ends your own run; never setsid, nohup or &). It also names lines of the defect classes the review keeps stopping PRs for. Edit nothing after a green run.\n" \
+    "$1" "$(sed -n 's/^\([0-9]\)\. \*\*\([^*]*\)\*\*.*/ \1. \2/p' "$CHECKLIST" | tr -d '\n')"; }
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal. Write the PR's description in $ST/pr-body.md before you finish: what changed, why, and how it was tested, with anything the lander must do after the merge (a restart, a migration). ~/WRITING.md has a worked example. cc done makes it the PR body and links the brief under it, so do not paste the brief; a line 'Closes <row>' there (several: 'Closes a, b and c') closes those board rows when the PR lands, and the brief's own Closes sentence counts. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line the word thread (the row's own thread, where whoever dispatched you reads — a track has no channel of its own, never invent one) or a #channel the brief named; an optional second line 'file: <path under the worktree>' goes up with it; then the text. The loop posts it once at DONE, since you cannot. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(dispatch_block)$(writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(selfrev_block "$1")"; }
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself, and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -788,7 +799,7 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
                # `subagent_stats.refused` block, and a successful worker whose own prose says "refused". The full
                # sanitized real result lives in cc-model's selfcheck — this file only has to test the loop's reaction.
-  local d n=0 bad=0 out rc head nxt last wm dtext wsp gone wtext wgone ptext pgone chain
+  local d n=0 bad=0 out rc head nxt last wm dtext wsp gone wtext wgone wref wp1 wbx wbg e ptext pgone chain
   d=$(mktemp -d) || return 1
   # THE SHIPPED CHAIN, NOT THIS BOX'S. cc-model filters its chain through ~/.cc/state/model-unavailable, so read from
   # the real HOME this suite went red whenever the box had a family recorded out — and with two shipped rungs since
@@ -942,6 +953,7 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   # as "no run"), and none going (suppressed: nothing waited, nothing journaled).
   grep -q 'do not sit in `cc-green wait`' "$CHECKLIST";  t 'the checklist tells the worker to end its iteration after cc-green start' "$?" 0
   grep -q "end the iteration: never wait on it in your turn" <<<"$(repo=r track=t ST="$d/st"; sp_worker trunk)"; t 'and so does the prompt cc-loop builds' "$?" 0
+  t 'the worker prompt never tells the worker to run cc-green wait' "$(repo=r track=t ST="$d/st"; sp_worker trunk | grep -o '[^.]*cc-green wait[^.]*' | grep -vc 'not sit in\|[Nn]ever wait\|no model call')" 0
   # The fake models the run: $3 = live as the iteration ended (1/0); `wait 0` answers from that alone, and each long
   # wait is one more 540 s, still going for the first $2 of them, ended on the next. `calls` counts every ask.
   gw(){ ( mkdir -p "$d/gw/$1/wt" "$d/gw/$1/st"; : > "$d/gw/$1/st/progress.md"; : > "$d/gw/$1/calls"; : > "$d/gw/$1/longs"
@@ -961,6 +973,26 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
     "$(grep -c '^- cc-loop: the cc-green run iteration 4 started is still going after 40 waits' "$d/gw/starved/st/progress.md")" 1
   t 'no run going: nothing waited on' "$(gw none 0 0)" "rc=1 asks=1"
   t '…and nothing journaled' "$(wc -c < "$d/gw/none/st/progress.md")" 0
+  # …AND ALL SIX REACH THE WORKER. selfrev_block lifts the headings by their `N. **Heading**` shape, so a checklist
+  # reformatted another way yields a prompt that says "fix what it finds:" and lists nothing. Read off the real
+  # file and the real worker prompt, each heading by its own number; the fixture above is one entry, not six.
+  local wrv srv n h miss=""; wrv=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st"; sp_worker main)
+  srv=${wrv#*fix what it finds:}; srv=${srv%% Then hand over*}
+  for n in 1 2 3 4 5 6; do
+    h=$(awk -v n="$n" 'index($0, n ". **") == 1 { sub(/^[0-9]\. \*\*/, ""); sub(/\*\*.*/, ""); print; exit }' "$CHECKLIST")
+    case "$srv" in *" $n. $h"*) [ -n "$h" ] || miss="$miss $n";; *) miss="$miss $n";; esac
+  done
+  t 'the worker prompt carries all six numbered self-review headings, word for word' "${miss:-none}" none
+  t 'control: the list the six are read from is not empty' "$( [ "${#srv}" -gt 60 ] && echo listed || echo empty)" listed
+  # …AND IT STARTS LIGHT, like the kinds `cc selfcheck` sizes (owner, 2026-09-28: "reduce bloat"): a worker's whole
+  # append is at most 6000 bytes, on the host and in each sandbox, where it carries the writing block's paragraph.
+  # A worker is never handed off, so no successor brief is reserved on top. Bytes, not characters: wc -c.
+  local e big=""
+  for e in host CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; do
+    wrv=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; [ "$e" = host ] || export "$e=1"; repo=r track=t ST="$HOME/.cc/state/r/t"; sp_worker main)
+    [ "$(printf %s "$wrv" | wc -c)" -le 6000 ] || big="$big $e"
+  done
+  t "the worker prompt is at most 6000 bytes on the host and in either sandbox" "${big:-none}" none
   # ── the context trim: what a worker's environment gets, and what a trimmed turn still carries ──
   # OFF IS THE DEFAULT, and off means nothing at all — no context edit in the request, so the API drops
   # nothing and the run is the one this loop has always done. The config is a scratch file, never the box's.
@@ -1605,17 +1637,25 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   # the next edit to it updates one copy of two. No literal from the file is written below — it is its own pattern.
   t '…and it is said once: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$dtext"; echo "$dup")" no
-  # ── AND THE OWNER'S WRITING RULE REACHES THE WORKER ── same three halves, same reason: a worker writes the BLOCKED
-  # line he reads, the board note and the journal a handoff is taken from, and `cc selfcheck` cannot see this prompt.
-  wtext=$(cat "$WRITING")
-  writes(){ case "$1" in *"$wtext"*) echo yes;; *) echo no;; esac; }
-  t 'the worker prompt carries the owner writing rule' "$(writes "$wsp")" yes
-  wgone=$(repo=r track=t ST="$d/st" WRITING="$d/absent/writing-prompt.md"; sp_worker main)
-  t 'control: with the writing rule gone, the worker prompt fails that same test' "$(writes "$wgone")" no
-  # EXACTLY ONCE: a copy pasted into sp_worker would pass `writes` and hand the worker the block twice.
-  once(){ local rest="${1#*"$wtext"}"; [ "$rest" != "$1" ] || { echo no; return; }; case "$rest" in *"$wtext"*) echo no;; *) echo yes;; esac; }
-  t '…the worker prompt carries it exactly once' "$(once "$wsp")" yes
-  t 'control: a prompt carrying the block twice fails that test' "$(once "$wsp $wtext")" no
+  # ── AND THE OWNER'S WRITING RULE REACHES THE WORKER ── a worker writes the BLOCKED line he reads, the board note and
+  # the journal a handoff is taken from, and `cc selfcheck` cannot see this prompt. ON THE HOST it loads ~/CLAUDE.md,
+  # which carries the block, so it gets the pointer and never a second copy; IN A SANDBOX it loads none, so it gets the
+  # block's first paragraph and guide line. Each half on its own env, each with its control.
+  wtext=$(cat "$WRITING"); wref=$(cat "$WRITING_REF"); wp1=$(awk 'BEGIN{RS=""} NR==1' "$WRITING")
+  writes(){ [ -n "$2" ] || { echo no; return; }; case "$1" in *"$2"*) echo yes;; *) echo no;; esac; }
+  wsp=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st"; sp_worker main)
+  t 'a host worker prompt carries the pointer to the writing rule' "$(writes "$wsp" "$wref")" yes
+  t '…and not a second copy of the block ~/CLAUDE.md gives it' "$(writes "$wsp" "$wtext")" no
+  wgone=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st" WRITING_REF="$d/absent/writing-ref-prompt.md"; sp_worker main)
+  t 'control: with the pointer gone, the host worker prompt fails that same test' "$(writes "$wgone" "$wref")" no
+  for e in CC_MEMBER_SANDBOX CC_WORKER_SANDBOX; do
+    wbx=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; export "$e=1"; repo=r track=t ST="$d/st"; sp_worker main)
+    # shellcheck disable=SC2088  # the literal text the prompt carries, not a path
+    t "a sandboxed worker ($e) carries the block's first paragraph and its guide line" "$(writes "$wbx" "$wp1"):$(writes "$wbx" '~/WRITING.md')" yes:yes
+    t "…and not the pointer to a ~/CLAUDE.md it cannot see ($e)" "$(writes "$wbx" "$wref")" no
+  done
+  wbg=$(export CC_MEMBER_SANDBOX=1; repo=r track=t ST="$d/st" WRITING="$d/absent/writing-prompt.md"; sp_worker main)
+  t 'control: with the writing rule gone, the sandboxed worker prompt fails that same test' "$(writes "$wbg" "$wp1")" no
   t '…and the writing rule is said once too: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$wtext"; echo "$dup")" no
   # ── AND THE RULE FOR RAISING A FRAMEWORK PROBLEM REACHES THE WORKER ── same three halves, third time. A worker
@@ -1656,6 +1696,13 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   t 'control: with the reading rule gone, the worker prompt fails that same test' "$(reads "$lgone")" no
   t '…and the reading rule is said once too: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$ltext"; echo "$dup")" no
+  # WHOM TO ASK names the perms session, which only the box's own sessions may ask ("a member workspace may not",
+  # ~/COMMS.md): a host worker carries it, a worker inside a member boundary never mentions perms at all.
+  atext=$(cat "$ASK")
+  case "$wsp" in *"$atext"*) t 'the worker prompt carries whom to ask' yes yes;; *) t 'the worker prompt carries whom to ask' no yes;; esac
+  msp=$(repo=r track=t ST="$d/st" CC_MEMBER_SANDBOX=1; sp_worker main)
+  case "$msp" in *[Pp]erms*) t 'a worker inside a member boundary is never told to ask perms' yes no;; *) t 'a worker inside a member boundary is never told to ask perms' no no;; esac
+  case "$msp" in *"$(cat "$LIBRARY")"*) t '…and it still carries the reading rule' yes yes;; *) t '…and it still carries the reading rule' no yes;; esac
   # THE JOURNAL BLOCK IS THE CHECKPOINT VIEW, not a byte tail: it starts at an entry, keeps the newest whole ones inside
   # the cap, and its header names how many it left out and the ask that reaches them. The one cut it makes is named.
   # Without cc-lib the tail is what it was — an iteration never starts with no journal at all.

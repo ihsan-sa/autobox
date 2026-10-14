@@ -432,6 +432,25 @@ def run_selfcheck():
            "on the 'unfinished right now' line",
            rc2 == 0 and "the host cut you over" in b2 and "Unfinished RIGHT NOW" in b2 and "t1" in b2)
         clear("ws2"); wins.pop("ws2~next", None); wins.pop("ws2", None)
+        # THE BRIEF FITS ITS RESERVE with the most it can carry and no note: a member successor (the cutover notice
+        # too) under a long journal path, with a dozen live loops of 50-byte names. It rides in the successor's
+        # system prompt, and `cc selfcheck` holds the prompt built there to 6000 minus BRIEF_RESERVE.
+        os.makedirs(os.path.join(DEV, "ws3", ".cc"))
+        open(os.path.join(DEV, "ws3", ".cc", "member-workspace"), "w").close()
+        for k in range(12):
+            os.makedirs(os.path.join(STATE, "ws3", f"t{k:02d}-a-long-row-name-that-runs-to-fifty-bytes-xx"))
+            with open(os.path.join(STATE, "ws3", f"t{k:02d}-a-long-row-name-that-runs-to-fifty-bytes-xx", "loop.log"), "w") as fh:
+                fh.write("iteration 1: building\n")
+        wins["ws3/a-long-track-name-for-the-brief"] = "@ws3"
+        with contextlib.redirect_stdout(io.StringIO()):
+            start("ws3/a-long-track-name-for-the-brief")
+        b3 = open(brief_path("ws3/a-long-track-name-for-the-brief"), "rb").read()
+        ok(f"a member successor's brief with a dozen long-named live loops fits its {BRIEF_RESERVE}-byte reserve "
+           f"({len(b3)}), names some and counts the rest",
+           len(b3) <= BRIEF_RESERVE and b"the host cut you over" in b3 and b"t00-" in b3 and b"t11-" not in b3
+           and b" more. Ask about them" in b3)
+        clear("ws3/a-long-track-name-for-the-brief"); wins.pop("ws3/a-long-track-name-for-the-brief~next", None)
+        wins.pop("ws3/a-long-track-name-for-the-brief", None)
         ok("...while any other kind's overlap keeps the successor's own --ready", read("r1").get("host_cutover") is False)
         nid = wins["ws1~next"]
         panes[nid] = IDLE
@@ -575,11 +594,34 @@ def run_selfcheck():
                     fh.write("canonical journal\n")
                 ok("...but the canonical name wins the moment it exists too, so the two never fork",
                    journal_for("j1@o") == "~/.cc/state/j1/o-handoff.md")
+                # `cc` names the journal in its planning and orch prompts by asking --journal, so the file a
+                # session is told to keep is this rule's answer, expanded, and never a second copy of the rule.
+                # Its own address (`oo`: an alias is two characters at least, as `cc --orch` takes it).
+                with open(os.path.join(st, "oo-handover.md"), "w") as fh:
+                    fh.write("legacy journal\n")
+                jo = subprocess.run([sys.executable, os.path.join(BIN, "cc-handoff"), "--journal", "j1@oo"],
+                                    capture_output=True, text=True)
+                ok("--journal prints the legacy file a successor reads, as a full path",
+                   jo.returncode == 0 and jo.stdout.strip() == os.path.join(st, "oo-handover.md"))
+                jp = subprocess.run([sys.executable, os.path.join(BIN, "cc-handoff"), "--journal", "j1"],
+                                    capture_output=True, text=True)
+                ok("...and the canonical one for an address with no legacy file",
+                   jp.returncode == 0 and jp.stdout.strip() == os.path.join(st, "planning-handoff.md"))
+                jx = subprocess.run([sys.executable, os.path.join(BIN, "cc-handoff"), "--journal"],
+                                    capture_output=True, text=True)
+                ok("...and no target is an error, with nothing on stdout for `cc` to take as a path",
+                   jx.returncode == 1 and jx.stdout == "")
             finally:
                 if home0 is None:
                     os.environ.pop("HOME", None)
                 else:
                     os.environ["HOME"] = home0
+
+        # The packet carries the journal's newest entries only, so the successor's brief names the way to the rest:
+        # a long journal is otherwise a history its successor cannot reach.
+        bt = BRIEF.format(target="j1@o", journal="~/.cc/state/j1/o-handoff.md", tmux="%1", mins=20, flight="")
+        ok("the successor's brief says the packet holds the newest journal entries and how to reach older ones",
+           "newest entries" in bt and "cc-lib ask --need history" in bt)
 
         wins["k2"], wins["k2@dash"] = "@k2", "@k2d"
         ok("...and an overlap open on one does not refuse the other",

@@ -169,7 +169,7 @@ so is one GitHub could not be asked about. The writer never changes the pass: se
 
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
-import atexit, calendar, datetime, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, zoneinfo
+import atexit, calendar, datetime, glob, json, os, re, shutil, stat, subprocess, sys, tempfile, time, zoneinfo
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy
@@ -387,34 +387,45 @@ def procs():
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
+        # The start time brackets every read below: taken before them and again after, and a pid whose two differ
+        # is left out of this scan. Read only after, an old worker's argv and cwd could be paired with the start
+        # time of whatever took its pid, and end_it would then pass that newcomer to cc-signal as the worker.
+        t0 = start_ticks(pid)
         try:
             with open(f"/proc/{pid}/status") as f:
-                for ln in f:
-                    if ln.startswith("PPid:"):
-                        ppids.add(ln.split()[1])
-                        parent[pid] = ln.split()[1]
-                        break
+                pp = next((ln.split()[1] for ln in f if ln.startswith("PPid:")), None)
             argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
             comm = open(f"/proc/{pid}/comm").read().strip()
         except OSError:
             continue
+        cwd = None
+        if comm == "claude":
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                pass
+        if t0 is None or start_ticks(pid) != t0:
+            continue
+        if pp is not None:
+            ppids.add(pp)
+            parent[pid] = pp
         for i, a in enumerate(argv):
             if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
                 live.add(f"{argv[i + 1]}/{argv[i + 2]}")
                 loops.setdefault(f"{argv[i + 1]}/{argv[i + 2]}", []).append(int(pid))
+                STARTS[int(pid)] = t0
                 break
         if comm == "claude":
             if not any(a in ("-p", "--print") for a in argv):
                 inter.add(pid)
-            try:
-                cwd = os.readlink(f"/proc/{pid}/cwd")
-            except OSError:
+            if cwd is None:
                 continue
             if cwd.startswith(root):
                 key = "/".join(cwd[len(root):].split(os.sep)[:2])
                 live.add(key)
                 if any(a.startswith("--max-budget-usd") for a in argv):
                     workers.setdefault(key, []).append(int(pid))
+                    STARTS[int(pid)] = t0
     for pid in inter:                                   # everything above an interactive session holds it
         up, seen = pid, set()
         while up and up not in seen and up != "1":
@@ -1453,9 +1464,13 @@ def end_it(pids):
     """SIGTERM to each process's whole group when it leads that group, else to it alone; never our own group, and
     never pid 1, the user manager or a tmux server, whoever leads the group. One already gone counts as ended.
     A group the pid does not lead is someone else's: a process the manager forked has the manager's group until it
-    calls setsid, and a TERM to the user manager is exit.target, which took every session down on 2026-10-01."""
+    calls setsid, and a TERM to the user manager is exit.target, which took every session down on 2026-10-01.
+    The signal goes through cc-signal with the start time procs() saw, so a pid the kernel has since handed to
+    someone else, and any group a systemd process is in, is refused rather than signalled. A pid procs() recorded
+    no start time for is skipped, never read afresh: a fresh read is the live process compared with itself."""
     mine, ok = os.getpgid(0), False
     for pid in pids:
+        t = STARTS.get(pid)
         try:
             pg = os.getpgid(pid)
         except OSError:
@@ -1463,15 +1478,27 @@ def end_it(pids):
             continue
         if keeper(pid) or keeper(pg):
             continue
-        try:
-            if pg == pid and pg != mine:
-                os.killpg(pg, signal.SIGTERM)
-            else:
-                os.kill(pid, signal.SIGTERM)
+        if t is None:
+            print(f"cc-reconcile: pid {pid} not signalled: the scan recorded no start time for it", file=sys.stderr)
+            continue
+        group = ["--group"] if pg == pid and pg != mine else []
+        r = subprocess.run([os.path.join(BIN, "cc-signal"), *group, "--ticks", str(t), str(pid)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
             ok = True
-        except OSError:
-            pass
+        else:
+            print(r.stderr.strip(), file=sys.stderr)
     return ok
+
+
+STARTS = {}   # pid → start time in ticks, as procs() saw it
+
+
+def start_ticks(pid):
+    try:
+        return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def board(*args):

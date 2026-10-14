@@ -1,0 +1,1 @@
+WHOM TO ASK: the perms session for a permission or a cc-guard refusal (~/COMMS.md), never a workaround; the planning seat for scope; the owner only for the approval list, through the seat that may reach him.

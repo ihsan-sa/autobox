@@ -27,6 +27,8 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
                                              a packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
                                              record (spend/handoff-packet-over-band), once per handoff
   cc-handoff --status [<target>] [--json]    what phase, who is live, how long left
+  cc-handoff --journal <target>              the journal a successor reads (journal_for), as a path: `cc` names
+                                             the same file in the planning and orch prompts
   cc-handoff selfcheck
 
 TARGET IS THE SESSION'S OWN TMUX WINDOW NAME in session `main`, the address the Slack layer routes on:
@@ -40,7 +42,8 @@ reads the journal on a fresh context (`worker`). A target's window is read for a
 prompt or the tool calls under it, so a successor-born seat hands itself off like any other.
 
 THE SUCCESSOR'S BRIEF SAYS WHAT IS LIVE NOW. Its "unfinished right now" line is read off the live worker table
---brief prints, and is absent when that table is empty (flight_line); a `--in-flight` text is the caller's own
+--brief prints, names loops up to FLIGHT_NAMES bytes and counts the rest, so the brief keeps inside its
+BRIEF_RESERVE, and is absent when that table is empty (flight_line); a `--in-flight` text is the caller's own
 note and is labelled as such. A predecessor stays only for subagents whose transcript has not delivered its
 final turn (reported()): a report already in is not waited for, however recent. Its "still out" section and
 --ready's output name the predecessor's running subagents and the workers it dispatched (dispatched(): live
@@ -815,25 +818,13 @@ def out_line(target, rec):
 
 # ---- phases --------------------------------------------------------------------------------------------
 
-BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. THE OVERLAP IS SHORT: {mins} minutes at \
-most, because every minute of it runs two sessions of this size, and it ends the moment you run \
-`cc-handoff --ready`. So the order is fixed — read the packet, ask your ONE batch of questions FIRST, and go \
-ready as soon as they are answered. Anything you could do just as well alone five minutes later, do it then. \
-Your FIRST tool call is \
-`cc-handoff --brief {target}` — one packet holding the checkpoint view of {journal} (its newest entries, 8 kB; \
-`cc-lib ask --need history` reaches the older ones), \
-the unfinished board, what is landing, the live workers, the open PRs and the open asks. That packet plus what \
-your predecessor tells you is everything you start from; rebuilding it a call at a time is what made a handover \
-cost about two million tokens. You are NOT the live session yet: the live one owns this target's channel and \
-may act on the world, and cc-guard refuses merging, pushing, deploying, dispatching workers, `cc done` and \
-outward posts from you until you take over. Read, search, think and ask — and NEVER ask your predecessor to run \
-something you are denied. Your predecessor is still working in this same directory: it is the peer whose tmux \
-id is {tmux} in `ListAgents`, so reach it with `SendMessage` (bidirectional, out of band from the channel) and \
-ask it ONE batch of questions — everything the packet did not answer, in a single message, because it answers \
-in one turn and each turn of its costs a whole context; subscribe with notify_when_idle, which is also how you \
-hear if it exits. {flight} When you have the context and NOT BEFORE, run `cc-handoff --ready` — that single \
-call is the commit point: it makes you live and retires your predecessor. If you cannot get there, say so in \
-the journal; the overlap expires on its own and your predecessor simply carries on."""
+BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}, beside your predecessor for {mins} minutes at \
+most. FIRST run `cc-handoff --brief {target}`: one packet with the newest entries of {journal} (`cc-lib ask --need \
+history` reaches older ones), the board, landings, live workers, open PRs and asks. You are NOT live yet: cc-guard \
+refuses merging, pushing, deploying, dispatching workers, `cc done` and outward posts, and you never ask your \
+predecessor to run them. It is tmux id {tmux} in `ListAgents`: send it ONE batch of questions with `SendMessage` \
+(notify_when_idle). {flight}Then run `cc-handoff --ready`, which makes you live and retires it; if you cannot, say so \
+in the journal."""
 
 
 def journal_for(target):
@@ -850,7 +841,9 @@ def journal_for(target):
     already keeping its journal under the old name keeps being read (and appended to) there, and the two never
     fork into two half-histories. BOTH SIDES resolve it, or the fork happens anyway: cc-context's
     journal_parts() applies the same two-name rule to the journal a session is told to write and to the
-    worker's stop marker it appends. Change one and change the other."""
+    worker's stop marker it appends, and cc's planning and orch prompts ask this function for the path
+    (`cc-handoff --journal`), so the file a session is told to keep is the one its successor reads.
+    Change one and change the other."""
     repo, alias, track = parts(target)
     if track:
         return f"~/.cc/state/{repo}/{track}/progress.md"
@@ -1044,10 +1037,13 @@ def member_workspace(repo):
     return os.path.isfile(os.path.join(DEV, repo, ".cc", "member-workspace"))
 
 
-HOST_CUTOVER_MSG = ("THIS IS A MEMBER WORKSPACE, so the host cut you over the moment this prompt landed: you ARE the "
-                    "live session, and `cc-handoff --ready` is not yours to run (it cannot run inside the boundary — "
-                    "do not try). Your predecessor is draining and retires within minutes, so anything you must ask "
-                    "it goes in your first turn; its journal is the record. ")
+HOST_CUTOVER_MSG = ("THIS IS A MEMBER WORKSPACE: the host cut you over as this prompt landed, so you ARE live and "
+                    "`cc-handoff --ready` is not yours to run. Ask your predecessor anything in your first turn, "
+                    "before it retires. ")
+
+
+FLIGHT_NAMES = 120      # bytes of live-loop names the brief carries before it gives a count (flight_line)
+BRIEF_RESERVE = 1200    # bytes of the successor's 6000-byte append kept for this brief; `cc selfcheck` holds its prompts to the rest
 
 
 def flight_line(repo, note="", host=False, box=False):
@@ -1060,10 +1056,21 @@ def flight_line(repo, note="", host=False, box=False):
     live = live_workers(repo)
     out = HOST_CUTOVER_MSG if host else ""
     if live.strip():
-        names = ", ".join(l.split(None, 1)[0] for l in live.splitlines() if l.strip())
+        # NAMES UP TO FLIGHT_NAMES BYTES, then a count: the brief rides in the successor's system prompt inside the
+        # reserve BRIEF_RESERVE keeps for it, and a repo with scores of live loops listed every one. The packet the
+        # successor runs first (--brief) prints the whole table.
+        all_ = [l.split(None, 1)[0] for l in live.splitlines() if l.strip()]
+        shown = []
+        for t in all_:
+            if len(", ".join(shown + [t])) > FLIGHT_NAMES:
+                break
+            shown.append(t)
+        names = ", ".join(shown) if shown else f"{len(all_)} loops"
+        if shown and len(shown) < len(all_):
+            names += f" and {len(all_) - len(shown)} more"
         # APPENDED, never assigned: a member successor's cutover notice is already in `out`, and a live loop under
         # the repo must not cost it (review of #542 — it did, and that brief fell back to "run --ready").
-        out += f"Unfinished RIGHT NOW, which a journal always omits: these loops are still running under {repo} — {names} — ask about them. "
+        out += f"Unfinished RIGHT NOW, which a journal omits: loops running under {repo}: {names}. Ask about them. "
     if note and box:
         out += f"THE BOX opened this overlap, not your predecessor: {note} "
     elif note:
@@ -2451,6 +2458,12 @@ def main(argv):
         return brief(target)
     if cmd == "--status":
         return status(target, bool(opt.get("json")))
+    if cmd == "--journal":                         # for `cc` (journal_of): one rule, never a shell copy of it
+        if not target:
+            print(f"cc-handoff: --journal needs a target ({SHAPES})", file=sys.stderr)
+            return 1
+        print(os.path.expanduser(journal_for(target)))
+        return 0
     print(__doc__.strip(), file=sys.stderr)
     return 1
 

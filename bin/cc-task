@@ -129,8 +129,8 @@ def save(state, record):
         if os.path.exists(tmp): os.unlink(tmp)
 
 # ---- who is asking -------------------------------------------------------------------------------------------
-def process(pid):
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+def process(pid, proc="/proc"):
+    fields = Path(f"{proc}/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     return {"pid": int(pid), "ppid": int(fields[1]), "start_ticks": int(fields[19])}
 
 def boot_id(): return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -151,26 +151,43 @@ def window():
 def owner():
     """Runtime evidence, walked out of /proc. `cc` is skipped: it is the front door and it exits at once, so a
     claim recorded against it would be dead the moment it was written. Inside a Claude Code or codex session the
-    runtime process is the owner; anywhere else it is whoever invoked this."""
-    chain, seen, pid = [], set(), os.getppid()
+    runtime process is the owner; anywhere else it is whoever invoked this.
+
+    NEVER A SYSTEMD PROCESS. A `cc` run from a shell the user manager had re-parented walked straight up to the
+    manager and recorded IT as the owner (14 claims on 2026-10-03), and a record naming the manager is one stale
+    reader away from signalling it. The walk stops at a systemd process (comm `systemd` or `(sd-pam)`) and never
+    takes it; with nothing else above `cc`, the owner is the `cc` process itself, a claim dead as soon as it exits."""
+    chain = ancestry(os.getppid())
+    caller = pick(chain, os.environ.get("CLAUDECODE") or os.environ.get("CODEX_THREAD_ID"))
+    return {"process": {k: caller[k] for k in ("pid", "start_ticks")}, "boot_id": boot_id(),
+            "agent_id": None, "window": window(),
+            "ancestry": [{k: v for k, v in p.items() if k not in ("cc", "systemd")} for p in chain],
+            "session": os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID"),
+            "parent_session": None, "transcript": None}
+
+def ancestry(pid, proc="/proc"):
+    """pid and its parents, nearest first, up to and including the first systemd process and never past it."""
+    chain, seen = [], set()
     while pid > 1 and pid not in seen:
         seen.add(pid)
         try:
-            p = process(pid)
-            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+            p = process(pid, proc)
+            argv = Path(f"{proc}/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+            comm = Path(f"{proc}/{pid}/comm").read_text().strip()
         except (OSError, ValueError, IndexError): break
         p["command"] = Path(argv[0]).name if argv[0] else ""
         p["cc"] = any(os.path.realpath(x) in (str(BIN / "cc"), str(BIN / "cc-native")) for x in argv[:2] if x)
+        if comm in ("systemd", "(sd-pam)") or p["command"] == "systemd":
+            chain.append({**p, "systemd": True}); break
         chain.append(p); pid = p["ppid"]
-    candidates = [p for p in chain if not p["cc"]]
+    return chain
+
+def pick(chain, runtime):
+    """The owner out of an ancestry: the runtime when there is one, else the nearest that is not `cc`; never systemd."""
+    candidates = [p for p in chain if not p["cc"] and not p.get("systemd")]
+    if not candidates: candidates = [p for p in chain if not p.get("systemd")]
     if not candidates: raise ValueError("cannot identify the calling process")
-    runtime = os.environ.get("CLAUDECODE") or os.environ.get("CODEX_THREAD_ID")
-    caller = next((p for p in candidates if runtime and p["command"] in ("claude", "codex")), candidates[0])
-    return {"process": {k: caller[k] for k in ("pid", "start_ticks")}, "boot_id": boot_id(),
-            "agent_id": None, "window": window(),
-            "ancestry": [{k: v for k, v in p.items() if k != "cc"} for p in chain],
-            "session": os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID"),
-            "parent_session": None, "transcript": None}
+    return next((p for p in candidates if runtime and p["command"] in ("claude", "codex")), candidates[0])
 
 IDENTITY = ("process", "boot_id", "agent_id")   # the window and the session ids are evidence, not identity
 

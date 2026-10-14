@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""cc-handoff-v2 — the rebuilt parts of the handoff & context path, beside the old ones and not wired in.
+The plan, with every part of the old system judged KEEP, REWRITE or DROP, is docs/rebuilds/handoff-and-context.md.
+This file holds the REWRITE parts the replay measures: the packet and the rotate line.
+
+usage: cc-handoff-v2 brief <target>     the packet the old `cc-handoff --brief` prints, rebuilt (below)
+       cc-handoff-v2 line               the rotate line in tokens, and what it was derived from
+       cc-handoff-v2 selfcheck
+
+THE PACKET is built to a byte budget per section, so it can't cross the band (CC_BRIEF_PACKET_BAND, 24 kB) however
+large the board grows. The old one copied every unfinished row with its notes and reached 155 kB. Sections, in order:
+  yours     the rows the predecessor holds (its tmux window id in the row's `agent` mark, or the row the track is),
+            the live workers whose `orch` file names this address, and the PRs on those rows' branches. In full,
+            up to its budget. The old packet never said which loops were the seat's own, so a successor asked.
+  journal   the checkpoint view (cc-lib view) at the section's budget; failing that, the tail at the same budget.
+            The journal is resolved by journal_paths(): BOTH the -handoff.md and -handover.md names are read, so the
+            two never fork into two half-histories, and when none exists the section names every path it tried.
+  board     the rest of the board as one count per state, a line per hold a person put on an unfinished row, and
+            the command that prints it.
+  land, still out, scope, who   as before, each cut at its budget with a line saying what was cut and how to read it.
+A section over its budget is cut at a line boundary and ends `… <n> more lines: <command>`. The whole packet is kept
+at ~/.cc/state/handoff/packets/<handoff id or target-date>.md (pruned after CC_HANDOFF_DONE_TTL, like a .done mark)
+so a later replay can re-read what was sent. The old packet went to stdout only.
+
+THE ROTATE LINE is the spend band minus headroom: CC_SPEND_CONTEXT_BAND (150k, the number cc-spend files
+spend/context-over-band at) minus CC_HANDOFF_V2_HEADROOM (20k). The old line was CC_CONTEXT_ROTATE_TOKENS, 200k, so
+every seat the box rotated had already crossed the band. `line` prints it, and the replay
+(core/tests/rebuilds/handoff_replay.py) measures it against the ledger.
+
+NOTHING CALLS THIS FROM cc-handoff. The plan's finding is to keep the old path for now (docs/rebuilds/
+handoff-and-context.md, "Finding"), so this file is the rebuilt packet and line, runnable by hand and measured by
+the replay. Wiring it into --brief, --rotate and the cutover row is the follow-up the plan names.
+"""
+import json
+import os
+import subprocess
+import sys
+import shutil
+import tempfile
+import time
+
+TOTAL = 18 * 1024               # the packet's own cap, three quarters of the band, so the band is never the limit hit
+BUDGET = {"yours": 5 * 1024, "journal": 8 * 1024 + 512,   # the journal: the old 8 kB checkpoint view and its header
+          "board": 1024, "land": 1024, "still out": 1024, "scope": 1024, "who": 512}   # sums to TOTAL
+HEADROOM = 20000
+STATE = os.path.expanduser("~/.cc/state")
+BOARDS = os.path.expanduser("~/.cc/boards")
+LIVE = ("running", "waiting", "review", "blocked")
+
+
+def fit(body, budget, more):
+    """`body` cut to `budget` bytes at a line boundary, ending with how many lines were cut and how to read them."""
+    body = (body or "").rstrip()
+    if len(body.encode()) <= budget:
+        return body
+    lines, kept, size = body.split("\n"), [], 0
+    tail = 64 + len(more)
+    for ln in lines:
+        n = len(ln.encode()) + 1
+        if size + n > budget - tail:
+            break
+        kept.append(ln)
+        size += n
+    if not kept:                                   # one line longer than the whole budget: cut it, never drop it
+        kept = [lines[0].encode()[:max(budget - tail, 0)].decode(errors="ignore")]
+    return "\n".join(kept + [f"… {len(lines) - len(kept)} more lines: {more}"])
+
+
+def journal_paths(h, target):
+    """Every path the journal for `target` may be at, existing ones first, newest last among them. A track has one;
+    an orch or a session has the canonical -handoff.md and the legacy -handover.md, and BOTH are read when both
+    exist, because the first entry written under the canonical name used to hide the whole legacy file."""
+    repo, alias, track = h.parts(target)
+    if track:
+        cands = [f"~/.cc/state/{repo}/{track}/progress.md"]
+    else:
+        cands = [f"~/.cc/state/{repo}/{alias or 'planning'}-handoff.md",
+                 f"~/.cc/state/{repo}/{alias or 'planning'}-handover.md"]
+    have = [p for p in cands if os.path.exists(os.path.expanduser(p))]
+    have.sort(key=lambda p: os.path.getmtime(os.path.expanduser(p)))
+    return have, cands
+
+
+def journal_section(h, target, budget):
+    """(label, body): the checkpoint view of the newest journal file through the old journal_view (KEEP: cc-lib view,
+    8 kB), headed by a line per older file; failing cc-lib, the tail from a heading at this section's budget, not the
+    old 64 kB fallback."""
+    have, tried = journal_paths(h, target)
+    if not have:
+        return "none found", "(tried " + ", ".join(tried) + ")"
+    newest, older = have[-1], have[:-1]
+    head = "".join(f"also {p} ({os.path.getsize(os.path.expanduser(p)) // 1024} kB, older entries): "
+                   f"cc-lib ask --need history \"<words>\"\n" for p in older)
+    room = max(budget - len(head.encode()), 512)
+    view = getattr(h, "journal_view", None)
+    body, label = view(newest) if view else (None, None)
+    if body is not None:
+        return f"checkpoint view: {label}", head + fit(body, room, f"cc-lib view {newest}")
+    try:
+        with open(os.path.expanduser(newest), "rb") as f:
+            f.seek(max(os.path.getsize(os.path.expanduser(newest)) - room, 0))
+            text = f.read().decode(errors="replace")
+    except OSError:
+        return "unreadable", head + newest
+    cut = text.find("\n## ")
+    text = text[cut + 1:] if cut >= 0 else text
+    return f"the tail of {newest}, from a heading", head + fit(text, room, f"tail {newest}")
+
+
+def board(repo):
+    """The repo's rows through cc-board's own opener (`read`), which refuses a link or pipe a member planted at the
+    board's name; a plain open here would follow it, and a pipe hangs the reader."""
+    try:
+        return (load_sibling("cc-board").read(os.path.join(BOARDS, repo + ".json")) or {}).get("tracks") or {}
+    except Exception:                              # Refused, unreadable, not JSON: no rows, and the section says none
+        return {}
+
+
+def state(h):
+    """cc-handoff's own state dir when it has one (its selfcheck points it at a fixture), else this file's."""
+    return getattr(h, "STATE", None) or STATE
+
+
+def orch_of(h, repo, track):
+    try:
+        with open(os.path.join(state(h), repo, track, "orch")) as f:
+            return f.readline().strip()
+    except OSError:
+        return ""
+
+
+def mine(h, target, rec, rows):
+    """The rows this address holds: the track itself; a row whose `agent` mark carries the predecessor's tmux window
+    id (cc-board marks `@<window>:<pid>`); a row whose worker's `orch` file names this address."""
+    repo, _, track = h.parts(target)
+    tmux = ((rec or {}).get("predecessor") or {}).get("tmux") or h.win_id(target) or ""
+    out = []
+    for name, r in rows.items():
+        if r.get("status") not in LIVE:
+            continue
+        if (track and name == track) or (tmux and str(r.get("agent") or "").startswith(tmux + ":")) \
+                or (not track and orch_of(h, repo, name) == target):
+            out.append(name)
+    return sorted(out)
+
+
+def yours(h, target, rec, rows, budget):
+    repo = h.parts(target)[0]
+    names = mine(h, target, rec, rows)
+    lines = []
+    for n in names:
+        r = rows[n]
+        lines.append(f"{n} [{r.get('status')}] {str(r.get('title') or '')[:120]}" + (f"  PR {r['pr']}" if r.get("pr") else ""))
+        for note in (r.get("notes") or [])[-2:]:
+            lines.append(f"    {note.get('ts', '')[:16]} {str(note.get('msg') or '')[:240]}")
+    idle = h.cfg("CC_BRIEF_WORKER_IDLE", 3600)
+    others = 0
+    sd = state(h)
+    for t in sorted(os.listdir(os.path.join(sd, repo))) if os.path.isdir(os.path.join(sd, repo)) else []:
+        log = os.path.join(sd, repo, t, "loop.log")
+        try:
+            if time.time() - os.path.getmtime(log) > idle:
+                continue
+        except OSError:
+            continue
+        if t in names or orch_of(h, repo, t) == target:
+            last = ""
+            for last in open(log, errors="replace"):
+                pass
+            lines.append(f"loop {t}: {last.strip()[:160]}")
+        else:
+            others += 1
+    lines.append(f"({others} other live loop(s) under {repo} are not yours)")
+    if not names:
+        lines.insert(0, "(no unfinished row is held by this seat)")
+    return fit("\n".join(lines), budget, f"cc board show {repo}")
+
+
+def board_rest(h, target, rec, rows, budget):
+    repo = h.parts(target)[0]
+    held = set(mine(h, target, rec, rows))
+    count = {}
+    for n, r in rows.items():
+        if n not in held:
+            count[r.get("status")] = count.get(r.get("status"), 0) + 1
+    order = [s for s in ("waiting", "blocked", "running", "review", "queued") if count.get(s)]
+    # A hold is a word a person set, and the packet is the only place a successor is offered it (the old board
+    # section's rule), so an unfinished row's hold is its own line here; a finished row's goes with the row.
+    holds = [f"{n} [{r.get('status')}] held ({r.get('held_by') or '?'}): {str(r.get('held'))[:200]}"
+             for n, r in sorted(rows.items()) if r.get("held") and r.get("status") not in ("merged", "done")]
+    return fit("\n".join(["not yours: " + ", ".join(f"{count[s]} {s}" for s in order)] + holds
+                         + [f"read any with `cc board show {repo}`, one with `cc board get {repo} <row> instructions`"]),
+               budget, f"cc board show {repo}")
+
+
+def keep(h, rec, target, packet):
+    d = os.path.join(h.HANDOFF, "packets")
+    try:
+        os.makedirs(d, exist_ok=True)
+        ttl = h.cfg("CC_HANDOFF_DONE_TTL", 30 * 86400)
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            if time.time() - os.path.getmtime(p) > ttl:
+                os.unlink(p)
+        name = (rec or {}).get("id") or (h.slug(target) + "-" + time.strftime("%Y-%m-%d", time.gmtime()))
+        with open(os.path.join(d, name + ".md"), "w") as f:
+            f.write(packet)
+    except OSError:
+        pass
+
+
+def brief(h, target):
+    """The rebuilt --brief, `h` being the cc-handoff module (its KEEP parts are used as they are)."""
+    repo = h.parts(target)[0]
+    rec = h.read(target)
+    rows = board(repo)
+    pre = (rec or {}).get("predecessor") or {}
+    who = [f"target        {target}",
+           f"predecessor   window main:{pre.get('window') or target}   tmux {pre.get('tmux') or h.win_id(target) or '?'}",
+           f"              session {(pre.get('session_id') or '?')}"]
+    if rec:
+        who.append(f"handoff       id {rec.get('id')}   phase {rec.get('phase')}   live {h.live_side(rec)}   "
+                   f"{int((rec.get('deadline', 0) - time.time()) / 60)}m left")
+    sections = [
+        ("yours — the rows, loops and PRs this seat holds", lambda b: yours(h, target, rec, rows, b), "yours"),
+        ("journal", lambda b: journal_section(h, target, b), "journal"),   # (label, body): titled "journal — <label>"
+        ("board — everything else", lambda b: board_rest(h, target, rec, rows, b), "board"),
+        ("land — lanes and the landing queue", lambda b: fit(h.lanes(), b, "cc-land queue"), "land"),
+        ("still out — the predecessor's subagents and the workers it dispatched",
+         lambda b: fit(h.out_line(target, rec), b, f"cc-handoff --status {target}"), "still out"),
+        ("scope — open asks from the owner",
+         lambda b: fit(h.out([os.path.join(h.BIN, "cc-scope"), "list", repo]), b, f"cc-scope list {repo}"), "scope"),
+        ("who", lambda b: "\n".join(who), "who"),
+    ]
+    lines = [f"cc-handoff --brief {target}  (v2, {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})"]
+    for title, build, key in sections:
+        try:
+            body = build(BUDGET[key])
+        except Exception as e:                     # best-effort like the old one: a section never fails the brief
+            body = f"(unavailable: {type(e).__name__})"
+        if isinstance(body, tuple):
+            title, body = f"{title} — {body[0]}", body[1]
+        lines += [f"\n== {title} ==", body.rstrip() if body.strip() else "(none)"]
+    lines.append("\nThat is the whole packet. `yours` is what you inherit. Ask your predecessor only what it does not "
+                 "answer, in ONE batch, and run `cc-handoff --ready` when that is done.")
+    packet = "\n".join(lines) + "\n"
+    if len(packet.encode()) > TOTAL:               # the budgets sum under TOTAL; this is the backstop
+        packet = fit(packet, TOTAL, f"cc-handoff --brief {target}") + "\n"
+    sys.stdout.write(packet)
+    sys.stdout.flush()
+    keep(h, rec, target, packet)
+    h.record_packet(target, rec, len(packet.encode()))
+    return 0
+
+
+def rotate_line():
+    band = int(os.environ.get("CC_SPEND_CONTEXT_BAND") or 150000)
+    return max(band - int(os.environ.get("CC_HANDOFF_V2_HEADROOM") or HEADROOM), 0), band
+
+
+def load_sibling(name, cache={}):
+    """A tool beside this file, imported as a module (once per process)."""
+    if name not in cache:
+        import importlib.machinery
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+        spec = importlib.util.spec_from_loader(name.replace("-", "_"), importlib.machinery.SourceFileLoader(name.replace("-", "_"), p))
+        cache[name] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cache[name])
+    return cache[name]
+
+
+def selfcheck():
+    passed = failed = 0
+
+    def ok(name, cond):
+        nonlocal passed, failed
+        passed, failed = passed + bool(cond), failed + (not cond)
+        print(("ok   " if cond else "FAIL ") + name)
+
+    ok("the sections' budgets add up to no more than the packet's TOTAL", sum(BUDGET.values()) <= TOTAL)
+
+    global STATE, BOARDS
+    d = tempfile.mkdtemp(prefix="hv2-")
+    STATE, BOARDS = os.path.join(d, "state"), os.path.join(d, "boards")
+    os.makedirs(BOARDS)
+
+    class H:                                       # the cc-handoff surface brief() uses, stubbed
+        BIN = os.path.join(d, "bin")
+        HANDOFF = os.path.join(d, "handoff")
+        RECORDS = os.path.join(d, "context")
+        parts = staticmethod(lambda t: (t.partition("/")[0].partition("@")[0], t.partition("/")[0].partition("@")[2],
+                                        t.partition("/")[2]))
+        slug = staticmethod(lambda t: t.replace("/", "--"))
+        win_id = staticmethod(lambda t: "@77")
+        cfg = staticmethod(lambda n, dflt: dflt)
+        read = staticmethod(lambda t: {"id": "hid1", "phase": "overlap", "deadline": time.time() + 600,
+                                       "predecessor": {"tmux": "@77", "window": t, "session_id": "s0"}})
+        live_side = staticmethod(lambda r: "predecessor")
+        lanes = staticmethod(lambda: "lane1 idle\n" * 400)
+        out_line = staticmethod(lambda t, r: "nothing")
+        out = staticmethod(lambda argv: H.calls.append(list(argv)) or "ask\n" * 2000)
+        recorded, calls = [], []
+        record_packet = staticmethod(lambda t, r, n: H.recorded.append(n))
+
+    note = {"ts": "2026-10-12T10:00:00Z", "msg": "n" * 400}
+    rows = {f"row{i}": {"status": "review", "title": "t" * 200, "notes": [note] * 8} for i in range(300)}
+    rows["held-by-me"] = {"status": "running", "title": "mine", "agent": "@77:123", "notes": [note], "pr": "9"}
+    rows["dispatched"] = {"status": "running", "title": "from my orch", "notes": []}
+    rows["done-mine"] = {"status": "merged", "title": "old", "agent": "@77:123"}
+    rows["other-window"] = {"status": "running", "title": "x", "agent": "@7:1"}
+    rows["held-q"] = {"status": "queued", "title": "q", "held": "behind #309, do not start", "held_by": "@3",
+                      "instructions": "TASK-TEXT-NEVER-PRINTED"}
+    rows["held-done"] = {"status": "merged", "title": "f", "held": "FINISHED-HOLD", "held_by": "@9"}
+    with open(os.path.join(BOARDS, "r.json"), "w") as f:
+        json.dump({"tracks": rows}, f)
+    for t, orch in (("dispatched", "r@o"), ("other-window", "r@x")):
+        os.makedirs(os.path.join(STATE, "r", t))
+        open(os.path.join(STATE, "r", t, "orch"), "w").write(orch + "\n")
+        open(os.path.join(STATE, "r", t, "loop.log"), "w").write(f"iteration 3 of {t}\n")
+    os.makedirs(os.path.join(STATE, "r"), exist_ok=True)
+
+    import io
+    import contextlib
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = d                          # journal_paths expands ~/.cc/state under the fixture
+    os.makedirs(os.path.join(d, ".cc", "state", "r"))
+    legacy = os.path.join(d, ".cc", "state", "r", "o-handover.md")
+    with open(legacy, "w") as f:
+        f.write("## old history\n" + "x\n" * 5000)
+    try:
+        have, tried = journal_paths(H, "r@o")
+        ok("an orch's legacy -handover.md is found when the canonical name is absent", have == ["~/.cc/state/r/o-handover.md"])
+        time.sleep(0.01)
+        with open(os.path.join(d, ".cc", "state", "r", "o-handoff.md"), "w") as f:
+            f.write("## 2026-10-12 new\nnewest entry\n")
+        have, _ = journal_paths(H, "r@o")
+        ok("…and once the canonical one is written too, BOTH are read, newest last (the fork that hid history)",
+           have == ["~/.cc/state/r/o-handover.md", "~/.cc/state/r/o-handoff.md"])
+        js = "\n".join(journal_section(H, "r@o", 2048))
+        ok("the journal section shows the newest file and names the older one", "newest entry" in js and "o-handover.md" in js)
+        ok("with no journal at all, the section names every path it tried", "tried ~/.cc/state/r/nope-handoff.md, "
+           "~/.cc/state/r/nope-handover.md" in journal_section(H, "r@nope", 2048)[1])
+        ok("a track's journal is its progress.md", journal_paths(H, "r/t")[1] == ["~/.cc/state/r/t/progress.md"])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            brief(H, "r@o")
+        p = buf.getvalue()
+        ok("a 300-row board with long notes still prints a packet under the 18 kB cap", len(p.encode()) <= TOTAL)
+        ok("…and the band record is asked with the packet's real size", H.recorded == [len(p.encode())])
+        y = p.split("== yours")[1].split("\n== ")[0]
+        ok("yours carries the row marked by the predecessor's window, and the row its orch dispatched",
+           "held-by-me [running]" in y and "dispatched [running]" in y)
+        ok("…not a finished row of its own, nor a row held by another window",
+           "done-mine" not in y and "other-window [" not in y)
+        ok("yours names its own live loop, and counts the other one", "loop dispatched: iteration 3" in y and "1 other live loop" in y)
+        ok("every section is printed, in order", [x.split(" ")[0] for x in p.split("\n== ")[1:]]
+           == ["yours", "journal", "board", "land", "still", "scope", "who"])
+        ok("the rest of the board is counts and a command", "not yours: 1 running, 300 review, 1 queued" in p
+           and "cc board show r" in p and "cc board get r <row> instructions" in p)
+        ok("…an unfinished row's hold a person set is kept, a finished row's is not, and no row's task text is printed",
+           "held-q [queued] held (@3): behind #309, do not start" in p and "FINISHED-HOLD" not in p
+           and "TASK-TEXT-NEVER-PRINTED" not in p)
+        ok("…who names the predecessor's window, tmux id, session and the handoff id",
+           all(x in p.split("== who")[1] for x in ("main:r@o", "@77", "session s0", "id hid1")))
+        ok("cc-scope is asked once, with `list`, for this repo only; the board is read in-process, not by cc-board",
+           H.calls == [[os.path.join(H.BIN, "cc-scope"), "list", "r"]])
+        ok("a cut section says how many lines went and how to read them", "more lines: cc-scope list r" in p)
+        ok("the packet is kept under the handoff dir by its handoff id",
+           open(os.path.join(H.HANDOFF, "packets", "hid1.md")).read() == p)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+    os.environ["CC_SPEND_CONTEXT_BAND"] = "150000"
+    os.environ.pop("CC_HANDOFF_V2_HEADROOM", None)
+    ok("the rotate line is the spend band minus 20k", rotate_line() == (130000, 150000))
+    os.environ["CC_HANDOFF_V2_HEADROOM"] = "0"
+    ok("headroom is the env's", rotate_line() == (150000, 150000))
+    os.environ.pop("CC_HANDOFF_V2_HEADROOM")
+    os.environ.pop("CC_SPEND_CONTEXT_BAND")
+
+    long1 = "y" * 5000
+    ok("one line longer than the budget is cut, never dropped", fit(long1, 1000, "m").startswith("yyy") and len(fit(long1, 1000, "m").encode()) <= 1000)
+    shutil.rmtree(d, ignore_errors=True)
+    print(f"cc-handoff-v2 selfcheck: {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["line"]:
+        line, band = rotate_line()
+        print(f"{line} (CC_SPEND_CONTEXT_BAND {band} minus CC_HANDOFF_V2_HEADROOM)")
+        return 0
+    if argv[:1] == ["brief"] and len(argv) == 2:
+        return brief(load_sibling("cc-handoff"), argv[1])
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -12,6 +12,24 @@ def selfcheck():
         print(("  ok   " if cond else "  FAIL ") + what)
         if not cond: n += 1
     print("cc-task selfcheck")
+    with tempfile.TemporaryDirectory(prefix="cctask-proc-") as proc:   # a /proc of its own: no live pid is read
+        def fake(pid, ppid, comm, argv, ticks=100):
+            d = Path(proc, str(pid)); d.mkdir()
+            (d / "stat").write_text(f"{pid} ({comm}) S {ppid} " + " ".join(["0"] * 17) + f" {ticks}\n")
+            (d / "comm").write_text(comm + "\n"); (d / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+        fake(10, 1, "systemd", ["/usr/lib/systemd/systemd", "--user"], 3100272)
+        fake(20, 10, "bash", ["bash", str(BIN / "cc")])           # `cc --go` run by a shell the manager adopted  # recurring-defect-ok: pause-hold-missing — a fake /proc argv in the selfcheck; nothing is launched
+        fake(30, 20, "bash", ["bash", "-c", "cc-task claim"])
+        fake(40, 10, "claude", ["claude"]); fake(50, 40, "bash", ["bash", str(BIN / "cc")])
+        chain = ancestry(30, proc); who = pick(chain, None)
+        ok("a cc whose only ancestor is the user manager never records the manager as the owner (2026-10-03)",
+           who["pid"] != 10 and who["pid"] == 30 and [p["pid"] for p in chain] == [30, 20, 10])
+        ok("…the walk stops at the manager and records nothing above it",
+           chain[-1].get("systemd") is True and all(not p.get("systemd") for p in chain[:-1]))
+        ok("…and with `cc` itself the only process under it, the owner is that `cc`, not the manager",
+           pick(ancestry(20, proc), None)["pid"] == 20)
+        ok("a claude under the manager is still the owner its runtime names",
+           pick(ancestry(50, proc), "1")["pid"] == 40)
     with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
         env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
         def run(*args):
