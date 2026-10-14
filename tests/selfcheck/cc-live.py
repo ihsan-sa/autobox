@@ -300,6 +300,22 @@ def selfcheck():
     limit, why = key_limit()
     print(f"cc-live: a key redrew in {worst:.1f} ms at worst ({len(timing)} keys); limit {limit} ms ({why})")
     case(f"every key redraws in under {limit} ms ({why})", timing and worst < limit)
+    # hive runs the checkout CC_HIVE_CODE names with CC_LIVE_BIN at its own folder, or this file if that won't compile
+    hive = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hive")
+    with open(f"{tmp}/probe", "w") as fh:
+        fh.write("import os, sys\nprint(os.environ.get('CC_LIVE_BIN'), __file__, *sys.argv[1:])\n")
+    with open(f"{tmp}/broken", "w") as fh:
+        fh.write("def (\n")
+    env = {k: v for k, v in os.environ.items() if k != "CC_LIVE_BIN"}
+    ran = subprocess.run([hive, "--once"], env=dict(env, CC_HIVE_CODE=f"{tmp}/probe"), capture_output=True, text=True,
+                         timeout=60)
+    case("hive runs the checkout CC_HIVE_CODE names, with CC_LIVE_BIN at hive's own folder",
+         ran.stdout.split() == [os.path.dirname(hive), f"{tmp}/probe", "--once"])
+    ran = subprocess.run([hive, "--help"], env=dict(env, CC_HIVE_CODE=f"{tmp}/broken"), capture_output=True, text=True,
+                         timeout=60)
+    case("…and runs the cc-live beside it, saying so on stderr, when that checkout won't compile",
+         ran.returncode == 0 and f"{tmp}/broken doesn't load (SyntaxError" in ran.stderr
+         and "hive --once" in ran.stdout)
     shutil.rmtree(tmp, ignore_errors=True)
     # hive is a link to this file, and check.sh wants the tally under the name it ran
     print(f"{os.path.basename(sys.argv[0]) or 'cc-live'} selfcheck: {ok} passed, {bad} failed")
