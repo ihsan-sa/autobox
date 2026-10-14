@@ -1,513 +1,683 @@
 #!/usr/bin/env python3
-"""cc-live — the box on one screen: who needs the owner, every session and every worker, and one key to each other
-section. Read-only; makes no model call.
+"""cc-live — the dispatch engine on one screen: each project's loop and the release it runs, its running and
+today's runs with their outcome and cost, what waits on a person, and the host's health. Read-only; makes no model
+call. The old system's sections (sessions, workers, the board, landings…) are cc-live-old, one key away.
 
-WHY. The owner steers from a laptop and a phone and had to ask in Slack to learn what the box was doing, so this is a
-box command he runs over the SSH login he already has (`ssh -t <box> ~/bin/cc-live`): it opens no port, tunnel or key.
-On 2026-10-04 he found it slow ("kinda slow to navigate ... more info than fits in one screen") and asked for "super
-low latency" with the main screen showing only sessions and workers. So it no longer collects anything itself: it
-draws from cc-pulse's snapshot, held in memory, and a key redraws from that with no I/O.
+WHY. The owner asked on 2026-10-14 whether cc-live showed the new architecture; it drew only cc-pulse's snapshot of
+the old sessions, boards and landings. The engine is ~/dev/dispatch: dispatch-fx.service and one
+dispatch-loop@<project>.service per project.
 
-WHERE THE DATA COMES FROM. cc-pulse (beside this file) is the one collector; its docstring says what it reads.
-$CC_STATE/pulse.json is followed with inotify while something keeps it current (it is under 30 s old); otherwise
-cc-live runs cc-pulse's feed in a thread of its own, and that redraws within ~50 ms of a board, session or landing
-file changing. The header shows the pulse's age: amber from 30 s, STALE past 90 s. The deeper views (a board row's
-notes and journal, a seat's pane, the failure board, PRs landed, models and spend) are read when opened, in a
-thread, so no key waits on them; each says "reading…" until it has its lines.
+WHERE THE DATA COMES FROM. Only what the owner's user may read without root, and nothing a project keeps private:
+  /var/lib/dispatch-status/        the engine's status door, written once a minute by dispatch-status.service
+                                   (0640, group the owner's user). Per project <R>.json (schema v1) if there, else
+                                   <R>.txt, whose lines are read by their opening word (Running:, Open:, Stuck:,
+                                   Needs you:, Today, Loop) and any other line is shown as it is. Also digest.txt
+                                   (the morning Slack line, re-rendered every minute) and health.json (fx_down).
+                                   Only plain <name>.txt/.json files directly in it are read, never a symlink or a pipe.
+  systemctl show                   dispatch-loop@*.service and dispatch-fx.service: up, down, since, restarts
+  /opt/dispatch/current            the release (readlink); one release for every loop unless <R>.json names one
+  /var/lib/dispatch-host/ledger.jsonl   the host's health and selftest failures (the box's checks write it)
+  $CC_STATE/pulse.json             the old system's one-line count, when cc-pulse keeps it fresh
+Never /var/lib/dispatch/<R> (a project's own state) or /var/lib/dispatch-fx. A cell no source gives draws "n/p"
+(not published); a source the user can't open draws "unreadable", and so does a project whose file can't be
+parsed or drawn, so one odd file is one odd row. A field of the wrong type is taken as absent (n/p). Control
+characters are dropped from every line drawn, so no escape sequence in a title or a why reaches the terminal.
 
-KEYS. ↑/↓ or j/k move the cursor (or scroll a view with no rows to pick), PgUp/PgDn page (the cursor goes with the page), Enter opens the row under
-the cursor, Esc, Backspace or ← goes back, h goes home, q quits from home and Ctrl-C anywhere. One key to each section:
-  s sessions   w workers   n needs you   l landing   r recent (r again: T)   p projects   x box and laptop
-  b board      f failures  m models and spend      P PRs landed   g landings graph (+/- widen)   T timeline
-  t  switch this tmux client to the selected session's window (when cc-live runs inside tmux)
-  :  or /  a command line: type a section or a project's name (board, fail, fund, …) and Enter jumps there
-A project's drill-in shows the panel that project writes (cc-pulse's docstring has the format), its workers and
-sessions; b from there opens its board rows.
+Sources are re-read when their mtime moves (checked each second, from a thread) and systemd is asked every 5 s, so
+a step shows within about a second of the door's minute rewrite. A key redraws from memory with no I/O.
 
-  cc-live              the navigable view on a terminal, until q or Ctrl-C; with no terminal on both ends it
-                       prints the main screen as text whenever the pulse changes
-  cc-live --once       print the main screen once and exit (cc-pulse --once --text)
-  cc-live selfcheck    cases over fixtures and a fake screen in a temp dir; no board, process, tmux or terminal of
-                       the box's. A key must redraw in 16 ms (the brief's target; it takes about 1 ms). Under load
-                       (CC_LOADED=1 set, or the 1-minute load at or above the core count) the limit is 48 ms, and the
-                       line it prints says which limit it held to.
+KEYS. ↑/↓ or j/k move, Enter opens the project under the cursor, Esc/←/Backspace back, h or e home, q quits.
+  a  waiting on a person and stuck      H  health: the ledger and the digest in full
+  o  cc-live-old's home; s w n l r p b f m x P g T : open that cc-live-old section directly (q there comes back)
+
+  cc-live              the view on a terminal; with no terminal, the main screen as text whenever it changes
+  cc-live --once       print the main screen once and exit
+  cc-live selfcheck    cases over fixtures in a temp dir; never the live host
+Env (for tests and other hosts): CC_LIVE_STATUS_DIR, CC_LEDGER, CC_LIVE_RELEASE (the current link),
+CC_LIVE_UNITS (a file of `systemctl show` output used instead of asking systemd), CC_PULSE.
 """
 import curses
-import glob
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
-import shutil
+import re
+import stat
 import subprocess
 import sys
 import threading
 import time
 
-
-def _load():
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-pulse")
-    loader = importlib.machinery.SourceFileLoader("cc_pulse", path)
-    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cc_pulse", loader))
-    loader.exec_module(mod)
-    return mod
-
-
-P = _load()
-ago, ts, mtime, state_dir, land_dir = P.ago, P.ts, P.mtime, P.state_dir, P.land_dir
-RECENT = P.RECENT
-SECTIONS = {ord("s"): ("section", "sessions"), ord("w"): ("section", "workers"), ord("n"): ("section", "needs"),
-            ord("l"): ("section", "landing"), ord("r"): ("section", "recent"), ord("p"): ("section", "projects"),
-            ord("x"): ("section", "box"), ord("b"): ("board", ""), ord("f"): ("failures",), ord("m"): ("models",),
-            ord("$"): ("models",), ord("P"): ("prs",), ord("g"): ("graph",), ord("T"): ("timeline",)}
-WORDS = {"sessions": ("section", "sessions"), "workers": ("section", "workers"), "needs": ("section", "needs"),
-         "landing": ("section", "landing"), "recent": ("section", "recent"), "projects": ("section", "projects"),
-         "board": ("board", ""), "box": ("section", "box"), "laptop": ("section", "box"), "failures": ("failures",),
-         "models": ("models",), "spend": ("models",), "prs": ("prs",), "graph": ("graph",), "timeline": ("timeline",),
-         "home": ("home",)}
+NP = "n/p"
+DAY = 86400
+UNITS = ["dispatch-fx.service", "dispatch-loop@*.service"]
+PROPS = "Id,ActiveState,SubState,ActiveEnterTimestamp,NRestarts"
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.(txt|json)$")
+ICON = {"running": "▶", "merged": "✓", "held": "✋", "stuck": "!", "failed": "✗", "lost": "?"}
 
 
-def resolve(word, p):
-    """A typed word as a view: a project's name first (exact), then a section whose name it starts, then a project
-    whose name it starts; None when nothing matches."""
-    w = word.strip().lower()
-    repos = [r["repo"] for r in (p or {}).get("projects") or []]
-    if not w:
+def status_dir():
+    return os.environ.get("CC_LIVE_STATUS_DIR") or "/var/lib/dispatch-status"
+
+
+def ledger_path():
+    return os.environ.get("CC_LEDGER") or "/var/lib/dispatch-host/ledger.jsonl"
+
+
+def current_link():
+    return os.environ.get("CC_LIVE_RELEASE") or "/opt/dispatch/current"
+
+
+def pulse_path():
+    return os.environ.get("CC_PULSE") or os.path.join(
+        os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state"), "pulse.json")
+
+
+# ── reading, all of it guarded: a source is text, "missing" or "unreadable" ───────────────────────────────────
+def door(name):
+    """A file directly in the status dir, as text; None when it isn't there, False when it can't be read. Anything
+    but a plain file with a plain name (a symlink, a subdir, a path, a FIFO) is refused, so nothing outside the door
+    is read. O_NONBLOCK so a FIFO's open returns at once instead of waiting for a writer; fstat then refuses it."""
+    if not NAME.match(name):
+        return False
+    path = os.path.join(status_dir(), name)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
         return None
-    if w in repos:
-        return ("section", "project", w)
-    for name, view in WORDS.items():
-        if name.startswith(w):
-            return view
-    for r in repos:
-        if r.startswith(w):
-            return ("section", "project", r)
-    return None
+    except OSError:
+        return False
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return False
+    with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
 
 
-# ── the feed: the pulse, in memory ────────────────────────────────────────────────────────────────────────────
-class Feed:
-    """The latest pulse and a version that moves with it. follow() keeps them current from pulse.json while that is
-    fresh, and otherwise runs cc-pulse's own feed here."""
+def listing():
+    """The door's file names, or None when the dir can't be listed."""
+    try:
+        return sorted(n for n in os.listdir(status_dir()) if NAME.match(n))
+    except OSError:
+        return None
 
-    def __init__(self, proc="/proc"):
-        self.p, self.version, self.done, self.proc, self.local, self.err = None, 0, False, proc, False, None
 
-    def put(self, p):
-        self.p = p
-        self.version += 1
+def stamp(path):
+    try:
+        st = os.lstat(path)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError as e:
+        return type(e).__name__
 
-    def follow(self):
-        """Follow pulse.json, or collect here; if either raises, the error goes on screen instead of a silent stop."""
+
+def when(text):
+    """systemd's 'Wed 2026-10-14 11:18:12 EDT' (local) as an epoch; None when empty or odd."""
+    parts = (text or "").split()
+    try:
+        return time.mktime(time.strptime(" ".join(parts[1:3]), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def parse_units(text):
+    """`systemctl show` blocks → {Id: {active, sub, since, restarts}}."""
+    out = {}
+    for blk in re.split(r"\n\s*\n", text or ""):
+        kv = dict(ln.split("=", 1) for ln in blk.splitlines() if "=" in ln)
+        if kv.get("Id"):
+            n = kv.get("NRestarts", "")
+            out[kv["Id"]] = {"active": kv.get("ActiveState", ""), "sub": kv.get("SubState", ""),
+                             "since": when(kv.get("ActiveEnterTimestamp")),
+                             "restarts": int(n) if n.isdigit() else None}
+    return out
+
+
+def ask_units():
+    """The units, or an error string: a fixture file under CC_LIVE_UNITS, else one read-only systemctl show."""
+    fake = os.environ.get("CC_LIVE_UNITS")
+    try:
+        if fake:
+            with open(fake, encoding="utf-8") as fh:
+                return parse_units(fh.read())
+        r = subprocess.run(["systemctl", "show", "--no-pager", "-p", PROPS, "--", *UNITS],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode:
+            return f"systemctl show: {(r.stderr.strip() or 'exit %d' % r.returncode)[:80]}"
+        return parse_units(r.stdout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"systemctl show: {e}"[:80]
+
+
+def release():
+    """The release /opt/dispatch/current points at, short; None when it isn't there, False when unreadable."""
+    try:
+        return os.path.basename(os.readlink(current_link()))[:12] or None
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+
+
+def ledger(now):
+    """The host ledger's failures in the last 24 h, grouped: [{kind, why, repo, n, last}], newest first, and how
+    many lines couldn't be read; None when there is no ledger, False when it can't be read."""
+    try:
+        with open(ledger_path(), encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return None, 0
+    except OSError:
+        return False, 0
+    groups, bad = {}, 0
+    for ln in lines:
         try:
-            self._follow()
-        except Exception as e:
-            self.err = f"{type(e).__name__}: {e}"[:100]
-            self.version += 1
+            r = json.loads(ln)
+            at = float(r["at"])
+        except (ValueError, KeyError, TypeError):
+            bad += bool(ln.strip())
+            continue
+        if r.get("outcome") != "failed" or now - at > DAY:
+            continue
+        k = (str(r.get("kind") or "?"), str(r.get("why") or ""), r.get("repo") or "")
+        g = groups.setdefault(k, {"kind": k[0], "why": k[1], "repo": k[2], "n": 0, "last": at})
+        g["n"] += 1
+        g["last"] = max(g["last"], at)
+    return sorted(groups.values(), key=lambda g: -g["last"]), bad
 
-    def _follow(self):
-        path = P.out_path()
-        w = P.Watch()
+
+def num(x):
+    """x when it is a finite number, else None: NaN or Infinity in a door file draws n/p."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def word(x):
+    return x if isinstance(x, str) else None
+
+
+def obj(x):
+    return x if isinstance(x, dict) else {}
+
+
+def tidy(r):
+    """One run from <R>.json with each field the view reads in the shape it reads it; any other value is None."""
+    t = dict(r)
+    for k in ("state", "on", "why", "title"):
+        t[k] = word(r.get(k))
+    for k in ("trigger", "pr", "read"):
+        t[k] = r[k] if isinstance(r.get(k), dict) else None
+    for k in ("started_at", "ended_at", "spent"):
+        t[k] = num(r.get(k))
+    t["issue"] = r["issue"] if isinstance(r.get("issue"), (int, str)) and not isinstance(r["issue"], bool) else "?"
+    return t
+
+
+def from_json(text):
+    """<R>.json (schema v1) as a project record; None when it isn't v1. Every nested read is type-checked, so a
+    field of the wrong shape ("loop": "running", "pr": "x") draws n/p instead of raising."""
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("v") != 1:
+        return None
+    loop, today = obj(d.get("loop")), obj(d.get("today"))
+    runs = [tidy(r) for r in (d["runs"] if isinstance(d.get("runs"), list) else []) if isinstance(r, dict)]
+    p = {"src": "json", "repo": word(d.get("repo")), "at": num(d.get("at")), "release": word(d.get("release")),
+         "loop": word(loop.get("state")), "poll": num(loop.get("last_poll")),
+         "runs_today": num(today.get("runs")), "merged": num(today.get("merged")), "spent": num(today.get("spent")),
+         "runs": runs, "open": [], "asks": [], "stuck": [], "other": []}
+    for r in runs:
+        label = f"#{r['issue']} " + (f"PR #{r['pr'].get('number')} " if r["pr"] else "")
+        line = label + (r.get("why") or r.get("state") or "")
+        if r.get("state") == "held" and r.get("on"):
+            p["asks"].append(f"held on {r['on']}: {line}")
+        elif r.get("state") in ("stuck", "failed", "lost"):
+            p["stuck"].append(f"{r['state']}: {line}")
+    return p
+
+
+HEAD = re.compile(r"^(\S+)(?: \(([^)]*)\))?(?:, (\d{4}-\d\d-\d\d \d\d:\d\d))?$")
+RUNNING = re.compile(r'^Running: (?:issue #(\d+) "(.*)"|(.*?)), (.+)$')
+TODAY = re.compile(r"^Today (\d+) merged, \$(\d+(?:\.\d+)?) spent")
+POLL = re.compile(r"last poll (\d+) (min|h|days) ago")
+
+
+def from_txt(text):
+    """<R>.txt's sentences as a project record, by each line's opening word; the rest are kept verbatim."""
+    lines = (text or "").splitlines()
+    m = HEAD.match(lines[0].strip()) if lines else None
+    p = {"src": "txt", "repo": m and m.group(2), "at": None, "release": None, "loop": None, "poll": None,
+         "runs_today": None, "merged": None, "spent": None, "runs": [], "open": [], "asks": [], "stuck": [],
+         "other": [], "loop_text": None}
+    if m and m.group(3):
         try:
-            w.add(os.path.dirname(path))
-            while not self.done:
-                try:
-                    with open(path) as f:
-                        p = json.load(f)
-                except (OSError, ValueError):
-                    p = None
-                if not isinstance(p, dict) or time.time() - (p.get("at") or 0) >= P.AMBER:
-                    break                          # nobody keeps the file current: collect here
-                self.put(p)
-                w.wait(1.0)
+            p["at"] = time.mktime(time.strptime(m.group(3), "%Y-%m-%d %H:%M"))
+        except (ValueError, OverflowError):        # "2026-13-45 99:99" is no time: the stamp draws n/p
+            pass
+    for ln in (x.strip() for x in lines[1:]):
+        if not ln or ln == "Nothing running or open.":
+            continue
+        if ln.startswith("Running: "):
+            r = RUNNING.match(ln)
+            p["runs"].append({"issue": r and r.group(1) and int(r.group(1)), "title": r and (r.group(2) or r.group(3)),
+                              "state": "running", "age": r and r.group(4), "text": ln[9:]})
+        elif ln.startswith("Open: "):
+            p["open"].append(ln[6:])
+        elif ln.startswith("Needs you: "):
+            p["asks"].append(ln[11:])
+        elif ln.startswith("Stuck: "):
+            p["stuck"].append(ln[7:])
+        elif ln.startswith("Today "):
+            t = TODAY.match(ln)
+            if t:
+                p["merged"], p["spent"] = int(t.group(1)), float(t.group(2))
             else:
-                return
-        finally:
-            w.close()
-        self.local = True
-        P.feed(self.put, lambda: self.done, self.proc)
+                p["other"].append(ln)
+        elif ln.startswith("Loop "):            # Loop running|<systemd word>|state unknown, last poll N min ago[, late]
+            p["loop_text"], body = ln, ln[5:]
+            word = body.split(",")[0]
+            p["loop"] = ("off" if body.startswith("off") else None if word == "state unknown"
+                         else "late" if body.endswith(", late") else "running" if word == "running" else "down")
+            lp = POLL.search(body)
+            if lp and p["at"]:
+                p["poll"] = p["at"] - int(lp.group(1)) * {"min": 60, "h": 3600, "days": DAY}[lp.group(2)]
+        else:
+            p["other"].append(ln)
+    return p
+
+
+def collect(now=None, units=None):
+    """One snapshot of the engine from every source. units: a prior systemd answer to reuse (asked if None)."""
+    now = time.time() if now is None else now
+    units = ask_units() if units is None else units
+    names = listing()
+    projects = {}
+    loops = {} if isinstance(units, str) else {
+        u[len("dispatch-loop@"):-len(".service")]: v for u, v in units.items() if u.startswith("dispatch-loop@")}
+    tenants = set(loops)
+    if names:
+        tenants |= {n.rsplit(".", 1)[0] for n in names} - {"all", "digest", "health"}
+    for t in sorted(tenants):
+        # Each project is read and then drawn once here, inside its own guard: a file that can't be parsed or drawn
+        # becomes one "unreadable" row with the error's name, never an exception that freezes the whole view.
+        try:
+            p = None
+            if names is not None and f"{t}.json" in names:
+                raw = door(f"{t}.json")
+                p = from_json(raw) if raw else None
+            if p is None:
+                raw = door(f"{t}.txt") if names is not None else False
+                p = from_txt(raw) if raw else dict(from_txt(""), src="unreadable" if raw is False else NP)
+            p["name"], p["unit"] = t, loops.get(t)
+            project({"projects": {t: p}, "units": units, "release": None}, t, now, 200)
+        except Exception as x:
+            p = dict(from_txt(""), src="unreadable", name=t, unit=loops.get(t),
+                     other=[f"could not read it: {type(x).__name__}"])
+        projects[t] = p
+    health = door("health.json") if names is not None else False
+    try:
+        fx_down = json.loads(health).get("fx_down") if health else None
+    except (ValueError, AttributeError):
+        fx_down = None
+    groups, bad = ledger(now)
+    return {"at": now, "units": units, "fx": None if isinstance(units, str) else units.get("dispatch-fx.service"),
+            "fx_down": fx_down, "release": release(), "projects": projects, "door": names is not None,
+            "digest": door("digest.txt") if names is not None else False, "ledger": groups, "ledger_bad": bad,
+            "old": old_count(now)}
+
+
+def old_count(now):
+    """The old system in one line, from cc-pulse's snapshot while it is under 90 s old; None otherwise."""
+    try:
+        with open(pulse_path(), encoding="utf-8") as fh:
+            p = json.load(fh)
+        g = p["glance"]
+        if now - float(p.get("at", 0)) > 90:
+            return None
+        s, w, lg = g.get("sessions") or {}, g.get("workers") or {}, g.get("landing") or {}
+        return (f"sessions {s.get('busy', 0)} busy {s.get('waiting', 0)} waiting · workers {w.get('live', 0)} live"
+                f" · landing {lg.get('active', 0)} active {lg.get('queued', 0)} queued"
+                f" · needs you {(g.get('needs') or {}).get('n', 0)}")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+# ── drawing: lines of (text, tone, item) from a snapshot, no I/O ──────────────────────────────────────────────
+def age(s):
+    if s is None:
+        return NP
+    s = max(0, s)
+    return f"{int(s)}s" if s < 60 else f"{int(s // 60)}m" if s < 5400 else f"{int(s // 3600)}h" if s < 2 * DAY \
+        else f"{int(s // DAY)}d"
+
+
+def hhmm(t):
+    return time.strftime("%H:%M", time.localtime(t)) if num(t) else NP
+
+
+def money(x):
+    return f"${x:.2f}" if num(x) is not None else NP
+
+
+CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def cut(s, w):
+    """s with its control characters (C0, DEL, C1) taken out, cut to w. Every line drawn passes through here, so an
+    escape sequence in a door file's title or why never reaches the terminal, in curses, --once or the stream."""
+    s = CTRL.sub("", s)
+    return s if len(s) <= w else s[:max(1, w - 1)] + "…"
+
+
+def loop_cell(p, now, units):
+    """('up 3h' | 'DOWN 12m' | …, tone)."""
+    u = p.get("unit")
+    if u:
+        if u["active"] == "active":
+            word, tone = f"up {age(now - u['since']) if u['since'] else NP}", ""
+        else:
+            word = f"{u['active'].upper() or 'DOWN'} {age(now - u['since']) if u['since'] else ''}".strip()
+            tone = "bad"
+        if u.get("restarts"):
+            word += f" ↻{u['restarts']}"
+        if p.get("loop") == "late":
+            word, tone = word + " late", tone or "warn"
+        return word, tone
+    if p.get("loop") == "off":
+        return "off", "dim"
+    if p.get("loop"):
+        return p["loop"] + (", no unit" if not isinstance(units, str) else ""), \
+            "bad" if p["loop"] == "down" else "warn" if p["loop"] == "late" else ""
+    return ("no unit" if not isinstance(units, str) else NP), "warn"
+
+
+def flow(r, p, now):
+    """One run as its flow: trigger → time → cost → PR → read → end. A field the door doesn't give draws n/p."""
+    st = r.get("state") or NP
+    if p["src"] == "txt":                             # the sentence door: issue, title and a rounded age only
+        title = f' "{r["title"]}"' if r.get("title") else ""
+        return (f"run #{r.get('issue') or '?'} {ICON.get(st, '·')}{title} · trigger {NP} → running {r.get('age') or NP}"
+                f" · cost {NP}")
+    tr = r.get("trigger") or {}
+    trig = (tr.get("kind") or f"trigger {NP}") + (f" by {tr['via']}" if tr.get("via") else "")
+    start, end = num(r.get("started_at")), num(r.get("ended_at"))
+    out = [f"run #{r.get('issue', '?')} {ICON.get(st, '·')} {trig} {hhmm(start)}"]
+    if st == "running":
+        out.append(f"running {age(now - start) if start else NP} · {money(r.get('spent'))}")
+    else:
+        out.append(f"ran {age(end - start) if start and end else NP} · {money(r.get('spent'))}")
+    pr = r.get("pr")
+    if pr:
+        out.append(f"PR #{pr.get('number', '?')}" + (f" ({pr['gh']})" if pr.get("gh") and st == "running" else ""))
+    elif st not in ("running", "failed", "lost"):
+        out.append(f"PR {NP}")
+    rd = r.get("read")
+    if rd:
+        out.append(f"read: {rd.get('verdict') or NP}")
+    if st == "merged":
+        out.append(f"merged {hhmm(end)}")
+    elif st == "held":
+        out.append(f"held on {r.get('on') or NP}" + (f": {r['why']}" if r.get("why") else ""))
+    elif st != "running":
+        out.append(st + (f": {r['why']}" if r.get("why") else ""))
+    return " → ".join(out)
+
+
+def tone_of(r):
+    return {"held": "warn", "stuck": "bad", "failed": "bad", "lost": "bad", "running": "bold"}.get(r.get("state"), "")
+
+
+def header(e, now):
+    ps, units = e["projects"].values(), e["units"]
+    if isinstance(units, str):
+        loops = f"loops {NP} ({units})"
+    else:
+        up = sum(1 for p in ps if p.get("unit") and p["unit"]["active"] == "active")
+        loops = f"loops {up}/{sum(1 for p in ps if p.get('unit'))} up"
+    fx = e["fx"]
+    fx = NP if fx is None else "fx up" if fx["active"] == "active" else f"fx {fx['active'].upper()}"
+    if e.get("fx_down"):
+        fx += " (was down)"
+    runs = [p["runs_today"] for p in ps]
+    runs = sum(runs) if runs and all(num(x) is not None for x in runs) else NP
+    spent = [p["spent"] for p in ps if num(p["spent"]) is not None]
+    waiting = sum(len(p["asks"]) for p in ps)
+    return (f"cc-live · {os.uname().nodename} · {time.strftime('%H:%M', time.localtime(now))} · {loops} · {fx}"
+            f" · runs today {runs} · ${sum(spent):.2f} today · {waiting} waiting on a person")
+
+
+def home(e, now, width):
+    """The main screen: [(text, tone, item)] where item is a project name for a selectable row."""
+    L = [(header(e, now), "bold", None), ("─" * min(width, 120), "dim", None)]
+    if not e["door"]:
+        L.append((f"status door {status_dir()}: unreadable", "bad", None))
+    rel = e["release"]
+    rel = "unreadable" if rel is False else rel or NP
+    L.append((f"ENGINE{'':18}{'loop':17}{'release':14}{'runs':>5}{'merged':>7}{'spend':>8}  door", "dim", None))
+    for p in e["projects"].values():
+        word, tone = loop_cell(p, now, e["units"])
+        r = (p.get("release") or rel)[:12]
+        door_age = f"{age(now - p['at'])} ago" if p["at"] else p["src"] if p["src"] in (NP, "unreadable") else NP
+        busy = p["runs"] or p["asks"] or p["stuck"] or p["open"]
+        L.append((f"{'▸' if busy else ' '} {p['name'][:21]:22}{word[:16]:17}{r:14}"
+                  f"{str(p['runs_today'] if p['runs_today'] is not None else NP):>5}"
+                  f"{str(p['merged'] if p['merged'] is not None else NP):>7}{money(p['spent']):>8}  {door_age}",
+                  tone or ("bold" if busy else ""), p["name"]))
+        for run in p["runs"]:
+            L.append(("    " + flow(run, p, now), tone_of(run), p["name"]))
+        for o in p["open"]:
+            L.append((f"    open: {o}", "", p["name"]))
+    asks = [(p["name"], a) for p in e["projects"].values() for a in p["asks"]]
+    stuck = [(p["name"], s) for p in e["projects"].values() for s in p["stuck"]]
+    L.append((f"WAITING ON A PERSON ({len(asks)})   stuck {len(stuck)} (a: both in full)", "bold", None))
+    for n, a in asks:
+        L.append((f"  {n:20} {a}", "warn", n))
+    L += health_lines(e, now, short=True)
+    o = e["old"]
+    L.append((f"OLD SYSTEM   {o or 'cc-pulse not running here'}   o: cc-live-old", "dim", None))
+    return [(cut(t, width), tone, it) for t, tone, it in L]
+
+
+def health_lines(e, now, short):
+    g, out = e["ledger"], []
+    if g is None:
+        head = "ledger: none yet"
+    elif g is False:
+        head = "ledger: unreadable"
+    else:
+        head = f"{len(g)} failing in the ledger" + (f", {e['ledger_bad']} lines unreadable" if e["ledger_bad"] else "")
+    d = e["digest"]
+    dg = "unreadable" if d is False else NP if d is None else "quiet (empty)" if not d.strip() else "written"
+    out.append((f"HEALTH (24 h)   {head}   digest: {dg}", "bad" if g else "bold", None))
+    if g:
+        items = [f"{x['kind']} {x['why']}" + (f" ({x['repo']})" if x["repo"] else "") + (f" ×{x['n']}" if x["n"] > 1
+                 else "") + f" {hhmm(x['last'])}" for x in g]
+        if short:
+            out.append(("  " + " · ".join(items), "bad" if any(now - x["last"] < 3600 for x in g) else "", None))
+        else:
+            out += [("  " + i, "", None) for i in items]
+    if d and d.strip():
+        text = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2", d.strip())   # Slack links as their labels
+        out += [("  digest: " + text.splitlines()[0], "", None)] if short else \
+            [("  digest:", "bold", None)] + [("  " + ln, "", None) for ln in text.splitlines()]
+    return out
+
+
+def waiting(e, now, width):
+    L = [("WAITING ON A PERSON", "bold", None)]
+    L += [(f"  {p['name']:20} {a}", "warn", p["name"]) for p in e["projects"].values() for a in p["asks"]] or \
+        [("  nothing", "dim", None)]
+    L.append(("STUCK", "bold", None))
+    L += [(f"  {p['name']:20} {s}", "bad", p["name"]) for p in e["projects"].values() for s in p["stuck"]] or \
+        [("  nothing", "dim", None)]
+    return [(cut(t, width), tone, it) for t, tone, it in L]
+
+
+def project(e, name, now, width):
+    """One project: every field, what the door doesn't publish, and the lines it gave verbatim."""
+    p = e["projects"].get(name)
+    if not p:
+        return [(cut(f"{name}: gone from the door", width), "warn", None)]
+    word, _ = loop_cell(p, now, e["units"])
+    u = p.get("unit") or {}
+    L = [(f"{name}  ({p['repo'] or 'repo ' + NP})  from {p['src']}", "bold", None),
+         (f"  loop: {word}" + (f" · systemd {u.get('active')}/{u.get('sub')} since {hhmm(u.get('since'))}"
+                               if u else "") + (f" · {p['loop_text']}" if p.get("loop_text") else ""), "", None),
+         (f"  last poll: {age(now - p['poll']) + ' ago' if p['poll'] else NP}   door written: "
+          f"{hhmm(p['at'])}   release: {p.get('release') or e['release'] or NP}", "", None),
+         (f"  today: runs {p['runs_today'] if p['runs_today'] is not None else NP} · merged "
+          f"{p['merged'] if p['merged'] is not None else NP} · spent {money(p['spent'])}", "", None)]
+    for r in p["runs"]:
+        L.append(("  " + flow(r, p, now), tone_of(r), None))
+        tr = r.get("trigger") or {}
+        if tr.get("channel") and tr.get("ts"):
+            L.append((f"      slack: https://slack.com/archives/{tr['channel']}/p{str(tr['ts']).replace('.', '')}",
+                      "dim", None))
+        if (r.get("pr") or {}).get("url"):
+            L.append((f"      {r['pr']['url']}", "dim", None))
+    L += [(f"  open: {o}", "", None) for o in p["open"]]
+    L += [(f"  needs you: {a}", "warn", None) for a in p["asks"]]
+    L += [(f"  stuck: {s}", "bad", None) for s in p["stuck"]]
+    L += [(f"  {o}", "", None) for o in p["other"]]
+    if p["src"] == "txt":
+        L.append((f"  not published by {name}.txt: trigger, start time, cost so far, runs today, per-run PR, "
+                  "fx's read, end state", "dim", None))
+    return [(cut(t, width), tone, it) for t, tone, it in L]
+
+
+def health(e, now, width):
+    return [(cut(t, width), tone, it) for t, tone, it in health_lines(e, now, short=False)]
+
+
+def render(view, e, now, width):
+    if e is None:
+        return [("reading the engine…", "dim", None)]
+    if view[0] == "project":
+        return project(e, view[1], now, width)
+    return {"home": home, "waiting": waiting, "health": health}[view[0]](e, now, width)
+
+
+def text(e, now=None, width=120):
+    return "\n".join(t for t, _, _ in home(e, time.time() if now is None else now, width))
+
+
+# ── the feed: a snapshot in memory, re-read when a source moves ───────────────────────────────────────────────
+class Feed:
+    def __init__(self):
+        self.e, self.version, self._seen, self._units_at = None, 0, None, 0
+
+    def sources(self):
+        d = status_dir()
+        return (stamp(d), tuple((n, stamp(os.path.join(d, n))) for n in (listing() or ())), stamp(ledger_path()),
+                stamp(current_link()), stamp(pulse_path()))
+
+    def step(self, now=None):
+        """Re-read if a source moved or systemd is due (5 s); True when the snapshot changed."""
+        now = time.time() if now is None else now
+        src, units = self.sources(), None
+        if self.e is not None and now - self._units_at < 5:
+            if src == self._seen:
+                return False
+            units = self.e["units"]
+        else:
+            self._units_at = now
+        e = collect(now, units)
+        changed = self.e is None or {k: v for k, v in e.items() if k != "at"} != \
+            {k: v for k, v in self.e.items() if k != "at"}
+        self.e, self._seen = e, src
+        self.version += changed
+        return changed
 
     def start(self):
-        threading.Thread(target=self.follow, daemon=True).start()
+        def go():
+            while True:
+                try:
+                    self.step()
+                except Exception as x:   # a bad source must never stop the view; show it and keep going
+                    self.err = str(x)[:80]
+                time.sleep(1)
+        self.err = None
+        threading.Thread(target=go, daemon=True).start()
         return self
 
 
-# ── the deeper views, read when opened ────────────────────────────────────────────────────────────────────────
-def tail(path, n):
-    b = P.read_capped(path)                # a regular file only, and capped: never a FIFO or /dev/zero
-    return b.decode("utf-8", "replace").splitlines()[-n:] if b is not None else []
-
-
-def local(t, fmt="%m-%d %H:%M"):
-    return time.strftime(fmt, time.localtime(t))
-
-
-def plain(lines):
-    return [(ln, "bold" if ln and not ln.startswith(" ") else "") for ln in lines], []
-
-
-def view_prs(now, width):
-    ls = P.landed()
-    out = [f"PRs LANDED ({len(ls)}, newest first; from the lander's queue log)", ""]
-    for t, repo, pr in ls:
-        if not P.is_member(repo):
-            out.append(f"  {local(t)}  {ago(now - t):>4} ago  {repo}#{pr}  {P.job(repo, pr).get('title') or ''}")
-    return plain(out if ls else out + ["  (the queue log records no landing)"])
-
-
-def view_graph(now, width, hours):
-    """Landings per hour over the last `hours`, one bar per clock hour, the current hour last."""
-    top = int(now // 3600) * 3600
-    first = top - (hours - 1) * 3600      # the oldest bar's hour starts here, and a landing on that second is in it
-    counts = {}
-    for t, _, _ in P.landed():
-        h = int(t // 3600) * 3600
-        if first <= h <= top:
-            counts[h] = counts.get(h, 0) + 1
-    peak = max(counts.values(), default=0)
-    bar = "█" if (sys.stdout.encoding or "").lower().startswith("utf") else "#"
-    room = max(10, width - 20)
-    out = [f"LANDINGS PER HOUR, last {hours} h: {sum(counts.values())} in all  (+ / - widen or narrow)", ""]
-    for h in range(first, top + 1, 3600):
-        n = counts.get(h, 0)
-        out.append(f"  {local(h, '%a %H:00')}  {bar * (-(-n * room // peak) if n else 0)}{' ' + str(n) if n else ''}")
-    return plain(out)
-
-
-_LOOPS = {}
-
-
-def loop_events(path):
-    """[(epoch, word, text)] from one loop.log: a first iteration starting, a loop ending. Re-read when its mtime moves."""
-    m = mtime(path)
-    if _LOOPS.get(path, (None,))[0] != m:
-        ev = []
-        for ln in tail(path, 100000):
-            stamp, _, msg = ln.partition(" ")
-            when = ts(stamp)
-            if not when:
-                continue
-            if msg.startswith("iter 1/") and " start" in msg:
-                ev.append((when, "started", ""))
-            elif msg == "DONE" or msg.startswith(("exit ", "timed out")):
-                ev.append((when, "stopped", "" if msg == "DONE" else msg[:60]))
-        _LOOPS[path] = (m, ev)
-    return _LOOPS[path][1]
-
-
-def timeline(now, span=RECENT):
-    """[(epoch, word, text)] newest first: hand-offs, landings, and worker loops starting and stopping."""
-    ev = []
-    for repo, tracks in P.boards().items():
-        if P.is_member(repo):
-            continue
-        for name, row in tracks.items():
-            ev.append((ts(row.get("created")), "added", f"{repo}/{name}  {row.get('title') or ''}"))
-            for n in row.get("notes") or []:
-                if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
-                    ev.append((ts(n.get("ts")), "dispatched", f"{repo}/{name}"))
-            ev.append((ts(row.get("agent_at")), "taken", f"{repo}/{name}"))
-    for t, repo, pr in P.landed():
-        if not P.is_member(repo):
-            ev.append((t, "landed", f"{repo}#{pr}  {P.job(repo, pr).get('title') or ''}"))
-    for path in glob.glob(f"{state_dir()}/*/*/loop.log"):
-        key = "/".join(path.split("/")[-3:-1])
-        if now - mtime(path) > span or P.is_member(key.split("/")[0]):
-            continue
-        for t, word, why in loop_events(path):
-            ev.append((t, f"worker {word}", f"{key}  {why}".rstrip()))
-    return sorted((e for e in ev if e[0] and 0 <= now - e[0] <= span), key=lambda e: e[0], reverse=True)
-
-
-def view_timeline(now, width):
-    ev = timeline(now)
-    out = [f"TIMELINE, last {RECENT // 3600} h ({len(ev)} events, newest first)", ""]
-    return plain(out + ([f"  {local(t, '%H:%M')}  {word:<15} {text}" for t, word, text in ev] or ["  (nothing)"]))
-
-
-def view_worker(now, width, repo, name):
-    row = P.boards().get(repo, {}).get(name)
-    if not isinstance(row, dict) or P.is_member(repo):
-        return plain([f"{repo}/{name}", "", "  (no such row on the board now)"])
-    out = [f"{repo}/{name}  [{row.get('status', '?')}]  {row.get('title') or ''}", ""]
-    for k in ("kind", "created", "agent", "agent_at", "held", "pr"):
-        if row.get(k):
-            out.append(f"  {k + ':':<10} {row[k]}")
-    notes = [n for n in row.get("notes") or [] if isinstance(n, dict)]
-    if notes:
-        out += ["", f"NOTES (last {min(8, len(notes))} of {len(notes)})"]
-        out += [f"  {str(n.get('ts', ''))[:16]}  {n.get('msg', '')}" for n in notes[-8:]]
-    d = f"{state_dir()}/{repo}/{name}"
-    for f, n in (("progress.md", 15), ("loop.log", 10)):
-        ls = tail(f"{d}/{f}", n)
-        if ls:
-            out += ["", f"{f.upper()} (last {len(ls)} lines, moved {ago(now - mtime(f'{d}/{f}'))} ago)"]
-            out += [f"  {ln}" for ln in ls]
-    return plain(out)
-
-
-def view_landing(now, width, repo, pr):
-    j = P.job(repo, pr)
-    if not j or P.is_member(repo):
-        return plain([f"{repo}#{pr}", "", "  (the lander has no record of it now)"])
-    out = [f"{repo}#{pr}  {j.get('title') or ''}", ""]
-    for k in ("stage", "state", "branch", "who", "queued_at", "attempts", "why"):
-        if j.get(k) not in (None, ""):
-            out.append(f"  {k + ':':<10} {j[k]}")
-    hist = [h for h in j.get("history") or [] if isinstance(h, dict)]
-    if hist:
-        out += ["", "HISTORY"]
-        out += [f"  {str(h.get('at', ''))[:16]}  {h.get('state', '')}  {h.get('why', '')}".rstrip() for h in hist]
-    return plain(out)
-
-
-def view_session(now, width, sid, p):
-    s = next((x for x in (p or {}).get("sessions") or [] if x["id"] == sid), None)
-    if not s:
-        return plain([f"session {sid}", "", "  (it is not on the pulse now: ended, or a member's)"])
-    out = [f"{s['name']}  {s['state']} {ago(s['since_s']) if s['since_s'] is not None else ''}  "
-           f"{s['repo']}{'/' + s['track'] if s['track'] else ''}  ctx {s['ctx_pct'] if s['ctx_pct'] is not None else '?'}%",
-           "", "WHAT ITS PANE SHOWS (last lines; t switches to it)"]
-    pane = []
-    if s.get("win"):
-        try:
-            r = subprocess.run(["tmux", "capture-pane", "-p", "-t", s["win"]], capture_output=True, text=True, timeout=5)
-            pane = [ln.rstrip() for ln in r.stdout.splitlines()] if not r.returncode else []
-        except (OSError, subprocess.TimeoutExpired):
-            pane = []
-    while pane and not pane[-1]:
-        pane.pop()
-    return plain(out + ([f"  {ln}" for ln in pane[-40:]] or ["  (tmux gave nothing back)"]))
-
-
-def view_board(now, width, repo):
-    """No repo: each project's rows by status, one line each (Enter opens it). A repo: its open rows."""
-    bds = {r: t for r, t in P.boards().items() if not P.is_member(r)}
-    if not repo:
-        lines, items = [("BOARD (open rows by status; Enter opens a project's rows)", "bold")], []
-        for r, tracks in sorted(bds.items()):
-            st = [x.get("status") for x in tracks.values()]
-            n = {s: st.count(s) for s in P.OPEN if st.count(s)}
-            if n:
-                items.append((len(lines), ("board", r)))
-                lines.append((f"  {r:<22} " + "  ".join(f"{s} {c}" for s, c in n.items()), ""))
-        return lines, items
-    order = ("running", "blocked", "waiting", "review", "queued", "held")     # what moves, then what is stuck
-    rows = sorted(((x.get("status"), k, x) for k, x in bds.get(repo, {}).items() if x.get("status") in order),
-                  key=lambda e: (order.index(e[0]), e[1]))
-    lines, items = [(f"BOARD {repo}: {len(rows)} open rows (Enter opens one)", "bold")], []
-    for st, k, x in rows:
-        items.append((len(lines), ("worker", repo, k)))
-        lines.append((P.cut(f"  {st:<8} {k:<34} {x.get('title') or ''}", width), "bad" if st == "blocked" else ""))
-    return lines, items
-
-
-def run_lines(argv, timeout=15):
-    try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        return (r.stdout + r.stderr).rstrip().splitlines() or ["(it printed nothing)"]
-    except (OSError, subprocess.SubprocessError) as e:
-        return [f"(could not run {os.path.basename(argv[0])}: {type(e).__name__})"]
-
-
-def view_failures(now, width):
-    exe = os.environ.get("CC_LIVE_FAILURES") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-failures")
-    return plain(["FAILURES (cc-failures show)", ""] + [f"  {ln}" for ln in run_lines([exe, "show"])])
-
-
-def view_models(now, width):
-    hs = P.home_state()
-    out = [f"MODEL  {P.model(now)}  (cc-model's override; 'default' when none holds)", ""]
-    out += ["MODEL LOG (last 8 lines)"] + [f"  {ln}" for ln in tail(f"{state_dir()}/model.log", 8)]
-    sp = hs.get("spend") if isinstance(hs.get("spend"), dict) else {}
-    out += ["", f"SPEND  today ${sp.get('today') or 0:.2f} · this week ${sp.get('week') or 0:.2f}"]
-    for r in (sp.get("rows") or [])[:15]:
-        if isinstance(r, dict) and not P.is_member(str(r.get("who")).partition("/")[0]):
-            out.append(f"  {str(r.get('who'))[:30]:<30} ${r.get('usd') or 0:>8.2f}  {r.get('tok') or ''}")
-    return plain(out)
-
-
-DEEP = {"prs": lambda v, now, w, h, p: view_prs(now, w), "graph": lambda v, now, w, h, p: view_graph(now, w, h),
-        "timeline": lambda v, now, w, h, p: view_timeline(now, w),
-        "worker": lambda v, now, w, h, p: view_worker(now, w, v[1], v[2]),
-        "landing": lambda v, now, w, h, p: view_landing(now, w, v[1], v[2]),
-        "session": lambda v, now, w, h, p: view_session(now, w, v[1], p),
-        "board": lambda v, now, w, h, p: view_board(now, w, v[1]),
-        "failures": lambda v, now, w, h, p: view_failures(now, w),
-        "models": lambda v, now, w, h, p: view_models(now, w)}
-
-
-class Deep:
-    """The deeper views, each built in a thread when opened and kept until it is opened again; get() never waits."""
-
-    def __init__(self):
-        self.got, self.busy, self.version = {}, set(), 0
-
-    def get(self, view, width, hours, p, fresh=False):
-        key = view + ((hours,) if view[0] == "graph" else ())
-        if (fresh or key not in self.got) and key not in self.busy:
-            self.busy.add(key)
-
-            def go():
-                try:
-                    self.got[key] = DEEP[view[0]](view, time.time(), width, hours, p)
-                except Exception as e:      # a view that fails says so; it never takes the screen down
-                    self.got[key] = plain([f"{view[0]}: {type(e).__name__}: {e}"])
-                self.busy.discard(key)
-                self.version += 1
-            threading.Thread(target=go, daemon=True).start()
-        return self.got.get(key) or ([("reading…", "dim")], [])
-
-
-def render(view, p, deep, width, rows, hours, err=None):
-    """(lines, items) of a view: home and the sections straight from the pulse, the rest from Deep. `err` is the
-    feed's error once it has stopped: it heads every view, since nothing on screen will move again."""
-    if err:
-        stop = (P.cut(f"PULSE STOPPED ({err}); restart cc-live", width), "bad")
-        if p is None:
-            return [stop], []
-        lines, items = render(view, p, deep, width, rows - 1, hours)
-        return [stop] + lines, [(i + 1, t) for i, t in items]
-    if p is None:
-        return [("waiting for the first pulse…", "dim")], []
-    if view[0] == "home":
-        return P.home(p, width, rows + 1)     # rows is the screen less its footer; home counts the footer in
-    if view[0] == "section":
-        return P.section(p, view[1], width, view[2] if len(view) > 2 else None)
-    return deep.get(view, width, hours, p)
-
-
-# ── the cursor ────────────────────────────────────────────────────────────────────────────────────────────────
+# ── the screen ────────────────────────────────────────────────────────────────────────────────────────────────
 ENTER = (10, 13, curses.KEY_ENTER)
 BACK = (27, 8, 127, curses.KEY_BACKSPACE, curses.KEY_LEFT)
+OLD_KEYS = {ord(c) for c in "swnlrpbfmxPgT:/"}
+FOOT = "↑↓ move · Enter project · a waiting · H health · o old system (s w n l r p b f m x P g T) · q quit"
+FOOT_IN = "Esc back · h home · a waiting · H health · o old system · q quit"
 
 
 class Nav:
-    """Where the owner is: a stack of views (home at the bottom), each with its cursor and scroll, and the command
-    line when it is open. key() changes that and says 'quit', 'open' (a view was opened), 'tmux' (switch to the
-    selected session) or None; it draws nothing, so the selfcheck drives it with key codes and no terminal."""
-
+    """Which view, the cursor and the scroll; key() changes them and returns an action, drawing nothing."""
     def __init__(self):
-        self.stack, self.cur, self.top, self.hours, self.cmd = [("home",)], [0], [0], 24, None
+        self.stack, self.cur, self.top = [("home",)], [0], [0]
 
     @property
     def view(self):
         return self.stack[-1]
 
     def go(self, view):
-        if view == ("home",):
-            del self.stack[1:], self.cur[1:], self.top[1:]
-        elif view != self.view:
-            self.stack.append(view), self.cur.append(0), self.top.append(0)
-        return "open"
+        if view != self.view:
+            self.stack.append(view)
+            self.cur.append(0)
+            self.top.append(0)
 
-    def key(self, k, items, nlines, rows, p=None):
-        if self.cmd is not None:                       # the command line takes every key until Enter or Esc
-            if k in ENTER:
-                v, self.cmd = resolve(self.cmd, p), None
-                return self.go(v) if v else None
-            if k == 27:
-                self.cmd = None
-            elif k in (8, 127, curses.KEY_BACKSPACE):
-                self.cmd = self.cmd[:-1]
-            elif 32 <= k < 127:
-                self.cmd += chr(k)
-            return None
-        if k in (ord(":"), ord("/")):
-            self.cmd = ""
-            return None
-        if k in (ord("q"), ord("Q")) and len(self.stack) == 1:
+    def back(self):
+        if len(self.stack) > 1:
+            self.stack.pop()
+            self.cur.pop()
+            self.top.pop()
+
+    def key(self, k, picks, nlines, rows):
+        if k == ord("q"):
             return "quit"
-        if k in BACK + (ord("q"), ord("Q")):           # "Esc or Backspace goes back": from any view, to the one below
-            if len(self.stack) > 1:
-                self.stack.pop(), self.cur.pop(), self.top.pop()
-                return "open"
-            return None
-        if k == ord("h"):
-            return self.go(("home",))
-        if self.view[0] == "graph" and k in (ord("+"), ord("="), ord("-")):
-            self.hours = max(6, min(168, self.hours // 2 if k == ord("-") else self.hours * 2))
-            return "open"
-        if k == ord("r") and self.view == ("section", "recent"):
-            return self.go(("timeline",))              # what the recent heading says: r again, the full timeline
-        if k in SECTIONS:
-            v = SECTIONS[k]
-            if v == ("board", "") and self.view[:2] == ("section", "project"):
-                v = ("board", self.view[2])            # b in a project opens that project's rows
-            return self.go(v)
-        sel = items[self.cur[-1]][1] if items and self.cur[-1] < len(items) else None
-        if k == ord("t"):
-            return "tmux" if sel and sel[0] == "session" or self.view[0] == "session" else None
-        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1}.get(k)
-        page = {curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows}.get(k)
-        if step and items:
-            self.cur[-1] = max(0, min(len(items) - 1, self.cur[-1] + step))
-        elif page and items:                           # the page moves and the cursor goes with it, so fit() keeps it
-            old, top = self.top[-1], max(0, min(max(0, nlines - rows), self.top[-1] + page))
-            lo = top + 1 if top else 0                 # fit() keeps one line above the cursor
-            on = [i for i, (ln, _) in enumerate(items) if lo <= ln < top + rows]
-            if top == old:                             # already at the end (or the start): to the last (first) row
-                self.cur[-1] = len(items) - 1 if page > 0 else 0
-            elif on:
-                self.cur[-1] = on[0]
-            elif page > 0:
-                self.cur[-1] = next((i for i, (ln, _) in enumerate(items) if ln >= lo), len(items) - 1)
-            else:
-                self.cur[-1] = max((i for i, (ln, _) in enumerate(items) if ln < top + rows), default=0)
-            self.top[-1] = top
-        elif step or page:
-            self.top[-1] = max(0, min(max(0, nlines - rows), self.top[-1] + (step or page)))
-        elif k == curses.KEY_HOME:
-            self.cur[-1], self.top[-1] = 0, 0
-        elif k in ENTER and sel:
-            return self.go(sel)
+        if k in OLD_KEYS or k == ord("o"):
+            return "old"
+        if k in (ord("h"), ord("e")):
+            self.__init__()
+        elif k == ord("a"):
+            self.go(("waiting",))
+        elif k == ord("H"):
+            self.go(("health",))
+        elif k in BACK:
+            self.back()
+        elif k in (curses.KEY_DOWN, ord("j")):
+            self.cur[-1] = min(self.cur[-1] + 1, max(0, len(picks) - 1)) if picks else self.cur[-1]
+            if not picks:
+                self.top[-1] = min(self.top[-1] + 1, max(0, nlines - rows))
+        elif k in (curses.KEY_UP, ord("k")):
+            self.cur[-1] = max(0, self.cur[-1] - 1)
+            if not picks:
+                self.top[-1] = max(0, self.top[-1] - 1)
+        elif k in ENTER and picks:
+            self.go(("project", picks[min(self.cur[-1], len(picks) - 1)][1]))
         return None
 
-    def fit(self, items, nlines, rows):
-        """Keep the cursor on an item and its line on screen, after a change or a resize moved things."""
-        if items:
-            self.cur[-1] = max(0, min(self.cur[-1], len(items) - 1))
-            line = items[self.cur[-1]][0]
-            if line < self.top[-1] + 1:
-                self.top[-1] = max(0, line - 1)
-            elif line >= self.top[-1] + rows:
-                self.top[-1] = line - rows + 1
+    def fit(self, picks, nlines, rows):
+        if picks:
+            self.cur[-1] = min(self.cur[-1], len(picks) - 1)
+            y = picks[self.cur[-1]][0]
+            if y < self.top[-1]:
+                self.top[-1] = y
+            elif y >= self.top[-1] + rows:
+                self.top[-1] = y - rows + 1
         self.top[-1] = max(0, min(self.top[-1], max(0, nlines - rows)))
 
 
-# Each footer fits 79 columns, so an 80-column terminal shows all of it; the docstring's KEYS list every key, and
-# home names the ones used most, the rest a view deep names only by letter.
-FOOT = "s sess w work n needs l land r recent p proj b board x box : jump q quit"
-FOOT_IN = "Esc back · h home · s w n l r p b f m x P g T · : jump"
-
-
-def paint(scr, nav, lines, items, tones, flash=""):
-    h, w = scr.getmaxyx()
-    rows = max(1, h - 1)
-    scr.erase()
-    hi = items[nav.cur[-1]][0] if items else None
-    for y, (ln, tone) in enumerate(lines[nav.top[-1]:nav.top[-1] + rows]):
-        attr = tones.get(tone, 0) | (curses.A_REVERSE if nav.top[-1] + y == hi else 0)
-        put(scr, y, 0, ln[:w - 1], attr)
-    if nav.cmd is not None:
-        foot = f":{nav.cmd}_   (a section or a project; Enter jumps, Esc cancels)"
-    else:
-        more = f"{nav.top[-1] + rows}/{len(lines)} · " if len(lines) > nav.top[-1] + rows or nav.top[-1] else ""
-        foot = flash or more + (FOOT if len(nav.stack) == 1 else FOOT_IN)
-    put(scr, h - 1, 0, foot[:w - 1], curses.A_DIM)
-    scr.refresh()
-
-
-def put(scr, y, x, text, attr):
-    try:
-        scr.addstr(y, x, text, attr)
-    except curses.error:                   # the bottom-right cell, or a terminal narrower than the line
-        pass
+def picks_of(lines):
+    """(line number, project) for each selectable row: the first line of each project block."""
+    out, last = [], None
+    for y, (_, _, it) in enumerate(lines):
+        if it and it != last:
+            out.append((y, it))
+        last = it
+    return out
 
 
 def colours():
-    """Tone → attribute: at most three colours (red for what needs him or failed, yellow for waiting or stale), and
-    each tone still reads in monochrome because the words carry it."""
     t = {"": 0, "bold": curses.A_BOLD, "dim": curses.A_DIM, "warn": curses.A_BOLD, "bad": curses.A_BOLD}
     try:
         if curses.has_colors():
@@ -521,31 +691,30 @@ def colours():
     return t
 
 
-def switch_later(win, flash):
-    """Run switch() in a thread, so a keypress does no I/O; its answer reaches the footer through `flash`, a list
-    [text, until (monotonic), version] the loop redraws on."""
-    flash[:] = ["switching to the session's window…", time.monotonic() + 3, flash[2] + 1]
-
-    def go():
-        why = switch(win)
-        flash[:] = [why, time.monotonic() + (3 if why else 0), flash[2] + 1]
-    threading.Thread(target=go, daemon=True).start()
-
-
-def switch(win):
-    """Point this tmux client at a window; a line saying why not when it cannot."""
-    if not os.environ.get("TMUX"):
-        return "t needs cc-live running inside tmux"
+def put(scr, y, text, attr):
     try:
-        r = subprocess.run(["tmux", "switch-client", "-t", win], capture_output=True, text=True, timeout=3)
-        return "" if not r.returncode else f"tmux: {r.stderr.strip()[:60]}"
-    except (OSError, subprocess.TimeoutExpired):
-        return "tmux did not answer"
+        scr.addstr(y, 0, text, attr)
+    except curses.error:
+        pass
 
 
-def ui(scr, feed, deep=None, clock=time.time, tones=None, timing=None):
-    """The navigable view on any screen that has curses' window methods: getch, addstr, getmaxyx, erase, refresh.
-    It draws when the pulse or a deeper view changes, when a key is pressed, and once a second for the clock."""
+_OLD = {}
+
+
+def old_ui(scr, k):
+    """cc-live-old in this same terminal, opened on key k (o: its home); its q comes back here."""
+    if "mod" not in _OLD:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-live-old")
+        loader = importlib.machinery.SourceFileLoader("cc_live_old", path)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cc_live_old", loader))
+        loader.exec_module(mod)
+        _OLD["mod"], _OLD["feed"] = mod, mod.Feed().start()
+    if k != ord("o"):
+        curses.ungetch(k)
+    _OLD["mod"].ui(scr, _OLD["feed"])
+
+
+def ui(scr, feed, clock=time.time, tones=None, timing=None, old=None):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -553,15 +722,23 @@ def ui(scr, feed, deep=None, clock=time.time, tones=None, timing=None):
     scr.keypad(True)
     scr.timeout(20)
     tones = tones if tones is not None else colours()
-    nav, deep, seen, flash, drawn = Nav(), deep or Deep(), None, ["", 0, 0], 0
+    nav, seen, drawn = Nav(), None, 0
     while True:
         h, w = scr.getmaxyx()
         rows = max(1, h - 1)
-        state = (feed.version, deep.version, len(nav.stack), nav.view, nav.cmd, int(clock()), flash[2])
+        state = (feed.version, nav.view, len(nav.stack), int(clock()))
         if state != seen:
-            lines, items = render(nav.view, feed.p, deep, w, rows, nav.hours, feed.err)
-            nav.fit(items, len(lines), rows)
-            paint(scr, nav, lines, items, tones, flash[0] if time.monotonic() < flash[1] else "")
+            lines = render(nav.view, feed.e, clock(), w - 1)
+            picks = picks_of(lines)
+            nav.fit(picks, len(lines), rows)
+            scr.erase()
+            hi = picks[nav.cur[-1]][0] if picks else None
+            for y, (ln, tone, _) in enumerate(lines[nav.top[-1]:nav.top[-1] + rows]):
+                put(scr, y, ln, tones.get(tone, 0) | (curses.A_REVERSE if nav.top[-1] + y == hi else 0))
+            err = getattr(feed, "err", None)
+            put(scr, h - 1, cut(f"error: {err}" if err else FOOT if len(nav.stack) == 1 else FOOT_IN, w - 1),
+                curses.A_DIM)
+            scr.refresh()
             seen = state
             if timing is not None and drawn:
                 timing.append(time.perf_counter() - drawn)
@@ -570,19 +747,14 @@ def ui(scr, feed, deep=None, clock=time.time, tones=None, timing=None):
         if k == -1:
             continue
         drawn = time.perf_counter()
-        act = nav.key(k, items, len(lines), rows, feed.p)
+        act = nav.key(k, picks, len(lines), rows)
         if act == "quit":
             return 0
-        if act == "tmux":
-            sel = nav.view if nav.view[0] == "session" else items[nav.cur[-1]][1]
-            s = next((x for x in (feed.p or {}).get("sessions") or [] if x["id"] == sel[1]), None)
-            if s and s.get("win"):
-                switch_later(s["win"], flash)
-            else:
-                flash[:] = ["that session has no tmux window", time.monotonic() + 3, flash[2] + 1]
-        if act == "open" and nav.view[0] in DEEP:
-            deep.get(nav.view, w, nav.hours, feed.p, fresh=True)
-        seen = None                                  # a key always redraws, from memory
+        if act == "old":
+            (old or old_ui)(scr, k)
+            tones = colours() if old is None else tones
+            scr.timeout(20)
+        seen = None
 
 
 def main(argv):
@@ -592,7 +764,7 @@ def main(argv):
         print(__doc__.split("\n\n")[-1].rstrip())
         return 0
     if argv[:1] == ["--once"]:
-        print(P.text(P.Pulse().step(laptop=False)))
+        print(text(collect()))
         return 0
     if argv:
         print(__doc__.split("\n\n")[-1].rstrip(), file=sys.stderr)
@@ -602,21 +774,20 @@ def main(argv):
         if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb":
             import locale
             locale.setlocale(locale.LC_ALL, "")
-            os.environ.setdefault("ESCDELAY", "10")   # Esc goes back at once, not after curses' default second
+            os.environ.setdefault("ESCDELAY", "10")
             return curses.wrapper(ui, feed)
         seen = 0
-        while True:                                  # no terminal: the main screen as text, on each change
-            if feed.version != seen and feed.p:
+        while True:
+            if feed.version != seen and feed.e:
                 seen = feed.version
-                print(P.text(feed.p) + "\n", flush=True)
-            time.sleep(0.05)
+                print(text(feed.e) + "\n", flush=True)
+            time.sleep(0.2)
     except KeyboardInterrupt:
         return 0
 
 
 def selfcheck(*a, **k):
-    """The cases are core/tests/selfcheck/cc-live.py, run in THIS namespace so their stubs and `global`
-    rebinds land on the tool as they did when the body was here. Defining them replaces this selfcheck()."""
+    """The cases are core/tests/selfcheck/cc-live.py, run in THIS namespace (as cc-live-old's are)."""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tests", "selfcheck", "cc-live.py")
     with open(path, encoding="utf-8") as fh:
         exec(compile(fh.read(), path, "exec"), globals())

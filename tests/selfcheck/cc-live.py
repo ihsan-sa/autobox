@@ -1,19 +1,15 @@
-# cc-live's selfcheck: the cases behind `cc-live selfcheck` (check.sh and selftest.sh run it that way; there is no
-# other entry point). Not a module: cc-live execs this file INSIDE ITS OWN NAMESPACE and calls the selfcheck() it
-# defines, so every name here is the tool's, a `global` rebinds the tool's, and `__file__` is the tool. No
-# module docstring (it would replace the tool's __doc__) and no top-level name but the defs below.
+# cc-live's selfcheck: the cases behind `cc-live selfcheck`. Not a module: cc-live execs this file INSIDE ITS OWN
+# NAMESPACE and calls the selfcheck() it defines, so every name here is the tool's and `__file__` is the tool. No
+# module docstring (it would replace the tool's __doc__) and no top-level name but the defs below. Every source is a
+# fixture in a temp dir pointed at by env; nothing reads the live host's status dir, ledger, units or release.
 
 # ── selfcheck ─────────────────────────────────────────────────────────────────────────────────────────────────
-def key_limit(load=None, cores=None):
-    """(ms a keypress may take to redraw, why). The target, or under load the slack a shared box needs."""
-    KEY_MS, KEY_MS_LOADED = 16, 48
+def key_limit():
+    """(ms a keypress may take to redraw, why): 16, or 48 under load, as cc-live-old holds to."""
     if os.environ.get("CC_LOADED"):
-        return KEY_MS_LOADED, "CC_LOADED is set"
-    load = os.getloadavg()[0] if load is None else load
-    cores = (os.cpu_count() or 1) if cores is None else cores
-    if load >= cores:
-        return KEY_MS_LOADED, f"load {load:.1f} on {cores} cores"
-    return KEY_MS, "the target"
+        return 48, "CC_LOADED is set"
+    load, cores = os.getloadavg()[0], os.cpu_count() or 1
+    return (48, f"load {load:.1f} on {cores} cores") if load >= cores else (16, "the target")
 
 
 def selfcheck():
@@ -27,197 +23,244 @@ def selfcheck():
             bad += 1
             print(f"FAIL {name}")
 
+    import shutil
     import tempfile
     tmp = tempfile.mkdtemp(prefix="cc-live-")
-    now = int(time.time())
-    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-    for k, v in {"CC_BOARDS": f"{tmp}/boards", "CC_STATE": f"{tmp}/state", "CC_LANDER_STATE": f"{tmp}/land",
-                 "CC_WORKTREES": f"{tmp}/wt", "CC_SESSIONS": f"{tmp}/sessions", "CC_MEMBERS": f"{tmp}/members",
-                 "CC_DEV": f"{tmp}/dev", "CC_PULSE": f"{tmp}/state/pulse.json", "CC_PULSE_SUITES": "/bin/true",
-                 "CC_LIVE_FAILURES": f"{tmp}/bin/failures"}.items():
+    st, now = f"{tmp}/status", int(time.time())
+    os.makedirs(st)
+    for k, v in {"CC_LIVE_STATUS_DIR": st, "CC_LEDGER": f"{tmp}/ledger.jsonl", "CC_LIVE_RELEASE": f"{tmp}/current",
+                 "CC_LIVE_UNITS": f"{tmp}/units", "CC_PULSE": f"{tmp}/pulse.json"}.items():
         os.environ[k] = v
-    os.environ.pop("TMUX", None)
-    for d in ("boards", "state/r/w1", "state/fund", "land/rest", "proc", "wt/r/w1", "bin", "sessions", "members", "dev/r"):
-        os.makedirs(f"{tmp}/{d}")
-    open(f"{tmp}/bin/tmux", "w").write("#!/bin/sh\n[ \"$1\" = capture-pane ] && { echo \"pane of $4\"; printf '\\n\\n'; }\n"
-                                      "[ \"$1\" = switch-client ] && { sleep 1; echo \"no client for $3\" >&2; exit 1; }\nexit 0\n")
-    open(f"{tmp}/bin/failures", "w").write("#!/bin/sh\necho '  c-1  gate-verdict/red  3 record(s)'\n")
-    for n in ("tmux", "failures"):
-        os.chmod(f"{tmp}/bin/{n}", 0o755)
-    os.environ["PATH"] = f"{tmp}/bin:{os.environ.get('PATH', '')}"
-    proc = f"{tmp}/proc"
-    for pid, comm, cwd in ((30, "claude", f"{tmp}/wt/r/w1"), (50, "claude", f"{tmp}/dev/r")):
-        os.makedirs(f"{proc}/{pid}")
-        open(f"{proc}/{pid}/comm", "w").write(comm + "\n")
-        open(f"{proc}/{pid}/cmdline", "wb").write(b"claude\0")
-        open(f"{proc}/{pid}/stat", "w").write(f"{pid} ({comm}) S " + " ".join(["0"] * 18) + " 100 0\n")
-        os.symlink(cwd, f"{proc}/{pid}/cwd")
-        json.dump({"pid": pid, "sessionId": f"s{pid}", "cwd": cwd, "name": f"n{pid}", "status": "busy",
-                   "statusUpdatedAt": (now - 60) * 1000, "tmux": f"main:@{pid}.%{pid}", "procStart": "100"},
-                  open(f"{tmp}/sessions/{pid}.json", "w"))
-    board = {"tracks": {
-        "fresh": {"title": "just added", "status": "queued", "created": iso(now - 60)},
-        "sent": {"title": "worker out", "status": "running", "created": iso(now - 7200),
-                 "notes": [{"ts": iso(now - 900), "msg": "dispatched headless worker (loop 2)"}]},
-        "w1": {"title": "live one", "status": "running", "created": iso(now - 90000)},
-        "stuck": {"title": "a blocked one", "status": "blocked", "created": iso(now - 90000)},
-        "old": {"title": "last week", "status": "merged", "created": iso(now - 7 * 86400)}}}
-    json.dump(board, open(f"{tmp}/boards/r.json", "w"))
-    json.dump({"tracks": {}}, open(f"{tmp}/boards/fund.json", "w"))
-    json.dump({"title": "fund", "at": iso(now), "rows": [{"label": "paper P&L", "value": "+$212", "state": "ok"}]},
-              open(f"{tmp}/state/fund/panel.json", "w"))
-    json.dump({"repo": "r", "pr": 7, "stage": "gates", "title": "a landing",
-               "history": [{"at": iso(now - 60), "state": "queued"}]}, open(f"{tmp}/land/r-7.json", "w"))
-    json.dump({"repo": "r", "pr": "5", "title": "the fifth"}, open(f"{tmp}/land/rest/r-5.json", "w"))
-    log = [(now - 7200, "stage r#5 merged sha=abc"), (now - 30 * 3600, "notify r#3 landed → thread"),
-           (now - 600, "stage r#6 merged sha=def")]
-    open(f"{tmp}/land/queue.log", "w").write("".join(f"{iso(t)}\t{m}\n" for t, m in log))
-    open(f"{tmp}/state/r/w1/loop.log", "w").write(f"{iso(now - 3000)} iter 1/2 start (budget $5)\n{iso(now - 2000)} iter 2/2 start\n"
-                                                  f"{iso(now - 1000)} DONE\n{iso(now - 900)} exit 1: gave up\n")
-    pulse = P.Pulse(proc)
-    p = pulse.step(now, laptop=False)
-    W = 120
+    stamp_ = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+    sd = lambda t: time.strftime("%a %Y-%m-%d %H:%M:%S %Z", time.localtime(t))
 
-    # the deeper views, each over the fixture
-    prs = "\n".join(t for t, _ in view_prs(now, W)[0])
-    case("the PR list says when each landed, with its title", f"  {local(now - 7200)}    2h ago  r#5  the fifth" in prs and "r#3" in prs)
-    g = [t for t, _ in view_graph(now, 60, 6)[0]]
-    case("the graph has one bar per hour, the current hour last, counting what is in its span",
-         len(g) == 8 and g[-1].startswith(f"  {local(int(now // 3600) * 3600, '%a %H:00')}") and "in all" in g[0])
-    case("a wider graph counts the landing a narrow one leaves out",
-         "2 in all" in g[0] and "3 in all" in view_graph(now, 60, 48)[0][0][0])
-    tl = "\n".join(t for t, _ in view_timeline(now, W)[0])
-    for word, what in (("added", "r/fresh  just added"), ("dispatched", "r/sent"), ("landed", "r#5  the fifth"),
-                       ("worker started", "r/w1"), ("worker stopped", "r/w1  exit 1: gave up")):
-        case(f"the timeline shows {word} {what}", f"{word:<15} {what}" in tl)
-    case("the timeline leaves out a second iteration and what is older than a day",
-         tl.count("worker started") == 1 and "r#3" not in tl and "r/old" not in tl)
-    wv = "\n".join(t for t, _ in view_worker(now, W, "r", "sent")[0])
-    case("a worker view shows its row and its notes", "r/sent  [running]  worker out" in wv and "dispatched headless" in wv)
-    case("a worker view shows its loop log's last lines", "exit 1: gave up" in "\n".join(t for t, _ in view_worker(now, W, "r", "w1")[0]))
-    case("a row gone from the board says so", "no such row" in view_worker(now, W, "r", "nope")[0][-1][0])
-    lv = "\n".join(t for t, _ in view_landing(now, W, "r", "7")[0])
-    case("a landing view shows its stage and history; an ended one is read from rest/",
-         "stage:     gates" in lv and "queued" in lv and view_landing(now, W, "r", "5")[0][0][0] == "r#5  the fifth")
-    sv = [t for t, _ in view_session(now, W, "30", p)[0]]
-    case("a session view shows its state and its pane, blank tail cut", sv[0].startswith("n30  busy") and sv[-1] == "  pane of @30")
-    case("a session gone from the pulse says so", "not on the pulse" in view_session(now, W, "9", p)[0][-1][0])
-    bl, bi = view_board(now, W, "")
-    case("the board view counts each project's open rows, and Enter goes to them",
-         any("r " in t and "running 2" in t and "blocked 1" in t for t, _ in bl) and ("board", "r") in [i[1] for i in bi])
-    rl, ri = view_board(now, W, "r")
-    case("a project's board lists its open rows, running first, and each opens", rl[1][0].lstrip().startswith("running")
-         and len(ri) == 4 and ri[0][1][0] == "worker" and not any("last week" in t for t, _ in rl))
-    case("the failures view is cc-failures show", "gate-verdict/red" in view_failures(now, W)[0][2][0])
-    case("the models view names the model and the log", view_models(now, W)[0][0][0].startswith("MODEL  default"))
+    def write(name, body, where=st):
+        with open(f"{where}/{name}.new", "w", encoding="utf-8") as fh:
+            fh.write(body if isinstance(body, str) else json.dumps(body))
+        os.replace(f"{where}/{name}.new", f"{where}/{name}")   # as the door writes: one rename
 
-    # the command line and the section keys
-    case("a typed project name opens it; a section prefix opens the section; nonsense opens nothing",
-         resolve("fund", p) == ("section", "project", "fund") and resolve("fail", p) == ("failures",)
-         and resolve("bo", p) == ("board", "") and resolve("zzz", p) is None)
-    K = curses
-    nav = Nav()
-    home, items = render(nav.view, p, Deep(), 80, 23, 24)
-    case("home fits 80x24 and its items are sessions and workers",
-         len(home) <= 23 and {i[1][0] for i in items} == {"session", "worker"})
-    case("q quits from home", nav.key(ord("q"), items, 50, 20) == "quit")
-    for k, v in ((ord("s"), ("section", "sessions")), (ord("b"), ("board", "")), (ord("f"), ("failures",)),
-                 (ord("m"), ("models",)), (ord("l"), ("section", "landing")), (ord("n"), ("section", "needs")),
-                 (ord("p"), ("section", "projects")), (ord("x"), ("section", "box")), (ord("P"), ("prs",)),
-                 (ord("T"), ("timeline",)), (ord("w"), ("section", "workers")), (ord("r"), ("section", "recent"))):
-        nav = Nav()
-        case(f"one key from home opens {v}", nav.key(k, items, 50, 20) == "open" and nav.view == v)
-    case("r again in recent opens the full timeline, as its heading says",
-         "r again: the full timeline" in render(("section", "recent"), p, Deep(), 80, 23, 24)[0][0][0]
-         and nav.key(ord("r"), [], 50, 20) == "open" and nav.view == ("timeline",))
-    sp = {**p, "sections": {**p["sections"], "sessions": {"at": now - 300, "err": "TypeError: x", "stale": True}}}
-    sh = [ln for ln in render(("home",), sp, Deep(), 80, 23, 24)[0] if ln[0].startswith("SESSIONS")]
-    case("a stale sessions section is drawn STALE with its time, in warn, on home and in its section",
-         sh and "STALE: as of" in sh[0][0] and sh[0][1] == "warn"
-         and "STALE" in render(("section", "sessions"), sp, Deep(), 80, 23, 24)[0][0][0]
-         and not any("STALE" in t for t, _ in render(("home",), p, Deep(), 80, 23, 24)[0]))
-    nav = Nav()
-    nav.key(ord("s"), items, 50, 20)
-    nav.key(ord("b"), [], 50, 20)
-    case("a section key from inside a section opens it on top, and h goes straight home",
-         len(nav.stack) == 3 and nav.key(ord("h"), [], 50, 20) == "open" and nav.stack == [("home",)])
-    nav = Nav()
-    for k in (ord(":"), ord("f"), ord("u"), ord("n"), 127, ord("n"), ord("d")):
-        nav.key(k, items, 50, 20, p)
-    case("the command line takes letters and Backspace, and does not jump on them", nav.cmd == "fund" and nav.view == ("home",))
-    case("Enter on the command line jumps to the project", nav.key(10, items, 50, 20, p) == "open"
-         and nav.view == ("section", "project", "fund") and nav.cmd is None)
-    case("b in a project opens that project's board rows", nav.key(ord("b"), [], 50, 20) == "open" and nav.view == ("board", "fund"))
-    nav = Nav()
-    nav.key(ord("p"), items, 50, 20)
-    pl, pi = render(nav.view, p, Deep(), 80, 23, 24)
-    nav.cur[-1] = [i[1] for i in pi].index(("section", "project", "fund"))
-    case("Enter on a project's line opens its drill-in, drawn from the pulse",
-         nav.key(10, pi, len(pl), 23) == "open" and render(nav.view, p, Deep(), 80, 23, 24)[0][1][0].startswith("PANEL fund"))
-    nav = Nav()
-    nav.key(ord("/"), items, 50, 20, p), nav.key(ord("x"), items, 50, 20, p)
-    case("Esc closes the command line without moving", nav.key(27, items, 50, 20, p) is None and nav.cmd is None
-         and nav.view == ("home",))
-    nav = Nav()
-    nav.key(K.KEY_DOWN, items, 50, 20)
-    case("↓ moves the cursor; Enter opens the row under it", nav.cur[-1] == 1 and nav.key(10, items, 50, 20) == "open"
-         and nav.view == items[1][1])
-    case("Esc goes back to home with the cursor where it was", nav.key(27, [], 50, 20) == "open" and nav.view == ("home",)
-         and nav.cur == [1])
-    case("Esc on home stays home", nav.key(27, items, 50, 20) is None and nav.view == ("home",))
-    nav.key(ord("T"), items, 50, 20)
-    nav.key(K.KEY_NPAGE, [], 50, 20)
-    case("PgDn scrolls a view with no rows to pick, no further than its end",
-         nav.top[-1] == 20 and (nav.key(K.KEY_NPAGE, [], 50, 20), nav.top[-1])[1] == 30)
-    nav = Nav()
-    nav.key(ord("g"), items, 50, 20)
-    case("the graph starts at 24 h; + doubles it and - halves it, within 6 h and a week",
-         nav.hours == 24 and nav.key(ord("+"), [], 9, 20) == "open" and nav.hours == 48
-         and [nav.key(ord("-"), [], 9, 20) for _ in range(4)] and nav.hours == 6
-         and (nav.key(27, [], 9, 20), nav.key(ord("+"), items, 9, 20))[1] is None)
-    sess_item = next(i for i in items if i[1][0] == "session")
-    nav = Nav()
-    nav.cur[-1] = items.index(sess_item)
-    case("t on a session asks for tmux; on a worker it does nothing", nav.key(ord("t"), items, 50, 20) == "tmux"
-         and (setattr(nav, "cur", [items.index(next(i for i in items if i[1][0] == "worker"))]),
-              nav.key(ord("t"), items, 50, 20))[1] is None)
-    case("t outside tmux says so instead of failing", switch("@30") == "t needs cc-live running inside tmux")
-    fx = [(2, ("prs",)), (4, ("graph",)), (30, ("timeline",))]
-    nav = Nav()
-    nav.cur[-1] = 2
-    nav.fit(fx, 40, 10)
-    case("fit keeps the cursor's line on screen", nav.top[-1] <= 30 < nav.top[-1] + 10)
-    p40 = {**p, "sessions": [{**p["sessions"][0], "id": str(i), "name": f"x{i}"} for i in range(40)]}
-    nav = Nav()
-    nav.key(ord("s"), items, 50, 23)
-    sl, si = render(nav.view, p40, Deep(), 80, 23, 24)
-    nav.fit(si, len(sl), 23)
+    def unit(name, active, since, restarts=0):
+        return (f"Id={name}\nActiveState={active}\nSubState={'running' if active == 'active' else active}\n"
+                f"ActiveEnterTimestamp={sd(since) if since else ''}\nNRestarts={restarts}\n")
 
-    def pg(k):
-        nav.key(k, si, len(sl), 23)
-        nav.fit(si, len(sl), 23)
-        return nav.top[-1], nav.cur[-1]
-    down = pg(K.KEY_NPAGE)
-    case("PgDn in a list of 40 sessions pages down and takes the cursor along",
-         down[0] > 0 and down[0] <= si[down[1]][0] < down[0] + 23)
-    case("PgUp comes back to the top, the cursor with it", pg(K.KEY_PPAGE) == (0, 0))
-    pg(K.KEY_NPAGE)
-    case("PgDn at the end puts the cursor on the last row", pg(K.KEY_NPAGE)[1] == len(si) - 1)
+    # ── the sentence door (<R>.txt), from the host's sample of 2026-10-14 ──
+    dac = (f"demo (o/demo), {stamp_}\n"
+           '  Stuck: issue #6 "Working toward GOALS.md" failed at 11:00, before a PR: Permission denied (publickey).\n'
+           '  Running: issue #10 "Working toward GOALS.md", 3 min\n'
+           "  Open: PR #11 (not checked yet)\n"
+           "  Today 2 merged, $1.56 spent; last 7 days 2 merged, $1.56 spent.\n"
+           "  Loop running, last poll 2 min ago\n"
+           "  1 ledger line couldn't be read\n")
+    p = from_txt(dac)
+    case("txt: the header gives the repo and the stamp",
+         p["repo"] == "o/demo" and abs(p["at"] - now) < 60)
+    case("txt: Running: is a run with its issue, title and the door's rounded age",
+         p["runs"] == [{"issue": 10, "title": "Working toward GOALS.md", "state": "running", "age": "3 min",
+                        "text": 'issue #10 "Working toward GOALS.md", 3 min'}])
+    case("txt: Open:, Stuck: and Today are read by their opening word",
+         p["open"] == ["PR #11 (not checked yet)"] and p["stuck"][0].startswith("issue #6") and
+         (p["merged"], p["spent"]) == (2, 1.56))
+    case("txt: Loop gives the state and a last poll counted back from the stamp",
+         p["loop"] == "running" and abs(p["poll"] - (p["at"] - 120)) < 1)
+    case("txt: a line with no known opening word is kept verbatim", p["other"] == ["1 ledger line couldn't be read"])
+    case("txt: the fields the sentences never carry stay None, so they draw n/p",
+         p["runs_today"] is None and p["release"] is None)
+    case("txt: late, down and off loops",
+         from_txt("x\n  Loop running, last poll 9 min ago, late\n")["loop"] == "late" and
+         from_txt("x\n  Loop failed, last poll 3 min ago\n")["loop"] == "down" and
+         from_txt("x\n  Loop off: this project isn't on dispatch's units\n")["loop"] == "off" and
+         from_txt("x\n  Loop state unknown, no poll yet, late\n")["loop"] is None)
+    needs = from_txt("app (o/app)\n  Needs you: PR #77 stopped (it changes his standing goals) "
+                     "and is still open (checked 6 min ago)\n")
+    case("txt: Needs you: is an ask waiting on a person", needs["asks"] and needs["asks"][0].startswith("PR #77"))
 
-    # the deep views never block the loop
-    deep = Deep()
-    os.environ["CC_LIVE_FAILURES"] = f"{tmp}/bin/slow"
-    open(f"{tmp}/bin/slow", "w").write("#!/bin/sh\nsleep 1; echo done\n")
-    os.chmod(f"{tmp}/bin/slow", 0o755)
-    t0 = time.perf_counter()
-    first = deep.get(("failures",), 80, 24, p)
-    case("a slow deeper view answers 'reading…' at once (the view takes 1 s) and fills in later",
-         time.perf_counter() - t0 < 0.15 and first[0][0][0] == "reading…")
+    # ── the field door (<R>.json, schema v1) ──
+    def run(state, **kw):
+        r = {"issue": 212, "title": "fix the header", "trigger": {"kind": "ask", "via": "mail", "channel": "C0ABC",
+             "ts": "1791992179.499989"}, "started_at": now - 40, "ended_at": None, "spent": 0.12, "state": state,
+             "on": None, "why": None, "pr": None, "read": None}
+        r.update(kw)
+        return r
 
-    # the whole loop over a fake screen: what it draws, how fast a key redraws, and a pulse change reaching it
-    class Screen:            # curses' window methods, over a dict: the whole navigable loop with no terminal
-        def __init__(self, keys, h=24, w=80):
-            self.keys, self.rows, self.hi, self.shots, self.h, self.w = list(keys), {}, [], [], h, w
+    def doc(runs, **kw):
+        d = {"v": 1, "repo": "o/web", "at": now, "release": "aeed4aae35c5",
+             "loop": {"state": "running", "last_poll": now - 30}, "today": {"runs": 3, "merged": 1, "spent": 4.1},
+             "runs": runs}
+        d.update(kw)
+        return d
+
+    pr = {"number": 1367, "url": "https://github.com/o/web/pull/1367", "gh": "is green and up to date"}
+    walk = [run("running"),
+            run("running", pr=pr, spent=0.7),
+            run("running", pr=pr, spent=0.7, read={"verdict": "LAND", "sha": "abc", "at": now - 5}),
+            run("merged", pr=pr, spent=0.7, read={"verdict": "LAND", "sha": "abc", "at": now - 5},
+                started_at=now - 300, ended_at=now)]
+    flows = [flow(r, from_json(json.dumps(doc([r]))), now) for r in walk]
+    case("json: a run walks trigger → running → PR → read → merged, a step at a time",
+         flows[0].endswith("running 40s · $0.12") and "ask by mail" in flows[0] and
+         flows[1].endswith("→ PR #1367 (is green and up to date)") and flows[2].endswith("→ read: LAND") and
+         "ran 5m · $0.70 → PR #1367 → read: LAND → merged" in flows[3])
+    held = from_json(json.dumps(doc([run("held", on="owner", why="it changes his standing goals", pr=pr,
+                                         ended_at=now)])))
+    case("json: a run held on the owner is waiting on a person, with its why",
+         held["asks"] == ["held on owner: #212 PR #1367 it changes his standing goals"] and
+         "held on owner: it changes his standing goals" in flow(held["runs"][0], held, now))
+    stuck = from_json(json.dumps(doc([run("failed", why="no PR: push refused", ended_at=now)])))
+    case("json: a failed run is listed as stuck and draws no PR step",
+         stuck["stuck"] == ["failed: #212 no PR: push refused"] and "→ PR" not in flow(stuck["runs"][0], stuck, now))
+    nul = from_json(json.dumps({"v": 1, "repo": "o/r", "at": None, "release": None, "loop": None, "today": None,
+                                "runs": [run("merged", trigger=None, spent=None, started_at=None, ended_at=None)]}))
+    f = flow(nul["runs"][0], nul, now)
+    case("json: every null field draws n/p, never a guess",
+         "trigger n/p n/p" in f and "ran n/p · n/p → PR n/p → merged n/p" in f and nul["spent"] is None)
+    case("json: a file that isn't schema v1 is not taken for one",
+         from_json('{"v": 2}') is None and from_json("not json") is None)
+
+    # ── the whole snapshot from a fixture host ──
+    write("demo.txt", dac)
+    write("demo.json", '{"v": 9}')                  # not v1: the sentences are read instead
+    write("web.txt", f"web (o/web), {stamp_}\n  Nothing running or open.\n")
+    write("web.json", doc(walk[:1] + [run("merged", issue=211, pr=pr, started_at=now - 900, ended_at=now - 300)]))
+    write("app.txt", "app (o/app)\n  Needs you: PR #77 stopped and is still open\n")
+    write("all.txt", "Dispatch at …\n")
+    write("digest.txt", "Needs you: app <https://github.com/o/app/pull/77|#77> changes your "
+                        "standing goals.\n")
+    write("health.json", {"fx_down": None})
+    with open(f"{tmp}/units", "w") as fh:
+        fh.write("\n".join([unit("dispatch-fx.service", "active", now - 3600),
+                            unit("dispatch-loop@web.service", "active", now - 3 * 3600),
+                            unit("dispatch-loop@demo.service", "active", now - 600),
+                            unit("dispatch-loop@tool.service", "failed", now - 720, restarts=3),
+                            unit("dispatch-loop@app.service", "inactive", None)]))
+    os.symlink("releases/aeed4aae35c57db233a98fd4fff0fa3f30d6108d", f"{tmp}/current")
+    rows = [{"kind": "health", "at": now - 600, "outcome": "failed", "why": "disk-high root"},
+            {"kind": "health", "at": now - 300, "outcome": "failed", "why": "disk-high root"},
+            {"kind": "selftest", "at": now - 900, "outcome": "failed", "why": "check-extra identity", "repo": "o/r"},
+            {"kind": "health", "at": now - 2 * DAY, "outcome": "failed", "why": "an old one"},
+            {"kind": "health", "at": now - 60, "outcome": "ok", "why": "passed"}]
+    with open(f"{tmp}/ledger.jsonl", "w") as fh:
+        fh.write("\n".join(map(json.dumps, rows)) + "\n{torn line\n")
+    e = collect(now)
+    ps = e["projects"]
+    case("the projects are the loop units and the door's files, less all/digest/health",
+         sorted(ps) == ["app", "demo", "tool", "web"])
+    case("<R>.json is read when it is v1, and <R>.txt otherwise",
+         ps["web"]["src"] == "json" and ps["demo"]["src"] == "txt")
+    case("a project with a unit and no door file reads n/p", ps["tool"]["src"] == NP)
+    screen = text(e, now, 160)
+    case("the header counts loops up, fx, spend and what waits on a person",
+         "loops 2/4 up · fx up" in screen and "$5.66 today" in screen and "1 waiting on a person" in screen)
+    case("runs today is n/p while any project's door doesn't publish it", "runs today n/p" in screen)
+    case("a loop's row: up and since, FAILED with restarts, INACTIVE",
+         re.search(r"web +up 3h", screen) and re.search(r"tool +FAILED 12m ↻3", screen) and
+         re.search(r"app +INACTIVE ", screen))
+    case("the release comes from the json, else the current link",
+         re.search(r"web .* aeed4aae35c5 +3 +1 +\$4\.10", screen) and
+         re.search(r"demo .* aeed4aae35c5 +n/p +2 +\$1\.56", screen))
+    case("the running run and today's finished one sit under their project",
+         "run #212 ▶ ask by mail" in screen and "run #211 ✓" in screen and "open: PR #11 (not checked yet)" in screen)
+    case("health: ledger failures in 24 h grouped, an old one and a passing one dropped, a torn line counted",
+         [(g["why"], g["n"]) for g in e["ledger"]] == [("disk-high root", 2), ("check-extra identity", 1)] and
+         e["ledger_bad"] == 1 and "disk-high root ×2" in screen and "an old one" not in screen)
+    case("the digest's first line, with Slack links drawn as their labels",
+         "digest: Needs you: app #77 changes your standing goals." in screen)
+    case("the old system says so when no fresh pulse is there", "cc-pulse not running here" in screen)
+    with open(f"{tmp}/pulse.json", "w") as fh:
+        json.dump({"at": now, "glance": {"needs": {"n": 2}, "sessions": {"busy": 3, "waiting": 1},
+                                         "workers": {"live": 5}, "landing": {"active": 1, "queued": 2}}}, fh)
+    case("the old system in one line from a fresh pulse", "sessions 3 busy 1 waiting · workers 5 live" in
+         text(collect(now), now, 160))
+    write("digest.txt", "")
+    case("an empty digest is a quiet day", "digest: quiet (empty)" in text(collect(now), now, 160))
+    os.unlink(f"{st}/digest.txt")
+    case("a missing digest is n/p", "digest: n/p" in text(collect(now), now, 160))
+
+    # ── the door, and nothing past it ──
+    secret = f"{tmp}/private"
+    os.makedirs(secret)
+    with open(f"{secret}/state.txt", "w") as fh:
+        fh.write("tenant-private-secret\n")
+    os.symlink(f"{secret}/state.txt", f"{st}/leak.txt")
+    os.makedirs(f"{st}/sub.txt")
+    e2 = collect(now)
+    case("a symlink in the door is refused, so nothing outside it is read",
+         e2["projects"]["leak"]["src"] == "unreadable" and "tenant-private-secret" not in json.dumps(e2))
+    case("a directory named like a file isn't read", e2["projects"]["sub"]["src"] == "unreadable")
+    case("only plain names are opened", door("../private/state.txt") is False and door("a/b.txt") is False)
+    if os.geteuid() != 0:
+        os.chmod(f"{st}/app.txt", 0)
+        case("a file the user can't open draws unreadable", collect(now)["projects"]["app"]["src"] ==
+             "unreadable")
+        os.chmod(f"{st}/app.txt", 0o640)
+    os.environ["CC_LIVE_UNITS"] = f"{tmp}/no-such-units"
+    e3 = collect(now)
+    case("with systemd unreadable, loops are n/p and each loop cell falls back to the door's word",
+         "loops n/p" in text(e3, now, 200) and loop_cell(e3["projects"]["web"], now, e3["units"])[0] == "running")
+    os.environ["CC_LIVE_UNITS"] = f"{tmp}/units"
+
+    # ── fail soft: an odd file is one odd row, a FIFO never hangs, no control character reaches the screen ──
+    odd = {"odd-loop.json": '{"v": 1, "loop": "running"}', "odd-today.json": '{"v": 1, "today": [1]}',
+           "odd-pr.json": doc([run("running", pr="x")]),
+           "odd-trigger.json": doc([run("merged", trigger="ask", ended_at=now)]),
+           "odd-stamp.txt": "acme (a/b), 2026-13-45 99:99\n  Today 1 merged, $1.2.3 spent\n",
+           "odd-deep.json": "[" * 100000}
+    for n, body in odd.items():
+        write(n, body)
+    e4 = collect(now)
+    p4, screen4 = e4["projects"], text(e4, now, 200)
+    case("fail soft: a field of the wrong shape is absent, so it draws n/p",
+         p4["odd-loop"]["src"] == "json" and p4["odd-loop"]["loop"] is None and p4["odd-today"]["merged"] is None and
+         p4["odd-pr"]["runs"][0]["pr"] is None and "run #212 ▶" in screen4 and
+         any("trigger n/p" in t for t, _, _ in project(e4, "odd-trigger", now, 200)))
+    case("fail soft: a header stamp that is no time draws n/p, and an odd Today line is kept verbatim",
+         p4["odd-stamp"]["src"] == "txt" and p4["odd-stamp"]["at"] is None and
+         p4["odd-stamp"]["other"] == ["Today 1 merged, $1.2.3 spent"])
+    case("fail soft: a file that raises while read is one unreadable row with the error's name",
+         p4["odd-deep"]["src"] == "unreadable" and p4["odd-deep"]["other"] == ["could not read it: RecursionError"]
+         and re.search(r"odd-deep .*unreadable", screen4))
+    case("fail soft: the other projects still render beside the odd ones",
+         p4["demo"]["src"] == "txt" and p4["web"]["src"] == "json" and re.search(r"web .* aeed4aae35c5", screen4) and
+         re.search(r"demo .* aeed4aae35c5 +n/p +2", screen4) and all(project(e4, n, now, 200) for n in p4))
+    nan = from_json('{"v": 1, "at": NaN, "today": {"spent": Infinity}, "runs": 5}')
+    case("fail soft: NaN and Infinity are no numbers, and runs that aren't a list are none",
+         nan["at"] is None and nan["spent"] is None and nan["runs"] == [])
+    write("esc.txt", 'esc (o/esc)\n  Running: issue #5 "evil\x1b[2J\x1b]0;pwned\x07 title", 1 min\n')
+    write("esc2.json", doc([run("failed", why="red\x1b[31m why\x9b", ended_at=now)]))
+    with open(f"{tmp}/ledger.jsonl", "a") as fh:
+        fh.write(json.dumps({"kind": "\x1b[1mhealth", "at": now - 30, "outcome": "failed", "why": "esc\x07 why",
+                             "repo": "o/\x9bbad"}) + "\n")
+    os.mkfifo(f"{st}/pipe.txt")
+    os.mkfifo(f"{st}/digest.txt")
+    try:
+        once = subprocess.run([sys.executable, __file__, "--once"], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        once = None
+    os.unlink(f"{st}/pipe.txt")        # gone before anything below reads the door in-process, where a FIFO opened
+    os.unlink(f"{st}/digest.txt")      # without O_NONBLOCK would hang the selfcheck instead of failing it
+    out = once.stdout if once else ""
+    case("a FIFO in place of a status file is refused at once: --once returns and draws it unreadable",
+         once is not None and once.returncode == 0 and re.search(r"pipe .*unreadable", out) and
+         "digest: unreadable" in out)
+    case("no control character reaches --once from a title, a why, or a ledger kind, why or repo",
+         "evil" in out and "red" in out and "o/bad" in out and not CTRL.search(out.replace("\n", "")))
+    case("cut drops C0, DEL and C1 characters before it measures", cut("a\x1b[2Jb\x7f\x85c\td", 8) == "a[2Jbcd")
+
+    # ── the feed: re-read when a source moves, not otherwise ──
+    feed = Feed()
+    feed.step(now)
+    v = feed.version
+    case("an unchanged door is not re-read", feed.step(now + 1) is False and feed.version == v)
+    write("web.json", doc(walk[1:2]))
+    case("a rename in the door moves the version", feed.step(now + 2) and feed.version == v + 1 and
+         "PR #1367" in text(feed.e, now + 2, 160))
+
+    # ── keys, on a fake screen ──
+    class Screen:
+        def __init__(self, keys, h=30, w=160):
+            self.keys, self.h, self.w, self.rows, self.shots = list(keys), h, w, {}, []
+
+        def getmaxyx(self):
+            return self.h, self.w
 
         def keypad(self, on):
             pass
@@ -225,147 +268,38 @@ def selfcheck():
         def timeout(self, ms):
             pass
 
-        def getmaxyx(self):
-            return self.h, self.w
-
         def erase(self):
-            self.rows, self.hi = {}, []
+            self.rows = {}
 
-        def addstr(self, y, x, text, attr=0):
-            ln = self.rows.get(y, "").ljust(x)
-            self.rows[y] = ln[:x] + text + ln[x + len(text):]
-            if attr & curses.A_REVERSE:
-                self.hi.append(text)
+        def addstr(self, y, x, s, attr=0):
+            self.rows[y] = s
 
         def refresh(self):
-            self.shots.append(("\n".join(self.rows.get(y, "") for y in range(self.h)), list(self.hi)))
+            self.shots.append("\n".join(self.rows.get(y, "") for y in range(self.h)))
 
         def getch(self):
-            if not self.keys:
-                raise KeyboardInterrupt
-            k = self.keys.pop(0)
-            if callable(k):
-                return k()
-            return k
+            return self.keys.pop(0) if self.keys else ord("q")
 
-    feed = Feed(proc)
-    feed.put(p)
-    tones = {"": 0, "bold": 0, "dim": 0, "warn": 0, "bad": 0}
-    keys = [ord("s"), 27, K.KEY_DOWN, ord("b"), 27, ord(":"), ord("f"), ord("u"), 10, 27, ord("q")]
-    timing = []
+    import curses as K
+    opened, timing = [], []
+    keys = [K.KEY_DOWN, 10, 27, ord("a"), 27, ord("H"), ord("h"), ord("s"), ord("o"), ord("q")]
     scr = Screen(keys)
-    rc = ui(scr, feed, Deep(), clock=lambda: now, tones=tones, timing=timing)
-    shots = [t for t, _ in scr.shots]
-    case("the loop draws home first, at 80x24, with the footer on the last row",
-         shots[0].splitlines()[1].startswith("needs you") and "SESSIONS 2" in shots[0] and shots[0].splitlines()[23].startswith("s sess"))
-    case("s opens sessions, Esc comes home, b opens the board, : fu Enter opens the fund's panel, q quits with 0",
-         any(t.startswith("SESSIONS 2, waiting first") for t in shots) and any("PANEL fund" in t for t in shots)
-         and "SESSIONS 2" in shots[-1] and rc == 0)
-    case("the cursor is drawn on the row it is on", scr.shots[0][1] and scr.shots[0][1][0].lstrip().startswith("n"))
+    rc = ui(scr, feed, clock=lambda: now + 2, tones={}, timing=timing, old=lambda s, k: opened.append(chr(k)))
+    shots = scr.shots
+    case("home draws first, with the footer on the last row",
+         shots[0].splitlines()[0].startswith("cc-live ·") and shots[0].splitlines()[-1].startswith("↑↓ move"))
+    case("↓ then Enter opens the second project, with its fields and what its door doesn't publish",
+         any(s.startswith("demo  (o/demo)  from txt") and "not published by" in s
+             for s in shots))
+    case("a opens waiting and stuck, H the health view", any(s.startswith("WAITING ON A PERSON\n") for s in shots)
+         and any(s.startswith("HEALTH (24 h)") and "disk-high root ×2" in s for s in shots))
+    case("an old section's key and o open cc-live-old on that key; q quits with 0", opened == ["s", "o"] and rc == 0)
+    case("no control character reaches the curses screen", shots and not any(CTRL.search(x.replace("\n", ""))
+                                                                              for x in shots))
     worst = max(timing) * 1000 if timing else -1
     limit, why = key_limit()
     print(f"cc-live: a key redrew in {worst:.1f} ms at worst ({len(timing)} keys); limit {limit} ms ({why})")
     case(f"every key redraws in under {limit} ms ({why})", timing and worst < limit)
-    loaded = os.environ.pop("CC_LOADED", None)
-    case("the key limit is 16 ms on a calm box and 48 ms under load or with CC_LOADED set",
-         key_limit(1.0, 6)[0] == 16 and key_limit(6.0, 6)[0] == 48
-         and (os.environ.__setitem__("CC_LOADED", "1"), key_limit(0.0, 6)[0])[1] == 48)
-    os.environ.pop("CC_LOADED", None)
-    if loaded is not None:
-        os.environ["CC_LOADED"] = loaded
-    feet = [FOOT, FOOT_IN] + [t.splitlines()[23] for t in shots]
-    case("every footer fits 79 columns, and home's ends with q quit", all(len(f) <= 79 for f in feet)
-         and FOOT.endswith("q quit"))
-
-    # t inside tmux: the switch runs in a thread, the key redraws at once, and tmux's answer reaches the footer
-    os.environ["TMUX"] = "/tmp/fake,1,0"
-    timing, scr = [], None
-
-    def until_footer():
-        if "tmux: no client for @" in scr.rows.get(23, ""):
-            return ord("q")
-        time.sleep(0.01)
-        return -1
-    scr = Screen([ord("t")] + [until_footer] * 300)
-    try:
-        ui(scr, feed, Deep(), clock=lambda: now, tones=tones, timing=timing)
-    except KeyboardInterrupt:
-        pass
-    os.environ.pop("TMUX", None)
-    feet = [t.splitlines()[23] for t, _ in scr.shots]
-    case("t switches in a thread: the key redraws at once, saying so, and tmux's answer follows",
-         timing and timing[0] < limit / 1000 and any(f.startswith("switching to") for f in feet)
-         and "tmux: no client for @" in feet[-1])
-
-    stamp = {}
-
-    def change():                                  # a board write, while the loop runs on the in-process feed
-        board["tracks"]["newrow"] = {"title": "brand new", "status": "running", "created": iso(now)}
-        json.dump(board, open(f"{tmp}/boards/r.json.tmp", "w"))
-        os.replace(f"{tmp}/boards/r.json.tmp", f"{tmp}/boards/r.json")
-        stamp["t"] = time.perf_counter()
-        return -1
-    live = Feed(proc)
-    live.done = False
-    live.start()
-    for _ in range(200):
-        if live.p:
-            break
-        time.sleep(0.01)
-    case("with no fresh pulse.json, cc-live collects in a thread of its own", live.local and live.p)
-
-    class Watcher(Screen):
-        def refresh(self):
-            super().refresh()
-            if "t" in stamp and "seen" not in stamp and "newrow" in self.shots[-1][0]:
-                stamp["seen"] = time.perf_counter() - stamp["t"]
-
-        def getch(self):
-            if "t" not in stamp:
-                return change()
-            if "seen" in stamp or time.perf_counter() - stamp["t"] > 2:
-                raise KeyboardInterrupt
-            time.sleep(0.005)
-            return -1
-    try:
-        ui(Watcher([], h=60, w=120), live, Deep(), tones=tones)
-    except KeyboardInterrupt:
-        pass
-    live.done = True
-    print(f"cc-live: a board write was on screen in {stamp['seen'] * 1000:.0f} ms" if "seen" in stamp
-          else "cc-live: a board write never reached the screen")
-    case("a board write is on screen in under 400 ms (~35 ms when idle)", stamp.get("seen", 9) < 0.4)
-
-    # a feed that raises says so on screen, and the Watch it opened is closed
-    made, RealWatch, RealFeed = [], P.Watch, P.feed
-
-    class CountedWatch(RealWatch):
-        def __init__(self):
-            super().__init__()
-            made.append(self)
-
-    def broken(*a, **k):
-        raise RuntimeError("boom")
-    P.Watch, P.feed = CountedWatch, broken
-    dead = Feed(proc)
-    dead.follow()
-    P.Watch, P.feed = RealWatch, RealFeed
-    case("a feed that raises keeps its error and closes its Watch", dead.err == "RuntimeError: boom"
-         and made and all(m.fd < 0 for m in made))
-    case("with no pulse, the error is the screen", render(("home",), None, Deep(), 80, 23, 24, dead.err)[0][0][0]
-         .startswith("PULSE STOPPED (RuntimeError: boom)"))
-    el, ei = render(("home",), p, Deep(), 80, 23, 24, dead.err)
-    case("with a pulse, the error heads the view, which still fits, and the cursor rows move down one",
-         el[0][0].startswith("PULSE STOPPED") and len(el) <= 23 and ei[0][0] == items[0][0] + 1 and ei[0][1] == items[0][1])
-    P.write(p)
-    fol = Feed(proc)
-    threading.Thread(target=fol.follow, daemon=True).start()
-    for _ in range(200):
-        if fol.p:
-            break
-        time.sleep(0.01)
-    case("a fresh pulse.json is followed, not collected again", fol.p and not fol.local)
-    fol.done = True
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"cc-live selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0
