@@ -314,14 +314,23 @@ def _selfcheck():
         rc, o = run("number", "--project", "Box", "--title", "Gamma renamed", "--tex")
         ok("number --tex gives a changed build the next letter as TeX macros",
            rc == 0 and o.startswith("\\def\\docnumber{001-0001-D}") and "\\docstamp{001-0001-D · " in o)
-        w = mkpdf(src, "w", "Gamma fourth 001-0001-D")
+        w = mkpdf(src, "w", "Gamma fourth\\par 001-0001-D")
         rc, o = run("file", w, "--project", "Box", "--title", "Gamma renamed")
         d = load()["documents"]["001-0001"]
         ok("a PDF carrying its own number is filed as it is, not stamped twice",
            rc == 0 and d["revisions"][-1]["stamped"] == "carried" and pdftext(os.path.join(ROOT, d["revisions"][-1]["file"])).count("001-0001-D") == 1)
-        x = mkpdf(src, "x", "Gamma fifth 001-0001-B")
+        x = mkpdf(src, "x", "Gamma fifth\\par 001-0001-B")
         rc, o = run("file", x, "--project", "Box", "--title", "Gamma renamed")
-        ok("a PDF carrying another number is refused", rc == 2 and "001-0001-B" in o and len(load()["documents"]["001-0001"]["revisions"]) == 4)
+        ok("a PDF carrying another number at the start of a line is refused",
+           rc == 2 and "001-0001-B" in o and len(load()["documents"]["001-0001"]["revisions"]) == 4)
+        # a number quoted inside a sentence is prose: the PDF files under its own next number, not refused
+        q = mkpdf(src, "q", "Gamma sixth quotes a number such as 001-0001-B in its text")
+        rc, o = run("file", q, "--project", "Box", "--title", "Gamma renamed")
+        ok("a PDF whose body quotes another number in a sentence files under its own next number",
+           rc == 0 and "001-0001-E" in o and "001-0001-B" not in o)
+        ok("carried_numbers: a stamp opening a line is carried, one inside a sentence is not",
+           carried_numbers("a number such as 001-0004-B\n  001-0004-C · 25 Sep 2026\n") == {"001-0004-C"}
+           and carried_numbers("a number such as 001-0004-B") == set())
         rc, o = run("file", v2, "--project", "Box", "--title", "Resume", "--no-stamp")
         rc2, o2 = run("file", v1, "--project", "Box", "--title", "Resume")
         rv = load()["documents"]["001-0002"]["revisions"]
@@ -329,15 +338,15 @@ def _selfcheck():
            [r["stamped"] for r in rv] == ["none", "none"] and "001-0002" not in pdftext(os.path.join(ROOT, rv[1]["file"])))
         # find
         rc, o = run("find", "001-0001")
-        ok("find by number prints the current revision's file", rc == 0 and o.strip().endswith("001-0001-D_gamma-renamed.pdf"))
+        ok("find by number prints the current revision's file", rc == 0 and o.strip().endswith("001-0001-E_gamma-renamed.pdf"))
         rc, o = run("find", "001-0001-A")
         ok("find by number and letter prints that revision", rc == 0 and o.strip().endswith("001-0001-A_gamma.pdf"))
         rc, o = run("find", "gamma")
-        ok("find by a word of the title", rc == 0 and "001-0001-D" in o)
+        ok("find by a word of the title", rc == 0 and "001-0001-E" in o)
         rc, o = run("find", "zeta")
         ok("find with no match exits 1", rc == 1)
         rc, o = run("find", "box")
-        ok("an ambiguous find lists the candidates and exits 3", rc == 3 and "001-0001-D" in o and "001-0002-B" in o)
+        ok("an ambiguous find lists the candidates and exits 3", rc == 3 and "001-0001-E" in o and "001-0002-B" in o)
         rc, o = run("find", "001-0009")
         ok("an unknown number is no match", rc == 1)
         # projects at the scheme's numbers
