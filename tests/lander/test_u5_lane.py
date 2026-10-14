@@ -730,6 +730,126 @@ class RealUnits(TL.Fixture):
         self.assertIn("FLAGGED: git could not read this change", block)
         self.assertNotIn("harmless", block)
 
+    def delta_interdiff(self, base, prior_head, head):
+        """The INTERDIFF a delta read of `head` against a HANDBACK at `prior_head` would carry (the read not bought)."""
+        bought = []
+        j = T.Job(repo="demo", pr=7, head=head, base_sha=base, digest="d" * 40, plan=T.Plan(paid=True), files=["f"],
+                  extra=dict(root=self.work))
+        prior = T.Verdict(verdict=T.HANDBACK_VERDICT, digest="0dd", extra={"head": prior_head})
+        with mock.patch.object(RV, "_buy", lambda job, name, diff, fill, **kw: bought.append(fill["INTERDIFF"])):
+            RV.delta_review(j, prior, comments=[], diff="x")
+        return bought[0]
+
+    def test_a_rebase_alone_drops_out_of_the_delta_read(self):
+        """autobox2's spend measure (2026-10-14): after a rebase onto a moved main, the interdiff was a diff of the two
+        heads and carried every file main changed, 80-178k tokens a read. Each head's own change is compared instead,
+        so a PR rebased onto a main that changed other files, with one fix line, shows that line and none of main's.
+        The diff runs on the PR's own paths, so a path with a glob character in its name is taken literally."""
+        old = self.push("track/row-1", {"f": "one\ntwo\nthree\n", "g": "keep\n"})
+        self.main({"m/a": "main moved on\n" * 50, "m/b": "and on\n", "f0": "near\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        new = self.push("track/row-1", {"f": "one\ntwo fixed\nthree\n", "g": "keep\n"})   # rebased, one fix
+        self.assertIn("main moved on", RV.plain_diff(self.work, old, new)[1])   # what the read carried before
+        inter = self.delta_interdiff(base, old, new)
+        self.assertIn("-two\n+two fixed\n", inter)
+        for gone in ("main moved on", "and on", "m/a", "f0", "keep"):
+            self.assertNotIn(gone, inter)
+        same = self.push("track/row-1", {"f": "one\ntwo fixed\nthree\n", "g": "keep\n"})
+        self.main({"m/c": "again\n"})
+        again = self.push("track/row-1", {"f": "one\ntwo fixed\nthree\n", "g": "keep\n"})   # a rebase and nothing else
+        base = self.git(self.work, "rev-parse", "origin/main")
+        rc, text = RV.interdiff(self.work, base, same, again)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text, RV.REBASED + "(no change: the rebase alone moved this head)\n")
+
+    def test_a_line_moved_after_a_rebase_shows_in_the_delta_read(self):
+        """The security read (2026-10-14): comparing hunks with their numbers cut let an author move a reviewed line
+        from one function into another after a rebase and read "no change". The two heads are diffed with the hunk
+        numbers kept, so the move shows; main's other file still drops out."""
+        pad = "".join(f"    p{i} = {i}\n" for i in range(6))
+        body = f"def public():\n{pad}    return 1\n\n\ndef admin():\n{pad}    return 2\n"
+        checked = pad.replace("    p2 = 2\n", "    p2 = 2\n    check = False\n")   # one line, the same context in both
+        public = body.replace("def public():\n" + pad, "def public():\n" + checked)  # functions: only a hunk's
+        admin = body.replace("def admin():\n" + pad, "def admin():\n" + checked)     # numbers tell them apart
+        self.main({"f": body})
+        old = self.push("track/row-1", {"f": public})
+        self.main({"m/a": "main moved on\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        new = self.push("track/row-1", {"f": admin})
+        rc, text = RV.interdiff(self.work, base, old, new)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("no change", text)
+        self.assertEqual(text.count("-    check = False\n"), 1, text)
+        self.assertEqual(text.count("+    check = False\n"), 1, text)
+        self.assertNotIn("main moved on", text)
+
+    def test_a_type_change_after_a_rebase_keeps_both_sections(self):
+        """A file that becomes a symlink is two `diff --git` sections with the same header line; both reach the
+        read, and a file whose name holds a glob character matches only itself."""
+        old = self.push("track/row-1", {"f": "plain\n", "[x]": "lit\n"})
+        self.main({"m/a": "main moved on\n", "x": "main's own\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/main")
+        self.write(self.work, {"[x]": "lit changed\n"})
+        os.symlink("[x]", os.path.join(self.work, "f"))
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "rebased, f a link")
+        self.git(self.work, "push", "-q", "-f", "origin", "track/row-1:refs/heads/track/row-1")
+        new = self.git(self.work, "rev-parse", "HEAD")
+        rc, text = RV.interdiff(self.work, base, old, new)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count("diff --git a/f b/f\n"), 2, text)
+        self.assertIn("deleted file mode 100644", text)
+        self.assertIn("new file mode 120000", text)
+        self.assertIn("+lit changed", text)
+        self.assertNotIn("main's own", text)
+        self.assertNotIn("main moved on", text)
+
+    def test_a_name_that_is_not_utf8_reads_whole_after_a_rebase(self):
+        """The security re-read (2026-10-14): git's name list came back with U+FFFD for a non-UTF-8 name, which as a
+        pathspec matched nothing, so an edit to that file dropped out of the interdiff. It fails closed now."""
+        bad = os.path.join(os.fsencode(self.work), b"bad\xffname")
+        with open(bad, "wb") as fh:
+            fh.write(b"ok\n")
+        old = self.push("track/row-1", {"f": "one\n"})
+        self.main({"m/a": "main moved on\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/main")
+        self.write(self.work, {"f": "one\n"})
+        with open(bad, "wb") as fh:
+            fh.write(b"EVIL\n")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "rebased, the odd name edited")
+        self.git(self.work, "push", "-q", "-f", "origin", "track/row-1:refs/heads/track/row-1")
+        new = self.git(self.work, "rev-parse", "HEAD")
+        rc, _ = RV.interdiff(self.work, base, old, new)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("read the whole diff", self.delta_interdiff(base, old, new))
+
+    def test_a_failed_compare_reads_whole(self):
+        """Any git failure in the compare (E2BIG on a long path list, say) asks for a whole read, never an empty one."""
+        self.push("track/row-1", {"f": "one\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        old = self.git(self.work, "rev-parse", "HEAD")
+        new = self.push("track/row-1", {"f": "two\n"})
+        with mock.patch.object(RV, "interdiff", lambda *a, **k: (127, "Argument list too long")):
+            self.assertIn("read the whole diff", self.delta_interdiff(base, old, new))
+
+    def test_an_unrebased_delta_read_is_the_diff_of_the_two_heads(self):
+        old = self.push("track/row-1", {"f": "one\n"})
+        new = self.push("track/row-1", {"f": "two\n"}, fresh=False)
+        self.main({"m/a": "main moved on\n"})   # main moves, the branch does not follow it
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.assertEqual(self.delta_interdiff(base, old, new), RV.plain_diff(self.work, old, new)[1])
+
+    def test_a_force_pushed_away_head_reads_whole(self):
+        self.push("track/row-1", {"f": "one\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        new = self.push("track/row-1", {"f": "two\n"})
+        self.assertIn("no longer in this repository", self.delta_interdiff(base, "e" * 40, new))
+
     def test_a_swapped_review_rules_blob_never_reaches_the_read(self):
         """main's docs/REVIEW.md blob is overwritten with a lenient rule's bytes: the checkout shows the lenient rule.
         rules_of() reads sealed, so it gets nothing rather than the swap, and the diff of any change on that base

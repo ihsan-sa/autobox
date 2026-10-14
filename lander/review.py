@@ -1009,6 +1009,46 @@ def change_diff(root, base, head, *opts, timeout=300):
         return run("diff", *PLAIN_DIFF, *opts, mb.strip(), got[1][1], timeout=timeout)
 
 
+REBASED = ("(this head was rebased since the earlier read: below is a diff of the two heads limited to the paths"
+           " either head's own change touches, so main's other files drop out. Main's own edits to those paths can"
+           " show here too)\n")
+
+
+def interdiff(root, base, old, new, timeout=300):
+    """What the author changed between the head an earlier read saw and this one -> (rc, text). Unrebased (both heads
+    share a merge-base with `base`) it is `git diff old new`, as before. Rebased, a two-commit diff carries every
+    file main changed, so it is `git diff old new` on the paths either head's own change touches (each taken against
+    its own merge-base). Each path is literal, as blind() sets GIT_LITERAL_PATHSPECS. Hunks keep their numbers, so a
+    line moved from one function into another still shows. All git runs in blind()."""
+    with blind(root, base, old, new) as (got, run):
+        if run is None:
+            return got
+        b, o, n = got[1]
+        rc, mo = run("merge-base", b, o)
+        if rc:
+            return rc, mo
+        rc, mn = run("merge-base", b, n)
+        if rc:
+            return rc, mn
+        mo, mn = mo.strip(), mn.strip()
+        if mo == mn:
+            return run("diff", *PLAIN_DIFF, o, n, timeout=timeout)
+        paths = set()
+        for mb, head in ((mo, o), (mn, n)):
+            rc, names = run("diff", *PLAIN_DIFF, "--name-only", "--no-renames", "-z", mb, head, timeout=timeout)
+            if rc:
+                return rc, names
+            if "\ufffd" in names:   # a name that isn't UTF-8 came back replaced, so as a pathspec it matches nothing
+                return 1, "a path name is not UTF-8"   # and its file would drop out silently: read whole instead
+            paths.update(p for p in names.split("\0") if p)
+        d = ""
+        if paths:
+            rc, d = run("diff", *PLAIN_DIFF, o, n, "--", *sorted(paths), timeout=timeout)
+            if rc:
+                return rc, d
+    return 0, REBASED + (d or "(no change: the rebase alone moved this head)\n")
+
+
 def diff_of(root, base, head):
     """The change as the review reads it. --no-renames as files_of() runs, so each section is one path: a rename
     section heads two names, and cut_paths() could pair a forged header with a decoy file."""
@@ -1452,9 +1492,10 @@ def delta_review(job, prior, comments=None, diff=None):
         return have
     was = prior.extra.get("head", "")
     rc, full = git(root, "rev-parse", "--verify", "-q", f"{was}^{{commit}}") if was else (1, "")
-    rc2, inter = plain_diff(root, full.strip(), job.head) if not rc else (1, "")
-    if rc or rc2:   # the head that read saw is gone (a force-push): read it whole, against the prior findings
-        inter = "(the head the earlier read saw is no longer in this repository; read the whole diff)"
+    rc2, inter = interdiff(root, job.base_sha, full.strip(), job.head) if not rc else (1, "")
+    if rc or rc2:   # the head that read saw is gone (a force-push) or the compare failed: read it whole
+        inter = ("(the head the earlier read saw is no longer in this repository, or git could not compare the two"
+                 " heads; read the whole diff)")
     numbered = "\n".join(f"{i}. {b}" for i, b in enumerate(prior.blocking, 1)) or "(none)"
     return _buy(job, "delta.md", diff, {"PRIOR": numbered, "INTERDIFF": capped(inter)}, prior=prior.blocking)
 
