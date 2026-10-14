@@ -39,6 +39,7 @@ SLUGS = {
     "resume/digest/rm": "resume-digest-rm",
     "cc-slack (local router + channel server; no Slack, no API)": "cc-slack-local",
     "model fallback (cc-model + cc-limit)": "model-fallback",
+    "cc-model.path fires the switch (a transient path unit, a stamp, and no tick called)": "cc-model-path-unit",
     "ccbox: a new box's ~/.claude gets the login and nothing else": "ccbox-login",
     "ccbox: a headless --cmd, and the seed helper's image (docker stubbed)": "ccbox-headless",
     "cc-trust prune (recorded trust vs real dirs)": "cc-trust-prune",

@@ -25,6 +25,11 @@
 #   cc-sandbox reconcile <repo> <track>     fold what the worker committed in its own branch namespace onto the host's
 #                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
 #                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
+#   cc-sandbox handle <handle>              exit 0 when <handle> may name a member workspace, else 2 and why: the shape
+#                                           [a-z0-9-], never one of the dirs core keeps in ~/.cc/state (BOX_STATE: land, …),
+#                                           never a link there, and never an existing ~/.cc/state/<handle> that is not a
+#                                           member workspace's own (a repo's planning dir). Every command below that takes
+#                                           a handle asks the same, and `member` refuses to start one that fails it.
 #   cc-sandbox worker-cred                  the credentials file the next worker launch will run on (WORKERS' LOGIN), after
 #                                           the same checks and refresh; cc-loop asks it so the limit it waits on is that login's.
 #   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
@@ -917,8 +922,9 @@ toolchains_bind(){   # ~/.cc/toolchains, RO, INTO BOTH BOUNDARIES — nothing el
   if [ $(( 8#$perm & 0022 )) -ne 0 ]; then echo "cc-sandbox: ~/.cc/toolchains is group- or world-writable — not bound" >&2; return 0; fi
   pin --ro-bind "$t" || echo "cc-sandbox: ~/.cc/toolchains is not the path it should be — not bound" >&2; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
-  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc
+  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc why
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
+  why=$(handle_taken "$h") && { echo "cc-sandbox: refusing to start $h — $why" >&2; exit 2; }   # before the mkdir and the bind below
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
   [ -n "$TREE" ] && cwd="$TREE"   # …or the landing's tree (--tree): checked in launch_member before this runs, bound below
   cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
@@ -1129,7 +1135,26 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
                         | reduce ($d, $cwd) as $k (.; .[$k] = ((.[$k] // {}) + {hasTrustDialogAccepted: true}))),
              mcpServers: $m, hasCompletedOnboarding: true}'); }
 CLAUDEBIN="${CC_CLAUDE:-$H/.local/bin/claude}"   # the same knob cc and cc-loop use to name claude
-handle_ok(){ [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; }   # a workspace's dir name IS its handle and its channel name
+# A HANDLE NEVER NAMES THE BOX'S OWN STATE (security read of #1050, 2026-10-12). build_member binds ~/.cc/state/<handle>
+# read-write into the member's boundary, so a handle `land` would hand that member the whole landing state dir, and a repo's
+# name that repo's planning dir. The brief: "refuses a handle that names an existing box-owned dir under ~/.cc/state that
+# is not that member's own, plus a fixed reserved list (land at least). Fail closed." BOX_STATE is the fixed half: the dirs
+# core's own tools keep there, refused even before any of them is first made. The rest is read off the disk, never typed
+# in, so nothing here names this box's repos.
+BOX_STATE="land handoff spend statusline audit context ask improve"
+# shellcheck disable=SC2088  # the literal ~ is the text a reason shows the reader, not a path for this shell
+handle_taken(){   # $1 handle · $2 "convert" when ~/dev/$1 is the repo being made into this very workspace → prints WHY, exit 0, when taken
+  local h="$1" s="$H/.cc/state/$1" n
+  for n in $BOX_STATE; do [ "$h" = "$n" ] && { echo "~/.cc/state/$h belongs to the box's own tools"; return 0; }; done
+  [ -L "$s" ] && { echo "~/.cc/state/$h is a link, so its bind would land somewhere else"; return 0; }
+  [ -f "$H/dev/$h/.cc/member-workspace" ] && return 1   # a member workspace already: that state dir is its own
+  [ "${2:-}" = convert ] && return 1   # the repo being converted: its own state dir becomes the workspace's (convert still refuses live tracks)
+  [ -e "$s" ] && { echo "~/.cc/state/$h already exists and is not a member workspace's (a repo's or the box's own)"; return 0; }
+  return 1; }
+handle_ok(){   # $1 handle [$2 convert] — the shape a workspace's dir, handle and channel name share, and not the box's own state; says why not
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || { echo "cc-sandbox: '$1' is not a handle (lower case, digits and -)" >&2; return 1; }
+  local why; why=$(handle_taken "$1" "${2:-}") || return 0
+  echo "cc-sandbox: '$1' cannot be a member handle — $why" >&2; return 1; }
 owners_own(){   # $1 candidate credentials file · $2 the .claude.json that login wrote ("" = none) → prints WHY, exit 0, when it is the OWNER'S
   # This used to REFUSE, and until 2026-09-02 that was right: a member drives the session inside their boundary and can print
   # whatever sits at ~/.claude/.credentials.json, so his credential in there is a working key to his account. The owner has
@@ -1213,7 +1238,7 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
   while [ $# -gt 0 ]; do case "$1" in
     --from) src="${2:-}"; [ -n "$src" ] || { echo "cc-sandbox: --from needs a file" >&2; return 2; }; shift;;
     *) echo "usage: cc-sandbox mint <handle> [--from <file>]" >&2; return 2;; esac; shift; done
-  handle_ok "$h" || { echo "cc-sandbox: '$h' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$h" || return 2
   [ -f "$H/dev/$h/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace — make one first (cc-sandbox convert $h), then mint into it" >&2; return 2; }
   dest="$H/.cc/members/$h/credentials.json"
   if [ -z "$src" ]; then
@@ -1275,7 +1300,7 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   # exist were made by cc-slack's join flow; a repo already on the box has no such path, and hand-editing the markers leaves
   # out the board, the exclude and the first commit. This makes the same workspace that flow makes, and says what it changed.
   local r="${1:-}" dev ctl live n why br x did=()
-  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$r" convert || return 2
   dev="$H/dev/$r"
   [ -d "$dev" ] || { echo "cc-sandbox: no ~/dev/$r to convert" >&2; return 2; }
   [ -f "$dev/.cc/member-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already a member workspace — nothing changed."; return 0; }
@@ -1321,7 +1346,7 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
 signout(){   # $1 workspace · $2 why — a deliberate sign-out, said as one: blank the credential and keep the reason beside it,
   # so cc-msg's signed-out notice names a stop somebody chose instead of calling it a refused refresh (owner, 2026-10-03).
   local r="${1:-}" why="${2:-}" m rc
-  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$r" || return 2
   [ -n "$why" ] || { echo "usage: cc-sandbox signout <workspace> <why> — the why is what #$r and the owner are told" >&2; return 2; }
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — nothing was changed" >&2; return 2; }
   m="$H/.cc/members/$r"; mkdir -p "$m" || return 2
@@ -1342,7 +1367,7 @@ own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked a
   # is one host-side file, ~/.cc/members/<repo>/owner-workspace: the host decides, and it is written where no session
   # inside can (build_member). It changes ONE thing, the ask baseline (settings_copy); it is not a wider boundary.
   local r="${1:-}" m
-  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$r" || return 2
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then mark it" >&2; return 2; }
   [ -f "$m/owner-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already the owner's own workspace — nothing changed."; return 0; }
@@ -1354,7 +1379,7 @@ web(){   # $1 workspace — a member workspace is granted WebFetch and WebSearch
   # grant is one host-side file, ~/.cc/members/<workspace>/web-grant, written where no session inside can (build_member).
   # It changes ONE thing, two entries of the ask baseline (settings_copy); it is not a wider boundary.
   local r="${1:-}" m
-  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$r" || return 2
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — there is no sealed session there to grant the web to" >&2; return 2; }
   [ -f "$m/web-grant" ] && { echo "cc-sandbox: ~/dev/$r already has the web — nothing changed."; return 0; }
@@ -1371,7 +1396,7 @@ github(){   # $1 handle [--org <org>] [$2 token file] — a member workspace is 
   local r="${1:-}" org="" f m l go=""
   shift; [ "${1:-}" = --org ] && { go=1; org="${2:-}"; shift 2 2>/dev/null || shift; }
   org=${org,,}; f="${1:-}"
-  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  handle_ok "$r" || return 2
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then grant it" >&2; return 2; }
   if [ -n "$go" ] || [ "${1:-}" = - ]; then   # an empty --org is refused below, never taken for the any-org grant
@@ -2005,6 +2030,31 @@ EOS
   out=$(env HOME="$fh" "$SELF" member alice -- sh -c 'echo inside=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1); rc=$?
   t 'convert + mint: the boundary starts that workspace, and the one credential inside it is the minted one' \
     "$rc/$(sed -n 's/^inside=//p' <<<"$out" | head -1)" 0/alice-access
+  # ── A HANDLE NEVER NAMES THE BOX'S OWN STATE: each case makes its own dirs, and each refusal has a kept twin ──────────
+  out=$(env HOME="$fh" "$SELF" handle land 2>&1); rc=$?
+  t "handle: land is refused before ~/.cc/state/land even exists, as the box's own" \
+    "$rc/$(grep -c 'belongs to the box' <<<"$out")/$([ -e "$fh/.cc/state/land" ] && echo made || echo none)" 2/1/none
+  out=$(env HOME="$fh" "$SELF" handle "free$$" 2>&1); rc=$?
+  t 'handle: …while a name nothing on the box holds is accepted' "$rc/$out" 0/
+  mkdir -p "$fh/dev/rpo$$" "$fh/.cc/state/rpo$$/plan"   # a repo with a planning dir and no marker: that state is the box's
+  out=$(env HOME="$fh" "$SELF" handle "rpo$$" 2>&1); rc=$?
+  t "handle: a repo's name is refused, because its ~/.cc/state dir is no member workspace's" "$rc/$(grep -c 'is not a member workspace' <<<"$out")" 2/1
+  mkdir -p "$fh/dev/mws$$/.cc" "$fh/.cc/state/mws$$/t" && : > "$fh/dev/mws$$/.cc/member-workspace"
+  out=$(env HOME="$fh" "$SELF" handle "mws$$" 2>&1); rc=$?
+  t "handle: …while a member workspace's own state dir is its own" "$rc/$out" 0/
+  mkdir -p "$fh/dev/lnk$$/.cc" "$fh/.cc/state/land" && : > "$fh/dev/lnk$$/.cc/member-workspace" && ln -s "$fh/.cc/state/land" "$fh/.cc/state/lnk$$"
+  out=$(env HOME="$fh" "$SELF" handle "lnk$$" 2>&1); rc=$?
+  t 'handle: a member workspace whose state dir is a link is refused, so the bind cannot land elsewhere' "$rc/$(grep -c 'is a link' <<<"$out")" 2/1
+  mkdir -p "$fh/dev/land/.cc" && : > "$fh/dev/land/.cc/member-workspace"
+  out=$(env HOME="$fh" "$SELF" member land -- sh -c 'echo RAN' 2>&1); rc=$?
+  t 'member: a workspace named land does not start, so the landing state dir is never bound into it' \
+    "$rc/$(grep -c '^RAN' <<<"$out")/$(grep -c 'refusing to start land' <<<"$out")" 2/0/1
+  out=$(env HOME="$fh" "$SELF" mint land --from "$fh/.cc/members/alice/credentials.json" 2>&1); rc=$?
+  t "mint: …nor is a credential installed for it" "$rc/$([ -e "$fh/.cc/members/land" ] && echo made || echo none)" 2/none
+  mkdir -p "$fh/dev/cvt$$" "$fh/.cc/state/cvt$$/old"   # convert makes the repo's own state dir the workspace's
+  out=$(env HOME="$fh" "$SELF" convert "cvt$$" 2>&1); rc=$?
+  t "convert: a repo with a state dir of its own still converts — that dir becomes the workspace's" \
+    "$rc/$([ -f "$fh/dev/cvt$$/.cc/member-workspace" ] && echo marked || echo none)" 0/marked
   real1=$(md5sum "$H/.claude/.credentials.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'mint/convert: through all of that, the box'"'"'s real ~/.claude/.credentials.json is untouched' "$real1" "$real0"
   git -C "$fh/dev/proj2" worktree remove --force "$fh/wt2" >/dev/null 2>&1
@@ -3230,6 +3280,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
   vet) shift; [ "${1:-}" = -- ] && shift
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
+  handle) handle_ok "${2:-}" && exit 0; exit 2;;   # cc-slack's join flow asks this before it makes a workspace
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
   signout) shift; signout "${1:-}" "${2:-}"; exit $?;;
@@ -3246,7 +3297,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox handle <handle>   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
 # ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
 # for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
 fence_off && exec "$@"   # off means the command runs exactly as given, nothing added

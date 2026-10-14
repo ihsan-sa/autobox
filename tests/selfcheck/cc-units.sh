@@ -43,6 +43,9 @@ selfcheck(){
   # the proven cost, 2026-08-31: editing cc-audit.timer's OnCalendar restarts and re-arms the TIMER
   out=$(restart_for core/config/systemd-user/cc-audit.timer)
   k "$(t grep -qx 'cc-audit.timer	rearm' <<<"$out")" "a changed .timer file re-arms that timer (#86's silent switch-off)"
+  # the first .path row (cc-model.path, #953): an edited path file restarts that path unit, so its new watch list is live
+  out=$(restart_for core/config/systemd-user/cc-model.path)
+  k "$(t grep -qx 'cc-model.path	restart' <<<"$out")" "a changed .path file restarts that path unit"
   # and a changed script still reaches the unit whose ExecStart runs it
   out=$(restart_for core/bin/cc-slack)
   k "$(t grep -qx 'cc-slackd.service	restart' <<<"$out")" "a changed script restarts the unit whose ExecStart runs it"

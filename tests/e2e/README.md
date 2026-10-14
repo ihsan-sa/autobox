@@ -191,6 +191,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `e2e-resume-digest-rm` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-cc-slack-local` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-model-fallback` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
+| `e2e-cc-model-path-unit` | host | drives a transient unit in this box's user systemd; `where` is the box alone, since a runner with no user bus skips it and passes |
 | `e2e-ccbox-login` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-ccbox-headless` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-cc-trust-prune` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |

@@ -3260,6 +3260,67 @@ ME env CC_MODEL_PRIMARY='claude-fable-5-1[1m]' CC_MODEL_DIALOG_WAIT=0.2 CC_MODEL
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
 fi
+if stanza "cc-model.path fires the switch (a transient path unit, a stamp, and no tick called)"; then
+# THE BRIEF'S "a test writes the stamp and sees the switch fire via the path unit" (2026-10-03). cc-model's own (p)
+# cases read the unit files and call tick themselves, so nothing there proves that the path unit triggers anything.
+# This builds a TRANSIENT copy of cc-model.path in the user manager with `systemd-run --user`: its Path*= lines are
+# the shipped file's, moved from %h to a HOME of its own under $T, and its service runs this tree's cc-model, copied
+# there byte for byte so its siblings (cc-notify, cc-slack, cc-msg, cc-config) are absent and nothing it does can
+# leave that HOME. It runs under `env -i` with only what is set here: no tmux server (TMUX_TMPDIR), no claude, a
+# three-rung chain (the shipped one has no rung to move to). A qualifying stamp is written at the watched path and
+# the switch is waited for, 60 s at most; nothing here calls tick. The units are named per run, collected, and
+# stopped and reset by the subshell's trap on any exit. The box's own cc-model units are never touched: no
+# daemon-reload, nothing enabled. With no user bus it says SKIP and passes, as on a runner with no systemd.
+PH="$T/pathunit"; PU="cc-model-e2e-$$"; PUD="$(dirname "$B")/config/systemd-user"
+pu_bus=""; [ -n "${XDG_RUNTIME_DIR:-}" ] && pu_bus=$(systemctl --user is-system-running 2>/dev/null)
+case "$pu_bus" in running|degraded|starting|initializing|maintenance) pu_bus=up ;; esac   # degraded is a bus: one failed unit
+if [ "$pu_bus" != up ]; then
+  echo "  · SKIP: no user systemd bus (XDG_RUNTIME_DIR ${XDG_RUNTIME_DIR:-unset}, is-system-running said '${pu_bus}'): cc-model.path is not driven here"
+else
+  mkdir -p "$PH/bin" "$PH/.cc/state" "$PH/.claude" "$PH/tmux"
+  cp "$B/cc-model" "$PH/bin/cc-model"
+  printf '{"switchModelsOnFlag":true,"autoContinueAtUsageLimit":false}\n' > "$PH/.claude/settings.json"   # both keys set: no line to anyone
+  pu_lines=$(grep -E '^Path[A-Za-z]*=' "$PUD/cc-model.path" | sed "s#=%h/#=$PH/#")
+  pu_props=(); while IFS= read -r l; do [ -n "$l" ] && pu_props+=("--path-property=$l"); done <<<"$pu_lines"
+  { [ "${#pu_props[@]}" -ge 1 ] && ! grep -qvF "=$PH/" <<<"$pu_lines" && grep -qxF "PathChanged=$PH/.cc/state/claude-limit" <<<"$pu_lines" &&
+    cmp -s "$B/cc-model" "$PH/bin/cc-model"; } \
+    && ok "the transient unit watches cc-model.path's own ${#pu_props[@]} Path*= lines, each moved under its HOME (cc-limit's stamp among them), and runs this tree's cc-model" \
+    || bad "the transient unit could not be built from cc-model.path: [$pu_lines]"
+  ( pu_down(){ systemctl --user stop "$PU.path" "$PU.service" 2>/dev/null; systemctl --user reset-failed "$PU.path" "$PU.service" 2>/dev/null; return 0; }
+    trap pu_down EXIT; trap 'exit 143' INT TERM HUP
+    systemd-run --user --quiet --collect --unit="$PU" "${pu_props[@]}" \
+      /usr/bin/env -i HOME="$PH" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TMUX_TMPDIR="$PH/tmux" \
+        CC_TMUX_SESSION="_ccpath$$" CC_MODEL_PROC=cat CC_CLAUDE="$PH/no-claude" CC_CLAUDE_SETTINGS="$PH/.claude/settings.json" \
+        CC_STATUSLINE_DIR="$PH/.cc/state/statusline" CC_MODEL_MEMBERS="$PH/.cc/members" CC_MODEL_TRANSCRIPTS="$PH/transcripts" \
+        CC_MODEL_RETURN_CHANNEL='#nowhere' CC_NOTIFY_LOG_ONLY=1 CC_NOTIFY_LOG="$PH/notify.log" \
+        CC_MODEL_PRIMARY='claude-fable-5-1[1m]' CC_MODEL_FALLBACK='claude-opus-5[1m]' CC_MODEL_CHAIN='claude-fable-5-1 claude-opus-5 claude-sonnet-5' \
+        "$PH/bin/cc-model" tick >&2 || { echo "run=refused"; exit 0; }
+    for _ in $(seq 50); do [ "$(systemctl --user is-active "$PU.path" 2>/dev/null)" = active ] && break; sleep 0.1; done
+    echo "armed=$(systemctl --user is-active "$PU.path" 2>/dev/null)"
+    echo "before=$([ -e "$PH/.cc/state/model-override" ] && echo override)$([ -e "$PH/.cc/state/model.log" ] && echo log)"
+    pu_now=$(date -u +%s)   # two runs' stamp, an hour to its reset, naming the primary: what stamp_says_switch acts on
+    printf '%s\tapi\t%s\tfable\taaaaaaaa,bbbbbbbb\n' "$((pu_now + 3600))" "$pu_now" > "$PH/.cc/state/claude-limit"
+    pu_t0=$(date +%s%N); pu_n=0
+    for _ in $(seq 120); do pu_n=$(grep -c "$(printf '\tswitch\t')" "$PH/.cc/state/model.log" 2>/dev/null); [ "${pu_n:-0}" -ge 1 ] && break; sleep 0.5; done
+    echo "waited_ms=$(( ($(date +%s%N) - pu_t0) / 1000000 ))"; echo "switchrows=${pu_n:-0}"
+    echo "after=$(cut -f1 "$PH/.cc/state/model-override" 2>/dev/null)"
+    pu_down
+    for _ in $(seq 20); do [ -z "$(systemctl --user list-units --all --no-legend "$PU.*" 2>/dev/null)" ] && break; sleep 0.1; done
+    echo "left=$(systemctl --user list-units --all --no-legend "$PU.*" 2>/dev/null | wc -l)"
+  ) > "$PH/out" 2> "$PH/run.err"
+  pu(){ sed -n "s/^$1=//p" "$PH/out" | tail -1; }
+  { [ -z "$(pu run)" ] && [ "$(pu armed)" = active ] && [ -z "$(pu before)" ]; } \
+    && ok "systemd-run armed the path unit, and nothing ran before the stamp was written" \
+    || bad "the path unit did not arm cleanly: run=[$(pu run)] armed=[$(pu armed)] before=[$(pu before)] err=[$(head -c 400 "$PH/run.err")]"
+  { [ "$(pu after)" = 'claude-opus-5[1m]' ] && [ "$(pu switchrows)" = 1 ]; } \
+    && ok "the stamp at the watched path switched that HOME to the fallback through the path unit alone, $(pu waited_ms) ms after the write, with no tick called here" \
+    || bad "no switch within 60 s of the stamp: override=[$(pu after)] switch rows=[$(pu switchrows)] log=[$(cat "$PH/.cc/state/model.log" 2>/dev/null)] err=[$(head -c 400 "$PH/run.err")]"
+  [ "$(pu left)" = 0 ] && ok "both transient units are gone afterwards: stopped, reset and collected" \
+    || bad "$(pu left) transient unit(s) named $PU.* still listed after the stop"
+  unset -f pu
+fi   # the bus: a bare `fi` here would end the stanza for split.py
+
+fi
 if stanza "ccbox: a new box's ~/.claude gets the login and nothing else"; then
 # The seed runs in a throwaway container (no docker here), so the snippet itself runs on stub files: the newest
 # credentials win, .claude.json keeps oauthAccount only (never project history), nothing to copy writes nothing.

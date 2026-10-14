@@ -7943,6 +7943,22 @@ def run_selfcheck():
         # creates nothing — ensure_channel finds that channel and invites the joiner INTO it. `box` is where the
         # owner's DMs route, `carol` is somebody else's channel, `dave` is in routes.json, and an `-updates` name
         # is another channel's lane. Each must be refused before anything at all is made.
+        # THE BOX'S OWN STATE. The boundary binds ~/.cc/state/<handle> rw, so `cc-sandbox handle` is asked before
+        # anything is made: its no is a refusal carrying its reason and nothing is created, its yes lets the join on.
+        asked_bs = []
+        def run_bs(cmd, **kw):
+            if str(cmd[0]).endswith("/cc-sandbox") and cmd[1:2] == ["handle"]:
+                asked_bs.append(cmd[2])
+                if cmd[2] == "uland":
+                    return subprocess.CompletedProcess(cmd, 2, "", "cc-sandbox: 'uland' cannot be a member handle — ~/.cc/state/uland belongs to the box's own tools\n")
+            return subprocess.CompletedProcess(cmd, 0, "{}", "")
+        EFFECTS.run_impl = run_bs
+        before_bs = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
+        st_bs, _, msg_bs = ensure_member(cfgw, "ULAND")
+        after_bs = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
+        st_bs_kept = ensure_member(cfgw, "UKEEP", by="owner")[0]   # by hand: the hourly cap the later cases drive stays untouched
+        kept_bs = "ukeep" in load_members() and os.path.isdir(f"{DEV}/ukeep")
+        EFFECTS.run_impl = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "{}", "")
         globals()["load_routes"] = lambda: {"#dave": "somerepo"}
         fkm.chans["carol"] = "C90"
         # …and a handle that names a dir under ~/.cc/state: the sandbox binds ~/.cc/state/<handle> rw as the owner's
@@ -8082,8 +8098,8 @@ def run_selfcheck():
           made5 == made4 and any("own member or the owner" in t for t in saidw))
     check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member — in #<handle> and its sub-projects, "
           "never in an -updates lane, which holds the owner alone",
-          owner_in_all and member_in_all and updates_owner_only and len(fkm.created) == 12)   # alice, erin, frank, grace,
-                                                                                               # henry, ivy pairs — a project makes none
+          owner_in_all and member_in_all and updates_owner_only and len(fkm.created) == 14)   # alice, ukeep, erin, frank,
+                                                                                               # grace, henry, ivy pairs — a project makes none
     check("a plain message in a member's channel reaches its SESSION — queued for alice-b with authority=instructions and "
           "autostart asked (cc puts that session inside the boundary); the daemon no longer answers it itself", no_session and started)
     check("a message that arrives before the workspace is minted is answered IN ITS OWN THREAD, every time, with the "
@@ -8099,6 +8115,10 @@ def run_selfcheck():
           "channel that already exists and a name in routes.json — nothing created, no channel joined, no stranger "
           "invited into somebody else's channel",
           set(coll.values()) == {"refused"} and after_coll == before_coll and carol_untouched)
+    check("a handle `cc-sandbox handle` refuses (the box's own state dir) is REFUSED with its reason and nothing is "
+          "made, while a handle it accepts is joined as before",
+          st_bs == "refused" and "belongs to the box's own tools" in msg_bs and after_bs == before_bs
+          and st_bs_kept == "created" and kept_bs and asked_bs == ["uland", "ukeep"])
     check("a handle naming the box's own state is REFUSED: `room` (cc-room's queue, relaunched as the owner) or `rotation` (its archive proposals) before "
           "its dir exists, and any name whose ~/.cc/state dir is already there and no member workspace's — while a "
           "provisioned workspace keeps its own", coll["UROOM"] == "refused" and coll["UHOUSE"] == "refused"
