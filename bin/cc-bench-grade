@@ -623,9 +623,10 @@ def venv_py():
     return HARNESS / "venv/bin/python"
 
 
-def untrusted(paths):
+def untrusted(paths, owner=0):
     """The first of `paths` a session could have changed — missing, a link, not root's, or writable by group or
-    others — else None. A link's target is judged by passing it resolved, as the venv's python is."""
+    others — else None. A link's target is judged by passing it resolved, as the venv's python is. `owner` is for
+    the selfcheck alone, whose sandbox maps no uid 0: its cases stand on scratch directories it owns."""
     for p in paths:
         try:
             st = os.lstat(p)
@@ -633,7 +634,7 @@ def untrusted(paths):
             return f"{p} is missing"
         if os.path.islink(p):
             return f"{p} is a link"
-        if st.st_uid != 0:
+        if st.st_uid != owner:
             return f"{p} is not root's"
         if st.st_mode & 0o022:
             return f"{p} is writable by group or others"
@@ -978,11 +979,16 @@ def selfcheck():
         return None
     with tempfile.TemporaryDirectory(prefix="cc-bench-grade-sc-") as hd:
         hd = Path(hd)
-        ok(untrusted([Path("/usr"), Path("/usr/bin")]) is None, "a root-owned, closed directory is trusted")
+        # the lander's sandbox has no uid 0 (/usr is the overflow uid there), so "root" here is this user and the
+        # directories are scratch ones of its own; the default owner=0 is the "not root's" case below
+        me = os.geteuid()
+        (hd / "closed").mkdir(); (hd / "closed").chmod(0o755)
+        (hd / "open").mkdir(); (hd / "open").chmod(0o777)
+        ok(untrusted([hd / "closed"], owner=me) is None, "a closed directory of the owner's is trusted")
         ok("missing" in (untrusted([hd / "nope"]) or ""), "a missing harness path is not")
         (hd / "ln").symlink_to("/usr")
         ok("link" in (untrusted([hd / "ln"]) or ""), "a link in the harness is not, whatever it points at")
-        ok("writable" in (untrusted([Path("/tmp")]) or ""), "a root-owned directory others can write is not")
+        ok("writable" in (untrusted([hd / "open"], owner=me) or ""), "a directory of the owner's others can write is not")
         ok(os.geteuid() == 0 or "not root's" in (untrusted([hd]) or ""), "a directory the user owns is not")
         ok(dies(lambda: harness(home=hd / "none")) == 1, "no harness yet: the suites stop, exit 1")
         (hd / "venv/bin").mkdir(parents=True)
