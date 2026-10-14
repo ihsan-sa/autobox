@@ -348,6 +348,24 @@ od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t2 2>&1); rd=$?
 { [ "$rd" = 0 ] && ! grep -q 'refusing to run git' <<<"$od" && grep -q 'no remote, so no PR' <<<"$od"; } \
   && ok "...and a track that really hangs off ~/dev/<handle>/.git passes the same check and finishes (no remote → no PR)" || bad "cc done refused a genuine workspace track: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2 >/dev/null 2>&1
+# A COMMIT THAT FAILED WAS STILL "is committed", rc 0 (#1082's round 3: a fixture home with no git identity cost a
+# builder an hour). The hook's rc is always 0, so `cc done` reads the tree: here a refusing pre-commit hook (the main
+# checkout's, which cc pins; an identity is given, so the hook alone fails it) leaves w.txt uncommitted, and the run says so, exits 1 and leaves the row as it was —
+# and the same worktree with the hook gone finishes as before.
+git -C "$GH/dev/alice" worktree add -q -b track/t2c "$GH/.cc/worktrees/alice/t2c" 2>/dev/null
+mkdir -p "$GH/.cc/worktrees/alice/t2c/.cc"; printf 'alice\nt2c\n' > "$GH/.cc/worktrees/alice/t2c/.cc/track"; echo work > "$GH/.cc/worktrees/alice/t2c/w.txt"
+env HOME="$GH" "$B/cc-board" add alice t2c "commit fails" >/dev/null 2>&1; env HOME="$GH" "$B/cc-board" status alice t2c running >/dev/null 2>&1
+gid=(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t)   # the fixture home has no identity: the hook alone is what fails
+printf '#!/bin/sh\nexit 1\n' > "$GH/dev/alice/.git/hooks/pre-commit"; chmod +x "$GH/dev/alice/.git/hooks/pre-commit"
+od=$(env HOME="$GH" PATH="$B:$PATH" "${gid[@]}" timeout 60 "$B/cc" done alice t2c 2>&1); rd=$?; st=$(env HOME="$GH" "$B/cc-board" get alice t2c status 2>/dev/null)
+{ [ "$rd" = 1 ] && grep -q '^cc: commit failed' <<<"$od" && ! grep -q 'is committed' <<<"$od" && [ "$st" = running ]; } \
+  && ok "cc done whose commit fails says so, exits 1 and leaves the row as it was — not 'is committed', rc 0" \
+  || bad "cc done after a failed commit: rc=$rd status=$st $od"
+rm -f "$GH/dev/alice/.git/hooks/pre-commit"
+od=$(env HOME="$GH" PATH="$B:$PATH" "${gid[@]}" timeout 60 "$B/cc" done alice t2c 2>&1); rd=$?
+{ [ "$rd" = 0 ] && grep -q 'is committed' <<<"$od" && [ -z "$(git -C "$GH/.cc/worktrees/alice/t2c" status --porcelain)" ]; } \
+  && ok "...and with the commit going through, the same worktree finishes as before" || bad "cc done after a good commit: rc=$rd $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2c" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2c >/dev/null 2>&1
 # A WORKTREE MADE BY HAND HAS NO .cc/track, AND `cc done` USED TO BLAME THE BRANCH FOR IT: the hook committed nothing,
 # --push read an empty track name and said "HEAD is 'track/t9', not 'track/'" (raised-cc-done-blames-the-branch-for-a-
 # missing-track-file, 2026-09-16/18); bare `cc done` inside the worktree died on bash's "line 991: 2: repo". Now a box
@@ -356,6 +374,7 @@ git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2" >/de
 # push, so the whole path after the marker runs and nothing reaches GitHub.
 git init -q -b main "$GH/dev/boxr"; echo a > "$GH/dev/boxr/a.txt"; git -C "$GH/dev/boxr" add -A; git -C "$GH/dev/boxr" -c user.email=t@t -c user.name=t commit -qm base
 git init -q --bare "$T/boxr.git"; git -C "$GH/dev/boxr" remote add origin "$T/boxr.git"   # a repo cc never stamped: no .cc/ exclude yet
+git -C "$GH/dev/boxr" config user.email t@t; git -C "$GH/dev/boxr" config user.name t   # the fixture home has no identity, and cc done now stops on a commit that fails
 mkdir -p "$GH/.cc/worktrees/boxr"; git -C "$GH/dev/boxr" worktree add -q -b track/t9 "$GH/.cc/worktrees/boxr/t9"   # by hand: no .cc/track
 env HOME="$GH" "$B/cc-board" init boxr "$GH/dev/boxr" main >/dev/null; env HOME="$GH" "$B/cc-board" add boxr t9 "hand-made" >/dev/null
 env HOME="$GH" "$B/cc-board" set boxr t9 kind session; echo work > "$GH/.cc/worktrees/boxr/t9/w.txt"

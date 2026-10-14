@@ -83,6 +83,7 @@ The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!r
 `!status` reads back what runs, lands and idles; `!needs` reads back NEEDS YOU, which includes every post that paged the owner (a 🔒 with his mention, or a DM to his user id) until he replies in its thread, reacts to it, or a week passes (owner-asks.json).
 `!pause` parks this channel's project and everything declared under it, queuing what arrives; `!resume` unparks it; a project parked on its own stays parked when its parent resumes.
 `!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
+~/.cc/state/owner-words.jsonl is the owner's own words: a line per message he sends where the daemon hears him, and per edit or deletion of one. It is a cache, not evidence: cc-infer fetches a cited message from Slack itself, and reads a deletion here as revoking every goal citing it.
 ~/.cc/state/home.json is the box's one live view and the dashboard reads it: rewritten every 30 s and within 2 s of any event, leading with what needs the owner, then running/idle counts, the backlog, the channels, load, handoff count, audit and boot. There is no Slack App Home tab: the daemon publishes a one-line pointer to the dashboard once at start and never again.
 While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused. The muted one is never delivered to, even alone: a message with no live side subscribed is held and handed over at the cutover (cc-handoff's `{"cutover"}` word, or the 30 s tick) or at the live side's hello. At the cutover the successor also gets what the predecessor was handed from 10 min before the overlap and never answered (no box post in its thread, no box reaction but 👀 on it, no 👍 from a woken turn), with a line saying so. An orch is a seat of its own: it reads its own record, `<repo>@<alias>`, never the repo's.
 Every hop of a person's message leaves one receipt line in ~/.cc/receipts/<day>.jsonl (CC_RECEIPTS_DIR): received with the session its route picked, each delivery try and its result (a track's hand-on to its repo or parent seat says where it went), an expiry, and the reply, file, Slack-accepted reaction or 👍, or threaded `post -c`, that answered it with the session that made it. `cc-receipts check` reads them; nothing here does.
@@ -1049,6 +1050,35 @@ def archive_in(target, chat, thread, ts, user, role, channel, text):
             os.close(fd)
     except Exception as e:
         log(f"archive: {chat} {ts}: {e!r}")
+
+def owner_words_path():
+    """Where owner_words writes: {DIR}/owner-words.jsonl when DIR is redirected, else the account's own
+    ~/.cc/state/owner-words.jsonl with ~ from the password database, as cc-infer reads it, so a daemon started under
+    another $HOME still writes the file cc-infer checks for a deletion (#1129 review)."""
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    if DIR not in (f"{HOME}/.cc/slack", f"{home}/.cc/slack"):
+        return f"{DIR}/owner-words.jsonl"
+    return f"{home}/.cc/state/owner-words.jsonl"
+
+def owner_words(event, chat, ts, thread="", text=""):
+    """The owner-words ledger: one JSON line per message the owner sends anywhere the daemon hears him (event
+    "message"), and per edit ("edit", the new text) or deletion ("delete") of one, in ~/.cc/state/owner-words.jsonl
+    ({DIR}/owner-words.jsonl when DIR is redirected, as home_dump does). It is only a cache: any session on the box can
+    write a file, so cc-infer fetches a cited message from Slack itself and reads this file for one thing, a deletion,
+    which revokes every goal citing that message (docs/architecture/goals-first-approvals.md). One os.write of one line
+    on an O_APPEND fd, like archive_in; best-effort, so a failure is one log line."""
+    try:
+        path = owner_words_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"event": event, "channel": chat, "ts": ts, "thread_ts": thread or "", "text": text or "",
+               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception as e:
+        log(f"owner-words: {chat} {ts}: {e!r}")
 
 RECEIPTS = os.environ.get("CC_RECEIPTS_DIR", f"{HOME}/.cc/receipts")
 
@@ -6179,6 +6209,8 @@ class Daemon:
         # what was delivered. No API call of its own: the cached name and channel, else the ids (what cc-lib's --object takes)
         archive_in(target, chat, thread, ts, self.users.get(user, (user,))[0], "owner" if is_owner else "member",
                    "dm" if ctype == "im" else "#" + self.names.get(chat, chat), text)
+        if is_owner:   # his words as Slack sent them, before the daemon's cleaning: what cc-infer will fetch and compare
+            owner_words("message", chat, ts, ev.get("thread_ts"), ev.get("text"))
         if cmd:   # intercepted before any routing/delivery, top-level or threaded, any channel
             return self.command(text, chat, thread, ts, target, ctype, is_owner)
         if is_owner:   # his word settles the asks it answers (owner_ask_answers); a `!` command above settles none
@@ -7160,12 +7192,19 @@ class Daemon:
             return   # a stranger's DM was never delivered (DMs are owner-only), so its edit is nothing to relay
         if not deleted and new_msg.get("text") == prev.get("text"):
             return   # metadata-only change (e.g. a reply bumping the root's reply_count) — not a real edit
-        key = (chat, ts, subtype)
+        # Slack can emit the same deletion/edit more than once. An edit is keyed by its own identity (Slack's
+        # edited.ts, else the event's ts, else its new text), so his second edit of one message is a new edit and
+        # reaches the owner-words ledger (#1129 review) while a retry of either is still dropped.
+        ident = "" if deleted else str((new_msg.get("edited") or {}).get("ts") or ev.get("event_ts") or new_msg.get("text") or "")
+        key = (chat, ts, subtype, ident)
         if key in self.edit_seen:
-            return   # Slack can emit the same deletion/edit more than once
+            return
         self.edit_seen[key] = 1
         while len(self.edit_seen) > 200:
             self.edit_seen.popitem(last=False)
+        if is_owner:
+            owner_words("delete" if deleted else "edit", chat, ts, prev.get("thread_ts") or new_msg.get("thread_ts"),
+                        "" if deleted else new_msg.get("text"))
         hit = self.find_queued(chat, ts)
         when = time.strftime("%H:%M", time.localtime(float(ts)))
         whose = "the owner" if is_owner else self.user_name(who or "")

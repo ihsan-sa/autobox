@@ -79,7 +79,28 @@ THE ASK (JSON). `ask` is required, and is the command itself; every other key is
                 ~/.cc/config, read through cc-config with HOME, CC_CONFIG and CC_CONFIG_DENY pinned) and not a member
                 workspace (~/.cc/members/<repo> without its owner-workspace marker); never a goals.md under ~/dev/
                 or anywhere else;
-                grant:N, item N of the owner's one-time grant in docs/host-rules.md.
+                grant:N, item N of the owner's one-time grant in docs/host-rules.md;
+                slack:<channel>/<ts>, one Slack message of his (below).
+              A goals.md line counts only when it carries its own `src: slack:<channel>/<ts>` and that source holds
+              for the same quote; a line with no src: steers the seat's own work but grants nothing (design 10-12,
+              docs/architecture/goals-first-approvals.md: goals.md is an index, not an authority). His 👍 on the commit that
+              added a line, the design's other route, is a deliberate follow-up and not read here. A Slack source is
+              fetched from Slack with the bot token when it is checked, never read from a file: conversations.history
+              for a top-level message, conversations.replies for a thread reply. It holds when the message is there
+              now, its user is SLACK_OWNER_ID with no bot_id, it is a message he wrote (no subtype but
+              thread_broadcast or file_share, so never a channel_topic or join line), the quote names the ask's own
+              key, every word of it whole (CC_ASK_TURNS: "ask" and "turns"), or the unit's whole name (cc-slackd, never
+              cc-slackd-old), and the value it sets as the only number, and the quote is his WHOLE message in its
+              current text (only a final . or ! may drop), after any edit, with his markup read as its words: one
+              line, one sentence, no code, mention, struck text or question, opening with a go verb (give, set,
+              raise, enable, allow, approve, go ahead, yes do). It fails closed on his meaning (#1129): a message in which any
+              negation, condition, retraction, rejection or reported-speech word stands anywhere (not, never, no, n't,
+              unless, until, only, but, wait, hold, if, maybe, kidding, ignore, rejected, asked, said, wants, …), or a sentence opens
+              like a question (should, can, would, what, …) with no ?, grants nothing, so "Never …", "If Bob
+              agrees, …", "Bob asked me this today." or "Just kidding." never reads as a go. The grant keeps his whole message.
+              ~/.cc/state/owner-words.jsonl, the owner's words as cc-slack records them, is only a cache any session
+              could write, so a line in it grants nothing; it is read for one thing, a deletion, which revokes every
+              goal citing that message.
               A cc-lib ticket is no evidence: tickets.log records no message, so its quote can't be tied to what it
               answered. ~ is the account's home from the password database, never $HOME, and only selfcheck() swaps
               these places, and the ledger's, for scratch ones, so the caller can't choose the evidence.
@@ -540,6 +561,21 @@ def related(quote, ask, repos):
     return any(x == y or x.startswith(y) or y.startswith(x) for x in qw for y in aw)
 
 
+def names_the_shape(quote, ask):
+    """Does the quote name the ask's own key or unit, every word of it whole (cc and service aside)? A Slack message
+    is his ordinary chat, so a shared word or a 4-letter prefix is not enough there: "I think we should wait" shares
+    "think" with CC_ASK_THINK, "Turn it off" begins "turns", "Slack is noisy" begins "slackd" (Opus security read of
+    #1129: "For a Slack source, require the exact key or unit word"). A unit is named by its whole name, so cc-slackd-old
+    is not cc-slackd. An ask that is no shape names nothing, so fails."""
+    shape = parse_shape(squash(ask))
+    if shape and shape[0] == "service":
+        return bool(re.search(rf"(?<![a-z0-9_.-]){re.escape(shape[1].lower())}(?:\.service)?(?![a-z0-9_-]|\.[a-z0-9])",
+                              fold(quote)))
+    words = {w for w in re.split(r"[^a-z0-9]+", (shape[2] or shape[1]).lower()) if w not in ("", "cc", "service")} \
+        if shape else set()
+    return bool(words) and words <= set(re.findall(r"[a-z0-9]+", fold(quote)))
+
+
 def grant_item(n):
     """Item n of the owner's one-time grant (2026-09-21), from the host rules next to this tool."""
     p = place("grants", os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "docs", "host-rules.md"))
@@ -559,6 +595,191 @@ def grant_item(n):
     return ""
 
 
+SLACK_SRC = re.compile(r"^slack:([CDG][A-Z0-9]{2,})/(\d{6,}\.\d{1,6})$")
+GOAL_SRC = re.compile(r"[\s(\[]*\bsrc:\s*(\S+?)[)\]]*\s*$")
+
+
+def slack_call(method, **params):
+    """One Slack Web API read with the bot token; raises on a refusal. selfcheck() swaps in a fake, so it never calls out."""
+    if "slack_api" in _TEST:
+        return _TEST["slack_api"](method, **params)
+    import urllib.parse, urllib.request
+    tok = config_now("SLACK_BOT_TOKEN")
+    if not isinstance(tok, str) or not tok:
+        raise RuntimeError("no SLACK_BOT_TOKEN")
+    req = urllib.request.Request(f"https://slack.com/api/{method}", data=urllib.parse.urlencode(params).encode(),
+                                 headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        out = json.loads(r.read().decode())
+    if not out.get("ok"):
+        raise RuntimeError(f"{method}: {out.get('error')}")
+    return out
+
+
+def slack_owner():
+    owner = _TEST["slack_owner"] if "slack_owner" in _TEST else config_now("SLACK_OWNER_ID")
+    return owner if isinstance(owner, str) and re.fullmatch(r"[UW][A-Z0-9]{2,}", owner) else ""
+
+
+def ledger_deleted(chat, ts):
+    """Has the daemon recorded his deletion of this message? The ledger is a cache any session could write, so it is
+    read for one thing only: a deletion, which can only take a goal away, never give one."""
+    try:
+        with open(place("owner_words", f"{HOME}/.cc/state/owner-words.jsonl"), encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("event") == "delete" and r.get("channel") == chat and r.get("ts") == ts:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def fetch_slack(chat, ts):
+    """The message at chat/ts as Slack holds it now, or None. conversations.history finds a top-level message (as
+    cc-slack's fetch_message does). A thread reply isn't in it, so this is cc-slack's reacted_message read, which
+    already reads channel thread replies with the bot token: conversations.replies for the reply's ts names its thread
+    (thread_ts), and a second read anchored at that parent with oldest=ts, inclusive, comes back parent first and then
+    the reply (the parent doesn't count against limit), which the ts filter picks out."""
+    try:
+        m = (slack_call("conversations.history", channel=chat, latest=ts, inclusive="true", limit="1").get("messages")
+             or [None])[0]
+        if m and m.get("ts") == ts:
+            return m
+        head = slack_call("conversations.replies", channel=chat, ts=ts, limit="1").get("messages") or []
+        if not head:
+            return None
+        root = head[0].get("thread_ts") or head[0].get("ts")
+        if root == ts:
+            return next((x for x in head if x.get("ts") == ts), None)
+        msgs = slack_call("conversations.replies", channel=chat, ts=root, oldest=ts, inclusive="true",
+                          limit="1").get("messages") or []
+        return next((x for x in msgs if x.get("ts") == ts and (x.get("thread_ts") or x.get("ts")) == root), None)
+    except Exception:
+        return None
+
+
+CUT = "\x00"     # where text that isn't his statement was taken out of a sentence: a boundary no quote crosses
+
+
+def unmark(text):
+    """Slack's markup read as the words he sees, so a quote of what Slack shows matches the text Slack stores:
+    <url|text> is its text, <url> the url, <#C…|name> #name, *bold* and _italic_ their words. What isn't his statement
+    leaves a CUT, never a space, so taking it out joins no words (dropping "`no`" from "Give cc-ask `no` more turns"
+    must not leave "Give cc-ask more turns", #1129 review): code, ~struck~ text (words he struck out) and a mention
+    (<@U…>, <!here>). &gt; &lt; &amp; are unescaped last, so a < he typed stays text."""
+    t = str(text or "")
+    t = re.sub(r"```.*?```", CUT, t, flags=re.S)
+    t = re.sub(r"`[^`\n]*`", CUT, t)
+    t = re.sub(r"<#[CG][A-Z0-9]+\|([^<>\n]*)>", r"#\1", t)
+    t = re.sub(r"<[@!#][^<>\n]*>", CUT, t)
+    t = re.sub(r"<[^<>|\n]+\|([^<>\n]+)>", r"\1", t)
+    t = re.sub(r"<([^<>|\n]+)>", r"\1", t)
+    for mark, keep in (("*", r"\1"), ("_", r"\1"), ("~", CUT)):
+        m = re.escape(mark)
+        t = re.sub(rf"(?<![\w{m}]){m}([^\s{m}](?:[^{m}\n]*[^\s{m}])?){m}(?![\w{m}])", keep, t)
+    return t.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+
+
+def sentence(s):
+    """Text folded for matching."""
+    return fold(squash(s))
+
+
+# what Slack lets a person post on his behalf: his own message, one also sent to the channel, one with a file
+HIS_SUBTYPES = (None, "", "thread_broadcast", "file_share")
+# a stop inside his one sentence, code he left open, or a question mark: then it is no single plain go
+STOPS = re.compile("[.!;:\u2026`?\u203d\u061f\u00bf\u2e2e\u2047-\u2049\uff1f\ufe56]")
+# round 4 of #1129: a Slack go opens his message with one of these, at its very start
+GO = re.compile(r"(?:give|set|raise|enable|allow|approve|go ahead|yes do)\b")
+# a word that can turn his line into a refusal or a condition, anywhere in the message: then nothing in it grants
+# (security read of #1129: "fail closed and keep it simple"). n't with any apostrophe, and the same words typed bare.
+# Then the words that hand his line to someone else or take it back (round 4: "Bob asked me this today", "If Bob
+# agrees", "Just kidding"), a time or a condition (round 4: "… once the review lands"), and a sentence that
+# opens like a question though it carries no ? ("Should we …").
+HEDGE = re.compile(r"\b(?:not|never|no|nope|nah|unless|until|only|but|wait|hold|cannot|dont|doesnt|didnt|isnt|arent|"
+                   r"wasnt|werent|wont|cant|shouldnt|wouldnt|couldnt|havent|hasnt|hadnt|aint|mustnt|neednt|"
+                   r"if|whether|maybe|perhaps|might|suppose|supposing|assuming|provided|unsure|"
+                   r"kidding|joking|joke|jk|scratch|ignore|disregard|cancel|retract|undo|forget|"
+                   r"asked|asks|asking|said|says|wrote|writes|wants|wanted|requested|suggested|suggests|proposed|"
+                   r"wonder|wondering|thoughts|reject|rejected|rejecting|refuse|refused|deny|denied|decline|declined|veto|vetoed|"
+                   r"once|when|whenever|after|before|later|tomorrow|tonight|soon|eventually|yet)\b"
+                   r"|n['`\u2018\u2019\u02bc\u00b4]t\b"
+                   r"|(?:^|[.!:;,\n]\s*)(?:should|could|would|can|will|shall|do|does|did|is|are|was|were|may|must|"
+                   r"what|why|how|which|who|whom|whose|where|any)\b")
+
+
+def hedged(text):
+    """Does a negation or condition word stand anywhere in his message, raw or folded (so markup, code, a link's text
+    or a look-alike letter hides none)? _ is a word character to \\b, so it is read as a space: _Hold_ is "hold"."""
+    t = str(text or "").replace("_", " ")
+    return any(HEDGE.search(x) for x in (t.casefold(), fold(t)))
+
+
+def his_go(text):
+    """His whole message as the one plain go it must be, folded and without its final . or !, or '' when it is
+    anything else (round 4 of #1129: "a Slack quote grants ONLY when his WHOLE message is that one sentence"). One line,
+    one sentence (no stop, colon or question mark inside it, no code, no mention, no struck text), opening with a go
+    verb. So a `>` quote, a list item, a second line ("… \nAfter the review lands."), a speaker ("Bob: give …") or
+    his past tense ("I gave …") is no go."""
+    t = sentence(unmark(unicodedata.normalize("NFKC", str(text or ""))).strip())
+    body = t.rstrip(" .!")
+    if len(unmark(str(text or "")).strip().splitlines()) > 1 or CUT in body or STOPS.search(body) or not GO.match(body):
+        return ""
+    return body
+
+
+def said(text, quote):
+    """Is the quote his whole message, the one plain go his_go() reads (only a final . or ! may be left off)?"""
+    go = his_go(text)
+    return bool(go) and sentence(unmark(quote)).rstrip(" .!") == go
+
+
+def names_the_value(text, ask):
+    """When the ask sets a value, his go says that value and no other number (round 4 of #1129: "Set cc-ask turns to
+    4." or "Give cc-ask fewer turns." must not grant 16). An ask that sets nothing (a restart) needs none."""
+    shape = parse_shape(squash(ask))
+    if not shape or shape[0] != "config":
+        return bool(shape)
+    return set(re.findall(r"\d+(?:[.,]\d+)*", his_go(text))) == {shape[1].split("=", 1)[1]}
+
+
+def check_slack(chat, ts, quote, ask):
+    """('', his message's whole text) when the message at chat/ts, fetched from Slack now, is the owner's own, it
+    names the ask's own key or unit and the value it sets, no negation or condition word stands anywhere in it, and
+    the quote is his whole message, one sentence that opens with a go verb. Otherwise (the reason it isn't, '').
+    The owner-words ledger is only a cache, so a line forged into it grants nothing; a deletion it records still
+    revokes the goal."""
+    if ledger_deleted(chat, ts):
+        return "he deleted that Slack message, so the goal citing it no longer stands", ""
+    owner = slack_owner()
+    if not owner:
+        return "the owner's Slack id can't be read, so no Slack citation can be checked", ""
+    m = fetch_slack(chat, ts)
+    if not m or m.get("subtype") == "tombstone":
+        return "that Slack message can't be fetched now (deleted, or not readable by the bot)", ""
+    if m.get("bot_id") or m.get("user") != owner:
+        return "that Slack message is not the owner's own", ""
+    if m.get("subtype") not in HIS_SUBTYPES:
+        return f"that Slack message is a {str(m.get('subtype'))[:40]} event, not something he wrote", ""
+    if any(unicodedata.category(c) in ("Cc", "Cf") for c in quote):
+        return "the quote carries invisible or control characters, so it isn't what he sees", ""
+    if not names_the_shape(quote, ask):
+        return "the quote doesn't name the ask's own key or unit, and a word in his chat is not enough", ""
+    if hedged(m.get("text")):
+        return ("his message carries a negation, condition, retraction or someone else's words (not, n't, if, "
+                "kidding, asked, …) or opens a sentence like a question, so no line of it is read as a go"), ""
+    if not said(m.get("text"), quote):
+        return ("the quote is not his whole statement: his whole message must be the quote, one sentence that opens "
+                "with a go verb (give, set, raise, enable, allow, approve, go ahead, yes do)"), ""
+    if not names_the_value(m.get("text"), ask):
+        return "his go doesn't say the value the ask sets, and no other number", ""
+    return "", str(m.get("text") or "")
+
+
 def check_evidence(evs, ask, cited_ok=False):
     """The evidence that holds: a quote of MIN_QUOTE characters or more that shares a content word with the ask and is
     in one counted line of the owner's state-dir goals.md, or of item N of his one-time grant. `cited_ok` (the
@@ -569,15 +790,21 @@ def check_evidence(evs, ask, cited_ok=False):
         e = e if isinstance(e, dict) else {}
         q, src = squash(e.get("quote")), str(e.get("source") or "").strip()
 
-        def verdict(ok, why):
-            (good if ok else bad).append({"quote": q, "source": src} if ok else {"source": src, "why": why})
+        def verdict(ok, why, message=""):
+            # design: "The grant record keeps the full message, so whoever reads the ledger later can see what the
+            # quote came from"
+            (good if ok else bad).append(dict({"quote": q, "source": src}, **({"message": message} if message else {}))
+                                         if ok else {"source": src, "why": why})
         if not q or not src:
             verdict(False, "no quote or no source"); continue
-        if len(q) < MIN_QUOTE:
+        # the Slack check matches sentence(unmark(q)), so the length and the shared word hold for that string too:
+        # "<https://example.org/turns|OK.>" passes on its url's word and matches as "OK." (#1129 review)
+        seen = (q, sentence(unmark(q)))
+        if any(len(s) < MIN_QUOTE for s in seen):
             verdict(False, f"a quote under {MIN_QUOTE} characters proves nothing"); continue
         if repos is None:
             repos = owner_repos() if not cited_ok else set()
-        if not related(q, ask, repos):
+        if not all(related(s, ask, repos) for s in seen):
             verdict(False, "the quote shares no content word with the ask"); continue
         if cited_ok:
             verdict(True, ""); continue
@@ -589,17 +816,32 @@ def check_evidence(evs, ask, cited_ok=False):
             # Architect, 10-11: "tickets.log carries no message, so a ticket only counts if the quote comes from the
             # message the ticket answers. If you can't resolve that, the ticket doesn't count as evidence."
             verdict(False, "a ticket can't be tied to the message it answered (tickets.log records none)")
+        elif SLACK_SRC.match(src):
+            why, text = check_slack(*SLACK_SRC.match(src).groups(), q, ask)
+            verdict(not why, why, text)
         elif os.path.basename(src) == "goals.md":
             path = os.path.expanduser(src.replace("~", HOME, 1) if src.startswith("~") else src)
             if not goals_file_ok(path, repos):
                 verdict(False, "goals count only from ~/.cc/state/<repo>/goals.md of the owner's own repos"); continue
             try:
-                lines = evidence_lines(open(path, encoding="utf-8", errors="replace").read())
+                raw = open(path, encoding="utf-8", errors="replace").read().split("\n")
             except OSError:
-                lines = []
-            verdict(any(fold(q) in ln for ln in lines), "the quote is not in one counted line of that goals.md")
+                raw = []
+            # design, 10-12: goals.md is an index, not an authority. A line grants only through its own
+            # `src: slack:<channel>/<ts>`, checked live; one with no src still steers the seat but grants nothing.
+            hits = [ln for ln in raw if any(fold(q) in e for e in evidence_lines(GOAL_SRC.sub("", ln)))]
+            srcs = [GOAL_SRC.search(ln).group(1) for ln in hits if GOAL_SRC.search(ln)]
+            whys = [check_slack(*SLACK_SRC.match(s).groups(), q, ask) if SLACK_SRC.match(s) else
+                    (f"its src: {s} is not slack:<channel>/<ts>", "") for s in srcs]
+            if not hits:
+                verdict(False, "the quote is not in one counted line of that goals.md")
+            elif not srcs:
+                verdict(False, "that goals.md line carries no src:, so it steers the seat's own work but grants nothing")
+            else:
+                verdict(any(not w for w, _ in whys), "; ".join(w for w, _ in whys if w),
+                        next((t for w, t in whys if not w), ""))
         else:
-            verdict(False, "not a goals.md or grant:N")
+            verdict(False, "not a goals.md, slack:<channel>/<ts> or grant:N")
     return good, bad
 
 
@@ -812,12 +1054,40 @@ def selfcheck():
             open(f"{td}/units/cc-slackd.service", "w").write(state + "\n")
         goals =f"{td}/state/proj/goals.md"
         os.makedirs(os.path.dirname(goals))
+        # a stand-in Slack: SL holds the messages as Slack would serve them now, and every read is logged
+        SL, slog = {}, []
+
+        def say(ts, text, user="UOWNER", **kw):
+            SL[("CPROJ", ts)] = dict(kw, ts=ts, text=text, **({"user": user} if user else {}))
+
+        def fake_slack(method, channel, ts=None, latest=None, oldest=None, limit="100", **_):
+            # as the real one does (probed 10-12): history is top-level only; replies for a reply's ts is that reply,
+            # and for a parent's ts is the parent first and then up to `limit` replies from `oldest`, which the parent
+            # doesn't count against
+            slog.append((method, ts or latest, oldest, limit))
+            here = {t: m for (c, t), m in SL.items() if c == channel}
+            if method == "conversations.history":
+                top = sorted(t for t, m in here.items() if m.get("thread_ts", t) == t and float(t) <= float(latest))
+                return {"messages": [here[top[-1]]] if top else []}
+            m = here.get(ts)
+            if not m:
+                raise RuntimeError("conversations.replies: thread_not_found")
+            if m.get("thread_ts", ts) != ts:
+                return {"messages": [m]}
+            reps = sorted((x for t, x in here.items() if x.get("thread_ts") == ts and t != ts
+                           and float(t) >= float(oldest or 0)), key=lambda x: float(x["ts"]))
+            return {"messages": [m] + reps[:int(limit)]}
+        _TEST.update(slack_api=fake_slack, slack_owner="UOWNER", owner_words=f"{td}/owner-words.jsonl")
+        say("1728000000.000001", "Give cc-ask 16 turns for questions that need them.")
+        say("1728000000.000002", "Allow cc-slackd restarts on a landing.")
+        say("1728000000.000003", "The proj repository is the one I care about most.")
         open(goals, "w").write("# Turns and daemons: proj standing goals (owner, 2026-08-31)\n"
-                               "- Give cc-ask more turns when a question needs them.\n"
-                               "- Keep the slack daemon on live code after a landing.\n"
-                               "- The proj repository is the one I care about most.\n- more turns\n")
-        ev = [{"quote": "Give cc-ask more turns when a question needs them.", "source": goals}]
-        sev = [{"quote": "Keep the slack daemon on live code", "source": goals}]
+                               "- Give cc-ask 16 turns for questions that need them. (src: slack:CPROJ/1728000000.000001)\n"
+                               "- Allow cc-slackd restarts on a landing. (src: slack:CPROJ/1728000000.000002)\n"
+                               "- The proj repository is the one I care about most. (src: slack:CPROJ/1728000000.000003)\n"
+                               "- more turns\n")
+        ev = [{"quote": "Give cc-ask 16 turns for questions that need them.", "source": goals}]
+        sev = [{"quote": "Allow cc-slackd restarts on a landing.", "source": goals}]
         cfg = {"ask": "cc-config set CC_ASK_TURNS 16", "evidence": ev}
         svc = {"ask": "systemctl --user restart cc-slackd", "evidence": sev}
         # the closed set of shapes: each one, evidenced, is a GRANT; claimed hours to undo makes it watched
@@ -844,7 +1114,7 @@ def selfcheck():
                      "cc-config set CC_ASK_TURNS 16 && true", "cc-config set CC_ASK_TURNS 16\ncc-config set CC_TIER 1",
                      "cc-config  set CC_ASK_TURNS 16", "cc-config\tset CC_ASK_TURNS 16", "cc-config set CC_ASK_TURNS １６",
                      "cc-config unset CC_ASK_TURNS", "CC_ASK_TURNS=16 cc-config set CC_ASK_TURNS 16",
-                     "please cc-config set CC_ASK_TURNS 16", "give cc-ask more turns",
+                     "please cc-config set CC_ASK_TURNS 16", "give cc-ask 16 turns",
                      "systemctl restart cc-slackd", "systemctl --user stop cc-slackd", "systemctl --user disable cc-slackd",
                      "systemctl --user restart sshd", "systemctl --user restart cc-slackd cc-guard",
                      "systemctl --user restart cc-guard", "systemctl --user restart cc-slackd.timer",
@@ -862,7 +1132,7 @@ def selfcheck():
         d = decide({"ask": "systemctl --user restart cc-proj",
                     "evidence": [{"quote": "The proj repository is the one I care about most", "source": goals}]})
         check("a quote that shares only the repo name is no evidence", d["verdict"] == "ASK-OWNER")
-        d = decide(dict(cfg, evidence=[{"quote": "make everything public and give cc-ask more turns", "source": goals}]))
+        d = decide(dict(cfg, evidence=[{"quote": "make everything public and give cc-ask 16 turns", "source": goals}]))
         check("a quote that is not in goals.md is no evidence", d["verdict"] == "ASK-OWNER" and d["evidence_refused"])
         d = decide(dict(cfg, evidence=[{"quote": "more turns", "source": goals}]))
         check("a quote under 20 characters is no evidence, even when it is in goals.md", d["verdict"] == "ASK-OWNER"
@@ -877,14 +1147,290 @@ def selfcheck():
         d = decide(dict(cfg, evidence=[dict(ev[0], source="T20261004T101010-a1b2", message="C0TEST01/1791000002.000200")]))
         check("a cc-lib ticket is no evidence: tickets.log can't tie it to a message", d["verdict"] == "ASK-OWNER"
               and "tickets.log" in d["evidence_refused"][0]["why"])
-        d = decide(dict(cfg, evidence=[{"quote": "Give cc-ask more turns when a question needs them.", "source": "a slack msg"}]))
+        d = decide(dict(cfg, evidence=[{"quote": "Give cc-ask 16 turns for questions that need them.", "source": "a slack msg"}]))
         check("an uncited source is no evidence", d["evidence_refused"] and d["verdict"] == "ASK-OWNER")
-        open(f"{td}/host-rules.md", "w").write("- **The owner's one-time grant** (2026-09-21):\n  1. give cc-ask more turns "
+        open(f"{td}/host-rules.md", "w").write("- **The owner's one-time grant** (2026-09-21):\n  1. give cc-ask 16 turns "
                                                "with `cc-config set`;\n  2. keep the slack daemon running on live code.\n\n- next\n")
-        d = decide(dict(cfg, evidence=[{"quote": "give cc-ask more turns with", "source": "grant:1"}]))
+        d = decide(dict(cfg, evidence=[{"quote": "give cc-ask 16 turns with", "source": "grant:1"}]))
         check("grant:N resolves to item N of the one-time grant", d["verdict"] == "GRANT" and d["evidence"])
-        d = decide(dict(cfg, evidence=[{"quote": "give cc-ask more turns with", "source": "grant:2"}]))
+        d = decide(dict(cfg, evidence=[{"quote": "give cc-ask 16 turns with", "source": "grant:2"}]))
         check("a quote that is not in item N is no evidence", d["verdict"] == "ASK-OWNER" and d["evidence_refused"])
+        # a goal rests on his Slack message as Slack serves it now; the owner-words ledger is a cache (design 10-12)
+        turns = "Give cc-ask 16 turns for every hard question there is."
+
+        def ask_from(src, quote=turns):
+            return decide(dict(cfg, evidence=[{"quote": quote, "source": src}]))
+
+        def edit_goals(a, b):
+            text = open(goals).read()
+            open(goals, "w").write(text.replace(a, b))
+
+        def ledger(*recs):
+            with open(f"{td}/owner-words.jsonl", "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in recs)
+        ledger()
+        say("1728000000.000100", turns)
+        check("his own Slack message, fetched live, is evidence", ask_from("slack:CPROJ/1728000000.000100")["verdict"] == "GRANT")
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000101", "text": turns})
+        d = ask_from("slack:CPROJ/1728000000.000101")
+        check("a forged ledger line with no message in Slack grants nothing", d["verdict"] == "ASK-OWNER"
+              and "can't be fetched" in d["evidence_refused"][0]["why"])
+        say("1728000000.000102", turns, user="UOTHER")
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000102", "text": turns})
+        check("... nor one whose Slack message is someone else's", ask_from("slack:CPROJ/1728000000.000102")["verdict"] == "ASK-OWNER")
+        ledger()
+        say("1728000000.000110", turns, bot_id="BSEAT")
+        d = ask_from("slack:CPROJ/1728000000.000110")
+        check("a bot-authored message under his user id grants nothing", d["verdict"] == "ASK-OWNER"
+              and "not the owner's own" in d["evidence_refused"][0]["why"])
+        say("1728000000.000111", turns, user=None, bot_id="BSEAT")
+        check("... nor one with a bot_id and no user", ask_from("slack:CPROJ/1728000000.000111")["verdict"] == "ASK-OWNER")
+        old = "Give cc-ask 16 turns for any hard question that needs them."
+        say("1728000000.000120", "Leave cc-ask's turns where they are for now.", edited={"ts": "1728000100.000000"})
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000120", "text": old},
+               {"event": "edit", "channel": "CPROJ", "ts": "1728000000.000120", "text": "Leave cc-ask's turns where they are for now."})
+        check("an edited message: the quote of its old text grants nothing", ask_from("slack:CPROJ/1728000000.000120", old)["verdict"] == "ASK-OWNER")
+        say("1728000000.000121", old, edited={"ts": "1728000100.000000"})
+        check("... and the quote of its current text does", ask_from("slack:CPROJ/1728000000.000121", old)["verdict"] == "GRANT")
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000130", "text": turns})
+        check("a message gone from Slack grants nothing", ask_from("slack:CPROJ/1728000000.000130")["verdict"] == "ASK-OWNER")
+        say("1728000000.000131", "This message was deleted.", subtype="tombstone")
+        check("... nor a tombstone left where he deleted a thread's root", ask_from("slack:CPROJ/1728000000.000131")["verdict"] == "ASK-OWNER")
+        say("1728000000.000132", turns)
+        rev = "Give cc-ask 16 turns for every hard question there is. (src: slack:CPROJ/1728000000.000132)"
+        open(goals, "a").write(f"- {rev}\n")
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000132", "text": turns})
+        check("a goal citing a message Slack still holds counts", ask_from(goals)["verdict"] == "GRANT")
+        ledger({"event": "message", "channel": "CPROJ", "ts": "1728000000.000132", "text": turns},
+               {"event": "delete", "channel": "CPROJ", "ts": "1728000000.000132"})
+        d = ask_from(goals)
+        check("... and a deletion the ledger records revokes it, there and cited directly", d["verdict"] == "ASK-OWNER"
+              and "deleted" in d["evidence_refused"][0]["why"]
+              and ask_from("slack:CPROJ/1728000000.000132")["verdict"] == "ASK-OWNER")
+        edit_goals(f"- {rev}\n", "")
+        ledger()
+        say("1728000000.000140", "Thinking about how cc-ask spends its budget.")
+        say("1728000000.000141", turns, thread_ts="1728000000.000140")
+        del slog[:]
+        check("a non-broadcast reply in a channel thread is fetched by cc-slack's anchored read and counts",
+              ask_from("slack:CPROJ/1728000000.000141")["verdict"] == "GRANT"
+              and slog[-2:] == [("conversations.replies", "1728000000.000141", None, "1"),
+                                ("conversations.replies", "1728000000.000140", "1728000000.000141", "1")])
+        say("1728000000.000142", "Not that one.", thread_ts="1728000000.000140")
+        check("... and the quote must be in that reply, not elsewhere in its thread",
+              ask_from("slack:CPROJ/1728000000.000142")["verdict"] == "ASK-OWNER")
+        say("1728000000.000143", turns)
+        say("1728000000.000144", "Only on weekdays.", thread_ts="1728000000.000143")
+        check("... nor in its parent, which Slack hands back first",
+              ask_from("slack:CPROJ/1728000000.000144")["verdict"] == "ASK-OWNER")
+        for n, text in (("150", f"Should we? {turns[:-1]}?"), ("151", f"&gt; {turns}"), ("152", f"```{turns}```"),
+                        ("153", f"Please don't {turns[0].lower()}{turns[1:]}")):
+            say(f"1728000000.000{n}", text)
+            check(f"a quote out of a question, a > quote, code or a negation is not his statement: {text[:12]!r}",
+                  ask_from(f"slack:CPROJ/1728000000.000{n}")["verdict"] == "ASK-OWNER")
+        # code taken out is a boundary, never a join: "Give cc-ask `extra` more turns" is not "Give cc-ask 16 turns"
+        say("1728000000.000154", "Give cc-ask `extra` more turns for every hard question there is.")
+        d = ask_from("slack:CPROJ/1728000000.000154")
+        check("a quote that joins the words either side of inline code is not his statement", d["verdict"] == "ASK-OWNER"
+              and "not his whole statement" in d["evidence_refused"][0]["why"])
+        say("1728000000.000155", "Give cc-ask ```\nno\n``` more turns for every hard question there is.")
+        check("... nor one that joins them across a code block",
+              ask_from("slack:CPROJ/1728000000.000155")["verdict"] == "ASK-OWNER")
+        say("1728000000.000156", f"`Don't` {turns[0].lower()}{turns[1:]}")
+        say("1728000000.000157", f"Run `cc-config get CC_ASK_TURNS` first. {turns}")
+        # security read of #1129: a quote is one whole line, so a sentence beside code on its line no longer counts
+        check("... nor one that starts where code ended, nor his own sentence after code on the same line",
+              ask_from("slack:CPROJ/1728000000.000156")["verdict"] == "ASK-OWNER"
+              and ask_from("slack:CPROJ/1728000000.000157")["verdict"] == "ASK-OWNER")
+        # Slack markup is read as the words he sees, on the message and the quote, and never joins words either
+        say("1728000000.000170", "<@UBOB>, Give cc-ask *16 turns* for every _hard_ question "
+                                 "<https://example.org/q|there is>. <!here> see <#C0ABC123|proj>.")
+        check("a sentence that shares its line with another is not quoted whole, and a mention inside the line is a CUT",
+              ask_from("slack:CPROJ/1728000000.000170")["verdict"] == "ASK-OWNER"
+              and ask_from("slack:CPROJ/1728000000.000170", "Give cc-ask 16 turns for every hard question there is. "
+                           "See #proj.")["verdict"] == "ASK-OWNER")
+        say("1728000000.000175", "<@UBOB>, Give cc-ask *16 turns* for every _hard_ question "
+                                 "<https://example.org/q|there is>.\nSee <#C0ABC123|proj>.")
+        check("a mention opening his message or a second line is no go (round 4: his whole message is the one sentence)",
+              ask_from("slack:CPROJ/1728000000.000175")["verdict"] == "ASK-OWNER")
+        say("1728000000.000176", "*Give* cc-ask _16 turns_ for every hard question <https://example.org/q|there is>.")
+        check("*bold*, _italic_ and a <url|text> link don't hide his statement",
+              ask_from("slack:CPROJ/1728000000.000176")["verdict"] == "GRANT")
+        say("1728000000.000171", turns)
+        check("... and a quote carrying the same markup matches his plain text",
+              ask_from("slack:CPROJ/1728000000.000171", "*Give* cc-ask 16 turns for every _hard_ question there is.")
+              ["verdict"] == "GRANT")
+        for n, text in (("172", "Give cc-ask <@UBOB> more turns for every hard question there is."),
+                        ("173", f"~{turns}~ Not yet."),
+                        ("174", "Give cc-ask ~no~ more turns for every hard question there is.")):
+            say(f"1728000000.000{n}", text)
+            check(f"a mention inside a sentence or struck-out text is a boundary, never a join: {text[:24]!r}",
+                  ask_from(f"slack:CPROJ/1728000000.000{n}")["verdict"] == "ASK-OWNER")
+        def said_in(text, quote):
+            return said(text, quote)
+        for msg, quote in (("Give cc-ask more turnstile checks, not turns.", "Give cc-ask 16 turns"),
+                           ("Deploy the dashboard nowhere until review.", "Deploy the dashboard now"),
+                           ("Deploy the dashboard after review.", "Deploy the dashboard")):
+            check(f"a quote must be a whole sentence of his, never a prefix: {quote!r} of {msg!r} is refused",
+                  not said_in(msg, quote))
+        check("... while his whole one-sentence go counts, with or without its final stop, but never two sentences",
+              said_in("Give the dashboard a deploy after review.", "Give the dashboard a deploy after review.")
+              and said_in("Give the dashboard a deploy after review.", "give the dashboard a deploy after review")
+              and not said_in("Ship it. Give the dashboard a deploy.", "Ship it. Give the dashboard a deploy.")
+              and not said_in("Deploy the dashboard after review.", "Deploy the dashboard after review."))
+        say("1728000000.000161", "OK.")
+        check("a quote whose link markup unmarks to under the length or off the ask is refused: '<…/turns|OK.>'",
+              decide(dict(cfg, evidence=[{"quote": "<https://example.org/turns|OK.>",
+                                          "source": "slack:CPROJ/1728000000.000161"}]))["verdict"] == "ASK-OWNER")
+        say("1728000000.000162", "Ship it, the whole build please.")
+        check("... and one long enough raw but off the ask once unmarked is refused too",
+              ask_from("slack:CPROJ/1728000000.000162",
+                       "<https://example.org/cc-ask-more-turns|Ship it, the whole build please.>")["verdict"] == "ASK-OWNER")
+        check("... while the same message quoted plainly, on the ask, still counts",
+              ask_from("slack:CPROJ/1728000000.000141")["verdict"] == "GRANT")
+        # Opus security read of #1129: his ordinary chat must never grant. Each case is one probe of
+        # .cc/probe-1129.py, and each fails when its fix is reverted.
+        hard = "Give cc-ask 16 turns for hard questions."
+
+        def chat(n, text, quote, ask="cc-config set CC_ASK_TURNS 16", **kw):
+            say(f"1728000000.000{n}", text, **kw)
+            d = decide({"ask": ask, "evidence": [{"quote": quote, "source": f"slack:CPROJ/1728000000.000{n}"}]})
+            return d["verdict"], (d["evidence_refused"] or [{}])[0].get("why", "")
+        for n, ask, text in (("180", "cc-config set CC_ASK_THINK 10000", "I think we should wait on that one."),
+                             ("181", "cc-config set CC_ASK_TURNS 24", "Turn it off, I'm going to bed now."),
+                             ("182", "systemctl --user restart cc-slackd", "Slack is noisy today, don't touch anything.")):
+            v, why = chat(n, text, text, ask)
+            check(f"a Slack quote must name the ask's own key or unit whole, not share a 4-letter prefix: {text[:22]!r}",
+                  v == "ASK-OWNER" and "own key or unit" in why)
+        check("... while one that names it whole counts, for a key and for a unit",
+              chat("183", "Set cc-ask think to 10000 on hard questions.", "Set cc-ask think to 10000 on hard questions.",
+                   "cc-config set CC_ASK_THINK 10000")[0] == "GRANT"
+              and chat("184", "Allow cc-slackd restarts on every landing.", "Allow cc-slackd restarts on every landing.",
+                       "systemctl --user restart cc-slackd")[0] == "GRANT")
+        check("a quote that stops before his sentence does is refused: 'Give cc-ask 16 turns only' of '... after I "
+              "approve each one.'", chat("185", "Give cc-ask 16 turns only after I approve each one.",
+                                         "Give cc-ask 16 turns only")[0] == "ASK-OWNER")
+        for n, text, quote in (("186", "Please don't\ngive cc-ask 16 turns for hard questions.",
+                                "give cc-ask 16 turns for hard questions"),
+                               ("187", "Never do these:\n• give cc-ask 16 turns for hard questions\n• touch the uplink",
+                                "give cc-ask 16 turns for hard questions"),
+                               ("188", f"&gt;&gt;&gt; Bob said:\n{hard}", hard),
+                               ("189", f"Bob wrote this.\n&gt;&gt;&gt; Quoted.\nShip it.\n{hard}", hard),
+                               ("190", "Never, e.g. give cc-ask 16 turns for hard questions.",
+                                "give cc-ask 16 turns for hard questions."),
+                               ("201", "Never, e.g. Give cc-ask 16 turns for hard questions.", hard),
+                               ("202", "Never, ex. give cc-ask 16 turns for hard questions.",
+                                "give cc-ask 16 turns for hard questions."),
+                               ("191", "Give cc-ask 16 turns for hard questions？", "Give cc-ask 16 turns for hard questions？"),
+                               ("192", f"`Don't\n{hard}", hard),
+                               ("193", f"&gt; Bob: please do not.\n{hard}", hard)):
+            check(f"a line is judged in its message: refused after a negation, a colon list, a quote, an abbreviation or "
+                  f"unclosed code, and in a full-width question: {text[:24]!r}", chat(n, text, quote)[0] == "ASK-OWNER")
+        check("a line under one of his own is no go (round 4), nor a sentence that shares its line",
+              chat("194", f"Ship it.\n\n{hard}", hard)[0] == "ASK-OWNER"
+              and chat("195", f"Ship it, e.g. today. {hard}", hard)[0] == "ASK-OWNER")
+        # security read of #1129, round 3 (.cc/probe-1129-r3.py): his meaning is never parsed, so a message that carries
+        # a negation or condition word anywhere grants nothing, and a quote is one whole line of it
+        for n, text, quote in (("203", "Never give cc-ask 16 turns for hard questions.",
+                                "Never give cc-ask 16 turns for hard questions."),
+                               ("204", f"I'm not approving these.\n- {hard}", hard),
+                               ("205", f"{hard} Not until I say so.", hard),
+                               ("206", f"{hard}\nI don’t mean it.", hard),
+                               ("207", f"{hard}\n_Hold_ <https://e.org/x|it>.", hard)):
+            v, why = chat(n, text, quote)
+            check(f"a negation or condition anywhere in his message, or a quote short of its line, grants nothing: "
+                  f"{text[-28:]!r}", v == "ASK-OWNER" and why != "")
+        # round 4 (Opus delta read at 51fd65ca): the whole message is judged, so each of these grants nothing
+        for n, text, quote, ask in (
+                ("209", "Don't give cc-ask 16 turns for hard questions.",
+                 "Don't give cc-ask 16 turns for hard questions.", None),
+                ("210", "Do not restart cc-slackd during a landing.", "Do not restart cc-slackd during a landing.",
+                 svc["ask"]),
+                ("211", f"{hard}\nJust kidding.", hard, None),
+                ("212", f"{hard}\nScratch that, later.", hard, None),
+                ("213", f"Bob asked me this today.\n{hard}", hard, None),
+                ("214", f"If Bob agrees,\n{hard}", hard, None),
+                ("215", f"Should we\n{hard}", hard, None),
+                ("216", f"Thanks. Can you look.\n{hard}", hard, None),
+                ("217", f"{hard}\n_Ignore_ that.", hard, None),
+                ("218", f"Things I rejected today.\n{hard}", hard, None)):
+            v, why = chat(n, text, quote, ask or "cc-config set CC_ASK_TURNS 16")
+            check(f"a negation in the quote, a retraction, someone else's words, a condition or a question with no ? "
+                  f"anywhere in his message grants nothing: {text[:30]!r}", v == "ASK-OWNER" and "a go" in why)
+        v, why = chat("219", f"Ship these today.\n\u2022 {hard}", f"\u2022 {hard}")
+        check("a list item reads under whatever heads its list, so none counts on its own", v == "ASK-OWNER"
+              and "whole statement" in why and chat("219", f"Ship these today.\n{hard}", hard)[0] == "ASK-OWNER")
+        v, why = chat("220", "Restart cc-slackd-old after the landing.", "Restart cc-slackd-old after the landing.",
+                      svc["ask"])
+        check("a unit is named by its whole name: cc-slackd-old does not name cc-slackd", v == "ASK-OWNER"
+              and "own key or unit" in why)
+        check("... and a plain line among others is no go either (round 4: his whole message is the one sentence)",
+              chat("208", f"Thanks.\n{hard}\nShip it today.", hard)[0] == "ASK-OWNER")
+        # round 4 (.cc/probe-1129-r4/p2.py): a Slack go is his whole message, one sentence opening with a go verb, that
+        # names the key and the value the ask sets. Each variant carries the value, so only the rule it probes refuses it.
+        for n, text, quote in (
+                ("230", f"{hard}\nI don\u2019t mean it.", hard), ("231", f"{hard}\nI don\u02bbt mean it.", hard),
+                ("232", f"{hard}\nI don\u2032t mean it.", hard), ("233", f"{hard}\nI don\uff07t mean it.", hard),
+                ("234", f"{hard}\nI don\u055at mean it.", hard), ("235", f"{hard}\nI don\ua78ct mean it.", hard),
+                ("236", f"{hard}\nn\u00adot yet.", hard), ("237", f"{hard}\nno\u200bt yet.", hard),
+                ("238", f"{hard}\nn\u200dot yet.", hard), ("239", f"{hard}\nn\u2060ot yet.", hard),
+                ("240", f"{hard}\nn\u043et yet.", hard), ("241", f"{hard}\nn\u03bft yet.", hard),
+                ("242", f"{hard}\n\uff2e\uff2f\uff34 yet.", hard), ("243", f"{hard}\n\U0001d427\U0001d428\U0001d42d yet.", hard),
+                ("244", f"{hard}\nn`o`t yet.", hard), ("245", f"{hard}\n*n*ot yet.", hard),
+                ("246", f"{hard}\nn~o~t yet.", hard), ("247", f"{hard}\n<https://e.org|no>t yet.", hard),
+                ("248", f"{hard}\nno<@UBOB>t yet.", hard), ("249", f"{hard}\n:no_entry:", hard),
+                ("250", f"{hard} :hand:", hard), ("251", f"{hard}\n:x:", hard),
+                ("252", "Give cc-ask 16 turns once the review lands.", "Give cc-ask 16 turns once the review lands."),
+                ("253", f"{hard}\nAfter the review lands.", hard), ("254", f"{hard}\nWhen the review lands.", hard),
+                ("255", f"{hard}\nTomorrow.", hard), ("256", f"{hard}\nLater though.", hard),
+                ("257", "Stop giving cc-ask 16 turns for hard questions.", "Stop giving cc-ask 16 turns for hard questions."),
+                ("258", "Avoid giving cc-ask 16 turns for hard questions.", "Avoid giving cc-ask 16 turns for hard questions."),
+                ("259", f"{hard}\nPause that.", hard), ("260", f"{hard}\nHmm, let me think.", hard),
+                ("261", "Bob: give cc-ask 16 turns for hard questions.", "Bob: give cc-ask 16 turns for hard questions."),
+                ("262", f"Bob thinks so.\n{hard}", hard),
+                ("263", "I gave cc-ask 16 turns for hard questions yesterday.",
+                 "I gave cc-ask 16 turns for hard questions yesterday."),
+                ("264", f"{hard}\n?", hard), ("265", f"{hard} :question:", hard), ("266", f"{hard} :thinking_face:", hard),
+                ("267", "Give cc-ask fewer turns.", "Give cc-ask fewer turns."),
+                ("268", "Set cc-ask turns to 4.", "Set cc-ask turns to 4."),
+                ("269", "Set cc-ask turns to 4, then 16.", "Set cc-ask turns to 4, then 16."),
+                ("270", f"{hard}\nNein.", hard), ("271", f"{hard}\nI don\u00a0't.", hard),
+                ("272", f"{hard}\nI do n t.", hard), ("273", f"{hard}\nI don t mean it.", hard),
+                ("274", f"{hard}\n\u202eton yet.", hard), ("275", f"Thanks.\n{hard}\nShip it today.", hard),
+                ("276", f"<@UBOB> {hard}", hard), ("277", f"{hard}\u2028Tomorrow.", hard)):
+            check(f"a Slack go is his whole message, one sentence opening with a go verb, with the value: {text[-26:]!r}",
+                  chat(n, text, quote)[0] == "ASK-OWNER")
+        check("... while one that is exactly that grants, naming the key by its words or whole",
+              chat("278", "Give cc-ask 16 turns.", "Give cc-ask 16 turns.")[0] == "GRANT"
+              and chat("279", "Set CC_ASK_TURNS to 16.", "Set CC_ASK_TURNS to 16.")[0] == "GRANT"
+              and chat("280", "Yes do raise cc-ask turns to 16!", "yes do raise cc-ask turns to 16")[0] == "GRANT")
+        check("a quote with a zero-width character in it is refused",
+              chat("196", hard, hard.replace("cc-ask", "cc-ask\u200b"))[0] == "ASK-OWNER")
+        for sub in ("channel_topic", "channel_purpose", "channel_join", "bot_message", "me_message"):
+            check(f"a Slack message with subtype {sub} is not his own words",
+                  chat("197", hard, hard, subtype=sub)[0] == "ASK-OWNER")
+        check("... while thread_broadcast and file_share are", chat("198", hard, hard, subtype="thread_broadcast")[0]
+              == "GRANT" and chat("198", hard, hard, subtype="file_share")[0] == "GRANT")
+        _TEST["slack_owner"] = ""
+        v, why = chat("199", hard, hard)
+        _TEST["slack_owner"] = "UOWNER"
+        check("an empty SLACK_OWNER_ID grants nothing", v == "ASK-OWNER" and "can't be read" in why
+              and chat("199", hard, hard)[0] == "GRANT")
+        say("1728000000.000200", f"*{hard[:4]}* {hard[5:]}")
+        d = decide(dict(cfg, evidence=[{"quote": hard, "source": "slack:CPROJ/1728000000.000200"}]))
+        check("the grant keeps his whole message as Slack holds it, not just the quote", d["verdict"] == "GRANT"
+              and d["evidence"][0].get("message") == f"*{hard[:4]}* {hard[5:]}")
+        say("1728000000.000160", turns)
+        bare = "- Give cc-ask 16 turns for every hard question there is.\n"
+        open(goals, "a").write(bare)
+        d = ask_from(goals)
+        check("a goals.md line with no src: grants nothing", d["verdict"] == "ASK-OWNER"
+              and "no src:" in d["evidence_refused"][0]["why"])
+        edit_goals(bare, bare.rstrip("\n") + " (src: slack:CPROJ/1728000000.000160)\n")
+        check("... while the same line with a src: that holds does", ask_from(goals)["verdict"] == "GRANT")
+        edit_goals(" (src: slack:CPROJ/1728000000.000160)", " (src: grant:1)")
+        check("... and a src: that is not a Slack message grants nothing", ask_from(goals)["verdict"] == "ASK-OWNER")
+        edit_goals("- Give cc-ask 16 turns for every hard question there is. (src: grant:1)\n", "")
         # HOME is the account's, not the caller's: a goals.md planted under a HOME the caller sets is not his
         check("HOME comes from the password database", HOME == pwd.getpwuid(os.getuid()).pw_dir)
         os.environ["CC_CONFIG"], os.environ["CC_CONFIG_DENY"] = f"{td}/evil-config", f"{HOME}/.cc/config"
@@ -1148,9 +1694,10 @@ def selfcheck():
             check(f"... and with evidence its text still crosses a hard line: {text!r}", d["verdict"] not in GRANTS)
         # a member workspace's own ~/.cc/state/<handle>/goals.md is writable from its sandbox: never the owner's intent,
         # even when the name is on the owner's list, unless the host marks that workspace his
-        mq = "serve our workspace demo publicly through cloudflare, and give cc-ask more turns please"
+        mq = "Give cc-ask 16 turns and serve our workspace demo publicly through cloudflare please"
         mgoals = f"{td}/state/ws/goals.md"
-        os.makedirs(os.path.dirname(mgoals)); open(mgoals, "w").write(mq + "\n")
+        os.makedirs(os.path.dirname(mgoals)); open(mgoals, "w").write(mq + " (src: slack:CPROJ/1728000000.000004)\n")
+        say("1728000000.000004", mq)
         os.makedirs(f"{td}/members/ws")
         mev = [{"quote": mq, "source": mgoals}]
         msite = {"ask": "serve the demo at demo.example.org via a Cloudflare tunnel to port 8080", "kind": "public-site",

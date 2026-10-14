@@ -1171,6 +1171,63 @@ def run_selfcheck():
           and (os.stat(arch).st_mode & 0o777) == 0o600)
     check("…and the bot line and the stranger's DM are nowhere in it: only what the daemon accepted from a person is archived",
           not any("bot line" in r["text"] for r in rows) and not os.path.exists(f"{DIR}/archive/box") and not glob.glob(f"{DIR}/archive/*/D0STRANGER1"))
+    # THE OWNER-WORDS LEDGER, on a daemon and a file of its own: his root, his thread reply, his edit and his deletion are
+    # four lines (a goal's citation is checked against Slack itself; this cache is what a deletion revokes from); a
+    # member's message, a member's edit and a bot's edit leave nothing.
+    words = f"{DIR}/owner-words.jsonl"
+    if os.path.exists(words):
+        os.unlink(words)
+    dmW = Daemon(use_slack=False); dmW.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dmW.bot_user = "UBOT"
+    dmW.route = lambda chat, ctype: "r"; dmW.deliver = lambda *a, **k: "delivered"; dmW.clear_needs = lambda *a, **k: None
+    dmW.chan_name = lambda c: "r"; dmW.user_name = lambda u: u
+    with offline_slack():
+        dmW.on_event({"type": "message", "channel": "C0WORDS01", "ts": "1789236000.000100", "user": "UOWNER", "text": "keep the GECKO site &gt; up"})
+        dmW.on_event({"type": "message", "channel": "C0WORDS01", "ts": "1789236060.000200", "thread_ts": "1789236000.000100", "user": "UOWNER", "text": "and private"})
+        dmW.on_event({"type": "message", "channel": "C0WORDS01", "ts": "1789236120.000300", "user": "UMEMBER", "text": "a member's line"})
+        dmW.on_edit({"type": "message", "subtype": "message_changed", "channel": "C0WORDS01",
+                     "message": {"ts": "1789236000.000100", "user": "UOWNER", "text": "keep the GECKO site down"},
+                     "previous_message": {"ts": "1789236000.000100", "user": "UOWNER", "text": "keep the GECKO site &gt; up"}})
+        dmW.on_edit({"type": "message", "subtype": "message_deleted", "channel": "C0WORDS01",
+                     "previous_message": {"ts": "1789236060.000200", "thread_ts": "1789236000.000100", "user": "UOWNER"}})
+        dmW.on_edit({"type": "message", "subtype": "message_changed", "channel": "C0WORDS01",
+                     "message": {"ts": "1789236120.000300", "user": "UMEMBER", "text": "a member's edit"}})
+        dmW.on_edit({"type": "message", "subtype": "message_changed", "channel": "C0WORDS01",
+                     "message": {"ts": "1789236180.000400", "user": "UOWNER", "bot_id": "BSEAT", "text": "a bot's edit"}})
+    wl = [json.loads(l) for l in open(words)] if os.path.exists(words) else []
+    check("owner-words: his message, his thread reply, his edit and his deletion are one line each, with channel, ts, thread_ts and Slack's own text",
+          [(r["event"], r["ts"], r["thread_ts"]) for r in wl] == [("message", "1789236000.000100", ""), ("message", "1789236060.000200", "1789236000.000100"),
+                                                                ("edit", "1789236000.000100", ""), ("delete", "1789236060.000200", "1789236000.000100")]
+          and all(r["channel"] == "C0WORDS01" for r in wl) and wl[0]["text"] == "keep the GECKO site &gt; up"
+          and wl[2]["text"] == "keep the GECKO site down" and wl[3]["text"] == "" and (os.stat(words).st_mode & 0o777) == 0o600)
+    check("owner-words: a member's message, a member's edit and a bot's edit are not his words, so none is in it",
+          not any(t in json.dumps(wl) for t in ("member", "bot's")))
+    # his second edit of one message is a new edit, not a retry of the first: both reach the ledger, a retry doesn't
+    def edit2(text, prev, at):
+        return {"type": "message", "subtype": "message_changed", "channel": "C0WORDS01", "event_ts": at,
+                "message": {"ts": "1789236300.000500", "user": "UOWNER", "text": text, "edited": {"user": "UOWNER", "ts": at}},
+                "previous_message": {"ts": "1789236300.000500", "user": "UOWNER", "text": prev}}
+    with offline_slack():
+        dmW.on_edit(edit2("B: keep it up", "A: keep it down", "1789236400.000000"))
+        dmW.on_edit(edit2("C: keep it private", "B: keep it up", "1789236500.000000"))
+        dmW.on_edit(edit2("C: keep it private", "B: keep it up", "1789236500.000000"))
+        dmW.on_edit(edit2("B: keep it up", "A: keep it down", "1789236400.000000"))
+    w2 = [json.loads(l) for l in open(words)][len(wl):]
+    check("owner-words: two successive edits of one message are two lines, in order, and a retry of either adds none",
+          [(r["event"], r["ts"], r["text"]) for r in w2] == [("edit", "1789236300.000500", "B: keep it up"),
+                                                             ("edit", "1789236300.000500", "C: keep it private")])
+    # where it goes is the account's home from the password database, as cc-infer reads it, whatever $HOME says;
+    # only a redirected DIR moves it. Paths only: nothing is written here.
+    pw_words = f"{pwd.getpwuid(os.getuid()).pw_dir}/.cc/state/owner-words.jsonl"
+    keepW = (HOME, DIR)
+    try:
+        globals()["HOME"] = "/nonexistent-home"
+        DIR = "/nonexistent-home/.cc/slack"; at_odd_home = owner_words_path()
+        DIR = f"{pwd.getpwuid(os.getuid()).pw_dir}/.cc/slack"; at_live_dir = owner_words_path()
+        DIR = keepW[1]; redirected = owner_words_path()
+    finally:
+        globals()["HOME"], DIR = keepW
+    check("owner-words: under another $HOME the daemon still writes the ledger cc-infer reads; a redirected DIR keeps its own",
+          at_odd_home == pw_words and at_live_dir == pw_words and redirected == f"{DIR}/owner-words.jsonl")
     cmain, corch = Conn(None, "r", {"alias": None}), Conn(None, "r", {"alias": "ai-dev"})
     sent5 = []; cmain.send = lambda p: sent5.append(("main", p)); corch.send = lambda p: sent5.append(("ai-dev", p))
     dm6 = Daemon(use_slack=False); dm6.subs["r"] = [cmain, corch]
