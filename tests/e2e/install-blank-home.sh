@@ -217,6 +217,14 @@ inst_as "$OH" thirdbox "$OV/core/install.sh"
 FH="$T/owner-boxmd"; mkdir -p "$FH"; echo "the owner's own notes" > "$FH/BOX.md"; inst_as "$FH" thirdbox "$OV/core/install.sh"
 LH="$T/owner-boxlink"; mkdir -p "$LH"; echo "elsewhere" > "$T/elsewhere.md"; ln -s "$T/elsewhere.md" "$LH/BOX.md"; inst_as "$LH" thirdbox "$OV/core/install.sh"
 { [ ! -L "$FH/BOX.md" ] && [ "$(cat "$FH/BOX.md")" = "the owner's own notes" ] && [ "$(readlink "$LH/BOX.md")" = "$T/elsewhere.md" ]; } && ok "…but a ~/BOX.md the owner made, a file or a link elsewhere, stays" || bad "owner's ~/BOX.md: file $([ -f "$FH/BOX.md" ] && echo kept || echo gone), link -> '$(readlink "$LH/BOX.md")'"
+# the overlay's user memory (home/claude/CLAUDE.md) is linked to ~/.claude/CLAUDE.md, where its @ imports load with no dialog
+UV="$T/overlay-um"; mkdir -p "$UV/home/claude"; ln -s "$IR" "$UV/core"; printf '@~/BOX.md\n' > "$UV/home/claude/CLAUDE.md"
+UH="$T/um-home"; inst_as "$UH" thirdbox "$UV/core/install.sh"
+[ "$(readlink "$UH/.claude/CLAUDE.md")" = "$UV/home/claude/CLAUDE.md" ] && ok "the overlay's home/claude/CLAUDE.md is linked as ~/.claude/CLAUDE.md (user memory)" || bad "~/.claude/CLAUDE.md -> '$(readlink "$UH/.claude/CLAUDE.md")' ($(tail -2 "$UH.log" | tr '\n' ' '))"
+UF="$T/um-own"; mkdir -p "$UF/.claude"; echo "the owner's own memory" > "$UF/.claude/CLAUDE.md"; inst_as "$UF" thirdbox "$UV/core/install.sh"
+{ [ ! -L "$UF/.claude/CLAUDE.md" ] && [ "$(cat "$UF/.claude/CLAUDE.md")" = "the owner's own memory" ] && grep -q 'kept your own ~/.claude/CLAUDE.md' "$UF.log"; } && ok "…but a ~/.claude/CLAUDE.md the owner wrote stays, and the install says so" || bad "owner's ~/.claude/CLAUDE.md: $([ -L "$UF/.claude/CLAUDE.md" ] && echo replaced by a link || cat "$UF/.claude/CLAUDE.md"), log=$(tail -2 "$UF.log" | tr '\n' ' ')"
+UN="$T/um-none"; inst_as "$UN" thirdbox "$OV/core/install.sh"
+{ [ ! -e "$UN/.claude/CLAUDE.md" ] && [ ! -L "$UN/.claude/CLAUDE.md" ]; } && ok "…and an overlay with no home/claude/CLAUDE.md links none" || bad "an overlay without user memory still linked ~/.claude/CLAUDE.md -> '$(readlink "$UN/.claude/CLAUDE.md")'"
 EH="$T/no-name"; inst_as "$EH" "" "$IR/install.sh"; erc=$?
 { [ $erc = 2 ] && grep -q 'this box has no name' "$EH.log" && [ ! -e "$EH/bin/cc" ]; } && ok "an empty box name stops the install with the cause, before it links anything" || bad "empty CC_BOX: rc=$erc, log=$(tail -2 "$EH.log" | tr '\n' ' ')"
 fi

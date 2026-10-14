@@ -65,6 +65,16 @@ if [ -n "$O" ]; then
     esac; fi
     echo "no boxes/$box/BOX.md in the overlay — this machine's facts are not written down yet"
   fi
+  # the overlay's user memory, home/claude/CLAUDE.md, becomes ~/.claude/CLAUDE.md. That is where the owner's
+  # imports (@~/BOX.md, @~/OWNER.md) live: Claude Code loads user-memory imports without the "external imports"
+  # dialog, which a @ in ~/CLAUDE.md raised in every new directory and every sandboxed start. A member's sandbox has
+  # its own ~/.claude, so the owner's files never reach a member's context. A real file or a link elsewhere stays.
+  if [ -f "$O/home/claude/CLAUDE.md" ]; then
+    mkdir -p ~/.claude
+    if [ -e ~/.claude/CLAUDE.md ] && { [ ! -L ~/.claude/CLAUDE.md ] || [ "$(readlink ~/.claude/CLAUDE.md)" != "$O/home/claude/CLAUDE.md" ]; }; then
+      echo "kept your own ~/.claude/CLAUDE.md — the overlay's user memory (home/claude/CLAUDE.md) is not linked; import it from yours"
+    else ln -sfn "$O/home/claude/CLAUDE.md" ~/.claude/CLAUDE.md; fi
+  fi
 fi
 # ~/CLAUDE.md and the guides beside it: whatever is still absent at ~ after the overlay's links is seeded ONCE from
 # templates/home/ — a copy, `<box>` and `<user>` filled in, the other <placeholders> the owner's to replace. A file
