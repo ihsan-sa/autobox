@@ -1392,6 +1392,22 @@ def run():
     k("attachment" not in router.mirror_line({"from": "a@b", "subject": "s", "text": "t"}),
       "…with no attachment count at all when there are none")
 
+    # -- THE CARD (owner, 2026-09-23): one line per mail — subject cut, sender, the box's word for its state.
+    inv = {"from": "ada@allowed.example", "subject": "Fwd: Invitation: Ada Lovelace and Sam Glover @ Thu 2 Oct",
+           "text": "the body is not on the card", "auth": {"header_from": '"Ada Lovelace" <ada@allowed.example>'}}
+    k(router.card_line(inv, "delivered")
+      == ":email: _Fwd: Invitation: Ada Lovelace and Sam Glo…_ · Ada Lovelace · delivered",
+      "a mail's card is one line: the subject cut at %d characters with an ellipsis, the From line's display "
+      "name, and the state — and no body" % router.CARD_SUBJECT)
+    k(router.card_line({"from": "a@b.example", "subject": "", "auth": {"header_from": "a@b.example"}}, "held")
+      == ":email: _(no subject)_ · `a@b.example` · held",
+      "…with no display name it names the address, whole, in a code span")
+    k("<@" not in router.card_line({"from": "a@b", "subject": "<@UOWNER>", "auth": {"header_from": "<!here> <a@b>"}},
+                                   "held") and "\n" not in router.card_line({"from": "a@b", "subject": "x\ny"}, "held"),
+      "…and the sender's words on it can neither mention anyone nor break it onto a second line")
+    k("`" not in router.card_line({"from": "a@b", "subject": "x `y", "auth": {"header_from": "Ev`il <a@b>"}}, "held"),
+      "…nor open a code span with a backtick in the display name or subject, which would swallow the rest of the card")
+
     # -- THE BODY, WHICHEVER PART CARRIED IT. Since #397 an inline text/html copy of the body is `html` rather
     # than an attachment, which is right — but a mail with NO text/plain part then stored text "" and nothing
     # read `html`, so its mirror line said "(no text)" and the vetting read had no body to judge. body_text() is
@@ -3171,6 +3187,69 @@ def run():
         finally:
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
 
+    # ------------------------------------------- 20c2. an address with another spelling (owner, 2026-10-12)
+    # Brief: "An aliased mail must be treated exactly as mail to its target … An alias to a missing channel behaves
+    # like today's unknown name. Selfcheck cases cover an alias hit, a miss, and an alias whose target doesn't
+    # exist." Each case is its own mail through the real door, the router handed MAIL_ALIASES as the daemon does.
+    k(router.alias_map("site=mem--site, Sam@box.example=Other\nhome=mem x=x bad= =y plain") ==
+      {"site": "mem--site", "sam": "other"} and router.alias_map("") == {},
+      "MAIL_ALIASES reads alias=target pairs, folds each side to a lower-case local part, and skips a pair "
+      "missing a side, a self-alias and any alias of home@")
+    with Box(allow=",".join([ALLOWED, OWNER, "second@allowed.example"]), MAIL_RATE=500) as b:
+        os.environ["CC_MAIL_ROUTE_FAKE"] = ""
+        try:
+            def to(rcpt, sender=ALLOWED, **kw):
+                return arrived(b, sender, rcpt=rcpt + "@box.example", to=rcpt + "@box.example", **kw)
+
+            # (a) a hit: the alias is decided exactly as its target is
+            dec = router.route(to("site"), Dir(), "box.example", aliases="site=mem--site")
+            base = router.route(to("mem--site"), Dir(), "box.example")
+            k(dec.rule == base.rule == "named" and [p.name for p in dec.to] == [p.name for p in base.to]
+              == ["mem--site"] and dec.workspace == base.workspace == "mem" and dec.note == "",
+              "a mail To an alias lands where a mail To its target does, rule `named`, no 'not a channel' note")
+            dec = router.route(to("site", "second@allowed.example"), Dir(), "box.example", aliases="site=mem--site")
+            k(dec.rule == "no-channel:unsure" and [p.name for p in dec.to] == ["other"] and "#site " in dec.note
+              and "mem--site" not in dec.note + dec.offer,
+              "…and the same sender check: another workspace's sender writing to it reaches only their own main "
+              "session, told the address they typed and never the target's name")
+            dec = router.route(to("notes"), Dir(), "box.example", quiet="study", aliases="notes=study")
+            k(dec.quiet and dec.rule == router.QUIET and not dec.to,
+              "…and the doors are the target's: an alias of a quiet address is quiet")
+
+            # (b) a miss: an address not on the map, or the map unset, is read as before
+            dec = router.route(to("mem--site"), Dir(), "box.example", aliases="site=other")
+            k(dec.rule == "named" and [p.name for p in dec.to] == ["mem--site"],
+              "an address that is not an alias is its own channel, whatever the map holds")
+            dec = router.route(to("site"), Dir(), "box.example")
+            k(dec.rule == "no-channel:unsure" and [p.name for p in dec.to] == ["mem"] and "#site " in dec.note,
+              "…and with MAIL_ALIASES unset the alias is a name no channel has — configured, never assumed")
+
+            # (c) an alias whose target no channel has is today's unknown name, said back as the address typed
+            dec = router.route(to("site"), Dir(), "box.example", aliases="site=gone")
+            k(dec.rule == "no-channel:unsure" and [p.name for p in dec.to] == ["mem"] and "#site " in dec.note
+              and "gone" not in dec.note + dec.offer,
+              "an alias to a missing channel lands as an unknown name does, its note naming the alias, not the target")
+
+            # (d) the reply. The record is made as the daemon makes it (new_conv on the routed mail), and the
+            # reply path answers From the address the sender wrote to, the alias, not the target it routed to.
+            first = to("site", headers={"Message-ID": "<alias-1@allowed.example>"})
+            dec = router.route(first, Dir(), "box.example", aliases="site=mem--site")
+            rec = router.new_conv(first, dec.workspace)
+            rec["roots"] = [{"chat": "C-mem--site", "ts": "222.1", "name": "mem--site",
+                             "target": "mem/site", "alias": None, "role": "to"}]
+            router.save_conv(rec)
+            k(dec.rule == "named" and outbound.from_addr(rec, "box.example") == "site@box.example"
+              and outbound.recipients(rec, "box.example") == ([ALLOWED], []),
+              "a reply to an aliased mail goes From the alias the sender wrote to, never the target's address")
+            again = to("site", subject="Re: a brief",
+                       headers={"Message-ID": "<alias-2@allowed.example>", "In-Reply-To": "<alias-1@allowed.example>"})
+            dec = router.route(again, Dir(), "box.example", aliases="site=mem--site")
+            k(dec.rule == "reply" and dec.conv and dec.conv["id"] == first["id"]
+              and [p.name for p in dec.to] == ["mem--site"],
+              "…and their answer to that reply, To the alias again, joins the same conversation in the target's channel")
+        finally:
+            os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+
     # ------------------------------------------- 20d. an HTML body on a mail the box starts (owner, 2026-09-24)
     # Brief: "a short explanation goes in a formatted mail body: multipart/alternative with an HTML part ... and a
     # diagram inlined as an image where it helps, plus the plain-text part ... keep plain text as the fallback,
@@ -3264,6 +3343,63 @@ def run():
           and bad == "cc-mail send: html must be a string",
           "`cc-mail send --json` reads html and images, leaves them empty when the ask has none, and refuses a "
           "non-string html by name")
+
+    # ------------------------------------------- 20d. per-sender rows for a forward from outside (perms, 2026-10-11)
+    # Term 3: "route Google's forwarding confirmation to #box-mail" — MAIL_PIN sends a sender to one channel
+    # whatever it was addressed to. Term 2: "no mail text in the turn" — MAIL_NO_TEXT names the senders whose
+    # words stay out of the session's turn (cc-slack's mail_hand reads textless(); tests/slack_selfcheck.py has
+    # the hand-off). Each case is its own mail through the real door, the rows handed as the daemon hands them.
+    k(router.pins("Forwarding-NoReply@google.com=#box-mail, x@y.example=, junk")
+      == {"forwarding-noreply@google.com": "box-mail"} and router.pins("") == {},
+      "MAIL_PIN reads `addr=channel` rows like MAIL_WORKSPACE: lower-cased address, `#` dropped, an empty or "
+      "malformed row pins nothing")
+    NOTEXT = "quotes@tufenkian.example, @rugs.example"
+    k(router.textless("Quotes@Tufenkian.example", NOTEXT) and router.textless("a@rugs.example", NOTEXT)
+      and router.textless("a@eu.rugs.example", NOTEXT),
+      "MAIL_NO_TEXT names a sender by address or by @domain, subdomains included, case folded")
+    k(not router.textless("other@tufenkian.example", NOTEXT) and not router.textless("a@evilrugs.example", NOTEXT)
+      and not router.textless("a@rugs.example", "rugs.example") and not router.textless("", NOTEXT)
+      and not router.textless(ALLOWED, ""),
+      "…and nobody else: another address at the same domain, a look-alike domain, a bare word with no `@`, no "
+      "sender, or the key unset")
+    k(router.UNMAPPED in router.NOT_OWNERS and router.PINNED in router.NOT_OWNERS,
+      "a pinned mail, like an unplaced one, is in the owner's workspace without being the owner's own word")
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+        os.environ["CC_MAIL_ROUTE_FAKE"] = ""
+        try:
+            def to(rcpt, sender=ALLOWED, **kw):
+                return arrived(b, sender, rcpt=rcpt + "@box.example", to=rcpt + "@box.example", **kw)
+
+            PIN = "%s=#box" % ALLOWED
+            dec = router.route(to("mem"), Dir(), "box.example", pin=PIN)
+            k([p.name for p in dec.to] == ["box"] and not dec.cc and dec.rule == "pinned"
+              and dec.workspace == "owner" and not dec.quiet and not dec.refuse,
+              "a pinned sender's mail To a member's channel goes To the pinned channel and nowhere else, held in "
+              "the owner's workspace")
+            dec = router.route(to("mem"), Dir(), "box.example")
+            k([p.name for p in dec.to] == ["mem"] and dec.rule == "named",
+              "…and the same mail without the row is the member's, as before: the row is the whole difference")
+            dec = router.route(to("mem"), Dir(), "box.example", pin="%s=#box" % OTHER)
+            k([p.name for p in dec.to] == ["mem"] and dec.rule == "named",
+              "…a row for another sender changes nothing for this one")
+            dec = router.route(to("mem"), Dir(), "box.example", pin="%s=#box-mail" % ALLOWED)
+            k(dec.quiet and dec.rule == "pinned:no-channel" and not dec.to and not dec.cc and not dec.refuse,
+              "a pin to a channel the box cannot deliver to stores the mail and delivers it nowhere — never to the "
+              "To's own session, which is what the pin is there to keep it from")
+            dec = router.route(to("mem"), Dir(), "box.example", table="%s=" % ALLOWED, pin=PIN)
+            k(dec.refuse and "placed nowhere" in dec.refuse and not dec.to,
+              "the owner's `addr=` refusal still comes before a pin")
+            dec = router.route(to("mem", sender=STRANGER), Dir(), "box.example", pin="%s=box" % STRANGER)
+            k([p.name for p in dec.to] == ["box"] and dec.rule == "pinned" and not dec.question,
+              "a pinned sender no workspace claims is pinned, not unplaced: the row placed it")
+            cfg = {"MAIL_ALLOW": ",".join([ALLOWED, OWNER])}
+            pinned = router.route(to("mem"), Dir(), "box.example", pin=PIN)
+            own = router.route(to("box", sender=OWNER), Dir(), "box.example")
+            k(not vetting.owners_own({"from": ALLOWED}, pinned, cfg)
+              and own.workspace == "owner" and vetting.owners_own({"from": OWNER}, own, cfg),
+              "vetting does not read a pinned mail as the owner's own, while his own mail to his channel still is")
+        finally:
+            os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
 
     # ------------------------------- 21. the reply's medium follows the message it answers (owner, 2026-09-10)
     # Brief: "a message the owner sends in Slack gets a Slack reply only, even inside a mail's mirror thread; a

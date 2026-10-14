@@ -255,6 +255,9 @@ it is written on the reload step of the runbook.
                          `status` prints it live
       MAIL_EXPLAIN       the explanation addresses, split as MAIL_QUIET is (`explain` makes `explain@<domain>`
                          one). Unset, there is none. Read by the daemon, so the same restart; `status` prints it
+      MAIL_ALIASES       other spellings of an address, `alias=target` pairs split as MAIL_QUIET is
+                         (`sam=sam-test` makes `sam@<domain>` mail to `sam-test@<domain>`). Read by the daemon,
+                         so the same restart; `status` prints it
       MAIL_ALLOW         the allow-list, comma- or space-separated. Falls back to LESSONS_EMAILS, which is the
                          list the box already keeps of the people it will talk to. An address added here
                          reaches the door on the next HUP or restart, not on the next mail
@@ -1197,6 +1200,8 @@ def status(_opt=None):
     teach = sorted(router.explain_names(cfg("MAIL_EXPLAIN", "")))
     print("cc-mail: explain %s" % (", ".join("%s@%s" % (n, cfg("MAIL_DOMAIN", "") or "<domain>") for n in teach)
                                    + " (answered with a reply and a PDF)" if teach else "none (MAIL_EXPLAIN unset)"))
+    alias = sorted(router.alias_map(cfg("MAIL_ALIASES", "")).items())
+    print("cc-mail: aliases %s" % (", ".join("%s@ -> %s@" % p for p in alias) if alias else "none (MAIL_ALIASES unset)"))
     print("cc-mail: store %s (%d mails)"
           % (INBOX, len(os.listdir(INBOX)) if os.path.isdir(INBOX) else 0))
     pid = running()

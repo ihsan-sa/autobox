@@ -24,6 +24,17 @@ FOUR DOORS, ON THE BOX'S MAIL DOMAIN.
                        ever — and then the mail goes to that workspace's main session with a line asking it to
                        answer with the `email-explanation` skill: a formatted mail, or a short one with a PDF. A Cc of it
                        counts for nothing, a quiet To outranks it, it outranks a channel named beside it, and a reply in its thread follows the thread.
+AN ALIAS IS ANOTHER SPELLING OF ONE OF THE ABOVE. MAIL_ALIASES (`MAIL_ALIASES=sam=sam-test`, pairs split on commas,
+spaces or newlines) rewrites the local part before anything reads it, so `sam@…` is decided exactly as `sam-test@…`
+is: the same workspace check, the same doors, the same vetting. An alias whose target no channel has is that unknown
+name, and the sender's note names the address they typed. The reply still goes From the address they wrote to
+(outbound.from_addr), because that is the address their client threads on, and an answer to it is aliased again.
+TWO PER-SENDER ROWS, BOTH THE OWNER'S. MAIL_PIN (`addr=channel`) sends an authenticated sender's mail to one
+channel whatever it was addressed to, decided before the workspace or any address is read (route(), pins()).
+MAIL_NO_TEXT (an address or `@domain` per word) keeps a sender's subject and body out of the session's turn:
+cc-slack's mail_hand writes them to a file and the turn names the file (textless()). Both are for a forward
+from outside the box (perms' terms 2 and 3, 2026-10-11): the forward's own mail goes to the workspace it is
+for without its text in the turn, and Google's confirmation of the forward goes to the channel that runs mail.
 A mail with a named To keeps the named channels and does not run the classifier: an address a person typed
 outranks a model's guess. A mail whose only To is home@ is the classifier's either way — a channel Cc'd
 beside it watches, as a Cc does, and does not decide who acts.
@@ -101,6 +112,7 @@ as `html`, both as they were written, and a mail from a client that sends only H
 body_text() is the one place that answers "the body, as text" for both: `text` as it arrived, or the HTML with
 its tags stripped. Nothing renders, opens or fetches the HTML — here or anywhere in this door.
 """
+import email.utils
 import fcntl
 import glob
 import json
@@ -179,7 +191,8 @@ class Decision:
     `rule` is the one word saying which rule placed the mail — the ledger's answer to "why is it there":
     `reply`, `named`, `cc-only`, `classified`, `unsure`, `unmapped` for a sender the door trusts and no row
     places, `explain` for a mail To a MAIL_EXPLAIN address, `quiet` for a mail To a MAIL_QUIET address (stored, nothing else; `quiet` is True on it and
-    nothing else is set), and the `no-channel:` forms of `classified`/`unsure` (plus
+    nothing else is set), `pinned` for a mail whose sender a MAIL_PIN row sends to one channel (and
+    `pinned:no-channel`, quiet, when that channel is not one the box can deliver to), and the `no-channel:` forms of `classified`/`unsure` (plus
     `no-channel:bounce`) for a mail whose To named a channel the sender cannot reach. `note` is one sentence
     for the SENDER about that address, put before the reply they get, and "" when there is nothing to say."""
 
@@ -265,6 +278,46 @@ def explain_names(raw):
     return quiet_names(raw)
 
 
+def alias_map(raw):
+    """The MAIL_ALIASES map: `alias=target` pairs split on commas, spaces or newlines, both sides local parts and
+    lower-cased (a side written with our domain on it is its local part). A pair missing either side, a self-alias
+    and an alias of `home` are skipped: home@ is the classifier's by name, and a name the box gives is not
+    rewritten by a config line. One step only, so `a=b b=c` sends a@ to b, never on to c."""
+    out = {}
+    for w in re.split(r"[,\s]+", (raw or "").lower()):
+        alias, eq, target = w.partition("=")
+        alias, target = (x.strip().lstrip("@").partition("@")[0].strip() for x in (alias, target))
+        if eq and alias and target and alias != target and alias != HOME_LOCAL:
+            out[alias] = target
+    return out
+
+
+def pins(raw):
+    """The MAIL_PIN table, `addr=channel` separated by commas or newlines, read exactly as MAIL_WORKSPACE is
+    (overrides): the authenticated sender on the left, the channel its mail goes to on the right, a leading `#`
+    dropped. A row with nothing after the `=` pins nothing. See route() for where a pin is decided."""
+    return {a: c.lstrip("#") for a, c in overrides(raw).items() if c.lstrip("#")}
+
+
+def textless(sender, raw):
+    """Whether MAIL_NO_TEXT names this sender: one word per address or `@domain`, split on commas, spaces or
+    newlines. A mail from such a sender is handed to its session with no word of the sender's in the turn —
+    cc-slack's mail_hand writes the subject and body to a file and names the file instead. `@x.example` names
+    that domain and its subdomains; a bare word without an `@` names nothing, because a guess at what it meant
+    could only widen it."""
+    a = (sender or "").strip().lower()
+    dom = a.rpartition("@")[2]
+    if not a or "@" not in a:
+        return False
+    for w in re.split(r"[,\s]+", (raw or "").lower()):
+        w = w.strip()
+        if w == a:
+            return True
+        if w.startswith("@") and len(w) > 1 and (dom == w[1:] or dom.endswith("." + w[1:])):
+            return True
+    return False
+
+
 def refused_by_row(sender, table):
     """Whether the owner's table has a row for this address with nothing after the `=`. That row is his own
     "not this address" and the one case a trusted sender is still refused. A row naming a handle no member has,
@@ -274,7 +327,7 @@ def refused_by_row(sender, table):
 
 # ---------------------------------------------------------------- the addresses on our domain
 
-def addressed(msg, domain):
+def addressed(msg, domain, aliases=None):
     """(to, cc) — the local parts of the addresses on OUR domain, in the order the mail wrote them, lower-cased
     and each one once. Everything else in To:/Cc: is somebody else's mail and is ignored.
 
@@ -283,12 +336,17 @@ def addressed(msg, domain):
 
     `<name>+<tag>@` names `<name>` (RFC 5233 subaddressing): the tag is a cold mail's Reply-To carrying its
     conversation (split_tag, conv_for_reply), and a channel name never holds a `+`. An answer to a mail the
-    box started thus still names the channel it came from even when its tag is unknown here."""
+    box started thus still names the channel it came from even when its tag is unknown here.
+
+    `aliases` is alias_map()'s dict: a local part on it is read as its target, after the tag is split off."""
+    aliases = aliases or {}
+
     def parts(field):
         out = []
         for a in msg.get(field) or []:
             local, sep, dom = (a or "").strip().lower().rpartition("@")
             local = split_tag(local)[0]
+            local = aliases.get(local, local)
             if sep and dom == (domain or "").strip().lower() and local and local not in out:
                 out.append(local)
         return out
@@ -634,8 +692,27 @@ def _plain(s, n, at=True):
     return s if len(s) <= n else s[:n - 1].rstrip() + "…"
 
 
+CARD_SUBJECT = 42           # characters of a mail card's subject, its ellipsis included: where the owner's example cut
+
+
+def card_line(msg, state):
+    """The card a mail leaves in every channel it reaches, and the root of its thread: one line (owner,
+    2026-09-23), `:email: _<subject, cut>_ · <sender> · <state>`. The sender is the display name on the raw
+    From line the receiver kept (auth.header_from) or, with none, the address in a code span; both are the
+    sender's words, so they are cut and folded like any other. `state` is the box's own word — delivered, copied, held, refused,
+    dropped — never the sender's. A held or refused mail's detail (mirror_line and the vetting note) goes in
+    the card's thread, under it."""
+    # The sender's name and subject lose their backticks, as the address does: one would open a code span that
+    # swallows the rest of the card.
+    name = _plain(email.utils.parseaddr(str((msg.get("auth") or {}).get("header_from") or ""))[0], 40).replace("`", "")
+    who = name or "`%s`" % _plain(msg.get("from", ""), 80, at=False)
+    subject = _plain(msg.get("subject") or "(no subject)", CARD_SUBJECT).replace("`", "")
+    return ":email: _%s_ · %s · %s" % (subject, who, state)
+
+
 def mirror_line(msg, who=""):
-    """The one line every mail leaves in every channel it reaches, and the root of its thread.
+    """A mail's detail: who sent it, the subject, its first lines. It sits under a held or refused mail's card
+    (card_line), with the vetting note, and is what the log records when a mail arrives.
 
     `_email from `<who>` · <subject> · first lines · N attachments_` — italic, because it is the box narrating
     rather than anyone speaking, and the address in a code span, where Slack's own `mailto:` link keeps the
@@ -760,6 +837,11 @@ def unmapped_line(sender):
             "in ~/.cc/config places it: `%s=owner`, or `%s=<member handle>`." % (a, a, a))
 
 
+PINNED = "pinned"            # the `rule` of a mail whose sender a MAIL_PIN row sends to one channel
+# The rules that place a mail in the owner's workspace without it being the owner's own word: an unplaced
+# sender is there for him to place, a pinned one because his row put it there. Neither sender is the owner,
+# so cc-slack's mail_own and vetting's owner's-own tests read this tuple, not workspace == "owner" alone.
+NOT_OWNERS = (UNMAPPED, PINNED)
 QUIET = "quiet"              # the `rule` of a mail To a MAIL_QUIET address: stored by the receiver, and nothing else
 EXPLAIN = "explain"          # the `rule` of a mail To a MAIL_EXPLAIN address: the workspace's main session, skill asked
 EXPLAIN_ASK = ("This mail came to an explanation address. Load the email-explanation skill and answer with it: a "
@@ -773,7 +855,7 @@ EXPLAIN_DEFAULT = ("If this mail asks for something to be explained, answer it w
                    "Where this workspace cannot build the PDF, send the HTML mail and say nothing about a PDF.")
 
 
-def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):
+def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain="", aliases="", pin=""):
     """The whole decision for one stored mail. Returns a Decision; `refuse` set means nothing else happened.
 
     The order is the boundary. The workspace is settled from the authenticated sender before anything is resolved,
@@ -794,19 +876,44 @@ def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):
     `explain` is MAIL_EXPLAIN (explain_names). A mail To one of them is decided AFTER the workspace, since the
     brief says "the sender must still pass the allow-list and workspace map as usual": no workspace is the
     unplaced path below, as for any address. Then it is the workspace's main session, carrying EXPLAIN_ASK; a
-    reply to a known conversation follows its thread and carries the ask too when its To is still explain@."""
+    reply to a known conversation follows its thread and carries the ask too when its To is still explain@.
+
+    `aliases` is MAIL_ALIASES (alias_map). Every name below is already the target; `typed` keeps the name the
+    sender wrote, for the one place that is said back to them (the 'not a channel' note).
+
+    `pin` is MAIL_PIN (pins): `sender=channel` rows the owner writes. A mail whose authenticated sender has a
+    row goes To that channel and nowhere else, whatever it was addressed to, and is decided right after the
+    quiet door and before the workspace, a reply thread or any address is read. It is for a sender whose mail
+    must not reach the session its address names: Google's forwarding confirmation, sent to the address a
+    forward is being set up for and carrying the code that switches the forward on, goes to the channel that
+    runs mail rather than to the workspace the forward is for (perms' term 3, 2026-10-11). The row is a
+    person's word, so it is the owner's workspace that holds the mail, and the channel is not checked against
+    any sender's places. A pinned channel the box cannot deliver to stores the mail and delivers it nowhere,
+    `pinned:no-channel` — never the address's own session, which is the one place the pin exists to avoid."""
     rows = overrides(table)
     if refused_by_row(msg.get("from", ""), rows):
         # THE OWNER'S OWN "NOT THIS ADDRESS". An `addr=` row is a word a person set: it is read and obeyed
         # here, never rewritten into a delivery. Refused, in a line that says what happened.
         return Decision(refuse="This address is placed nowhere on this box, so I did not deliver it.")
-    to_names, cc_names = addressed(msg, domain)
+    amap = alias_map(aliases)
+    to_names, cc_names = addressed(msg, domain, amap)
+    typed = {}
+    for n in sum(addressed(msg, domain), []):
+        typed.setdefault(amap.get(n, n), n)
     hush = quiet_names(quiet)
     # Brief: "a quiet To delivers nothing and logs `quiet`" — any To on the list, whatever else the mail names;
     # "a Cc of a quiet address changes nothing" — a quiet Cc is dropped here and the rest decides as before.
     if any(n in hush for n in to_names):
         return Decision(rule=QUIET, quiet=True)
     cc_names = [n for n in cc_names if n not in hush]
+    ch = pins(pin).get((msg.get("from") or "").strip().lower())
+    if ch:
+        # Perms' term 3 (2026-10-11): "route Google's forwarding confirmation to #box-mail". The pin wins
+        # over the To, and a pin it cannot honour falls through to nothing, never to the To.
+        p = d.place(ch)
+        if p is None:
+            return Decision(rule=PINNED + ":no-channel", quiet=True)
+        return Decision(to=[p], workspace="owner", rule=PINNED)
     ws = workspace_for(msg.get("from", ""), rows, d)
     if ws is None:
         # TRUSTED AT THE DOOR, PLACED BY NOBODY. The owner put this address on MAIL_ALLOW and receiver.py let the
@@ -860,7 +967,8 @@ def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):
     # An address in both fields is a To: acting is the larger of the two, and a mail is never half-delivered.
     to = [places[n] for n in to_names if n in places]
     cc = [places[n] for n in cc_names if n in places and places[n] not in to]
-    unplaced = [n for n in to_names if n in lost]     # a Cc that was lost was only ever going to watch
+    # a Cc that was lost was only ever going to watch; an alias that was lost is told back as the address typed
+    unplaced = [typed.get(n, n) for n in to_names if n in lost]
     note = unplaced_note(unplaced)
     if to:
         return Decision(to=to, cc=cc, workspace=ws, rule="named", note=note)

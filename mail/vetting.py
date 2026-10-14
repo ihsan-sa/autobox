@@ -301,7 +301,7 @@ def digest(msg, dec, cfg):
     want = digest_senders(cfg)
     if not want or msg.get("attachments") or not trusted(msg.get("from"), cfg):
         return False
-    if dec.workspace != "owner" or dec.rule == _router().UNMAPPED:
+    if dec.workspace != "owner" or dec.rule in _router().NOT_OWNERS:
         return False
     a = forwarded_from(_router().body_text(msg))
     dom = a.partition("@")[2]
@@ -315,9 +315,10 @@ SHAPES_MAX = 500        # learned shapes kept; the oldest go first
 
 def owners_own(msg, dec, cfg):
     """A mail from one of the owner's own addresses: on the list, and placed in the owner's workspace by a rule
-    other than the unplaced-mail one — the router gives `owner` only to his own addresses (see digest())."""
+    other than the unplaced-mail and the pinned one (router.NOT_OWNERS) — the router gives `owner` otherwise
+    only to his own addresses (see digest())."""
     return (trusted(msg.get("from"), cfg) and dec.workspace == "owner"
-            and (dec.rule or "") != _router().UNMAPPED)
+            and (dec.rule or "") not in _router().NOT_OWNERS)
 
 
 def shape(msg, dec):
@@ -786,6 +787,10 @@ def vet(msg, dec, cfg=None):
         if dec.rule == _router().UNMAPPED:
             who = ("an address on the box's list that no workspace claims — the mail is in the owner's own "
                    "channel so that he can place it, which is where every such mail goes")
+        elif dec.rule == _router().PINNED:
+            # a MAIL_PIN row put it in this channel; the sender is a service on the list, not the owner
+            who = ("an address on the box's list that the owner sends to this one channel — it is not the "
+                   "owner, and the mail is here because of where it comes from, not what it asks")
         else:
             who = "the box's owner" if ws == "owner" else "a member of this box"
         got, why = _ask(_prompt("mail-vet-known-prompt.md",
