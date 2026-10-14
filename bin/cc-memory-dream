@@ -9,7 +9,9 @@ notes Claude Code already keeps, plus the history and the write guard they lack.
 WHERE. A memory dir is <projects>/<slug>/memory with at least MIN_NOTES notes (*.md besides MEMORY*.md). <projects> is
 ~/.claude/projects, or CC_MEMORY_ROOT. A session in a git worktree writes to its main repo's memory dir, not one of its
 own (Claude Code resolves the worktree to the repo), so a worktree has nothing to fold in. The empty memory dirs under
-slugs of temp copies (a landing's run dir) are skipped by the note count.
+slugs of temp copies (a landing's run dir) are skipped by the note count. A seat's own dir (SEAT_SLUGS: the permission
+seat's, whose memory is a launch input cc-guard fences, #1259) is never one, nor taken by --dir; cc-memory-verify reads
+the same list through memory_dirs() and seat_memory().
 
 HISTORY. Each memory dir becomes a git repo of its own the first time a pass touches it, its git dir kept OUTSIDE the
 memory dir at ~/.cc/state/memory-dream/repos/<slug>.git (a .git a session could write would be config git obeys), and
@@ -71,6 +73,7 @@ refusal, the proposals) in ~/.cc/state/memory-dream/<day>/<slug>.md. Nothing is 
 """
 import datetime
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import json
@@ -86,6 +89,7 @@ import time
 BIN = os.path.dirname(os.path.realpath(__file__))
 # recurring-defect-ok: pause-hold-missing — a box-wide nightly tidy under cc-tier; it launches no worker and writes no board
 MIN_NOTES = 5             # a dir with fewer notes has nothing worth a model call
+SEAT_SLUGS = ("*-cc-state-*-perms",)   # project slugs no pass reads or writes: cc-guard's fence on the seat's memory
 ESSENTIAL_DIRS = 1        # dirs a night takes under the essential tier, largest first
 HOOK_FLOOR = 90           # a hook longer than this is cut at a word, toward it, when the index is over its cap
 QUOTE_MIN = 20            # a "…" this long in a feedback note is an owner quote that must survive a merge
@@ -214,11 +218,17 @@ def split_note(text):
     return m.group(0), text[m.end():], (t.group(1) if t else "")
 
 
+def seat_memory(d):
+    """True when d is a seat's memory dir (its project slug matches SEAT_SLUGS), which no pass touches."""
+    s = os.path.basename(os.path.dirname(os.path.realpath(d)))
+    return any(fnmatch.fnmatchcase(s, p) for p in SEAT_SLUGS)
+
+
 def memory_dirs(root=None):
     root = root or os.environ.get("CC_MEMORY_ROOT") or home(".claude", "projects")
     out = []
     for d in glob.glob(os.path.join(root, "*", "memory")):
-        if os.path.isdir(d) and not os.path.islink(d):
+        if os.path.isdir(d) and not os.path.islink(d) and not seat_memory(d):
             n = notes_of(d)
             if len(n) >= MIN_NOTES:
                 out.append((sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
@@ -796,6 +806,9 @@ def cmd_run(argv):
         if not one or not os.path.isdir(one) or os.path.islink(one):
             print(f"cc-memory-dream: --dir needs a memory dir that exists (not a symlink), got {one or 'nothing'!r}", file=sys.stderr)
             return usage()
+        if seat_memory(one):
+            print(f"cc-memory-dream: {one} is a seat's memory, which no pass touches", file=sys.stderr)
+            return 2
     day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     tier = subprocess.run([os.path.join(BIN, "cc-tier")], capture_output=True, text=True).stdout.strip() or "autonomous"
@@ -1019,6 +1032,18 @@ def selfcheck():
         open(os.path.join(d, "notes.txt"), "w").write("not a note\n")
         run(tmp, root, {}, tier="essential")
         ok("dirs=0/0" in read(os.path.join(tmp, "state", "nights.log")).strip().split("\n")[-1], "unchanged dir skipped next night")
+
+    # 4b. the permission seat's memory (a slug in SEAT_SLUGS) is never dreamed, by the night or by --dir
+    with tempfile.TemporaryDirectory() as tmp:
+        root, d = fixture(tmp)
+        seat = os.path.join(root, "-home-u--cc-state-demo-perms", "memory")
+        os.rename(os.path.dirname(d), os.path.dirname(seat))
+        p = run(tmp, root, {"merges": [MERGE]})
+        ok(p.returncode == 0 and not has_repo(seat) and os.path.exists(os.path.join(seat, "rule-a-dup.md")),
+           f"the night skips the permission seat's memory ({p.stderr.strip()[-200:]})")
+        p = run(tmp, root, {"merges": [MERGE]}, args=("--dir", seat))
+        ok(p.returncode == 2 and not has_repo(seat) and os.path.exists(os.path.join(seat, "rule-a-dup.md")),
+           "--dir refuses the permission seat's memory")
 
     # 5. the index cap cuts the longest hook; an injected hook with a newline is ignored
     with tempfile.TemporaryDirectory() as tmp:
