@@ -250,7 +250,8 @@ class Check(Record):
     cap: seconds before it is killed (unrunnable, not red). where: runners it may use ("box", "laptop",
     "member"; U2 owns the list). mounts/net/fixtures: what its bwrap profile adds to the default. bare: a host or
     box check run on the box without cc-nosignal's signal scope (run.py), for one whose cases read what a Landlock
-    domain hides; it may signal whatever the lander can. Only a host or box check may say it."""
+    domain hides; it may signal whatever the lander can. Only a host or box check may say it. klass: host here, but a
+    manifest [[check]] with no class line is hermetic (manifest.parse_checks), base and head alike."""
     name: str
     run: str
     paths: list = field(default_factory=list)

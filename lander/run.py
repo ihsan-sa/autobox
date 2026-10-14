@@ -55,8 +55,9 @@ first, and when that re-run is unrunnable the shared red holds as main-red), the
 Outcome.sets naming both sets (no_new_reds; never for a check that guards a security path — gate_first,
 LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, and never for a head red that names no
 case, where the exit code is all there is); a check the base does not define, or whose run file the base lacks, has no
-base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic rerun alone (every slot
-held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+base run and its red is the diff's — except a check the base defines whose run file is on neither tree, which is not
+run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
+load, on either tree, gets ONE diagnostic rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
 whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded,
 a check that guards a security path or that the change touches, whose first red stands; green the second time passes
 with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
@@ -903,6 +904,13 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         if why:
             out[name] = Outcome(name, DEFERRED, f"runs at landing: {why}")
             continue
+        lacks = missing_run(repo_root, base_tree, head_tree, base_m, name)
+        if lacks:
+            # main once registered a check before the PR that brought its script, and the lane handed back
+            # every PR on "not found" when only that one PR could fix it
+            out[name] = Outcome(name, BLOCKED, f"{BLOCKED}:{name} (main registered it, but its run file {lacks} "
+                                               "is on neither the base nor the merge tree)")
+            continue
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory", so it is never quarantined
         security = name == M.BUILTIN or any(M.match(list(m.policy.gate_first) + list(m.policy.security_review) +
@@ -935,6 +943,18 @@ def runs_on_base(repo_root: str, base_tree: str, base_m, name: str) -> bool:
         return False
     f = M.run_file(base_m.checks[name].run)
     return not f or M.read_at(repo_root, base_tree, base_m.cwd.get(name, "") + f) is not None
+
+
+def missing_run(repo_root: str, base_tree: str, head_tree: str, base_m, name: str) -> str:
+    """The run file of check `name` when the base manifest defines it and neither the base tree nor the head's has
+    that file, else '': main's gap, which no change but the one that brings the file can close."""
+    if not base_tree or base_m is None or name not in base_m.checks:
+        return ""
+    f = M.run_file(base_m.checks[name].run)
+    p = base_m.cwd.get(name, "") + f
+    if not f or M.read_at(repo_root, base_tree, p) is not None or M.read_at(repo_root, head_tree, p) is not None:
+        return ""
+    return p
 
 
 def quarantine_text(repo_root: str, rev: str) -> str:

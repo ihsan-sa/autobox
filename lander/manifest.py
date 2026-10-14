@@ -30,9 +30,10 @@ PRs had, red on every run). A changed run line is
 always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
 the policy (its security list too) never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
 named. widen_faults also names a check the head adds or changes that grants itself a class outside the sandbox,
-net = true, bare = true or a mount its base definition lacks (self_widening); a check the head adds with no class
-line is hermetic, not T.Check's host default (head_check), and may not say bare. Given the trees, a check the
-head adds whose run line names files, none of them in the head's tree, is a fault too: a check lands
+net = true, bare = true or a mount its base definition lacks (self_widening). A check with no class line is
+hermetic wherever it is read, base or head (parse_checks), never T.Check's host default, and may not say bare: a new
+one reviewed as sandboxed may not move to the host once it merges (2026-10-14, #1300's security read). Given the
+trees, a check the head adds whose run line names files, none of them in the head's tree, is a fault too: a check lands
 with its tool or after it, never before. The built-in check
 `manifest-widen` (BUILTIN) is selected by any change to a manifest, policy, security or reach file and runs widen_faults
 in-process on the two git trees; `lander manifest-widen` runs it by hand, and its red is never quarantined (run.py).
@@ -69,8 +70,8 @@ TOOL_DIRS = ("bin/", "bin-private/", "core/bin/")
 # Higher runs earlier or on more: host runs before every merge, box only on the tip, hermetic in the sandbox,
 # static reads files. A class may move up this list in a head, never down.
 CLASS_RANK = {T.STATIC: 0, T.HERMETIC: 1, T.TIMING: 1, T.BOX: 2, T.HOST: 3}
-# The classes that run on the host outside the sandbox (run.py), and the one a check the head adds gets when it
-# names no class of its own.
+# The classes that run on the host outside the sandbox (run.py), and the one a check gets when its text names no
+# class of its own, in the base and in the head alike.
 UNSANDBOXED = (T.BOX, T.HOST)
 NEW_DEFAULT = T.HERMETIC
 BUILTIN = "manifest-widen"
@@ -152,15 +153,13 @@ def read_at(repo_root: str, rev: str, path: str):
 @dataclass
 class Manifest:
     """checks: name -> Check with paths and fixtures prefixed to the repo root. cwd: name -> the prefix its run
-    starts in. reach: (caller, callee) tool-name edges from every reach.tsv. faults: what was wrong with the text.
-    unclassed: the names of checks whose text has no `class` line."""
+    starts in. reach: (caller, callee) tool-name edges from every reach.tsv. faults: what was wrong with the text."""
     checks: dict = field(default_factory=dict)
     cwd: dict = field(default_factory=dict)
     policy: T.Policy = field(default_factory=T.Policy)
     reach: list = field(default_factory=list)
     sources: list = field(default_factory=list)
     faults: list = field(default_factory=list)
-    unclassed: set = field(default_factory=set)
 
     def owns(self, name: str, path: str) -> bool:
         c = self.checks[name]
@@ -208,9 +207,9 @@ def renamed(out: str) -> set:
     return src
 
 
-def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set | None = None) -> tuple:
-    """-> ([Check], [fault]). Paths and fixtures come back prefixed. unclassed: gets the name of each check that
-    names no class (it keeps T.Check's default here; head_check() decides what a new one gets)."""
+def parse_checks(text: str, prefix: str = "", source: str = "") -> tuple:
+    """-> ([Check], [fault]). Paths and fixtures come back prefixed. A check that names no class gets NEW_DEFAULT
+    (the sandbox), not T.Check's host default, so it is judged the same as the PR's own and as a base check."""
     try:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
@@ -228,13 +227,13 @@ def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set |
         if not NAME_RE.fullmatch(c.name):
             faults.append(f"{source}: check #{i + 1}: name {c.name!r} is not letters, digits, '_', '.' and '-'")
             continue
-        if c.bare and "class" not in d:   # a new one with no class line is judged hermetic (head_check), never bare
+        if c.bare and "class" not in d:   # one with no class line is hermetic, never bare
             faults.append(f"{source}: check {c.name!r}: bare = true needs its host or box class written out")
             continue
         c.paths = [prefix + p for p in c.paths]
         c.fixtures = [prefix + p for p in c.fixtures]
-        if unclassed is not None and "class" not in d:
-            unclassed.add(c.name)
+        if "class" not in d:
+            c.klass = NEW_DEFAULT
         out.append(c)
     return out, faults
 
@@ -289,7 +288,7 @@ def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True, read
         text = get(pre + MANIFEST)
         if text is not None:
             m.sources.append(pre + MANIFEST)
-            checks, faults = parse_checks(text, pre, pre + MANIFEST, m.unclassed)
+            checks, faults = parse_checks(text, pre, pre + MANIFEST)
             m.faults += faults
             for c in checks:
                 if c.name in m.checks or c.name == BUILTIN:
@@ -313,7 +312,7 @@ def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True, read
     if not m.checks and fallback:
         try:
             with open(fallback, encoding="utf-8") as f:
-                checks, faults = parse_checks(f.read(), "", fallback, m.unclassed)
+                checks, faults = parse_checks(f.read(), "", fallback)
         except OSError as e:
             checks, faults = [], [f"{fallback}: {e}"]
         m.sources.append(fallback)
@@ -332,15 +331,6 @@ def builtin_check() -> T.Check:
     """manifest-widen: owns every manifest, policy, security and reach file; run.py runs it in-process (static)."""
     return T.Check(name=BUILTIN, run="lander manifest-widen", klass=T.STATIC, cap=60,
                    paths=[p + f for p in PREFIXES for f in (MANIFEST, POLICY, SECURITY, REACH)])
-
-
-def head_check(base: Manifest, head: Manifest, n: str) -> T.Check:
-    """The head's check n as it is judged: a check the head adds with no class line gets NEW_DEFAULT (the sandbox),
-    not T.Check's host default. A check the base has keeps whatever its text says, default included."""
-    c = head.checks[n]
-    if n not in base.checks and n in head.unclassed:
-        c = dataclasses.replace(c, klass=NEW_DEFAULT)
-    return c
 
 
 def self_widening(b, h: T.Check) -> list:
@@ -450,7 +440,7 @@ def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
             if h is None and dead_check(b, base.cwd.get(n, ""), files):
                 del out.checks[n], out.cwd[n]
     for n in head.checks:
-        c = head_check(base, head, n)
+        c = head.checks[n]
         if n not in out.checks:
             if not self_widening(None, c):
                 out.checks[n], out.cwd[n] = c, head.cwd.get(n, "")
@@ -481,7 +471,7 @@ def widen_faults(base: Manifest, head: Manifest, files=None) -> list:
     bad = list(head.faults)
     # the owner's call on U2's review: a check the head adds or changes may not widen its own boundary
     for n in head.checks:
-        for w in self_widening(base.checks.get(n), head_check(base, head, n)):
+        for w in self_widening(base.checks.get(n), head.checks[n]):
             bad.append(f"check {n!r}: {'adds' if n not in base.checks else 'changes'} itself to {w}, "
                        "which its base definition does not have")
         # 2026-10-13: #1046 and #1154 added checks for tools only unmerged PRs had, and main ran them red

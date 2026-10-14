@@ -253,7 +253,7 @@ class AddOnly(unittest.TestCase):
             base.checks[c.name], base.cwd[c.name] = c, "core/"
         base.policy = M.parse_policy(POLICY, "", "p")[0]
         head = M.Manifest()
-        for c in M.parse_checks(head_text, "core/", "h", head.unclassed)[0]:
+        for c in M.parse_checks(head_text, "core/", "h")[0]:
             head.checks[c.name], head.cwd[c.name] = c, "core/"
         head.policy = base.policy
         return base, head
@@ -294,17 +294,27 @@ class AddOnly(unittest.TestCase):
             self.assertTrue(any(words in f for f in faults), (what, faults))
             self.assertNotIn("new", M.widen(base, head).checks, what)   # an added one is never selected to run
 
-    def test_a_new_check_with_no_class_runs_in_the_sandbox_and_an_old_one_keeps_its_default(self):
-        base_text = CORE_MANIFEST + '\n[[check]]\nname = "old"\nrun = "true"\n'   # no class: host, at base
-        head_text = base_text + '\n[[check]]\nname = "new"\nrun = "true"\n'
-        base, head = self.two(head_text, base_text)
+    def test_a_check_with_no_class_runs_in_the_sandbox_as_the_prs_own_and_as_a_base_check(self):
+        # 2026-10-14, #1300's security read: one reviewed as hermetic while new kept T.Check's host default once merged
+        unclassed = '\n[[check]]\nname = "u"\nrun = "true"\n'
+        base, head = self.two(CORE_MANIFEST + unclassed)   # the PR's own
         self.assertEqual(M.widen_faults(base, head), [])
-        w = M.widen(base, head)
-        self.assertEqual((w.checks["new"].klass, w.checks["old"].klass), (T.HERMETIC, T.HOST))
-        r = Repo(self)   # the same through load(): the missing class line is seen in the git text
-        head = r.commit("add", {"tests/LANDING.toml": OVERLAY_MANIFEST + '\n[[check]]\nname="n"\nrun="true"\n'})
+        own = M.widen(base, head).checks["u"].klass
+        base, head = self.two(CORE_MANIFEST + unclassed, CORE_MANIFEST + unclassed)   # merged: now a base check
+        self.assertEqual(M.widen_faults(base, head), [])
+        merged = M.widen(base, head).checks["u"].klass
+        self.assertEqual((own, merged), (T.HERMETIC, T.HERMETIC))
+        hosted = CORE_MANIFEST + unclassed + 'class = "host"\n'   # writing host in later is a widening, not a no-op
+        self.assertTrue(any("'u': changes itself to class host" in f
+                            for f in M.widen_faults(*self.two(hosted, CORE_MANIFEST + unclassed))))
+        r = Repo(self)   # the same through load() and plan(): the missing class line is seen in the git text
+        text = OVERLAY_MANIFEST + '\n[[check]]\nname="n"\nrun="true"\npaths=["n.txt"]\n'
+        head = r.commit("add", {"tests/LANDING.toml": text})
         self.assertEqual(M.widen(M.load(r.root, r.base), M.load(r.root, head)).checks["n"].klass, T.HERMETIC)
         self.assertTrue(M.widen_check(r.root, r.base, head)[0])
+        later = r.commit("later", {"n.txt": "x\n"})   # a later PR, on top of the merged one
+        self.assertEqual(M.load(r.root, head).checks["n"].klass, T.HERMETIC)
+        self.assertEqual(M.widen(M.load(r.root, head), M.load(r.root, later)).checks["n"].klass, T.HERMETIC)
 
     def test_a_grant_the_base_already_has_is_not_a_widening(self):
         base_text = CORE_MANIFEST.replace('class = "box"', 'class = "box"\nnet = true\nmounts = ["/opt/x"]\nbare = true')

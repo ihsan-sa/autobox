@@ -2147,9 +2147,29 @@ class Judge(unittest.TestCase):
         run, calls = self.runner({head: T.FAILED, r.base: T.FAILED})
         outs = RUN.run_plan(r.root, m, T.Plan(checks=["new", "e2e-x", "a"]), ["core/tests/new.sh"], head, r.base,
                             runner=run)
-        self.assertEqual((outs["new"].status, outs["e2e-x"].status), (T.FAILED, T.FAILED))
+        self.assertEqual(outs["new"].status, T.FAILED)                # the head adds it: its red is the diff's
         self.assertEqual(outs["a"].status, RUN.BLOCKED)                # a base that has it still compares
         self.assertEqual(calls.count((r.base, False)), 1)
+        # main defines e2e-x, and its script is on neither tree: main's gap, held without a run (#1127 before #1126)
+        self.assertEqual(outs["e2e-x"].status, RUN.BLOCKED)
+        self.assertIn("core/tests/e2e/x.sh", outs["e2e-x"].note)
+        self.assertEqual(RUN.missing_run(r.root, r.base, head, base_m, "e2e-x"), "core/tests/e2e/x.sh")
+        run, calls = self.runner({head: T.FAILED, r.base: T.FAILED})
+        RUN.run_plan(r.root, m, T.Plan(checks=["e2e-x"]), ["core/tests/new.sh"], head, r.base, runner=run)
+        self.assertEqual(calls, [])                                    # no gate run is spent on it
+
+    def test_a_check_whose_run_file_only_the_head_brings_is_run_and_its_red_is_the_diffs(self):
+        from test_plan import Repo, CORE_MANIFEST
+        r = Repo(self)
+        head = r.commit("head", {"core/tests/LANDING.toml": CORE_MANIFEST, "core/tests/e2e/x.sh": "exit 1\n"})
+        m, base_m = M.widen(M.load(r.root, r.base), M.load(r.root, head, strict=False)), M.load(r.root, r.base)
+        self.assertEqual(RUN.missing_run(r.root, r.base, head, base_m, "e2e-x"), "")   # the head has it
+        self.assertEqual(RUN.missing_run(r.root, r.base, head, base_m, "a"), "")       # the base has bin/a
+        self.assertEqual(RUN.missing_run(r.root, r.base, head, base_m, "docs-lint"), "")  # no run file to miss
+        run, calls = self.runner({head: T.FAILED, r.base: T.FAILED})
+        outs = RUN.run_plan(r.root, m, T.Plan(checks=["e2e-x"]), ["core/tests/e2e/x.sh"], head, r.base, runner=run)
+        self.assertEqual(outs["e2e-x"].status, T.FAILED)
+        self.assertIn((head, False), calls)
 
     def test_a_red_not_under_load_is_rerun_once_on_the_same_tree_and_recorded_once(self):
         run, calls = self.runner({self.H: T.FAILED, self.B: T.PASSED})
