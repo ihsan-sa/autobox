@@ -32,6 +32,7 @@
 #                                           a handle asks the same, and `member` refuses to start one that fails it.
 #   cc-sandbox worker-cred                  the credentials file the next worker launch will run on (WORKERS' LOGIN), after
 #                                           the same checks and refresh; cc-loop asks it so the limit it waits on is that login's.
+#                                           In the host refresher's mode, its copy or nothing and exit 2 (THE HOST REFRESHER'S MODE).
 #   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
 #   cc-sandbox --help | -h                  this header, exit 0
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
@@ -202,7 +203,7 @@
 # WORKERS' LOGIN: `cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json` makes that file the source
 #   of the stripped copy instead of the box's; `cc-config unset` (or empty) goes back. Nothing else moves: settings,
 #   hooks, agents, skills, transcripts and memory are still the box's ~/.claude, and CLAUDE_CONFIG_DIR is never set
-#   inside. That login has one refresher, this launch: with <65 min left it marks the token expired and runs `claude -p`
+#   inside. Without the host refresher's flag (below) that login has one refresher, this launch: with <65 min left it marks the token expired and runs `claude -p`
 #   on the host with CLAUDE_CONFIG_DIR at that file's dir, so the refresh lock and the write-back stay in that dir; that
 #   claude runs from a fresh 0700 dir under ~/.cc/tmp with no tools, no MCP and user settings only. Because that dir is
 #   a config dir the HOST runs claude on, the key is taken only in one shape: ~/.claude-<name>/.credentials.json, a dir
@@ -211,6 +212,16 @@
 #   missing, signed out, or expired and not refreshed: one line on stderr and the worker runs on the box's own login.
 #   `cc-sandbox worker-cred` answers which one a launch would use, and cc-loop keys its limit stamp and model record to
 #   it (CC_LIMIT_STAMP, CC_MODEL_CRED there); member workspaces and every session outside a worker never read the key.
+# THE HOST REFRESHER'S MODE (the dispatch host plan, step 11b): two refreshers of one refresh token sign each other out,
+#   so once dispatch-login refreshes the workers' login itself, this launch must not. While /etc/dispatch/login-refresh
+#   is a regular file owned by root (not a symlink, not this user's) and WORKER_CLAUDE_CREDENTIALS is set, a worker's
+#   login is the copy dispatch-login writes for the workers, at `cc-config get WORKER_CLAUDE_LOGIN_COPY` (empty →
+#   /var/lib/dispatch-login-workers/claude-login.json): an access token and its expiry, no refresh token. In that mode
+#   this never refreshes ~/.claude-workers, never takes its lock and never reads the key's file. A copy that is missing,
+#   a symlink, not a plain file, writable by group or others, unreadable, signed out or with under an hour left REFUSES
+#   the launch (exit 2, the reason on stderr), and worker-cred prints nothing and exits 2: no fallback to refreshing and
+#   none to the box's login, since either would hide a refresher that has stopped. A flag that is not root's regular file
+#   is ignored, and with no flag nothing above changes.
 # NETWORK (a worker; the member and vet profiles are their own paragraphs): an ALLOW-LIST, not the host's network. The
 #   sandbox has its own network namespace (--unshare-net: loopback and nothing else, no resolver either — the host's
 #   /run/systemd/resolve is not bound, so a DNS query is not a way out). Its one way off the box is cc-egress: a proxy
@@ -544,7 +555,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
      --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv CC_TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN
-     --unsetenv CC_SANDBOX_TEST_DELAY --setenv TMPDIR /tmp --chdir "$wt")   # the host's TMPDIR ($H/.cc/tmp) is under the tmpfs $H: scratch stays in this sandbox's own /tmp
+     --unsetenv CC_SANDBOX_TEST_DELAY --unsetenv CC_SANDBOX_TEST_REFRESH_FLAG --unsetenv CC_SANDBOX_TEST_REFRESH_UID --setenv TMPDIR /tmp --chdir "$wt")   # the host's TMPDIR ($H/.cc/tmp) is under the tmpfs $H: scratch stays in this sandbox's own /tmp
   # STILL BOUND BY NAME, and why: every source below, and settings_bind's copy, is host-owned with a PARENT no sandbox on
   # this box can reach, so there is no name here for a walled-off session to redefine. ~/.cc/members/<h>/board is the
   # near miss — a member writes its CONTENTS (it is their ~/.cc/boards) but never sees the directory above it, so the
@@ -573,10 +584,33 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc .cc/github-deny .cc/github-deny.gitconfig; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
 egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
 cred_left(){ local e; e=$(jq -r '.claudeAiOauth.expiresAt // 0' "$1" 2>/dev/null); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
+refresher_flag(){   # true while the host refresher (dispatch-login) is the one refresher of the workers' login: its flag is
+  # root's own regular file. Only root writes /etc/dispatch, so a flag of anyone else's is not the switch and is ignored.
+  # The brief: "while /etc/dispatch/login-refresh exists and is a root-owned regular file, cc-sandbox never refreshes".
+  # CC_SANDBOX_TEST_REFRESH_FLAG moves it and CC_SANDBOX_TEST_REFRESH_UID names its owner, both for the selfcheck: a
+  # worker's green runs where root is unmapped and a root-owned file is not root's. Host-only: build unsets both inside.
+  local f="${CC_SANDBOX_TEST_REFRESH_FLAG:-/etc/dispatch/login-refresh}" u="${CC_SANDBOX_TEST_REFRESH_UID:-0}"
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %u -- "$f")" = "$u" ]; }
+refresher_copy(){   # → the host refresher's copy of the workers' login, or return 2 with the reason on stderr
+  local c why="" perm left
+  c=$("$BIN/cc-config" get WORKER_CLAUDE_LOGIN_COPY 2>/dev/null); c="${c/#\~/$H}"; c="${c:-/var/lib/dispatch-login-workers/claude-login.json}"
+  if [ -L "$c" ]; then why='a symlink'
+  elif [ ! -e "$c" ]; then why=missing
+  elif [ ! -f "$c" ]; then why='not a plain file'
+  elif perm=$(stat -c %a -- "$c") && [ $(( 8#$perm & 0022 )) -ne 0 ]; then why='writable by group or others'
+  elif [ ! -r "$c" ]; then why='unreadable by this user'
+  elif ! cred_usable "$c"; then why='signed out (no access token)'
+  elif left=$(cred_left "$c") && [ "$left" -lt 3600 ]; then   # the brief: "expires within the next hour, the launch refuses"
+    if [ "$left" -le 0 ]; then why=expired; else why="expiring within the hour ($((left / 60)) min left)"; fi; fi
+  [ -z "$why" ] || { echo "cc-sandbox: the host refresher's copy of the workers' login ${c/#"$H"/\~} is $why — nothing was started. dispatch-login refreshes that login (/etc/dispatch/login-refresh is set), so this neither refreshes it nor falls back to another." >&2; return 2; }
+  echo "$c"; }
 worker_cred(){   # → the credentials file a WORKER's stripped copy is made from: the box's own, or the workers' login (WORKERS' LOGIN in the header)
   local box="$H/.claude/.credentials.json" k w d why="" perm
   k=$("$BIN/cc-config" get WORKER_CLAUDE_CREDENTIALS 2>/dev/null); k="${k/#\~/$H}"
   [ -n "$k" ] || { echo "$box"; return; }   # "empty = today's behaviour"
+  # THE HOST REFRESHER OWNS THE LOGIN (its paragraph in the header): its copy, or a refusal, and nothing here refreshes.
+  # Ahead of every check on the key, which names a file this mode never reads.
+  if refresher_flag; then refresher_copy; return; fi
   # ONE SHAPE, AN ALLOW-LIST. The file's dir becomes CLAUDE_CONFIG_DIR for a claude the HOST runs below, so a
   # settings.json with a hook in it, planted there beside an expiring credential, would run with the host's rights. A
   # list of trees to keep out (it was ~/.cc/worktrees and ~/.cc/members) missed ~/.cache, which every worker writes. So
@@ -636,7 +670,7 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # that deserves its own sentence rather than pin's "that is not the path it should be".
   [ -d "$wt" ] || { echo "cc-sandbox: no worktree $wt" >&2; exit 2; }
   build "$1" "$2"; shift 2
-  cred=$(worker_cred)
+  cred=$(worker_cred) || exit 2   # the host refresher's copy was refused, its line printed: nothing is started
   tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred" 2>/dev/null) || tok=""
   if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
   else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
@@ -2623,6 +2657,7 @@ selfcheck_workercred(){   # THE WORKERS' LOGIN (worker_cred), in a HOME of its o
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxwc-XXXXXX") || return 1; chmod 700 "$fh"
   mkdir -p "$fh/.claude" "$fh/bin" "$fh/.local/bin" "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
   wt="$fh/.cc/worktrees/r/t"; wf="$fh/.claude-workers/.credentials.json"
+  local -x CC_SANDBOX_TEST_REFRESH_FLAG="$fh/no-flag"   # every call below that does not set its own flag runs without one
   git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
     && git -C "$fh/dev/r" worktree add -q -b track/t "$wt" >/dev/null 2>&1 \
     && git -C "$fh/dev/r" worktree add -q -b track/t2 "$fh/.cc/worktrees/r/t2" >/dev/null 2>&1 || return 1
@@ -2638,7 +2673,10 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   printf '#!/bin/sh\nexit 1\n' > "$fh/norefresh"; chmod +x "$fh/refresher" "$fh/norefresh"
   probe='echo tok=$(jq -r ".claudeAiOauth.accessToken" ~/.claude/.credentials.json); echo rt=$(jq -c ".claudeAiOauth | has(\"refreshToken\")" ~/.claude/.credentials.json)
     echo set=$(sha256sum < ~/.claude/settings.json | cut -c1-16); echo hooks=$(jq -c ".hooks.PreToolUse[0].hooks[0].command" ~/.claude/settings.json); echo ccd=${CLAUDE_CONFIG_DIR:-unset}'
-  run(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="${2:-$fh/refresher}" WORKER_CLAUDE_CREDENTIALS="$1" "$SELF" r "${3:-t}" -- sh -c "$probe" 2>&1; }
+  # RF/RU/RC set the host refresher's flag, its owner and its copy for one run (HOST REFRESHER'S MODE); unset, the flag
+  # is a path that does not exist, so a box that has the real one still runs the cases above it as written
+  run(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="${2:-$fh/refresher}" WORKER_CLAUDE_CREDENTIALS="$1" CC_SANDBOX_TEST_REFRESH_FLAG="${RF:-$fh/no-flag}" \
+    CC_SANDBOX_TEST_REFRESH_UID="${RU:-0}" WORKER_CLAUDE_LOGIN_COPY="${RC:-}" "$SELF" r "${3:-t}" -- sh -c "$probe" 2>&1; }
   rwsrc(){ local k=0; while [ "$k" -lt "${#B[@]}" ]; do   # the host paths a bwrap argument list binds READ-WRITE, one a line
     case "${B[k]}" in --bind|--bind-try) printf '%s\n' "${B[k+1]}"; k=$((k+3));; --bind-fd) readlink "/proc/self/fd/${B[k+1]}"; k=$((k+3));; *) k=$((k+1));; esac; done; }
   out=$(run "$wf")
@@ -2747,6 +2785,46 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
     "$(tail -1 <<<"$out")/$(grep -c 'is in a directory that could not be made 0700 — this worker runs' <<<"$out")" "$fh/.claude/.credentials.json/1"
   rm -f "$wf"; out=$(run "$wf")
   t "workers' login: missing → the box's login, one line" "$(g tok)/$(grep -c 'is missing — this worker runs' <<<"$out")" box-access/1
+  # THE HOST REFRESHER'S MODE: with its flag root's, the worker runs on dispatch-login's copy and nothing here refreshes;
+  # without it, or with a flag that is not root's, the refresh above runs as it did. Every case starts from a workers'
+  # token with 10 min left, which a launch in today's mode always refreshes, and from a fresh copy with hours left, so a
+  # refresh that runs or a copy that is skipped shows in the case that should not have it. The flag is this user's file
+  # with RU naming this user, since a worker's green runs where root is unmapped; RU unset is the real test, owner 0.
+  local cf="$fh/dl/claude-login.json" fl="$fh/login-refresh" me; me=$(id -u)
+  mkdir -p "$fh/dl" && : > "$fl" || return 1
+  cpy(){ rm -f "$cf"; jq -n --argjson e "$1" '{claudeAiOauth: {accessToken: "copy-access", expiresAt: $e, scopes: ["user:inference"], subscriptionType: "max"}}' > "$cf" && chmod 640 "$cf"; }
+  fresh(){ rm -f "$fh/refreshed" "$fh/.claude-workers/.cc-worker-refresh.lock"; wk wk-old $(( ($(date +%s) + 600) * 1000 )); cpy 99999999999999; }
+  fresh; out=$(RC="$cf" run "$wf")
+  t "host refresher: no flag → the workers' login is refreshed as before and the copy is not read" \
+    "$(g tok)/$([ -e "$fh/refreshed" ] && echo ran || echo none)" wk-fresh/ran
+  fresh; out=$(RF="$fl" RC="$cf" run "$wf")
+  t "host refresher: a flag that is not root's → ignored, refreshed as before" "$(g tok)/$([ -e "$fh/refreshed" ] && echo ran || echo none)" wk-fresh/ran
+  fresh; ln -s "$fl" "$fh/flag-link"; out=$(RF="$fh/flag-link" RU="$me" RC="$cf" run "$wf")
+  t "host refresher: a flag that is a symlink, even to the owner's file → ignored, refreshed as before" "$(g tok)/$([ -e "$fh/refreshed" ] && echo ran || echo none)" wk-fresh/ran
+  fresh; out=$(RF="$fl" RU="$me" RC="$cf" run "$wf")
+  t "host refresher: flag set → the worker runs on the copy, no refresh token inside, the workers' login not refreshed, its lock not taken" \
+    "$(g tok)/$(g rt)/$([ -e "$fh/refreshed" ] && echo ran || echo none)/$([ -e "$fh/.claude-workers/.cc-worker-refresh.lock" ] && echo taken || echo none)/$(jq -r .claudeAiOauth.accessToken "$wf")" \
+    copy-access/false/none/none/wk-old
+  if [ "$(stat -c %u /etc/passwd 2>/dev/null)" = 0 ]; then   # where root is mapped: a real root-owned file, no RU
+    fresh; out=$(RF=/etc/passwd RC="$cf" run "$wf")
+    t "host refresher: a flag that IS root's (here /etc/passwd), with no owner override → the copy, no refresh" \
+      "$(g tok)/$([ -e "$fh/refreshed" ] && echo ran || echo none)" copy-access/none
+  fi
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$wf" CC_SANDBOX_TEST_REFRESH_FLAG="$fl" CC_SANDBOX_TEST_REFRESH_UID="$me" WORKER_CLAUDE_LOGIN_COPY="$cf" "$SELF" worker-cred 2>/dev/null)
+  t "host refresher: worker-cred names the copy" "$out" "$cf"
+  # REFUSALS: each starts the launch with the flag set and a copy it cannot use, and the probe must not run at all
+  refused(){ out=$(RF="$fl" RU="$me" RC="$cf" run "$wf")
+    t "host refresher: a copy that is $1 → the launch refuses and says so, nothing runs, nothing refreshes" \
+      "$(grep -c '^tok=' <<<"$out")/$(grep -c "copy of the workers' login .* is $1.* — nothing was started" <<<"$out")/$([ -e "$fh/refreshed" ] && echo ran || echo none)" 0/1/none; }
+  fresh; rm -f "$cf"; refused missing
+  fresh; cpy $(( ($(date +%s) - 60) * 1000 )); refused expired
+  fresh; cpy $(( ($(date +%s) + 1800) * 1000 )); refused 'expiring within the hour'
+  fresh; mv "$cf" "$fh/dl/real.json"; ln -s "$fh/dl/real.json" "$cf"; refused 'a symlink'
+  fresh; chmod 660 "$cf"; refused 'writable by group or others'
+  fresh; jq -n '{claudeAiOauth: {accessToken: "", expiresAt: 99999999999999}}' > "$cf"; chmod 640 "$cf"; refused 'signed out'
+  if [ "$me" != 0 ]; then fresh; chmod 200 "$cf"; refused 'unreadable by this user'; fi
+  fresh; rm -f "$cf"; out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$wf" CC_SANDBOX_TEST_REFRESH_FLAG="$fl" CC_SANDBOX_TEST_REFRESH_UID="$me" WORKER_CLAUDE_LOGIN_COPY="$cf" "$SELF" worker-cred 2>/dev/null; echo "rc=$?")
+  t "host refresher: …and worker-cred answers nothing, exit 2, rather than the box's login" "$out" rc=2
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
@@ -3285,7 +3363,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   # cc-loop, before every iteration: the login the launch will run on. With the fence off the command runs as given,
   # on the box's own login, so that is the answer, and the key is not read at all.
-  worker-cred) if fence_off; then echo "$H/.claude/.credentials.json"; else worker_cred; fi; exit 0;;
+  worker-cred) if fence_off; then echo "$H/.claude/.credentials.json"; else worker_cred || exit 2; fi; exit 0;;
   mint) shift; mint "$@"; exit $?;;
   vet) shift; [ "${1:-}" = -- ] && shift
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
