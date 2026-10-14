@@ -139,6 +139,22 @@ class Run(Case):
         self.assertEqual(HL.red("demo"), {})
         self.assertNotIn("since", HL.load("demo")["checks"]["app"])
 
+    def test_a_check_main_retires_leaves_the_red_list_and_one_it_keeps_stays(self):
+        self.go(TIP1, ["app/x.py", "lib/x.py"], red={"app", "lib"})
+        self.assertEqual(set(HL.red("demo")), {"app", "lib"})
+        m = manifest()
+        del m.checks["app"], m.cwd["app"]
+        with mock.patch.object(M, "load", lambda *a, **k: m):
+            self.go(TIP2, ["app/y.py"], red={"lib"})
+        self.assertEqual(set(HL.red("demo")), {"lib"})      # app retired: gone; lib still in main: still red
+        self.assertNotIn("app", HL.load("demo")["checks"])
+
+    def test_a_tip_manifest_that_reads_empty_prunes_nothing(self):
+        self.go(TIP1, ["app/x.py"], red={"app"})
+        with mock.patch.object(M, "load", lambda *a, **k: M.Manifest(checks={}, cwd={}, policy=T.Policy())):
+            self.go(TIP2, ["app/y.py"])
+        self.assertIn("app", HL.red("demo"))
+
     def test_an_unrunnable_result_is_not_recorded(self):
         self.tip, self.files[TIP1] = TIP1, ["app/x.py"]
         self.assertEqual(HL.run("demo", lambda n, s: T.Result(check=n, tree=s, status=T.UNRUNNABLE)), {})

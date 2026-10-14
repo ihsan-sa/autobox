@@ -371,6 +371,42 @@ class AddOnly(unittest.TestCase):
         self.assertIn("identity", text)
 
 
+class Retired(unittest.TestCase):
+    """A check main removed after a PR branched does not come back from that PR's head (fork). 2026-10-14: #1286
+    dropped the cc-member-* checks and every PR branched before it ran them, red on main, for a day."""
+    OLD = '\n[[check]]\nname = "old"\nrun = "core/bin/a"\npaths = ["core/bin/a"]\nclass = "static"\n'
+
+    def setUp(self):
+        self.r = Repo(self, {"tests/LANDING.toml": OVERLAY_MANIFEST + self.OLD})
+        self.main = self.r.commit("main drops old", {"tests/LANDING.toml": OVERLAY_MANIFEST})
+
+    def head(self, files):
+        git(self.r.root, "checkout", "-q", "-b", "pr" + str(len(files)), self.r.base)
+        head = self.r.commit("pr", {"core/bin/a": "#!/bin/sh\necho\n", **files})
+        git(self.r.root, "checkout", "-q", "-")
+        return head
+
+    def test_a_check_main_retired_stays_out_of_a_stale_heads_plan(self):
+        head = self.head({})
+        self.assertIn("old", M.widen(M.load(self.r.root, self.main), M.load(self.r.root, head)).checks)   # the bug
+        self.assertEqual(M.fork(self.r.root, self.main, head).checks["old"].run, "core/bin/a")
+        self.assertNotIn("old", P.plan(self.r.root, self.main, head, ["core/bin/a"]).checks)
+
+    def test_a_check_the_head_adds_or_changes_still_runs(self):
+        new = '\n[[check]]\nname = "new"\nrun = "core/bin/a"\npaths = ["core/bin/a"]\nclass = "static"\n'
+        head = self.head({"tests/LANDING.toml": OVERLAY_MANIFEST + self.OLD + new})
+        p = P.plan(self.r.root, self.main, head, ["core/bin/a", "tests/LANDING.toml"])
+        self.assertIn("new", p.checks)
+        self.assertNotIn("old", p.checks)
+        changed = self.OLD.replace('paths = ["core/bin/a"]', 'paths = ["core/bin/a", "core/bin/b"]')
+        head = self.head({"tests/LANDING.toml": OVERLAY_MANIFEST + changed, "core/x": "1"})
+        self.assertIn("old", P.plan(self.r.root, self.main, head, ["core/bin/a", "tests/LANDING.toml"]).checks)
+
+    def test_no_fork_for_the_working_copy_or_a_head_on_the_base(self):
+        self.assertIsNone(M.fork(self.r.root, self.main, ""))
+        self.assertIsNone(M.fork(self.r.root, self.main, self.r.commit("on main", {"core/bin/a": "#!/bin/sh\n:\n"})))
+
+
 class DeadWeight(unittest.TestCase):
     """A head may narrow only what it deletes: an entry naming files the base has and the head does not."""
     BASE = textwrap.dedent('''

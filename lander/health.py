@@ -159,7 +159,11 @@ def run(repo, check, fallback=""):
     rc, out = git(root, "diff", "--name-only", "--no-renames", "-z", last, tip) if last else (1, "")
     files = [f for f in out.split("\0") if f] if rc == 0 else []
     m = MF.load(root, tip, fallback=fallback, strict=False)
-    plan = T.Plan(checks=sorted(select(m, files)), klass=T.LEAF)
+    # 2026-10-14: #1286 retired the cc-member-* checks, and their FAILED entries stayed red here for good. A tip
+    # manifest that read empty is no word on what main retired, so it prunes nothing.
+    for n in [n for n in rec["checks"] if m.checks and n not in m.checks]:
+        del rec["checks"][n]
+    plan =T.Plan(checks=sorted(select(m, files)), klass=T.LEAF)
     names = set(NG.trim(repo, m, plan).checks) | {n for n in rec["checks"] if n in m.checks and
                                                   rec["checks"][n].get("status") == T.FAILED}
     # brief: "a killed or interrupted run keeps what it already learned and the next run picks up from there"

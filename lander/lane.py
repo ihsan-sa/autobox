@@ -1235,12 +1235,14 @@ class Lane:
         J.move(job, T.CHECKING)
 
     def manifest(self, job):
-        """The manifest at base, widened by the head's (what plan() planned on and `lander check` runs by), with each
+        """The manifest at base, widened by the head's less the checks main retired since the head branched (MF.fork;
+        what plan() planned on and `lander check` runs by), with each
         check's `where` from the tip of the base branch (MF.placed): a PR based before main let a check leave the box
         still sends it (2026-09-29, #800 waited hours on ten box-only host checks main had let go)."""
         try:
             m = MF.widen(MF.load(self.root, job.base_sha, fallback=self.fallback),
-                         MF.load(self.root, job.head, fallback=self.fallback, strict=False))
+                         MF.load(self.root, job.head, fallback=self.fallback, strict=False),
+                         since=MF.fork(self.root, job.base_sha, job.head, self.fallback))
         except MF.ManifestError as e:
             raise UnitFault(f"the manifest at {job.base_sha[:12]} does not parse: {e}") from None
         tip = self.tip_manifest(job.extra.get("base_ref") or "main")

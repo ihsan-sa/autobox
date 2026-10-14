@@ -29,7 +29,10 @@ here, so a head may remove it too (never_ran; 2026-10-13 #1046 and #1154 left ch
 PRs had, red on every run). A changed run line is
 always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
 the policy (its security list too) never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
-named. widen_faults also names a check the head adds or changes that grants itself a class outside the sandbox,
+named. A check main removed after a head branched is not one that head adds: plan() and the lane hand widen() the
+manifest at the merge-base (fork()), and a check the head carries unchanged from there and the base lacks stays gone
+(2026-10-14: PRs branched before #1286 kept running the cc-member-* checks it dropped, red on main). widen_faults
+also names a check the head adds or changes that grants itself a class outside the sandbox,
 net = true, bare = true or a mount its base definition lacks (self_widening). A check with no class line is
 hermetic wherever it is read, base or head (parse_checks), never T.Check's host default, and may not say bare: a new
 one reviewed as sandboxed may not move to the host once it merges (2026-10-14, #1300's security read). Given the
@@ -427,11 +430,13 @@ def dead_check(b: T.Check, cwd: str, files) -> bool:
     return never_ran(run, files) or bool(run) and all(gone(x, files) for x in run + b.paths + b.fixtures)
 
 
-def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
+def widen(base: Manifest, head: Manifest, files=None, since=None) -> Manifest:
     """What plan() selects from: the base's checks, each check's paths and fixtures widened by the head's, plus every
     check the head adds. A narrowing in the head is ignored here (and is manifest-widen's red), and so is a check the
     head adds that grants itself more than the sandbox: it never runs before manifest-widen refuses it. With files
-    (Trees), a base check the head removes as dead goes: it may not run on files the head deleted."""
+    (Trees), a base check the head removes as dead goes: it may not run on files the head deleted. With since (fork():
+    the manifest where the head branched off), a check the base lacks and the head carries exactly as it was there is
+    one main retired after the head branched, not one the head adds, so it does not come back."""
     out = Manifest(checks=dict(base.checks), cwd=dict(base.cwd), policy=base.policy, reach=list(base.reach),
                    sources=base.sources, faults=list(head.faults))
     if files is not None:
@@ -442,6 +447,9 @@ def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
     for n in head.checks:
         c = head.checks[n]
         if n not in out.checks:
+            # 2026-10-14: #1286 dropped the cc-member-* checks, and every PR branched before it ran them red again
+            if since is not None and since.checks.get(n) == head.checks[n] and since.cwd.get(n) == head.cwd.get(n):
+                continue
             if not self_widening(None, c):
                 out.checks[n], out.cwd[n] = c, head.cwd.get(n, "")
             continue
@@ -452,6 +460,24 @@ def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
             out.checks[n] = dataclasses.replace(b, paths=b.paths + more, fixtures=b.fixtures + fx)
     out.reach += [e for e in head.reach if e not in out.reach]
     return out
+
+
+def fork(repo_root: str, base_sha: str, head_sha: str, fallback: str = ""):
+    """The manifest at the merge-base of base_sha and head_sha, widen()'s `since`. None for the working copy (head
+    ""), when there is no merge-base or it is the base itself, and when it will not read: then nothing counts as
+    retired and every head check runs as before. It only ever drops a check the base does not have, so a rewritten
+    object that moved the merge-base can at worst skip a check main itself does not run. The merge-base is
+    git.merge_base's, read sealed, so no replace ref or graft of the checkout's moves it."""
+    from lander import git as G
+    if not base_sha or not head_sha:
+        return None
+    mb = G.merge_base(G.host_tree(repo_root), base_sha, head_sha)
+    if not mb or mb == base_sha:
+        return None
+    try:
+        return load(repo_root, mb, fallback=fallback)
+    except (ManifestError, G.GitError):
+        return None
 
 
 def placed(m: Manifest, tip: Manifest) -> Manifest:

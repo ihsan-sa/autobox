@@ -211,7 +211,9 @@ def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=()
     added = added_files(repo_root, base_sha, head_sha, files)
     generated = generated_reach(repo_root, base_sha, head_sha, files)
     clean = clean_manifest(repo_root, base_sha, head_sha, files, generated, fallback)
-    p = select(M.widen(base, head, M.Trees(repo_root, base_sha, head_sha)), files, protected, added, generated, clean)
+    since = M.fork(repo_root, base_sha, head_sha, fallback)   # a check main retired since the head branched stays out
+    p = select(M.widen(base, head, M.Trees(repo_root, base_sha, head_sha), since), files, protected, added, generated,
+               clean)
     # perms 10-12: "the lane can't build its plan from the PR's own head LANDING.toml". Whether code is ungated is
     # the base's word: a check the head adds (run = 'true' over **) would otherwise make it look gated, and unpaid.
     if not p.extra.get("ungated") and select(base, files, protected, added, generated, clean).extra.get("ungated"):
