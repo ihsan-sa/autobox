@@ -426,6 +426,22 @@ def run_selfcheck():
                           "second start inside 90 s of a REAL one still waits",
                           st_pre == "no-credential" and st_post == "starting" and ran_post == 1
                           and st_again == "starting" and ran_again == 0)
+                    # A MEMBER WHO DELETED THE MARKER IS NOT STARTED (perms, 2026-10-13): the host's record (the minted
+                    # credentials.json) says member and ~/dev/<h> has no marker, so autostart runs nothing; the
+                    # marker put back, the same target starts again.
+                    os.makedirs(f"{DEV}/unmarked/.cc", exist_ok=True)
+                    os.makedirs(f"{hw}/.cc/members/unmarked", exist_ok=True)
+                    with open(f"{hw}/.cc/members/unmarked/credentials.json", "w") as fmc:
+                        json.dump({"claudeAiOauth": {"accessToken": "selfcheck"}}, fmc)
+                    _popU, n_u = EFFECTS.popen_impl, len(scalls)
+                    EFFECTS.popen_impl = lambda cmd, **k: scalls.append(cmd) or type("P", (), {"poll": lambda s: 0})()
+                    st_u = Daemon.autostart(dm, "unmarked"); ran_u = len(scalls) - n_u
+                    open(f"{DEV}/unmarked/{MEMBER_MARKER}", "w").close()
+                    st_um = Daemon.autostart(dm, "unmarked")
+                    EFFECTS.popen_impl = _popU; dm.starting.pop("unmarked", None)
+                    check("autostart: a member workspace whose marker was deleted (its host record remains) is 'no-marker' "
+                          "and runs nothing; with the marker it starts",
+                          st_u == "no-marker" and ran_u == 0 and st_um == "starting" and scalls[-1] == [f"{BIN}/cc", "unmarked"])
                     # A MESSAGE NEVER STARTS A TRACK'S SESSION (2026-09-06): a finished `--go` worker leaves a worktree
                     # whose window is gone, and starting `cc <repo> <track>` there is a session nobody asked for. The
                     # owner naming it (`!start`, `!restart` → asked=True) is the one thing that still does.
@@ -9448,10 +9464,11 @@ def run_selfcheck():
           and esc_text.endswith("…") and esc_text.count("x") < 2000 and "<" not in esc_text and "`" not in esc_text)
     check("MEMBER socket: `escalate` with `notice` is a TRACK'S OWN LINE, not a request — the daemon re-enters cc-notify PLAIN "
           "on the host with the very title (`<h>/<track> <kind>` routes it into the track's thread, the table's rung, no phone) "
-          "and hands the control seat ONE `loop:` line through cc-broker (source loop, --no-start), so the thread that "
-          "dispatched it and the seat both have the end within the minute; the answer says where it went",
+          "and hands the control seat ONE `loop:` line through cc-broker (source notice, --no-start: its events.md, no wake, "
+          "since that seat did not dispatch the track), so the thread that dispatched it has the end within the minute "
+          "and the seat has it on file; the answer says where it went",
           r_not.get("ok") and ran_not == [[f"{BIN}/cc-notify", "-t", "alice/pna done", "--", "Customs documents. PR: https://x/pull/3"],
-                                          [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", CTL,
+                                          [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "notice", CTL,
                                            "loop: alice/pna done — Customs documents. PR: https://x/pull/3"]]
           and "track's thread" in r_not.get("text", "") and "seat has the line" in r_not.get("text", ""))
     check("MEMBER socket: …with an `attach` (a file: that word is a verb), the deliverable goes up INTO the track's thread as one message, the text as its "

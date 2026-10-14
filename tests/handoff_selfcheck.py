@@ -680,9 +680,20 @@ def run_selfcheck():
 
         # The packet carries the journal's newest entries only, so the successor's brief names the way to the rest:
         # a long journal is otherwise a history its successor cannot reach.
-        bt = BRIEF.format(target="j1@o", journal="~/.cc/state/j1/o-handoff.md", tmux="%1", mins=20, flight="")
+        bt = BRIEF.format(target="j1@o", journal="~/.cc/state/j1/o-handoff.md", ask=ask_line("j1@o", "%1"), mins=20,
+                          flight="")
         ok("the successor's brief says the packet holds the newest journal entries and how to reach older ones",
            "newest entries" in bt and "cc-lib ask --need history" in bt)
+        # SendMessage refuses every <repo>@<alias> and <repo>/<track> name: an orch's successor told to use it burnt
+        # two turns of its overlap (2026-10-14). Only a bare planning name is a peer SendMessage reaches.
+        ok("an orch's or a track's successor is told to reach its predecessor with cc-msg and to have the answer "
+           "sent back to its own ~next window, never with SendMessage",
+           all("SendMessage refuses this name" in ask_line(a, "%1") and "`cc-msg` it ONE batch" in ask_line(a, "%1")
+               and "reply to your `~next` window" in ask_line(a, "%1") and "notify_when_idle" not in ask_line(a, "%1")
+               for a in ("j1@o", "j1/t1")))
+        ok("...and a planning seat's successor still asks with SendMessage, naming the tmux id it matches on",
+           "`SendMessage` (notify_when_idle)" in ask_line("j1", "%7") and "tmux id %7" in ask_line("j1", "%7")
+           and "cc-msg" not in ask_line("j1", "%7"))
 
         wins["k2"], wins["k2@dash"] = "@k2", "@k2d"
         ok("...and an overlap open on one does not refuse the other",

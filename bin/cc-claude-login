@@ -2,7 +2,8 @@
 # cc-claude-login — start a Claude login the owner asked for, hand back its link, and finish it with his code.
 #
 #   cc-claude-login start <name>         start `claude auth login` for ~/.claude-<name> and print the login link
-#   cc-claude-login code <name> <code>   paste the code the owner got back from that link, and say whether it took
+#   cc-claude-login code <name>          read the code the owner got back from that link on stdin, paste it, and say
+#                                        whether it took
 #   cc-claude-login status <name>        `claude auth status` for ~/.claude-<name>
 #   cc-claude-login selfcheck
 #
@@ -16,51 +17,68 @@
 # does), never `setup-token`, whose year-long token is printed into a pane and a scrollback. It runs in a tmux
 # session of its own, cc-login-<name>, because it waits for the code after this command returns; the session is
 # wide so the link is never wrapped, and it is killed once the code has been tried. A second `start` for a name whose
-# login is still waiting prints the same link again instead of starting another. <name> is letters, digits and
-# dashes, so the config dir is always ~/.claude-<name> and never a path somebody passed in.
+# login is still waiting prints the same link again instead of starting another; one whose login already exited
+# starts afresh. The code comes on stdin and reaches the pane through a tmux buffer, so it is never in an argv that
+# ps shows. remain-on-exit is set in the same tmux call as new-session, so a login that exits at once still leaves its
+# screen to show. <name> is letters, digits and dashes, so the config dir is always ~/.claude-<name> and never a path
+# somebody passed in.
 #
-# Exit: 0 done, 1 failed (no link within CC_LOGIN_WAIT seconds, a code the login refused, not logged in), 2 usage.
+# Exit: 0 done, 1 failed (the login session would not start, it exited or showed no link within CC_LOGIN_WAIT
+# seconds, a code the login refused, not logged in), 2 usage or no code on stdin.
 # CC_CLAUDE_BIN and CC_LOGIN_TMUX (a tmux socket path) are for the selfcheck.
 set -u
 CLAUDE="${CC_CLAUDE_BIN:-$HOME/.local/bin/claude}"
 WAIT="${CC_LOGIN_WAIT:-30}"
-USAGE="usage: cc-claude-login start <name> | code <name> <code> | status <name> | selfcheck"
+USAGE="usage: cc-claude-login start <name> | code <name> (the code on stdin) | status <name> | selfcheck"
 B="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 tm(){ if [ -n "${CC_LOGIN_TMUX:-}" ]; then tmux -S "$CC_LOGIN_TMUX" "$@"; else tmux "$@"; fi; }
 name_ok(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,31}$ ]] || { echo "cc-claude-login: name must be letters, digits and dashes: '${1:-}'" >&2; return 2; }; }
 cfg(){ printf '%s/.claude-%s' "$HOME" "$1"; }
 sess(){ printf 'cc-login-%s' "$1"; }
-screen(){ tm capture-pane -p -J -t "$(sess "$1")" 2>/dev/null; }
+screen(){ tm capture-pane -p -J -S - -t "$(sess "$1")" 2>/dev/null; }
+dead(){ tm display-message -p -t "$(sess "$1")" '#{pane_dead}' 2>/dev/null; }
 link(){ screen "$1" | grep -o -E 'https://[^[:space:]]+' | grep -E 'oauth|authorize|login' | tail -1; }
 
 start(){
   local n="$1" s u i
   s=$(sess "$n")
+  [ "$(dead "$n")" = 1 ] && tm kill-session -t "=$s" 2>/dev/null
   if ! tm has-session -t "=$s" 2>/dev/null; then
     mkdir -p "$(cfg "$n")" && chmod 700 "$(cfg "$n")" || return 1
     tm new-session -d -s "$s" -x 1000 -y 50 \
-      env CLAUDE_CONFIG_DIR="$(cfg "$n")" "$CLAUDE" auth login || { echo "cc-claude-login: could not start the login session" >&2; return 1; }
-    tm set-option -t "$s" remain-on-exit on >/dev/null 2>&1
+      env CLAUDE_CONFIG_DIR="$(cfg "$n")" "$CLAUDE" auth login \; set-option -t "=$s:" remain-on-exit on >/dev/null &&
+      tm has-session -t "=$s" 2>/dev/null ||   # tmux exits 0 even when it cannot create its socket
+      { echo "cc-claude-login: could not start the login session" >&2; tm kill-session -t "=$s" 2>/dev/null; return 1; }
   fi
   for ((i = 0; i < WAIT * 2; i++)); do
     u=$(link "$n"); [ -n "$u" ] && { echo "$u"; return 0; }
+    [ "$(dead "$n")" = 1 ] && { echo "cc-claude-login: the login exited without a link; the screen was:" >&2; break; }
     sleep 0.5
   done
-  echo "cc-claude-login: no login link within ${WAIT}s; the screen was:" >&2; screen "$n" | sed '/^$/d' | tail -5 >&2
+  [ "$i" -lt $((WAIT * 2)) ] || echo "cc-claude-login: no login link within ${WAIT}s; the screen was:" >&2
+  screen "$n" | sed '/^$/d' | tail -5 >&2
   tm kill-session -t "=$s" 2>/dev/null; return 1
 }
 
 code(){
-  local n="$1" c="$2" s i dead
+  local n="$1" c s i d=""
   s=$(sess "$n")
   tm has-session -t "=$s" 2>/dev/null || { echo "cc-claude-login: no login is waiting for '$n'; run start first" >&2; return 1; }
-  tm send-keys -t "$s" -l "$c" && tm send-keys -t "$s" Enter
+  IFS= read -r c; c="${c%$'\r'}"
+  [ -n "$c" ] || { echo "cc-claude-login: no code on stdin" >&2; return 2; }
+  printf '%s' "$c" | tm load-buffer -b "$s" - && tm paste-buffer -d -b "$s" -t "$s" && tm send-keys -t "$s" Enter
+  tm delete-buffer -b "$s" 2>/dev/null   # a paste that failed would leave the code in the server's buffers
   for ((i = 0; i < WAIT * 2; i++)); do
-    dead=$(tm display-message -p -t "$s" '#{pane_dead}' 2>/dev/null); [ "$dead" = 1 ] && break
+    tm has-session -t "=$s" 2>/dev/null || { d=gone; break; }
+    d=$(dead "$n"); [ "$d" = 1 ] && break
     sleep 0.5
   done
-  [ "$dead" = 1 ] || echo "cc-claude-login: the login was still running after ${WAIT}s; stopping it" >&2
+  case "$d" in
+    1) ;;
+    gone) echo "cc-claude-login: the login session ended before it finished" >&2 ;;
+    *) echo "cc-claude-login: the login was still running after ${WAIT}s; stopping it" >&2 ;;
+  esac
   tm kill-session -t "=$s" 2>/dev/null
   status "$n"
 }
@@ -77,7 +95,7 @@ selfcheck(){   # the cases are tests/selfcheck/cc-claude-login.sh beside this bi
 
 case "${1:-}" in
   start)  [ $# = 2 ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; start "$2" ;;
-  code)   [ $# = 3 ] && [ -n "$3" ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; code "$2" "$3" ;;
+  code)   [ $# = 2 ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; code "$2" ;;
   status) [ $# = 2 ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; status "$2" ;;
   selfcheck) selfcheck ;;
   *) echo "$USAGE" >&2; exit 2 ;;

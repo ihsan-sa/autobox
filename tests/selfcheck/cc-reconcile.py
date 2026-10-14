@@ -1470,6 +1470,18 @@ def selfcheck():
             globals().update(WTS=_w)
     finally:
         shutil.rmtree(th9, ignore_errors=True); globals().update(BOARDS=_b, STATE=_s)
+    _b, _w, _s, thd = BOARDS, WTS, STATE, tempfile.mkdtemp(prefix="cc-reconcile-depth-")
+    globals().update(BOARDS=f"{thd}/.cc/boards", WTS=f"{thd}/.cc/worktrees", STATE=f"{thd}/.cc/state")
+    try:
+        os.makedirs(BOARDS)
+        json.dump({"repo": "other", "tracks": {}}, open(f"{BOARDS}/other.json", "w"))
+        for wd in (f"{WTS}/nosuchrepo/sub", f"{WTS}/other/fix"):   # a worktree made at the wrong depth, and a real repo's
+            os.makedirs(wd); os.utime(wd, (0, 0))
+        ok("orphans(): a dir at WTS/nosuchrepo/sub with no board gives no orphan (a worktree at the wrong depth is not a "
+           "track of a repo that is not there) — while a real repo's untracked worktree beside it still is",
+           [(r, t) for r, t, _ in orphans(None, net=False, grace=GRACE)] == [("other", "fix")])
+    finally:
+        shutil.rmtree(thd, ignore_errors=True); globals().update(BOARDS=_b, WTS=_w, STATE=_s)
     # ── the tick's parts: reconcile, wake, sweep, digest — each in a HOME of its own ──
     import contextlib, io
     _g = {k: globals()[k] for k in ("BOARDS", "WTS", "STATE", "DEV", "PULSE_LOG", "JANITOR_LOG", "procs", "tmux_live",
