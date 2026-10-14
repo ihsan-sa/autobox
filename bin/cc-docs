@@ -121,12 +121,14 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         changed since filing: <files>`): a re-keep adds to the source kept at filing, never replaces it. --from names the .tex of documents, one `PPP-NNNN<TAB>/abs/path.tex[<TAB>nearest]` a line ('#'
         comments and a path of `none` skipped), and becomes a document's --source when its own is unrecorded or gone;
         `nearest` records source_nearest on the revision it keeps: the nearest source found, not an exact match. Prints
-        `<number>\tkept|not kept|no source\t<detail>` per document it tried.
+        `<number>\tkept|not kept|no source|not recorded\t<detail>` per document it tried.
     cc-docs check [--post]
         Compiles every document's kept source (current revision) with DOCS_SOURCE_CHECK, which must be set, and lists
         each problem as `<number>\t<kind>\t<detail>`: `no source`, `fails`
         (its first error) or `cannot check` (the check did not run), then each revision marked with `gone` (no source,
-        or a kept one that fails) as `<number>\tgone\t<why>`, which is not a problem and is not counted below; a Markdown revision, or a kept source with no .tex (a PDF or slide deck), has nothing to compile and is skipped; then `missing TeX packages: …` from the
+        or a kept one that fails) as `<number>\tgone\t<why>`, and each whose tarball's bytes are not in the source
+        ledger (filed through the sandboxed door) as `<number>\tnot recorded\t<detail>`, which is not compiled; neither
+        is a problem, and neither is counted below; a Markdown revision, or a kept source with no .tex (a PDF or slide deck), has nothing to compile and is skipped; then `missing TeX packages: …` from the
         failures, and `N of M kept sources compile` over those with a .tex. Exit 1 when there is any problem. A pass
         is cached by the tarball's sha256 in checks.json beside the register, and a failure is compiled again each
         time. Two checks never run together: the second says so and exits 0. --post sends a summary under 800
@@ -272,7 +274,11 @@ CONFIG (cc-config keys, read through this repo's own cc-config, else the one on 
 DOCS_SOURCE_CHECK, the compile check, a command split like a shell line and run as `<cmd> [--engine E] <tarball>`:
 it prints one JSON {ok, engine, main, errors: [{path, line, message}], missing: [...], log_tail} and exits 0 when it
 compiled, 1 when it did not, anything else when it could not run; it has 120 s. Unset, a source is kept unchecked
-and `check` refuses. DOCS_TEX_TREES, the house styles, space-separated ROOT:SUB entries (a maker puts ROOT/SUB on
+and `check` refuses. DOCS_SOURCE_LEDGER, the sha256 of every source tarball this filer packed, default
+<state>/docs/sources.sha256 (CC_STATE, else ~/.cc/state), never under the root: a filer in a sandbox can write all of
+the root, so `check`, `backfill-sources` and `gone` compile only a private copy of a tarball whose bytes are in it, and
+with no ledger at all the first filing or check seeds it from the register as it stands. DOCS_TEX_TREES,
+the house styles, space-separated ROOT:SUB entries (a maker puts ROOT/SUB on
 TEXINPUTS recursively). DOCS_CHECK_CHANNEL, where `check --post` posts; unset, it posts nothing and a filing starts
 no check. LIBRARY_URL, the library site's origin, for `link`, which authenticates with LIBRARY_LINK_CLIENT_ID and
 LIBRARY_LINK_CLIENT_SECRET when both are set, else LIBRARY_FEEDBACK_CLIENT_ID and LIBRARY_FEEDBACK_CLIENT_SECRET; the
@@ -1307,22 +1313,130 @@ def record_passes(passes):
         update_checks(lambda c: c.setdefault("passes", {}).update(passes))
 
 
+# ── the source ledger ──
+# A filer running in a sandbox can write everything under ROOT, register.json and checks.json too, so the register's
+# word that a tarball is a revision's source proves nothing. The ledger, kept where no such filer reaches, holds the
+# sha256 of every source tarball this filer packed itself, and only a tarball whose bytes are in it is ever compiled.
+NOT_RECORDED = "source not recorded by this filer; not compiled"
+
+
+def ledger_path():
+    """DOCS_SOURCE_LEDGER, else docs/sources.sha256 under the state dir. One inside ROOT is refused."""
+    p = conf("DOCS_SOURCE_LEDGER") or os.path.join(os.environ.get("CC_STATE") or os.path.join(HOME, ".cc", "state"),
+                                                   "docs", "sources.sha256")
+    p = os.path.abspath(os.path.expanduser(p))
+    if within(os.path.realpath(p), [os.path.realpath(ROOT)]):
+        raise Refused(f"the source ledger {p} is inside the library, which a sandboxed filer can write "
+                      "(cc-config set DOCS_SOURCE_LEDGER <a path outside it>)")
+    return p
+
+
+def ledger():
+    """The sha256s in the ledger. With no ledger at all it is seeded once from the tarballs the register names now,
+    saying so on stderr; one that cannot be seeded trusts nothing."""
+    path = ledger_path()
+    try:
+        with open(path) as f:
+            return {ln.split()[0] for ln in f if ln.strip()}
+    except FileNotFoundError:
+        pass
+    seen = {}
+    for d in load()["documents"].values():
+        for r in d.get("revisions") or ():
+            try:
+                if r.get("sources") and os.path.isfile(os.path.join(ROOT, r["sources"])):
+                    seen.setdefault(sha_of(os.path.join(ROOT, r["sources"])), r["sources"])
+            except OSError:
+                continue
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "x") as f:
+            f.writelines(f"{h}  {rel}\n" for h, rel in seen.items())
+    except FileExistsError:
+        return ledger()
+    except OSError as e:
+        print(f"cc-docs: no source ledger at {path}, and it could not be seeded: {e}", file=sys.stderr)
+        return set()
+    print(f"cc-docs: no source ledger at {path}; seeded it with the {len(seen)} source tarball(s) the register "
+          "names now", file=sys.stderr)
+    return set(seen)
+
+
+def private_dir(prefix, fallback=False):
+    """A scratch dir beside the ledger, where no sandboxed filer reaches. With fallback, one under ROOT when that
+    cannot be made: a filer in such a sandbox, which never sees the ledger and compiles nothing of the owner's."""
+    try:
+        d = os.path.dirname(ledger_path())
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        return tempfile.mkdtemp(dir=d, prefix=prefix)
+    except (OSError, Refused) as e:
+        if not fallback:
+            raise Refused(f"no private dir beside the source ledger to compile in, so nothing is compiled: {e}")
+    os.makedirs(ROOT, mode=0o700, exist_ok=True)
+    return tempfile.mkdtemp(dir=ROOT, prefix=prefix)
+
+
+def recorded_copy(tar, into, known):
+    """The register tarball `tar` copied into the private dir `into` and hashed in the same read, so the bytes compiled
+    are the bytes found in the ledger, and a sandboxed filer cannot swap them in between. -> the copy, or None when
+    those bytes are not in the ledger."""
+    h = hashlib.sha256()
+    fd, cp = tempfile.mkstemp(dir=into, suffix=".tar.gz")
+    with open(tar, "rb") as f, os.fdopen(fd, "wb") as out:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+            out.write(chunk)
+    return cp if h.hexdigest() in known else None
+
+
+def check_recorded(cmd, tar, known):
+    """run_check on a private copy of the register tarball tar. -> (its verdict, whether it ran), or None when its
+    bytes are not in the ledger, so nothing is compiled."""
+    into = private_dir(".compile.")
+    try:
+        cp = recorded_copy(tar, into, known)
+        return run_check(cmd, cp) if cp else None
+    finally:
+        shutil.rmtree(into, ignore_errors=True)
+
+
+def record_source(sha, rel):
+    """A tarball this filer packed, added to the ledger (seeded first when there is none). A ledger that cannot be
+    written (a filer in a sandbox, which never sees it) leaves the filing as it is, and that tarball never compiles."""
+    try:
+        os.makedirs(os.path.dirname(ledger_path()), mode=0o700, exist_ok=True)
+        ledger()
+        fd = os.open(ledger_path(), os.O_WRONLY | os.O_APPEND)     # never created here: only a seed creates it
+        with os.fdopen(fd, "a") as f:
+            f.write(f"{sha}  {rel}\n")
+    except (OSError, Refused):
+        pass
+
+
 class Staged:
-    """A revision's source packed in a scratch dir under the register and checked, waiting for commit()."""
+    """A revision's source packed in a private scratch dir (private_dir) and checked, waiting for commit()."""
     def __init__(self):
-        os.makedirs(ROOT, mode=0o700, exist_ok=True)
-        self.dir = tempfile.mkdtemp(dir=ROOT, prefix=".source.")
+        self.dir = private_dir(".source.", fallback=True)
         self.tar = os.path.join(self.dir, "source.tar.gz")
         self.fields = {}
 
     def commit(self, proj, full):
-        """Into sources/PPP/<full>.tar.gz, replacing what was there. -> the fields its revision records."""
+        """Into sources/PPP/<full>.tar.gz, replacing what was there, hashed as it is copied out of the private dir and
+        recorded in the ledger. -> the fields its revision records."""
         rel = os.path.join("sources", proj, f"{full}.tar.gz")
         os.makedirs(os.path.join(ROOT, "sources", proj), exist_ok=True)
-        os.replace(self.tar, os.path.join(ROOT, rel))
+        h = hashlib.sha256()
+        fd, part = tempfile.mkstemp(dir=os.path.join(ROOT, "sources", proj), prefix=".part.")
+        with open(self.tar, "rb") as f, os.fdopen(fd, "wb") as out:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+                out.write(chunk)
+        os.chmod(part, 0o444)
+        os.replace(part, os.path.join(ROOT, rel))
+        record_source(h.hexdigest(), rel)
         if self.fields.get("source_checked"):
-            record_passes({sha_of(os.path.join(ROOT, rel)): {"at": self.fields["source_checked"],
-                                                              "engine": self.fields["source_engine"]}})
+            record_passes({h.hexdigest(): {"at": self.fields["source_checked"],
+                                           "engine": self.fields["source_engine"]}})
         return dict(self.fields, sources=rel)
 
     def close(self):
@@ -2733,6 +2847,7 @@ def cmd_backfill(a):
         todo = [(num, dict(reg["documents"][num]), dict(current(reg["documents"][num])))
                 for num in sorted(reg["documents"]) if current(reg["documents"][num])]
     cmd, cache, passes = conf("DOCS_SOURCE_CHECK"), read_checks().get("passes", {}), {}
+    known = ledger() if cmd else set()
     for num, d, r in todo:
         full = f"{num}-{r['rev']}"
         tar = os.path.join(ROOT, r["sources"]) if r.get("sources") else None
@@ -2742,9 +2857,13 @@ def cmd_backfill(a):
             if not cmd:
                 continue
             sha = sha_of(tar)
-            if sha in cache:
+            if sha in cache and sha in known:
                 continue
-            v, ran = run_check(cmd, tar)
+            got = check_recorded(cmd, tar, known)
+            if got is None:
+                print(f"{full}\tnot recorded\t{NOT_RECORDED}")
+                continue
+            v, ran = got
             if v["ok"]:
                 passes[sha] = {"at": utcnow(), "engine": v.get("engine")}
                 continue
@@ -2752,6 +2871,10 @@ def cmd_backfill(a):
         ns = argparse.Namespace(source=d.get("source"), latex=None, origin=member or None,
                                 trees=member_trees(member, "") if member else None)
         files = find_sources(ns, r.get("from") or "")
+        if any(within(os.path.realpath(p), [os.path.realpath(ROOT)]) for p, _ in files):
+            # the register names it, and a sandboxed filer can write both the register and the file
+            print(f"{full}\tnot kept\tits source is inside the library; not compiled")
+            continue
         if not files:
             print(f"{full}\tno source\t{d.get('source') or 'no --source recorded'}")
             continue
@@ -2807,7 +2930,10 @@ def cmd_gone(a):
         if not cmd:
             raise Refused("DOCS_SOURCE_CHECK is not set, so there is no telling whether the kept source compiles "
                           "(cc-config set DOCS_SOURCE_CHECK <command>)")
-        v, ran = run_check(cmd, tar)        # compiled now, whatever checks.json holds
+        got = check_recorded(cmd, tar, ledger())        # compiled now, whatever checks.json holds
+        if got is None:
+            raise Refused(f"{full}: {NOT_RECORDED}")
+        v, ran = got
         if v["ok"]:
             raise Refused(f"{full} keeps a source that compiles; nothing is gone")
         if not ran:
@@ -2854,7 +2980,7 @@ def cmd_check(a):
         except OSError:
             print("cc-docs: another check is running; this one stops")
             return 0
-        reg, checks = load(), read_checks()
+        reg, checks, known = load(), read_checks(), ledger()
         cache, passes = checks.get("passes", {}), {}
         problems, gone, missing, n_ok, n_all = [], [], set(), 0, 0
         for num in sorted(reg["documents"]):
@@ -2876,10 +3002,15 @@ def cmd_check(a):
                 continue             # a PDF, slide deck or early Markdown upload: nothing to compile
             n_all += 1
             sha = sha_of(tar)
-            if sha in cache:
+            if sha in cache and sha in known:
                 n_ok += 1
                 continue
-            v, ran = run_check(cmd, tar)
+            got = check_recorded(cmd, tar, known)
+            if got is None:
+                gone.append((full, "not recorded", NOT_RECORDED))   # refused, listed, not a problem
+                n_all -= 1
+                continue
+            v, ran = got
             if v["ok"]:
                 n_ok += 1
                 passes[sha] = {"at": utcnow(), "engine": v.get("engine")}

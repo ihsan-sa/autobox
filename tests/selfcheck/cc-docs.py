@@ -8,13 +8,17 @@ def selfcheck():
     DOCS_CHECK_CHANNEL) reaches them, and each case sets the keys it tests in the environment, which wins."""
     keys = ("CC_CONFIG", "DOCS_SOURCE_CHECK", "DOCS_TEX_TREES", "DOCS_CHECK_CHANNEL", "DOCS_PUBLIC_HOOK", "CC_SLACK_BIN",
             "CC_DOCS_GH",
+            "DOCS_SOURCE_LEDGER",
             "TEXINPUTS", "LIBRARY_URL", "LIBRARY_LINK_CLIENT_ID", "LIBRARY_LINK_CLIENT_SECRET",
             "LIBRARY_FEEDBACK_CLIENT_ID", "LIBRARY_FEEDBACK_CLIENT_SECRET")
     saved = {k: os.environ.pop(k, None) for k in keys}
     os.environ["CC_CONFIG"] = "/nonexistent/cc-docs-selfcheck-config"
+    led = tempfile.mkdtemp(prefix="cc-docs-sc-ledger-")     # the box's own ledger is never written by a case
+    os.environ["DOCS_SOURCE_LEDGER"] = os.path.join(led, "sources.sha256")
     try:
         return _selfcheck()
     finally:
+        shutil.rmtree(led, ignore_errors=True)
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1410,6 +1414,97 @@ def _selfcheck():
                and "source_main" not in r1 and "sources_backfilled" not in r1
                and "001-0002-A\tkept\t" in o and has_manifest(os.path.join(ROOT, r2["sources"]))
                and r2.get("source_main") == "main.tex" and "source_nearest" not in r2)
+            # the source ledger: a filer in a sandbox can write all of ROOT, so only a tarball whose bytes this filer
+            # recorded outside it is compiled; the sandbox is a ledger dir that cannot be written
+            ROOT = os.path.join(t, "r-ledger")
+            led0 = os.environ["DOCS_SOURCE_LEDGER"]
+            tried()
+            ro = os.path.join(t, "ro-state")
+            os.makedirs(ro)
+            os.chmod(ro, 0o500)
+            door, lg = os.path.join(ro, "docs", "sources.sha256"), os.path.join(t, "led-new", "sources.sha256")
+            os.environ["DOCS_SOURCE_LEDGER"] = door
+            l1 = texdir("led1", "\\documentclass{article}\\begin{document}first\\end{document}\n")
+            rc, o = run("file", mkpdf(src, "led1", "Ledger one"), "--project", "Led", "--kind", "work",
+                        "--title", "One", "--latex", l1)
+            r = load()["documents"]["001-0001"]["revisions"][-1]
+            tar1 = os.path.join(ROOT, r.get("sources") or "none")
+            ok("filing with a ledger dir it cannot write (a sandboxed filer) still files and keeps the source, "
+               "compiled in a scratch dir under ROOT that it removes, and records nothing",
+               rc == 0 and os.path.isfile(tar1) and tried() == ["pdflatex"] and not os.path.exists(door)
+               and not [x for x in os.listdir(ROOT) if x.startswith(".source.")])
+            os.environ["DOCS_SOURCE_LEDGER"] = lg
+            update_checks(lambda c: c.pop("passes", None))
+            rc, o = run("check")
+            sha1 = sha_of(tar1)
+            with open(lg) as fh:
+                seeded = fh.read().split()
+            with tempfile.TemporaryDirectory(dir=t) as into:
+                cp, none = recorded_copy(tar1, into, {sha1}), recorded_copy(tar1, into, set())
+                copied = cp and cp.startswith(into + "/") and sha_of(cp) == sha1 and none is None
+            ok("a missing ledger is seeded once from the register, and says so; a tarball in it is compiled, from a "
+               "private copy of the bytes found there",
+               rc == 0 and f"no source ledger at {lg}; seeded it with the 1 source tarball(s)" in o
+               and seeded == [sha1, "sources/001/001-0001-A.tar.gz"] and tried() == ["pdflatex"]
+               and "1 of 1 kept sources compile" in o.splitlines() and copied)
+            os.environ["DOCS_SOURCE_LEDGER"] = door
+            l2 = texdir("led2", "\\documentclass{article}\\begin{document}second\\end{document}\n")
+            run("file", mkpdf(src, "led2", "Ledger two"), "--project", "Led", "--title", "Two", "--latex", l2)
+            tried()
+            os.environ["DOCS_SOURCE_LEDGER"] = lg
+            rc, o = run("check")
+            ok("a revision a sandboxed filer kept is listed by check and never compiled, and does not fail the check",
+               rc == 0 and "001-0002-A\tnot recorded\tsource not recorded by this filer; not compiled" in o
+               and "seeded" not in o and tried() == [] and o.splitlines()[-1] == "1 of 1 kept sources compile")
+            # a planted tarball over a recorded one, with a forged pass in checks.json: check, backfill and gone
+            # refuse it
+            planted = os.path.join(t, "planted.tar.gz")
+            pack([(texdir("plant", "\\documentclass{article}\\begin{document}PLANTED\\end{document}\n"), "main.tex")],
+                 planted, extra=[(MANIFEST, b'{"engine": "pdflatex", "main": "main.tex"}\n')])
+            os.replace(planted, tar1)
+            update_checks(lambda c: c.setdefault("passes", {}).update({sha_of(tar1): {"at": utcnow()}}))
+            rc, o = run("check")
+            rcb, ob = run("backfill-sources")
+            rcg, og = run("gone", "001-0001-A", "--why", "lost")
+            ok("a tarball planted over a recorded one is refused by check, backfill and gone, and nothing is compiled",
+               rc == 0 and "001-0001-A\tnot recorded\tsource not recorded by this filer; not compiled" in o
+               and o.splitlines()[-1] == "0 of 0 kept sources compile"
+               and rcb == 0 and "001-0001-A\tnot recorded\tsource not recorded by this filer; not compiled" in ob
+               and "001-0002-A\tnot recorded\t" in ob
+               and rcg == 2 and "001-0001-A: source not recorded by this filer; not compiled" in og and tried() == [])
+            # backfill re-keeps from the source the register names: one inside ROOT is never packed or compiled
+            reg = load()
+            evil = os.path.join(ROOT, "evil", "main.tex")
+            os.makedirs(os.path.dirname(evil))
+            with open(evil, "w") as fh:
+                fh.write("\\documentclass{article}\\begin{document}evil\\end{document}\n")
+            reg["documents"]["001-0002"]["source"] = evil
+            reg["documents"]["001-0002"]["revisions"][-1].pop("sources")
+            save(reg)
+            rc, o = run("backfill-sources")
+            ok("backfill refuses a source the register names inside the library, compiling nothing",
+               rc == 0 and "001-0002-A\tnot kept\tits source is inside the library; not compiled" in o
+               and tried() == [] and "sources" not in load()["documents"]["001-0002"]["revisions"][-1])
+            os.environ["DOCS_SOURCE_LEDGER"] = os.path.join(ROOT, "sources.sha256")
+            rc, o = run("check")
+            ok("a ledger inside the library is refused", rc == 2 and "is inside the library" in o and tried() == [])
+            # a ledger that is there but whose dir cannot take a scratch copy: refused, nothing compiled
+            os.environ["DOCS_SOURCE_LEDGER"] = lg
+            checker = os.environ.pop("DOCS_SOURCE_CHECK")
+            l3 = texdir("led3", "\\documentclass{article}\\begin{document}third\\end{document}\n")
+            run("file", mkpdf(src, "led3", "Ledger three"), "--project", "Led", "--title", "Three", "--latex", l3)
+            os.environ["DOCS_SOURCE_CHECK"] = checker
+            ro2 = os.path.join(t, "ro-led")
+            os.makedirs(ro2)
+            shutil.copy(lg, os.path.join(ro2, "sources.sha256"))
+            os.chmod(ro2, 0o500)
+            os.environ["DOCS_SOURCE_LEDGER"] = os.path.join(ro2, "sources.sha256")
+            rc, o = run("check")
+            ok("a recorded source with no private dir to compile in is refused, not compiled under ROOT",
+               rc == 2 and "no private dir beside the source ledger" in o and tried() == [])
+            for x in (ro, ro2):
+                os.chmod(x, 0o700)
+            os.environ["DOCS_SOURCE_LEDGER"] = led0
         finally:
             globals()["_cwds"] = old_cwds
             if old_env is None:
