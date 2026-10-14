@@ -137,7 +137,8 @@
 #     inside, each org's copy is a gh config dir at ~/.config/gh-orgs/<org>, ro, and cc-gh-org picks it by the org a
 #     git or gh call names. An org with no token of its own gets the any-org token above, or none. With --org and no
 #     file there yet, or `-` for the file, the owner pastes the token at a hidden prompt first; it is saved mode 600 and
-#     asked of GitHub, and one GitHub refuses or whose repositories belong to another owner is not saved (gh_read).
+#     asked of GitHub. One that is not a fine-grained github_pat_ (a classic PAT), one GitHub refuses, or one whose
+#     repositories name any owner but the org is not saved (gh_read).
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -1384,8 +1385,9 @@ github(){   # $1 handle [--org <org>] [$2 token file] — a member workspace is 
 gh_read(){   # $1 org $2 the file — THE OWNER'S READ-IN of a fine-grained PAT for one org: a hidden prompt (a line on stdin
   # when it is not a terminal), saved mode 600, then asked of GitHub which owner's repositories it reaches. The token is
   # never echoed or printed, and goes to curl as a config file on a descriptor (--config, not -H @file, which needs curl
-  # 7.55), never an argument or the environment. A token GitHub refuses, or one whose
-  # repositories all belong to another owner, is not saved; nor is one GitHub gave any other answer about (a 404, a 5xx),
+  # 7.55), never an argument or the environment. A token that is not a fine-grained PAT (github_pat_…) is refused before
+  # it is sent anywhere: a classic PAT pasted here would hand the workspace its owner's whole GitHub reach. A token GitHub
+  # refuses, or one whose repositories name any owner but the org, is not saved; nor is one GitHub gave any other answer about (a 404, a 5xx),
   # since that checked nothing. One that reaches none yet (a new org) is saved with a warning, and so is one when GitHub
   # could not be reached at all (no connection, a timeout: curl's 000). CC_GH_API points the check elsewhere (the
   # selfcheck: nowhere, and a local server answering 404 and 500).
@@ -1393,6 +1395,7 @@ gh_read(){   # $1 org $2 the file — THE OWNER'S READ-IN of a fine-grained PAT 
   [ -t 0 ] && printf 'Paste the fine-grained token for %s (it is not shown): ' "$org" >&2
   IFS= read -rs tok; [ -t 0 ] && echo >&2
   tok=${tok//[[:space:]]/}; [ -n "$tok" ] || { echo "cc-sandbox: no token was given — nothing was saved" >&2; return 1; }
+  case $tok in github_pat_?*) ;; *) echo "cc-sandbox: this is not a fine-grained token (github_pat_…) — nothing was saved; make one with $org as the resource owner" >&2; return 1;; esac
   body=$(mktemp) || return 1
   q=${tok//\\/\\\\}; q=${q//\"/\\\"}   # the config's quoting: a backslash or a quote in the token is escaped
   code=$(curl -sS -m 20 -o "$body" -w '%{http_code}' --config /dev/fd/3 \
@@ -1401,8 +1404,8 @@ gh_read(){   # $1 org $2 the file — THE OWNER'S READ-IN of a fine-grained PAT 
   own=$(jq -r '.[]?.owner.login | ascii_downcase' "$body" 2>/dev/null | sort -u); rm -f "$body"
   case $code in
     401|403) echo "cc-sandbox: GitHub refused this token ($code) — nothing was saved" >&2; return 1;;
-    200) if [ -n "$own" ] && ! grep -qxF "$org" <<<"$own"; then
-           echo "cc-sandbox: this token reaches repositories of $(paste -sd, <<<"$own"), not $org — nothing was saved; make it with $org as the resource owner" >&2; return 1; fi
+    200) if [ -n "$own" ] && [ "$own" != "$org" ]; then   # any owner but the org refuses it, not only all of them
+           echo "cc-sandbox: this token reaches repositories of $(paste -sd, <<<"$own"), not $org alone — nothing was saved; make it with $org as the resource owner" >&2; return 1; fi
          [ -n "$own" ] || echo "cc-sandbox: this token reaches no repository yet, so I could not check it is $org's — saved anyway" >&2;;
     000) echo "cc-sandbox: could not reach GitHub to check this token — saved unchecked" >&2;;
     *) echo "cc-sandbox: GitHub answered $code, so this token was not checked — nothing was saved; try again" >&2; return 1;;
@@ -2172,9 +2175,9 @@ selfcheck_ghorgs(){   # A WORKSPACE HOLDING ONE GITHUB TOKEN PER ORG, in a HOME 
   # --org`, a third org granted nothing. git's credential lookup — the step `git push` asks — answers each org with its own
   # token and the third with none; gh answers by the org of the cwd's remote or GH_REPO; an any-org token added later fills
   # the third org only; a per-org grant removed leaves nothing of it. Every check prints a count, never a token.
-  local fh h dev out probe ta tb tc code port pid res rc
+  local fh h dev out probe ta tb tc tp code port pid res rc
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxgo-XXXXXX") || return 1; chmod 700 "$fh"
-  h="ccsbxo$$"; dev="$fh/dev/$h"; ta="fixture-org-$$-a"; tb="fixture-org-$$-b"; tc="fixture-any-$$-c"
+  h="ccsbxo$$"; dev="$fh/dev/$h"; ta="fixture-org-$$-a"; tb="fixture-org-$$-b"; tc="fixture-any-$$-c"; tp="github_pat_fixture$$"
   mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/.cc/boards" "$fh/.cc/members/$h" "$fh/.cc/secrets" || return 1
   chmod 700 "$fh/.cc/secrets"; : > "$dev/.cc/member-workspace"
   { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
@@ -2221,15 +2224,15 @@ selfcheck_ghorgs(){   # A WORKSPACE HOLDING ONE GITHUB TOKEN PER ORG, in a HOME 
   t 'gh-orgs: an org grant removed — its token is gone inside and on the host, the other org keeps its own' \
     "$(g ga)/$(g gb)/$([ -e "$fh/.cc/sandbox/$h/gh/orgs/fx-alpha" ] && echo copy || echo none)" '0/0/1/0/none'
   # the read-in: a token on stdin for an org, checked against a GitHub that cannot be reached, is saved 600 and granted
-  printf '%s\n' "$ta" | env HOME="$fh" CC_GH_API=http://127.0.0.1:9 "$SELF" github "$h" --org new-org - >/dev/null 2>&1
+  printf '%s\n' "$tp" | env HOME="$fh" CC_GH_API=http://127.0.0.1:9 "$SELF" github "$h" --org new-org - >/dev/null 2>&1
   t 'gh-orgs: the read-in saves the token to ~/.cc/secrets/github-<org>.token, mode 600, and grants it' \
-    "$(stat -c %a "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(grep -cxF "$ta" "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(readlink "$fh/.cc/members/$h/github-tokens/new-org")" \
+    "$(stat -c %a "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(grep -cxF "$tp" "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(readlink "$fh/.cc/members/$h/github-tokens/new-org")" \
     "600/1/$fh/.cc/secrets/github-new-org.token"
   # THE READ-IN AGAINST A LOCAL GITHUB, each case its own org: a server answers /user/repos once with a code and a body,
   # and writes down the Authorization header it got. Kept: a 200 whose repositories are the org's own (any case). Not
   # saved and not granted: GitHub refusing (401, 403), a 200 whose repositories all belong to another owner, and an
   # answer that checked nothing (404, 500).
-  readin(){   # $1 code $2 body $3 org → "<code>:<rc>/<saved|none>/<granted|none> "
+  readin(){   # $1 code $2 body $3 org [$4 the token, default $tp] → "<code>:<rc>/<saved|none>/<granted|none> "
     : > "$fh/port"
     python3 -c 'import http.server,sys
 class H(http.server.BaseHTTPRequestHandler):
@@ -2239,7 +2242,7 @@ class H(http.server.BaseHTTPRequestHandler):
 v=http.server.HTTPServer(("127.0.0.1",0),H); print(v.server_address[1],flush=True); v.handle_request()' "$1" "$fh/auth-$3" "$2" > "$fh/port" 2>/dev/null & pid=$!
     for port in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$fh/port" ] && break; sleep 0.25; done
     port=$(head -n1 "$fh/port")
-    printf '%s\n' "$ta" | env HOME="$fh" CC_GH_API="http://127.0.0.1:$port" "$SELF" github "$h" --org "$3" - >/dev/null 2>&1; rc=$?
+    printf '%s\n' "${4:-$tp}" | env HOME="$fh" CC_GH_API="http://127.0.0.1:$port" "$SELF" github "$h" --org "$3" - >/dev/null 2>&1; rc=$?
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     printf '%s:%s/%s/%s ' "$1" "$rc" "$([ -e "$fh/.cc/secrets/github-$3.token" ] && echo saved || echo none)" "$([ -e "$fh/.cc/members/$h/github-tokens/$3" ] && echo granted || echo none)"; }
   res="$(readin 404 '[]' org-404)$(readin 500 '[]' org-500)"
@@ -2249,15 +2252,25 @@ v=http.server.HTTPServer(("127.0.0.1",0),H); print(v.server_address[1],flush=Tru
   res="$(readin 200 '[{"owner":{"login":"Other-Org"}},{"owner":{"login":"someone"}}]' org-wrong)$(readin 200 '[{"owner":{"login":"Org-Right"}}]' org-right)"
   t 'gh-orgs: the read-in, a 200 whose repositories are another owner'"'"'s is refused; one of the org'"'"'s own (any case) is saved and granted' \
     "$res" '200:2/none/none 200:0/saved/granted '
+  # "refuse any token ... whose repo listing names an owner other than the org": one of the org's repositories beside
+  # another owner's is refused too, not only a listing with none of the org's; the org's alone (two repos) is kept
+  res="$(readin 200 '[{"owner":{"login":"org-mixed"}},{"owner":{"login":"someone"}}]' org-mixed)$(readin 200 '[{"owner":{"login":"org-two"}},{"owner":{"login":"Org-Two"}}]' org-two)"
+  t 'gh-orgs: the read-in, a 200 naming the org and another owner is refused; one naming the org alone is saved and granted' \
+    "$res" '200:2/none/none 200:0/saved/granted '
+  # "refuse any token that isn't a fine-grained github_pat_": a classic PAT (ghp_) or any other string is refused even
+  # when GitHub would list only the org's repositories, and is never sent; a github_pat_ with the same answer is kept
+  res="$(readin 200 '[{"owner":{"login":"org-cl"}}]' org-cl "ghp_fixture$$")$(readin 200 '[{"owner":{"login":"org-raw"}}]' org-raw "fixture-raw-$$")$(readin 200 '[{"owner":{"login":"org-fg"}}]' org-fg)"
+  t 'gh-orgs: the read-in, a classic ghp_ token or a bare string is refused and not sent; a github_pat_ one is saved and granted' \
+    "$res/$([ -s "$fh/auth-org-cl" ] || [ -s "$fh/auth-org-raw" ] && echo sent || echo unsent)" '200:2/none/none 200:2/none/none 200:0/saved/granted /unsent'
   t 'gh-orgs: …and the token reached GitHub as the Authorization header (curl --config from a descriptor)' \
-    "$(cat "$fh/auth-org-404" "$fh/auth-org-500" "$fh/auth-org-401" "$fh/auth-org-wrong" 2>/dev/null | grep -cxF "Bearer $ta")" 4
+    "$(cat "$fh/auth-org-404" "$fh/auth-org-500" "$fh/auth-org-401" "$fh/auth-org-wrong" 2>/dev/null | grep -cxF "Bearer $tp")" 4
   # A --org GITHUB WOULD NOT CALL A LOGIN, OR ONE ON THE BOX'S DENY LIST, grants nothing and saves nothing — beside a
   # well-formed one in the same HOME that does (the kept case), each with a token file already in place
   printf 'fx-denied\n' > "$fh/.cc/github-deny"
   res=""
   for o in fx-denied FX-DENIED -lead trail- 'under_score' 'sp ace' fx-fine; do
     env -u CC_GITHUB_DENY HOME="$fh" "$SELF" github "$h" --org "$o" "$fh/.cc/secrets/b.token" >/dev/null 2>&1; rc=$?
-    res+="$rc$(shopt -s nullglob dotglob; for f in "$fh/.cc/members/$h/github-tokens"/*; do case "${f##*/}" in fx-beta|org-right|new-org) ;; *) echo +; break ;; esac; done)"
+    res+="$rc$(shopt -s nullglob dotglob; for f in "$fh/.cc/members/$h/github-tokens"/*; do case "${f##*/}" in fx-beta|org-right|org-two|org-fg|new-org) ;; *) echo +; break ;; esac; done)"
     rm -f "$fh/.cc/members/$h/github-tokens/fx-fine"
   done
   env -u CC_GITHUB_DENY HOME="$fh" "$SELF" github "$h" --org '' "$fh/.cc/secrets/b.token" >/dev/null 2>&1; res+=":$?"
