@@ -45,12 +45,21 @@
                                       with no fence of its own or hidden character in either) and the owner's
                                       👍 on it through Slack. The owner, the token, #approvals and the record dir come from the
                                       password database's home and its ~/.cc/config, never the environment, and the command runs
-                                      in an environment built there, not the caller's. It claims the card twice before
+                                      in an environment built there, not the caller's (SSH_AUTH_SOCK only this user's own
+                                      agent socket at /run/user/<uid>/openssh_agent, so an approved push can reach its remote). It claims the card twice before
                                       it runs, on the host (an O_EXCL .ran file) and in Slack (the bot's ⏳ on the card), and
                                       either one already there refuses the run. The DM masks tokens, keys and NAME=secret
-                                      values; the whole output stays in ~/.cc/approvals/run/<ts>.ran. Every refusal and
-                                      every run is a line in ~/.cc/approvals/run/log. When his 👍 is refused or the command
-                                      fails, the seat that posted the card (the record's `from`) is told why by cc-msg.
+                                      values in the output's last 16 KB (RUN_MASK_CAP), cut before masking; the whole output stays in ~/.cc/approvals/run/<ts>.ran. Every refusal and
+                                      every run is a line in ~/.cc/approvals/run/log. The card's thread gets ✅ or ❌ and one
+                                      line: ran (exit 0), ran and failed (its exit code), or not run and why, for every
+                                      refusal found once his 👍 is on a card on file in #approvals. A Slack autolink in the
+                                      card (<http://host|host>, <mailto:a|a>) is read as its words when its label is its own
+                                      target; one with any other label, or a backtick in it, stays a link and refuses. When
+                                      systemd-run starts no unit, the daemon tries a scope of its own; when systemd gives
+                                      neither, the thread gets ❌ and nothing runs. Only with no systemd-run on PATH does it
+                                      start as a detached child (which dies if the command restarts cc-slackd). When his 👍
+                                      is refused or the command fails, the seat that posted the card (the record's `from`) is
+                                      told why by cc-msg.
   cc-slack selfcheck                  unit checks, no Slack needed (tests/selftest.sh runs it); the cases are core/tests/slack_selfcheck.py, run in this file's namespace; every state it touches is its own scratch dir, never the box's.
   cc-slack manifest --print | --config-token xoxe.xoxp-… --app A0…      paste-ready manifest, or push it onto an existing app; the owner still taps Reinstall and generates the app-level token.
 
@@ -87,7 +96,7 @@ and everyone there but SLACK_OWNER_ID_<N> is a member. SLACK_MIRROR_<N>=1 makes 
 rather than a move: names stay in the default workspace and its channels route by id (`workspace route|channel|employee`).
 SLACK_APPROVER_ID_<N> is the id there whose word counts as the member's; SLACK_INVITE_<N>="U… …" joins every channel made there.
 """
-import calendar, collections, contextlib, fcntl, glob, io, json, os, pwd, re, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, unicodedata, urllib.parse, urllib.request
+import calendar, collections, contextlib, fcntl, glob, io, json, os, pwd, re, select, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, unicodedata, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
@@ -119,6 +128,7 @@ RUN_CARDS = f"{PW_HOME or '/nonexistent'}/.cc/approvals/run"   # cc-notify --app
 RUN_TS_RE = re.compile(r"^[0-9]{6,12}\.[0-9]{1,9}$")           # a card ts, and the only thing a path under RUN_CARDS is built from
 RUN_TIMEOUT = 900                                              # seconds an approved command may run before it is killed and reported as exit 124
 RUN_TAIL = 1500                                                # characters of its output the owner's DM shows (never #approvals: members read it)
+RUN_MASK_CAP = 16384                                           # characters of its output's end that are masked at all: the tail is cut from these, so no output's length sets the mask's time
 RUN_LINE = "Your 👍 runs this once on the box; the exit code comes back here and the output in your DM"   # cc-notify --run writes these words; the selfcheck holds the two to each other
 # Slack stores a posted emoji as its :name:, so conversations.history hands a run card back as ":closed_lock_with_key:
 # *Approval needed:* … Your :+1: runs this …" and never with the glyphs cc-notify sent: 0 of 7 approved cards ran
@@ -128,14 +138,19 @@ RUN_CLAIM = "hourglass_flowing_sand"                            # the bot's own 
 # NAME=value, NAME: value and "NAME":"value" (credentials JSON), masked in what a run reports; NTFY_TOPIC is a secret too.
 # The value may be quoted either way (API_KEY='…', YAML password: '…') and is masked whole, spaces and all; an
 # unterminated quote still masks the word after it.
-RUN_SECRET_RE = re.compile(r"(?i)\b([a-z0-9_]*(?:token|secret|passw(?:or)?d|api_?key|topic|webhook|credential|private_?key)[a-z0-9_]*)"
+# LINEAR (security read of #659: a 40 KB word of repeated `token` took 54 s): the keyword is found by a lookahead from the
+# word's start, and the name is then the whole word, so no two stars inside one word are tried against each other.
+RUN_KEYWORDS = r"token|secret|passw(?:or)?d|api_?key|topic|webhook|credential|private_?key"
+RUN_SECRET_RE = re.compile(r"(?i)\b(?=[a-z0-9_]*?(?:" + RUN_KEYWORDS + r"))([a-z0-9_]+)"
                            r"(\"?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[\"']?[^\s\"']+)")
+RUN_NAME_RE = re.compile(r"(?i)" + RUN_KEYWORDS)   # a name the cut parted from its `=` (run_capped)
+RUN_WS, RUN_TOKEN = re.compile(r"\s*"), re.compile(r"\S*")   # run_capped steps over the tokens a cut pair owes with these, by index
 RUN_MASKS = (   # what SECRET_RE (the tool-preview mask) does not know, each seen in a real config or credentials file
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S), "[redacted private key]"),
     (re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}"), "[redacted]"),               # Anthropic/OpenAI keys and OAuth tokens
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[redacted]"),                 # a fine-grained GitHub PAT
     (re.compile(r"https?://hooks\.slack\.com/\S+"), "[redacted]"),                 # a Slack webhook: posting rights in its URL
-    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@", re.I), r"\1[redacted]@"),   # user:pass@ in a URL
+    (re.compile(r"(\b[a-z][a-z0-9+.-]{0,63}://)[^\s/:@]+:[^\s/@]+@", re.I), r"\1[redacted]@"),   # user:pass@ in a URL; the scheme bounded, as an unbounded one tried at every `\b` of `sk-sk-…` was quadratic
 )
 ACK_MAX = 10                                                   # agent posts one session can be waiting to 👍 at once
 REEXEC = "CC_SLACK_REEXEC"                                     # set on a re-exec'd channel server: the host initialised the copy before it
@@ -1569,13 +1584,17 @@ def pdf_link_post(cfg, path, to, thread=None, comment=None, title=None, mail=Tru
     _n, first = post(cfg, to or "dm", text, thread, mail=mail, ts=ts)
     return first, to
 
-def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None, library=True):
+def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None, mail_path=None,
+                library=True):
     """Upload one file to `to` (a chat id, #name, user id, or None for the owner's DM), into `thread`. Same
     contract as post(): no token, or local, means outbox log only, never a false claim of sending. Returns
     (file_id, chat); file_id None means nothing reached Slack. `mail` is post()'s tap for a file: answering a
     mail, the file either goes as an attachment (or a MAIL_OUT_LINKS link) or the call is refused before the
     upload — UploadRefused names why — so `sent` is never said of a file the sender did not get. `name` is the
-    file's name in Slack when `path` does not carry it (an open fd's /proc/self/fd/<n>, open_member_file).
+    file's name in Slack when `path` does not carry it (an open fd's /proc/self/fd/<n>, open_member_file), and
+    `mail_path` the name the mail door is handed instead of `path`: it opens that name once itself, O_NOFOLLOW, and
+    sends it only if the fd lies in the workspace's own trees (outbound.attach_bytes), which /proc/self/fd/<n> — a link
+    — never passes.
     A PDF IS NEVER UPLOADED (owner, 2026-09-28: a PDF handed to a person is a link to its library document): a filed
     one is posted as its link (pdf_link_post) and the returned id is that post's ts; one nobody filed is refused
     with cc-docs' line saying to file it first, and nothing is sent. With no cc-docs beside this script the PDF
@@ -1615,7 +1634,7 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
         # session is told — before this, Slack got the file, the mail went without it, and the tool reported `sent`
         # (2026-09-09: "[… - not attached]" reached the sender while the session told the owner it was attached)
         try:
-            why = mail_outbound().attach_check(cfg, to, thread, ts or "", path)
+            why = mail_outbound().attach_check(cfg, to, thread, ts or "", mail_path or path)
         except Exception as e:
             log(f"mail out: {e!r}"); why = ""       # a broken mail door costs the outbound copy, never the Slack post
         if why:
@@ -1637,7 +1656,7 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
     if mail:
         # `said`, not `comment`: comment has since been rewritten to Slack markup and raw ids, no use to a mail
         # reader — post() taps text as written for the same reason, one rule not two.
-        mail_tap(cfg, to, thread, text=said, path=path, ts=ts)
+        mail_tap(cfg, to, thread, text=said, path=mail_path or path, ts=ts)
     return done["files"][0]["id"], to
 
 def tmux(*args):
@@ -5051,15 +5070,30 @@ class Daemon:
                     answered(chat, ts, first.get("thread_ts"), target, "react")
             return {"ok": True, "text": "ok"}
         if verb == "file":
-            path = os.path.realpath(str(first.get("path") or ""))
+            # BY NAME, AS WRITTEN, THEN OPENED ONCE (raised-member-file-verb-checks-then-opens-by-name): a realpath
+            # here and an upload by name let a member swap a directory on the path for a link to ~/.cc between the two,
+            # and the daemon posted a host file. The member side sends the path already resolved in its own view, so
+            # nothing is realpath'd out here; open_member_file walks it with no link followed, and the upload reads that fd.
+            path = str(first.get("path") or "")
             inside = f"{HOME}/.cc/slack/files/"          # the boundary's ~/.cc/slack is this member's dir out here
             if path.startswith(inside):
                 path = f"{member_dir(h)}/files/{path[len(inside):]}"
             roots = (f"{DEV}/{h}", f"{HOME}/.cc/worktrees/{h}", f"{member_dir(h)}/files")
             if not any(path.startswith(r + "/") for r in roots):
                 return {"ok": False, "error": f"{first.get('path')} is not visible outside the boundary — put it under ~/dev/{h} first"}
-            fid, _ = upload_file(self.cfg, path, chat, first.get("thread_ts") or None, comment=first.get("text") or None, title=first.get("title") or None,
-                                 ts=str(first.get("ts") or "") or None, library=False)   # a member's PDF uploads as before
+            try:
+                fd = open_member_file(path, roots)
+            except (OSError, UploadRefused) as e:
+                log(f"file {h}: {path} refused: {e}")
+                return {"ok": False, "error": f"{first.get('path')} is not a regular file the box can read under the workspace — nothing sent"}
+            try:   # the mail door, when the thread answers a mail, is handed the checked name and opens it once itself
+                fid, _ = upload_file(self.cfg, f"/proc/self/fd/{fd}", chat, first.get("thread_ts") or None, comment=first.get("text") or None,
+                                     title=first.get("title") or None, ts=str(first.get("ts") or "") or None, name=os.path.basename(path),
+                                     mail_path=path, library=False)   # a member's PDF uploads as before
+            except UploadRefused as e:
+                return {"ok": False, "error": f"not sent — {e}"[:400]}
+            finally:
+                os.close(fd)
             if first.get("ts"):
                 react(self.cfg, chat, str(first["ts"]), "eyes", remove=True)
             if not fid:
@@ -7289,18 +7323,67 @@ class Daemon:
         """A reaction on a card `cc-notify --approval --run` posted. The brief: "only a reaction by the owner's own Slack
         user id counts, never a member's and never text" — so anyone else's 👍 is a log line and nothing more, and the
         owner's starts `cc-slack run-approved`, which checks everything again itself before it runs anything. It runs as
-        a transient user unit, not a child of this process, because the command may well restart this daemon."""
+        a transient user unit, not a child of this process, because the command may well restart this daemon.
+        systemd-run is waited on (it returns once the unit is queued) and its answer read: on 09-28 it started no unit,
+        its stderr went nowhere and the log said "started", so a 👍 ran nothing and nobody heard. When it refuses, the
+        run gets a scope of its own instead (run_approved_scope), which also leaves the daemon's cgroup. A detached
+        child does not leave it (setsid and nohup change the session, not the cgroup), so a restart of this daemon kills
+        it before it reports: while systemd-run is on PATH nothing starts that way, and when systemd gives neither a
+        unit nor a scope the card's thread gets ❌ and nothing runs. A scope that never answered starts nothing more,
+        since it may yet have run. Only with no systemd-run at all does run-approved start as a detached child, and the
+        thread is told a restart may cut its report short. When that child fails too, the card's thread gets ❌ and
+        why, and since only the owner's 👍 reaches this line, nobody else can make the bot speak."""
         if reaction not in ("+1", "thumbsup"):
             return None
         owner = self.cfg.get("SLACK_OWNER_ID")
         if not owner or who != owner:
             run_log(f"{ts}: :{reaction}: by {who} is not the owner's — nothing runs"); return None
+        argv, why = run_approved_argv(chat, ts), None
+        if argv[0] == "systemd-run":
+            try:
+                r = EFFECTS.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    run_log(f"{ts}: the owner's 👍 — run-approved started"); return None
+                why = f"systemd-run exited {r.returncode}: {last_line((r.stderr or '') + (r.stdout or '')) or '(no output)'}"
+            except Exception as e:
+                why = f"systemd-run failed: {e.__class__.__name__}: {e}"
+            run_log(f"{ts}: the owner's 👍, but {why[:300]} — starting run-approved in a scope of its own instead")
+            try:
+                up, scope_why = run_approved_scope(chat, ts)
+            except Exception as e:
+                up, scope_why = False, f"systemd-run --scope failed: {e.__class__.__name__}: {e}"
+            if up:
+                run_log(f"{ts}: the owner's 👍 — run-approved started in its own scope"); return None
+            if up is None:
+                run_log(f"{ts}: the owner's 👍, but {scope_why} — it may yet have run, so nothing else starts")
+                with contextlib.suppress(Exception):
+                    post(self.cfg, chat, "⚠️ The box's systemd did not answer in time, so this may not have run. If no "
+                         "result comes back in this thread, it did not.", thread=ts, mail=False)
+                return None
+            # No plain child here: it would stay in cc-slackd's cgroup, and the approved command may restart cc-slackd.
+            run_log(f"{ts}: the owner's 👍, but {scope_why[:300]} — not run: systemd gave it no unit or scope of its "
+                    f"own, and a plain child would die with this daemon")
+            with contextlib.suppress(Exception):
+                post(self.cfg, chat, "❌ Not run: the box's systemd would not give the run a unit or a scope of its own, "
+                     "so it would die with the Slack daemon. Nothing ran on the box.", thread=ts, mail=False)
+                react(self.cfg, chat, ts, "x")
+            return None
+        # systemd-run is not on PATH, so nothing can move the run out of cc-slackd's cgroup: it starts as a detached
+        # child (a session of its own, as setsid gives), and if the approved command restarts cc-slackd, the run dies
+        # with the daemon before it reports.
         try:
-            EFFECTS.popen(run_approved_argv(chat, ts), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL, start_new_session=True)
-            run_log(f"{ts}: the owner's 👍 — run-approved started")
+            EFFECTS.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          start_new_session=True)
+            run_log(f"{ts}: the owner's 👍 — run-approved started as a child, with no systemd-run on PATH")
+            with contextlib.suppress(Exception):
+                post(self.cfg, chat, "⚠️ Started without a systemd unit of its own, so if this command restarts the "
+                     "Slack daemon, its result may never come back here.", thread=ts, mail=False)
         except Exception as e:
             run_log(f"{ts}: the owner's 👍, but run-approved did not start: {e!r}")
+            with contextlib.suppress(Exception):
+                post(self.cfg, chat, f"❌ Not run: the box could not start the run ({e.__class__.__name__}). "
+                     f"Nothing ran on the box.", thread=ts, mail=False)
+                react(self.cfg, chat, ts, "x")
         return None
 
     def on_approval(self, chat, ts, reaction, who=None, approves=True):
@@ -10244,13 +10327,48 @@ def run_card_known(ts):
 
 def run_approved_argv(chat, ts):
     """How the daemon starts `run-approved`: its own transient user unit where systemd has one, so a command that
-    restarts cc-slackd does not kill the run that is reporting on it; a detached child otherwise. The unit name is the
+    restarts cc-slackd does not kill the run that is reporting on it; a detached child only when systemd-run is not on
+    PATH, and that child dies with the daemon. The unit name is the
     card's, so a second start while the first still runs is refused by systemd too (the .ran claim is the real once)."""
     me = [sys.executable, SELF, "run-approved", chat, ts]
     if shutil.which("systemd-run"):
         return ["systemd-run", "--user", "--quiet", "--collect", f"--unit=cc-run-approved-{ts.replace('.', '-')}",
                 f"--setenv=PATH={os.environ.get('PATH', '')}", f"--setenv=HOME={HOME}", *me]
     return me
+
+RUN_SCOPE_MARK = "cc-run-approved: in its own scope"   # what the scope's first process says before it becomes run-approved
+RUN_SCOPE_WAIT = 30                                    # seconds systemd-run --scope gets to say so (its own bus timeout is 25)
+
+def run_approved_scope(chat, ts):
+    """The second way to start `run-approved` when the transient unit was refused: `systemd-run --scope`, which moves
+    the run into a scope of its own, out of cc-slackd's cgroup, so a command that restarts the daemon does not kill the
+    run before it reports. A new session alone does not do that. The scope runs as this process's child, so it is not
+    waited on; its sh says RUN_SCOPE_MARK and only then execs run-approved, and the mark is what is waited for.
+    True: started. False: systemd-run ended without the mark, so nothing ran and a plain child is safe to start.
+    None: no answer in RUN_SCOPE_WAIT; our end of the pipe is closed, so a scope that comes up later dies on its echo,
+    but nobody can say it never ran, so nothing else starts (`&&`: an echo that fails execs nothing)."""
+    me = [sys.executable, SELF, "run-approved", chat, ts]
+    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit=cc-run-approved-{ts.replace('.', '-')}",
+            "sh", "-c", f'echo "{RUN_SCOPE_MARK}" && exec "$@" >/dev/null 2>&1', "sh", *me]
+    p = EFFECTS.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                      start_new_session=True)
+    out, deadline = b"", time.monotonic() + RUN_SCOPE_WAIT
+    try:
+        fd = p.stdout.fileno()
+        while RUN_SCOPE_MARK.encode() not in out:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return None, f"systemd-run --scope gave no answer in {RUN_SCOPE_WAIT}s"
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                with contextlib.suppress(Exception):
+                    p.wait(timeout=5)
+                return False, f"systemd-run --scope: {last_line(out.decode(errors='replace')) or '(no output)'}"
+            out += chunk
+        return True, ""
+    finally:
+        with contextlib.suppress(Exception):
+            p.stdout.close()
 
 def run_card_tail(cmd, sha):
     """The exact end of a run card, as cc-notify --run builds it: the command, escaped as Slack keeps it, in a code block,
@@ -10272,7 +10390,7 @@ def run_card_unlink(text):
     address in a card, even inside its code block, as <http://host|host> or <mailto:a@b|a@b> (a DNS card,
     2026-10-06), so the card no longer ended with the command. A link is undone only when its label is exactly the
     URL minus its scheme (minus mailto: for an address), or it is an http(s) link with no label and shows the URL
-    itself, so what is put back is what the owner saw. A link whose label says anything else is left as it is, so the
+    itself (or a label that is the whole URL, PR #1010), so what is put back is what the owner saw. A link whose label says anything else is left as it is, so the
     card does not match and nothing runs: a card may not show one target and carry another. A link holding a backtick
     is never undone, because <http://```|```> would put back the code fence that a link had stood in for, and the
     command between two such links shows as formatted text (security read of this change). A literal < in a command is &lt; on the
@@ -10281,7 +10399,7 @@ def run_card_unlink(text):
         url, scheme, rest, label = m.groups()
         if label is None:
             return url if scheme != "mailto:" else m.group(0)
-        return label if label == rest else m.group(0)
+        return label if label in (rest, url) else m.group(0)
     return RUN_CARD_LINK_RE.sub(put_back, text)
 
 RUN_CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_OWNER_ID", "SLACK_APPROVALS")
@@ -10307,13 +10425,27 @@ def run_cfg():
         return {}
     return {k: v for k, eq, v in (line.partition("=") for line in r.stdout.splitlines()) if eq and k in RUN_CFG_KEYS}
 
+RUN_RUNTIME = f"/run/user/{os.getuid()}"   # this user's runtime dir: what systemd gives XDG_RUNTIME_DIR, fixed
+
 def run_env():
     """What an approved command runs in: built from the password database and fixed values, never the caller's, so
-    no BASH_ENV, PATH or HOME of theirs decides what the approved text does — and it runs the same whoever started it."""
+    no BASH_ENV, PATH or HOME of theirs decides what the approved text does — and it runs the same whoever started it.
+    An approved `git push` must reach its remote (security read of #659): over https git asks `gh auth git-credential`,
+    which reads its token from ~/.config/gh under HOME, so no token is put here; over SSH it needs an agent, and the one
+    this user's systemd starts listens at RUN_RUNTIME/openssh_agent (ssh-agent.socket), so SSH_AUTH_SOCK names that path
+    when it is a socket of this user's own — never the caller's SSH_AUTH_SOCK, and nothing when there is none."""
     uid = os.getuid()
-    return {"HOME": PW_HOME, "USER": PW_USER, "LOGNAME": PW_USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
-            "PATH": f"{PW_HOME}/bin:{PW_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "XDG_RUNTIME_DIR": f"/run/user/{uid}", "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"}
+    env = {"HOME": PW_HOME, "USER": PW_USER, "LOGNAME": PW_USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
+           "PATH": f"{PW_HOME}/bin:{PW_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "XDG_RUNTIME_DIR": RUN_RUNTIME, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={RUN_RUNTIME}/bus"}
+    agent = f"{RUN_RUNTIME}/openssh_agent"
+    try:
+        st = os.lstat(agent)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == uid:
+            env["SSH_AUTH_SOCK"] = agent
+    except OSError:
+        pass
+    return env
 
 def run_hidden(s):
     r"""Does s hold a character that makes a card show one command and bash run another? cc-notify refuses the same set
@@ -10394,8 +10526,9 @@ def run_approved(cfg, chat, ts, run=None):
     why, rec, tell = run_card_refusal(cfg, chat, ts)
     if why:
         run_log(f"{ts}: not run — {why}")
-        if tell:
-            post(cfg, chat, f"Not run: {why}. Nothing ran on the box.", thread=ts, mail=False)
+        if tell:   # the brief (10-06): "the owner sees the outcome of each 👍 in the card's thread, with a ✅ or ❌"
+            post(cfg, chat, f"❌ Not run: {why}. Nothing ran on the box.", thread=ts, mail=False)
+            react(cfg, chat, ts, "x")
             run_tell_seat(ts, f"was refused: {why}. Nothing ran.")
         return None
     try:
@@ -10428,7 +10561,8 @@ def run_approved(cfg, chat, ts, run=None):
     # to the owner's DM, masked all the same since Slack keeps it; the whole output stays in the .ran file beside the
     # record, which only this user reads.
     mark = "✅" if rc == 0 else "❌"
-    post(cfg, chat, f"{mark} Ran it: exit {rc}. The output went to the owner's DM.", thread=ts, mail=False)
+    said = "Ran it: exit 0" if rc == 0 else f"It ran and failed on its own: exit {rc}"
+    post(cfg, chat, f"{mark} {said}. The output went to the owner's DM.", thread=ts, mail=False)
     try:
         post(cfg, cfg["SLACK_OWNER_ID"], f"{mark} The command on your #approvals card {ts} exited {rc}:\n"
              f"```\n{run_shown(rec['cmd'], 300)}\n```\nIts output, secrets masked:\n```\n{run_shown(out.strip(), RUN_TAIL) or '(no output)'}\n```\n"
@@ -10439,6 +10573,55 @@ def run_approved(cfg, chat, ts, run=None):
     if rc != 0:
         run_tell_seat(ts, f"ran, and its command exited {rc}. The whole output is in {RUN_CARDS}/{ts}.ran.")
     return rc
+
+def run_capped(text, cap=RUN_MASK_CAP):
+    """The last `cap` characters of text, cut before masking so a long output cannot make the mask slow (security read
+    of #659), and cut at a line start so no NAME=value pair loses its name to the cut and walks past the mask as a bare
+    value (nor a value on the line below its `NAME:`). A key block the cut split has an END line with no BEGIN above
+    it, so everything up to that END goes too, and one still open at the end of the output takes all that is kept."""
+    text = text or ""
+    if len(text) <= cap:
+        return text
+    dropped, t = text[:-cap], text[-cap:]
+    dropped, t = (dropped + t[:t.find("\n") + 1], t[t.find("\n") + 1:]) if "\n" in t else (dropped + t, "")
+    # A pair the cut split across lines goes whole: the masks' \s* crosses any run of blank space, so the name may sit in
+    # dropped with its value, or its `=`, kept below it after that run (#850's read: 16 KB of spaces between `password:`
+    # and the value hid the name from a check of dropped's last 256 characters). Read the last tokens of dropped with the
+    # blank space stripped from both sides of the cut, then drop each owed token and the rest of its line. Linear: strips
+    # and splits, no pattern with a star tried at every offset.
+    # What goes may itself open a pair (#850's second read: `Progress:` owed one token, that token was `password:`, and
+    # its value was then shown bare), so the same test runs again on what went, until it owes nothing. Each round reads
+    # only the text the last one dropped, by index into t, so the whole is still one pass over what is kept.
+    i, ctx = 0, dropped
+    while True:
+        s = ctx.rstrip()
+        toks = s.rsplit(None, 2)[-2:]
+        last, before = (toks[-1].lower() if toks else ""), (toks[0].lower() if len(toks) == 2 else "")
+        j = RUN_WS.match(t, i).end()
+        if last.endswith("authorization:"):
+            owed = 2                                # SECRET_RE's `Authorization:\s*\S+(?:\s+\S+)?`: the scheme and the token
+        elif "authorization:" in last or before.endswith("authorization:") or last.endswith("bearer") or s.endswith(("=", ":")):
+            owed = 1                                # the token after `Authorization: Basic`/`Bearer`, the value after NAME= / NAME:
+        elif RUN_NAME_RE.search(last) and t[j:j + 1] in ("=", ":"):
+            j, owed = j + 1, 1                      # a bare NAME line with `= value` below it: the `=` and its value
+        else:
+            break
+        for _ in range(owed):
+            j = RUN_TOKEN.match(t, RUN_WS.match(t, j).end()).end()
+        nl = t.find("\n", j)
+        j = nl + 1 if nl >= 0 else len(t)
+        ctx, i = t[i:j], j
+    gone, t = t[:i], t[i:]
+    end = re.search(r"-----END [A-Z0-9 ]*PRIVATE KEY-----", t)
+    begin = t.find("-----BEGIN ")
+    # A key block opened in what the rounds above dropped is open at the cut just as one opened in `dropped` is.
+    gb, ge = gone.rfind("-----BEGIN "), gone.rfind("-----END ")
+    still_open = gb > ge if gb >= 0 or ge >= 0 else dropped.rfind("-----BEGIN ") > dropped.rfind("-----END ")
+    if end and (begin < 0 or begin > end.start()):
+        t = "[redacted private key]" + t[end.end():]
+    elif not end and still_open:
+        t = "[redacted private key]"   # a block open at the cut and never closed: all of what is kept is its body
+    return "(the output's start is cut)\n" + t
 
 RUN_SEAT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@/-]{0,79}$")
 
@@ -10465,7 +10648,7 @@ def run_tell_seat(ts, what):
 
 def run_mask(text):
     """A run's output with every secret shape this box has met masked: SECRET_RE's, RUN_MASKS' and NAME=value pairs.
-    Masked whole, before any tail is cut, so a key block the cut would split is still found by its BEGIN line."""
+    Every pattern runs in time linear in the text; run_shown caps the text first (run_capped)."""
     text = SECRET_RE.sub("[redacted]", text or "")
     for rx, to in RUN_MASKS:
         text = rx.sub(to, text)
@@ -10477,12 +10660,16 @@ def run_mask(text):
 
 def run_shown(text, n):
     """The last n characters of text, masked, fit for a Slack code block: no fence of its own and nothing read as a link."""
-    return (run_mask(text)[-n:].replace("```", "ˋˋˋ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return (run_mask(run_capped(text))[-n:].replace("```", "ˋˋˋ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 def cmd_run_approved(argv):
     if len(argv) != 2:
         print("cc-slack run-approved <chat> <ts>", file=sys.stderr); return 2
-    rc = run_approved(run_cfg(), argv[0], argv[1])
+    try:
+        rc = run_approved(run_cfg(), argv[0], argv[1])
+    except Exception as e:   # the trail says so, where a dead unit said nothing (09-28); the thread is not told, since
+        run_log(f"{argv[1]}: run-approved stopped with {e.__class__.__name__}: {str(e)[:200]}")   # nothing here was checked
+        raise
     return 1 if rc is None else (0 if rc == 0 else 3)
 
 def cmd_post_approval(argv):

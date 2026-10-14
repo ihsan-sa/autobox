@@ -8535,6 +8535,34 @@ def run_selfcheck():
         except UploadRefused as e:
             small_read = str(e)
         globals()["MAX_UPLOAD"] = real_max_ms
+        # THE MEMBER `file` VERB, the same race (raised-member-file-verb-checks-then-opens-by-name): it realpath'd the
+        # name and uploaded by name. Each case its own fixture: kept — a plain file goes up, read from the fd; swapped
+        # after the open — still the opened file; swapped after the check and before the open (open_member_file wrapped)
+        # or a link at the last name — refused, nothing up.
+        real_omf, n_fv0 = globals()["open_member_file"], len(upSW)
+        _sw_reset(); r_fv_ok = ms_req({"file": "CAL", "path": f"{sw}/cfg"}); fv_ok = upSW[n_fv0:]
+        _sw_reset(); sw_at["upload"] = _sw_dir
+        n_fv1 = len(upSW); r_fv_late = ms_req({"file": "CAL", "path": f"{sw}/cfg"}); fv_late = upSW[n_fv1:]
+        sw_at.pop("upload", None); _sw_reset()
+        def _omf_swap(path, roots):
+            _sw_dir(); return real_omf(path, roots)
+        globals()["open_member_file"] = _omf_swap
+        n_fv2 = len(upSW); r_fv_race = ms_req({"file": "CAL", "path": f"{sw}/cfg"}); n_fv_race = len(upSW) - n_fv2
+        globals()["open_member_file"] = real_omf
+        _sw_reset(); _sw_last()
+        n_fv3 = len(upSW); r_fv_link = ms_req({"file": "CAL", "path": f"{sw}/cfg"}); n_fv_link = len(upSW) - n_fv3
+        # a thread answering a mail: the mail door is handed the checked name (it opens that once itself and sends only
+        # a file in the workspace), never /proc/self/fd/<n>, which it cannot open; its refusal comes back as not-ok
+        fv_kw, up_sw_fv = [], globals()["upload_file"]
+        def _up_kw(cfg, path, to, thread=None, comment=None, **k):
+            fv_kw.append(k); return "F3", to
+        def _up_mailno(cfg, path, to, thread=None, comment=None, **k):
+            raise UploadRefused("📎 cfg would not travel. Nothing was sent, to Slack or by mail")
+        _sw_reset(); globals()["upload_file"] = _up_kw
+        r_fv_mail = ms_req({"file": "CAL", "path": f"{sw}/cfg", "thread_ts": "5.5"})
+        globals()["upload_file"] = _up_mailno
+        r_fv_mailno = ms_req({"file": "CAL", "path": f"{sw}/cfg", "thread_ts": "5.5"})
+        globals()["upload_file"] = up_sw_fv
         globals()["track_thread"] = real_tt_ms
         os.unlink(f"{DEV}/alice/pna/pipe"); _sw_reset(); shutil.rmtree(sw, ignore_errors=True)
         # ONE CARD PER ID (review of #561): cc-loop's done card carries `done:<repo>/<track>:pr<n>` so a fix round that ends
@@ -9381,6 +9409,16 @@ def run_selfcheck():
           and r_sw_up.get("ok") and len(sw_up) == 1 and sw_up[0][:2] == ("inside", "cfg") and sw_up[0][2].startswith("/proc/self/fd/")
           and not any("SECRET" in u[0] for u in sw_up)
           and r_fifo.get("ok") is False and "not a regular file the box can read" in r_fifo.get("error", "") and n_fifo_up == 0)
+    check("MEMBER socket: the `file` verb uploads from the one fd it opened (raised-member-file-verb-checks-then-opens-by-name) "
+          "— a plain file goes up read from /proc/self/fd under its own name; a directory swapped for a link to outside after "
+          "the open still uploads the opened file; swapped after the name check and before the open, or a link at the last "
+          "name, is refused with nothing uploaded",
+          r_fv_ok.get("ok") and len(fv_ok) == 1 and fv_ok[0][:2] == ("inside", "cfg") and fv_ok[0][2].startswith("/proc/self/fd/")
+          and r_fv_late.get("ok") and len(fv_late) == 1 and fv_late[0][0] == "inside"
+          and r_fv_race.get("ok") is False and "not a regular file the box can read" in r_fv_race.get("error", "") and n_fv_race == 0
+          and r_fv_link.get("ok") is False and n_fv_link == 0
+          and r_fv_mail.get("ok") and len(fv_kw) == 1 and fv_kw[0].get("mail_path") == f"{sw}/cfg"
+          and r_fv_mailno.get("ok") is False and "would not travel" in r_fv_mailno.get("error", ""))
     check("MEMBER socket: a notice's file is walked from its root, the root itself opened O_NOFOLLOW (security read of "
           "9a202b11) — the member's files root swapped for a link to outside after the name check, or a link from the "
           "start, is refused, and so is a hard link to a file outside the workspace (its link count); nothing uploaded, "
@@ -9619,9 +9657,11 @@ def run_selfcheck():
           len(c["ran"]) == 1)
 
     c = rc_case(edited=True)
-    check("run card: an EDITED card runs nothing; the log and the thread both say so",
+    check("run card: an EDITED card runs nothing; the log and the thread both say so, the thread's line under ❌ and "
+          "the card marked ❌ (the owner sees each 👍's outcome there)",
           rc_go(c) is None and not c["ran"] and "edited" in rc_log(c)
-          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run: the card was edited"))
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("❌ Not run: the card was edited")
+          and c["reacts"] == ["x"])
     c = rc_case(rewrite=lambda ts, cmd, sha: {"ts": ts, "cmd": "rm -rf ~/dev", "sha256": sha})
     check("run card: a command changed on disk after the card went out (sha256 kept) runs nothing",
           rc_go(c) is None and not c["ran"] and "sha256 no longer matches" in rc_log(c))
@@ -9667,6 +9707,20 @@ def run_selfcheck():
     check("run card: a code fence sent as a link (<http://```|```>, label = URL minus scheme) is NOT undone, since the "
           "command between two such links shows as bold and struck text — nothing runs",
           rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    # A \n IN THE COMMAND (the queued row raised-run-card-refuses-its-own-command, four cards 09-30..10-02): printf's
+    # backslash-n and a real line break both reach the card as they are, so each runs, and a card whose second line
+    # differs from the record's is still refused.
+    for nl_cmd, what in (("sudo mkdir -p /etc/x.d && printf '[Unit]\\nA=1\\n\\n[Service]\\nB=2\\n' | sudo tee /etc/x.d/r.conf",
+                          "printf's backslash-n"), ("echo one\necho two", "a real line break")):
+        c = rc_case(cmd=nl_cmd)
+        check(f"run card: a command holding {what} runs on the owner's 👍, exactly as stored",
+              rc_go(c) == 0 and c["ran"] == [["bash", "-c", nl_cmd]])
+    nl_cmd = "echo one\necho two"
+    nl_sha = hashlib.sha256(nl_cmd.encode()).hexdigest()
+    c = rc_case(cmd=nl_cmd, text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* x"
+                + run_card_tail(nl_cmd, nl_sha).replace("echo two", "rm -rf ~"))
+    check("run card: …and a card whose second line is not the record's runs nothing",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
     c = rc_case(mode=0o620)
     check("run card: a record other users could write runs nothing, and nothing is posted",
           rc_go(c) is None and not c["ran"] and not c["posts"] and "unshared file" in rc_log(c))
@@ -9682,7 +9736,7 @@ def run_selfcheck():
     check("run card: …while the same card signed by another app's bot runs nothing, and the owner is told so in its "
           "thread (his 👍 is on it and a record is on file) rather than left waiting",
           rc_go(c) is None and not c["ran"] and "not the bot's own post" in rc_log(c)
-          and len(c["posts"]) == 1 and c["posts"][0] == (c["ts"], "Not run: the card is not the bot's own post. Nothing ran on the box."))
+          and len(c["posts"]) == 1 and c["posts"][0] == (c["ts"], "❌ Not run: the card is not the bot's own post. Nothing ran on the box."))
     c = rc_case(author={"user": "UPERSON"}, reactors=("UMEMBER",))
     check("run card: a person's post with only a member's 👍 on it runs nothing and makes the bot say nothing",
           rc_go(c) is None and not c["ran"] and not c["posts"] and "owner's 👍 is not on the card" in rc_log(c))
@@ -9722,6 +9776,109 @@ def run_selfcheck():
           and len(c["dms"]) == 1 and not [x for x in leaks if x in dmRC_]
           and "plain line" in dmRC_ and "last line" in dmRC_ and "[redacted private key]" in dmRC_
           and all(x in ranRC.get("out", "") for x in leaks))
+    # THE MASK IS LINEAR AND CAPPED (security read of #659: a 40 KB word of repeated `token` took 54 s to mask, and the
+    # whole output was masked however long it was). Kept: the tail's secret is still masked, its plain line still shown.
+    c = rc_case(cmd="cat big")
+    advRC = "token" * 8192 + "\n" + "sk-" * 13653 + "\nAPI_KEY=tailsecret\nlast line\n"
+    c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": 0, "stderr": "", "stdout": advRC})()
+    t0RC = time.monotonic(); rc_go(c); tookRC = time.monotonic() - t0RC
+    dmA = c["dms"][0] if c["dms"] else ""
+    check("run card: an 80 KB adversarial output (a 40 KB word of repeated `token`, 40 KB of `sk-`) is masked and "
+          "reported in well under a second, its tail's API_KEY value still masked and its last plain line still shown",
+          tookRC < 1.0 and len(c["dms"]) == 1 and "last line" in dmA and "tailsecret" not in dmA and "API_KEY=[redacted]" in dmA)
+    capV = "PASSWORD=" + "v" * RUN_MASK_CAP
+    cutRC = run_capped("head\n" + capV + "\nkept\n")
+    keyRC = "-----BEGIN PRIVATE KEY-----\n" + ("k" * 63 + "\n") * (RUN_MASK_CAP // 64 + 8) + "-----END PRIVATE KEY-----\nafter\n"
+    orphanRC = run_capped(keyRC)
+    wholeRC = run_capped("x\n" * 10 + keyRC[:200] + "\n-----END PRIVATE KEY-----\nafter\n")
+    nlRC = run_capped("x" * RUN_MASK_CAP + "password:\n\n  nextlinesecret\nkept\n")
+    openRC = run_capped("-----BEGIN PRIVATE KEY-----\n" + ("k" * 63 + "\n") * (RUN_MASK_CAP // 64 + 8))
+    check("run card: the output is cut to its last RUN_MASK_CAP characters BEFORE masking, at a line start — a NAME=value "
+          "line the cut splits goes whole, never a bare value past the mask, nor a value on the line under its NAME:; a key "
+          "block the cut splits goes up to its END, or all of it with no END; a short output, key block and all, is left as it was for the mask",
+          cutRC.endswith("\nkept\n") and "vvvv" not in cutRC and cutRC.startswith("(the output's start is cut)")
+          and "kkkk" not in orphanRC and "[redacted private key]" in orphanRC and orphanRC.endswith("\nafter\n")
+          and wholeRC.startswith("x\n") and "-----BEGIN PRIVATE KEY-----" in wholeRC
+          and run_capped("a\nb") == "a\nb"
+          and "nextlinesecret" not in nlRC and nlRC.endswith("\nkept\n")
+          and "kkkk" not in openRC and "[redacted private key]" in openRC)
+    # A NAME AND ITS VALUE STAY TOGETHER ACROSS ANY BLANK RUN (#850's landing read: 16 KB of spaces between `password:` and
+    # its value put the name past a 256-character look-back, and the bare value reached the DM unmasked). Both sides of the
+    # cut: the run in what is dropped, or in what is kept above the value; the `=` on the line under a bare NAME; the token
+    # under `Authorization: Bearer` or `Authorization:`. A plain line after a blank run is still shown, and the cut stays linear.
+    wsRC = [run_shown("password:\n" + " " * 16384 + "\ncanary-credential\n", 3000),
+            run_shown("password:" + "\n" * 20000 + "canary-two\nkept\n", 3000),
+            run_shown("password:" + " \n" * 9000 + "canary-three\nkept\n", 3000),
+            run_shown("API_KEY" + " " * 20000 + "\n= canary-four\nkept\n", 3000),
+            run_mask(run_capped("API_KEY\n= canary-five\nkept\n", cap=len("KEY\n= canary-five\nkept\n"))),
+            run_shown("Authorization: Bearer" + "\n" * 20000 + "canary-six-token\nkept\n", 3000),
+            run_shown("Authorization:" + "\n" * 20000 + "Basic\ncanary-seven\nkept\n", 3000)]
+    plainRC = run_shown("plain\n" + "\n" * 20000 + "shown line\nkept\n", 3000)
+    t0RC = time.monotonic(); run_capped(("x " * 1000 + "\n" + " " * 4000) * 400 + "password:" + " \n" * 400000 + "v\n"); tookWS = time.monotonic() - t0RC
+    check("run card: a value the cut parts from its name, its `=` or its `Authorization:` by any run of blank space "
+          "(16 KB of spaces, 20000 newlines, either side of the cut) is dropped with it, never shown bare; a plain line "
+          "after such a run is still shown, and a 3 MB whitespace-heavy output is cut in well under a second",
+          not [w for w in wsRC if "canary" in w] and all(w.endswith("kept\n") for w in wsRC[1:])
+          and "shown line" in plainRC and tookWS < 1.0)
+    # WHAT THE CUT DROPS FOR A PAIR MAY OPEN THE NEXT ONE (#850's second read: `Progress:` owed one token, the token was
+    # `password:`, and its value on the line below was shown bare). The read's own input, then every cut position over
+    # names split by the cut, values a blank run below their name, chains of `NAME:` lines and a key block opened in what
+    # went; and a chain of 5000 owed lines is still cut in well under a second.
+    chainRC = run_shown("Progress:\n" + " " * 16384 + "\npassword:\ncanary-credential\nkept\n", 3000)
+    chainBodies = ["Progress:\n" + " " * 40 + "\npassword:\ncanary-credential\nkept\n",
+                   "Progress:\npassword:\n\n\n   \n\ncanary-credential\nkept\n",
+                   "Note=\nAuthorization:\n\nBearer\n\ncanary-credential\nkept\n",
+                   "x:\ntoken\n\n=\n\ncanary-credential\nkept\n",
+                   "a:\nb:\nc:\nAPI_KEY:\n \n canary-credential\nkept\n",
+                   "Progress:\nmy_secret = \n\n\ncanary-credential\nkept\n",
+                   "Status: x\nPASSWORD=\n" + "\n" * 30 + "canary-credential\nkept\n",
+                   "Progress:\n" + " " * 20 + "\npassword:\n-----BEGIN RSA PRIVATE KEY-----\nMIIcanarybody\nkept\n"]
+    chainLeaks = [(b[:24], k) for b in chainBodies for k in range(1, len(b) + 1) if "canary" in run_mask(run_capped(b, cap=k))]
+    t0RC = time.monotonic(); run_shown("Progress:\n" + "a:\n" * 5000 + "v\n", 3000); tookChain = time.monotonic() - t0RC
+    check("run card: a token the cut drops for a split pair that is itself a secret's name (`Progress:` then `password:`, "
+          "`Authorization:`, a bare `token` with its `=` below) takes its value too, at every cut position and across blank "
+          "runs; a key block opened in what went is redacted; a 5000-line chain is cut in well under a second",
+          "canary" not in chainRC and chainRC.endswith("kept\n") and not chainLeaks and tookChain < 1.0)
+    # AN APPROVED PUSH REACHES ITS REMOTE (security read of #659): the command runs for real, in run_env, and pushes a
+    # fixture clone to a fixture bare remote. The agent socket: this user's own socket at RUN_RUNTIME/openssh_agent is
+    # named to the command; a plain file there, or only the caller's SSH_AUTH_SOCK, names nothing.
+    gRC = tempfile.mkdtemp(prefix="cc-slack-selfcheck-push-")
+    gitRC = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], capture_output=True, text=True, timeout=30)
+    gitRC("init", "-q", "--bare", f"{gRC}/remote.git"); gitRC("init", "-q", f"{gRC}/clone")
+    gitRC("-C", f"{gRC}/clone", "commit", "-q", "--allow-empty", "-m", "approved")
+    gitRC("-C", f"{gRC}/clone", "remote", "add", "origin", f"file://{gRC}/remote.git")
+    def rc_push(runtime_file):
+        rt = tempfile.mkdtemp(prefix="ccrt-", dir="/tmp")
+        sk = None
+        if runtime_file == "socket":
+            sk = socket.socket(socket.AF_UNIX); sk.bind(f"{rt}/openssh_agent")
+        else:
+            open(f"{rt}/openssh_agent", "w").close()
+        c = rc_case(cmd=f"git -C {gRC}/clone push -q origin HEAD:refs/heads/approved && printf 'sock=[%s]\\n' \"$SSH_AUTH_SOCK\"")
+        c["run"] = lambda argv, **kw: c["ran"].append(argv) or subprocess.run(argv, **kw)
+        was_rt, was_sock = globals()["RUN_RUNTIME"], os.environ.get("SSH_AUTH_SOCK")
+        globals()["RUN_RUNTIME"], os.environ["SSH_AUTH_SOCK"] = rt, f"{gRC}/callers-agent"
+        try:
+            rc = rc_go(c)
+        finally:
+            globals()["RUN_RUNTIME"] = was_rt
+            os.environ.pop("SSH_AUTH_SOCK") if was_sock is None else os.environ.__setitem__("SSH_AUTH_SOCK", was_sock)
+            if sk:
+                sk.close()
+        out = json.load(open(f"{c['dir']}/{c['ts']}.ran")).get("out", "")
+        head = gitRC("--git-dir", f"{gRC}/remote.git", "rev-parse", "-q", "--verify", "refs/heads/approved").stdout.strip()
+        gitRC("--git-dir", f"{gRC}/remote.git", "update-ref", "-d", "refs/heads/approved")
+        shutil.rmtree(rt, ignore_errors=True)
+        return rc, out, head, rt
+    want_head = gitRC("-C", f"{gRC}/clone", "rev-parse", "HEAD").stdout.strip()
+    rcP1, outP1, headP1, rtP1 = rc_push("socket")
+    rcP2, outP2, headP2, _ = rc_push("file")
+    check("run card: an approved `git push` runs for real and reaches the fixture remote; the command is handed this "
+          "user's own agent socket at RUN_RUNTIME/openssh_agent, and with a plain file there it gets none — never the "
+          "caller's SSH_AUTH_SOCK either way",
+          rcP1 == 0 and headP1 == want_head and f"sock=[{rtP1}/openssh_agent]" in outP1
+          and rcP2 == 0 and headP2 == want_head and "sock=[]" in outP2 and "callers-agent" not in outP1 + outP2)
+    shutil.rmtree(gRC, ignore_errors=True)
     notify_src = open(os.path.join(BIN, "cc-notify")).read()
     check("run card: cc-notify --run writes the very words run_card_tail expects the card to end with",
           RUN_LINE in notify_src and "· `run:%s`" in notify_src)
@@ -9816,7 +9973,7 @@ def run_selfcheck():
     check("run card: three backticks in the card's own words (a fence the description opens) run nothing, and the "
           "thread says why",
           rc_go(c) is None and not c["ran"] and "three backticks" in rc_log(c)
-          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run:"))
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("❌ Not run:"))
     c = rc_case(cmd="echo a ```b``` c")
     check("run card: …and three backticks in the stored command run nothing either",
           rc_go(c) is None and not c["ran"] and "three backticks" in rc_log(c))
@@ -9844,7 +10001,35 @@ def run_selfcheck():
     c = rc_case(text=colon_card("echo other"), author={"bot_id": "BBOT", "username": "demo-box · planning"})
     check("run card: …while the same stored form ending with another command runs nothing, and the thread says why",
           rc_go(c) is None and not c["ran"] and "does not end with this command" in rc_log(c)
-          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run:"))
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("❌ Not run:"))
+    # LINKS SLACK MADE ON ITS OWN (raised-an-approved-run-card-said-not-run): a domain, an address or a URL in the
+    # command comes back autolinked even inside the code block, so the card of 10-03 23:53Z never ran.
+    def linked_card(cmd, plain, stored):
+        return colon_card(cmd).replace(plain, stored)
+    lcmd = "dns-tool pages domains add acmefund-co acmefund.co"
+    c = rc_case(cmd=lcmd, text=linked_card(lcmd, "acmefund.co", "<http://acmefund.co|acmefund.co>"),
+                author={"bot_id": "BBOT", "username": "demo-box · planning"})
+    check("run card: a command holding a domain, stored by Slack as <http://acmefund.co|acmefund.co>, runs on the owner's 👍",
+          rc_go(c) == 0 and c["ran"] == [["bash", "-c", lcmd]] and "not run" not in rc_log(c))
+    mcmd = "cc-mail send ops@example.org hello"
+    c = rc_case(cmd=mcmd, text=linked_card(mcmd, "ops@example.org", "<mailto:ops@example.org|ops@example.org>"))
+    check("run card: …an address stored as <mailto:ops@example.org|ops@example.org> runs too",
+          rc_go(c) == 0 and c["ran"] == [["bash", "-c", mcmd]])
+    ucmd = "curl -fsS https://example.org/a?x=1&y=2"
+    c = rc_case(cmd=ucmd, text=linked_card(ucmd, "https://example.org/a?x=1&amp;y=2", "<https://example.org/a?x=1&amp;y=2>"))
+    check("run card: …and a full URL stored as <https://…> with no label runs too",
+          rc_go(c) == 0 and c["ran"] == [["bash", "-c", ucmd]])
+    c = rc_case(cmd=lcmd, text=linked_card(lcmd, "acmefund.co", "<https://evil.example|acmefund.co>"))
+    check("run card: a link whose label is not its target (<https://evil.example|acmefund.co>) runs nothing, and the "
+          "thread says why", rc_go(c) is None and not c["ran"] and "does not end with this command" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("❌ Not run:"))
+    c = rc_case(cmd=lcmd, text=linked_card(lcmd, "acmefund.co", "<http://acmefund.co.evil|acmefund.co>"))
+    check("run card: …nor one whose target only starts with its label",
+          rc_go(c) is None and not c["ran"] and "does not end with this command" in rc_log(c))
+    c = rc_case(cmd="echo acmefund.co", text=linked_card("echo acmefund.co", "acmefund.co", "<http://acmefund.co|acmefund.co>"),
+                edited=True)
+    check("run card: …and an edited card with an autolinked domain still runs nothing",
+          rc_go(c) is None and not c["ran"] and "edited" in rc_log(c))
     # A REFUSED OR FAILED 👍 IS TOLD TO THE SEAT THAT POSTED THE CARD (approval-tap-acts-fast): 16 of 25 approved cards
     # (09-27..10-11) were refused or failed, and only the owner heard about it.
     dcmd = "cc-zonetool dns set 2b --proxied --zone example.org"
@@ -9900,28 +10085,160 @@ def run_selfcheck():
     c = rc_case()
     dmRC = Daemon(use_slack=False); dmRC.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmRC.bot_user = "UBOT"
     dmRC.chan_name = lambda chat: "approvals"
-    apprRC, popRC = [], []
+    apprRC, popRC, sdRC = [], [], []
     dmRC.on_approval = lambda *a, **k: apprRC.append(a) or None
-    was_cards, was_popen = globals()["RUN_CARDS"], EFFECTS.popen_impl
+    was_cards, was_popen, was_run, was_which = globals()["RUN_CARDS"], EFFECTS.popen_impl, EFFECTS.run_impl, shutil.which
     globals()["RUN_CARDS"], EFFECTS.popen_impl = c["dir"], (lambda argv, **kw: popRC.append(argv))
+    EFFECTS.run_impl = lambda argv, **kw: sdRC.append(argv) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    shutil.which = lambda n, *a, **k: "/usr/bin/systemd-run" if n == "systemd-run" else was_which(n, *a, **k)
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             ev = lambda who, name="+1": {"type": "reaction_added", "user": who, "reaction": name,
                                         "item": {"type": "message", "channel": "CAPPR", "ts": c["ts"]}}
             dmRC.on_reaction(ev("UMEMBER"))
-            member_pop = list(popRC)
+            member_pop, member_sd = list(popRC), list(sdRC)
             dmRC.on_reaction(ev("UOWNER", "eyes"))
             dmRC.on_reaction(ev("UOWNER"))
             dmRC.on_reaction({"type": "reaction_added", "user": "UOWNER", "reaction": "+1",
                               "item": {"type": "message", "channel": "CAPPR", "ts": "1790000009.000100"}})
     finally:
-        globals()["RUN_CARDS"], EFFECTS.popen_impl = was_cards, was_popen
+        globals()["RUN_CARDS"], EFFECTS.popen_impl, EFFECTS.run_impl, shutil.which = was_cards, was_popen, was_run, was_which
     check("run card (daemon): a member's 👍 on a run card starts nothing and says so in the log",
-          member_pop == [] and "is not the owner's — nothing runs" in rc_log(c))
+          member_pop == [] and member_sd == [] and "is not the owner's — nothing runs" in rc_log(c))
     check("run card (daemon): the owner's 👍 starts exactly one run-approved for that card and its chat (other reactions "
-          "start none), and never reaches the PR merge path; a 👍 on a card with no record still goes there",
-          len(popRC) == 1 and popRC[0][-3:] == ["run-approved", "CAPPR", c["ts"]] and len(apprRC) == 1
-          and apprRC[0][1] == "1790000009.000100")
+          "start none) as its own systemd unit, waited on so its answer is read, and never reaches the PR merge path; "
+          "a 👍 on a card with no record still goes there",
+          popRC == [] and len(sdRC) == 1 and sdRC[0][0] == "systemd-run" and sdRC[0][-3:] == ["run-approved", "CAPPR", c["ts"]]
+          and len(apprRC) == 1 and apprRC[0][1] == "1790000009.000100" and "run-approved started" in rc_log(c))
+
+    # SYSTEMD-RUN THAT STARTS NOTHING (09-28: the log said "started", no unit ran, the owner heard nothing). Each case
+    # builds its own card and its own fakes. systemd-run refusing the unit falls back to a scope of its own (a new
+    # session alone stays in cc-slackd's cgroup, and a daemon restart kills it), learned from the mark its sh prints;
+    # a scope refused too is ❌ and nothing runs, since a plain child would die with the daemon; a scope that never
+    # answers starts nothing more; only with no systemd-run on PATH does a plain child start, and the thread hears a
+    # restart may cut it short; that child failing is ❌; a systemd-run that works starts no scope and no child.
+    # `launches` is every argv the daemon handed to a process start, whichever seam it went through.
+    def rc_daemon(sd_rc, pop_raises, scope="refused", on_path=True):
+        c = rc_case()
+        dm = Daemon(use_slack=False); dm.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dm.bot_user = "UBOT"
+        dm.chan_name = lambda chat: "approvals"
+        sd, pop, scopes, held, launches = [], [], [], [], []
+        def popen(argv, **kw):
+            launches.append((list(argv), kw))
+            if argv[0] == "systemd-run":
+                scopes.append(argv)
+                if scope == "raises":
+                    raise FileNotFoundError("systemd-run")
+                r, w = os.pipe()
+                if scope == "silent":
+                    held.append(w)
+                else:
+                    os.write(w, (RUN_SCOPE_MARK + "\n" if scope == "up"
+                                 else "Failed to start transient scope unit: Access denied\n").encode())
+                    os.close(w)
+                return types.SimpleNamespace(stdout=os.fdopen(r, "rb"), wait=lambda timeout=None: 1)
+            if pop_raises:
+                raise OSError("no fork")
+            pop.append(argv)
+            c["pop_kw"] = kw
+        saved = (globals()["RUN_CARDS"], globals()["api"], EFFECTS.popen_impl, EFFECTS.run_impl, EFFECTS.api_impl,
+                 shutil.which, globals()["RUN_SCOPE_WAIT"])
+        globals()["RUN_CARDS"], globals()["api"], EFFECTS.popen_impl, EFFECTS.api_impl = c["dir"], c["fake"], popen, c["fake"]
+        globals()["RUN_SCOPE_WAIT"] = 0.3
+        EFFECTS.run_impl = lambda argv, **kw: launches.append((list(argv), kw)) or sd.append(argv) or type("R", (), {
+            "returncode": sd_rc, "stdout": "", "stderr": "Failed to start transient service unit: Access denied\n"})()
+        shutil.which = lambda n, *a, **k: (("/usr/bin/systemd-run" if on_path else None) if n == "systemd-run"
+                                           else saved[5](n, *a, **k))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                dm.on_reaction({"type": "reaction_added", "user": "UOWNER", "reaction": "+1",
+                                "item": {"type": "message", "channel": "CAPPR", "ts": c["ts"]}})
+        finally:
+            (globals()["RUN_CARDS"], globals()["api"], EFFECTS.popen_impl, EFFECTS.run_impl, EFFECTS.api_impl,
+             shutil.which, globals()["RUN_SCOPE_WAIT"]) = saved
+            for w in held:
+                os.close(w)
+        c["launches"] = launches
+        return c, sd, pop, scopes
+    # every start while systemd-run is on PATH: systemd-run --user under a unit or a scope, never setsid, nohup or a
+    # bare interpreter, whatever systemd answers
+    def rc_off_cgroup(launches):
+        return bool(launches) and all(a[:2] == ["systemd-run", "--user"]
+                                      and any(x == "--scope" or x.startswith("--unit=") for x in a[:6])
+                                      and "setsid" not in a and "nohup" not in a for a, _ in launches)
+    c, sd, pop, scopes = rc_daemon(1, False, scope="up")
+    check("run card (daemon): when systemd-run starts no unit, run-approved starts in a scope of its own (systemd-run "
+          "--user --scope under the card's unit name, its sh printing the mark before it execs the same argv), the log "
+          "names systemd-run's answer, no plain child starts, and the thread hears nothing",
+          len(sd) == 1 and len(scopes) == 1 and scopes[0][:3] == ["systemd-run", "--user", "--scope"]
+          and f"--unit=cc-run-approved-{c['ts'].replace('.', '-')}" in scopes[0]
+          and scopes[0][-5:] == [sys.executable, SELF, "run-approved", "CAPPR", c["ts"]]
+          and pop == [] and c["posts"] == [] and c["reacts"] == []
+          and "systemd-run exited 1: Failed to start transient service unit: Access denied" in rc_log(c)
+          and "started in its own scope" in rc_log(c))
+    # the scope's sh for real: it says the mark, then execs; and when the mark can't be written (our end of the pipe
+    # closed after a timeout), it execs nothing, so a scope that comes up late never runs the command
+    shS = scopes[0][scopes[0].index("sh"):scopes[0].index("sh") + 3] if scopes else ["sh", "-c", "false"]
+    flagS = tempfile.mktemp(prefix="cc-slack-selfcheck-scope-")
+    okS = subprocess.run([*shS, "sh", "touch", flagS], capture_output=True, text=True, timeout=10).stdout.strip()
+    ranS = os.path.exists(flagS)
+    with contextlib.suppress(OSError):
+        os.remove(flagS)
+    rS, wS = os.pipe(); os.close(rS)
+    subprocess.run([*shS, "sh", "touch", flagS], stdout=wS, stderr=subprocess.DEVNULL, timeout=10)
+    os.close(wS)
+    lateS = os.path.exists(flagS)
+    with contextlib.suppress(OSError):
+        os.remove(flagS)
+    check("run card (daemon): the scope's sh prints the mark and then runs the command, and with nobody left to read "
+          "the mark it runs nothing", okS == RUN_SCOPE_MARK and ranS and not lateS)
+    c, sd, pop, scopes = rc_daemon(1, False)
+    check("run card (daemon): when the scope is refused too, nothing starts outside systemd: every launch is "
+          "systemd-run --user under a unit or a scope, the log names both answers, and the card's thread gets ❌ and "
+          "the card ❌ (a plain child would die with cc-slackd when the command restarts it)",
+          rc_off_cgroup(c["launches"]) and len(sd) == 1 and len(scopes) == 1 and pop == []
+          and "systemd-run exited 1: Failed to start transient service unit: Access denied" in rc_log(c)
+          and "systemd-run --scope: Failed to start transient scope unit: Access denied" in rc_log(c)
+          and "not run: systemd gave it no unit or scope" in rc_log(c) and "started as a child" not in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][0] == c["ts"]
+          and c["posts"][0][1].startswith("❌ Not run: the box's systemd would not") and c["reacts"] == ["x"])
+    c, sd, pop, scopes = rc_daemon(1, False, scope="raises")
+    check("run card (daemon): …and a systemd-run --scope that will not even start counts as refused: no plain child, "
+          "❌ in the thread, the log says why",
+          rc_off_cgroup(c["launches"]) and len(scopes) == 1 and pop == []
+          and "systemd-run --scope failed: FileNotFoundError" in rc_log(c) and c["reacts"] == ["x"])
+    offC = []
+    for argsC in ((0, False, "up"), (1, False, "up"), (1, False, "refused"), (1, False, "raises"), (1, False, "silent"),
+                  (1, True, "refused")):
+        cC = rc_daemon(*argsC)[0]
+        offC.append((argsC, rc_off_cgroup(cC["launches"]),
+                     [a for a, _ in cC["launches"] if a[0] in ("setsid", "nohup") or "setsid" in a or "nohup" in a]))
+    check("run card (daemon): with systemd-run on PATH no launch path issues setsid, nohup or a plain child, whatever "
+          "systemd answers" + "".join(f"; {a}: {bad}" for a, ok, bad in offC if not ok or bad),
+          all(ok and not bad for _, ok, bad in offC))
+    c, sd, pop, scopes = rc_daemon(1, False, on_path=False)
+    check("run card (daemon): with no systemd-run on PATH (the control), run-approved starts as the old detached child "
+          "in a session of its own, systemd-run is never called, and the thread hears a daemon restart may cut its "
+          "result short",
+          sd == [] and scopes == [] and len(pop) == 1 and pop[0] == [sys.executable, SELF, "run-approved", "CAPPR", c["ts"]]
+          and c.get("pop_kw", {}).get("start_new_session") is True
+          and "started as a child, with no systemd-run on PATH" in rc_log(c) and len(c["posts"]) == 1
+          and c["posts"][0][0] == c["ts"] and "restarts the Slack daemon" in c["posts"][0][1] and c["reacts"] == [])
+    c, sd, pop, scopes = rc_daemon(1, False, scope="silent")
+    check("run card (daemon): a scope that gives no answer in time starts no plain child (it may yet have run), and "
+          "the thread and the log say it may not have run",
+          len(scopes) == 1 and pop == [] and "may yet have run, so nothing else starts" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][0] == c["ts"] and "may not have run" in c["posts"][0][1])
+    c, sd, pop, scopes = rc_daemon(1, True, on_path=False)
+    check("run card (daemon): …and when that child will not start either, the card's thread gets ❌ and why, the card "
+          "is marked ❌, and the log says it did not start",
+          sd == [] and scopes == [] and pop == [] and "did not start" in rc_log(c) and len(c["posts"]) == 1
+          and c["posts"][0][0] == c["ts"] and c["posts"][0][1].startswith("❌ Not run: the box could not start the run")
+          and c["reacts"] == ["x"])
+    c, sd, pop, scopes = rc_daemon(0, True)
+    check("run card (daemon): a systemd-run that starts its unit starts no scope and no child and says nothing in the thread",
+          len(sd) == 1 and scopes == [] and pop == [] and c["posts"] == [] and c["reacts"] == []
+          and "run-approved started" in rc_log(c))
 
     subprocess.run(["rm", "-rf", f"{DEV}/alice", f"{DEV}/bob", f"{DEV}/myrepo", f"{DEV}/other",
                     f"{DEV}/{hF}", f"{DEV}/{rF}"])
