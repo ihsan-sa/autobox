@@ -1121,24 +1121,28 @@ def receipt(stage, chat, ts, thread=None, **f):
     except Exception as e:
         log(f"receipt: {stage} {chat} {ts}: {e!r}")
 
-_POSTER = []
+_POSTER = {}                         # TMUX_PANE -> its window name, asked once per pane
+_POSTER_DAEMON = []                  # set by `cc-slack daemon`: what it posts is its own, never a window's
 def poster_window():
-    """Who is posting, for the `posted` receipt: this process's tmux window (its broker key), "member" for a member's
-    session (counted, never named), else None (the daemon under systemd, a cron script). Asked once per process, with
-    a short timeout; any failure is None, never an error."""
-    if not _POSTER:
+    """Who is posting, for the `posted` receipt: the calling session's tmux window (its broker key), "member" for a
+    member's session (counted, never named), else None (the daemon, under systemd or not, and a cron script). The
+    window is asked of tmux with a short timeout once per pane, so a long-lived process serving more than one session
+    never stamps one session's name on another's post; the daemon never asks. Any failure is None, never an error."""
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1" or os.environ.get("CC_ROLE") == "member":
+        return "member"
+    pane = os.environ.get("TMUX_PANE")
+    if _POSTER_DAEMON or not pane:
+        return None
+    if pane not in _POSTER:
         w = None
-        if os.environ.get("CC_MEMBER_SANDBOX") == "1" or os.environ.get("CC_ROLE") == "member":
-            w = "member"
-        elif os.environ.get("TMUX_PANE"):
-            try:
-                r = subprocess.run(["tmux", "display-message", "-p", "-t", os.environ["TMUX_PANE"], "#W"],
-                                   capture_output=True, text=True, timeout=2, stdin=subprocess.DEVNULL)
-                w = (r.stdout.strip() or None) if r.returncode == 0 else None
-            except Exception:
-                w = None
-        _POSTER.append(w)
-    return _POSTER[0]
+        try:
+            r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#W"],
+                               capture_output=True, text=True, timeout=2, stdin=subprocess.DEVNULL)
+            w = (r.stdout.strip() or None) if r.returncode == 0 else None
+        except Exception:
+            w = None
+        _POSTER[pane] = w
+    return _POSTER[pane]
 
 def seat_name(target, alias=None):
     """The session a receipt names: `<target>` or `<target>@<alias>`, the same key cc-slack seat prints."""
@@ -11735,6 +11739,7 @@ def main(argv):
         print(__doc__.strip()); return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "daemon":
+        _POSTER_DAEMON.append(True)
         Daemon(use_slack="--no-slack" not in rest).run()
     elif cmd == "channel":
         target = rest[0] if rest else detect_target()

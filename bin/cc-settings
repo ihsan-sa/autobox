@@ -64,16 +64,17 @@ live_hooks(){ jq -r '(.hooks // {}) | to_entries[] as $e | $e.value[]? | (.match
 live_deny(){ jq -r '(.permissions.deny // [])[]' "$S" 2>/dev/null; }
 live_statusline(){ jq -r '.statusLine.command // empty' "$S" 2>/dev/null; }
 
-# add_hook <file> <event> <matcher> <command> — one of the mutations apply() can make, on stdout. Like
+# add_hook <file> <event> <matcher> <command> [<timeout s>] — one of the mutations apply() can make, on stdout. Like
 # remove_hook it only ever assigns under `.hooks`: no path in it names `.permissions`, and apply proves that
-# against its own output too.
-add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
-      .hooks //= {} | .hooks[$ev] //= []
+# against its own output too. A timeout is the manifest row's own, written with the command when it names one.
+add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" --arg to "${5:-}" '
+      ({type:"command", command:$c} + (if $to != "" then {timeout:($to | tonumber)} else {} end)) as $h
+    | .hooks //= {} | .hooks[$ev] //= []
     | if ([.hooks[$ev][] | select((.matcher // "") == $m)] | length) > 0
-      then .hooks[$ev] |= map(if (.matcher // "") == $m then .hooks = ((.hooks // []) + [{type:"command", command:$c}]) else . end)
-      else .hooks[$ev] += [ (if $m == "" then {hooks:[{type:"command", command:$c}]}
-                                         else {matcher:$m, hooks:[{type:"command", command:$c}]} end) ] end
+      then .hooks[$ev] |= map(if (.matcher // "") == $m then .hooks = ((.hooks // []) + [$h]) else . end)
+      else .hooks[$ev] += [ (if $m == "" then {hooks:[$h]} else {matcher:$m, hooks:[$h]} end) ] end
   ' "$1"; }
+want_timeout(){ jq -r --arg e "$1" --arg c "$2" 'first(.hooks[] | select(.event == $e and .command == $c) | .timeout // empty) // empty' "$M"; }
 # remove_hook <file> <event> <matcher> <command> — drop that one command, spelled exactly so, from the entries
 # with exactly that matcher; an entry it leaves with no hooks goes, and so does an event it leaves empty.
 remove_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
@@ -323,7 +324,7 @@ apply(){
   tmp="$S.new.$$"; cp -a "$S" "$tmp" || exit 1
   while IFS=$US read -r _ ev m cmd _; do
     [ -n "$ev" ] || continue
-    if add_hook "$tmp" "$ev" "$m" "$cmd" > "$tmp.j"
+    if add_hook "$tmp" "$ev" "$m" "$cmd" "$(want_timeout "$ev" "$cmd")" > "$tmp.j"
     then mv -f "$tmp.j" "$tmp"
     else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed on $ev — nothing changed ($bak holds the backup)" >&2; exit 1; fi
     n=$((n+1))
@@ -667,6 +668,18 @@ selfcheck(){
   add_hook "$d/applied.json" Stop "" '$HOME/bin/cc-checkpoint' > "$d/twice.json"
   S="$d/twice.json"; scan
   k "$(t test -z "$MISSING")" "applying twice still satisfies the subset (scan matches on content, not count)"
+  # A HOOK WITH A TIMEOUT (messages-record-their-sender follow-up): the manifest row's timeout is the one the shipped
+  # default carries, and apply writes it with the command; a row that names none is written with none, as before.
+  k "$(t test "$(want_timeout PostToolUse '$HOME/bin/cc-receipts sendmessage-hook')" = 5)" "the SendMessage receipt hook's manifest row names a 5 s timeout"
+  k "$(t test "$(jq -r '.hooks.PostToolUse[] | select(.matcher == "SendMessage") | .hooks[] | select(.command == "$HOME/bin/cc-receipts sendmessage-hook") | .timeout' "$DEF")" = 5)" \
+     "…the same as config/claude-settings.json's"
+  jq 'del(.hooks.PostToolUse)' "$DEF" > "$d/no-sm.json"
+  add_hook "$d/no-sm.json" PostToolUse SendMessage '$HOME/bin/cc-receipts sendmessage-hook' \
+    "$(want_timeout PostToolUse '$HOME/bin/cc-receipts sendmessage-hook')" > "$d/sm.json"
+  k "$(t test "$(jq -c '.hooks.PostToolUse' "$d/sm.json")" = '[{"matcher":"SendMessage","hooks":[{"type":"command","command":"$HOME/bin/cc-receipts sendmessage-hook","timeout":5}]}]')" \
+     "…and apply's add_hook writes that timeout with the command"
+  k "$(t test -z "$(want_timeout Stop '$HOME/bin/cc-checkpoint')$(jq -r '.hooks.Stop[].hooks[] | .timeout // empty' "$d/applied.json")")" \
+     "…while a row naming no timeout is written with none"
   # set_statusline is the third mutation apply() can make: it sets a missing statusLine and touches nothing else
   jq 'del(.statusLine)' "$d/live.json" > "$d/sl-live.json"; S="$d/sl-live.json"; scan
   sl_cmd=$(miss_of statusline | cut -d"$US" -f2)

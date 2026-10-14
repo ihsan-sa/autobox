@@ -7671,8 +7671,9 @@ def run_selfcheck():
                   rcPo == [0, 0, 0] and rcpPo == [("C-web", "9.9", "9.9", "web", "post")])
             # EVERY POST SLACK TAKES SAYS WHO POSTED IT (messages-record-their-sender): `posted`, keyed by the post's own
             # ts, with the poster's window; a member is counted as member; a receipt that cannot be written changes
-            # nothing post() returns. Each case its own receipts dir and its own cached poster.
-            realPw = {k: globals()[k] for k in ("api", "RECEIPTS", "_POSTER")}
+            # nothing post() returns. Each case its own receipts dir and its own cached poster. The cache is per pane, so
+            # one process serving two sessions names each its own, and the daemon names none and asks tmux nothing.
+            realPw = {k: globals()[k] for k in ("api", "RECEIPTS", "_POSTER", "_POSTER_DAEMON")}
             envPw = {k: os.environ.get(k) for k in ("CC_MEMBER_SANDBOX", "CC_ROLE", "TMUX_PANE")}
             try:
                 shutil.rmtree(RECEIPTS, ignore_errors=True)
@@ -7680,14 +7681,20 @@ def run_selfcheck():
                 cfgPw = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
                 for k in envPw:
                     os.environ.pop(k, None)
-                globals()["_POSTER"] = ["web/t1"]                 # a session in window web/t1, as tmux would name it
+                globals()["_POSTER"] = {"%7": "web/t1", "%8": "box@arch"}   # two panes, as tmux would name them
+                os.environ["TMUX_PANE"] = "%7"
                 with contextlib.redirect_stderr(io.StringIO()):
                     rPw = post(cfgPw, "C-web", "hello", thread="9.0", mail=False)
                 pw = [(r["chat"], r["ts"], r["thread"], r.get("session")) for f in sorted(os.listdir(RECEIPTS))
                       for r in map(json.loads, open(f"{RECEIPTS}/{f}")) if r["stage"] == "posted"] if os.path.isdir(RECEIPTS) else []
-                globals()["_POSTER"] = []; os.environ["CC_MEMBER_SANDBOX"] = "1"; os.environ["TMUX_PANE"] = "%1"
+                os.environ["TMUX_PANE"] = "%8"
+                pwOther = poster_window()
+                globals()["_POSTER"] = {}; globals()["_POSTER_DAEMON"] = [True]; os.environ["TMUX_PANE"] = "%7"
+                pwDaemon, pwAsked = poster_window(), dict(_POSTER)
+                globals()["_POSTER_DAEMON"] = []
+                globals()["_POSTER"] = {}; os.environ["CC_MEMBER_SANDBOX"] = "1"; os.environ["TMUX_PANE"] = "%1"
                 pwMem = poster_window()
-                globals()["_POSTER"] = []; os.environ.pop("CC_MEMBER_SANDBOX"); os.environ.pop("TMUX_PANE")
+                globals()["_POSTER"] = {}; os.environ.pop("CC_MEMBER_SANDBOX"); os.environ.pop("TMUX_PANE")
                 pwNone = poster_window()
                 fPw = tempfile.mkstemp(prefix="_selfcheck_rcpt_")[1]
                 globals()["RECEIPTS"] = f"{fPw}/r"                # under a FILE: no dir can be made there
@@ -7702,8 +7709,10 @@ def run_selfcheck():
                     else:
                         os.environ[k] = v
             check("receipts: every post Slack takes leaves `posted` with its chat, ts and thread and the poster's window; "
+                  "another pane in the same process is its own window, the daemon is no name and asks tmux nothing, "
                   "a member's session is `member`, no tmux is no name, and an unwritable receipt dir changes nothing post() returns",
-                  pw == [("C-web", "9.96", "9.0", "web/t1")] and pwMem == "member" and pwNone is None
+                  pw == [("C-web", "9.96", "9.0", "web/t1")] and pwOther == "box@arch" and pwDaemon is None and pwAsked == {}
+                  and pwMem == "member" and pwNone is None
                   and rPw == (1, "9.96") and rPwBad == (1, "9.96"))
             # A REPLAYED `--id` WRITES NO SECOND RECEIPT (review of #1001 claimed it did): submit() answers the replay
             # `already` with the first ts, cmd_post returns before answered(), so an old answer can never cover a

@@ -50,7 +50,7 @@ THE RECORD (--record): each red is one `cc-failures record --once --link source=
 red seen on every tick is written once, and the ledger's clusters (scope, kind) do the dedup the investigator reads.
 The scope is the routed session's repo. A check never replies to anyone and never posts.
 """
-import json, os, subprocess, sys, time, calendar, glob
+import json, os, stat, subprocess, sys, time, calendar, glob
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 DIR = os.environ.get("CC_RECEIPTS_DIR") or os.path.expanduser("~/.cc/receipts")
@@ -236,11 +236,14 @@ def sample(recs, now, days):
 
 
 def session_name(sid, home=None):
-    """The name Claude Code gave session `sid`, from its sessions/<pid>.json; None when no file says."""
+    """The name Claude Code gave session `sid`, from its sessions/<pid>.json; None when no file says. Only a regular
+    file is read: each is opened non-blocking and anything else is skipped, since a FIFO there would hang the hook."""
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home or os.path.expanduser("~"), ".claude")
     for p in glob.glob(os.path.join(base, "sessions", "*.json")):
         try:
-            with open(p, encoding="utf-8") as fh:
+            with os.fdopen(os.open(p, os.O_RDONLY | os.O_NONBLOCK), encoding="utf-8") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    continue
                 d = json.load(fh)
         except (OSError, ValueError):
             continue
@@ -465,9 +468,9 @@ def selfcheck():
         with open(os.path.join(H, ".claude", "sessions", "42.json"), "w") as f:
             json.dump({"pid": 42, "sessionId": "sid-1", "name": "box@arch"}, f)
         base_env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CC_MEMBER_SANDBOX", "CC_ROLE")}
-        hook = lambda ev, rd, **e: subprocess.run([os.path.realpath(__file__), "sendmessage-hook"], input=ev,
-                                                  env=dict(base_env, HOME=H, CC_RECEIPTS_DIR=rd, **e),
-                                                  capture_output=True, text=True, timeout=30)
+        hook = lambda ev, rd, timeout_s=30, **e: subprocess.run([os.path.realpath(__file__), "sendmessage-hook"], input=ev,
+                                                                env=dict(base_env, HOME=H, CC_RECEIPTS_DIR=rd, **e),
+                                                                capture_output=True, text=True, timeout=timeout_s)
         sent = lambda rd: [json.loads(ln) for p in glob.glob(f"{rd}/*.jsonl") for ln in open(p)]
         ev = json.dumps({"session_id": "sid-1", "tool_name": "SendMessage", "tool_input": {"to": "perms", "message": "hi"}})
         h1 = hook(ev, f"{T}/hk1")
@@ -486,6 +489,14 @@ def selfcheck():
         ok(h4.returncode == 0 and h4.stdout + h4.stderr == "" and h5.returncode == 0 and h5.stdout + h5.stderr == ""
            and not os.path.exists(f"{T}/hk5"),
            "…and a receipt dir that cannot be written, or input that is not the hook's JSON, exits 0 and says nothing")
+        os.mkfifo(os.path.join(H, ".claude", "sessions", "7.json"))   # nothing ever writes it: a blocking open hangs
+        os.mkdir(os.path.join(H, ".claude", "sessions", "8.json"))
+        try:
+            h6 = hook(ev, f"{T}/hk6", timeout_s=5)
+        except subprocess.TimeoutExpired:
+            h6 = None
+        ok(h6 is not None and h6.returncode == 0 and [r.get("from") for r in sent(f"{T}/hk6")] == ["box@arch"],
+           "…and a FIFO or a directory among the sessions files is skipped, not waited on: the sender is still named")
         # THE OTHER SENDER RECORDS, as cc-loop and cc-slack write them: no invariant reads them, however old
         dsp = {"stage": "sent", "via": "dispatch", "from": "box", "to": "box/t1", "loop": 3, "t": T0}
         pst = {"stage": "posted", "via": "slack", "chat": "C1", "ts": "5.5", "thread": "5.5", "session": "web", "t": T0}
