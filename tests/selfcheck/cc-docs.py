@@ -168,6 +168,9 @@ def _selfcheck():
         rc3, o3 = run("token", tok[:-1] + ("A" if tok[-1] != "A" else "B"), "901-0001-A")
         ok("the token serves its own revision and no other, and a wrong token serves nothing",
            rc == 0 and o.strip().endswith("901-0001-A_kid-doc.pdf") and rc2 == 1 and rc3 == 1)
+        rc, o = run("token", "-Abc123", "901-0001-A")
+        ok("a token that begins with '-' is read as a token, not an option, and exits 1 when it serves nothing",
+           rc == 1)
         mine = json.loads(run("library", "--viewer", wid)[1])
         own = json.loads(run("library", "--viewer", "owner")[1])
         with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:

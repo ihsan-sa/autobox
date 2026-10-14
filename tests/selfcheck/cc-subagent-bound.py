@@ -18,7 +18,8 @@ def selfcheck():
     global STATE
     home = tempfile.mkdtemp(prefix="cc-subagent-bound-selfcheck-")
     state0, env0 = STATE, {k: os.environ.pop(k, None) for k in
-                           ("CC_SUBAGENT_CONTEXT_TOKENS", "CC_SUBAGENT_WRAPUP_TOKENS", "CC_CONFIG")}
+                           ("CC_SUBAGENT_CONTEXT_TOKENS", "CC_SUBAGENT_WRAPUP_TOKENS",
+                            "CC_SUBAGENT_SAVE_TOKENS", "CC_CONFIG")}
     STATE = os.path.join(home, "state")
     os.environ["CC_CONFIG"] = os.path.join(home, "config")        # an empty config: the box's own must not move a line
     open(os.environ["CC_CONFIG"], "w").close()
@@ -53,9 +54,41 @@ def selfcheck():
         s = out.getvalue()
         return rc, (json.loads(s)["hookSpecificOutput"] if s.strip() else None)
 
+    def parallel(parent, agent):
+        """Sixteen hooks for one agent at the save line, let go at once; the number that refused."""
+        sub(parent, agent, [asst(95000)])
+        gate_r, gate_w = os.pipe()
+        res_r, res_w = os.pipe()
+        kids = []
+        for _ in range(16):
+            pid = os.fork()
+            if pid == 0:
+                os.close(gate_w)
+                os.read(gate_r, 1)   # every child blocks here until the gate closes
+                os.environ["CC_SUBAGENT_BOUND_PAUSE"] = "0.05"   # so without a claim every child reads no record
+                try:
+                    said = run(payload(parent, agent))[1]
+                    os.write(res_w, b"1" if said and said["permissionDecision"] == "deny" else b"0")
+                finally:
+                    os._exit(0)
+            kids.append(pid)
+        os.close(gate_w)
+        os.close(res_w)
+        for pid in kids:
+            os.waitpid(pid, 0)
+        got = b""
+        while True:
+            c = os.read(res_r, 64)
+            if not c:
+                break
+            got += c
+        os.close(gate_r)
+        os.close(res_r)
+        return got.count(b"1") if len(got) == 16 else -1
+
     try:
-        # 1. under the bound: the call runs, nothing is recorded
-        sub("s1", "a1", [asst(9000), asst(100000)])
+        # 1. under the save line (60% of the bound): the call runs, nothing is recorded
+        sub("s1", "a1", [asst(9000), asst(80000)])
         rc, d = run(payload("s1", "a1"))
         ok("under the bound: no decision", rc == 0 and d is None)
         ok("under the bound: no crossing recorded", not os.path.exists(os.path.join(STATE, "s1-a1.json")))
@@ -67,9 +100,11 @@ def selfcheck():
         ok("the refusal orders a save and a report", d and "progress file" in d["permissionDecisionReason"]
            and "re-spawn" in d["permissionDecisionReason"] and "150,000" in d["permissionDecisionReason"])
         ok("the crossing is recorded", json.load(open(os.path.join(STATE, "s2-a2.json")))["used"] == 150000)
-        # one token under, a sibling: untouched
+        # one token under, a sibling with the early save off: untouched
         sub("s2", "a2b", [asst(150000 - 106)])
+        os.environ["CC_SUBAGENT_SAVE_TOKENS"] = "0"
         ok("one token under the bound: no decision", run(payload("s2", "a2b"))[1] is None)
+        os.environ.pop("CC_SUBAGENT_SAVE_TOKENS")
 
         # 3. inside the wrap-up room the calls run; past it every call is refused with the stop order
         sub("s3", "a3", [asst(200000)])
@@ -141,6 +176,59 @@ def selfcheck():
         old = os.path.join(mroot, "-dev-y", "p", "subagents", "agent-small.jsonl")
         os.utime(old, (1000, 1000))
         ok("measure: --since drops an older file", measure(2000, 300000, out=io.StringIO(), root=mroot)[0] == 1)
+
+        # 10. the early save: once at 60% of the bound, then calls run, and the bound and its grace are unchanged
+        sub("s10", "a10", [asst(90000 - 106)])
+        ok("one token under the save line: no decision", run(payload("s10", "a10"))[1] is None)
+        sub("s10", "a10", [asst(95000)])
+        rc, d = run(payload("s10", "a10"))
+        ok("at the save line: refused once with the save order", rc == 0 and d and d["permissionDecision"] == "deny"
+           and "deliverable file now" in d["permissionDecisionReason"]
+           and "next calls run normally" in d["permissionDecisionReason"])
+        rec = json.load(open(os.path.join(STATE, "s10-a10.json")))
+        ok("the save is recorded, not as a crossing", rec.get("saved") == 95105 and "used" not in rec)
+        ok("the next call at the same size runs", run(payload("s10", "a10"))[1] is None)
+        sub("s10", "a10", [asst(140000)])
+        ok("a later call under the bound runs", run(payload("s10", "a10"))[1] is None)
+        sub("s10", "a10", [asst(150000)])
+        rc, d = run(payload("s10", "a10"))
+        ok("at the bound after a save: the wrap-up order as before", d and d["permissionDecision"] == "deny"
+           and "progress file" in d["permissionDecisionReason"])
+        rec = json.load(open(os.path.join(STATE, "s10-a10.json")))
+        ok("the crossing keeps the save", rec.get("used") == 150105 and rec.get("saved") == 95105)
+        sub("s10", "a10", [asst(175000)])
+        ok("after a save, the wrap-up room still runs", run(payload("s10", "a10"))[1] is None)
+        sub("s10", "a10", [asst(185000)])
+        ok("after a save, past the room: the stop order", "End your turn now" in
+           ((run(payload("s10", "a10"))[1] or {}).get("permissionDecisionReason") or ""))
+        # a first call already past the bound gets the wrap-up order, never the save order
+        sub("s10", "a10c", [asst(160000)])
+        ok("a first call past the bound: wrap-up, not save", "progress file" in
+           ((run(payload("s10", "a10c"))[1] or {}).get("permissionDecisionReason") or ""))
+        # 0 turns it off; a set figure moves it; a save that cannot be recorded leaves the call alone
+        sub("s10", "a10d", [asst(95000)])
+        os.environ["CC_SUBAGENT_SAVE_TOKENS"] = "0"
+        ok("save 0: off", run(payload("s10", "a10d"))[1] is None
+           and not os.path.exists(os.path.join(STATE, "s10-a10d.json")))
+        os.environ["CC_SUBAGENT_SAVE_TOKENS"] = "120000"
+        ok("save set to 120k: 95k runs", run(payload("s10", "a10d"))[1] is None)
+        sub("s10", "a10d", [asst(125000)])
+        ok("save set to 120k: 125k is refused once",
+           (run(payload("s10", "a10d"))[1] or {}).get("permissionDecision") == "deny")
+        os.environ.pop("CC_SUBAGENT_SAVE_TOKENS")
+        blocker = os.path.join(home, "not-a-dir")
+        open(blocker, "w").close()
+        state_ok, STATE = STATE, os.path.join(blocker, "state")
+        sub("s10", "a10e", [asst(95000)])
+        ok("an unrecordable save: no decision", run(payload("s10", "a10e"))[1] is None)
+        STATE = state_ok
+        # 11. parallel tool calls: sixteen hooks for one agent at the save line, let go at once, refuse it exactly once,
+        # with the per-agent lock (a11) and with the lock unobtainable, a symlink O_NOFOLLOW refuses (a11n)
+        os.makedirs(STATE, exist_ok=True)
+        os.symlink(os.path.join(home, "elsewhere"), os.path.join(STATE, "s11-a11n.json.lock"))
+        for ag in ("a11", "a11n"):
+            ok(f"sixteen parallel hooks at the save line ({ag}): one save refusal, the rest run", parallel("s11", ag) == 1)
+        ok("an unobtainable lock is never followed", not os.path.exists(os.path.join(home, "elsewhere")))
     finally:
         STATE = state0
         for k, v in env0.items():
