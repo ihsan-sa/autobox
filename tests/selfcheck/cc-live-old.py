@@ -367,5 +367,5 @@ def selfcheck():
     case("a fresh pulse.json is followed, not collected again", fol.p and not fol.local)
     fol.done = True
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"cc-live selfcheck: {ok} passed, {bad} failed")
+    print(f"cc-live-old selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0
