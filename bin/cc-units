@@ -6,7 +6,9 @@
 #   cc-units link                      the unit filenames to symlink (all of them)
 #   cc-units enable                    unit<TAB>start, for the rows the installer switches on
 #   cc-units check                     is-enabled/is-active/list-timers vs the manifest, and every overlay row linked,
-#                                      enabled (when it has an [Install]) and up; one line, exit 1 on a fault
+#                                      enabled (when it has an [Install] and no enabled or static, active timer starts it; an
+#                                      `enable: owner` row only once enabled) and up; a unit whose condition skipped
+#                                      its start is not down; one line, exit 1 on a fault
 #   cc-units restart-for [--root <dir>] <path…>
 #                                      unit<TAB>restart|rearm|owner|none for the units a change touches
 #   cc-units daemons-for [--root <dir>] <path…>
@@ -125,6 +127,25 @@ dprows(){
 }
 
 sc(){ systemctl --user "$@" 2>&1; }   # never fails the caller: an is-* answer is the value, not the exit code
+# A unit whose Condition*= or ExecCondition= said no at its last start was SKIPPED, not stopped: tmux-main.service is
+# inactive whenever the main tmux server is up outside it (its ExecCondition), and that is the box working.
+# ConditionResult=no is also what a unit whose conditions were never evaluated reports, so it counts only with a
+# non-zero ConditionTimestampMonotonic: an enabled service that never started is down, not skipped.
+skipped(){
+  [ "$(sc show -p Result --value "$1")" = exec-condition ] && return 0
+  [ "$(sc show -p ConditionResult --value "$1")" = no ] && [ "$(sc show -p ConditionTimestampMonotonic --value "$1")" -gt 0 ] 2>/dev/null
+}
+# A .service with [Install] that nothing enabled is still started on time when an enabled (or static), active timer triggers it
+# (a nightly refresh or backup, say): enabling the .service itself would run it at every manager start.
+timer_driven(){
+  local tr
+  for tr in $(sc show -p TriggeredBy --value "$1"); do
+    case "$tr" in *.timer) ;; *) continue;; esac
+    case "$(sc is-enabled "$tr")" in enabled|enabled-runtime|static) ;; *) continue;; esac   # static: armed by its own dependency
+    [ "$(sc is-active "$tr")" = active ] && return 0
+  done
+  return 1
+}
 
 # ---- check: what the audit asks. Every `required` row must be enabled and healthy; an `owner` row is checked
 # only once the owner has enabled it (a bare clone with no Slack tokens is not a broken box); a `timer` row is
@@ -145,7 +166,7 @@ check(){
     esac
     n=$((n+1))
     case "$he" in
-      active)     state=$(sc is-active "$u"); [ "$state" = active ] || { bad="$bad $u=$state"; continue; } ;;
+      active)     state=$(sc is-active "$u"); [ "$state" = active ] || skipped "$u" || { bad="$bad $u=$state"; continue; } ;;
       not-failed) [ "$(sc is-failed "$u")" = failed ] && { bad="$bad $u=failed"; continue; } ;;
     esac
     if [ "$re" = rearm ]; then   # armed, not merely active: a changed OnCalendar reloaded but not restarted sits at `Trigger: n/a`
@@ -157,13 +178,15 @@ check(){
     fi
   done < <(rows)
   # The overlay's own rows have no policy words: declaring a unit there IS wanting it, so one that is linked but
-  # never enabled is a fault, whatever its `enable` says — a box's editor service was linked, not enabled,
+  # never enabled is a fault unless its row says `enable: owner` — a box's editor service was linked, not enabled,
   # and stayed down 3.5 h after the 10-01 restart. A bare template (`x@.service`) has no state of its own and is
   # skipped; an instance of one (`x@reports.service`) is a unit like any other, read from its template's file.
-  local t m d ty uf
+  # The one word a row may carry is `enable: owner`, and it means what it means in the core list: off by the owner's
+  # choice is no fault (a watch timer that disables itself once its one-off job is done).
+  local t m d ty uf ow
   while IFS=$'\t' read -r t m d; do
     [ "$m" = "$M" ] && continue
-    while IFS= read -r u; do
+    while IFS=$'\t' read -r u ow; do
       case "$u" in ""|*@.*) continue;; esac
       uf="$u"; case "$u" in *@*) uf="${u%%@*}@.${u##*.}";; esac
       [ -e "$lnk/$uf" ] || { bad="$bad $u=unlinked"; continue; }
@@ -171,8 +194,11 @@ check(){
       # masked (a link to /dev/null, which has no [Install] either), or one systemd cannot load, is down whatever its
       # file says: read before the no-[Install] rule below turns it into `static` (the 922 review)
       case "$state" in masked|masked-runtime|not-found|bad) bad="$bad $u=not-enabled($state)"; continue;; esac
+      [ "$ow" = owner ] && case "$state" in enabled|enabled-runtime) ;; *) continue;; esac
       # a unit with no [Install] reads `linked` too, but nothing can enable it: its timer starts it, so it is no fault
       grep -q '^\[Install\]' "$lnk/$uf" 2>/dev/null || state=static
+      # …and one with [Install] that an enabled, running timer starts is no fault either (see timer_driven)
+      case "$state" in linked|linked-runtime|disabled) timer_driven "$u" && state=static;; esac
       case "$state" in enabled|enabled-runtime|static|generated|indirect) ;; *) bad="$bad $u=not-enabled($state)"; continue;; esac
       n=$((n+1))
       [ "$(sc is-failed "$u")" = failed ] && { bad="$bad $u=failed"; continue; }
@@ -181,8 +207,8 @@ check(){
       case "$state" in enabled|enabled-runtime) ;; *) continue;; esac
       ty=$(grep -hE '^(Type|RemainAfterExit)=' "$lnk/$uf" 2>/dev/null | tr '\n' ' ')
       case "$u:$ty" in *.timer:*|*:*RemainAfterExit=yes*) ;; *Type=oneshot*|*.path:*|*.socket:*) continue;; esac
-      state=$(sc is-active "$u"); [ "$state" = active ] || bad="$bad $u=$state"
-    done < <(jq -r '.units[].unit' "$m" | awk '!s[$0]++')
+      state=$(sc is-active "$u"); [ "$state" = active ] || skipped "$u" || bad="$bad $u=$state"
+    done < <(jq -r '.units[] | [.unit, (.enable // "")] | @tsv' "$m" | awk -F'\t' '!s[$1]++')
   done < <(manifests)
   if [ -n "$bad" ]; then echo "user units —$bad"; return 1; fi
   echo "user units — all $n enabled, active and armed as config/units.json declares"

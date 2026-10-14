@@ -15,6 +15,9 @@
 # The "announced" stamp is written only after cc-notify accepts the message, so a boot whose network never
 # came back stays unannounced and is retried by the next `systemctl --user start cc-boot-notify` (the unit
 # runs with TimeoutStartSec=infinity: the wait-for-network + retries can outlast any finite timeout).
+# A request the seat closed (`cc-notify requests answer`) is not asked again while the check names the same units:
+# cc-notify files an answered id asked again as a new request, and units-boot:5865e66f woke the seat three more times
+# on 10-13 after it was closed. A different set of units is a new question and is asked.
 # `cc-boot-notify selfcheck` proves the restart notice and the unit check after it in a scratch HOME, with cc-notify,
 # cc-units, systemctl and ps stubs (cc-notify records its call).
 set -uo pipefail
@@ -66,6 +69,22 @@ if [ "${1:-}" = selfcheck ]; then
   k "$c" "…and a terminal run (no MANAGERPID) takes the manager's MainPID from systemctl, the same id, without waiting"
   printf '#!/bin/sh\nexit 0\n' > "$U/bin/cc-units"; u env MANAGERPID=4444
   c=0; [ "$rc" = 0 ] && [ ! -e "$U/calls" ] || c=1; k "$c" "…and with every unit up nothing is asked"
+  # a request the seat closed stays closed for the same units, open or moved to closed/; a new unit is asked again
+  mkdir -p "$U/.cc/requests/closed"; printf '#!/bin/sh\necho "user units — cc-library.service=failed"; exit 1\n' > "$U/bin/cc-units"
+  # cc-notify's own shapes: req_write's record plus what `requests answer` adds, and closed/<id>@<answered_at>.json
+  jq -n --arg id "units-restart:$b:4444" '{id:$id, at:"2026-10-13T23:10:00Z", from:"", to:"myrepo", title:"units down after a user-manager restart",
+    text:"user units — cc-library.service=inactive", delivered:true, attempts:1, why:"",
+    answered_at:"2026-10-13T23:20:00Z", by:"myrepo", answer:"nothing is down", answer_ts:""}' > "$U/.cc/requests/units-restart:$b:4444.json"
+  u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && [ ! -e "$U/calls" ] || c=1; k "$c" "a request answered for the same units is not asked again under its id"
+  mv "$U/.cc/requests/units-restart:$b:4444.json" "$U/.cc/requests/closed/units-restart:$b:4444@2026-10-13T23:20:00Z.json"; u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && [ ! -e "$U/calls" ] || c=1; k "$c" "…nor once cc-notify has moved the answered file to closed/"
+  printf '#!/bin/sh\necho "user units — cc-library.service=inactive cc-editor.service=inactive"; exit 1\n' > "$U/bin/cc-units"; u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && grep -q "^--ask|.*|units-restart:$b:4444|.*cc-editor" "$U/calls" || c=1; k "$c" "…but a unit the answer did not cover is asked"
+  jq '.answered_at=""' "$U/.cc/requests/closed/units-restart:$b:4444@2026-10-13T23:20:00Z.json" > "$U/.cc/requests/units-restart:$b:4444.json"
+  rm -f "$U/.cc/requests/closed/"*; printf '#!/bin/sh\necho "user units — cc-library.service=inactive"; exit 1\n' > "$U/bin/cc-units"; u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && grep -q "^--ask|.*|units-restart:$b:4444|" "$U/calls" || c=1; k "$c" "…and an open, unanswered one is handed to cc-notify as before"
+  rm -rf "$U/.cc/requests"
   # a pid nothing gives (systemctl answers empty): no stamp says "none", and the ask is keyed on the last logged restart
   printf '#!/bin/sh\necho "cc-library.service=inactive"; exit 1\n' > "$U/bin/cc-units"; printf '#!/bin/sh\n' > "$U/bin/systemctl"
   echo '2026-10-02T16:00:00Z restart=2026-10-02T16:00:00Z last_alive=2026-10-02T15:58:00Z gap=120s cause=user-manager-restart' >> "$U/.cc/state/power-events.log"
@@ -94,6 +113,23 @@ stamp="$HOME/.cc/state/boot-announced"; bootid=$(cat /proc/sys/kernel/random/boo
 mpid=${MANAGERPID:-$(systemctl show -p MainPID --value "user@$(id -u).service" 2>/dev/null)}; [ "${mpid:-0}" != 0 ] || mpid=""
 bootmgr="$HOME/.cc/state/boot-manager"   # "<boot id> <manager pid>" of the run that announced the boot
 [ -x "$notify" ] || { echo "cc-boot-notify: $notify is missing — nothing announced" >&2; exit 1; }
+# the units a `cc-units check` line names, one per line, sorted: "user units — a=inactive b=failed" -> a, b
+unitset(){ grep -o '[^ =]*=' <<<"$1" | sort -u; }
+# $1 id $2 the check's line: a request under this id was answered for these same units (open file, or moved to closed/)
+answered(){
+  local f want; want=$(unitset "$2")
+  for f in "$HOME/.cc/requests/$1.json" "$HOME/.cc/requests/closed/$1@"*.json; do
+    [ -f "$f" ] && [ -n "$(jq -r '.answered_at // ""' "$f" 2>/dev/null)" ] \
+      && [ "$(unitset "$(jq -r '.text // ""' "$f" 2>/dev/null)")" = "$want" ] && return 0
+  done
+  return 1
+}
+# $1 title $2 id: ask the planning seat about the units `cc-units check` finds down, unless that was already answered
+ask_units(){
+  local units; units=$("$HOME/bin/cc-units" check 2>&1) && return 0
+  answered "$2" "$units" && { echo "cc-boot-notify: $2 was answered for these units — not asked again" >&2; return 0; }
+  "$notify" --ask -t "$1" --id "$2" "$units" || true
+}
 # …except a user-manager restart inside the boot: every session and user service stopped with it (2026-10-01 and
 # 10-02: a test TERMed the manager, and the 10-02 one went unsaid for 4.5 h). cc-heartbeat logs it as one
 # cause=user-manager-restart line; that line is said once, high priority, with how long the box was dark.
@@ -127,7 +163,7 @@ if [ "$(cat "$stamp" 2>/dev/null)" = "$bootid" ]; then
   # under the boot's own manager it is the boot ask's id, and with no pid known it is the last restart cc-heartbeat logged.
   id="units-restart:$bootid:$mpid"; [ "$known" = boot ] && id="units-boot:$bootid"
   if [ -z "$mpid" ]; then last=$(grep 'cause=user-manager-restart' "$log" 2>/dev/null | tail -n1); id="units-restart:$bootid:at-${last%% *}"; fi
-  units=$("$HOME/bin/cc-units" check 2>&1) || "$notify" --ask -t "units down after a user-manager restart" --id "$id" "$units" || true
+  ask_units "units down after a user-manager restart" "$id"
   exit 0
 fi
 hhmmss() { local t=${1#*T}; printf '%s' "${t%Z}"; }   # 2026-08-27T04:05:06Z -> 04:05:06 (the message says UTC once)
@@ -166,4 +202,4 @@ printf '%s\n' "$msg"
 printf '%s\n' "$bootid" > "$stamp"; [ -z "$mpid" ] || printf '%s %s\n' "$bootid" "$mpid" > "$bootmgr"
 # …then whether every declared unit came back. A unit linked but never enabled does not survive a restart, and the
 # planning seat is the one that switches it on (the library editor stayed down 3.5 h after the 10-01 restart).
-units=$("$HOME/bin/cc-units" check 2>&1) || "$notify" --ask -t "units down after boot" --id "units-boot:$bootid" "$units" || true
+ask_units "units down after boot" "units-boot:$bootid"

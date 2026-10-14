@@ -177,6 +177,15 @@ J
   k "$(nt grep -q 'cc-audit.timer=not-armed' <<<"$out")" "a timer with no NEXT whose service is running is armed, not a fault"
   out=$( sc(){ fake inactive "$@"; }; CC_UNITS_LINKDIR="$UD" check 2>&1 )
   k "$(t grep -q 'cc-audit.timer=not-armed' <<<"$out")" "…and with its service idle it is not-armed, as before"
+  # a `health: active` row whose ExecCondition said no is skipped, not down: tmux-main.service is inactive whenever the
+  # main tmux server runs outside it (10-13: listed as tmux-main.service=inactive with the server up)
+  skfake(){ case "$1:${2:-}:${3:-}:${5:-}" in
+      is-active:tmux-main.service::) echo inactive;; is-active:*) echo active;; is-failed:*) echo active;; list-timers:*) ;;
+      show:-p:Result:tmux-main.service) echo "$SKIP";; show:*) echo success;; *) echo enabled;; esac; }
+  out=$( sc(){ skfake "$@"; }; SKIP=exec-condition; CC_UNITS_LINKDIR="$UD" check 2>&1 )
+  k "$(nt grep -q 'tmux-main.service=' <<<"$out")" "a core unit its ExecCondition skipped is not down"
+  out=$( sc(){ skfake "$@"; }; SKIP=success; CC_UNITS_LINKDIR="$UD" check 2>&1 )
+  k "$(t grep -q 'tmux-main.service=inactive' <<<"$out")" "…but the same unit stopped after a start that ran is"
   # the overlay's own rows (10-01: a linked, never-enabled library editor stayed down 3.5 h after a restart). Its own
   # fixture tree: one unit each that is reported, and one each that is kept quiet.
   T=$(mktemp -d); mkdir -p "$T/config/systemd-user"; d="$T/config/systemd-user"
@@ -188,13 +197,28 @@ J
   printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-wk@.service"      # a template; its instances are units
   ln -s /dev/null "$d/ov-masked.service"                                                          # masked: no [Install] to read
   printf '[Service]\nType=oneshot\n' > "$d/ov-gone.service"                                       # no [Install], and systemd cannot load it
-  printf '{"units":[{"unit":"ov-boot.service"},{"unit":"ov-bytimer.service"},{"unit":"ov-down.service"},{"unit":"ov-up.service"},{"unit":"ov-ran.service"},{"unit":"ov-tpl@.service"},{"unit":"ov-wk@reports.service"},{"unit":"ov-wk@live.service"},{"unit":"ov-masked.service"},{"unit":"ov-gone.service"}]}\n' > "$T/config/units.json"
+  # a timer-driven .service can have [Install] and still be started only by its timer
+  printf '[Service]\nType=oneshot\n[Install]\nWantedBy=default.target\n' > "$d/ov-timed.service"    # linked; its timer is on and running
+  printf '[Service]\nType=oneshot\n[Install]\nWantedBy=default.target\n' > "$d/ov-stale.service"    # linked; its timer is enabled but stopped
+  printf '[Timer]\nOnBootSec=1min\n[Install]\nWantedBy=timers.target\n' > "$d/ov-owneroff.timer"   # enable=owner, switched off (a finished move)
+  printf '[Timer]\nOnBootSec=1min\n[Install]\nWantedBy=timers.target\n' > "$d/ov-owneron.timer"    # enable=owner, enabled but not running
+  printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-skip.service"     # enabled; its condition said no
+  printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-never.service"    # enabled, never started: no condition ran
+  printf '[Service]\nType=oneshot\n[Install]\nWantedBy=default.target\n' > "$d/ov-stimed.service"  # linked; a static, running timer starts it
+  printf '{"units":[{"unit":"ov-boot.service"},{"unit":"ov-bytimer.service"},{"unit":"ov-down.service"},{"unit":"ov-up.service"},{"unit":"ov-ran.service"},{"unit":"ov-tpl@.service"},{"unit":"ov-wk@reports.service"},{"unit":"ov-wk@live.service"},{"unit":"ov-masked.service"},{"unit":"ov-gone.service"},{"unit":"ov-timed.service"},{"unit":"ov-stale.service"},{"unit":"ov-owneroff.timer","enable":"owner"},{"unit":"ov-owneron.timer","enable":"owner"},{"unit":"ov-skip.service"},{"unit":"ov-never.service"},{"unit":"ov-stimed.service"}]}\n' > "$T/config/units.json"
   ovfake(){ case "$1:$2" in
-      is-enabled:ov-boot.service|is-enabled:ov-bytimer.service) echo linked;; is-enabled:ov-wk@reports.service) echo disabled;;
+      is-enabled:ov-boot.service|is-enabled:ov-bytimer.service|is-enabled:ov-timed.service|is-enabled:ov-stale.service|is-enabled:ov-stimed.service) echo linked;;
+      is-enabled:ov-stimed.timer) echo static;;
+      is-enabled:ov-wk@reports.service|is-enabled:ov-owneroff.timer) echo disabled;;
       is-enabled:ov-masked.service) echo masked;; is-enabled:ov-gone.service) echo not-found;;
       is-enabled:*) echo enabled;;
-      is-active:ov-down.service|is-active:ov-ran.service|is-active:ov-wk@reports.service) echo inactive;; is-active:*) echo active;;
-      is-failed:*) echo inactive;; *) ;; esac; }
+      is-active:ov-down.service|is-active:ov-ran.service|is-active:ov-wk@reports.service) echo inactive;;
+      is-active:ov-stale.timer|is-active:ov-owneroff.timer|is-active:ov-owneron.timer|is-active:ov-skip.service|is-active:ov-never.service) echo inactive;; is-active:*) echo active;;
+      is-failed:*) echo inactive;;
+      show:-p) case "$3:$5" in TriggeredBy:ov-timed.service) echo ov-timed.timer;; TriggeredBy:ov-stale.service) echo ov-stale.timer;; TriggeredBy:ov-stimed.service) echo ov-stimed.timer;;
+                 TriggeredBy:ov-boot.service) echo ov-boot.path;; ConditionResult:ov-skip.service|ConditionResult:ov-never.service) echo no;; ConditionResult:*) echo yes;;
+                 ConditionTimestampMonotonic:ov-never.service) echo 0;; ConditionTimestampMonotonic:*) echo 51234567;; esac;;
+      *) ;; esac; }
   out=$( sc(){ ovfake "$@"; }; OV="$T"; CC_UNITS_LINKDIR="$d" check 2>&1 )
   k "$(t grep -q 'ov-boot.service=not-enabled(linked)' <<<"$out")" "an overlay unit linked but never enabled is reported"
   k "$(nt grep -q 'ov-bytimer' <<<"$out")" "…but one with no [Install] is its timer's to start, not a fault"
@@ -204,6 +228,14 @@ J
   k "$(t grep -q 'ov-wk@reports.service=not-enabled(disabled)' <<<"$out")" "…but a declared instance of a template that is not enabled is"
   k "$(t grep -q 'ov-masked.service=not-enabled(masked)' <<<"$out")" "…and so is a masked one, though its /dev/null has no [Install]"
   k "$(t grep -q 'ov-gone.service=not-enabled(not-found)' <<<"$out")" "…and one with no [Install] that systemd cannot load"
+  k "$(nt grep -q 'ov-timed' <<<"$out")" "a linked service with [Install] that an enabled, running timer starts is not a fault"
+  k "$(t grep -q 'ov-stale.service=not-enabled(linked)' <<<"$out")" "…but one whose timer is stopped is (and so is one only a .path triggers: ov-boot above)"
+  k "$(nt grep -q 'ov-owneroff' <<<"$out")" "an enable=owner overlay row the owner left off is not a fault"
+  k "$(t grep -q 'ov-owneron.timer=inactive' <<<"$out")" "…but once enabled it must be up"
+  k "$(nt grep -q 'ov-skip' <<<"$out")" "an enabled overlay service its condition skipped is not down (ov-down above still is)"
+  # systemd reports ConditionResult=no for a unit whose conditions were never evaluated (the #1338 review)
+  k "$(t grep -q 'ov-never.service=inactive' <<<"$out")" "…but an enabled service never started (ConditionResult=no, no condition timestamp) is down"
+  k "$(nt grep -q 'ov-stimed' <<<"$out")" "a linked service a static, running timer starts is not a fault either"
   rm -rf "$T"
   # a unit the installer enables must have somewhere to be enabled FROM
   out=""; while IFS=$'\t' read -r u en st he re; do
