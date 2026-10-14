@@ -25,7 +25,9 @@
 #   cc-sandbox reconcile <repo> <track>     fold what the worker committed in its own branch namespace onto the host's
 #                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
 #                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
-#   cc-sandbox selfcheck                    a scratch repo + worktree: the world inside is what this header says
+#   cc-sandbox worker-cred                  the credentials file the next worker launch will run on (WORKERS' LOGIN), after
+#                                           the same checks and refresh; cc-loop asks it so the limit it waits on is that login's.
+#   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
 #   cc-sandbox --help | -h                  this header, exit 0
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
@@ -185,11 +187,23 @@
 #   selfcheck plants each one in a fixture HOME and reads for it from inside. A harness that needs its own credential
 #   inside gets it the way claude does below — one stripped copy on a descriptor — in that harness's own phase.
 # AUTH (a WORKER; a member workspace's is the `cc-sandbox member` paragraph above): claude reads a STRIPPED copy of
-#   ~/.claude/.credentials.json at its normal path — the current access token and its
+#   ~/.claude/.credentials.json (or of the workers' login, WORKERS' LOGIN below) at its normal path — the current access token and its
 #   expiry, no refresh token — so the read claude needs is the one cc-guard's credential rule denies the worker, and nothing
 #   goes in the environment (CLAUDE_CODE_OAUTH_TOKEN is unset inside: `env` is not gated, that path is). An iteration is ≤1 h
 #   and whichever session next needs the token refreshes the real file, so a launch with <65 min left is logged: if it
 #   expires mid-run that iteration errors and the next one starts on a fresh copy.
+# WORKERS' LOGIN: `cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json` makes that file the source
+#   of the stripped copy instead of the box's; `cc-config unset` (or empty) goes back. Nothing else moves: settings,
+#   hooks, agents, skills, transcripts and memory are still the box's ~/.claude, and CLAUDE_CONFIG_DIR is never set
+#   inside. That login has one refresher, this launch: with <65 min left it marks the token expired and runs `claude -p`
+#   on the host with CLAUDE_CONFIG_DIR at that file's dir, so the refresh lock and the write-back stay in that dir; that
+#   claude runs from a fresh 0700 dir under ~/.cc/tmp with no tools, no MCP and user settings only. Because that dir is
+#   a config dir the HOST runs claude on, the key is taken only in one shape: ~/.claude-<name>/.credentials.json, a dir
+#   directly under the home that no sandbox binds (the same ~/.claude-* set shared_refresh treats as live logins), made
+#   or tightened to 0700 here, this user's own, and the file plain, this user's and not a symlink. Any other shape, or
+#   missing, signed out, or expired and not refreshed: one line on stderr and the worker runs on the box's own login.
+#   `cc-sandbox worker-cred` answers which one a launch would use, and cc-loop keys its limit stamp and model record to
+#   it (CC_LIMIT_STAMP, CC_MODEL_CRED there); member workspaces and every session outside a worker never read the key.
 # NETWORK (a worker; the member and vet profiles are their own paragraphs): an ALLOW-LIST, not the host's network. The
 #   sandbox has its own network namespace (--unshare-net: loopback and nothing else, no resolver either — the host's
 #   /run/systemd/resolve is not bound, so a DNS query is not a way out). Its one way off the box is cc-egress: a proxy
@@ -544,12 +558,71 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # gh shim, the credential helper, git's url.insteadOf and cc-guard's rule hold inside exactly as they do here
   for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc .cc/github-deny .cc/github-deny.gitconfig; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
 egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
+cred_left(){ local e; e=$(jq -r '.claudeAiOauth.expiresAt // 0' "$1" 2>/dev/null); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
+worker_cred(){   # → the credentials file a WORKER's stripped copy is made from: the box's own, or the workers' login (WORKERS' LOGIN in the header)
+  local box="$H/.claude/.credentials.json" k w d why="" perm
+  k=$("$BIN/cc-config" get WORKER_CLAUDE_CREDENTIALS 2>/dev/null); k="${k/#\~/$H}"
+  [ -n "$k" ] || { echo "$box"; return; }   # "empty = today's behaviour"
+  # ONE SHAPE, AN ALLOW-LIST. The file's dir becomes CLAUDE_CONFIG_DIR for a claude the HOST runs below, so a
+  # settings.json with a hook in it, planted there beside an expiring credential, would run with the host's rights. A
+  # list of trees to keep out (it was ~/.cc/worktrees and ~/.cc/members) missed ~/.cache, which every worker writes. So
+  # the dir must be ~/.claude-<name>, one level under the home: every tree either boundary binds writable sits under
+  # ~/dev, ~/.cc, ~/.claude, ~/.npm or ~/.cache (a landing's --tree is under TMPDIR, ~/.cc/tmp), and none of them
+  # matches. selfcheck_workercred holds that against the bind lists build and build_member really make, so a new bind
+  # under ~/.claude-* goes red there. The path is normalised without following links (-s), so `..` cannot walk out of
+  # the shape, and a link at the dir is refused rather than followed. The file name is fixed because claude reads and
+  # refreshes <dir>/.credentials.json and nothing else; under any other name the refresh would land beside the key.
+  d=$(realpath -s -m -- "$(dirname -- "$k")"); w="$d/.credentials.json"
+  if [ "${k##*/}" != .credentials.json ]; then why='not named .credentials.json, the one file claude refreshes'
+  elif [ "$(dirname -- "$d")" != "$(realpath -s -m -- "$H")" ] || [[ "${d##*/}" != .claude-?* ]]; then
+    why='not in a ~/.claude-<name> directory, the one place no sandbox can write'
+  elif [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then why='in a directory that is a symlink or not a directory'
+  # THE DIR IS 0700 BECAUSE THIS CODE MAKES IT SO, not because a seat once did: made 0700 when missing, closed to 0700
+  # when it is this user's own and no one else could have written to it, and refused, as toolchains_bind refuses, when
+  # it is someone else's or open to group or world writes, since a second writer may already have planted a setting.
+  elif [ ! -e "$d" ] && ! mkdir -m 700 -- "$d" 2>/dev/null; then why='in a directory that could not be made 0700'
+  elif [ "$(stat -c %u -- "$d")" != "$(id -u)" ]; then why="in a directory that is not this user's own"
+  elif perm=$(stat -c %a -- "$d") && [ $(( 8#$perm & 0022 )) -ne 0 ]; then why='in a directory that is group- or world-writable'
+  elif ! chmod 700 -- "$d" 2>/dev/null; then why='in a directory that could not be made 0700'
+  elif [ -L "$w" ]; then why='a symlink'
+  elif [ -e "$w" ] && [ ! -f "$w" ]; then why='not a plain file'
+  elif [ -e "$w" ] && [ "$(stat -c %u -- "$w")" != "$(id -u)" ]; then why="not this user's own file"; fi
+  [ -z "$why" ] || { echo "cc-sandbox: the workers' login ${k/#"$H"/\~} is $why — this worker runs on the box's own login" >&2; echo "$box"; return; }
+  # THE ONE REFRESHER of that login is here, on the host, with CLAUDE_CONFIG_DIR at its own dir: claude takes its refresh
+  # lock in <dir>/.oauth_refresh.lock and writes the new token back to <dir>/.credentials.json, so the token is held and
+  # rotated in one place. The copy inside has no refresh token, as the box's never had. claude itself refreshes only
+  # within 5 min of expiry (2.1.296: `n+300000>=e`), and an iteration runs up to an hour, so the expiry is marked 0
+  # first; a refresh that does not happen (offline, out of time) gets the old expiry back, and the token is used for
+  # what it has left. A refused one blanks the token and falls through to the box's login below. One launch at a time.
+  # That claude runs on the HOST, so it runs from a fresh 0700 dir of its own under ~/.cc/tmp (removed after), with no
+  # tools, no MCP, no session file and the user's settings only: a .claude/settings.json in a shared cwd such as /tmp
+  # is a project setting, and its hooks would run here with the host's rights.
+  if cred_usable "$w" && [ "$(cred_left "$w")" -lt 3900 ]; then
+    ( umask 077; cwd=""   # the dir is 0700 (above); the lock and temp files this makes in it are 0600
+      exec 9>"$d/.cc-worker-refresh.lock" && flock -w 150 9 || exit 0
+      [ "$(cred_left "$w")" -lt 3900 ] || exit 0   # another launch refreshed it while this one waited
+      jset(){ local tf; tf=$(mktemp "$d/.credentials.json.cc-tmp-XXXXXX") && jq "$@" "$w" > "$tf" && mv -f "$tf" "$w" || { rm -f "$tf"; return 1; }; }   # a temp of its own, never a fixed name
+      ot=$(jq -r '.claudeAiOauth.accessToken' "$w") oe=$(jq -r '.claudeAiOauth.expiresAt // 0' "$w")
+      jset '.claudeAiOauth.expiresAt = 0' || exit 0
+      mkdir -p "$H/.cc/tmp" && cwd=$(mktemp -d "$H/.cc/tmp/cc-worker-refresh-XXXXXX") \
+        && ( cd "$cwd" && timeout 120 env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$d" "$CLAUDEBIN" -p \
+               --tools "" --strict-mcp-config --no-session-persistence --setting-sources user --model haiku --max-turns 1 ok ) </dev/null >/dev/null 2>&1
+      [ -n "$cwd" ] && rm -rf "$cwd"
+      [ "$(jq -r '.claudeAiOauth.accessToken' "$w" 2>/dev/null)" = "$ot" ] && [ "$(jq -r '.claudeAiOauth.expiresAt' "$w")" = 0 ] \
+        && jset --argjson e "$oe" '.claudeAiOauth.expiresAt = $e' )
+  fi
+  if cred_usable "$w" && [ "$(cred_left "$w")" -gt 0 ]; then echo "$w"; return; fi
+  why='expired, and the refresh did not renew it'
+  [ -e "$w" ] || why=missing; [ -e "$w" ] && ! cred_usable "$w" && why='signed out (no access token)'
+  echo "cc-sandbox: the workers' login ${w/#"$H"/\~} is $why — this worker runs on the box's own login" >&2
+  echo "$box"; }
 launch(){   # $1 repo · $2 track · the rest is the command
-  local wt="$H/.cc/worktrees/$1/$2" cred="$H/.claude/.credentials.json" tok="" exp left
+  local wt="$H/.cc/worktrees/$1/$2" cred tok="" exp left
   # AHEAD OF build, not after it: build pins the worktree now, and a track that was never created is a plain mistake
   # that deserves its own sentence rather than pin's "that is not the path it should be".
   [ -d "$wt" ] || { echo "cc-sandbox: no worktree $wt" >&2; exit 2; }
   build "$1" "$2"; shift 2
+  cred=$(worker_cred)
   tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred" 2>/dev/null) || tok=""
   if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
   else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
@@ -574,7 +647,7 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # Inside it is ~/.cc/egress, not its host path: a bind under ~/.cc/sandbox would make that directory exist in here,
   # and the namespace case holds that it does not.
   B+=(--ro-bind "$eg" "$H/.cc/egress" --ro-bind "$EGRESS" "$EGRESS")
-  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$H/.claude/.credentials.json" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
 launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES FOR ITSELF, and the only one that needs
@@ -2458,6 +2531,140 @@ selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its
     sudo -n chown "$(id -u):$(id -g)" "$tc" 2>/dev/null
   fi
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_workercred(){   # THE WORKERS' LOGIN (worker_cred), in a HOME of its own: a worker's copy comes from the box's
+  # login when WORKER_CLAUDE_CREDENTIALS is empty and from the workers' file when it is set, with the same settings and
+  # hooks either way; a near-expiry workers' token is refreshed on the host in ITS dir and nowhere else; a missing,
+  # signed-out or unrefreshable one falls back to the box's login with one line. The fixture does NOT make
+  # ~/.claude-workers: the first run with the key set has to, so the 0700 asserted below is the code's.
+  local fh wt wf probe s0 out rw
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxwc-XXXXXX") || return 1; chmod 700 "$fh"
+  mkdir -p "$fh/.claude" "$fh/bin" "$fh/.local/bin" "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
+  wt="$fh/.cc/worktrees/r/t"; wf="$fh/.claude-workers/.credentials.json"
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$wt" >/dev/null 2>&1 \
+    && git -C "$fh/dev/r" worktree add -q -b track/t2 "$fh/.cc/worktrees/r/t2" >/dev/null 2>&1 || return 1
+  jq -n '{hooks: {PreToolUse: [{matcher: "Bash", hooks: [{type: "command", command: "/x/cc-guard"}]}]}}' > "$fh/.claude/settings.json"
+  jq -n '{claudeAiOauth: {accessToken: "box-access", refreshToken: "box-refresh", expiresAt: 99999999999999}}' > "$fh/.claude/.credentials.json"
+  wk(){ jq -n --arg a "$1" --argjson e "$2" '{claudeAiOauth: {accessToken: $a, refreshToken: "wk-refresh", expiresAt: $e}}' > "$wf"; }
+  # the stand-in claude does what the real one does at a refresh — rewrites <CLAUDE_CONFIG_DIR>/.credentials.json — and
+  # notes where, from which cwd and with which flags; it also loads project settings the way claude does (./.claude and
+  # the dir above) unless it was told --setting-sources user, so a planted hook runs exactly when the real one would
+  printf '#!/bin/sh\necho "$CLAUDE_CONFIG_DIR" >> %s/refreshed; echo "$PWD" > %s/refresh-cwd; echo "$*" > %s/refresh-args
+case " $* " in *" --setting-sources user "*) ;; *) for s in .claude/settings.json ../.claude/settings.json; do [ -f "$s" ] && sh -c "$(jq -r ".hooks.SessionStart[0].hooks[0].command" "$s")"; done ;; esac
+f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk-fresh\\" | .claudeAiOauth.expiresAt = 99999999999999" "$f" > "$f.n" && mv "$f.n" "$f"\n' "$fh" "$fh" "$fh" > "$fh/refresher"
+  printf '#!/bin/sh\nexit 1\n' > "$fh/norefresh"; chmod +x "$fh/refresher" "$fh/norefresh"
+  probe='echo tok=$(jq -r ".claudeAiOauth.accessToken" ~/.claude/.credentials.json); echo rt=$(jq -c ".claudeAiOauth | has(\"refreshToken\")" ~/.claude/.credentials.json)
+    echo set=$(sha256sum < ~/.claude/settings.json | cut -c1-16); echo hooks=$(jq -c ".hooks.PreToolUse[0].hooks[0].command" ~/.claude/settings.json); echo ccd=${CLAUDE_CONFIG_DIR:-unset}'
+  run(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="${2:-$fh/refresher}" WORKER_CLAUDE_CREDENTIALS="$1" "$SELF" r "${3:-t}" -- sh -c "$probe" 2>&1; }
+  rwsrc(){ local k=0; while [ "$k" -lt "${#B[@]}" ]; do   # the host paths a bwrap argument list binds READ-WRITE, one a line
+    case "${B[k]}" in --bind|--bind-try) printf '%s\n' "${B[k+1]}"; k=$((k+3));; --bind-fd) readlink "/proc/self/fd/${B[k+1]}"; k=$((k+3));; *) k=$((k+1));; esac; done; }
+  out=$(run "$wf")
+  t "workers' login: no ~/.claude-workers yet → the launch makes it 0700, and the missing file is the box's login, one line" \
+    "$(stat -c %a "$fh/.claude-workers")/$(g tok)/$(grep -c 'is missing — this worker runs' <<<"$out")" 700/box-access/1
+  chmod 755 "$fh/.claude-workers"; wk wk-access 99999999999999
+  out=$(run ""); s0="$(g set)/$(g hooks)"
+  t "workers' login: key empty → the box's credential, no refresh token" "$(g tok)/$(g rt)/$(g ccd)" box-access/false/unset
+  t "workers' login: …and with the key empty the workers' dir is not touched" "$(stat -c %a "$fh/.claude-workers")" 755
+  out=$(run "$wf")
+  t "workers' login: key set → the workers' credential, no refresh token, CLAUDE_CONFIG_DIR not set" "$(g tok)/$(g rt)/$(g ccd)" wk-access/false/unset
+  t "workers' login: …and its 0755 dir, this user's own, is closed to 0700" "$(stat -c %a "$fh/.claude-workers")" 700
+  t "workers' login: …and the settings and hooks are the box's, the same as with the key empty" "$(g set)/$(g hooks)" "$s0"
+  t "workers' login: …which is a real hooks entry, not two empties" "$(g hooks)" '"/x/cc-guard"'
+  # shellcheck disable=SC2088   # the literal ~ is the case: cc-config hands it over unexpanded
+  out=$(run "~/.claude-workers/.credentials.json"); t "workers' login: a ~/ path is the home's" "$(g tok)" wk-access
+  wk wk-old $(( ($(date +%s) + 600) * 1000 )); out=$(run "$wf")
+  t "workers' login: <65 min left → refreshed on the host, in the workers' dir only, and the fresh token goes in" \
+    "$(g tok)/$(cat "$fh/refreshed")/$(jq -r .claudeAiOauth.refreshToken "$fh/.claude/.credentials.json")" "wk-fresh/$fh/.claude-workers/box-refresh"
+  t "workers' login: …from a fresh 0700 dir under ~/.cc/tmp, removed after, with no tools, MCP, session file or project settings" \
+    "$(dirname "$(cat "$fh/refresh-cwd")")/$([ -e "$(cat "$fh/refresh-cwd")" ] && echo left || echo removed)/$(grep -c -- '--tools  --strict-mcp-config --no-session-persistence --setting-sources user ' "$fh/refresh-args")" \
+    "$fh/.cc/tmp/removed/1"
+  t "workers' login: …and the lock it takes in the workers' 0700 dir is 0600" "$(stat -c %a "$fh/.claude-workers")/$(stat -c %a "$fh/.claude-workers/.cc-worker-refresh.lock")" 700/600
+  # a hook planted where the refresher's cwd would find it as a project setting: the dir above the fresh one, and the
+  # stand-in shows it does run when --setting-sources is left off, so the case can fail
+  mkdir -p "$fh/.cc/tmp/.claude"; jq -n --arg c "touch $fh/hook-ran" '{hooks: {SessionStart: [{hooks: [{type: "command", command: $c}]}]}}' > "$fh/.cc/tmp/.claude/settings.json"
+  wk wk-old $(( ($(date +%s) + 600) * 1000 )); out=$(run "$wf")
+  t "workers' login: a planted <cwd>/.claude/settings.json hook does not run at the refresh" "$(g tok)/$([ -e "$fh/hook-ran" ] && echo ran || echo none)" wk-fresh/none
+  mkdir -p "$fh/.cc/tmp/x" && (cd "$fh/.cc/tmp/x" && "$fh/refresher" -p </dev/null >/dev/null 2>&1)
+  t "workers' login: …and the stand-in does run it without --setting-sources user" "$([ -e "$fh/hook-ran" ] && echo ran || echo none)" ran
+  rm -rf "$fh/.cc/tmp/.claude" "$fh/.cc/tmp/x" "$fh/hook-ran"
+  wk wk-old $(( ($(date +%s) + 600) * 1000 )); out=$(run "$wf" "$fh/norefresh")
+  t "workers' login: …a refresh that does not happen keeps the token for the minutes it has left" "$(g tok)/$(jq -r '.claudeAiOauth.expiresAt > 0' "$wf")" wk-old/true
+  rm -f "$fh/refreshed"; wk wk-access 99999999999999; out=$(run "$wf")
+  t "workers' login: …and a token with hours left is not refreshed" "$(g tok)/$([ -e "$fh/refreshed" ] && echo ran || echo none)" wk-access/none
+  wk wk-old $(( ($(date +%s) - 60) * 1000 )); out=$(run "$wf" "$fh/norefresh")
+  t "workers' login: expired and not refreshed → the box's login, one line" "$(g tok)/$(grep -c "expired, and the refresh did not renew it — this worker runs on the box's own login" <<<"$out")" box-access/1
+  wk "" 0; out=$(run "$wf")
+  t "workers' login: signed out (blank token) → the box's login, one line" "$(g tok)/$(grep -c 'signed out (no access token)' <<<"$out")" box-access/1
+  # TWO LAUNCHES AT ONCE: the refresh is one at a time (the flock in the workers' dir), and the one that waited finds
+  # the token already fresh and does not refresh it a second time.
+  printf '#!/bin/sh\nsleep 2\nexec %s "$@"\n' "$fh/refresher" > "$fh/slowrefresher"; chmod +x "$fh/slowrefresher"
+  rm -f "$fh/refreshed"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
+  run "$wf" "$fh/slowrefresher" t2 > "$fh/a.out" & out=$(run "$wf" "$fh/slowrefresher"); wait
+  t "workers' login: two launches at once → one refresh, and both run on the fresh token" \
+    "$(grep -c . "$fh/refreshed")/$(g tok)/$(out=$(cat "$fh/a.out"); g tok)" 1/wk-fresh/wk-fresh
+  # THE KEY'S SHAPE (an allow-list): ~/.claude-<name>/.credentials.json and nothing else; each other shape is one line
+  # and the box's login. The near-expiry token in each proves no refresh ran from the refused dir either.
+  rm -f "$fh/refreshed"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
+  cp "$wf" "$fh/.claude-workers/custom.json"; out=$(run "$fh/.claude-workers/custom.json")
+  t "workers' login: a key not named .credentials.json → the box's login, one line, no refresh" \
+    "$(g tok)/$(grep -c 'is not named .credentials.json, the one file claude refreshes — this worker runs' <<<"$out")/$([ -e "$fh/refreshed" ] && echo ran || echo none)" box-access/1/none
+  mkdir -p "$fh/.cache/x"; cp "$wf" "$fh/.cache/x/.credentials.json"
+  jq -n --arg c "touch $fh/hook-ran" '{hooks: {SessionStart: [{hooks: [{type: "command", command: $c}]}]}}' > "$fh/.cache/x/settings.json"
+  out=$(run "$fh/.cache/x/.credentials.json")
+  t "workers' login: a key under ~/.cache, which every worker writes, with a planted settings.json → the box's login, one line, no refresh, no hook" \
+    "$(g tok)/$(grep -c 'is not in a ~/.claude-<name> directory, the one place no sandbox can write — this worker runs' <<<"$out")/$([ -e "$fh/refreshed" ] && echo ran || echo none)/$([ -e "$fh/hook-ran" ] && echo ran || echo none)" box-access/1/none/none
+  mkdir -p "$fh/.npm"; cp "$wf" "$fh/.npm/.credentials.json"; out=$(run "$fh/.npm/.credentials.json")
+  t "workers' login: a key whose dir IS a sandbox-bound tree (~/.npm) → the box's login, one line" \
+    "$(g tok)/$(grep -c 'is not in a ~/.claude-<name> directory' <<<"$out")" box-access/1
+  cp "$wf" "$fh/.cache/.credentials.json"; out=$(run "$fh/.claude-workers/../.cache/.credentials.json")
+  t "workers' login: …and a .. that walks out of ~/.claude-workers into ~/.cache is the same refusal" \
+    "$(g tok)/$(grep -c 'is not in a ~/.claude-<name> directory' <<<"$out")" box-access/1
+  cp "$wf" "$fh/.cc/worktrees/r/.credentials.json"; out=$(run "$fh/.cc/worktrees/r/.credentials.json")
+  t "workers' login: a key under ~/.cc/worktrees → the box's login, one line" "$(g tok)/$(grep -c 'is not in a ~/.claude-<name> directory' <<<"$out")" box-access/1
+  ln -s "$fh/.claude-workers" "$fh/.claude-ln"; out=$(run "$fh/.claude-ln/.credentials.json")
+  t "workers' login: a ~/.claude-<name> that is a symlink to a dir → the box's login, one line" \
+    "$(g tok)/$(grep -c 'is in a directory that is a symlink or not a directory — this worker runs' <<<"$out")" box-access/1
+  mkdir -m 700 "$fh/.claude-link"; ln -s "$wf" "$fh/.claude-link/.credentials.json"; out=$(run "$fh/.claude-link/.credentials.json")
+  t "workers' login: a symlink key → the box's login, one line" "$(g tok)/$(grep -c 'is a symlink — this worker runs' <<<"$out")" box-access/1
+  mkdir -m 700 "$fh/.claude-gw"; cp "$wf" "$fh/.claude-gw/.credentials.json"; chmod 775 "$fh/.claude-gw"; out=$(run "$fh/.claude-gw/.credentials.json")
+  t "workers' login: a group-writable ~/.claude-<name> → the box's login, one line, and the dir is left as it was" \
+    "$(g tok)/$(grep -c 'is in a directory that is group- or world-writable — this worker runs' <<<"$out")/$(stat -c %a "$fh/.claude-gw")" box-access/1/775
+  if sudo -n true 2>/dev/null && sudo -n chown 0:0 "$fh/.claude-gw/.credentials.json" 2>/dev/null; then
+    chmod 700 "$fh/.claude-gw"; out=$(run "$fh/.claude-gw/.credentials.json")
+    t "workers' login: a key owned by someone else (root, here) → the box's login, one line" "$(g tok)/$(grep -c "is not this user's own file — this worker runs" <<<"$out")" box-access/1
+    sudo -n chown "$(id -u):$(id -g)" "$fh/.claude-gw/.credentials.json" 2>/dev/null
+  fi
+  if sudo -n true 2>/dev/null && sudo -n chown 0:0 "$fh/.claude-gw" 2>/dev/null; then
+    out=$(run "$fh/.claude-gw/.credentials.json")
+    t "workers' login: a ~/.claude-<name> owned by someone else (root, here) → the box's login, one line" "$(g tok)/$(grep -c "is in a directory that is not this user's own — this worker runs" <<<"$out")" box-access/1
+    sudo -n chown "$(id -u):$(id -g)" "$fh/.claude-gw" 2>/dev/null
+  fi
+  # A WORKER CANNOT WRITE THE REFRESH DIR, measured twice: from inside a live worker, and against the bind lists BOTH
+  # boundaries really make (every rw source, the descriptor-pinned ones read back from their fd), so a bind added under
+  # ~/.claude-* later goes red here instead of reopening the hook hole.
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="$fh/refresher" WORKER_CLAUDE_CREDENTIALS="$wf" "$SELF" r t -- \
+    sh -c 'mkdir -p ~/.claude-workers && echo "{}" > ~/.claude-workers/settings.json; echo wrote=$?' 2>&1)
+  t "workers' login: a worker's write to ~/.claude-workers never reaches the host's" "$(g wrote)/$([ -e "$fh/.claude-workers/settings.json" ] && echo landed || echo absent)" 0/absent
+  mkdir -p "$fh/dev/wch/.cc" && : > "$fh/dev/wch/.cc/member-workspace" && git -C "$fh/dev/wch" init -q -b main >/dev/null 2>&1
+  rw=$( { ( H="$fh" HOME="$fh"; build r t >/dev/null 2>&1 || exit 1; rwsrc ) && ( H="$fh" HOME="$fh"; build_member wch "" >/dev/null 2>&1 || exit 1; rwsrc ); } 2>/dev/null)
+  t "workers' login: the worker and member bind lists were read (each has its ~/.cache)" \
+    "$(grep -cx "$fh/.cache" <<<"$rw")/$(grep -cx "$fh/.cc/members/wch/cache" <<<"$rw")" 1/1
+  t "workers' login: …and not one writable source either boundary binds is a ~/.claude-<name> dir or under one" "$(grep -c "^$fh/\.claude-" <<<"$rw")" 0
+  # worker-cred, the question cc-loop asks: the same answer the launch acts on, the one line on a refusal, and the
+  # box's login with the fence off, where the key is not read.
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$wf" "$SELF" worker-cred 2>/dev/null)
+  t "workers' login: worker-cred names the workers' file when the launch would use it" "$out" "$wf"
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$fh/.npm/.credentials.json" "$SELF" worker-cred 2>&1)
+  t "workers' login: …and the box's when the launch would refuse the key, with its one line" \
+    "$(tail -1 <<<"$out")/$(grep -c 'this worker runs on the box' <<<"$out")" "$fh/.claude/.credentials.json/1"
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=0 WORKER_CLAUDE_CREDENTIALS="$wf" "$SELF" worker-cred 2>&1)
+  t "workers' login: …and the box's, with no line, when the fence is off" "$out" "$fh/.claude/.credentials.json"
+  chmod 500 "$fh"; out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$fh/.claude-new/.credentials.json" "$SELF" worker-cred 2>&1); chmod 700 "$fh"
+  t "workers' login: a ~/.claude-<name> that cannot be made → the box's login, one line" \
+    "$(tail -1 <<<"$out")/$(grep -c 'is in a directory that could not be made 0700 — this worker runs' <<<"$out")" "$fh/.claude/.credentials.json/1"
+  rm -f "$wf"; out=$(run "$wf")
+  t "workers' login: missing → the box's login, one line" "$(g tok)/$(grep -c 'is missing — this worker runs' <<<"$out")" box-access/1
+  git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
   # off switch (`<repo> <track>` execs the command untouched when CC_WORKER_SANDBOX=0), and the mail door's rule is that
@@ -2944,7 +3151,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
@@ -2988,6 +3195,9 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
   probe) fence_off && exit 0; why=$(fence_why) || { echo "$why" >&2; exit 2; }; exit 0;;   # cc-loop, before iteration 1
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
+  # cc-loop, before every iteration: the login the launch will run on. With the fence off the command runs as given,
+  # on the box's own login, so that is the answer, and the key is not read at all.
+  worker-cred) if fence_off; then echo "$H/.claude/.credentials.json"; else worker_cred; fi; exit 0;;
   mint) shift; mint "$@"; exit $?;;
   vet) shift; [ "${1:-}" = -- ] && shift
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
@@ -3008,7 +3218,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
 # ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
 # for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
 fence_off && exec "$@"   # off means the command runs exactly as given, nothing added

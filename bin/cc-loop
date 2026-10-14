@@ -113,6 +113,10 @@
 #      default, and off is byte-for-byte the run this loop always did. What it is and what it measured: trim_body.
 # Env: every worker runs inside bwrap (cc-sandbox) — secrets, sockets, other tracks absent, network through an allow-list;
 #   CC_WORKER_SANDBOX=0 is the owner's off switch. A box where the fence cannot start runs no worker (`cc-sandbox probe`, before iter 1).
+# Env: WORKER_CLAUDE_CREDENTIALS (cc-config key) set and the fence on → the worker runs on that login when cc-sandbox takes
+#   it (`cc-sandbox worker-cred`, asked every iteration), and then this loop's limit stamp is ~/.cc/state/claude-limit.workers
+#   and its CC_MODEL_CRED is `workers`, so that account's limit waits and exits 8 as above while the box's sessions run
+#   on. An iteration cc-sandbox puts on the box's login waits on the box's stamp, as before.
 # Every iteration's claude runs under cc-nosignal: it and every Bash run it makes can signal only what they started.
 # Inside the sandbox every Bash call shares bwrap's pid namespace and the session's scope with the worker's claude, so a
 # test there can still signal that claude and bwrap's init, but not the user manager, the tmux server or another
@@ -1252,11 +1256,12 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   local lb="$d/lb" lh="$d/lh" c
   mkdir -p "$lb" "$lh"; cp "$0" "$lb/cc-loop"
   printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"; echo >> "%s"\n' "$d/lb.n" "$d/lb.n" > "$lb/cc-notify"
-  printf '#!/bin/sh\ncase "$1" in reconcile|probe) exit 0;; esac\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' > "$lb/cc-sandbox"
+  printf '#!/bin/sh\ncase "$1" in reconcile|probe) exit 0;; worker-cred) echo "$FK_CRED"; exit 0;; esac\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' > "$lb/cc-sandbox"
   printf '#!/bin/sh\nexit 0\n' > "$lb/cc-tier"
   printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_SHELL_PREFIX-UNSET}" > "%s"\nshift; exec "$@"\n' "$d/lb.ns" > "$lb/cc-nosignal"   # records the prefix it was handed, then runs what follows --
   printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-UNSET}" > "$FK_ST/bgceil"\n[ -n "$FK_LINE" ] && printf "%%s\\n" "$FK_LINE" >> "$FK_ST/progress.md"\n[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step\nprintf "%%s\\n" "{\\"type\\":\\"result\\",\\"subtype\\":\\"success\\",\\"is_error\\":false,\\"num_turns\\":3,\\"total_cost_usd\\":1.25,\\"result\\":\\"did a step\\"}"\n' > "$lb/claude"
   sed -i '1a printf "%s\\n" "$@" > "$FK_ST/argv"' "$lb/claude"   # what the loop handed claude, one arg a line
+  sed -i '1a printf "%s/%s\\n" "${CC_LIMIT_STAMP-UNSET}" "${CC_MODEL_CRED-UNSET}" > "$FK_ST/acct"' "$lb/claude"   # whose limit stamp and model record it ran under
   printf '#!/bin/sh\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/9\\",\\"landing\\":{\\"message\\":\\"It is queued to land.\\"}}"\n' > "$lb/cc-land"
   chmod +x "$lb"/*
   lrun(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"
@@ -1288,6 +1293,19 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/sbx" FK_LINE="" FK_COMMIT=0 CC_WORKER_SANDBOX=0 "$lb/cc-loop" lp sbx --max-iter 1 ) >/dev/null 2>&1
   t '…and with the sandbox off (CC_WORKER_SANDBOX=0), each of its Bash calls is handed a scope of its own' "$(cat "$d/lb.ns" 2>/dev/null)" "$lb/cc-nosignal-shell"
+  # ── WHOSE LIMIT ── with WORKER_CLAUDE_CREDENTIALS set, the limit stamp and model record follow the login cc-sandbox
+  # says the launch will use (its stub answers worker-cred from FK_CRED), not the key: the workers' file, then the
+  # box's, which is what a missing, expired or refused workers' login falls back to. The key alone moves nothing.
+  printf '#!/bin/sh\n[ "$1 $2" = "get WORKER_CLAUDE_CREDENTIALS" ] && { echo "$FK_KEY"; exit 0; }\nexit 1\n' > "$lb/cc-config"; chmod +x "$lb/cc-config"
+  wacct(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
+    git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" \
+        FK_LINE="" FK_COMMIT=0 FK_KEY="$lh/.claude-workers/.credentials.json" FK_CRED="$2" "$lb/cc-loop" lp "$1" --max-iter 1 ) >/dev/null 2>&1
+    cat "$lh/.cc/state/lp/$1/acct" 2>/dev/null; }
+  t "the workers' login in use → its own limit stamp and model record" "$(wacct wa "$lh/.claude-workers/.credentials.json")" "$lh/.cc/state/claude-limit.workers/workers"
+  t "…and the key set but cc-sandbox falling back to the box's login → the box's stamp and record, as with no key" \
+    "$(wacct wb "$lh/.claude/.credentials.json")" UNSET/UNSET
+  rm -f "${lb:?}/cc-config"
   # ── NO FENCE, NO WORKER ── a cc-sandbox whose probe refuses (a box with no working bwrap): the loop stops with exit 2
   # before iteration 1, says why in loop.log, and claude never runs. Its own track and stub; the passing stub is put back.
   mv "$lb/cc-sandbox" "$lb/cc-sandbox.ok"
@@ -1887,6 +1905,22 @@ tiered(){ [ "$i" -gt 0 ] || return 1   # iteration 1 was let through by the star
   "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
   "$BOARD" note "$repo" "$track" "loop exit 13: $("$BIN/cc-tier" line) — a wider tier, or critical=yes on this row, re-dispatches it" >/dev/null 2>&1
   log "exit 13: $("$BIN/cc-tier" line) — standing down after iteration $i; cc $repo $track --go \"\" resumes it"; exit 13; }
+# THE WORKERS' LOGIN (WORKER_CLAUDE_CREDENTIALS, cc-sandbox's WORKERS' LOGIN): its usage limit is that account's, not the
+# box's. So the stamp and the unavailable-model record are its own, and the wait-then-exit-8 below handles it the same way
+# without making the box's sessions wait on it. But the key being set does not mean the worker runs on it: cc-sandbox
+# falls back to the box's login when that file is missing, expired, signed out or refused. So every iteration asks
+# cc-sandbox which login its launch will use (`worker-cred`, the same checks and refresh, its line dropped here because
+# the launch prints it) and keys the stamp and the record to that answer. Asked per iteration, not once, because an hour
+# is long enough for that login to sign out or come back. The box's values are what the loop started with.
+LS0="${CC_LIMIT_STAMP:-}" MC0="${CC_MODEL_CRED:-}"
+worker_account(){
+  local c=""
+  if ! inside_boundary && [ -n "$("$BIN/cc-config" get WORKER_CLAUDE_CREDENTIALS 2>/dev/null)" ]; then
+    c=$("$BIN/cc-sandbox" worker-cred 2>/dev/null); fi
+  if [ -n "$c" ] && [ "$c" != "$HOME/.claude/.credentials.json" ]; then
+    export CC_LIMIT_STAMP="${LS0:-$HOME/.cc/state/claude-limit}.workers" CC_MODEL_CRED=workers; return; fi
+  if [ -n "$LS0" ]; then export CC_LIMIT_STAMP="$LS0"; else unset CC_LIMIT_STAMP; fi
+  if [ -n "$MC0" ]; then export CC_MODEL_CRED="$MC0"; else unset CC_MODEL_CRED; fi; }
 base=$(worker_base "$repo")
 SP=$(sp_worker "$base")
 # NO FENCE, NO WORKER. The fence (cc-sandbox) is on for every worker and has no host fallback, so a box where it cannot
@@ -1907,6 +1941,7 @@ while [ $i -lt "$MAXI" ]; do
   parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
   stopped  # …the stop file, written by a person or a session while the last iteration ran
   tiered   # …and the spend tier the same way, for iteration 2 onwards
+  worker_account   # whose login this launch runs on, before its limit stamp and its model are read (above, at worker_account)
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     hm=$(sed -n 's/.*until \([0-9][0-9]:[0-9][0-9]\)Z.*/\1/p' <<<"$p")   # status speaks UTC; a person reads local time
     at=$([ -n "$hm" ] && "$BIN/cc-time" slack "$(date -u +%Y-%m-%d)T$hm:00Z" 2>/dev/null || echo "${hm:-later}${hm:+Z}")

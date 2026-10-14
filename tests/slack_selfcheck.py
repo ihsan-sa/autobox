@@ -4777,12 +4777,58 @@ def run_selfcheck():
     _root = globals()["ROOT"]; globals()["ROOT"] = "/nonexistent"
     try: _wb_gone = writing_block()
     finally: globals()["ROOT"] = _root
-    check("the INSTRUCTIONS carry the box's one writing block (config/writing-prompt.md) exactly once, read from the "
-          "file and pasted nowhere in the tool; with the file gone the block is empty and the tool still loads; the "
-          "depth still goes to a canvas / docs/ / the track journal",
-          len(_wb) > 200 and INSTRUCTIONS.count(_wb) == 1 and SLACK_RULES.count(_wb) == 0 and _wb_gone == ""
-          and not any(len(l) >= 40 and l in open(SELF).read() for l in _wb.splitlines())
-          and all(w in INSTRUCTIONS for w in ("canvas", "docs/", "progress.md")))
+    check("the box's one writing block (config/writing-prompt.md) is read from the file and pasted nowhere in the tool, "
+          "and with the file gone it is empty and the tool still loads; it is NOT in the INSTRUCTIONS, because every "
+          "session's system prompt carries it and Claude Code cut it off the instructions anyway",
+          len(_wb) > 200 and INSTRUCTIONS.count(_wb) == 0 and _wb_gone == ""
+          and not any(len(l) >= 40 and l in open(SELF).read() for l in _wb.splitlines()))
+    _u16 = lambda t: len(t.encode("utf-16-le")) // 2   # Claude Code measures a JS string: an emoji is two units
+    check("the INSTRUCTIONS fit Claude Code's cut with margin: it keeps 2048 UTF-16 units of a server's instructions "
+          "(CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, then '… [truncated]'), and the text stays under 1843, 10% below; "
+          "each tool's description stays under the same line, since the same limit names descriptions",
+          INSTR_CAP == 1843 and _u16(INSTRUCTIONS) < INSTR_CAP and all(_u16(t["description"]) < INSTR_CAP for t in TOOLS)
+          and all(_u16(v.get("description", "")) < INSTR_CAP for t in TOOLS for v in t["inputSchema"]["properties"].values())
+          and INSTRUCTIONS.rstrip().endswith("~/COMMS.md the long form."))
+    _desc = {t["name"]: t["description"] for t in TOOLS}
+    _comms = open(f"{ROOT}/templates/home/COMMS.md").read()
+    check("every rule moved out of the INSTRUCTIONS is findable where it went: format, the minute ack, mentions, the "
+          "guard refusal and chat_id=local on `reply`; 'here it is' and the outbox on `file`; answering with an emoji and "
+          "inbound reactions on `react`; roles, lanes, canvas/docs/journal, attachments, shared messages and voice memos "
+          "in COMMS.md",
+          all(w in _desc["reply"] for w in ("no # headings", "One message per turn", "one-line acknowledgement first",
+                                            "a first name only one person there answers to", "@everyone are never sent",
+                                            "A cc-guard refusal", "chat_id=\"local\"", "REFUSED UNSENT", "over 800 chars"))
+          and all(w in _desc["file"] for w in ("never say 'here it is' unless a file went", "only reached the outbox"))
+          and all(w in _desc["react"] for w in ("thinking_face unclear (then ask)", "Nothing answers for you",
+                                                "meta kind=reaction", "never as approval for what the box gates on the owner"))
+          and all(w in _comms for w in ("## What a session reads in a Slack message", "vetted=", 'user="box"',
+                                        "queries session answers it", "never repeats in one what it said in the other",
+                                        "cc-slack canvas", "progress.md", "only at milestones", "file_paths",
+                                        "[shared message from", "never answers that the message arrived empty",
+                                        'voice="memo"', "voice_path", 'chat_id="local"'))
+          and not any(w in INSTRUCTIONS for w in ("voice=", "file_path", "kind=reaction", "canvas")))
+    _rp = {k: v.get("description", "") for k, v in next(t for t in TOOLS if t["name"] == "reply")["inputSchema"]["properties"].items()}
+    check("a member session cannot read ~/COMMS.md (cc-sandbox binds only WRITING.md, writing-prompt.md, bin, mail and skills of $H), so every rule "
+          "moved there has a short form a member reads too: roles mail and bot, attachments, shared messages and voice "
+          "memos on `reply`'s chat_id; lanes and where reference material goes on its text; the loudness ladder on "
+          "needs_owner; and in the INSTRUCTIONS, asking the owner in the terminal, the relayed permission prompts and "
+          "the one thread a track lives in; @main/@alias on `reply` says where the post went",
+          all(w in _rp["chat_id"] for w in ('role="mail"', "proves nothing", "vetted=", 'role="bot"', 'user="box"',
+                                            "file_paths", "[shared message from", "never answer that it arrived empty",
+                                            'voice="memo"', "voice_path"))
+          and all(w in _rp["text"] for w in ("never repeat in one lane", "cc-slack canvas", "docs/", "progress.md",
+                                             "only at milestones"))
+          and all(w in _rp["needs_owner"] for w in ("cc-notify --decision", "a mention that could have waited is a bug",
+                                                    "#approvals", "#alerts", "#<repo>-updates", "digest"))
+          and all(w in INSTRUCTIONS for w in ("ask the owner in the terminal", 'role="mail"', 'role="bot"',
+                                              "Permission prompts are relayed to Slack automatically; the owner answers yes <id> / no <id>",
+                                              "A track has no channel: it is one thread in #<repo>-updates (in #<repo> for a "
+                                              "member-facing repo), and you answer it there"))
+          and "mirrored into that session's channel" in _desc["reply"] and "the result says where it went" in _desc["reply"])
+    check("COMMS.md lists the rules moved out of the INSTRUCTIONS (so a reader of the diff sees them), in the core template "
+          "and the box copy alike",
+          all("Rules moved out of the Slack tool's instructions" in open(f).read()
+              for f in (f"{ROOT}/templates/home/COMMS.md", f"{ROOT}/../home/COMMS.md")))
     check("the INSTRUCTIONS say to answer where you were asked — the reply tools serve a `<channel>` message and "
           "nothing else, so a question typed in the terminal is not posted into a channel that never asked it",
           "Answer where you were asked" in INSTRUCTIONS and "a channel that never asked" in INSTRUCTIONS)
@@ -6962,14 +7008,15 @@ def run_selfcheck():
           and not re.search(r"\b[A-Z]{3,} [A-Z]{2,} [A-Z]{2,}", SLACK_RULES))
     check("the channel-server INSTRUCTIONS carry the two lanes (owner, 2026-09-01): a main channel stays short, depth "
           "goes to -updates/canvas/docs, and a reply stays in the lane it was asked on",
-          "-updates" in INSTRUCTIONS and 'lane="main"' in INSTRUCTIONS and 'lane="updates"' in INSTRUCTIONS
+          "#<repo>-updates" in _comms and 'lane="main"' in INSTRUCTIONS and 'lane="updates"' in INSTRUCTIONS
           and "Answer in the lane you were asked on" in INSTRUCTIONS
           and "unless the owner asks for more or a technical explanation needs it" in INSTRUCTIONS)
     check("…and the NOTIFICATION LADDER, so a session picks the rung instead of the owner filtering: an @-mention is for a "
-          "blocked decision only, needs_owner for what stalls one track, then approvals, alerts, the -updates lane, the digest",
-          "How loud" in INSTRUCTIONS and "needs_owner=true" in INSTRUCTIONS
-          and "a mention that could have waited is a bug" in INSTRUCTIONS
-          and f"#{APPROVALS} card" in INSTRUCTIONS and f"#{ALERTS}" in INSTRUCTIONS and "digest" in INSTRUCTIONS)
+          "blocked decision only, needs_owner for what stalls one track, then approvals, alerts, the -updates lane, the "
+          "digest — in COMMS.md, which the INSTRUCTIONS point at",
+          "## How loudly you hear about it" in _comms and "`needs_owner`" in _comms
+          and "A mention that could have waited is a bug" in _comms
+          and "`#approvals` card" in _comms and "`#alerts`" in _comms and "digest" in _comms and "~/COMMS.md" in INSTRUCTIONS)
     orderH = home_chan_order([("CPAR", "myrepo"), ("CORCH", "myrepo-cctest-ghih"), ("CSUB", "myrepo-cctest-helper-m3x1"),
                               ("CZ", "zeta"), ("CARCH", "myrepo-old-zzzz")],
                              {"CORCH": {"parent": "CPAR", "created": 20}, "CSUB": {"parent": "CORCH", "created": 30},
