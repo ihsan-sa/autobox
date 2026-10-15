@@ -638,6 +638,24 @@ rm -f "$GH/.cc/state/member-spend.json"; c9=$(CAP_CEIL=1 cap); r9=$?
   && ok "…the ceiling defaults to twice the cap when the owner set none, and one set below the cap is the cap" \
   || bad "the default ceiling is wrong (first rc=$r7 '$c7'; second rc=$r8 '$c8'; ledger $l8; ceiling<cap rc=$r9 '$c9')"
 rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
+# PER-WORKSPACE OVERRIDE (owner, 2026-10-13: one fund develops 24/7 with no cap; the shared ceiling widens every member).
+# MEMBER_DAILY_CEILING_USD_<HANDLE> is read before the shared key for that one handle: alice's own $30 lets an $8 run
+# through a shared $5 ceiling and the lines name her key; bob's $30 does nothing for alice, who stays at the shared $5;
+# and an override that is not a complete decimal (lots, 999..0) falls back to the shared value rather than to nothing.
+cA=$(MEMBER_DAILY_CEILING_USD_ALICE=30 CAP_CEIL=5 cap); rA=$?
+rm -f "$GH/.cc/state/member-spend.json"; cB=$(MEMBER_DAILY_CEILING_USD_BOB=30 CAP_CEIL=5 cap); rB=$?
+rm -f "$GH/.cc/state/member-spend.json"; cC=$(MEMBER_DAILY_CEILING_USD_ALICE=lots CAP_CEIL=30 cap); rC=$?
+rm -f "$GH/.cc/state/member-spend.json"; cD=$(MEMBER_DAILY_USD_ALICE=8 CAP_CEIL=8 cap); rD=$?
+rm -f "$GH/.cc/state/member-spend.json"; cE=$(MEMBER_DAILY_CEILING_USD_ALICE=999..0 CAP_CEIL=5 cap); rE=$?
+[ "$rA" = 0 ] && grep -q 'raised to \$8.00 for today (ceiling \$30.00)' <<<"$cA" && grep -q 'cc-config set MEMBER_DAILY_CEILING_USD_ALICE <n>' "$T/cap.args" \
+  && [ "$rB" = 1 ] && grep -q 'over its \$5.00 ceiling' <<<"$cB" \
+  && [ "$rC" = 0 ] && grep -q 'ceiling \$30.00' <<<"$cC" \
+  && [ "$rD" = 0 ] && ! grep -q 'raised' <<<"$cD" \
+  && [ "$rE" = 1 ] && grep -q 'over its \$5.00 ceiling' <<<"$cE" \
+  && ok "MEMBER_DAILY_CEILING_USD_<HANDLE> moves one workspace's ceiling only: the shared one holds for every other handle, a non-numeric or malformed one (999..0) falls back to it, and MEMBER_DAILY_USD_<HANDLE> moves the cap the same way" \
+  || bad "per-workspace override wrong (own rc=$rA '$cA'; other's rc=$rB '$cB'; non-numeric rc=$rC '$cC'; cap rc=$rD '$cD'; malformed rc=$rE '$cE')"
+unset MEMBER_DAILY_CEILING_USD_ALICE MEMBER_DAILY_CEILING_USD_BOB MEMBER_DAILY_USD_ALICE MEMBER_DAILY_USD_BOB
+rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
 # …and the other side of that same wall: INSIDE the boundary the very same command charges nothing and opens no
 # window — it writes the brief and hands the daemon a `dispatch`, which is what charges the cap out here. A MEMBER
 # SESSION NEVER RAISES ITS OWN CAP: the ceiling in ITS environment is nobody's — what crosses to the host is the brief

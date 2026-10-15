@@ -422,7 +422,20 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
 # in. Inside there is no tmux and no ledger, so `cc <h> <track> --go` writes the brief and asks the daemon (cc-slack dispatch)
 # to run the same command out here. The bare internals (__run*) refuse a workspace repo outside the boundary: depth.
 MEMBER_WS_SP="This session belongs to a MEMBER WORKSPACE and runs inside its boundary: only its folder, its tracks and its Slack channels exist here, so a missing path or tool is by design, not a fault. 'cc-notify -t \"<what>\" \"...\"' and reply(needs_owner) both reach the box's planning seat, which answers you or asks the owner itself. A cc-guard REFUSAL is already a query to the box: never post it, a 🔐 line or 'I cannot do that' into the channel; say what you CAN do. ASKING THE BOX (a GitHub repo, a host-side push, a question about the box) is 'cc slack ask -t \"<what>\" \"...\"' (at most 5 an hour), and the answer comes back in this channel. Never ask the owner to relay a question you can send yourself. Dispatch with 'cc <handle> <track> --go \"...\"' (inside this boundary, on the workspace's budget); a track session is opened from its 🧵 thread in #<handle> or by the owner, never from here."
-member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_DAILY_USD/day. The cost is PRE-charged at
+# PER-WORKSPACE OVERRIDES (owner, 2026-10-13: one fund runs 24/7 with no cap, and raising the shared ceiling would widen
+# every other member). MEMBER_DAILY_USD and MEMBER_DAILY_CEILING_USD each take a per-handle form, <KEY>_<HANDLE> with the
+# handle upper-cased and every character outside A-Z0-9 made `_` (bayesian-squirrel → _BAYESIAN_SQUIRREL), read BEFORE the
+# shared key. A value that is not a plain number falls back to the shared key, and that to the built-in default. Host
+# config only: a member session never sees ~/.cc/config. cc-slack's member_budget reads the same keys the same way.
+member_key(){ printf '%s_%s' "$1" "$(printf '%s' "$2" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9' '_')"; }
+member_num(){   # $1 key, $2 handle → the per-handle value, else the shared one, else empty; each only when numeric
+  local v
+  v=$("$BIN/cc-config" get "$(member_key "$1" "$2")" "" 2>/dev/null) || v=""
+  [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || { v=$("$BIN/cc-config" get "$1" "" 2>/dev/null) || v=""; }
+  [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || v=""
+  printf '%s' "$v"
+}
+member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_DAILY_USD[_<HANDLE>]/day. The cost is PRE-charged at
   # dispatch (budget x loops), so the cap bounds exposure rather than accounting for it, and the owner is told in the
   # workspace's own updates lane when it bites. Nothing here applies to any other repo.
   # THE CAP IS A TELL-LINE, THE CEILING IS THE STOP (owner, 2026-09-08: a day cap guards against runaway; the box raises
@@ -436,7 +449,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   # `cc … --go` inside the boundary is brokered to the daemon (the `go)` case below) and carries only the brief — and the
   # cap, the ceiling and the ledger are read out here from ~/.cc/config and ~/.cc/state, neither of which exists inside.
   member_workspace "$1" || return 0
-  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap ceiling eff raised day cur spent mention=0
+  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap ceiling ckey eff raised day cur spent mention=0
   if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && budget="$a"; prev="$a"; done; fi
   # `--budget 1e9` was charged as $8 (not a number → the default) and passed through as-is: a cap the dispatch it
   # gates then ignores. A budget the ledger cannot add up is refused here, before anything is charged (cc-loop too).
@@ -444,10 +457,10 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   [ -n "$budget" ] || budget=8      # cc-loop's own default when --budget is not given
   case "$loops" in ''|*[!0-9]*) loops=1;; esac
   want=$(awk -v b="$budget" -v n="$loops" 'BEGIN{printf "%.2f", b * n}')
-  cap=$("$BIN/cc-config" get MEMBER_DAILY_USD 20 2>/dev/null) || cap=20   # below cc-loop's own default budget ($8/iter) the first plain --go already raises it
-  case "$cap" in ''|*[!0-9.]*) cap=20;; esac
-  ceiling=$("$BIN/cc-config" get MEMBER_DAILY_CEILING_USD "" 2>/dev/null) || ceiling=""
-  case "$ceiling" in ''|*[!0-9.]*) ceiling=$(awk -v c="$cap" 'BEGIN{printf "%.2f", c * 2}');; esac
+  cap=$(member_num MEMBER_DAILY_USD "$repo")   # below cc-loop's own default budget ($8/iter) the first plain --go already raises it
+  [ -n "$cap" ] || cap=20
+  ceiling=$(member_num MEMBER_DAILY_CEILING_USD "$repo"); ckey=$(member_key MEMBER_DAILY_CEILING_USD "$repo")
+  [ -n "$ceiling" ] || ceiling=$(awk -v c="$cap" 'BEGIN{printf "%.2f", c * 2}')
   ceiling=$(awk -v c="$cap" -v l="$ceiling" 'BEGIN{printf "%.2f", (l < c) ? c : l}')   # a ceiling below the cap is the cap: it never lowers it
   day=$(date -u +%F); mkdir -p "$STBASE"
   exec 8>"$MEMBER_SPEND.lock" || return 0; flock 8            # two dispatches at once must not both see the same headroom
@@ -469,7 +482,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
     fi
     exec 8>&-
     echo "cc: $repo has used \$$spent of its \$$eff/day and this dispatch asks for \$$want — over its \$$ceiling ceiling, refused."
-    "$BIN/cc-slack" post -c "#$repo-updates" "💸 \`$repo\` has used \$$spent of its \$$eff for today and this run asked \$$want — over the \$$ceiling ceiling, so it was refused. Raise \`MEMBER_DAILY_CEILING_USD\` or let it roll over." >/dev/null 2>&1 || true
+    "$BIN/cc-slack" post -c "#$repo-updates" "💸 \`$repo\` has used \$$spent of its \$$eff for today and this run asked \$$want — over the \$$ceiling ceiling, so it was refused. Raise \`$ckey\` or let it roll over." >/dev/null 2>&1 || true
     if [ "$mention" = 1 ]; then
       # DIRECT to the workspace's main channel: cc-notify's escalation walk turns a --decision raised from a
       # member-facing cwd — and the workspace's own session is exactly who dispatches here — into an owner DM
@@ -477,7 +490,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
       # day-stamp holds only for a message somebody could hear: a failed post releases the claim, so the
       # next refusal retries instead of inheriting a stamp for silence.
       if ! "$BIN/cc-slack" post -c "#$repo" --mention \
-        "\`$repo\` hit its \$$ceiling/day ceiling (\$$spent used, this run asked \$$want) — raise it: \`cc-config set MEMBER_DAILY_CEILING_USD <n>\`, or it resets at 00:00 UTC." >/dev/null 2>&1; then
+        "\`$repo\` hit its \$$ceiling/day ceiling (\$$spent used, this run asked \$$want) — raise it: \`cc-config set $ckey <n>\`, or it resets at 00:00 UTC." >/dev/null 2>&1; then
         { exec 8>"$MEMBER_SPEND.lock" && flock 8 \
           && jq --arg h "$repo" 'del(.[$h].mentioned)' "$MEMBER_SPEND" > "$MEMBER_SPEND.tmp" 2>/dev/null \
           && mv "$MEMBER_SPEND.tmp" "$MEMBER_SPEND"; } || true
@@ -497,7 +510,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
     exec 8>&-
     echo "cc: $repo had used \$$spent of its \$$eff/day and this dispatch asks for \$$want — cap raised to \$$raised for today (ceiling \$$ceiling)."
     "$BIN/cc-slack" post -c "#$repo-updates" "💸 \`$repo\` needed more than its \$$eff for today (\$$spent used, this run asked \$$want) — the box raised today's cap to \$$raised, under the \$$ceiling ceiling." >/dev/null 2>&1 || true
-    "$BIN/cc-slack" post -c "#$repo" --mention "raised \`$repo\`'s cap to \$$raised for today (was \$$eff, this run asked \$$want; ceiling \$$ceiling — \`cc-config set MEMBER_DAILY_CEILING_USD <n>\` moves it)." >/dev/null 2>&1 || true
+    "$BIN/cc-slack" post -c "#$repo" --mention "raised \`$repo\`'s cap to \$$raised for today (was \$$eff, this run asked \$$want; ceiling \$$ceiling — \`cc-config set $ckey <n>\` moves it)." >/dev/null 2>&1 || true
     return 0
   fi
   printf '%s' "$cur" | jq --arg h "$repo" --arg d "$day" --argjson w "$want" \

@@ -9701,6 +9701,11 @@ def run_selfcheck():
     check("members: the cap printed beside today's spend is TODAY'S — what cc's member_gate raised it to today when it did, "
           "the config's when it did not; a raise from another day is gone with its day, and a workspace with no row reads the config's",
           caps == (16.0, 5.0, 5.0))
+    pw = {"MEMBER_DAILY_USD": "5", "MEMBER_DAILY_USD_BAYESIAN_SQUIRREL": "50", "MEMBER_DAILY_USD_CAROL": "1e3", "MEMBER_DAILY_USD_DAVE": "999..0"}
+    check("members: MEMBER_DAILY_USD_<HANDLE> (dashes made _) is one workspace's cap, read before the shared key; every other "
+          "handle reads the shared one, and an override that is not a number falls back to it",
+          (member_budget(pw, "bayesian-squirrel"), member_budget(pw, "alice"), member_budget(pw, "carol"), member_budget(pw, "dave"), member_budget({}, "alice"))
+          == (50.0, 5.0, 5.0, 5.0, float(MEMBER_DAILY_DEFAULT)))
     check("MEMBER socket: a subscriber that hangs up is gone from the table, and the member dir a join makes is what the "
           "boundary sees as ~/.cc/slack", gone and member_dir("alice") == f"{DIR}/member/alice"
           and member_chat_ok("alice", "alice--todo-updates") and not member_chat_ok("alice", "alice2") and not member_chat_ok("alice", "dm"))

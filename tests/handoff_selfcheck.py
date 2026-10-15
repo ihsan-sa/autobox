@@ -1610,6 +1610,20 @@ def run_selfcheck():
             ok("...and once the retry window is over it is rotated", sweep(True) == 0 and (read("rt1/again") or {}).get("phase") == "overlap")
             del os.environ["CC_HANDOFF_ROTATE_RETRY"]
 
+            # the stamp holds off the session it rotated, never the successor that cut over (2026-10-15: a successor
+            # past the line in its first hour sat at ~475k under its predecessor's stamp)
+            seat("rt1/succ", "sid-succ-new", used=300000, rotate=True)
+            seat("rt1/same", "sid-same", used=300000, rotate=True)
+            with open(os.path.join(HANDOFF, "rt1--succ.rotated"), "w") as fh:
+                json.dump({"target": "rt1/succ", "session_id": "sid-succ-old", "used": 250000}, fh)
+            with open(os.path.join(HANDOFF, "rt1--same.rotated"), "w") as fh:
+                json.dump({"target": "rt1/same", "session_id": "sid-same", "used": 250000}, fh)
+            ok("a successor past the line inside its predecessor's retry window is rotated: the stamp names another session",
+               sweep(True) == 0 and (read("rt1/succ") or {}).get("phase") == "overlap"
+               and read("rt1/succ")["predecessor"]["session_id"] == "sid-succ-new")
+            ok("...while the session the stamp names is still held off inside the window",
+               read("rt1/same") is None and "rt1/same~next" not in wins)
+
             # the stamp says an overlap OPENED: a start that refuses writes none, so the next tick tries again
             seat("rt7/x", "sid-x", used=300000, rotate=True)
             os.environ["CC_ROLE"] = "worker"               # start() refuses a worker caller (WORKER_REFUSAL)
