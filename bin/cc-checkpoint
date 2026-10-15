@@ -36,6 +36,9 @@
 #                          the reason. The wall `cc done` puts in front of its own git (core/bin/cc), asked here so
 #                          both callers keep one rule and one message (review-156c)
 #   cc-checkpoint selfcheck  that rule, on fixtures of its own (check.sh runs it)
+# EVERY git IT RUNS carries core.fsmonitor=false and, unless the caller pinned a core.hooksPath through
+# GIT_CONFIG_KEY_<n> (cc-loop and cc pin the main checkout's hooks), the hooksPath the repo's shared config names:
+# no program a worker configured in config.worktree runs in the host's checkpoint (see gg, below).
 # It also INDEXES what the turn wrote for the knowledge base
 # (`cc-lib index --touch ~/.cc/state ~/.claude/projects`: the journal and the memory file) after `cc-lib memory` has
 # kept the loaded memory index to its rule lines (a fact line a turn added moves to MEMORY-facts.md, found on demand),
@@ -135,6 +138,25 @@ SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; STRICT=0
 case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; --sweep) MODE=sweep;; gitdir) MODE=gitdir;; adopt) MODE=adopt;; bind) MODE=bind;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+# ── no git here runs a program the worker configured ──────────────────────────────────────────────────
+# A worker writes its worktree and, with extensions.worktreeConfig on, its admin dir's config.worktree too, until
+# cc-sandbox bound the host's empty file there: a core.fsmonitor or core.hooksPath in it made this file's plain
+# `git add -A` run the worker's program as the owner. So every git below carries core.fsmonitor=false, and a
+# core.hooksPath the worker cannot have written: the caller's own pin when it set one through GIT_CONFIG_KEY_<n>
+# (cc-loop, cc and the sweep pin the MAIN checkout's hooks that way, and a -c here would beat their pin, being the
+# stronger scope), else the one the repo's SHARED config names, read from the common dir's config file alone, else
+# that dir's hooks/ — the hooks git would run anyway, minus anything config.worktree adds. A failing pre-commit there
+# still stops a checkpoint (cc-native's N9 counts on it). Outside a repo it is /dev/null.
+# Filter drivers are not neutralised here: their commands come from config, and the one config file a worker could
+# write is that config.worktree. cc-green's tree (green_tree) carries core.fsmonitor=false and no hooks at all.
+HP=/dev/null
+if GCD=$(command git -c core.fsmonitor=false rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -n "$GCD" ]; then
+  HP=$(command git config --file "$GCD/config" --get core.hooksPath 2>/dev/null) || HP="$GCD/hooks"; fi
+GG=()
+gg(){ local i=0 k; GG=(-c core.fsmonitor=false -c "core.hooksPath=$HP")
+  while [ "$i" -lt "${GIT_CONFIG_COUNT:-0}" ] 2>/dev/null; do
+    k=GIT_CONFIG_KEY_$i; [ "${!k:-}" ] && [ "${!k,,}" = core.hookspath ] && GG=(-c core.fsmonitor=false); i=$((i+1)); done; }
+git(){ gg; command git "${GG[@]}" "$@"; }
 # ── no push waits for a person ───────────────────────────────────────────────────────────────────
 PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds. A track's push is seconds of work, so this is a wall, not a budget.
 git_unattended(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
@@ -143,10 +165,10 @@ git_unattended(){   # git that can ask nobody anything and cannot run past the b
   # helper that blocks on its own, a connection accepted and then never answered. `timeout` runs the command in
   # a process group of its own and signals the GROUP, so the transport helper dies with it instead of outliving
   # the run (the lesson the gate runner learned on its own subprocesses, cc-steward:368).
-  timeout -k 5 "$PUSH_TIMEOUT" env -u GIT_ASKPASS -u SSH_ASKPASS \
+  gg; timeout -k 5 "$PUSH_TIMEOUT" env -u GIT_ASKPASS -u SSH_ASKPASS \
     GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never \
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
-    git -c core.askPass= "$@"; }
+    git "${GG[@]}" -c core.askPass= "$@"; }
 bound_hit(){   # $1 a git_unattended exit code, $2 the file its stderr went to.  0 when the bound fired.
   # `timeout` KILLS the command, so git wrote nothing at all — without this the push fails with an empty
   # push.err, which is the same silence the bound exists to end.

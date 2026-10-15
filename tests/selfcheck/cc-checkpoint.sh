@@ -842,6 +842,22 @@ SH
   strict "$d"; rc=$?
   k "$([ "$rc" = 0 ] && [ "$(git -C "$d" rev-parse HEAD)" != "$tip" ] && echo 0 || echo 1)" \
     "C3 recovery: removing the failure commits the same work" "rc=$rc"
+  # G1: NO PROGRAM THE WORKER CONFIGURED RUNS IN THE HOST'S CHECKPOINT. With extensions.worktreeConfig on, a hook dir and
+  # a core.fsmonitor planted in config.worktree (a worker could once write its admin dir's, which git reads as repo
+  # config): the unpinned checkpoint commits and runs neither; with the caller's pin the hook it names does run; plain
+  # git runs the fsmonitor, so the plant is live and the first case can fail.
+  dg=$(mkproj_main gplant/task origin "$(bare gplant)"); echo '/.cc/' >> "$dg/.git/info/exclude"; g=$(git -C "$dg" rev-parse --absolute-git-dir)
+  mkdir -p "$T/g1hooks"; printf '#!/bin/sh\ntouch "%s/g1.hook"\n' "$T" > "$T/g1hooks/pre-commit"; printf '#!/bin/sh\ntouch "%s/g1.fsm"\nexit 1\n' "$T" > "$T/g1fsm"
+  chmod +x "$T/g1hooks/pre-commit" "$T/g1fsm"; printf '[extensions]\n\tworktreeConfig = true\n' >> "$g/config"
+  printf '[core]\n\tfsmonitor = %s\n\thooksPath = %s/g1hooks\n' "$T/g1fsm" "$T" > "$g/config.worktree"
+  before=$(git -C "$dg" -c core.fsmonitor=false rev-parse HEAD); echo planted >> "$dg/work.txt"; strict "$dg"; rc=$?
+  k "$([ "$rc" = 0 ] && [ "$(git -C "$dg" -c core.fsmonitor=false rev-parse HEAD)" != "$before" ] && [ ! -e "$T/g1.hook" ] && [ ! -e "$T/g1.fsm" ] && echo 0 || echo 1)" \
+    "G1: the checkpoint commits and runs neither the planted hook nor the planted fsmonitor" "rc=$rc $(cd "$T" && echo g1.*)"
+  echo pinned >> "$dg/work.txt"; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$T/g1hooks" strict "$dg"
+  k "$([ -e "$T/g1.hook" ] && [ ! -e "$T/g1.fsm" ] && echo 0 || echo 1)" "G1: …a hooksPath the caller pinned is still honoured" "$(cd "$T" && echo g1.*)"
+  echo plain >> "$dg/work.txt"; command git -C "$dg" add -A >/dev/null 2>&1   # `command`: sourced into cc-checkpoint, a bare git here is its guarded one
+  k "$([ -e "$T/g1.fsm" ] && echo 0 || echo 1)" "G1 control: plain git add -A does run that fsmonitor" "no g1.fsm"
+  rm -f "$T/g1.hook" "$T/g1.fsm" "$T/g1fsm"
   git -C "$d" checkout -q main; before=$(git -C "$d" rev-parse HEAD); echo offtrack > "$d/stray.txt"
   strict "$d"; rc=$?
   k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && echo 0 || echo 1)" \

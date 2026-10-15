@@ -31,9 +31,12 @@
 green_tree(){     # $1 = a repo root → the git tree its working copy WOULD commit, or nothing if that cannot be taken
   local idx tree
   idx=$(mktemp "${TMPDIR:-/tmp}/cc-green.XXXXXX" 2>/dev/null) || return 0
-  # An index of its own, so hashing the working copy neither stages anything nor disturbs the real one.
-  tree=$(cd "$1" && GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null &&
-         GIT_INDEX_FILE="$idx" git add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null) || tree=""
+  # An index of its own, so hashing the working copy neither stages anything nor disturbs the real one. And no
+  # program the worktree's config names: cc-loop asks this on the HOST, in a worker's tree, and a core.fsmonitor or
+  # hook a worker planted in its config.worktree would run as the owner (cc-checkpoint carries the same two settings).
+  local ng=(-c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  tree=$(cd "$1" && GIT_INDEX_FILE="$idx" git "${ng[@]}" read-tree HEAD 2>/dev/null &&
+         GIT_INDEX_FILE="$idx" git "${ng[@]}" add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git "${ng[@]}" write-tree 2>/dev/null) || tree=""
   rm -f "$idx"
   printf '%s' "$tree"
   return 0

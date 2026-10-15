@@ -421,8 +421,10 @@ EOS
   # holds the run in that step: a watcher that started only with the check (the code before) let the run sit there
   # past the 45 s a `cc-green stop` waits on the run's lock, so that stop gave up though the run stopped later.
   D2=$(mktemp -d); R=$(newrepo stD 120); GDIR=$D2 lock_files "$R"; mkdir -p "$D2" "$D/sgit"; echo early > "$STATUS.stop"
-  # Only the fixture's tree is slow, not the one green.sh takes of this checkout as cc-green sources it.
-  printf '#!/bin/sh\n[ "$1" = write-tree ] && [ "$(pwd -P)" = "%s" ] && for _ in $(seq 500); do [ -e "%s/sgit/go" ] && break; sleep 0.1; done\nexec %s "$@"\n' \
+  # Only the fixture's tree is slow, not the one green.sh takes of this checkout as cc-green sources it. The subcommand
+  # is the first word past git's own options: green_tree leads with `-c key=value` pairs, and a stub that read only $1
+  # never saw write-tree, so the run was not held there and this case stopped testing a stop during the hashing.
+  printf '#!/bin/sh\nsub=; skip=; for a in "$@"; do if [ -n "$skip" ]; then skip=; continue; fi; case "$a" in -c|-C|--git-dir|--work-tree|--namespace|--config-env) skip=1;; -*) ;; *) sub=$a; break;; esac; done\n[ "$sub" = write-tree ] && [ "$(pwd -P)" = "%s" ] && for _ in $(seq 500); do [ -e "%s/sgit/go" ] && break; sleep 0.1; done\nexec %s "$@"\n' \
     "$(readlink -f "$R")" "$D" "$(command -v git)" > "$D/sgit/git"; chmod +x "$D/sgit/git"
   t0=$SECONDS
   out=$( cd "$R" && PATH="$D/sgit:$PATH" CC_GREEN_DIR="$D2" CC_GREEN_RUNID=early timeout 60 "$SELF" __run 2>&1 ); rc=$?
@@ -464,6 +466,23 @@ EOS
   k "$(t test "$rc" = 1 -a -n "$(grep 'DEFECT  pause-hold-missing at bin/cc-tick:2' <<<"$out")")" "a green tree whose diff launches with no pause check is NOT green, and names the line"
   k "$(t grep -q 'green   lander check' <<<"$out")" "…while its check itself is green"
   rm -rf "$D2"
+
+  # THE TREE IS HASHED ON THE HOST WITHOUT RUNNING THE WORKER'S PROGRAMS. cc-loop asks for it in a worker's tree, and
+  # with extensions.worktreeConfig on the admin dir's config.worktree is repo config: a core.fsmonitor and a
+  # post-index-change hook planted there (as a worker could before cc-sandbox walled that file) run on a plain
+  # `git add -A`. green_tree still answers, and runs neither; the control runs the same plant with plain git.
+  local cw="$D/cfgwt" cwt="$D/cfgwt-t" ctree
+  git init -q -b main "$cw" && printf '[extensions]\n\tworktreeConfig = true\n' >> "$cw/.git/config" \
+    && git -C "$cw" -c user.name=t -c user.email=t@t commit -q --allow-empty -m i && git -C "$cw" worktree add -q -b track/t "$cwt" >/dev/null 2>&1
+  mkdir -p "$cwt/.hk"; printf '#!/bin/sh\ntouch "%s/cw.fsm"\nexit 1\n' "$D" > "$cwt/.fsm"; printf '#!/bin/sh\ntouch "%s/cw.hook"\n' "$D" > "$cwt/.hk/post-index-change"
+  chmod +x "$cwt/.fsm" "$cwt/.hk/post-index-change"
+  printf '[core]\n\tfsmonitor = %s/.fsm\n\thooksPath = %s/.hk\n' "$cwt" "$cwt" > "$cw/.git/worktrees/cfgwt-t/config.worktree"
+  echo x > "$cwt/f"; ctree=$(green_tree "$cwt")
+  k "$([ -n "$ctree" ] && [ ! -e "$D/cw.fsm" ] && [ ! -e "$D/cw.hook" ] && echo 0 || echo 1)" \
+    "green_tree hashes a worker's tree without running the fsmonitor or hook its config.worktree names"
+  git -C "$cwt" add -A >/dev/null 2>&1
+  k "$([ -e "$D/cw.fsm" ] && [ -e "$D/cw.hook" ] && echo 0 || echo 1)" "…control: plain git add -A there runs both"
+  git -C "$cw" worktree remove --force "$cwt" >/dev/null 2>&1
 
   echo "cc-green selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]

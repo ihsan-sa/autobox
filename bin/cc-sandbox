@@ -157,7 +157,9 @@
 #   refs/heads/main, HEAD, the tags, the remotes, packed-refs, config, config.worktree, hooks and every OTHER track's
 #   git dir are read-only — as are the two files that say where THIS worktree's git dir and common dir are, the
 #   worktree's own .git and .git/worktrees/<n>/commondir, so the host's git can never be sent to a directory a worker
-#   wrote. A name the real .git does not have is the worker's own and reaches the host nowhere —
+#   wrote — and so is .git/worktrees/<n>/config.worktree, which is the host's own empty file bound over the name, since
+#   with extensions.worktreeConfig on the host's git reads it as this repo's config. A name the real .git does not have
+#   is the worker's own and reaches the host nowhere —
 #   the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks
 #   (cc-loop), and a worker must not re-point its hooksPath or its remotes, nor write a hook the host would run. Every
 #   source in a tree this list hands the worker rw is bound BY DESCRIPTOR and not by name (see `pin`, and the paragraph
@@ -246,8 +248,10 @@
 #   own (the namespace is per-track now). What is left is exactly the loose objects of the last hour. Closing that too
 #   wants a private object store the host merges back, and a merge that is even slightly incomplete leaves a branch
 #   pointing at objects that are not there, which is worse than the deletion it prevents. So it stays accepted.
-#   THE OTHER TWO ARE CLOSED, and each is one bind: a SIBLING track's branch (the namespace above), and re-pointing the
+#   THE OTHER THREE ARE CLOSED, and each is one bind: a SIBLING track's branch (the namespace above), and re-pointing the
 #   host's git at a directory the worker wrote (the worktree's .git and the admin dir's commondir, both ro, below).
+#   So is writing the admin dir's config.worktree, which git reads as repo config when extensions.worktreeConfig is on:
+#   it is the host's empty file, ro, and a launch that finds a link or text there refuses.
 #   AND ONE THAT IS NOT THIS FILE'S TO CLOSE: a relative core.hooksPath (this repo's core/.githooks) names TRACKED
 #   files the worker edits. cc-loop pins the main checkout's copy for its own host-side git, so the checkpoint and its
 #   push never run a hook a worker wrote — but `cc done` typed by hand on that worktree still merges with the
@@ -455,7 +459,7 @@ rs_seed(){   # $1 repo · $2 track → a private $NSD holding this track's own r
   [ -f "$dev/.git/logs/$NSD/$2" ] && cp "$dev/.git/logs/$NSD/$2" "$rs/logs/$2"   # its own reflog, so an amend inside has something to walk back to
   return 0; }
 build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
-  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd rs
+  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd rs cw ks
   proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
   mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
@@ -545,6 +549,29 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # review-156b). Unconditional: git writes both when it creates a linked worktree, so an absent one is a name free for
   # a worker to take and the launch should refuse rather than bind whatever is there next time.
   pinq --ro-bind "$wt/.git"; pinq --ro-bind "$gd/commondir"
+  # …AND config.worktree IN IT IS THE HOST'S OWN EMPTY FILE, ro, as build_member does it. With extensions.worktreeConfig
+  # on (the host repo has it) git reads `$gd/config.worktree` as repo config, and $gd is rw: a worker that wrote core.fsmonitor or
+  # core.hooksPath there had the host's next plain `git add -A` (cc-checkpoint, cc-green's tree) run a program of its
+  # own, as the owner. Measured on the host half: the planted fsmonitor and hook both ran. The SOURCE is under
+  # ~/.cc/sandbox, which no bind reaches; the DEST is a name the worker could have left a link at on an earlier launch,
+  # and one already holding text is not a file the host wrote — both refuse rather than mount over and carry on, since
+  # the file outside stays what it is and the host's git still reads it. Every track's on this box was empty when this
+  # landed. An EMPTY file with a second hard link refuses too (review of #1281): the bind covers this name only, so a
+  # worker that left `ln config.worktree ~/.cache/x` on an earlier launch writes the same inode through ~/.cache, rw in
+  # here, and the host reads what it wrote. Anything but a regular file refuses with it, and a FIFO is never opened.
+  # A file the HOST filled is refused as well — sparse-checkout and `git config --worktree` write here — because this
+  # boundary does not yet tell their keys from a worker's; the message names the keys so the operator can tell.
+  cw="$gd/config.worktree"
+  if [ -L "$cw" ] || { [ -e "$cw" ] && [ ! -f "$cw" ]; }; then
+    echo "cc-sandbox: $cw is a link or not a regular file, and the host's git reads it as this repo's own config — nothing was bound and nothing started. See what it is, remove it, then launch again." >&2; exit 2
+  elif [ -e "$cw" ] && [ "$(stat -c %h -- "$cw" 2>/dev/null)" != 1 ]; then
+    echo "cc-sandbox: $cw has another name (hard links: $(stat -c %h -- "$cw" 2>/dev/null)), and whatever holds that name can write the config the host's git reads past the ro bind — nothing was bound and nothing started. find ~ -samefile $cw shows the other name; remove this one, then launch again." >&2; exit 2
+  elif [ -s "$cw" ]; then
+    ks=$(git config --no-includes --file "$cw" --name-only --list 2>/dev/null | sort -u | paste -sd ' ' -)
+    echo "cc-sandbox: $cw holds config (${ks:-nothing git can parse}), and the host's git reads it as this repo's own — nothing was bound and nothing started. git sparse-checkout and git config --worktree write some of these keys on the host, and a sealed launch refuses those too: if the host set them, undo that (git sparse-checkout disable) or run this track unsealed; if it did not, empty the file. Then launch again." >&2; exit 2
+  fi
+  f="$H/.cc/sandbox/$1/$2/gitwall"; mkdir -p "$f"; : > "$f/config.worktree"
+  pinq --ro-bind "$f/config.worktree" "$cw"
   # …AND THE BRANCH NAMESPACE IS THIS TRACK'S OWN COPY OF IT, not the host's directory (rstore, above). The DEST is the
   # constant $NSD, never a name anything inside supplies; the SOURCE is under ~/.cc/sandbox, which no bind here reaches,
   # so it needs no pin — a name a worker cannot reach is not a name it can swap.
@@ -2605,6 +2632,58 @@ selfcheck_skills(){   # THE BOX'S SHARED SKILLS (skills_bind), in a HOME of its 
     "$rc/$(g RAN)/$(grep -c 'is a symlink — none of' <<<"$out")/$(ls -A "$fh/target" | wc -l)" 0/yes/1/0
   unset CC_SKILLS_LIST CC_SKILLS_NOTIFY
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_cfgwt(){   # A TRACK'S config.worktree, in a HOME of its own, with extensions.worktreeConfig ON as the host repo has it: a
+  # worker writes core.fsmonitor and core.hooksPath into its admin dir's config.worktree, naming programs it left in its
+  # worktree, and the host then runs a plain `git add -A` and `git commit` there the way cc-checkpoint does. Before
+  # `build` bound the host's empty file over that name, the write landed and both programs ran as the owner.
+  local fh dev wt gd mk out rc
+  ranN(){ local f n=0; for f in "$fh"/ran.*; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }   # how many planted programs ran
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxcw-XXXXXX") || return 1; chmod 700 "$fh"
+  dev="$fh/dev/r"; wt="$fh/.cc/worktrees/r/t"; gd="$dev/.git/worktrees/t"; mk="$fh/ran"
+  mkdir -p "$dev" "$fh/.cc/worktrees/r" "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" || return 1
+  git -C "$dev" init -q -b main && printf '[extensions]\n\tworktreeConfig = true\n' >> "$dev/.git/config" \
+    && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$dev" worktree add -q -b track/t "$wt" >/dev/null 2>&1 || return 1
+  printf '[core]\n\tfsmonitor = %s/.fsm\n\thooksPath = %s/.hk\n' "$wt" "$wt" > "$fh/plant"   # the text the worker writes (its $PWD is $wt), kept for the control
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c '
+    printf "#!/bin/sh\ntouch %s.fsm\nexit 1\n" "'"$mk"'" > .fsm; mkdir -p .hk; printf "#!/bin/sh\ntouch %s.hook\n" "'"$mk"'" > .hk/pre-commit; chmod +x .fsm .hk/pre-commit
+    echo plant=$( (printf "[core]\n\tfsmonitor = %s/.fsm\n\thooksPath = %s/.hk\n" "$PWD" "$PWD" > "'"$gd"'/config.worktree") 2>/dev/null && echo wrote || echo refused)
+    echo seen=$(wc -c < "'"$gd"'/config.worktree")' 2>&1)
+  # the host's side, as cc-checkpoint runs it: plain git, no -c guards, so this reads the bind and nothing else
+  echo x > "$wt/f"; git -C "$wt" add -A >/dev/null 2>&1; git -C "$wt" -c user.name=t -c user.email=t@t commit -qm c >/dev/null 2>&1
+  t 'cfgwt: a worker cannot write its admin dir'"'"'s config.worktree — it sees the host'"'"'s empty file, ro' "$(g plant)/$(g seen)" refused/0
+  t 'cfgwt: …so the host'"'"'s plain git add -A and commit in that worktree run neither the planted fsmonitor nor the hook' \
+    "$(cat "$gd/config.worktree" 2>/dev/null | wc -c)/$(ranN)" 0/0
+  # THE CONTROL, so the two above can fail: the same text written from the host side is live, and the programs it names
+  # run. If this ever reads 0 the fixture's plant is broken and the cases above prove nothing.
+  # --remove-destination, as git's own lock-and-rename does: bwrap made the bind's mountpoint on the host as an empty
+  # 0444 file, so a plain cp into it fails, plants nothing, and this control and the refusal below read 0 for no reason.
+  cp --remove-destination "$fh/plant" "$gd/config.worktree" || t 'cfgwt: the control could not plant its text' fail ok
+  echo y > "$wt/g"
+  git -C "$wt" add -A >/dev/null 2>&1; git -C "$wt" -c user.name=t -c user.email=t@t commit -qm c2 >/dev/null 2>&1
+  t 'cfgwt: control — that text in config.worktree does make the host'"'"'s git run both programs' "$(ranN)" 2
+  # …and a launch that finds config already in that file refuses rather than mount over it, since the host still reads it
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c 'echo RAN=yes' 2>&1); rc=$?
+  t 'cfgwt: a launch that finds config in the admin dir'"'"'s config.worktree refuses, one line naming its keys and sparse-checkout, and runs nothing' \
+    "$rc/$(g RAN)/$(grep -c 'holds config (core.fsmonitor core.hookspath).*sparse-checkout' <<<"$out")" 2//1
+  # …AND THE SHAPES A NAME TEST MISSES, driven through build itself: its refusals come before any bwrap runs, so these
+  # cases need none. An EMPTY config.worktree that is a second name of a file in ~/.cache, which is rw inside, was
+  # accepted, and the worker then wrote the host's config through ~/.cache (review of #1281). BUILT never printing is
+  # build stopping there, before the bind; the other name is still there, still empty, and nothing removed it.
+  mkdir -p "$fh/.cache"; : > "$fh/.cache/planted-config"
+  rm -f "$gd/config.worktree"; ln "$fh/.cache/planted-config" "$gd/config.worktree"
+  out=$( (H="$fh"; build r t; echo BUILT=yes) 2>&1 ); rc=$?
+  t 'cfgwt: an empty config.worktree hard-linked to a file the worker can write refuses, one line, before any bind' \
+    "$rc/$(g BUILT)/$(grep -c 'has another name (hard links: 2)' <<<"$out")/$(stat -c %h -- "$fh/.cache/planted-config")/$(wc -c < "$fh/.cache/planted-config")" 2//1/2/0
+  rm -f "$gd/config.worktree"; ln -s "$fh/.cache/planted-config" "$gd/config.worktree"
+  out=$( (H="$fh"; build r t; echo BUILT=yes) 2>&1 ); rc=$?
+  t 'cfgwt: a config.worktree that is a symlink refuses, one line, before any bind' \
+    "$rc/$(g BUILT)/$(grep -c 'is a link or not a regular file' <<<"$out")" 2//1
+  rm -f "$gd/config.worktree"; mkfifo "$gd/config.worktree"   # never opened, so the launch cannot hang on it
+  out=$( (H="$fh"; build r t; echo BUILT=yes) 2>&1 ); rc=$?
+  t 'cfgwt: a config.worktree that is not a regular file (a FIFO) refuses, one line, before any bind' \
+    "$rc/$(g BUILT)/$(grep -c 'is a link or not a regular file' <<<"$out")" 2//1
+  git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its own: bound ro into both boundaries when it
   # is a real directory, owned by the user this runs as, and closed to any other write; refused, one line, and never
   # bound otherwise — missing, a symlink, group- or world-writable, and (root available) owned by someone else.
@@ -3287,8 +3366,10 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   for c in "the track worktree:$wt" "the parent .git/hooks:$dev/.git/hooks"; do
     # Ordered by race_swap, not by sleeps; the delay only has to outlast one poll of the racer, and the name comes back
     # after the launch is over, so nothing the session sees depends on how long the box took.
-    # The worktree's last pin is its own `.git`, then the admin dir's commondir; hooks is pinned in the .git/* loop, then
-    # objects/pack.
+    # The worktree's last pin is its own `.git`, so the racer waits on the one after it, the admin dir's commondir; the
+    # admin dir's config.worktree is pinned after both now, but its source is under ~/.cc/sandbox, not the worktree, so
+    # it only adds to the window and commondir is still the first pin past the swapped name. Hooks is pinned in the
+    # .git/* loop, then objects/pack.
     sname=${c#*:}; pw="$dev/.git/objects/pack"; [ "$sname" = "$wt" ] && pw="$dev/.git/worktrees/t/commondir"; of="$H/.cc/swap-out.$$"
     CC_SANDBOX_TEST_DELAY=3 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes; ls -A '"$sname"' 2>/dev/null' >"$of" 2>&1 & lp=$!
     sw=$(race_swap "$lp" "$pw" swap_decoy); wait "$lp"; out=$(cat "$of"); rm -f "$of"
@@ -3317,7 +3398,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_workercred; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
