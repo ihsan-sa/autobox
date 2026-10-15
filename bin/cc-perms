@@ -19,7 +19,8 @@
 # WHY IT IS SAFE TO CALL: the property that fenced the seat is that nothing another session can call, write or
 # signal starts a session that skips permissions under that session's say-so. So relaunch takes NO argument, reads
 # nothing from the caller's environment, and builds one fixed command: the seat's own directory, its own brief.md,
-# the one model written below ($MODEL, never cc-model, an override file or the env), and nothing else. The caller
+# the one model written below ($MODEL, never cc-model, an override file or the env), the effort the box's own
+# ~/.cc/config names (one of claude's levels, else high; never the env), and nothing else. The caller
 # decides only WHEN, never WHAT.
 # NO LAUNCH EVER LOADS A TRANSCRIPT: any unsandboxed shell can write a .jsonl into ~/.claude/projects, and a seat
 # that resumed it would take a planted turn as its own. So relaunch, like handoff, always starts FRESH: a session id
@@ -143,18 +144,26 @@ lock(){ local um
   um=$(umask); umask 077; exec 9<>"$LOCK"; umask "$um"
   [ -f "$LOCK" ] && [ ! -L "$LOCK" ] || die "cannot take the lock $LOCK; nothing started"
   flock -n 9 || die "$1"; }
-# sandboxed — rc 0 when CC_WORKER_SANDBOX=1 in the box's own $H/.cc/config, parsed as cc-config does (last line wins,
-# one layer of quotes); the environment and a CC_CONFIG override are ignored on purpose, so a worker cannot set the key
-# for one call (see NO LAUNCH WHILE WORKERS RUN UNSANDBOXED); relaunch and handoff ask it first and refuse otherwise
-sandboxed(){ local l k v="" f=$H/.cc/config
-  [ -f "$f" ] || return 1
+# boxconf KEY — prints KEY's value in the box's own $H/.cc/config, parsed as cc-config does (last line wins, one layer
+# of quotes), or nothing; the environment and a CC_CONFIG override are ignored on purpose, so a worker cannot set a key
+# for one call (see NO LAUNCH WHILE WORKERS RUN UNSANDBOXED)
+boxconf(){ local l k v="" f=$H/.cc/config
+  [ -f "$f" ] || return 0
   while IFS= read -r l || [ -n "$l" ]; do
     l="${l#"${l%%[![:space:]]*}"}"; case "$l" in '#'*|*=*) ;; *) continue;; esac
-    k="${l%%=*}"; k="${k%"${k##*[![:space:]]}"}"; [ "$k" = CC_WORKER_SANDBOX ] || continue
+    k="${l%%=*}"; k="${k%"${k##*[![:space:]]}"}"; [ "$k" = "$1" ] || continue
     l="${l#*=}"; l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
     case "$l" in '"'*'"'|"'"*"'") l="${l:1:${#l}-2}";; esac; v=$l
   done < "$f"
-  [ "$v" = 1 ]; }
+  printf '%s' "$v"; }
+# sandboxed — rc 0 when CC_WORKER_SANDBOX=1 in the box's own config (boxconf); relaunch and handoff ask it first and
+# refuse otherwise
+sandboxed(){ [ "$(boxconf CC_WORKER_SANDBOX)" = 1 ]; }
+# effort — the seat's --effort: CC_PERMS_EFFORT in the box's own config (boxconf) when it is one of claude's levels,
+# else high. High, not max: the owner's line is the strongest model at high effort, and max thinking was about 40% of
+# what filled each seat's window (perms' measurement, 2026-10-15); its security reads run in their own subagents.
+effort(){ local e; e=$(boxconf CC_PERMS_EFFORT)
+  case "$e" in low|medium|high|xhigh|max) printf '%s' "$e";; *) printf high;; esac; }
 # handoff_gate_open — rc 0 when both locks are open, else rc 1 with the reason on stdout: the sandbox key, then the
 # owner's marker /etc/cc/perms-handoff-live (a regular file, not a link, owned by root:root, mode 0644 or stricter,
 # checked with stat). Only a fixture (CC_PERMS_FIXTURE, see above) may move the marker and the ids it expects; a real
@@ -367,7 +376,7 @@ pins_alert(){
   set=$(pins_diff "$2" "$3"); k=$(printf '%s' "$set" | sha256sum | cut -c1-16)
   [ "$(cat "$2/pins-alerted" 2>/dev/null)" = "$k" ] && return 0
   case "$d" in "$H"/*) d=\~/${d#"$H"/};; esac   # the path as he types it
-  cmd="tmux new-window -t $SESSION -n $WIN -c $d -- ~/.local/bin/claude --model '$MODEL' --effort max --dangerously-skip-permissions 'Read brief.md in this directory; it is your whole job. Your startup files changed since your last pin: check what changed, then run cc-perms pin.'"
+  cmd="tmux new-window -t $SESSION -n $WIN -c $d -- ~/.local/bin/claude --model '$MODEL' --effort $(effort) --dangerously-skip-permissions 'Read brief.md in this directory; it is your whole job. Your startup files changed since your last pin: check what changed, then run cc-perms pin.'"
   msg="The $1 permission seat is down, and cc-perms relaunch will not start it because its startup files changed since it last pinned them: $(paste -sd '\t' <<<"$set" | sed 's/\t/, /g'). Check those, then start it by hand with: $cmd"
   "${NOTIFY[@]}" --owner -t "$1 perms" --heading "The $1 permission seat is down until you start it by hand" --id "perms-pins:$1:$k" "$msg" >/dev/null 2>&1 \
     && printf '%s\n' "$k" > "$2/pins-alerted"
@@ -385,7 +394,7 @@ pins_diff_verb(){
 # seat_argv DIR TARGET — fills SEAT with the one fixed launch both verbs start from, as an argument list: a fixed sh
 # that cds into DIR and execs env -i with the pane's own TMUX and TMUX_PANE (tmux sets those per pane) and a fixed
 # environment, then TARGET through DIR/launch/claude (so the process is still called claude), only the MCP servers in
-# DIR/launch/mcp.json (written here, from the template below), $MODEL, max effort, the skip flag and inbound messages
+# DIR/launch/mcp.json (written here, from the template below), $MODEL, the effort (see effort), the skip flag and inbound messages
 # accepted. Each verb adds only how the conversation starts. rc 1: the link or the MCP file was not written.
 # --mcp-config takes several values, so it comes before other options and never just before the prompt.
 SEAT=()
@@ -398,7 +407,7 @@ seat_argv(){
     HOME="$H" USER="$u" LOGNAME="$u" SHELL=/bin/bash PATH="$H/bin:/usr/local/bin:/usr/bin:/bin"
     TERM=tmux-256color LANG=C.UTF-8 XDG_RUNTIME_DIR="/run/user/$(id -u)" PYTHONPYCACHEPREFIX="$1/launch/pycache")
   [ -d "$H/.cc/tmp" ] && SEAT+=(TMPDIR="$H/.cc/tmp")
-  SEAT+=("$l" --strict-mcp-config --mcp-config "$m" --model "$MODEL" --effort max "$SKIP" --settings '{"crossSessionInbound":"accept"}'); }
+  SEAT+=("$l" --strict-mcp-config --mcp-config "$m" --model "$MODEL" --effort "$(effort)" "$SKIP" --settings '{"crossSessionInbound":"accept"}'); }
 
 relaunch(){
   local r why pd cl lexe pid sid U how
@@ -732,10 +741,19 @@ echo "x:x:%s:%s::%s:/bin/bash"
   ok "$( [ $rc = 0 ] && started && grep -qxF -- --fixture-no-bypass <<<"$a" && ! grep -qx -- '--dangerously-skip-permissions' <<<"$a" \
       && grep -qxF "$PROMPT" <<<"$a" && ! grep -qx -- --resume <<<"$a" && grep -qx -- --session-id <<<"$a" \
       && grep -qxF "$(cat "$H/.cc/state/r1/perms/session-id")" <<<"$a" && grep -qxF 'claude-opus-5-5[1m]' <<<"$a" \
-      && ! grep -q evil <<<"$a" && [[ $out == *"fresh from brief.md"* ]]; echo $?)" \
-    "r1's planning seat brings the seat back from brief.md, on the pinned model and not cc-model's, an override's or the env's (a fixture never skips permissions)"
+      && ! grep -q evil <<<"$a" && [[ $out == *"fresh from brief.md"* ]] && grep -A1 -x -- --effort <<<"$a" | grep -qx high; echo $?)" \
+    "r1's planning seat brings the seat back from brief.md, on the pinned model and not cc-model's, an override's or the env's, at high effort when the config names none (a fixture never skips permissions)"
   : > "$F/tmux.log"; out=$(run "$c"); rc=$?
   ok "$( [ $rc = 0 ] && ! started && [[ $out == *"already live"* ]]; echo $?)" "a second call while the seat is live does nothing"
+  # ── the effort: CC_PERMS_EFFORT in ~/.cc/config when it is one of claude's levels; the env never, anything else gives high ──
+  fx effort; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; echo 'CC_PERMS_EFFORT="xhigh"' > "$H/.cc/config"
+  out=$(CC_PERMS_EFFORT=low run "$c"); rc=$?; a=$(seatargs)
+  ok "$( [ $rc = 0 ] && grep -A1 -x -- --effort <<<"$a" | grep -qx xhigh && ! grep -qx low <<<"$a"; echo $?)" \
+    "the seat runs at the effort ~/.cc/config names, not the env's ($rc)"
+  fx effortbad; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; echo 'CC_PERMS_EFFORT=max --resume x' > "$H/.cc/config"
+  out=$(CC_PERMS_EFFORT=max run "$c"); rc=$?; a=$(seatargs)
+  ok "$( [ $rc = 0 ] && grep -A1 -x -- --effort <<<"$a" | grep -qx high && ! grep -qx -- --resume <<<"$a" && ! grep -qx max <<<"$a"; echo $?)" \
+    "a CC_PERMS_EFFORT that is not one of claude's levels gives high, whatever the env says ($rc)"
 
   fx resume; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
   # the recorded conversation, and a newer one planted beside it, as any unsandboxed shell could write
