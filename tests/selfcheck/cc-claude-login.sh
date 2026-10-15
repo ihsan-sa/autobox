@@ -69,7 +69,7 @@ EOF
 
   printf '%s\n' good >"$T/code"
   L start ps >/dev/null && { L code ps <"$T/code" >/dev/null 2>&1 & }
-  for _ in 1 2 3 4 5 6 7 8 9 10; do out=$(ps -eo args | grep -F 'cc-claude-login code ps' | grep -v grep) && break; sleep 0.1; done
+  for ((_ = 0; _ < 100; _++)); do out=$(ps -eo args | grep -F 'cc-claude-login code ps' | grep -v grep) && break; sleep 0.1; done
   wait
   k "$([ -n "$out" ] && ! grep -q good <<<"$out" && [ -f "$T/home/.claude-ps/.credentials.json" ] && echo 0 || echo 1)" \
     "code reads the code on stdin, so ps never shows it, and the login takes"
@@ -93,11 +93,16 @@ EOF
   k "$([ $rc = 1 ] && grep -q 'ended before it finished' <<<"$out" && ! grep -q 'still running' <<<"$out" && echo 0 || echo 1)" \
     "a login session that vanishes during code says it ended, not that it is still running"
 
-  printf '#!/bin/sh\necho "auth: config dir unreadable"; sleep 1; exit 3\n' >"$T/quit"; chmod +x "$T/quit"
+  printf '#!/bin/sh\necho "auth: config dir unreadable"; exit 3\n' >"$T/quit"; chmod +x "$T/quit"
   out=$(HOME="$T/home" CC_CLAUDE_BIN="$T/quit" CC_LOGIN_TMUX="$T/sock" "$B/cc-claude-login" start quit 2>&1); rc=$?
   k "$([ $rc = 1 ] && grep -q 'exited without a link' <<<"$out" && grep -q 'config dir unreadable' <<<"$out" && echo 0 || echo 1)" \
     "a login that exits at once fails at once and shows what it printed"
   k "$(S quit && echo 1 || echo 0)" "…and leaves no session behind"
+
+  tmux -S "$T/sock" new-session -d -s cc-login-dead -x 200 -y 50 "$T/quit" \; set-option -t =cc-login-dead: remain-on-exit on; sleep 0.5
+  out=$(HOME="$T/home" CC_CLAUDE_BIN="$T/claude" CC_LOGIN_TMUX="$T/sock" "$B/cc-claude-login" code dead <<<good 2>&1); rc=$?
+  k "$([ $rc = 1 ] && grep -q 'already exited' <<<"$out" && grep -q 'config dir unreadable' <<<"$out" && ! S dead && echo 0 || echo 1)" \
+    "code on a login that already exited shows its last screen and exits 1"
 
   out=$(HOME="$T/home" CC_CLAUDE_BIN="$T/claude" CC_LOGIN_TMUX="$T/no-such-dir/sock" "$B/cc-claude-login" start broken 2>&1); rc=$?
   k "$([ $rc = 1 ] && grep -q 'could not start the login session' <<<"$out" && echo 0 || echo 1)" \
