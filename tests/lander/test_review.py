@@ -249,7 +249,8 @@ class TestDigestAndMarkers(Case):
 
     def test_shipped_prompts_have_every_slot(self):
         for name, slots in (("review.md", ("@DIFF@", "@FILES@", "@BRIEF@", "@RULES@")),
-                            ("delta.md", ("@DIFF@", "@PRIOR@", "@INTERDIFF@"))):
+                            ("delta.md", ("@DIFF@", "@PRIOR@", "@INTERDIFF@")),
+                            ("security.md", ("@DIFF@", "@FILES@", "@BRIEF@", "@RULES@", "@TESTED@"))):
             text = R.load_prompt(name)
             for s in slots:
                 self.assertIn(s, text, f"{name} lacks {s}")
@@ -1079,7 +1080,7 @@ class TestReview(Case):
                     self.assertIn(f"; FLAGGED: binary, {why})", sent)
                 self.assertNotIn("rm -rf", sent)
                 shutil.rmtree(os.environ["CC_LAND_STATE"], ignore_errors=True)
-        for name in ("review.md", "delta.md"):   # the read is told what to do with that line
+        for name in ("review.md", "delta.md", "security.md"):   # the read is told what to do with that line
             self.assertIn("`FLAGGED:`", R.load_prompt(name))
 
     def test_a_file_git_cannot_show_is_flagged_and_only_a_missing_entry_is_deleted(self):
@@ -1895,6 +1896,180 @@ class TestSecurityPaths(Case):
         self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
         self.reads([self.rec(j)])   # a record names no path: an unpaid job off the list still reads as before
         self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
+
+
+class TestPermsReads(Case):
+    """Perms' own reads, which outlive the perms window (review.py, "perms' own reads"): one case per requirement of
+    perms', each on its own files, plus the run and the start."""
+
+    OLD = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        from lander import deploy as D
+        real = (D.verified_tip, R.perms_seat_caller)
+        D.verified_tip = lambda root, base: BASE
+        R.perms_seat_caller = lambda repo, *a, **kw: True
+        self.addCleanup(lambda: (setattr(D, "verified_tip", real[0]), setattr(R, "perms_seat_caller", real[1])))
+        self.seat = os.path.join(R.PERMS_STATE, "demo", "perms")
+        os.makedirs(self.seat, mode=0o700)
+        os.makedirs(os.environ["CC_STATE"], exist_ok=True)
+        os.makedirs(os.path.join(self.tmp, "demo", ".git"))   # $CC_DEV/demo, a checkout the host made
+        with open(os.path.join(os.environ["CC_BOARDS"], "record-root.json"), "w") as f:
+            json.dump({"path": os.path.join(self.tmp, "demo")}, f)
+        old = os.environ.get("CC_DEV")
+        os.environ["CC_DEV"] = self.tmp
+        self.addCleanup(lambda: os.environ.pop("CC_DEV") if old is None else os.environ.update(CC_DEV=old))
+
+    def facts(self, head=HEAD, state="OPEN"):
+        return (0, json.dumps({"headRefOid": head, "baseRefName": "main", "comments": [], "state": state,
+                               "files": [{"path": "x.py"}], "headRefName": "track/x"}))
+
+    def entry(self, head=HEAD, **kw):
+        return dict({"repo": "demo", "pr": 7, "head": head, "base": BASE, "change": R.change_digest(DIFF),
+                     "state": "done", "verdict": "LAND", "model": "claude-test"}, **kw)
+
+    def ledger(self):
+        return R.perms_reads("demo")[0]
+
+    # 1. the file lives only in a directory a member's sandbox cannot write
+    def test_1_reads_live_only_in_perms_own_closed_dir(self):
+        path, why = R.write_read("demo", self.entry())
+        self.assertEqual(why, "")
+        self.assertEqual(os.path.dirname(path), os.path.join(self.seat, "reads"))   # beside perms' ledger
+        self.assertEqual(stat_mode(os.path.dirname(path)), 0o700)
+        self.assertEqual(stat_mode(path), 0o600)
+        self.assertIsNotNone(R.load_read("demo", 7, HEAD)[0])
+        reads = os.path.dirname(path)
+        # the reads dir open to others, the seat dir open to others' writes, the reads dir a link: none counts
+        for loosen, undo in ((lambda: os.chmod(reads, 0o750), lambda: os.chmod(reads, 0o700)),
+                             (lambda: os.chmod(self.seat, 0o777), lambda: os.chmod(self.seat, 0o700))):
+            loosen()
+            self.assertIsNone(R.load_read("demo", 7, HEAD)[0])
+            self.assertIsNone(R.write_read("demo", self.entry())[0])
+            self.assertEqual(R.read_files("demo"), [])
+            undo()
+        os.rename(reads, reads + ".real")
+        os.symlink(reads + ".real", reads)
+        self.assertIn("symlink", R.load_read("demo", 7, HEAD)[1])
+        self.assertIsNone(R.write_read("demo", self.entry())[0])
+        os.unlink(reads)
+        os.rename(reads + ".real", reads)
+        os.chmod(path, 0o644)   # a file others may read is not one perms wrote
+        self.assertIsNone(R.load_read("demo", 7, HEAD)[0])
+        # with no perms seat dir, no reads dir is made: that dir is perms' alone
+        shutil.rmtree(self.seat)
+        self.assertIsNone(R.write_read("demo", self.entry())[0])
+        self.assertFalse(os.path.exists(self.seat))
+
+    # 2. each file names the repo, the PR and the exact head it read
+    def test_2_a_read_file_names_its_repo_pr_and_exact_head(self):
+        for bad in (self.entry(head=HEAD[:12]), self.entry(repo="other"), self.entry(pr="7"),
+                    {k: v for k, v in self.entry().items() if k != "head"}):
+            self.assertEqual(R.write_read("demo", bad), (None, "a read file names its repo, its PR and the 40-hex "
+                                                               "head it read"), bad)
+        path, _ = R.write_read("demo", self.entry())
+        self.assertEqual(os.path.basename(path), f"7-{HEAD}.json")
+        with open(path) as f:
+            self.assertEqual({k: v for k, v in json.load(f).items() if k in ("repo", "pr", "head")},
+                             {"repo": "demo", "pr": 7, "head": HEAD})
+        # a file whose name and body disagree (an old read renamed to the live head's name) is no read of that head
+        R.write_read("demo", self.entry(head=self.OLD))
+        os.replace(os.path.join(os.path.dirname(path), f"7-{self.OLD}.json"), path)
+        e, why = R.load_read("demo", 7, HEAD)
+        self.assertIsNone(e)
+        self.assertIn("does not name demo PR #7", why)
+        self.assertIsNone(R.load_read("demo", 8, HEAD)[0])   # another PR's name finds nothing
+
+    # 3. the successor checks the file's head against the PR's live head before it grants a merge
+    def adopt(self, head=HEAD):
+        self.box(**{"gh pr view": self.facts(head=head)})
+        return R.cmd_perms_adopt(["demo", "7"])
+
+    def test_3_adopt_grants_only_a_finished_land_of_the_live_head_and_change(self):
+        R.write_read("demo", self.entry(head=self.OLD))   # a LAND of a head the PR has moved off
+        self.assertEqual(self.adopt(), 1)
+        self.assertEqual(self.ledger(), [])
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+        for e in (self.entry(change="c" * 40), self.entry(state="running"), self.entry(verdict="HANDBACK"),
+                  self.entry(state="failed")):
+            R.write_read("demo", e)
+            self.assertEqual(self.adopt(), 1, e)
+            self.assertEqual(self.ledger(), [], e)
+        os.unlink(os.path.join(self.seat, "reads", f"7-{self.OLD}.json"))
+        R.write_read("demo", self.entry())
+        self.assertEqual(self.adopt(head=self.OLD), 1)   # the file is right, but the PR moved after it was read
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual(self.adopt(), 0)
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+        self.assertEqual(self.adopt(), 0)   # once: a second adopt adds nothing
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o600)
+
+    def test_3_adopt_is_the_perms_seat_s_and_needs_an_open_pr(self):
+        R.write_read("demo", self.entry())
+        self.assertEqual(self.adopt_as(False), 1)
+        self.assertEqual(self.ledger(), [])
+        self.box(**{"gh pr view": self.facts(state="MERGED")})
+        self.assertEqual(R.cmd_perms_adopt(["demo", "7"]), 1)
+        self.assertEqual(self.ledger(), [])
+
+    def adopt_as(self, seat):
+        R.perms_seat_caller = lambda repo, *a, **kw: seat
+        return self.adopt()
+
+    def test_3_adopt_never_writes_over_a_ledger_it_cannot_read(self):
+        R.write_read("demo", self.entry())
+        with open(R.perms_reads_path("demo"), "w") as f:
+            f.write("[]")
+        os.chmod(R.perms_reads_path("demo"), 0o644)
+        self.assertEqual(self.adopt(), 1)
+        self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o644)
+
+    # the read itself: apart from the window, once per head
+    def test_the_read_starts_in_a_session_of_its_own_and_only_once_a_head(self):
+        from unittest import mock
+        self.box(**{"gh pr view": self.facts()})
+        proc = mock.Mock(pid=4242)
+        with mock.patch.object(R.subprocess, "Popen", return_value=proc) as popen:
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertEqual(popen.call_args.args[0][-3:], ["7", "--run", HEAD])
+            e = R.load_read("demo", 7, HEAD)[0]
+            self.assertEqual((e["state"], e["pid"], e["change"]), ("running", 4242, R.change_digest(DIFF)))
+            with mock.patch.object(R, "alive", return_value=True):
+                self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)   # running: a successor starts nothing
+            R.write_read("demo", self.entry())
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)       # done: nothing either
+            self.assertEqual(popen.call_count, 1)
+            R.write_read("demo", self.entry(state="running", pid=None))   # died: it runs again
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)
+            self.assertEqual(popen.call_count, 2)
+            R.perms_seat_caller = lambda repo, *a, **kw: False
+            os.unlink(os.path.join(self.seat, "reads", f"7-{HEAD}.json"))
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 1)       # only the perms seat starts one
+            self.assertEqual(popen.call_count, 2)
+
+    def test_the_detached_run_reads_and_writes_its_verdict(self):
+        box = self.box(**{"gh pr view": self.facts(), "claude": claude_says("HANDBACK", [
+            {"kind": "security", "where": "x.py:1", "what": "leaks", "input": "i", "fix": "f"}])})
+        R.RUN_WAIT, real = 1, R.RUN_WAIT
+        self.addCleanup(setattr, R, "RUN_WAIT", real)
+        self.assertEqual(R._perms_run("demo", 7, HEAD), 1)   # no stub names this process: nothing read
+        self.assertEqual(box.called("claude"), [])
+        R.write_read("demo", self.entry(state="running", pid=os.getpid(), verdict=None))
+        self.assertEqual(R._perms_run("demo", 7, HEAD), 0)
+        self.assertIn("SECURITY read", box.called("claude")[0]["input"])
+        e = R.load_read("demo", 7, HEAD)[0]
+        self.assertEqual((e["state"], e["verdict"], e["model"]), ("done", "HANDBACK", "claude-test"))
+        self.assertIn("leaks", e["blocking"][0])
+        R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid()))
+        self.assertEqual(R._perms_run("demo", 7, self.OLD), 0)   # the PR moved before the read began
+        self.assertEqual(R.load_read("demo", 7, self.OLD)[0]["state"], "stale")
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
 
 
 if __name__ == "__main__":
