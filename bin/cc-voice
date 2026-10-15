@@ -7,8 +7,8 @@
     cc-voice status              venv · weights · model, or the one line saying what is missing
     cc-voice selfcheck
 
-TWO STEPS, AND ONLY THE SECOND ONE LEAVES. The transcript is Whisper (`large-v3-turbo`) run LOCALLY in a venv of
-its own: the recording is read off the disk it was downloaded to and no part of it is uploaded anywhere. The
+TWO STEPS, AND ONLY THE SECOND ONE LEAVES. The transcript is Whisper (`large-v3-turbo`) run LOCALLY, on the GPU
+when CUDA works and on the CPU when it does not, in a venv of its own: the recording is read off the disk it was downloaded to and no part of it is uploaded anywhere. The
 transcript is then CONDENSED by one small model call — the same class of call as everything else the box sends —
 because a memo rambles and what a session should read is the message the owner would have typed. Both halves are
 returned: the raw transcript is what the owner checks the condensing against, so it is never thrown away.
@@ -27,6 +27,13 @@ bundled `av`). Another box repeats the feature by running that one command. At M
 with local_files_only — a missing weight is an error that says "run install", never a silent download on the
 hot path.
 
+THE GPU IS AN OPTION, NEVER A DEPENDENCY. The worker tries CUDA (`int8_float16`) with the cuBLAS and cuDNN 9 wheels
+from the venv's own site-packages preloaded, in a process of its own, and on ANY failure there (an error, an exit, a
+signal such as CTranslate2's abort on a missing cuDNN, a timeout) the parent runs that same memo on the CPU and says
+so on stderr, every time: a memo never fails because of the GPU.
+Another host gets the two wheels by running `cc-voice install` again. (A later change can queue the GPU run
+through `cc-gpu`; it is not wired in here.)
+
 WHAT IT COSTS, MEASURED (2026-09-05, 6-core CPU box, no GPU): 4 s of WAV took 45.7 s wall and peaked at 2.1 GB
 RSS — LOADING the model is nearly all of that, and the audio itself runs several times faster than realtime once
 it is up. So a 3-minute memo lands near 90 s, and the timeouts are set from the load being the fixed cost, not
@@ -36,13 +43,15 @@ is 600 — a recording longer than ten minutes is not a memo, and is refused rat
 wall. THE 2.1 GB IS THE REAL LIMIT: this loads the model per memo and frees it again, deliberately, because a
 resident 2 GB on a box that is also running sessions costs more than the 45 s does.
 
-ENV: CC_VOICE_DIR (default ~/.cc/voice) · CC_VOICE_MODEL (large-v3-turbo) · CC_VOICE_CONDENSE (the model of the
+ENV: CC_VOICE_DIR (default ~/.cc/voice) · CC_VOICE_MODEL (large-v3-turbo) · CC_VOICE_DEVICE (auto, cpu or cuda; auto
+is the GPU when CUDA is usable and the CPU when not) · CC_VOICE_CONDENSE (the model of the
 condensing call, sonnet) · CC_VOICE_TIMEOUT (the transcription cap in seconds) · CC_CLAUDE (the CLI) ·
 CC_VOICE_FAKE (tests: the condensing answer, without a model).
 """
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -51,7 +60,8 @@ DIR = os.environ.get("CC_VOICE_DIR") or f"{HOME}/.cc/voice"
 MODEL = os.environ.get("CC_VOICE_MODEL") or "large-v3-turbo"
 CONDENSE_MODEL = os.environ.get("CC_VOICE_CONDENSE") or "sonnet"
 CLAUDE = os.environ.get("CC_CLAUDE") or f"{HOME}/.local/bin/claude"
-REQ = "faster-whisper>=1.1"          # CTranslate2 + its own `av`: CPU-only, no torch, no system ffmpeg
+REQ = "faster-whisper>=1.1"          # CTranslate2 + its own `av`: no torch, no system ffmpeg
+GPU_REQ = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12==9.*"]   # the GPU's libraries, --no-deps, into the venv only
 USAGE = "usage: cc-voice text <audio> | transcript <audio> | install [--model M] | status | selfcheck"
 MAX_SECONDS = 600                    # a 10-minute recording is not a memo; refuse rather than hand a session a wall
 TRANSCRIBE_TIMEOUT = int(os.environ.get("CC_VOICE_TIMEOUT") or 420)
@@ -76,15 +86,50 @@ DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,We
 # The local half, run by the venv's python — the only place faster-whisper is imported. local_files_only is the
 # hot-path promise: at message time this loads what install fetched or fails saying so, and never downloads.
 PROGRAM = r'''
-import json, sys
-from faster_whisper import WhisperModel
+import ctypes, glob, json, os, site, sys, sysconfig
 model, path, cache, fetch = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "fetch"
-m = WhisperModel(model, device="cpu", compute_type="int8", download_root=cache, local_files_only=not fetch)
-if fetch:
-    print(json.dumps({"text": "", "seconds": 0.0, "language": ""})); raise SystemExit(0)
-segments, info = m.transcribe(path, beam_size=5, vad_filter=True, condition_on_previous_text=False)
-text = " ".join(s.text.strip() for s in segments).strip()
-print(json.dumps({"text": text, "seconds": info.duration, "language": info.language}))
+# ONE DEVICE PER PROCESS. The parent picks: auto or cuda tries the GPU here, and on ANY non-zero exit or signal (a
+# CTranslate2 abort on a missing cuDNN kills the process outright, so no except here can catch it) the parent runs
+# the memo again with cpu. Exit 3 is auto finding no usable CUDA device: a plain CPU run, nothing went wrong.
+want = "cpu" if fetch else (os.environ.get("CC_VOICE_DEVICE") or "auto").lower()
+
+def preload():
+    # cuBLAS and cuDNN 9 from the wheels in THIS venv's site-packages, loaded by path so no system CUDA is needed.
+    # Never sys.path: its '' is the working directory, and a library planted there would load into this process.
+    # Best effort: a missing wheel just means the cuda load below fails and the parent falls back to the CPU.
+    dirs = {sysconfig.get_paths().get(k) for k in ("purelib", "platlib")} | set(site.getsitepackages())
+    for pkg, pat in (("cublas", "libcublas.so.12"), ("cudnn", "libcudnn.so.9")):
+        for d in sorted(x for x in dirs if x and os.path.isabs(x)):
+            for so in glob.glob(os.path.join(d, "nvidia", pkg, "lib", pat)):
+                try:
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+def cuda_ok():
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+def run(device, ctype):
+    from faster_whisper import WhisperModel
+    m = WhisperModel(model, device=device, compute_type=ctype, download_root=cache, local_files_only=not fetch)
+    if fetch:
+        return {"text": "", "seconds": 0.0, "language": "", "device": device}
+    segments, info = m.transcribe(path, beam_size=5, vad_filter=True, condition_on_previous_text=False)
+    text = " ".join(s.text.strip() for s in segments).strip()      # the generator runs HERE, so a cuda error lands here
+    return {"text": text, "seconds": info.duration, "language": info.language, "device": device}
+
+if want == "cpu":
+    d = run("cpu", "int8")
+else:
+    preload()
+    if want != "cuda" and not cuda_ok():
+        raise SystemExit(3)
+    d = run("cuda", "int8_float16")
+print(json.dumps(d))
 '''
 
 FRAME = """You are given the transcript of a voice memo somebody dictated to a colleague. Rewrite it as the
@@ -124,6 +169,22 @@ def missing():
     return ""
 
 
+def worker(path, fetch, device):
+    """One run of PROGRAM in the venv on `device` (auto, cuda or cpu). Raises TimeoutExpired or OSError."""
+    return subprocess.run([venv_python(), "-c", PROGRAM, MODEL, path, models_dir(), "fetch" if fetch else "read"],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          env=dict(os.environ, CC_VOICE_DEVICE=device),
+                          timeout=TRANSCRIBE_TIMEOUT if not fetch else None)
+
+
+def parsed(p):
+    """The JSON line a clean run ends with. ValueError when there is none."""
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except IndexError:
+        raise ValueError("no output")
+
+
 def transcribe(path, fetch=False):
     """The recording as text, locally. Raises RuntimeError with a line worth showing a person."""
     path = os.path.realpath(path)
@@ -136,20 +197,40 @@ def transcribe(path, fetch=False):
     if gap:
         raise RuntimeError(gap)
     os.makedirs(models_dir(), exist_ok=True)
-    try:
-        p = subprocess.run([venv_python(), "-c", PROGRAM, MODEL, path, models_dir(), "fetch" if fetch else "read"],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           timeout=TRANSCRIBE_TIMEOUT if not fetch else None)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"transcribing {os.path.basename(path)} took longer than {TRANSCRIBE_TIMEOUT}s")
-    except OSError as e:
-        raise RuntimeError(f"the transcriber would not start ({e})")
-    if p.returncode != 0:
-        raise RuntimeError(f"the transcriber failed: {(p.stderr or p.stdout).strip()[-400:]}")
-    try:
-        d = json.loads(p.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        raise RuntimeError(f"the transcriber said nothing usable: {p.stdout.strip()[-200:]}")
+    want = (os.environ.get("CC_VOICE_DEVICE") or "auto").lower()
+    d, gpu = None, ""                                # gpu: why the GPU was tried and not used
+    if want != "cpu" and not fetch:
+        # THE GPU RUN IN A PROCESS OF ITS OWN: CTranslate2 aborts the whole process on a missing cuDNN, so the CPU
+        # fallback has to live out here. Any non-zero exit, signal, timeout or unreadable answer runs it on the CPU.
+        try:
+            p = worker(path, fetch, want)
+            if p.returncode == 0:
+                d = parsed(p)
+            elif p.returncode != 3:                  # 3 is auto finding no CUDA device: a CPU run, not a failure
+                last = ((p.stderr or p.stdout).strip().splitlines() or [""])[-1][-160:]
+                gpu = (f"killed by {signal.Signals(-p.returncode).name}" if p.returncode < 0
+                       else f"exit {p.returncode}") + (f": {last}" if last else "")
+        except subprocess.TimeoutExpired:
+            gpu = f"no answer in {TRANSCRIBE_TIMEOUT}s"
+        except (OSError, ValueError) as e:           # ValueError: a clean exit that printed nothing usable
+            gpu = f"{e.__class__.__name__}: {str(e)[:160]}"
+        if gpu:   # said on every run that falls back, not only a failed one: a quiet CPU run is the bug to see
+            print(f"cc-voice: cuda failed ({gpu}) - using the CPU", file=sys.stderr)
+    if d is None:
+        try:
+            p = worker(path, fetch, "cpu")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"transcribing {os.path.basename(path)} took longer than {TRANSCRIBE_TIMEOUT}s")
+        except OSError as e:
+            raise RuntimeError(f"the transcriber would not start ({e})")
+        if p.returncode != 0:
+            raise RuntimeError(f"the transcriber failed: {(p.stderr or p.stdout).strip()[-400:]}")
+        try:
+            d = parsed(p)
+        except ValueError:
+            raise RuntimeError(f"the transcriber said nothing usable: {p.stdout.strip()[-200:]}")
+        if gpu:
+            d["gpu"] = gpu
     if (d.get("seconds") or 0) > MAX_SECONDS:
         raise RuntimeError(f"{int(d['seconds'])}s of audio — longer than a memo ({MAX_SECONDS}s), not transcribed")
     return d
@@ -188,7 +269,9 @@ def condense(transcript):
 def cmd_text(path, with_model=True):
     d = transcribe(path)
     out = {"transcript": d.get("text") or "", "seconds": round(d.get("seconds") or 0, 1),
-           "language": d.get("language") or "", "model": MODEL}
+           "language": d.get("language") or "", "model": MODEL, "device": d.get("device") or ""}
+    if d.get("gpu"):
+        out["gpu"] = d["gpu"]                        # why the GPU was tried and not used
     if with_model:
         out["condensed"] = condense(out["transcript"]) if out["transcript"] else ""
     return out
@@ -208,6 +291,9 @@ def cmd_install(model):
     if r.returncode != 0:
         print(f"cc-voice: pip failed — {(r.stderr or r.stdout).strip()[-500:]}", file=sys.stderr)
         return 1
+    r = subprocess.run([f"{DIR}/venv/bin/pip", "install", "--no-deps"] + GPU_REQ, capture_output=True, text=True)
+    if r.returncode != 0:          # not fatal: without them the worker runs on the CPU
+        print(f"cc-voice: GPU libraries not installed, the CPU will do — {(r.stderr or r.stdout).strip()[-300:]}", file=sys.stderr)
     print(f"cc-voice: fetching {model} into {models_dir()}")
     try:
         transcribe("", fetch=True)

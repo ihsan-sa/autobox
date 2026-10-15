@@ -14,8 +14,9 @@ def selfcheck():
         if not cond:
             f += 1
 
-    def err_of(argv, timeout=None):
+    def err_of(argv, timeout=None, device=None):
         e = dict(env, CC_VOICE_TIMEOUT=timeout) if timeout else env   # a 1 s cap: the hang case must not wait out 420
+        e = dict(e, CC_VOICE_DEVICE=device) if device else e
         r = subprocess.run([os.path.realpath(__file__)] + argv, capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, env=e, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -133,6 +134,50 @@ def selfcheck():
           "transcript comes back with an empty `condensed`, for the caller to fall back on",
           rcC == 0 and dC.get("transcript") == SAID and dC.get("condensed") == ""
           and "condensing call failed" in errC and "FileNotFoundError" in errC)
+
+    # THE GPU IS AN OPTION. First PROGRAM itself, run by a real python against a stub faster_whisper whose cuda load
+    # raises (the shape of a missing cuBLAS or an out-of-memory card): it runs ONE device and exits non-zero on cuda,
+    # 3 when auto finds no CUDA device, and cpu transcribes.
+    os.makedirs(f"{box}/stub/faster_whisper")
+    with open(f"{box}/stub/faster_whisper/__init__.py", "w") as fh:
+        fh.write("class WhisperModel:\n"
+                 "    def __init__(self, model, device, compute_type, **k):\n"
+                 "        if device == 'cuda':\n            raise RuntimeError('libcublas.so.12 not found')\n"
+                 "        self.device = device\n"
+                 "    def transcribe(self, path, **k):\n"
+                 "        class S: text = ' on the ' + self.device\n"
+                 "        class I: duration = 1.0; language = 'en'\n"
+                 "        return [S()], I()\n")
+    def prog(dev):
+        r = subprocess.run([sys.executable, "-c", PROGRAM, "m", audio, f"{box}/models", "read"], capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, timeout=60,
+                           env=dict(os.environ, PYTHONPATH=f"{box}/stub", CC_VOICE_DEVICE=dev))
+        return r.returncode, (json.loads(r.stdout.splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else {})
+    rcG, _ = prog("cuda")
+    rcA, _ = prog("auto")
+    rcP, dP = prog("cpu")
+    check("PROGRAM runs one device: cuda that cannot load exits non-zero, auto with no CUDA device exits 3, cpu "
+          "transcribes", rcG not in (0, 3) and rcA == 3 and rcP == 0 and dP.get("device") == "cpu")
+    check("…and preloads the CUDA wheels from site-packages only, never sys.path, whose '' is the working directory",
+          "getsitepackages" in PROGRAM and "in sys.path" not in PROGRAM)
+    # Then the parent, against a venv python that ABORTS on the GPU try, as CTranslate2 does on a missing cuDNN: no
+    # except inside that process can catch it, so the CPU run has to come from out here, and the reason is printed
+    # on a run that succeeds, not only on one that fails.
+    py = f"{box}/venv/bin/python"
+    keep = open(py).read()
+    with open(py, "w") as fh:
+        fh.write(f'#!/bin/sh\n[ "$CC_VOICE_DEVICE" = cpu ] || kill -ABRT $$\n'
+                 f'echo \'{{"text": "on the cpu", "seconds": 1.0, "language": "en", "device": "cpu"}}\'\n')
+    rcF, outF, errF = err_of(["text", audio])
+    dF = json.loads(outF) if rcF == 0 else {}
+    check("a GPU run killed by a signal falls back to the CPU in the parent, and says so on stderr and in the answer",
+          rcF == 0 and dF.get("transcript") == "on the cpu" and dF.get("device") == "cpu"
+          and "SIGABRT" in dF.get("gpu", "") and "cuda failed" in errF and "using the CPU" in errF)
+    rcN, _, errN = err_of(["transcript", audio], device="cpu")
+    check("…and CC_VOICE_DEVICE=cpu never tries the GPU, so it has nothing to say about it",
+          rcN == 0 and "cuda failed" not in errN)
+    with open(py, "w") as fh:
+        fh.write(keep)
 
     empty = tempfile.mkdtemp(prefix="cc-voice-bare-")
     env = dict(os.environ, CC_VOICE_DIR=empty)
