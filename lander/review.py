@@ -109,11 +109,13 @@ buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_
 With the record, a verdict recorded at this digest stands as on any change (a HANDBACK there still hands it back);
 with none recorded the record is the LAND (model PERMS_SECURITY_READER, extra read="perms"), and nothing is bought.
 A record CARRIES to a new head (carried_from()): when this head has none, an entry for an earlier head of the same
-PR counts if its `verdict` is LAND or absent and the trees of that head and this one differ on no path the base's
-security list matches (security_globs(), plan.select's own list). A delta that touches one, an old head that is
-gone, or a manifest that will not load carries nothing. The LAND then names the old head in extra carried_from, so
-nobody takes it for a fresh read. Only review(), delta_review() and would_read() carry; perms_recorded() itself, and
-so lane.landed_at() and release, still want the head exact.
+PR counts if its `verdict` is LAND or absent and the author's delta from that head to this one (delta_files(), as
+interdiff() compares them: after a rebase only the PR's own paths, so main's other files drop out, plus those of
+them main changed between the two merge-bases) touches no path the base's security list matches (security_globs(),
+plan.select's own list). A delta that touches one, an old head that is gone, a compare git cannot make, or a
+manifest that will not load carries nothing. The LAND then names the old head in extra carried_from, so nobody takes it
+for a fresh read. Only review(), delta_review() and would_read() carry; perms_recorded() itself, and so
+lane.landed_at() and release, still want the head exact.
 `lander record ... --by perms-*` is refused unless the calling Claude session works in the perms seat
 (perms_seat_caller()), but a marker by that name is only a comment: it clears nothing.
 
@@ -346,14 +348,17 @@ def security_globs(root, base, repo):
         return None
 
 
-def delta_files(root, old, new):
-    """The paths whose content differs between two heads' trees, or None when that diff will not run (the old head
-    is gone after a force-push)."""
+def delta_files(root, base, old, new):
+    """The paths the author changed between two heads, as interdiff() compares them (after a rebase only the paths
+    either head's own change touches, so main's other files drop out), plus, after a rebase, those of these paths
+    main changed between the two merge-bases: a head that puts one back as it was before main's fix agrees with the
+    old head there, yet merging it reverts the fix. None when that will not run: the old head is gone after a
+    force-push, any git error, or a name that is not UTF-8."""
     rc, full = git(root, "rev-parse", "--verify", "-q", f"{old}^{{commit}}")
     if rc:
         return None
-    rc, out = plain_diff(root, full.strip(), new, "--name-only", "--no-renames", "-z")
-    return None if rc else [p for p in out.split("\0") if p]
+    rc, out, _ = heads_diff(root, base, full.strip(), new, "--name-only", "--no-renames", "-z", mains=True)
+    return None if rc or "\ufffd" in out else sorted({p for p in out.split("\0") if p})
 
 
 def carried_from(job):
@@ -372,7 +377,7 @@ def carried_from(job):
         return ""
     from lander import manifest as M
     for old in reversed(olds):
-        files = delta_files(root, old, job.head)
+        files = delta_files(root, job.base_sha, old, job.head)
         if files is not None and not any(M.match(globs, f) for f in files):
             return old
     return ""
@@ -1015,38 +1020,49 @@ REBASED = ("(this head was rebased since the earlier read: below is a diff of th
 
 
 def interdiff(root, base, old, new, timeout=300):
-    """What the author changed between the head an earlier read saw and this one -> (rc, text). Unrebased (both heads
-    share a merge-base with `base`) it is `git diff old new`, as before. Rebased, a two-commit diff carries every
-    file main changed, so it is `git diff old new` on the paths either head's own change touches (each taken against
-    its own merge-base). Each path is literal, as blind() sets GIT_LITERAL_PATHSPECS. Hunks keep their numbers, so a
-    line moved from one function into another still shows. All git runs in blind()."""
+    """What the author changed between the head an earlier read saw and this one -> (rc, text), as heads_diff()
+    compares them, a rebased one headed so the read knows."""
+    rc, d, rebased = heads_diff(root, base, old, new, timeout=timeout)
+    if rc or not rebased:
+        return rc, d
+    return 0, REBASED + (d or "(no change: the rebase alone moved this head)\n")
+
+
+def heads_diff(root, base, old, new, *opts, mains=False, timeout=300):
+    """`git diff <opts> old new` as the author changed it -> (rc, text, rebased). Unrebased (both heads share a
+    merge-base with `base`) it is that diff whole. Rebased, a two-commit diff carries every file main changed, so it
+    is that diff on the paths either head's own change touches (each taken against its own merge-base). Each path is
+    literal, as blind() sets GIT_LITERAL_PATHSPECS. Hunks keep their numbers, so a line moved from one function into
+    another still shows. With `mains` (for --name-only -z) a rebased one also names those paths main changed between
+    the two merge-bases. All git runs in blind()."""
     with blind(root, base, old, new) as (got, run):
         if run is None:
-            return got
+            return (*got, False)
         b, o, n = got[1]
         rc, mo = run("merge-base", b, o)
         if rc:
-            return rc, mo
+            return rc, mo, False
         rc, mn = run("merge-base", b, n)
         if rc:
-            return rc, mn
+            return rc, mn, False
         mo, mn = mo.strip(), mn.strip()
         if mo == mn:
-            return run("diff", *PLAIN_DIFF, o, n, timeout=timeout)
+            return (*run("diff", *PLAIN_DIFF, *opts, o, n, timeout=timeout), False)
         paths = set()
         for mb, head in ((mo, o), (mn, n)):
             rc, names = run("diff", *PLAIN_DIFF, "--name-only", "--no-renames", "-z", mb, head, timeout=timeout)
             if rc:
-                return rc, names
+                return rc, names, True
             if "\ufffd" in names:   # a name that isn't UTF-8 came back replaced, so as a pathspec it matches nothing
-                return 1, "a path name is not UTF-8"   # and its file would drop out silently: read whole instead
+                return 1, "a path name is not UTF-8", True   # and its file would drop out silently: fail closed
             paths.update(p for p in names.split("\0") if p)
-        d = ""
-        if paths:
-            rc, d = run("diff", *PLAIN_DIFF, o, n, "--", *sorted(paths), timeout=timeout)
-            if rc:
-                return rc, d
-    return 0, REBASED + (d or "(no change: the rebase alone moved this head)\n")
+        if not paths:
+            return 0, "", True
+        rc, d = run("diff", *PLAIN_DIFF, *opts, o, n, "--", *sorted(paths), timeout=timeout)
+        if rc or not mains:
+            return rc, d, True
+        rc, m = run("diff", *PLAIN_DIFF, *opts, mo, mn, "--", *sorted(paths), timeout=timeout)
+        return rc, (m if rc else d + m), True
 
 
 def diff_of(root, base, head):

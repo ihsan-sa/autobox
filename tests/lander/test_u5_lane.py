@@ -8,6 +8,7 @@ cards/board/deploy/tip units (they post to Slack and touch the box).
 Load-robust: no wall-clock deadline anywhere; the checks are `host` class (no bwrap, no scope), and whether the box
 is loaded only decides whether a red is rerun alone, which gives the same verdict here.
 """
+import contextlib
 import json
 import os
 import re
@@ -849,6 +850,71 @@ class RealUnits(TL.Fixture):
         base = self.git(self.work, "rev-parse", "origin/main")
         new = self.push("track/row-1", {"f": "two\n"})
         self.assertIn("no longer in this repository", self.delta_interdiff(base, "e" * 40, new))
+
+    def rebased(self, files):
+        """track/row-1 rebuilt on origin/main with `files` (None deletes one) and force-pushed -> its head."""
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/main")
+        self.write(self.work, {p: t for p, t in files.items() if t is not None})
+        for p in (p for p, t in files.items() if t is None):
+            self.git(self.work, "rm", "-q", p)
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "rebased")
+        self.git(self.work, "push", "-q", "-f", "origin", "track/row-1:refs/heads/track/row-1")
+        return self.git(self.work, "rev-parse", "HEAD")
+
+    def test_delta_files_after_a_rebase_names_only_the_authors_change(self):
+        """delta_files diffed the two heads, so after a rebase every file main changed was in it and a perms LAND
+        never carried over. It compares them as interdiff() does now, and fails closed as interdiff() does."""
+        old = self.push("track/row-1", {"f": "one\n", "g": "keep\n"})
+        self.main({"m/a": "main moved on\n", "core/sec": "main's\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        new = self.rebased({"f": "one\ntwo\n", "g": "keep\n"})
+        self.assertIn("core/sec", RV.plain_diff(self.work, old, new, "--name-only")[1])   # what it named before
+        self.assertEqual(RV.delta_files(self.work, base, old, new), ["f"])
+        again = self.rebased({"f": "one\ntwo\n", "g": "keep\n"})
+        self.assertEqual(RV.delta_files(self.work, base, new, again), [])
+        self.assertIsNone(RV.delta_files(self.work, base, "e" * 40, new))   # the old head is gone
+        with mock.patch.object(RV, "blind", side_effect=lambda *a: contextlib.nullcontext(((128, "boom"), None))):
+            self.assertIsNone(RV.delta_files(self.work, base, old, new))   # any git error
+
+    def test_delta_files_after_a_rebase_that_undoes_mains_fix_names_that_path(self):
+        """The old head touches only f; main lands a fix to core/sec and a change to core/sec2; the rebased head
+        keeps its own core/sec. Both heads agree on core/sec, but merging the new one reverts main's fix, so the
+        delta names it and a perms LAND does not carry."""
+        self.main({"core/sec": "unsafe\n", "core/sec2": "one\n"})
+        old = self.push("track/row-1", {"f": "one\n"})
+        self.main({"core/sec": "fixed\n", "core/sec2": "two\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        new = self.rebased({"f": "one\n", "core/sec": "unsafe\n"})
+        self.assertEqual(RV.delta_files(self.work, base, old, new), ["core/sec"])
+
+    def test_delta_files_unrebased_is_every_path_the_two_heads_differ_on(self):
+        old = self.push("track/row-1", {"f": "one\n"})
+        new = self.push("track/row-1", {"f": "two\n", "h": "new\n"}, fresh=False)
+        self.main({"m/a": "main moved on\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.assertEqual(RV.delta_files(self.work, base, old, new), ["f", "h"])
+
+    def test_delta_files_fails_closed_on_a_name_that_is_not_utf8(self):
+        old = self.push("track/row-1", {"f": "one\n"})
+        self.main({"m/a": "main moved on\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/main")
+        with open(os.path.join(os.fsencode(self.work), b"bad\xffname"), "wb") as fh:
+            fh.write(b"EVIL\n")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "rebased, an odd name added")
+        new = self.git(self.work, "rev-parse", "HEAD")
+        self.assertIsNone(RV.delta_files(self.work, base, old, new))
+        unrebased = self.push("track/row-1", {"f": "one\n"})
+        with open(os.path.join(os.fsencode(self.work), b"bad\xffname"), "wb") as fh:
+            fh.write(b"EVIL\n")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "an odd name added")
+        odd = self.git(self.work, "rev-parse", "HEAD")
+        self.assertIsNone(RV.delta_files(self.work, base, unrebased, odd))
 
     def test_a_swapped_review_rules_blob_never_reaches_the_read(self):
         """main's docs/REVIEW.md blob is overwritten with a lenient rule's bytes: the checkout shows the lenient rule.

@@ -1834,7 +1834,7 @@ class TestSecurityPaths(Case):
         real = (R.security_globs, R.delta_files)
         self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
         R.security_globs = lambda root, base, repo: list(self.PATHS)
-        R.delta_files = lambda root, old, new: list(delta) if old == self.OLD and new == j.head else None
+        R.delta_files = lambda root, base, old, new: list(delta) if old == self.OLD and new == j.head else None
         return j
 
     def test_a_perms_land_carries_to_a_head_whose_delta_touches_no_security_path(self):
