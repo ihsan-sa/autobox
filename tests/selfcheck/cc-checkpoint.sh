@@ -150,6 +150,62 @@ SH
   eq "inside, a track-named remote and no origin: nowhere to push, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
   d=$(mkwt ws1/proj8); printf 'ws1\nproj8\n' > "$d/.cc/track"
   eq "inside, no remote at all: nowhere to push, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
+  # A TRACK THE HOST BOUND to its project's remote delivers THERE, host and sandbox alike: a member project
+  # (2026-10-12) had origin=another project and a remote named after the track, pushed to origin and opened its PR
+  # there. The binding is cc-track.<track>.remote in ~/dev/<ws>/.git/config, the file the member cannot write.
+  ws wsb; git init -q "$HOME/dev/wsb"
+  git -C "$HOME/dev/wsb" remote add origin https://example.test/org/first.git
+  git -C "$HOME/dev/wsb" remote add projb https://example.test/org/projb.git
+  d=$(mkwt wsb/projb origin https://example.test/org/first.git projb https://example.test/org/projb.git); printf 'wsb\nprojb\n' > "$d/.cc/track"
+  eq "unbound, a track-named remote elsewhere is not taken on the host: origin" "$(run "$d")" origin
+  eq "…nor inside the boundary" "$(irun "$d" | tr '\n' ' ')" "origin rc=0 "
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind wsb projb 2>&1 ); rc=$?
+  eq "bind on the host records the binding" "$rc|$(git config --file "$HOME/dev/wsb/.git/config" --get cc-track.projb.remote)" "0|projb"
+  eq "bound: the host pushes to the project's own remote" "$(run "$d")|$(cat "$CALLS")" "projb|"
+  eq "bound: inside the boundary too, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "projb rc=0 |"
+  rm -f "$d/.cc/own-remote.said"; eq "bound: and no 'is not origin' complaint" "$( ( cd "$d" && "$bin/cc-checkpoint" --remote 2>&1 >/dev/null ) | grep -c 'is not origin')" 0
+  # …kept to the HOST's word: a binding the worktree's own config claims (the member's to write) is not one, and a
+  # member who names a new track after another project's remote reaches origin, not that repository (review of #965).
+  d=$(mkwt wsb/projc origin https://example.test/org/first.git projc https://example.test/org/projc.git); printf 'wsb\nprojc\n' > "$d/.cc/track"
+  git -C "$d" config cc-track.projc.remote projc
+  eq "a binding written in the worktree's own config is not taken: origin" "$(run "$d")" origin
+  eq "…nor inside the boundary" "$(irun "$d" | tr '\n' ' ')" "origin rc=0 "
+  d=$(mkwt wsb/projd origin https://example.test/org/first.git projb https://example.test/org/projb.git); printf 'wsb\nprojd\n' > "$d/.cc/track"
+  eq "another track does not inherit projb's binding: origin" "$(run "$d")|$(irun "$d" | tr '\n' ' ')" "origin|origin rc=0 "
+  # bind refuses inside the boundary, a remote the workspace does not have, and a directory that is no workspace
+  out=$( cd "$T" && CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" bind wsb projc 2>&1 ); rc=$?
+  eq "bind refuses inside the boundary, and writes nothing" "$rc|$(git config --file "$HOME/dev/wsb/.git/config" --get cc-track.projc.remote)" "1|"
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind wsb projc nosuch 2>&1 ); rc=$?
+  eq "bind refuses a remote the workspace does not have" "$rc|$(git config --file "$HOME/dev/wsb/.git/config" --get cc-track.projc.remote)" "1|"
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind myrepo t1 2>&1 ); rc=$?
+  eq "bind refuses a repo that is not a member workspace" "$rc" 1
+  # A TOKEN IN THE REMOTE'S URL stays out of the confirmation, which names the repository by its url_key (review of #1137).
+  git -C "$HOME/dev/wsb" remote add projs https://bot:SECRET@example.test/org/projs.git
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind wsb projs 2>&1 ); rc=$?
+  eq "bind with a token in the remote's url still binds it" "$rc|$(git config --file "$HOME/dev/wsb/.git/config" --get cc-track.projs.remote)" "0|projs"
+  eq "…and its confirmation prints no token" "$(grep -c SECRET <<<"$out")|$(grep -c 'delivers to projs (example.test/org/projs)' <<<"$out")" "0|1"
+  # THE MIGRATION (review of #1137), in the reported shape: a workspace wired before tracks were bound. origin is one
+  # project, a remote named after its own repository is another, a mirror is named otherwise, an alias is origin's
+  # repository under a task's name, and one track the host already bound elsewhere. --wired binds the project alone,
+  # and its track then delivers there on both sides.
+  ws wsm; git init -q "$HOME/dev/wsm"
+  git -C "$HOME/dev/wsm" remote add origin https://example.test/org/first.git
+  git -C "$HOME/dev/wsm" remote add projm https://bot:SECRET@example.test/org/projm.git
+  git -C "$HOME/dev/wsm" remote add mirm https://example.test/org/wsm-mirm.git
+  git -C "$HOME/dev/wsm" remote add taskm https://example.test/org/first.git
+  git -C "$HOME/dev/wsm" remote add kept https://example.test/org/kept.git
+  git config --file "$HOME/dev/wsm/.git/config" cc-track.kept.remote mirm
+  d=$(mkwt wsm/projm origin https://example.test/org/first.git projm https://example.test/org/projm.git); printf 'wsm\nprojm\n' > "$d/.cc/track"
+  eq "before the migration, a project wired with its own remote still delivers to origin" "$(run "$d")|$(irun "$d" | tr '\n' ' ')" "origin|origin rc=0 "
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind wsm --wired 2>&1 ); rc=$?
+  eq "--wired binds the remote named after its own repository, and nothing else" "$rc|$(git config --file "$HOME/dev/wsm/.git/config" --get-regexp '^cc-track\.' | tr '\n' ' ')" "0|cc-track.kept.remote mirm cc-track.projm.remote projm "
+  eq "…says what it bound by url_key, with no token" "$(grep -c 'track projm of wsm delivers to projm (example.test/org/projm)' <<<"$out")|$(grep -c SECRET <<<"$out")" "1|0"
+  eq "migrated: the host pushes to the project's own remote" "$(run "$d")|$(cat "$CALLS")" "projm|"
+  eq "migrated: inside the boundary too, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "projm rc=0 |"
+  out=$( cd "$T" && "$bin/cc-checkpoint" bind wsm --wired 2>&1 ); rc=$?
+  eq "--wired run again binds nothing new and says so" "$rc|$out" "0|cc-checkpoint bind: nothing in wsm left to bind"
+  out=$( cd "$T" && CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" bind wsm --wired 2>&1 ); rc=$?
+  eq "--wired refuses inside the boundary" "$rc" 1
   # THE ONE THAT MATTERS. .cc/track is bound read-WRITE into the member session, so it is the member's word;
   # the worktree's path is not. A .cc/track naming another workspace and a free name must not become an
   # org-admin call for that name (review of #214).
@@ -240,6 +296,15 @@ SH
   k "$(has "$ti" track/projI && echo 0 || echo 1)" "a refused delete leaves the branch where it was" "gone from $ti"
   k "$(grep -q 'refused' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err says the delete was refused" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
   k "$(grep -c 'refused' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and the board hears it" "$(cat "$NOTES")"
+  # NEVER THE TRACK'S OWN DELIVERY (a member project's PR, closed three times on 2026-10-12 while the push went to
+  # origin): the remote named after the track keeps the branch its PR stands on. A sibling remote with the same tip
+  # in the same run is still emptied, so the rule is the name and not a broken eviction.
+  oj=$(bare ownEvJ); tj=$(bare ownProjEvJ); sj=$(bare siblingEvJ)
+  d=$(mkproj ws3/projJ origin "$oj" projJ "$tj" stale "$sj"); git -C "$d" push -q projJ track/projJ; git -C "$d" push -q stale track/projJ
+  runp "$d"
+  k "$(has "$oj" track/projJ && echo 0 || echo 1)" "an unbound track still delivers to origin" "not on $oj"
+  k "$(has "$tj" track/projJ && echo 0 || echo 1)" "…and its branch is NOT deleted from the remote named after the track" "deleted from $tj"
+  k "$(has "$sj" track/projJ && echo 1 || echo 0)" "…while a sibling project's repository is still tidied" "still on $sj"
   # BY PUSH DESTINATION, NEVER BY FETCH URL (lander, #1118). `push --delete` goes to a remote's pushurl, so who is
   # own, who is the mirror and what is probed are all asked of where each remote pushes, not of its url.
   # (a) the mirror's pushurl is the branch's real home and its url is a repository of no interest: another remote
@@ -397,6 +462,19 @@ SH
   eq "legacy: and it is rewritten to the hash, password and all gone" "$(cat "$d/.cc/evict.same" 2>/dev/null)" "$(same_key "$tss")"
   # …and git's words are cut free of a password before they are kept: a refusal or a mirror error quotes them.
   eq "token: a url's user and password are dropped from git's words" "$(no_userinfo <<<"fatal: unable to access 'https://bot:TOK@github.com/o/r.git/': x; git@host:o/r")" "fatal: unable to access 'https://github.com/o/r.git/': x; git@host:o/r"
+  # …nor from the repository the track's PR is on (the board's pr url), under whatever remote name: kept while the
+  # row names that PR, and tidied once it names another. Over ssh in the scp form, with ssh run from $T, so git
+  # reaches the bare repository without rewriting the url, and its url_key (localhost/acme/prk) is the PR's repository.
+  printf '#!/usr/bin/env bash\nfor a; do c=$a; done; cd "%s" && exec sh -c "$c"\n' "$T" > "$T/fakesshT"; chmod +x "$T/fakesshT"
+  sshK(){ ( export GIT_SSH_COMMAND="$T/fakesshT" GIT_SSH_VARIANT=ssh; runp "$1" ); }
+  ok=$(bare ownEvK); pk=$(bare acme/prK)
+  d=$(mkproj ws10/projK origin "$ok" other "git@localhost:acme/prK.git"); git -C "$d" push -q "$pk" track/projK
+  mkdir -p "$ROWS/ws10/projK"; echo https://localhost/acme/prK/pull/3 > "$ROWS/ws10/projK/pr"
+  sshK "$d"
+  k "$(has "$pk" track/projK && echo 0 || echo 1)" "the branch of the PR the row names is not deleted" "deleted from $pk: $(cat "$d/.cc/evict.err" 2>/dev/null)"
+  echo https://localhost/acme/ownK/pull/1 > "$ROWS/ws10/projK/pr"
+  sshK "$d"
+  k "$(has "$pk" track/projK && echo 1 || echo 0)" "…and once the row's PR is elsewhere, that repository is tidied as any other" "still on $pk: $(cat "$d/.cc/evict.err" 2>/dev/null)"
   # Not a member workspace: its remotes are its own business and nothing is ever taken out of them.
   od=$(bare ownD); td=$(bare otherD)
   d=$(mkproj myrepo2/t2 origin "$od" t2 "$td"); git -C "$d" push -q t2 track/t2

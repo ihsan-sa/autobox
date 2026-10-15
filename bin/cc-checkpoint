@@ -25,6 +25,13 @@
 #                          given the sha they read, and only while the remote still answers with it, it records the
 #                          host's lease and the next push reconciles the branch. It pushes nothing itself and reads
 #                          nothing out of the member's tree
+#   cc-checkpoint bind <handle> <track> [<remote>]   the HOST says a member workspace's track is a project of its own
+#                          that delivers to <remote> (default: the remote named after the track), which must already
+#                          be a remote of ~/dev/<handle>. Written to that checkout's .git/config, which the member
+#                          cannot write; pick_remote then pushes and `cc done` opens the PR there, in and out of the boundary
+#   cc-checkpoint bind <handle> --wired   the same for every project cc-gh-token wired into ~/dev/<handle> before it
+#                          bound tracks: each remote but origin that is named after its own repository and is not
+#                          origin's repository binds the track of that name. Already-bound tracks are left; it says each
 #   cc-checkpoint gitdir <handle> <worktree>   0 when that worktree really hangs off ~/dev/<handle>/.git, else 1 and
 #                          the reason. The wall `cc done` puts in front of its own git (core/bin/cc), asked here so
 #                          both callers keep one rule and one message (review-156c)
@@ -86,11 +93,16 @@
 # name again); every other track of a workspace is a task on the workspace's project and pushes to its `origin`.
 # Only a workspace with no remote at all gets a repository CREATED for its track (cc-gh-token create), so work
 # finished there does not sit on a local branch nobody else can see — never one per task (2026-10-05).
-# Inside the member's boundary it is `origin` or nothing (pick_remote says when); a track-named remote pointing anywhere but origin's repository (its url or a push url) is never taken, in there or out here. A repository that could not be
+# A TRACK THE HOST BOUND to a remote (`cc-checkpoint bind`, or cc-gh-token wiring a project's repository) delivers there,
+# inside the member's boundary and out here alike: the binding is cc-track.<track>.remote in ~/dev/<handle>/.git/config,
+# which cc-sandbox holds read-only in there, so a member naming a track never picks a repository by it (review of #965).
+# Unbound, inside the member's boundary it is `origin` or nothing (pick_remote says when); a track-named remote pointing anywhere but origin's repository (its url or a push url) is never taken, in there or out here. A repository that could not be
 # made is nowhere to push; the reason is in .cc/create.err and the next turn tries again. After a push succeeds, the branch is REMOVED from any other repository the workspace
 # remotes name but the project's mirror (below), so opening a project's repository shows that project and not its neighbours (owner,
 # 2026-09-04). Only a tip that is an ancestor of what was just pushed is removed; anything else is left and
-# named in .cc/evict.err — never push.err, which means the push failed (review of #217). Nothing is created, and nothing removed, for anything but a member workspace's project.
+# named in .cc/evict.err — never push.err, which means the push failed (review of #217). Never removed from: the
+# remote named after the track, nor the repository the track's PR is on — that delete closes the PR it lands through.
+# Nothing is created, and nothing removed, for anything but a member workspace's project.
 # AND THAT TRACK-NAMED REMOTE IS THE PROJECT'S MIRROR (mirror_push). On the host, once a member track's push to origin
 # lands, the same branch goes to the remote named after the track too when its urls are not origin's, FAST-FORWARD
 # ONLY: a plain push, never forced, so a mirror somebody else wrote to refuses and is said once per commit on the
@@ -122,7 +134,7 @@
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; STRICT=0
-case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; --sweep) MODE=sweep;; gitdir) MODE=gitdir;; adopt) MODE=adopt;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; --sweep) MODE=sweep;; gitdir) MODE=gitdir;; adopt) MODE=adopt;; bind) MODE=bind;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
 # ── no push waits for a person ───────────────────────────────────────────────────────────────────
 PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds. A track's push is seconds of work, so this is a wall, not a budget.
 git_unattended(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
@@ -247,6 +259,50 @@ own_remote_ok(){   # the remote named after the track may be pushed to only if i
   [ -n "$ST" ] && printf '%s\n' "$msg" > "$ST/own-remote.said" 2>/dev/null
   echo "$msg" >&2
   return 1; }
+bound_remote(){   # → the remote the HOST bound this workspace track to, on stdout.  1 = none (or one that is not there)
+  # Read from ~/dev/<handle>/.git/config BY PATH and nowhere else: that file is the host's (cc-sandbox binds it read-only
+  # into the member's boundary), while the worktree's own config.worktree and .cc/track are the member's to write. Only
+  # a binding names the remote, never the track's name alone, so a member cannot reach another project's repository
+  # by calling a track after it (review of #965). Set by `cc-checkpoint bind` or cc-gh-token's wire().
+  local cfg="$HOME/dev/$WSREPO/.git/config" r
+  [ -f "$cfg" ] && [ ! -L "$cfg" ] || return 1
+  r=$(git config --file "$cfg" --get "cc-track.$WSTRACK.remote" 2>/dev/null) || return 1
+  case "$r" in ''|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  git remote get-url "$r" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$r"; }
+bind_track(){   # $1 handle · $2 track, or --wired · $3 remote (default: the track's name).  The host binds a workspace track to its project's remote
+  local h="${1:-}" t="${2:-}" r="${3:-${2:-}}" d cfg ou k u o f n=0
+  if [ "$t" = --wired ]; then set -- "$h"; else set -- "$h" "$t" "$r"; fi
+  for f; do case "$f" in ''|-*|.*|*[!A-Za-z0-9._-]*) echo "cc-checkpoint bind: <handle>, <track> and <remote> are plain names" >&2; return 1 ;; esac; done
+  [ "${CC_MEMBER_SANDBOX:-}" != 1 ] || { echo "cc-checkpoint bind: the host binds a track, never a session inside a workspace's boundary" >&2; return 1; }
+  d="$HOME/dev/$h"; cfg="$d/.git/config"
+  [ -f "$d/.cc/member-workspace" ] || { echo "cc-checkpoint bind: ~/dev/$h is not a member workspace" >&2; return 1; }
+  [ -f "$cfg" ] && [ ! -L "$cfg" ] || { echo "cc-checkpoint bind: ~/dev/$h has no .git/config of its own" >&2; return 1; }
+  # Each confirmation names the repository by its url_key, never the url as written: a url can carry a token, and
+  # this line is printed (review of #1137).
+  if [ "$t" != --wired ]; then
+    u=$(git config --file "$cfg" --get "remote.$r.url" 2>/dev/null) || { echo "cc-checkpoint bind: ~/dev/$h has no remote '$r' — wire it first (cc-gh-token create $h <name>)" >&2; return 1; }
+    git config --file "$cfg" "cc-track.$t.remote" "$r" || return 1
+    echo "cc-checkpoint bind: track $t of $h delivers to $r ($(url_key "$u"))"; return 0
+  fi
+  # --wired: THE PROJECTS WIRED BEFORE TRACKS WERE BOUND, which still deliver to origin. cc-gh-token's wire() names a
+  # project's remote after its repository, so that shape is the one taken: a remote but origin, named after its own
+  # repository, and not origin's repository. A remote named otherwise (a project's mirror) or origin's repository
+  # under another name (a task's alias) is no project of its own and stays unbound. Read by path, like bound_remote.
+  ou=$(git config --file "$cfg" --get remote.origin.url 2>/dev/null) || ou=''
+  while read -r k u; do
+    o=${k#remote.}; o=${o%.url}
+    [ "$o" != origin ] || continue
+    case "$o" in -*|.*|*[!A-Za-z0-9._-]*) continue ;; esac
+    [ -z "$ou" ] || [ "$(url_key "$u")" != "$(url_key "$ou")" ] || continue
+    f=${u%/}; f=${f%.git}; f=${f##*/}; f=${f##*:}
+    [ "${f,,}" = "${o,,}" ] || continue
+    git config --file "$cfg" --get "cc-track.$o.remote" >/dev/null 2>&1 && continue   # the host's earlier word stands
+    git config --file "$cfg" "cc-track.$o.remote" "$o" || return 1
+    echo "cc-checkpoint bind: track $o of $h delivers to $o ($(url_key "$u"))"; n=$((n+1))
+  done < <(git config --file "$cfg" --get-regexp '^remote\..*\.url$' 2>/dev/null)
+  [ "$n" -gt 0 ] || echo "cc-checkpoint bind: nothing in $h left to bind"
+  return 0; }
 mirror_remote(){   # cwd = worktree root, $WSTRACK set → the project's mirror remote on stdout, or 1 when there is none.
   # It is the remote named after the track — the owner's binding, in ~/dev/<h>/.git/config, which the member cannot
   # write — when origin is there to take the delivery and the two are not one repository (own_remote_ok). Never from
@@ -275,14 +331,14 @@ mirror_push(){   # $1 = the branch just delivered to $remote, cwd = worktree roo
   else printf '%s %s\n' "$head" "$why" > "$ST/mirror.err"; fi   # no network, no credential, the bound: the next push or sweep tick tries again
   return 0; }
 pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push · 1 there is not
-  local url
+  local url r
   # A MEMBER WORKSPACE FIRST, and only then that workspace's own rules: the track-named remote below belongs
   # to a workspace project, not to every repo on the box, and asking for it first applied it to all of them
   # (review of #214). The path, never .cc/track — the header says why.
   if path_ids "$root" && [ -f "$HOME/dev/$WSREPO/.cc/member-workspace" ]; then
     workspace="$WSREPO"   # so the token is minted for this workspace and opens no other member's repository
     # INSIDE THE WORKSPACE'S BOUNDARY (CC_MEMBER_SANDBOX=1: the member's own `cc done`, run by its loop) nothing is
-    # created and no remote named after the track is pushed to (a member's track name once chose another project's
+    # created and no remote named after an UNBOUND track is pushed to (a member's track name once chose another project's
     # repository, review of #965). What is left is `origin`. A remote named after the track that points anywhere
     # else (its url or any push destination, own_remote_ok) is not taken here OR on the host: the track delivers to
     # origin, the same answer both sides give. The one thing "nowhere to push" still means in here is a workspace
@@ -290,6 +346,10 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
     # A TRACK IS USUALLY A TASK ON THE WORKSPACE'S ONE PROJECT, not a project of its own: the #965 cut also wanted
     # origin's URL to END in the track's name, which no task track's does, so every finished track in two workspaces
     # stopped undelivered and the host's `cc done` then made a repository for it (2026-10-05).
+    # A TRACK THE HOST BOUND goes to its bound remote, in here and out there alike. Without this a project wired with
+    # a remote of its own pushed to origin (another project's repository) and the eviction below then deleted its
+    # branch from its own repository, closing the PR there (a member project, 2026-10-12).
+    if r=$(bound_remote); then remote="$r"; return 0; fi
     own_remote_ok || true   # says (stderr, once) when a track-named remote contradicts origin; host and sandbox both then use origin
     if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
       git remote get-url origin >/dev/null 2>&1 || return 1
@@ -541,6 +601,12 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   [ -z "$mk" ] || { mapfile -t miru < <(git remote get-url --push --all "$mr" 2>/dev/null)
     mapfile -t mc < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$mr" 2>/dev/null)" "$workspace" 2>/dev/null); }
   rm -f "$ST/evict.err.tmp"
+  # NEVER THE TRACK'S OWN DELIVERY. The repository its PR is on (the board's pr url) and the remote named after the
+  # track — its project's own repository, bound or not — are skipped: deleting the branch there closes the very PR
+  # this track is landing through, which is what closed a member project's PR three times on 2026-10-12 while the
+  # push went to origin. The board is the member's to write as much as ours, so it can only make this delete LESS.
+  local prkey; prkey=$("$BIN/cc-board" get "$WSREPO" "$WSTRACK" pr 2>/dev/null | head -1)
+  prkey=$(sed -nE 's#^(https?://[^/]+/[^/]+/[^/]+)/pull/[0-9]+.*#\1#p' <<<"$prkey"); prkey=${prkey:+$(url_key "$prkey")}   # the whole url: one url_key rule for both sides
   # evict.same REMEMBERS A HASH OF THE URL_KEY, never the url, which can carry a token (security read of #1118, round
   # 3). A file written before that holds raw urls: each such line is rewritten to its hash here, so it is still known.
   if [ -s "$ST/evict.same" ] && grep -qvxE '[0-9a-f]{64}' "$ST/evict.same"; then
@@ -558,6 +624,8 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   for o in "${rem[@]}"; do
    while IFS= read -r url; do
     [ -n "$url" ] || continue
+    [ "$o" != "$WSTRACK" ] || continue
+    [ -z "$prkey" ] || [ "$(url_key "$url")" != "$prkey" ] || continue
     case $url in -*) printf '%s %s\n' "$(date -u +%FT%TZ)" "$o has a push url beginning with '-', which git would read as an option — left alone. Fix that remote by hand." >> "$ST/evict.err.tmp"; continue;; esac
     grep -qxF -- "$(url_key "$url")" <<<"$own" && continue
     [ -z "$mk" ] || ! grep -qxF -- "$(url_key "$url")" <<<"$mk" || continue   # the project's own mirror (mirror_push) holds this branch by design
@@ -924,6 +992,7 @@ selfcheck(){   # the cases are tests/selfcheck/cc-checkpoint.sh beside this bin/
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
 [ "$MODE" = gitdir ] && { member_gitdir "${2:?cc-checkpoint gitdir: handle}" "${3:?cc-checkpoint gitdir: worktree}"; exit $?; }
 [ "$MODE" = adopt ] && { adopt "${2:-}" "${3:-}" "${4:-}"; exit $?; }
+[ "$MODE" = bind ] && { bind_track "${2:-}" "${3:-}" "${4:-}"; exit $?; }
 if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes for itself, and the box's own repos push from their own hook
   # SAID ONCE, NOT EVERY FIVE MINUTES, and never inside the member's own tree: ~/.cc/worktrees/<h> and ~/.cc/state/<h>
   # are both bound read-write into the boundary (cc-sandbox), so a marker kept there is the member's to forge or

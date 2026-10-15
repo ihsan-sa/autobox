@@ -14,7 +14,10 @@
 #                                       or under the owner's own account when <owner> is CC_GH_PERSONAL_OWNER.
 #                                       There, a repository he already made is wired AS IT STANDS and only a missing
 #                                       one is created; prints the url. Idempotent, it refuses a name already someone
-#                                       else's, and a create his token may not make names what he does instead
+#                                       else's, and a create his token may not make names what he does instead.
+#                                       A remote other than origin also BINDS the track called <name> to it
+#                                       (cc-track.<name>.remote, read by cc-checkpoint): that track pushes there.
+#                                       Run again on a project wired before binding existed, it binds that one too
 #   cc-gh-token api <workspace> <METHOD> <path> [<json>]   any other operation his token allows on a repository that
 #                                       workspace owns under CC_GH_PERSONAL_OWNER — Pages, Actions, branches,
 #                                       releases, settings, whatever it is. Prints the response; a refusal names the
@@ -330,9 +333,24 @@ wire(){   # $1 workspace dir, $2 repo name, $3 url → the remote that makes it 
           # now — and the repository's own name otherwise, because each project has its own repository (owner,
           # 2026-09-03) and must not take another project's remote. Through wsgit, so a caller's GIT_DIR cannot
           # make the remote land in the caller's own repository instead.
+          # A remote of its own BINDS the track of that name to it (cc-checkpoint's bound_remote): written here, in the
+          # workspace's .git/config that the member cannot write, so the project's pushes and PR go to its repository.
   local rn=origin
   [ -z "$(wsgit "$1" remote 2>/dev/null)" ] || rn="$2"
-  wsgit "$1" remote add "$rn" "$3" 2>/dev/null
+  wsgit "$1" remote add "$rn" "$3" 2>/dev/null || return 1
+  [ "$rn" = origin ] || bind_own "$1" "$2" "$3"
+}
+bind_own(){   # $1 workspace dir, $2 repo name, $3 its url → the track called $2 bound to the remote wire() made for it.
+              # Only that remote: named $2, not origin, its url this repository's. A track already bound keeps the
+              # host's earlier word. wire() calls it for a new project, and create's already-its-own path for one
+              # wired before tracks were bound, so running create again is that project's migration (review of #1137).
+  local u a b
+  [ "$2" != origin ] || return 0
+  u=$(wsgit "$1" config --local --get "remote.$2.url" 2>/dev/null) || return 0
+  a=${u%/}; a=${a%.git}; b=${3%/}; b=${b%.git}
+  [ "${a,,}" = "${b,,}" ] || return 0
+  wsgit "$1" config --local --get "cc-track.$2.remote" >/dev/null 2>&1 && return 0
+  wsgit "$1" config --local "cc-track.$2.remote" "$2"
 }
 create(){   # $1 handle, $2 [<owner>/]<name> — a workspace's project ends up with somewhere to push, nobody present
   local ws="$1" name="$2" d url tok r msg other owner="$OWNER" ep
@@ -348,7 +366,7 @@ create(){   # $1 handle, $2 [<owner>/]<name> — a workspace's project ends up w
     owner="$OWNER"; ep="$API/orgs/$OWNER/repos"
   fi
   url="https://$HOST/$owner/$name.git"
-  ws_owns "$ws" "$name" "$owner" && { printf '%s\n' "$url"; return 0; }   # already its own: nothing is created twice
+  ws_owns "$ws" "$name" "$owner" && { bind_own "$d" "$name" "$url"; printf '%s\n' "$url"; return 0; }   # already its own: nothing is created twice, and its track is bound
   other=$(ws_owner_of "$name" "$owner") && die "$owner/$name is workspace $other's — narrowing what a workspace reaches needs nobody, widening it is the owner's alone"
   if is_personal "$owner"; then tok=$(personal_token); else WS=""; tok=$(token); fi   # WS="": org action, see above
   [ -n "$tok" ] || exit 1
@@ -701,17 +719,28 @@ EOF
   k "$(t grep -q '^/orgs/myorg/repos ' "$T/created")" "…in the app's ORG, which is what organization Administration is for"
   k "$(t test "$(jq -r '.private,.name' <<<"$(cut -d' ' -f2- "$T/created")" | tr '\n' ' ')" = "true proj-x ")" "…private, under the name it was asked for"
   k "$(t test "$(git -C "$T/dev/wsa" remote get-url proj-x)" = https://github.com/myorg/proj-x.git)" "…as a remote named after itself, so the workspace's other projects keep theirs"
+  k "$(t test "$(git -C "$T/dev/wsa" config --get cc-track.proj-x.remote)" = proj-x)" "…and the track of that name is bound to it, in the workspace's own .git/config"
   k "$(t test "$(G repos wsa | grep -cx proj-x)" = 1)" "…and it is now one of that workspace's own repositories"
   k "$(t test -n "$(G gitargs https://github.com/myorg/proj-x.git wsa)")" "…so the very next push from that workspace has a credential for it"
   k "$(t test -z "$(G gitargs https://github.com/myorg/proj-x.git wsb)")" "…and no other workspace does"
   : > "$T/created"
   out=$(G create wsa proj-x); rc=$?
   k "$(t test $rc = 0 -a "$out" = https://github.com/myorg/proj-x.git -a ! -s "$T/created")" "creating the same repository again prints the url and creates nothing"
+  # A PROJECT WIRED BEFORE TRACKS WERE BOUND (a member project, 2026-10-12): its remote is there and its track is
+  # not bound, so it delivered to origin. Running create again is its migration: nothing made, the track bound.
+  git -C "$T/dev/wsa" config --unset cc-track.proj-x.remote
+  out=$(G create wsa proj-x); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myorg/proj-x.git -a ! -s "$T/created")" "create on a project wired before binding prints the url and creates nothing…"
+  k "$(t test "$(git -C "$T/dev/wsa" config --get cc-track.proj-x.remote)" = proj-x)" "…and binds its track to its remote"
+  git -C "$T/dev/wsa" config cc-track.proj-x.remote elsewhere; G create wsa proj-x >/dev/null
+  k "$(t test "$(git -C "$T/dev/wsa" config --get cc-track.proj-x.remote)" = elsewhere)" "…but a track the host already bound keeps that binding"
+  git -C "$T/dev/wsa" config cc-track.proj-x.remote proj-x
   out=$(G create wsb proj-x 2>"$T/err"); rc=$?
   k "$(t test $rc != 0 -a ! -s "$T/created")" "another workspace cannot create over a repository that is already someone's"
   k "$(t grep -q wsa "$T/err")" "…and is told whose it is"
   out=$(G create wsnone first-proj)
   k "$(t test "$(git -C "$T/dev/wsnone" remote get-url origin)" = https://github.com/myorg/first-proj.git)" "a workspace with nowhere to push at all gets its first repository as origin"
+  k "$(t test -z "$(git -C "$T/dev/wsnone" config --get-regexp '^cc-track\.')")" "…and binds no track: origin is every unbound track's already"
   out=$(G create plain nope 2>/dev/null); rc=$?
   k "$(t test $rc != 0)" "create refuses a directory that is not a member workspace"
   out=$(CC_CONFIG=/dev/null HOME="$T" "$SELF" create wsa other 2>&1 >/dev/null); rc=$?
