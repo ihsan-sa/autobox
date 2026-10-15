@@ -22,6 +22,7 @@ case "$1 $2" in
     read -r c
     [ "$c" = hang ] && sleep 30
     [ "$c" = good ] || { echo "OAuth error: invalid code"; exit 1; }
+    sleep 1   # a real login takes a moment, so `code` is still waiting when the ps case looks for it
     echo '{"token":"x"}' >"$CLAUDE_CONFIG_DIR/.credentials.json"; echo "Login successful."; exit 0 ;;
   "auth status")
     if [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then echo '{ "loggedIn": true }'; else echo '{ "loggedIn": false }'; fi ;;
@@ -69,7 +70,7 @@ EOF
 
   printf '%s\n' good >"$T/code"
   L start ps >/dev/null && { L code ps <"$T/code" >/dev/null 2>&1 & }
-  for ((_ = 0; _ < 100; _++)); do out=$(ps -eo args | grep -F 'cc-claude-login code ps' | grep -v grep) && break; sleep 0.1; done
+  for ((i = 0; i < 100; i++)); do out=$(ps -eo args | grep -F 'cc-claude-login code ps' | grep -v grep) && break; sleep 0.1; done
   wait
   k "$([ -n "$out" ] && ! grep -q good <<<"$out" && [ -f "$T/home/.claude-ps/.credentials.json" ] && echo 0 || echo 1)" \
     "code reads the code on stdin, so ps never shows it, and the login takes"
