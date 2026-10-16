@@ -95,6 +95,12 @@
 # still counts it), and at the step limit it buys ONE more iteration to read that result — once per round (gext:
 # the grant is not repeated until a commit starts a new round, or a worker re-running a red suite every iteration
 # would never be stopped by anything), not a batch, and not under --no-extend, whose bound is the caller's promise.
+# One that ends with ANY OTHER RUN OF ITS OWN STILL GOING in its worktree (own_run_live: a detached EDA run, a heavy
+# slot) is not waited for, so it gets neither of those (a stray shell or dev server there must not switch the barren
+# stops off), but neither kind is COUNTED: the hour limit, a capped turn or an error that ended an iteration whose gate
+# was still running is not one of the two failures or two caps that stop a track (owner 10-16: no caps that stop work
+# that is still going; raised-loop-hour-cap-kills-long-gates, raised-gate-wait-counts-as-loop-failure). The waits are
+# checked BEFORE the counting for that reason. The barren-run and spend-multiple stops and --budget stand.
 # A STOP IS ADDRESSED TO THE SESSION THAT DISPATCHED THE TRACK — an orch when one did (`<repo>@<alias>`, the broker's
 # own key for it), the repo seat only when none is recorded. The record is $ST/orch, written by this loop at start from
 # CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window, else from CC_DISPATCH_WIN,
@@ -773,6 +779,18 @@ green_wait(){   # a cc-green run on THIS worktree still going when the iteration
   log "the cc-green run ended: exit $rc — ${o##*$'\n'}"
   printf -- '- cc-loop: the cc-green run iteration %s started ended while the loop waited on it (exit %s%s) — read that log before you run another\n' \
     "$i" "$rc" "${lg:+, log $lg}" >> "$ST/progress.md"; return 0; }
+own_run_live(){   # a process of the worker's own still running in $WT once claude has exited (a detached EDA run, a
+  # `cc-room heavy` slot) → prints "pid command" and 0; none → 1. This loop's own tree (its subshells, the hook) is not
+  # one, nor is anything it runs under (the window's shell, a sandbox's pid 1).
+  local p a x cmd up=" 1 "
+  a=$$; while [ "${a:-0}" -gt 1 ]; do up="$up$a "; x=$(cat "/proc/$a/stat" 2>/dev/null) || break; x=${x##*) }; a=$(cut -d' ' -f2 <<<"$x"); done
+  # shellcheck disable=SC2044  # every path is /proc/<pid>/cwd: no spaces or globs to split on
+  for p in $(find /proc/[0-9]*/cwd -maxdepth 0 \( -lname "${WT%/}" -o -lname "${WT%/}/*" \) 2>/dev/null); do
+    p=${p#/proc/}; p=${p%/cwd}; case "$up" in *" $p "*) continue;; esac; a=$p; while [ "${a:-0}" -gt 1 ]; do [ "$a" = "$$" ] && continue 2
+      x=$(cat "/proc/$a/stat" 2>/dev/null) || break; x=${x##*) }; a=$(cut -d' ' -f2 <<<"$x"); done
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | head -c 120); [ -n "$cmd" ] || continue   # a zombie or a kernel thread
+    printf '%s %s\n' "$p" "$cmd"; return 0; done
+  return 1; }
 deliver_post(){   # THE WORKER'S SLACK DELIVERABLE, posted by the loop and never by the worker (raised-headless-cannot-deliver-to-slack).
   # A worker is guarded from every outward post, so a track whose done-criterion is a message in a channel reached its
   # last step, was refused, and ended BLOCKED with the work done and undelivered (a test member, 2026-09-09). It
@@ -1424,6 +1442,32 @@ TO
     "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/toc/loop.log")/$(grep -c 'timed out at the 1 h iteration limit (rc=124), but it committed' "$lh/.cc/state/lp/toc/loop.log")" 0/2
   t '…while two that committed nothing count, each error line naming the timeout, and stop the track as errored' \
     "$(grep -c 'error ([12]): timed out at the 1 h iteration limit (rc=124) with nothing committed' "$lh/.cc/state/lp/ton/loop.log")/$(grep -c '2 consecutive failures' "$lh/.cc/state/lp/ton/loop.log")" 2/1
+  # ── AN ITERATION STILL RUNNING ITS OWN GATE IS NEVER COUNTED (owner 10-16) ── the same timed-out claude, nothing
+  # committed: tog with a cc-green run live as it ends (CC_GREEN answers 3 to `wait 0`), toe with a detached run of its
+  # own (an EDA run) left in the worktree. Neither is a failure, so neither track is stopped as errored.
+  printf '#!/bin/sh\n[ "$2" = 0 ] && { echo "cc-green: still running (pid 1, since 00:00)"; exit 3; }\necho "cc-green: green — log /x/g.log"; exit 0\n' > "$lb/greenlive"
+  cat > "$lb/claudeeda" <<'EDA'
+#!/bin/sh
+setsid sleep 60 </dev/null >/dev/null 2>&1 &
+echo $! >> "$FK_EDA"
+exit 124
+EDA
+  chmod +x "$lb/greenlive" "$lb/claudeeda"
+  for tk in tog toe; do
+    mkdir -p "$lh/.cc/state/lp/$tk" "$lh/.cc/worktrees/lp/$tk"; echo "the task" > "$lh/.cc/state/lp/$tk/task.md"
+    git -C "$lh/.cc/worktrees/lp/$tk" init -q; git -C "$lh/.cc/worktrees/lp/$tk" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  done
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_GREEN="$lb/greenlive" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+      FK_COMMIT=0 "$lb/cc-loop" lp tog --max-iter 2 --no-extend ) >/dev/null 2>&1
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeeda" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+      FK_EDA="$d/eda.pids" "$lb/cc-loop" lp toe --max-iter 2 --no-extend ) >/dev/null 2>&1
+  for p in $(cat "$d/eda.pids" 2>/dev/null); do kill "$p" 2>/dev/null; done
+  t 'two timed-out iterations whose own cc-green run was still going are not failures: no error line, no errored stop' \
+    "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/tog/loop.log")/$(grep -c 'ended (rc=124) while its own gate run was still going — not counted' "$lh/.cc/state/lp/tog/loop.log")" 0/2
+  t '…nor two whose own detached run (an EDA run) was still going in the worktree, each named in the log' \
+    "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/toe/loop.log")/$(grep -c 'a run of its own still going in its worktree ([0-9]* sleep 60' "$lh/.cc/state/lp/toe/loop.log")" 0/2
+  t '…but a run of its own it never waits for does not switch the barren stops off: each of the two is a runaway signal' \
+    "$(grep -c 'runaway signal [0-9]*/[0-9]*: committed nothing and left the journal untouched' "$lh/.cc/state/lp/toe/loop.log")" 2
   t '…and a finished iteration keeps the cost its own json reports, unmarked' \
     "$(grep -c 'iter 1 end .*cost=\$1.25 total=' "$lh/.cc/state/lp/it/loop.log")" 1
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
@@ -2192,7 +2236,13 @@ while [ $i -lt "$MAXI" ]; do
       refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
       stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;
   esac
-  if [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
+  gated=no; green_wait && gated=yes   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
+  # a process of its own still in the worktree (own_run_live) only keeps an error or a cap from counting: it is never
+  # waited for, so it must not also switch off the barren checks or buy an iteration below, which stay green_wait's
+  ownrun=no; if [ "$gated" = no ] && orl=$(own_run_live); then ownrun=yes; log "iter $i ended with a run of its own still going in its worktree (${orl}) — not idle"; fi
+  if { [ "$gated" = yes ] || [ "$ownrun" = yes ]; } && { [[ "$subtype" == error_max_* ]] || [ "$rc" != 0 ] || [ "$iserr" = true ]; }; then
+       log "ended (rc=$rc${subtype:+, $subtype}) while its own gate run was still going — not counted as a failure or a cap"
+  elif [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
   elif [[ "$subtype" == error_max_* ]]; then caps=$((caps+1)); log "capped ($subtype) with nothing to show ($caps)"
        [ $caps -ge 2 ] && stop 7 "hit its cap" "Two capped iterations with no commits or journal change (\$$spent). Raise --budget/--turns or split the task; log: $LOG"
   elif [ "$rc" = 124 ] && [ "$before_head" != "$after_head" ]; then errs=0; log "timed out at the 1 h iteration limit (rc=124), but it committed — not counted as a failure"
@@ -2202,7 +2252,6 @@ while [ $i -lt "$MAXI" ]; do
   elif [ "$rc" != 0 ] || [ "$iserr" = true ]; then errs=$((errs+1)); log "error ($errs): $( { head -c 300 "$out.err" 2>/dev/null; [ -s "$out.err" ] || jq -r '"\(.subtype // "")\ \(.result // "" | tostring)"' "$out" 2>/dev/null | head -c 300; } | tr '\n' ' ')"   # a run that errored in-band leaves .err empty: say why from the json
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   else errs=0; caps=0; fi
-  gated=no; green_wait && gated=yes   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
   # ── the runaway rule: progress-free SPEND, and every number it uses comes from this track's own history ──
   committed=no; [ "$before_head" != "$after_head" ] && committed=yes
   sig=$(jq -r '"\(.subtype // "")|\(.is_error // false)|\((.result // "")|tostring)"' "$out" 2>/dev/null | tr -d '\n' | head -c 160)

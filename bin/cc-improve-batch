@@ -28,8 +28,9 @@ group with no model at all.
 
 MODELS, cheapest that holds: pass 1 and the fix picking of pass 3 on IMPROVE_BATCH_MODEL (sonnet), pass 2 on
 IMPROVE_BATCH_SMALL_MODEL (haiku), the quiet-fix judge and pass 4 on IMPROVE_BATCH_JUDGE_MODEL (opus). Every call is
-`claude -p` with no tools and one turn. The day stops calling models once IMPROVE_BATCH_BUDGET dollars (default 3)
-are spent, and the report and stdout say what the day cost, per pass. Under a spend tier that holds `goals`
+`claude -p` with no tools and one turn. IMPROVE_BATCH_BUDGET dollars (default 3) is a ceiling that alerts: its first
+crossing posts one ambient cc-notify line, the pass in hand finishes (its calls under OVER_CALL each), and the day
+stops before the next pass. The report and stdout say what the day cost, per pass. Under a spend tier that holds `goals`
 (cc-tier), it spends nothing and exits 0.
 
 OUTPUT, in ~/.cc/state/improve/reports/ (or --out DIR): <day>.md, the ranked report, and <day>.jsonl, one finding per
@@ -111,21 +112,49 @@ class ModelFailed(Exception):
     pass
 
 
+OVER_CALL = 0.50   # the per-call ceiling once the day's budget is crossed and the pass in hand is being finished
+
+
 class Models:
-    """Every model call goes through here, so the day's cost is counted in one place and the budget holds."""
+    """Every model call goes through here, so the day's cost is counted in one place. The budget alerts rather than
+    cuts (owner 10-16): crossing it says so once, the pass in hand finishes with each further call under OVER_CALL,
+    and next_item() is where a crossed day stops."""
 
     def __init__(self, budget, workdir):
-        self.budget, self.workdir, self.cost = budget, workdir, {}
+        self.budget, self.workdir, self.cost, self.said, self.stopped = budget, workdir, {}, False, False
 
     def spent(self):
         return sum(self.cost.values())
 
+    def crossed(self):
+        """True once the budget is spent; the first time, one ambient cc-notify line (--id keeps it to one a day).
+        CC_JOB_NOTIFY: test hook."""
+        if self.budget - self.spent() >= 0.05:
+            return False
+        if not self.said:
+            self.said = True
+            note = os.environ.get("CC_JOB_NOTIFY") or os.path.join(BIN, "cc-notify")
+            try:
+                subprocess.run([note, "-t", "cc-improve-batch budget crossed", "--id",
+                                f"budget:cc-improve-batch:{time.strftime('%Y-%m-%d')}", "--",
+                                f"cc-improve-batch: the day's ${self.budget:.2f} budget is crossed (${self.spent():.2f} so far). "
+                                "It finishes the pass it is on and stops there; nothing is cut off mid-pass."],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return True
+
+    def next_item(self):
+        """Between passes: a crossed budget stops the day here. Every later call refuses, so each pass falls back as it
+        does on a failed call (pass 2 keeps its groups with no model)."""
+        self.stopped = self.stopped or self.crossed()
+
     def ask(self, pass_name, prompt):
+        if self.stopped:
+            raise ModelFailed(f"the day's budget of ${self.budget:.2f} is spent (the pass it crossed in finished)")
         key, default = PASS_MODEL[pass_name]
         model = conf(key, default)
-        left = self.budget - self.spent()
-        if left < 0.05:
-            raise ModelFailed(f"the day's budget of ${self.budget:.2f} is spent")
+        left = OVER_CALL if self.crossed() else self.budget - self.spent()
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
         env["CC_ROLE"] = "improve-batch"
         claude = os.environ.get("CC_CLAUDE") or home(".local", "bin", "claude")
@@ -564,13 +593,17 @@ def run(snapshot, out):
     models = Models(float(conf("IMPROVE_BATCH_BUDGET", "3")), work)
     notes, errors, findings = {}, {}, []
     try:
+        models.next_item()   # each pass is an item: a budget crossed inside one lets it finish, the next is where the day stops
         try:
             findings += pass_nudges(snap, models, out, day, notes)
         except ModelFailed as e:
             errors["nudges"] = str(e)
+        models.next_item()
         findings += pass_failures(snap, models, out, day, notes, errors)
+        models.next_item()
         quiet, checks = pass_fixes(snap, models, day, findings, notes, errors)
         findings += quiet
+        models.next_item()
         findings += pass_ideas(models, findings, checks, notes, errors)
         cost, per = write_report(out, day, snap, findings, checks, notes, errors, models)
     finally:

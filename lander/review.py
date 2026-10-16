@@ -49,8 +49,8 @@ Otherwise the lander buys one:
     reopen does not reset it), and the read that takes them past READ_CEILING_USD tells the planning seat, and so
     does the read that takes them past each doubling of it (2x, 4x, ...; over_ceiling: a planner request naming the
     PR and its spend), and the reading goes on. A codex read reports no dollars, so its cost is an estimate:
-    the `tokens used` count it prints at CODEX_USD_PER_MTOK, or CODEX_READ_USD when it prints none
-    (codex_usd).
+    the `tokens used` count it prints at CODEX_USD_PER_MTOK, or CODEX_READ_USD when it prints none, and at least
+    CODEX_READ_USD when codex exits nonzero (codex_usd).
   - one read by EACH model on CC_LAND_REVIEWERS (the passwd home's ~/.cc/config only, cards.REVIEWER_CONFIG;
     default READERS: Fable 5.1 and Astra 6 — owner, 2026-09-24: "a review goes to Fable 5.1 and Astra 6
     together"), at CC_LAND_REVIEW_EFFORT (default high; one of EFFORTS, checked before any read). A `claude-*`
@@ -774,9 +774,10 @@ def codex_tools_left(run):
     return f"codex has feature(s) on that the review does not allow: {', '.join(left)}" if left else ""
 
 
-# codex exec's own count: a line that is only "tokens used", then a line that is only the number. A number written
-# inline ("tokens used: 9") is a diff's or an answer's text, not codex's, and a count past CODEX_MAX_TOKENS is capped.
-CODEX_TOKENS = re.compile(r"^tokens used[ \t]*\r?\n[ \t]*([\d,]{1,20})[ \t]*\r?$", re.M)
+# codex exec's own count: a line that is only "tokens used", then a line that is only the number (a digit first, so a
+# bare "," is no count). A number written inline ("tokens used: 9") is a diff's or an answer's text, not codex's, and a
+# count past CODEX_MAX_TOKENS is capped.
+CODEX_TOKENS = re.compile(r"^tokens used[ \t]*\r?\n[ \t]*(\d[\d,]{0,19})[ \t]*\r?$", re.M)
 CODEX_MAX_TOKENS = 50_000_000
 
 
@@ -784,8 +785,10 @@ def codex_usd(rc, out):
     """-> the estimated dollars of a `codex exec` that exited `rc` and printed `out`: the last `tokens used` count codex itself
     printed (CODEX_TOKENS, capped at CODEX_MAX_TOKENS) at CODEX_USD_PER_MTOK (CC_LAND_CODEX_USD_PER_MTOK overrides it when it is a finite number >= 0), else
     CODEX_READ_USD, and 0.0 only for rc 126/127 with no count (a missing binary or a refused flag reached no model; a
-    timeout's 124 or any other failure may have run the model for the whole read). A usage limit is not looked for
-    here: an answer can quote the words, and ask_codex() charges nothing for a read the limit stopped."""
+    timeout's 124 or any other failure may have run the model for the whole read). A nonzero rc with a count is
+    charged at least CODEX_READ_USD: a codex that crashed before printing its own count leaves only a pair the PR
+    text planted (echoed on stderr), so a "tokens used" / "0" there never makes a failed read free. A usage limit is
+    not looked for here: an answer can quote the words, and ask_codex() charges nothing for a read the limit stopped."""
     said = CODEX_TOKENS.findall(out or "")
     if not said:
         return 0.0 if rc in (126, 127) else CODEX_READ_USD
@@ -796,8 +799,9 @@ def codex_usd(rc, out):
     if not math.isfinite(rate) or rate < 0:
         rate = CODEX_USD_PER_MTOK
     try:
-        tokens = min(int(said[-1].replace(",", "") or 0), CODEX_MAX_TOKENS)
-        return round(tokens / 1e6 * rate, 4)
+        tokens = min(int(said[-1].replace(",", "")), CODEX_MAX_TOKENS)
+        usd = round(tokens / 1e6 * rate, 4)
+        return max(usd, CODEX_READ_USD) if rc != 0 else usd
     except (ValueError, OverflowError):
         return CODEX_READ_USD
 

@@ -53,7 +53,8 @@ MAX_DRAIN="${CC_MSG_MAX_DRAIN:-20}"          # messages per window per drain: a 
 DEDUP_S="${CC_MSG_DEDUP_S:-120}"             # a caller repeating ITS OWN line inside this many seconds is retrying,
                                              # not sending twice; past it, the same words are a second message
 REPORT_TRIES="${CC_MSG_REPORT_TRIES:-3}"     # injects of one standing-dialog (or orphan) report that nobody heard
-                                             # before it stops: each is a NEW message in the told session's queue
+                                             # a tick apart: each is a NEW message in the told session's queue, so
+REPORT_SLOW="${CC_MSG_REPORT_SLOW:-1800}"    # past them it re-pages only every this many seconds, until the stall clears
 HUNG_WAIT="${CC_MSG_HUNG_WAIT:-1}"           # a pane that has not moved YET: seconds between the re-reads that decide
 HUNG_TRIES="${CC_MSG_HUNG_TRIES:-3}"         # it never will — a live pane costs one read, only a wedged one waits
 HUNG_COOLDOWN="${CC_MSG_HUNG_COOLDOWN:-30}"  # min before one window is restarted again: a session that comes back
@@ -356,12 +357,17 @@ unsent(){   # $1 window id  $2 the text as typed → 0 while the input box still
 # unread mail. A line that is not such an object (a kill mid-append, a hand-edit) is dropped by the drain and said
 # through cc-notify: the drain used to stop at it, every tick, for ever, and nothing said so (review-157e).
 # inbox.dialog beside it is the standing-dialog stamp: "<first-seen epoch>\t<reported 0|1>\t<report attempts>\t<line>"
-# — the attempt count is why a report that reached nobody is retried (REPORT_TRIES times) but paged only once.
+# — the attempt count is why a report that reached nobody is retried REPORT_TRIES times a tick apart, then every
+# REPORT_SLOW seconds while the stall stands (report_due), and paged only once.
 # inbox.hung is the same idea for a pane that stopped taking keys: "<restarted epoch>\t<said 0|1>\t<pid>\t<screen>"
 # — the epoch holds HUNG_COOLDOWN over the next restart of that window, and the pid and the hashed screen are the
 # pane it froze on: while the same process still reads the same way the drain types nothing at it, and the first
 # read that differs (or the file's own age passing HUNG_COOLDOWN) drops the stamp.
 sdir(){ printf '%s/%s' "$STATE" "$1"; }
+report_due(){   # $1 failed tries so far  $2 seconds the stall has stood -> 0 when another report is due: the first
+                # REPORT_TRIES at once, then one each REPORT_SLOW (owner 10-16: never drop it, keep going slower)
+  [ "$1" -lt "$REPORT_TRIES" ] && return 0
+  [ "$2" -ge $(( STAND_MIN * 60 + ($1 - REPORT_TRIES + 1) * REPORT_SLOW )) ]; }
 lock(){ mkdir -p "$(sdir "$1")"; printf '%s/.inbox.lock' "$(sdir "$1")"; }
 
 # WHO SENT IT, for the spool line's `from` (and so its queued receipt): the sender's own tmux window — its broker key,
@@ -472,7 +478,7 @@ dialog_seen(){   # $1 window  $2 pane text
   [ "${rep:-0}" = 1 ] || rep=0
   printf '%s\t%s\t%s\t%s\n' "$first" "$rep" "$att" "$line" > "$f"
   { [ "$rep" = 1 ] || [ $((now - first)) -lt $((STAND_MIN * 60)) ]; } && return 0
-  [ "$att" -lt "$REPORT_TRIES" ] || return 0   # tried REPORT_TRIES times and heard by nobody: stop (see below)
+  report_due "$att" $((now - first)) || return 0   # tried REPORT_TRIES times, heard by nobody: slower (see below)
   n=$(spool_n "$1")
   text="cc-msg: main:$1 needs you — a dialog has stood ${STAND_MIN}+ min with $n message(s) queued behind it, and the session is unreachable until it is answered (tmux select-window -t main:$1). The dialog: $line"
   # REPORTED ONCE MEANS HEARD ONCE. The stamp is closed only when the injector says the text reached a live session
@@ -480,10 +486,11 @@ dialog_seen(){   # $1 window  $2 pane text
   # (a deploy restarts it, and a drain tick can fall in that second), mean NOBODY has read it: rep stays 0 and the
   # next tick tries again. A report that could not be taken at all is the box going quiet with mail behind a dialog
   # — that one is said to the owner too, but only on the first failure, not every minute.
-  # AND ONLY REPORT_TRIES TIMES: the injector stamps every inject as a new message (a fresh meta.ts is its sender
+  # AND ONLY REPORT_TRIES TIMES A TICK APART: the injector stamps every inject as a new message (a fresh meta.ts is its sender
   # name, so this script's own retry-collapse never matches it), and with the told session simply not running each
   # tick appended one more copy of this line to its queue — sixty an hour, flushed at it the moment it came up
-  # (review-157e). The owner has his line by then; a report nobody could take three times waits for them.
+  # (review-157e). A report nobody could take three times is then sent again every REPORT_SLOW seconds while the
+  # dialog stands: a couple of copies an hour, never dropped (owner 10-16, no caps that stop work).
   # AND NEVER INTO THE PANE IT IS ABOUT: when the stuck window IS the session we would tell, the inject would come
   # back through this same script (no subscriber → cc-slack types it → cc-msg → this dialog again, round and round).
   tgt=${CC_MSG_REPORT_TO:-$(ctl)}
@@ -523,7 +530,7 @@ orphan_seen(){   # $1 window — its spool has NO window to drain into (a handof
   [ -f "$f" ] && IFS=$'\t' read -r rep att _ < "$f"
   [ "${rep:-0}" = 1 ] && return 0
   case "$att" in ''|*[!0-9]*) att=0;; esac
-  [ "$att" -lt "$REPORT_TRIES" ] || return 0   # bounded exactly as dialog_seen's: each try is a new message there
+  report_due "$att" $((now - first)) || return 0   # paced exactly as dialog_seen's: each try is a new message there
   n=$(spool_n "$1")
   text="cc-msg: $n message(s) are spooled for main:$1 but no such window exists — a rename or an exit left them behind ($(sdir "$1")/inbox.spool). Deliver or delete them; nothing drains this by itself."
   tgt=${CC_MSG_REPORT_TO:-$(ctl)}
@@ -1960,13 +1967,18 @@ $BUSY"; out=$(msg "hello mid-turn")
   # (9b′) …AND NOT FOR EVER. Every inject is a NEW message to the daemon (it stamps a fresh meta.ts as the sender, so
   # this script's own retry-collapse never matches it): with the told session not running, a retry a minute was a
   # copy a minute in its queue, sixty an hour, flushed at it when it came up (review-157e). A report nobody hears is
-  # tried CC_MSG_REPORT_TRIES times and then left — logged on the first failure.
+  # tried CC_MSG_REPORT_TRIES times a tick apart, then once every CC_MSG_REPORT_SLOW seconds while it stands.
   reset; scr "$PERM"; msg "stuck7" >/dev/null; stand
   for _ in 1 2 3 4 5; do CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "five ticks that nobody hears: three injects (CC_MSG_REPORT_TRIES), the fourth and fifth make none"
   k "$(t test "$(cut -f3 "$DG")" = 3)" "…the stamp counts the tries"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and is still open: the stop is a bound, not a claim it was heard"
   k "$(t test "$(grep -c 'dialog-untold' "$T/.cc/state/msg.log")" = 1)" "…and it was logged once, on the first failure, as before"
+  printf '%s\t0\t3\tDo you want to make this edit?\n' "$(( $(date +%s) - 600 - 1810 ))" > "$DG"
+  CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 4)" "…and NEVER DROPPED: once it has stood CC_MSG_REPORT_SLOW past the tries, it re-pages"
+  CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 4)" "…the slower pace holds: the next tick makes none until another CC_MSG_REPORT_SLOW"
 
   # (9c) WHO hears it: the control repo this copy of cc-msg lives in (~/dev/<repo>/core/bin, which ~/bin links to),
   # whose planning session can walk over to the window — not a name written into the script.
@@ -2008,7 +2020,9 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(nt test -f "$T/.cc/state/$W/inbox.orphan")" "…and the orphan stamp is gone with it"
   reset; scr "$PERM"; msg "stranded2" >/dev/null; touch -d '20 minutes ago' "$SP"
   for _ in 1 2 3 4 5; do CC_FAKE_WIN='' CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
-  k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "…and a report of it that nobody hears is bounded the same way: three tries, then quiet"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "…and a report of it that nobody hears is paced the same way: three tries, then quiet"
+  touch -d '41 minutes ago' "$SP"; CC_FAKE_WIN='' CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 4)" "…until CC_MSG_REPORT_SLOW has passed: then it re-pages, never dropped"
 
   # (9f) a target whose repo segment is a suite fixture's (_cctest<pid>) is never reported this way: the gate suite
   # spools one behind a fixture window every run, and the sweep found it orphaned the same as a real one — four

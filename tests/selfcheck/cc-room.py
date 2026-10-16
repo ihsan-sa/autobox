@@ -616,6 +616,21 @@ esac''')):
           ("told r@comms" in "".join(lines(f"{d}/loop.log")), len(lines(f"{d}/told")) - n1,
            bool(e) and read_entry(e).get("noticed")), (True, 0, True))
 
+        # NOTICE_TRIES refused: said once in the dispatcher's channel (a plain --major notice), not only logged
+        d = fixture("unheard")
+        open(f"{d}/bin/cc-notify", "w").write(f'#!/bin/sh\necho "notify $*" >> "{d}/told"\n'
+                                             f'case " $* " in *" --ask "*) exit 1 ;; esac\n')
+        rec = {"queued": time.time() - 7200, "target": "r@comms", "notice_tries": NOTICE_TRIES}
+        said = unheard("r/deaf", rec, "the host is busy", f"{d}/loop.log")
+        told = lines(f"{d}/told")
+        t("unheard: after the last refused try it says so once in the repo's channel, naming how to cancel",
+          (said, len(told), bool(told) and "--major --id room-unheard:r/deaf:" in told[0]
+           and "cc-room cancel r/deaf" in told[0]), (True, 1, True))
+        os.chmod(f"{d}/bin/cc-notify", 0o644)
+        t("unheard: a channel that refuses too is logged, and the entry does not call it said",
+          (unheard("r/deaf", rec, "x", f"{d}/loop.log"), "could not say in the channel" in open(f"{d}/loop.log").read()),
+          (False, True))
+
         # status's sweep runs under the room lock, and its settling stamp never writes back an entry a cancel removed
         d = fixture("settle", cap=1)
         os.environ["CC_ROOM_GRACE"] = "60"

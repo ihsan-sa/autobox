@@ -80,7 +80,8 @@ inject --source room` to `<repo>@<alias>` when an orch dispatched it (CC_SLACK_A
 the window), else `<repo>`; a broker that does not take it files a `cc-notify --ask` instead. The line says why it
 waits and how to cancel it. Delivered is kept in the entry apart from tried, so a restart does not repeat a notice
 that arrived and a failed one is not taken for one: both refused, it tries again CC_ROOM_NOTICE_RETRY seconds (300)
-later, doubling up to 6 h, NOTICE_TRIES times at most.
+later, doubling up to 6 h, NOTICE_TRIES times at most; after the last refused try it says so once in its repo's
+channel (a plain `cc-notify --major`), and the launch keeps waiting.
 
 HEAVY (2026-09-27: place_anneal ran at 4% CPU at load 160 beside ~20 sessions). `heavy` is FIFO over CC_HEAVY_CAP
 slots (cc-config, default a third of the cores, at least 1) and waits on nothing else: the load is the sessions',
@@ -504,8 +505,8 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
         if tell_now:
             if notice(what, rec, why, log):
                 rec["noticed"] = True
-            elif rec["notice_tries"] >= NOTICE_TRIES:
-                logline(log, f"cc-room: gave up telling anyone that {what} waits, after {NOTICE_TRIES} tries")
+            elif rec["notice_tries"] >= NOTICE_TRIES and not rec.get("unheard_said"):
+                rec["unheard_said"] = unheard(what, rec, why, log)
             with Lock():
                 if os.path.exists(me):   # a cancel in between moved it away: never write it back
                     write_entry(qsub, name, what, rec)
@@ -598,6 +599,29 @@ def notice(what, rec, why, log):
         return True
     logline(log, f"cc-room: could not tell anyone that {what} waits (the broker and cc-notify both refused; "
                  f"try {rec.get('notice_tries', 1)} of {NOTICE_TRIES})")
+    return False
+
+
+def unheard(what, rec, why, log):
+    """NOTICE_TRIES refused notices: say so once in the dispatcher's repo channel (a plain --major cc-notify, a door
+    apart from the broker and the request file) rather than only in the log. -> True once that post was taken; the
+    --id keeps a restart from saying it twice. The launch keeps waiting either way: nothing is dropped."""
+    logline(log, f"cc-room: nobody took the notice that {what} waits, after {NOTICE_TRIES} tries; saying so in its channel")
+    mins = int((time.time() - rec["queued"]) // 60)
+    stamp = time.strftime("%Y%m%dT%H%MZ", time.gmtime(rec["queued"]))
+    line = (f"{what} has waited {mins // 60} h {mins % 60:02d} min in the worker queue: {why}. Its seat "
+            f"({rec.get('target', '?')}) did not take the notice after {NOTICE_TRIES} tries. It starts on its own "
+            f"when there is room; `cc-room cancel {what}` drops it.")
+    b = os.environ.get("CC_ROOM_BIN") or BIN
+    try:
+        r = subprocess.run([f"{b}/cc-notify", "--major", "--id", f"room-unheard:{what}:{stamp}",
+                            "-t", f"{what} queued", line], capture_output=True, timeout=60)
+        if r.returncode == 0:
+            logline(log, f"cc-room: said in the channel: {line}")
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    logline(log, f"cc-room: could not say in the channel that {what} waits either")
     return False
 
 

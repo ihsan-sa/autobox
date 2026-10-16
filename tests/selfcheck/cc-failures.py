@@ -381,7 +381,7 @@ def selfcheck():
         ok("THE THRESHOLD is a cc-config key (the environment wins): at 2, a case red on two PRs is claimed", rc == 0 and json.loads(out)["text"] == "another case entirely" and len(claimed()) == 2)
         red(301, "✗ a third case", at(2)); red(302, "✗ a third case", at(1))
         rc, out, err = rcl()
-        ok("…and two claims a rolling day is the cap, whatever the cases", rc == 1 and len(claimed()) == 2 and "the cap" in err)
+        ok("NO DAY CAP: a third case red on the threshold the same day is claimed too", rc == 0 and json.loads(out)["text"] == "a third case" and len(claimed()) == 3)
         del env["CC_RECURRING_RED_MIN"]
         # …and the lander's own record (records.record_red's argv, --once and its links) feeds the same count
         def red_l(pr, line, ts, check="core-guard"):

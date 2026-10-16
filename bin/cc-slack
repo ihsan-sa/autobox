@@ -1499,9 +1499,6 @@ def owner_ask_rows(d, names=None, now=None):
             for a in sorted(rows, key=lambda a: -_home_num(a.get("at")))]
 
 MAX_UPLOAD = 25 * 1024 * 1024   # renders and screenshots, not archives
-MAX_FILES = 10                  # attachments saved per inbound Slack message: Slack's own per-message limit, so the cap
-                                # is never the reason one is missing (five of six, then five of ten, were saved while the
-                                # text named them all — raised 2026-09-10); attach() names any that still did not arrive
 
 def flat_name(name):
     """A sender's filename as ONE token of the box's own `[attached: …]` line: whitespace collapsed (an RFC 2231
@@ -3304,7 +3301,8 @@ class Conn:
 # ---------------------------------------------------------------- home.json (one live view for the dashboard, never a message)
 HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
               ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
-LOOKUP_WAIT, LOOKUP_TRIES = 30, 20             # a message whose channel name can't be looked up yet: retried 30 s apart for 10 min
+LOOKUP_WAIT, LOOKUP_TRIES = 30, 20             # a message whose channel name can't be looked up yet: retried 30 s apart for 10 min,
+LOOKUP_SLOW = 1800                             # then on a backoff doubling up to 30 min, for as long as it takes (never dropped)
 HOME_CACHE = 5                                 # seconds a costly input (tmux/systemctl/pgrep/cc-limit) is cached for
 HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff ledger the dashboard reads (its tail)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
@@ -4740,6 +4738,7 @@ class Daemon:
         self.home_links, self.home_cards = {}, {}           # "<chat>:<ts>" -> (permalink, when) · "repo#n" -> its #approvals card's permalink
         self.edit_seen = collections.OrderedDict()          # (chat, ts, subtype) already handled — dedupes duplicate edit/delete events
         self.warned, self.told = set(), {}
+        self.lookup_said = set()                            # channels whose held-message notice is out; cleared when the lookup works
         self.warned_users = set()                           # non-owners told once per daemon run that DMs are owner-only
         self.starting = {}
         self.unminted = set()                                # targets whose last `starting` stamp was an unminted attempt
@@ -6005,6 +6004,7 @@ class Daemon:
                 info = api("conversations.info", self.cfg["SLACK_BOT_TOKEN"], channel=chat)["channel"]
                 self.names[chat] = "dm" if info.get("is_im") else info.get("name", chat)
                 self.unnamed.discard(chat)
+                self.lookup_said.discard(chat)
             except Exception as e:                      # not cached: no DNS yet after a boot must not fix the raw id as the name
                 log(f"channel {chat}: name lookup failed ({e!r}); retried on the next call")
                 self.unnamed.add(chat)
@@ -6012,18 +6012,31 @@ class Daemon:
         return self.names[chat]
 
     def hold_for_lookup(self, ev):
-        """A message from a channel whose name lookup failed waits and is routed again, LOOKUP_WAIT s apart and at most
-        LOOKUP_TRIES times, instead of being routed by its raw id: on 10-02 that made the control channel a new project named after its id.
-        False once the tries are spent: the caller goes on unrouted (the "no project maps" notice)."""
+        """A message from a channel whose name lookup failed waits and is routed again, instead of being routed by its
+        raw id: on 10-02 that made the control channel a new project named after its id. LOOKUP_WAIT s apart for
+        LOOKUP_TRIES tries, then on a backoff doubling up to LOOKUP_SLOW, for good: it is never dropped (owner 10-16).
+        Past the fast tries it is said once per channel in the control channel (lookup_said, until the lookup works), so a
+        person knows messages are waiting and a channel whose lookup keeps failing posts one line, not one per message.
+        Always True."""
         n = ev.get("_lookup_tries", 0) + 1
-        if n > LOOKUP_TRIES:
-            log(f"channel {ev.get('channel')}: name still unknown after {LOOKUP_TRIES} tries — routed as unmapped")
-            return False
         ev["_lookup_tries"] = n
+        wait = LOOKUP_WAIT if n <= LOOKUP_TRIES else min(LOOKUP_WAIT * 2 ** (n - LOOKUP_TRIES), LOOKUP_SLOW)
+        chat = ev.get("channel")
+        if n == LOOKUP_TRIES + 1 and chat not in self.lookup_said:
+            self.lookup_said.add(chat)
+            log(f"channel {chat}: name still unknown after {LOOKUP_TRIES} tries — still held, retried every {LOOKUP_SLOW // 60} min at most")
+            try:
+                EFFECTS.run([f"{BIN}/cc-notify", "--major", "--id", f"lookup-held:{chat}", "-t", f"{CTL} lookup held",
+                             "--", f"Messages in channel {chat} (first ts {ev.get('ts')}) are waiting: the box cannot look the channel's "
+                                   f"name up, so it cannot route them yet. Each is retried every {LOOKUP_SLOW // 60} min at most and goes "
+                                   f"through on its own once the lookup works; this is said once per channel."],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            except Exception as e:
+                log(f"channel {chat}: could not say the message is held ({e!r})")
         def again():
             self.seen.pop((ev.get("channel"), ev.get("ts")), None)
             self.dispatch(ev, None)                     # a message: its chat's own executor, so order holds
-        self.later(LOOKUP_WAIT, again)
+        self.later(wait, again)
         return True
 
     def later(self, secs, fn):
@@ -7463,16 +7476,14 @@ class Daemon:
         self.deliver(target, {"type": "message", "content": note, "meta": meta}, autostart=False)
 
     def fetch_files(self, files, member=None, pairs=False):
-        """Downloads up to MAX_FILES Slack attachments (≤50 MB each) to ~/.cc/slack/files (or a member's own dir);
+        """Downloads every Slack attachment on the message (≤50 MB each; no count cap, owner 10-16) to ~/.cc/slack/files (or a member's own dir);
         returns saved paths, or with pairs=True, (file, path) pairs — needed since a skipped/failed download
         leaves no path, and a plain zip of the two lists would misalign by one."""
         tok = self.cfg.get("SLACK_BOT_TOKEN"); out = []
         fdir = f"{member_dir(member)}/files" if member else f"{DIR}/files"
         os.makedirs(fdir, exist_ok=True)
         self.prune_files()
-        if len(files) > MAX_FILES:
-            log(f"files: {len(files)} on one message, saving the first {MAX_FILES}; the rest are named as not saved")
-        for f in files[:MAX_FILES]:
+        for f in files:
             url = f.get("url_private_download") or f.get("url_private")
             if not (url and tok) or int(f.get("size") or 0) > 50 * 1024 * 1024:
                 continue

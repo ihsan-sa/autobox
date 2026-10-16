@@ -11,12 +11,15 @@ def selfcheck():
         print(f"  {'ok' if ok else 'FAIL'}  {label}")
 
     real_home = os.environ.get("HOME")
-    keep = {k: os.environ.get(k) for k in ("HOME", "CC_CLAUDE", "CC_CONFIG", "STUB_LOG", "STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS")}
+    keep = {k: os.environ.get(k) for k in ("HOME", "CC_CLAUDE", "CC_CONFIG", "STUB_LOG", "STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS", "CC_JOB_NOTIFY")}
 
     def fixture():
         h = tempfile.mkdtemp(prefix="cc-improve-batch-sc.")
         os.environ.update({"HOME": h, "CC_CLAUDE": os.path.join(h, "claude"), "CC_CONFIG": os.path.join(h, "config"),
-                           "STUB_LOG": os.path.join(h, "calls.jsonl")})
+                           "STUB_LOG": os.path.join(h, "calls.jsonl"), "CC_JOB_NOTIFY": os.path.join(h, "notify")})
+        with open(os.environ["CC_JOB_NOTIFY"], "w") as f:   # never the live cc-notify: a crossed budget lands in a file
+            f.write(f"#!/bin/sh\necho \"$*\" >> '{h}/notified'\n")
+        os.chmod(os.environ["CC_JOB_NOTIFY"], 0o755)
         for k in ("STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS"):
             os.environ.pop(k, None)
         open(os.environ["CC_CONFIG"], "w").close()
@@ -141,6 +144,21 @@ def selfcheck():
         rc, out = main_(snap)
         case("a budget of $0.06 buys the first call and stops the rest", rc == 0 and len(calls()) == 1 and "budget" in out + open(
             os.path.join(h, ".cc", "state", "improve", "reports", "2026-01-10.md")).read())
+
+        # 4b. THE BUDGET ALERTS, IT DOES NOT CUT A PASS (owner 10-16): pass 3's pick call crosses $0.10, its judge call
+        #     still runs under the over-budget ceiling, one ambient line says so, and pass 4 is where the day stops
+        h, snap = fixture()
+        homes.append(h)
+        os.environ["IMPROVE_BATCH_BUDGET"] = "0.10"
+        rc, out = main_(snap)
+        cs = calls()
+        said = open(os.path.join(h, "notified")).read() if os.path.exists(os.path.join(h, "notified")) else ""
+        case("a budget crossed inside pass 3 lets its judge call run, under the over-budget ceiling",
+             rc == 0 and [c["head"].split(": ", 1)[-1] for c in cs] == ["nudges", "failures", "fixes-pick", "fixes-judge"]
+             and cs[-1]["argv"][cs[-1]["argv"].index("--max-budget-usd") + 1] == f"{OVER_CALL:.2f}")
+        case("…its first crossing posts one ambient cc-notify line, and the day stops before pass 4, saying why",
+             said.count("\n") == 1 and "--id budget:cc-improve-batch:" in said and "failed: ideas" in out
+             and "budget of $0.10 is spent" in open(os.path.join(h, ".cc", "state", "improve", "reports", "2026-01-10.md")).read())
 
         # 5. the spend tier: a tier that holds `goals` spends nothing; one that allows it runs
         h, snap = fixture()

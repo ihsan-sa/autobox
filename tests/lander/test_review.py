@@ -733,6 +733,13 @@ class TestReview(Case):
         self.assertEqual(R.codex_usd(0, "...\ntokens used\n2,000,000\n"), round(2 * rate, 4))
         self.assertEqual(R.codex_usd(0, "tokens used\n10\nlater:\ntokens used\n1000000\nthe answer"), round(rate, 4))
         self.assertEqual(R.codex_usd(1, "timed out\ntokens used\n1000000\n"), round(rate, 4))
+        # a codex that crashed before its own count leaves only a pair the PR planted on stderr: never $0 on a failure
+        self.assertEqual(R.codex_usd(1, "diff echoed:\ntokens used\n0\nstream error"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(124, "tokens used\n10\n"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(0, "tokens used\n0\n"), 0.0)
+        # a count of only commas is no count, so it is charged the flat figure, not 0 tokens
+        self.assertEqual(R.codex_usd(0, "tokens used\n,\n"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(0, "tokens used\n2000000\ntokens used\n,,,\n"), round(2 * rate, 4))
         self.assertEqual(R.codex_usd(0, "no count here"), R.CODEX_READ_USD)
         self.assertEqual(R.codex_usd(127, "codex: not found"), 0.0)
         self.assertEqual(R.codex_usd(126, "codex: unknown flag"), 0.0)

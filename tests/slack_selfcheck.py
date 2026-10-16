@@ -3734,7 +3734,7 @@ def run_selfcheck():
             with contextlib.redirect_stderr(io.StringIO()):
                 got13 = dmL13.fetch_files(ten, pairs=True)
                 meta13 = {}
-                text13 = dmL13.attach("the set", ten, got13, meta13, None)
+                text13 = dmL13.attach("the set", ten, got13[:10], meta13, None)   # the eleventh's download failed
                 meta13b = {}
                 text13b = dmL13.attach("the set", ten[:3], got13[:3], meta13b, None)
                 meta13c = {}
@@ -3742,10 +3742,9 @@ def run_selfcheck():
         finally:
             urllib.request.urlopen = real_urlopen
             globals()["DIR"] = real_dir13
-    check("fetch_files: ten attachments on one message are all fetched (MAX_FILES is Slack's own ten), and the "
-          "eleventh is the only one not — L13",
-          MAX_FILES == 10 and len(got13) == 10 and [f["id"] for f, _ in got13] == ["F%d" % i for i in range(1, 11)]
-          and len(opened13) == 10)
+    check("fetch_files: NO COUNT CAP: eleven attachments on one message are all fetched (owner 10-16) — L13",
+          len(got13) == 11 and [f["id"] for f, _ in got13] == ["F%d" % i for i in range(1, 12)]
+          and len(opened13) == 11)
     check("attach: a file named but not saved is listed as NOT saved in the same line the session reads, with the "
           "count (10 of 11) and its name in files_missing; a complete set carries no such words and no files_missing; "
           "and nothing saved at all says so for every name — L13",
@@ -12108,9 +12107,27 @@ def run_selfcheck():
         check("lookup: the next call retries and caches the real name",
               dmL.chan_name("C0LOOKUP1") == "myrepo" and dmL.names.get("C0LOOKUP1") == "myrepo" and "C0LOOKUP1" not in dmL.unnamed)
         held.clear(); dmL.unnamed.add("C0SPENT")
-        spent = dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.1", "_lookup_tries": LOOKUP_TRIES})
+        notesL, run_was = [], EFFECTS.run_impl
+        EFFECTS.run_impl = lambda cmd, **kw: notesL.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         kept = dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.2", "_lookup_tries": LOOKUP_TRIES - 1})
-        check("lookup: held at most LOOKUP_TRIES times, then routed as unmapped", spent is False and kept is True and len(held) == 1)
+        check("lookup: inside the fast tries it is held LOOKUP_WAIT and nothing is said", kept is True and held[-1][0] == LOOKUP_WAIT and notesL == [])
+        evS = {"channel": "C0SPENT", "ts": "6.1", "_lookup_tries": LOOKUP_TRIES}
+        spent = dmL.hold_for_lookup(evS)
+        check("lookup: NEVER DROPPED: past LOOKUP_TRIES it is still held, on a longer wait",
+              spent is True and held[-1][0] == 2 * LOOKUP_WAIT)
+        check("lookup: …and said once in the control channel (a --major notice under its own id)",
+              len(notesL) == 1 and "--major" in notesL[0] and "lookup-held:C0SPENT" in notesL[0])
+        for _ in range(12): dmL.hold_for_lookup(evS)
+        check("lookup: …said only that once, the backoff capped at LOOKUP_SLOW", len(notesL) == 1 and held[-1][0] == LOOKUP_SLOW)
+        dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.3", "_lookup_tries": LOOKUP_TRIES})
+        check("lookup: a second held message in the same channel says nothing more (one notice per channel)", len(notesL) == 1)
+        dmL.hold_for_lookup({"channel": "C0SPENT2", "ts": "7.1", "_lookup_tries": LOOKUP_TRIES})
+        check("lookup: another channel gets its own notice", len(notesL) == 2 and "lookup-held:C0SPENT2" in notesL[1])
+        globals()["api"] = lambda method, token, **kw: {"channel": {"name": "spent"}}
+        dmL.chan_name("C0SPENT")
+        dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.4", "_lookup_tries": LOOKUP_TRIES})
+        check("lookup: once the lookup has worked, a later failure is said again", len(notesL) == 3)
+        EFFECTS.run_impl = run_was
     finally:
         globals()["api"] = real_api_L
 
