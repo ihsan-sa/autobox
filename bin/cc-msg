@@ -367,10 +367,19 @@ lock(){ mkdir -p "$(sdir "$1")"; printf '%s/.inbox.lock' "$(sdir "$1")"; }
 # WHO SENT IT, for the spool line's `from` (and so its queued receipt): the sender's own tmux window — its broker key,
 # `<repo>`, `<repo>/<track>` or `<repo>@<alias>` — then the orch alias its shell exports, then the calling process's name
 # as before. A member's session is counted, never named: its line says `member`. Best effort: no tmux is the next one.
+# A tool run by an interpreter (cc-handoff is python3) is named by its script, not "python3": the owner saw the
+# dashboard name a handoff's kickoff "python3" and had to ask what that was (2026-10-16).
+procname(){ local c a
+  c=$(ps -o comm= -p "$1" 2>/dev/null | tr -d ' \n')
+  case $c in python*|bash|sh|dash|perl|node|ruby)
+    a=$(ps -o args= -p "$1" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) { if ($i == "-c") exit; if ($i !~ /^-/) { print $i; exit } }}')
+    a=${a##*/}; case $a in ''|*[!A-Za-z0-9._-]*) ;; *) c=$a;; esac;;
+  esac
+  printf '%s' "$c"; }
 sender(){ local w=""
   if [ "${CC_MEMBER_SANDBOX:-}" = 1 ] || [ "${CC_ROLE:-}" = member ]; then printf member; return 0; fi
   [ -n "${TMUX_PANE:-}" ] && w=$(timeout 2 tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null | tr -d '\n')
-  printf '%s' "${w:-${CC_SLACK_ALIAS:-$(ps -o comm= -p $PPID 2>/dev/null | tr -d ' \n')}}"; }
+  printf '%s' "${w:-${CC_SLACK_ALIAS:-$(procname $PPID)}}"; }
 
 spool_add(){  # $1 window  $2 text — under the lock, so a drain never rewrites the file mid-append. Prints the line.
   local sp line from out now
@@ -1398,7 +1407,9 @@ case "$*" in
   # window perms exists (the tmux stub), so a case that sets it to a word cannot also make up a pid out of it.
   *-eo*) printf '991234 1 %s\n%s 991234 %s\n' "${CC_FAKE_ROOT:-bash}" "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}"
          printf '881234 1 bash\n881235 881234 claude\n';;
-  *)     echo cc-test;;                                                           # ps -o comm= -p $PPID
+  *comm=*) echo "${CC_FAKE_COMM:-cc-test}";;                                      # ps -o comm= -p $PPID
+  *args=*) echo "${CC_FAKE_ARGS:-cc-test}";;                                      # ps -o args= -p $PPID
+  *)     echo cc-test;;
 esac
 STUB
   cat > "$T/bin/cc-slack" <<'STUB'
@@ -1529,6 +1540,14 @@ STUB
   env -u CC_MSG_FROM -u TMUX_PANE -u CC_SLACK_ALIAS "$T/bin/cc-msg" "$W" "from a script" >/dev/null
   k "$(t sh -c "f=\$(jq -r 'select(.stage == \"queued\") | .from' '$T'/.cc/receipts/*.jsonl); [ -n \"\$f\" ] && [ \"\$f\" != demo/t9 ] && [ \"\$f\" != arch ]")" \
     "…with neither, the calling process's name, as before"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM -u TMUX_PANE -u CC_SLACK_ALIAS CC_FAKE_COMM=python3 CC_FAKE_ARGS="python3 -u /home/x/bin/cc-handoff --brief t" \
+    "$T/bin/cc-msg" "$W" "from a python tool" >/dev/null
+  k "$(t test "$(sfrom)" = cc-handoff)" "…and a tool run by an interpreter is named by its script, not python3"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
+  env -u CC_MSG_FROM -u TMUX_PANE -u CC_SLACK_ALIAS CC_FAKE_COMM=bash CC_FAKE_ARGS="bash -c cc-msg w hi" \
+    "$T/bin/cc-msg" "$W" "from a bash -c" >/dev/null
+  k "$(t test "$(sfrom)" = bash)" "…but never by the code of a -c: that keeps the interpreter's name"
   reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"
   env -u CC_MSG_FROM TMUX_PANE=%9 CC_FAKE_SENDER_WIN=ada-ws CC_MEMBER_SANDBOX=1 "$T/bin/cc-msg" "$W" "from a member" >/dev/null
   k "$(t test "$(sfrom)" = member)" "…and a member's session is counted as member, never named"
