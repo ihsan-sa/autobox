@@ -31,7 +31,7 @@
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
   cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide. `fix` grants something lasting on one kind of card only: on a member workspace's WebFetch or WebSearch card, `yes <id> fix` (here or the owner's in Slack) grants that workspace the web (`cc-sandbox web`) and the card gets ⚙️; on any other card a fix is a plain yes, and the thread says nothing lasting was written. With the web grant, from its next launch those two tools are no ask rule, and auto mode judges each call. It re-reads the session's pane: a dialog still standing unchanged after the answer went out is reported as not landed (exit 1, the prompt stays open), never as delivered.
   cc-slack retire <C…>… [--to <#chan|C…>] [--dry-run]   archive channels BY ID (never by name or suffix) after recording each in ~/.cc/slack/retired.json with where its posts go now (--to, else the log lane #<box>-updates). Refuses #alerts, #approvals, the log lane, the vitals store, a member's channel and a channel a live seat routes to. --dry-run archives nothing and prints, per id, its name, whether it is archived already, and where a post aimed at it would land.
-  cc-slack engine add <C…> [--name N] | rm <C…> | list   channels the dispatch engine owns, BY ID (~/.cc/slack/engine.json): this daemon hears nothing there — no session, no dir made for its name, no reply, no ! command — while the bot stays in it, since the engine reads it with the same token. A queue its folder already holds (a paused project's) is left as it is.
+  cc-slack engine add <C…> [--name N] | rm <C…> | list   channels the dispatch engine owns, BY ID (~/.cc/slack/engine.json): this daemon hears nothing there — no session, no dir made for its name, no reply, no ! command — while the bot stays in it, since the engine reads it with the same token. One thing it does there: a person's post (not a bot's, ours, an edit or a delete; a thread reply counts) in a channel some hive loop's /var/lib/dispatch-door/<R>.poke/channel names (CC_DISPATCH_DOOR_ROOT overrides the root; the dirs are re-read at most once a minute) runs `dispatch-door <dir> poke` for R, fire and forget, at most once per R per 5 s, which ends that loop's 60 s wait. A queue its folder already holds (a paused project's) is left as it is.
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
   cc-slack unarchive <C…> [--superseded-by <C…>]   bring an archived sub-orch channel back and route it again; with --superseded-by a newer live channel stays the orch's home, and the old one keeps its history with one pinned line pointing there.
@@ -1920,6 +1920,63 @@ def engine_owned(chat):
     channel someone makes under an owned one's name is still routed as before. Read fresh every use, like routes.json:
     the members seat adds a channel on its go-live day and the running daemon leaves it alone from the next event."""
     return bool(chat) and chat in load_table(ENGINE)
+
+# A person's post wakes that project's hive loop at once (dispatch #718/#734): each loop R has <root>/<R>.poke/ holding
+# `channel` (R's Slack channel id) and `poke`, and `dispatch-door <dir> poke` ends R's 60 s wait. The dirs are read
+# fresh at most once a minute, never listed anywhere else; a missing root or no match does nothing.
+DOOR_ROOT = "/var/lib/dispatch-door"                       # CC_DISPATCH_DOOR_ROOT overrides it (the selfcheck's fixture)
+DOOR_BIN = "/opt/dispatch/current/host/dispatch-door"
+DOOR_MAP_TTL, DOOR_POKE_GAP, DOOR_POKE_TIMEOUT = 60, 5, 5   # re-read the dirs · one poke per loop per 5 s · seconds a poke may take
+_door = {"root": None, "t": None, "map": {}, "last": {}, "logged": set()}
+
+def door_map(now):
+    """{channel id: <R>.poke dir}, read from the door root at most once per DOOR_MAP_TTL (or when the root changes)."""
+    root = os.environ.get("CC_DISPATCH_DOOR_ROOT") or DOOR_ROOT
+    if _door["root"] == root and _door["t"] is not None and now - _door["t"] < DOOR_MAP_TTL:
+        return _door["map"]
+    m = {}
+    for d in sorted(glob.glob(f"{glob.escape(root)}/*.poke")):
+        try:
+            with open(f"{d}/channel") as f:
+                chan = f.read().strip()
+        except OSError:
+            continue
+        if chan:
+            m[chan] = d
+    _door.update(root=root, t=now, map=m)
+    return m
+
+def door_poke(chat, now=None):
+    """Poke the hive loop whose channel is `chat`, fire and forget: the run happens on a daemon thread with a short
+    timeout, a failure is logged once per loop and never raised. Returns that thread (the selfcheck joins it), else None."""
+    try:
+        now = time.monotonic() if now is None else now
+        d = door_map(now).get(chat) if chat else None
+        if not d:
+            return None
+        r = os.path.basename(d)[:-len(".poke")]
+        last = _door["last"].get(r)
+        if last is not None and now - last < DOOR_POKE_GAP:
+            return None
+        _door["last"][r] = now
+        def fire():
+            try:
+                p = EFFECTS.run([DOOR_BIN, d, "poke"], timeout=DOOR_POKE_TIMEOUT, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                err = f"rc {p.returncode}: {last_line(p.stderr)}" if p.returncode else None
+            except Exception as e:
+                err = repr(e)
+            if err and r not in _door["logged"]:
+                _door["logged"].add(r)
+                log(f"door poke {r}: {err} (logged once)")
+        t = threading.Thread(target=fire, name=f"door-poke-{r}", daemon=True)
+        t.start()
+        return t
+    except Exception as e:
+        if "map" not in _door["logged"]:
+            _door["logged"].add("map")
+            log(f"door poke: {e!r} (logged once)")
+        return None
 
 TWINS = "twins.json"               # {chat id: {name, at}}: the -updates twins the box itself made, under the name it made them
 
@@ -6310,7 +6367,7 @@ class Daemon:
                     if old0 != new0 and self.mentioned.setdefault(hkey, mark) is mark:
                         self.mentioned[hkey] = ("handoff", self.notify_owner_change(target0, chat0, thread0, new0, old0))
             return
-        if ev.get("type") != "message" or ev.get("subtype") not in (None, "file_share", "thread_broadcast", "bot_message"):
+        if ev.get("type") != "message" or ev.get("subtype") not in (None, "file_share", "thread_broadcast", "bot_message", "me_message"):
             return
         key = (ev.get("channel"), ev.get("ts"))
         if key in self.seen:
@@ -6319,6 +6376,7 @@ class Daemon:
         while len(self.seen) > 500:
             self.seen.popitem(last=False)
         user, chat, ctype, ts = ev.get("user"), ev["channel"], ev.get("channel_type"), ev["ts"]
+        self.poke_loop(ev)                                 # before engine_owned: the hive's own channels are the ones it wakes
         if engine_owned(chat):                             # the engine answers here: nothing said, no ! command, no session, no dir
             return
         thread = ev.get("thread_ts") or ts
@@ -6487,6 +6545,18 @@ class Daemon:
                 return
             text = self.attach(text, ev["files"], got, meta, ws)
         return self.hand_off(target, text, meta, chat, thread, ts, route_alias)
+
+    def poke_loop(self, ev):
+        """A person's post (not a bot, not ours, not an edit or delete; a thread reply counts) pokes the hive loop
+        whose channel it is in (door_poke). Returns door_poke's thread or None."""
+        # brief: "a person's post means not a bot, not the box's own post, and not message_changed or message_deleted;
+        # thread replies count" — so a plain, file or broadcast message with a user and no bot_id, and not our bot user
+        if ev.get("type") != "message" or ev.get("subtype") not in (None, "file_share", "thread_broadcast", "me_message"):
+            return None
+        user = ev.get("user")
+        if not user or ev.get("bot_id") or ev.get("bot_profile") or user == self.bot_user:
+            return None
+        return door_poke(ev.get("channel"))
 
     def is_foreign_bot(self, ev):
         """Another app's bot wrote this: a bot_id that is not ours. Before auth.test gives our bot_id nothing is

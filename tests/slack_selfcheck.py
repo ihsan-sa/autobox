@@ -12581,5 +12581,103 @@ def run_selfcheck():
             sys.modules.pop(m, None)
         shutil.rmtree(devW, ignore_errors=True); shutil.rmtree(dirW, ignore_errors=True)
 
+    # A PERSON'S POST WAKES ITS HIVE LOOP AT ONCE (slack-post-pokes-its-loop): the channel -> loop map comes from
+    # <root>/<R>.poke/channel, read fresh, and the poke runs dispatch-door on a thread. Its own fixture root and runner.
+    rootK = tempfile.mkdtemp(prefix="cc-slack-door-")
+    for rK, chK in (("docs", "CDOCS\n"), ("career", "CCAR"), ("empty", None)):
+        os.makedirs(f"{rootK}/{rK}.poke")
+        if chK is not None:
+            open(f"{rootK}/{rK}.poke/channel", "w").write(chK)
+    callsK, envWasK, runWasK, ownedWasK = [], os.environ.get("CC_DISPATCH_DOOR_ROOT"), EFFECTS.run_impl, globals()["engine_owned"]
+    def runK(cmd, **kw):
+        callsK.append((list(cmd), kw.get("timeout")))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    def door_reset():
+        _door.update(root=None, t=None, map={}, last={}, logged=set()); callsK.clear()
+    def pokedK(t):
+        if t:
+            t.join(5)
+        return [c for c, _ in callsK]
+    try:
+        os.environ["CC_DISPATCH_DOOR_ROOT"] = rootK; EFFECTS.run_impl = runK
+        dmK = Daemon(use_slack=False); dmK.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmK.bot_user = "UBOT"; dmK.bot_id = "BOURS"
+        door_reset()
+        tK = dmK.poke_loop({"type": "message", "channel": "CDOCS", "user": "UOWNER", "ts": "30.1"})
+        check("door poke: a person's post in a channel a <R>.poke/channel names runs dispatch-door <dir> poke for R, "
+              "with a short timeout",
+              tK is not None and pokedK(tK) == [[DOOR_BIN, f"{rootK}/docs.poke", "poke"]]
+              and callsK[0][1] == DOOR_POKE_TIMEOUT)
+        door_reset()
+        tK = dmK.poke_loop({"type": "message", "channel": "CCAR", "user": "UMEMB", "ts": "30.3", "thread_ts": "30.2"})
+        check("door poke: a thread reply counts, and a channel file without a newline matches",
+              pokedK(tK) == [[DOOR_BIN, f"{rootK}/career.poke", "poke"]])
+        door_reset()
+        nonK = [dmK.poke_loop(e) for e in (
+            {"type": "message", "channel": "CNONE", "user": "UOWNER", "ts": "31.1"},
+            {"type": "message", "channel": "CDOCS", "user": "UOTHER", "bot_id": "BOTHER", "ts": "31.2"},
+            {"type": "message", "channel": "CDOCS", "bot_id": "BOURS", "subtype": "bot_message", "ts": "31.3"},
+            {"type": "message", "channel": "CDOCS", "user": "UBOT", "ts": "31.4"},
+            {"type": "message", "channel": "CDOCS", "subtype": "message_changed", "message": {"user": "UOWNER"}, "ts": "31.5"},
+            {"type": "message", "channel": "CDOCS", "subtype": "message_deleted", "ts": "31.6"},
+            {"type": "reaction_added", "channel": "CDOCS", "user": "UOWNER", "ts": "31.7"})]
+        check("door poke: no match, another app's bot, our own signed or plain post, an edit, a delete and a reaction "
+              "poke nothing", nonK == [None] * 7 and callsK == [])
+        door_reset()
+        t1K, t2K = door_poke("CDOCS", now=100.0), door_poke("CDOCS", now=103.0)
+        t3K, t4K = door_poke("CCAR", now=103.0), door_poke("CDOCS", now=105.5)
+        for tt in (t1K, t3K, t4K):
+            tt and tt.join(5)
+        check("door poke: at most one poke per loop per 5 s, each loop on its own clock",
+              t2K is None and None not in (t1K, t3K, t4K)
+              and sorted(c[0][1] for c in callsK) == sorted([f"{rootK}/docs.poke", f"{rootK}/career.poke", f"{rootK}/docs.poke"]))
+        door_reset()
+        door_poke("CNEW", now=200.0)
+        os.makedirs(f"{rootK}/fresh.poke"); open(f"{rootK}/fresh.poke/channel", "w").write("CNEW")
+        tSoonK, tLaterK = door_poke("CNEW", now=230.0), door_poke("CNEW", now=261.0)
+        check("door poke: a loop's dir that appears is picked up on the next read, at most once a minute",
+              tSoonK is None and tLaterK is not None and pokedK(tLaterK) == [[DOOR_BIN, f"{rootK}/fresh.poke", "poke"]])
+        door_reset()
+        def boomK(cmd, **kw):
+            callsK.append((list(cmd), kw.get("timeout")))
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        EFFECTS.run_impl = boomK
+        errK = io.StringIO()
+        with contextlib.redirect_stderr(errK):
+            for nowK in (300.0, 310.0):
+                tK = door_poke("CDOCS", now=nowK)
+                tK and tK.join(5)
+        EFFECTS.run_impl = runK
+        check("door poke: a poke that fails is logged once and never raised",
+              len(callsK) == 2 and errK.getvalue().count("door poke docs:") == 1)
+        door_reset()
+        os.environ["CC_DISPATCH_DOOR_ROOT"] = f"{rootK}/missing"
+        tK = dmK.poke_loop({"type": "message", "channel": "CDOCS", "user": "UOWNER", "ts": "32.1"})
+        check("door poke: a missing door root is a no-op", tK is None and callsK == [] and _door["map"] == {})
+        door_reset()
+        os.environ["CC_DISPATCH_DOOR_ROOT"] = rootK
+        globals()["engine_owned"] = lambda chat: chat == "CDOCS"
+        dmK.on_event({"type": "message", "channel": "CDOCS", "user": "UOWNER", "ts": "33.1"})
+        for th in threading.enumerate():
+            if th.name.startswith("door-poke-"):
+                th.join(5)
+        check("door poke: on_event pokes a person's post even in a channel the engine owns, which it otherwise leaves alone",
+              [c for c, _ in callsK] == [[DOOR_BIN, f"{rootK}/docs.poke", "poke"]])
+        door_reset()
+        dmK.on_event({"type": "message", "subtype": "me_message", "channel": "CDOCS", "user": "UOWNER", "text": "hello", "ts": "34.1"})
+        for th in threading.enumerate():
+            if th.name.startswith("door-poke-"):
+                th.join(5)
+        check("door poke: a person's /me post (subtype me_message) pokes its loop through on_event",
+              [c for c, _ in callsK] == [[DOOR_BIN, f"{rootK}/docs.poke", "poke"]])
+    finally:
+        globals()["engine_owned"] = ownedWasK
+        EFFECTS.run_impl = runWasK
+        if envWasK is None:
+            os.environ.pop("CC_DISPATCH_DOOR_ROOT", None)
+        else:
+            os.environ["CC_DISPATCH_DOOR_ROOT"] = envWasK
+        _door.update(root=None, t=None, map={}, last={}, logged=set())
+        shutil.rmtree(rootK, ignore_errors=True)
+
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0
