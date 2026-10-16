@@ -179,10 +179,11 @@ class TestDeploy(Box):
         self.assertIn("did not deploy", card[0]["argv"][-1])
         self.assertIn(f"{D.MOVED} to /x/deploy-aside: docs/d.md", card[0]["argv"][-1])
 
-    def test_a_failed_target_is_retried_on_backoff_with_no_cap_and_posts_once(self):
-        # owner 10-16: no TRIES cap that leaves a failed target waiting for a new request; one card, at the first failure
+    def test_a_failed_target_is_retried_on_backoff_with_no_cap_and_posts_on_a_new_reason_or_a_day(self):
+        # owner 10-16: no TRIES cap that leaves a failed target waiting for a new request; a card at the first failure,
+        # and again only when the reason changes or a day has passed since the last card
         POST = "cc-slack " + "post"
-        box = self.fake(**{"install.sh": (1, "install broke\n")})
+        box = self.fake(**{"install.sh": (1, "install broke at 12:01 pid 4242\n")})
         with mock.patch.object(D, "fast_forward", lambda *a: ""):
             D.request("demo", NEW)
             t0 = time.time()
@@ -192,17 +193,34 @@ class TestDeploy(Box):
                 self.assertIn("tried again in 10 min", box.called(POST)[0]["argv"][-1])
                 st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]   # inside the wait: not tried
             self.assertEqual((st["tries"], len(box.called("install.sh"))), (1, 1))
-            for n in range(2, 7):   # past the old TRIES=3, where a target waited for a new request
-                with mock.patch.object(D.time, "time", lambda: t0 + 10 * D.BACKOFF_MAX * n):
+            box.answers["install.sh"] = (1, "install broke at 13:07 pid 5151\n")   # the same reason, other digits
+            for n in range(2, 5):   # past the old TRIES=3, where a target waited for a new request; all inside a day
+                with mock.patch.object(D.time, "time", lambda: t0 + D.BACKOFF_MAX * (n - 1)):
                     st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
                 self.assertEqual((st["state"], st["tries"]), ("failed", n))
-            self.assertEqual(len(box.called("install.sh")), 6)
-            self.assertEqual(len(box.called(POST)), 1)
+            self.assertEqual((len(box.called("install.sh")), len(box.called(POST))), (4, 1))
+            # a day after the last card, the same reason posts again, once
+            with mock.patch.object(D.time, "time", lambda: t0 + D.REPOST_AFTER):
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+            self.assertEqual((st["tries"], len(box.called(POST))), (5, 2))
+            self.assertIn("after 5 tries over a day", box.called(POST)[1]["argv"][-1])
+            self.assertIn(f"land:demo:deploy:demo:failed@{NEW[:12]}:5", box.called(POST)[1]["argv"])   # its own id
+            # a new reason posts at the next try, though the day is not up
+            box.answers["install.sh"] = (1, "disk full\n")
+            with mock.patch.object(D.time, "time", lambda: t0 + D.REPOST_AFTER + D.BACKOFF_MAX):
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+            self.assertEqual((st["tries"], len(box.called(POST))), (6, 3))
+            self.assertIn("now for another reason (try 6) — install: install.sh: disk full", box.called(POST)[2]["argv"][-1])
             self.assertEqual((D.retry_wait(1), D.retry_wait(2), D.retry_wait(9)), (D.BACKOFF, 2 * D.BACKOFF, D.BACKOFF_MAX))
             self.fake()
             with mock.patch.object(D.time, "time", lambda: t0 + 100 * D.BACKOFF_MAX):
                 st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
         self.assertEqual(st["state"], "verified")
+
+    def test_fail_reason_drops_digits_and_the_moved_aside_tail(self):
+        self.assertEqual(D.fail_reason("install: rc=1 at 12:01; moved 2 files"), "install: rc=# at #:#")
+        self.assertEqual(D.fail_reason("install: rc=1 at 12:01"), D.fail_reason("install: rc=2 at 9:30; x"))
+        self.assertNotEqual(D.fail_reason("install: broke"), D.fail_reason("pull: broke"))
 
     def test_a_moved_aside_draft_rides_on_the_restart_mention(self):
         self.unit("demo-daemon.service")

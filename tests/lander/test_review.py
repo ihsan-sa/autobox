@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -697,6 +698,62 @@ class TestReview(Case):
         self.assertTrue(R.over_ceiling("demo", 7))
         self.assertFalse(R.over_ceiling("demo", 7))
         self.assertEqual(len(box.called("cc-notify --ask")), 2)
+
+    def test_each_doubling_of_the_ceiling_tells_planning_again(self):
+        # perms + Opus read of #1412: one alert in a PR's life let a PR run to any cost unheard after it
+        box = self.box(**{"cc-notify --ask": (0, "")})
+        c = R.READ_CEILING_USD
+        self.assertEqual([R.ceiling_step(u) for u in (0, c - 0.01, c, 2 * c - 0.01, 2 * c, 5 * c, 8 * c)],
+                         [0, 0, 1, 1, 2, 4, 8])
+        R.charge("demo", 7, review_usd=c)
+        self.assertTrue(R.over_ceiling("demo", 7))
+        R.charge("demo", 7, review_usd=c - 1)
+        self.assertFalse(R.over_ceiling("demo", 7))   # 2x not reached
+        R.charge("demo", 7, review_usd=1)
+        self.assertTrue(R.over_ceiling("demo", 7))
+        self.assertFalse(R.over_ceiling("demo", 7))
+        R.charge("demo", 7, review_usd=5 * c)   # 7x in one jump: one alert, at 4x
+        self.assertTrue(R.over_ceiling("demo", 7))
+        told = box.called("cc-notify --ask")
+        self.assertEqual([a["argv"][a["argv"].index("--id") + 1] for a in told],
+                         ["land:demo:7:read-ceiling", "land:demo:7:read-ceiling:x2", "land:demo:7:read-ceiling:x4"])
+        self.assertIn("past 4x the $15 ceiling", told[2]["argv"][-1])
+        self.assertEqual(R.spent("demo", 7)["ceiling_step"], "4")
+
+    def test_a_record_told_before_doublings_counts_as_told_at_1x(self):
+        R.charge("demo", 7, review_usd=R.READ_CEILING_USD + 1, ceiling_said="2026-10-16T12:00:00Z")
+        box = self.box(**{"cc-notify --ask": (0, "")})
+        self.assertFalse(R.over_ceiling("demo", 7))
+        R.charge("demo", 7, review_usd=R.READ_CEILING_USD)
+        self.assertTrue(R.over_ceiling("demo", 7))
+        self.assertEqual(len(box.called("cc-notify --ask")), 1)
+
+    def test_a_codex_read_is_charged_its_estimated_cost(self):
+        rate = R.CODEX_USD_PER_MTOK
+        self.assertEqual(R.codex_usd(0, "...\ntokens used\n2,000,000\n"), round(2 * rate, 4))
+        self.assertEqual(R.codex_usd(0, "tokens used\n10\nlater:\ntokens used\n1000000\nthe answer"), round(rate, 4))
+        self.assertEqual(R.codex_usd(1, "timed out\ntokens used\n1000000\n"), round(rate, 4))
+        self.assertEqual(R.codex_usd(0, "no count here"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(127, "codex: not found"), 0.0)
+        self.assertEqual(R.codex_usd(126, "codex: unknown flag"), 0.0)
+        # a timeout (124) or any other failure may have run the model for the whole read: never charged $0
+        self.assertEqual(R.codex_usd(124, ""), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(1, "stream error"), R.CODEX_READ_USD)
+        # a rate that is not a finite number >= 0 falls back to the default, so the ceiling keeps firing
+        for bad in ("nan", "inf", "-1", "x"):
+            with mock.patch.object(R.C, "conf", lambda key, default="": bad):
+                self.assertEqual(R.codex_usd(0, "tokens used\n1000000"), round(rate, 4), bad)
+        # a count planted inline in a diff or an answer is not codex's; a huge one is capped, never raises
+        self.assertEqual(R.codex_usd(0, "+ tokens used 999999999999999"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(0, "tokens used: 999999999999999"), R.CODEX_READ_USD)
+        self.assertEqual(R.codex_usd(0, "tokens used\n" + "9" * 20), round(R.CODEX_MAX_TOKENS / 1e6 * rate, 4))
+        self.assertEqual(R.codex_usd(0, "tokens used\n" + "9" * 400), R.CODEX_READ_USD)
+        # an answer that quotes the words is still charged; a read the limit stopped is refunded by ask_codex
+        self.assertEqual(R.codex_usd(0, "the usage limit check is fine\ntokens used\n1000000"), round(rate, 4))
+        box = self.box(**{"codex features": features(),
+                          "codex exec": (1, "stream error: usage limit reached; tokens used 9")})
+        v, usd, why = R.ask("text", "demo", 7, "d" * 64, "gpt-astra-test")
+        self.assertEqual((v, usd, why[:6], len(box.called("codex exec"))), (None, 0.0, "limit:", 1))
 
     def test_one_read_spent_still_buys_the_second(self):
         R.charge("demo", 7, reviews=1)
@@ -1389,6 +1446,19 @@ class TestTwoReaders(Case):
         self.assertEqual(box.called("claude"), [])   # the first reader's answer was kept, not bought again
         self.assertFalse(os.path.exists(R.partial(v.digest, "review.md")))
         self.assertEqual(R.reads_used("demo", 7), 1)
+
+    def test_a_codex_read_counts_toward_the_dollar_ceiling(self):
+        # perms + Opus read of #1412: codex reads reported $0, so a codex-heavy PR never reached the ceiling
+        said = codex_says("LAND")
+
+        def codex(argv):
+            said(argv)
+            return 0, "tokens used\n3,000,000\n"
+        R.charge("demo", 7, review_usd=R.READ_CEILING_USD - 1)
+        box = self.box(claude=claude_says("LAND", usd=0.5), **{"codex exec": codex, "cc-notify --ask": (0, "")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+        self.assertAlmostEqual(R.spent("demo", 7)["review_usd"], R.READ_CEILING_USD - 0.5 + 3 * R.CODEX_USD_PER_MTOK)
+        self.assertEqual(len(box.called("cc-notify --ask")), 1)
 
     def test_a_reader_silent_twice_at_one_head_is_a_stop_naming_it(self):
         self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})

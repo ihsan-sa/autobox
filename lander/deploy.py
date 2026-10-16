@@ -110,9 +110,18 @@ def held(target):
 WAITING = ("requested", "held")
 MOVED = "untracked file(s) that stood where the merge adds tracked ones"   # deploy_one's line; run() says it
 # A failed target is tried again by a later run(), with no count cap: BACKOFF seconds after its first failure,
-# doubling to BACKOFF_MAX. Only the first failure posts (owner 10-16: a cap that left a target waiting for a new
-# request was a stop nobody was told of; a fix that lands on the box, or a unit that comes back, now deploys).
+# doubling to BACKOFF_MAX (owner 10-16: a cap that left a target waiting for a new request was a stop nobody was told
+# of; a fix that lands on the box, or a unit that comes back, now deploys). The first failure posts, and a retry
+# posts again only when its reason differs from the one last posted (fail_reason) or REPOST_AFTER has passed since
+# that post: a deploy that keeps failing is never quiet for more than a day, and a backoff retry is not a card.
 BACKOFF, BACKOFF_MAX = 600, 6 * 3600
+REPOST_AFTER = 24 * 3600
+
+
+def fail_reason(line):
+    """-> what a failure line is compared on: its first part (`<step>: <why>`, without the files moved aside after
+    it), with every run of digits one `#`, so a pid, a count or a time in the step's output is not a new reason."""
+    return re.sub(r"\d+", "#", (line or "").split("; ")[0]).strip()
 
 
 def retry_wait(tries):
@@ -778,13 +787,27 @@ def run(repo, green=None):
         pid = f"land:{repo}:deploy:{target}:{state}@{sha[:12]}"
         if state == "failed":
             # --major: the owner was told "merged", so a deploy that failed is his to know, on #<repo> and not only in
-            # the -updates lane (#770 was called live by hand while its deploy had failed, 2026-09-28). Once, on the
-            # first failure: the retries that follow on backoff are queue.log lines, not more cards
-            if st["tries"] > 1:
+            # the -updates lane (#770 was called live by hand while its deploy had failed, 2026-09-28). On the first
+            # failure, and on a retry whose reason changed or that comes a REPOST_AFTER after the last post; the
+            # retries between are queue.log lines, not more cards
+            reason, now = fail_reason(line), time.time()
+            if st["tries"] == 1:
+                head = f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}."
+            elif reason != st.get("said_reason"):
+                head = (f"[{repo}] main at {sha[:12]} still did not deploy to {target}, now for another reason "
+                        f"(try {st['tries']}) — {line}.")
+            elif now - float(st.get("said_at") or 0) >= REPOST_AFTER:
+                head = (f"[{repo}] main at {sha[:12]} has still not deployed to {target} after {st['tries']} tries "
+                        f"over a day — {line}.")
+            else:
                 continue
-            C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--major", "--id", pid,
-                        f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}. It is tried "
-                        f"again in {retry_wait(1) // 60} min and then less often, without another post"], repo, 0)
+            if st["tries"] > 1:
+                pid += f":{st['tries']}"
+            # recorded whether or not cc-slack took it: a refused card is in say()'s pending, retried from there
+            st.update(said_reason=reason, said_at=now)
+            C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--major",
+                        "--id", pid, f"{head} It is tried again in {retry_wait(st['tries']) // 60} min and then less "
+                        "often; it posts again if the reason changes or a day passes"], repo, 0)
             continue
         text = f"[{repo}] deployed {sha[:12]}" + (f" to {target}" if target != repo else "")
         if state == "unverified":

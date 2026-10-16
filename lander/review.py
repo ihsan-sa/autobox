@@ -46,8 +46,11 @@ Otherwise the lander buys one:
     `until` (limit_until) says when to ask again, and the lane holds the job till then.
   - no count of reads stops one (owner, 10-16: the two-read cap turned a PR that still needed a read into a planning
     query and a stall). The PR's reads are summed in dollars (spent(): the family, repo + PR number, so a push or a
-    reopen does not reset it), and the read that takes them past READ_CEILING_USD tells the planning seat once
-    (over_ceiling: a planner request naming the PR and its spend) and the reading goes on.
+    reopen does not reset it), and the read that takes them past READ_CEILING_USD tells the planning seat, and so
+    does the read that takes them past each doubling of it (2x, 4x, ...; over_ceiling: a planner request naming the
+    PR and its spend), and the reading goes on. A codex read reports no dollars, so its cost is an estimate:
+    the `tokens used` count it prints at CODEX_USD_PER_MTOK, or CODEX_READ_USD when it prints none
+    (codex_usd).
   - one read by EACH model on CC_LAND_REVIEWERS (the passwd home's ~/.cc/config only, cards.REVIEWER_CONFIG;
     default READERS: Fable 5.1 and Astra 6 — owner, 2026-09-24: "a review goes to Fable 5.1 and Astra 6
     together"), at CC_LAND_REVIEW_EFFORT (default high; one of EFFORTS, checked before any read). A `claude-*`
@@ -138,6 +141,7 @@ import datetime
 import hashlib
 import sys
 import json
+import math
 import os
 import re
 import shutil
@@ -151,7 +155,9 @@ from lander import cards as C
 from lander import types as T
 
 MARK = "cc-land-review"
-READ_CEILING_USD = 15.0   # a PR's reads past this tell the planning seat once; nothing stops reading
+READ_CEILING_USD = 15.0   # a PR's reads past this, and past each doubling of it, tell the planning seat; nothing stops
+CODEX_USD_PER_MTOK = 5.0  # a codex read's estimated dollars per million tokens it says it used (CC_LAND_CODEX_USD_PER_MTOK)
+CODEX_READ_USD = 1.0      # a codex read that ran but printed no token count is charged this
 READERS = "claude-fable-5-1 gpt-6-astra"   # the default of CC_LAND_REVIEWERS
 READ_TIMEOUT = 1200
 PROMPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "lander")
@@ -583,22 +589,35 @@ def reads_used(repo, pr):
     return int(j.get("reviews") or 0)
 
 
+def ceiling_step(usd):
+    """-> the largest of 1, 2, 4, ... whose multiple of READ_CEILING_USD `usd` has reached; 0 below the ceiling."""
+    step = 0
+    while usd >= READ_CEILING_USD * (step * 2 or 1):
+        step = step * 2 or 1
+    return step
+
+
 def over_ceiling(repo, pr):
-    """Once the PR's reads have cost READ_CEILING_USD or more, tell the planning seat, once in the PR's life (the spend
-    file's `ceiling_said`), and go on: an alert, never a stop. -> True when it told it now. A request cc-notify
-    refused is asked again by the next read's charge."""
+    """Once the PR's reads have cost READ_CEILING_USD or more, tell the planning seat, and again each time they pass a
+    doubling of it (the spend file's `ceiling_step`: the multiple last told; a record with only the older
+    `ceiling_said` was told at 1x), and go on: an alert, never a stop. -> True when it told it now. A request
+    cc-notify refused is asked again by the next read's charge."""
     j = spent(repo, pr)
     usd = float(j.get("review_usd") or 0)
-    if usd < READ_CEILING_USD or j.get("ceiling_said"):
+    step = ceiling_step(usd)
+    told = int(j.get("ceiling_step") or (1 if j.get("ceiling_said") else 0))
+    if step <= told:
         return False
-    rc, _ = C.sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", f"land:{repo}:{pr}:read-ceiling", "-t",
-                  f"{repo} landing", f"[{repo}] PR #{pr}: its review reads have cost ${usd:.2f}, past the "
+    past = "the" if step == 1 else f"{step}x the"
+    rc, _ = C.sh([os.path.join(BIN, "cc-notify"), "--ask", "--id",
+                  f"land:{repo}:{pr}:read-ceiling" + (f":x{step}" if step > 1 else ""), "-t",
+                  f"{repo} landing", f"[{repo}] PR #{pr}: its review reads have cost ${usd:.2f}, past {past} "
                   f"${READ_CEILING_USD:g} ceiling. The reading goes on; look at why this PR keeps needing reads."],
                  timeout=60, **C.box_hand())
     if rc:
         return False
-    charge(repo, pr, ceiling_said=C.now())
-    C.log("read-ceiling", repo, pr, usd=f"{usd:.2f}")
+    charge(repo, pr, ceiling_said=C.now(), ceiling_step=str(step))   # a str: charge() sets it, never adds to it
+    C.log("read-ceiling", repo, pr, usd=f"{usd:.2f}", step=step)
     return True
 
 
@@ -755,14 +774,43 @@ def codex_tools_left(run):
     return f"codex has feature(s) on that the review does not allow: {', '.join(left)}" if left else ""
 
 
+# codex exec's own count: a line that is only "tokens used", then a line that is only the number. A number written
+# inline ("tokens used: 9") is a diff's or an answer's text, not codex's, and a count past CODEX_MAX_TOKENS is capped.
+CODEX_TOKENS = re.compile(r"^tokens used[ \t]*\r?\n[ \t]*([\d,]{1,20})[ \t]*\r?$", re.M)
+CODEX_MAX_TOKENS = 50_000_000
+
+
+def codex_usd(rc, out):
+    """-> the estimated dollars of a `codex exec` that exited `rc` and printed `out`: the last `tokens used` count codex itself
+    printed (CODEX_TOKENS, capped at CODEX_MAX_TOKENS) at CODEX_USD_PER_MTOK (CC_LAND_CODEX_USD_PER_MTOK overrides it when it is a finite number >= 0), else
+    CODEX_READ_USD, and 0.0 only for rc 126/127 with no count (a missing binary or a refused flag reached no model; a
+    timeout's 124 or any other failure may have run the model for the whole read). A usage limit is not looked for
+    here: an answer can quote the words, and ask_codex() charges nothing for a read the limit stopped."""
+    said = CODEX_TOKENS.findall(out or "")
+    if not said:
+        return 0.0 if rc in (126, 127) else CODEX_READ_USD
+    try:
+        rate = float(C.conf("CC_LAND_CODEX_USD_PER_MTOK", str(CODEX_USD_PER_MTOK)))
+    except ValueError:
+        rate = CODEX_USD_PER_MTOK
+    if not math.isfinite(rate) or rate < 0:
+        rate = CODEX_USD_PER_MTOK
+    try:
+        tokens = min(int(said[-1].replace(",", "") or 0), CODEX_MAX_TOKENS)
+        return round(tokens / 1e6 * rate, 4)
+    except (ValueError, OverflowError):
+        return CODEX_READ_USD
+
+
 def ask_codex(text, repo, pr, digest, model):
-    """One tool-less `codex exec` read. -> (Verdict | None, 0.0, why), as ask(); codex reports no dollar cost."""
+    """One tool-less `codex exec` read. -> (Verdict | None, usd, why), as ask(); codex reports no dollar cost, so
+    `usd` is codex_usd()'s estimate, and 0.0 when the exec never ran."""
     run, cwd = scratch(repo, pr)
     schema, answer = os.path.join(run, "schema.json"), os.path.join(run, "answer.json")
     argv = codex_argv("exec", "-m", model, "-c", f'model_reasoning_effort="{effort()}"', "-c", 'web_search="disabled"',
                       "-s", "read-only", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                       "--skip-git-repo-check", "--color", "never", "--output-schema", schema, "-o", answer, "-C", cwd)
-    said, rc, out = "", 1, ""
+    said, rc, out, usd = "", 1, "", 0.0
     try:
         left = codex_tools_left(run)
         if left:
@@ -770,6 +818,7 @@ def ask_codex(text, repo, pr, digest, model):
         with open(schema, "w") as f:
             json.dump(strict(SCHEMA), f)
         rc, out = C.sh(argv + ["-"], cwd=cwd, input=text, timeout=READ_TIMEOUT, env=codex_env())
+        usd = codex_usd(rc, out)
         try:
             with open(answer) as f:
                 said = f.read()
@@ -779,12 +828,12 @@ def ask_codex(text, repo, pr, digest, model):
         shutil.rmtree(run, ignore_errors=True)
     v = parse(said, digest, model=model)
     if v:
-        return v, 0.0, ""
+        return v, usd, ""
     tail = " ".join((out or "").split())[-200:]
     if LIMIT_SAID.search(out or ""):
         return None, 0.0, f"limit: rc={rc} {tail}"
     bad = fault(rc, out)
-    return None, 0.0, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {tail}"
+    return None, usd, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {tail}"
 
 
 # The names `claude --model` takes that do not start with `claude`: a reader named so is claude's, not codex's.
