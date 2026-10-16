@@ -233,6 +233,11 @@ if [ "$etc" = 1 ]; then
     sudo udevadm control --reload-rules 2>/dev/null || true
     sudo udevadm trigger --subsystem-match=powercap --action=change 2>/dev/null || true
   fi
+  if [ -f "$E/60-io-uring.conf" ]; then   # io_uring for root only: cc-member-v2's walk cannot see a closed registered ring
+    sudo install -m 644 "$E/60-io-uring.conf" /etc/sysctl.d/60-io-uring.conf
+    sudo sysctl -q -p /etc/sysctl.d/60-io-uring.conf ||
+      echo "install.sh: kernel.io_uring_disabled not applied: this kernel may predate the setting (6.6)" >&2
+  fi
   if [ -f "$E/claude-bwrap" ] && [ -f "$E/claude-bwrap-path.json" ]; then   # Claude Code's Bash sandbox under the AppArmor userns restriction: see the profile's header
     b=/usr/local/libexec/claude-bwrap                       # a copy, so re-run --etc after a bubblewrap update
     a=/etc/apparmor.d/claude-bwrap ms=/etc/claude-code/managed-settings.d/50-claude-bwrap.json
