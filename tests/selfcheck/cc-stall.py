@@ -51,7 +51,10 @@ def selfcheck():
     with q: run(t, True, 1000)
     k(t.keys == [], "a dead pane still showing the dialog gets no key")
     # 3 …nor with its footer not at the bottom, nor with a permission word on the screen, nor in copy mode, nor bare
-    for scr, what in ((DEV + "\n❯ typed by the owner\n", "footer not at the bottom"), (PERM, "a permission word")):
+    stale = LIMIT.replace("Enter to confirm · Esc to cancel", "") + "\n" * 3 + "\n".join(f"  line {i}" for i in range(12)) + "\n  Enter to confirm · Esc to cancel\n"
+    for scr, what in ((DEV + "\n❯ typed by the owner\n", "footer not at the bottom"), (PERM, "a permission word"),
+                      ("  Do you want to proceed?\n" + LIMIT, "a permission word above a limit prompt"),
+                      (stale, "limit options only in scrollback, above the bottom block")):
         fresh(); t = Fake(); t.add("box", scr)
         with q: run(t, True, 1000)
         k(t.keys == [], f"no key with {what}")
