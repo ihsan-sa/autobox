@@ -221,12 +221,15 @@
 #   login is the copy dispatch-login writes for the workers, at `cc-config get WORKER_CLAUDE_LOGIN_COPY` (empty →
 #   /var/lib/dispatch-login-workers/claude-login.json): an access token and its expiry, no refresh token. In that mode
 #   this never refreshes ~/.claude-workers, never takes its lock and never reads the key's file. The copy is READ LIVE:
-#   its directory is bound ro at ~/.cc/worker-login and ~/.claude/.credentials.json is a link into it, so a worker
-#   running when dispatch-login renews the login (at 20 min left, revoking the old token) reads the new token rather
-#   than dying on the old one. A copy that is missing, a symlink, not a plain file, writable by group or others,
-#   unreadable, signed out or with under 25 min left (one tick above that renewal) REFUSES the launch, and so does a
-#   directory that is a symlink, writable by group or others or holding a refresh token in any file this user can read
-#   (exit 2, the reason on stderr); worker-cred prints nothing and exits 2: no fallback to refreshing and
+#   a stripped copy of that one file (claudeAiOauth, every refreshToken taken out) sits alone in a dir of the launch's
+#   own under ~/.cc/sandbox/.login, bound ro at ~/.cc/worker-login, and ~/.claude/.credentials.json is a link into it.
+#   A watcher on the host, alive while the launch's bwrap is, renames a fresh stripped copy in within a second of the
+#   copy changing, so a worker running when dispatch-login renews the login (at 20 min left, revoking the old token)
+#   reads the new token rather than dying on the old one. The copy's own directory is never bound, so the other files
+#   dispatch-login keeps there do not reach a worker. A copy that is missing, a symlink, not a plain file, writable by
+#   group or others, unreadable, signed out, holding a refreshToken key at any depth (parsed by jq, so an escaped key
+#   counts) or with under 25 min left (one tick above that renewal) REFUSES the launch, and so does a directory that is
+#   a symlink or writable by group or others (exit 2, the reason on stderr); worker-cred prints nothing and exits 2: no fallback to refreshing and
 #   none to the box's login, since either would hide a refresher that has stopped. A flag that is not root's regular file
 #   is ignored, and with no flag nothing above changes.
 # NETWORK (a worker; the member and vet profiles are their own paragraphs): an ALLOW-LIST, not the host's network. The
@@ -614,6 +617,27 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # …and the GitHub orgs the box may not touch: the list and the git include cc-github-deny writes from it, ro, so the
   # gh shim, the credential helper, git's url.insteadOf and cc-guard's rule hold inside exactly as they do here
   for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc .cc/github-deny .cc/github-deny.gitconfig; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
+login_strip(){   # $1 a login copy · $2 the mirror dir → $2/<its name>, renamed in whole: claudeAiOauth with every refreshToken, at any depth, taken out
+  local t; t=$(mktemp "$2/.cc-tmp-XXXXXX") || return 1
+  jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.. | objects | .refreshToken))}' -- "$1" > "$t" 2>/dev/null && chmod 600 "$t" && mv -f "$t" "$2/${1##*/}" || { rm -f "$t"; return 1; }; }
+login_mirror(){   # $1 the host refresher's copy (refresher_copy passed it) → LM, a dir holding only a stripped copy of it, kept current.
+  # Called bare, never in $(…): the watcher is this shell's child, and one started in a subshell sees its parent go at once.
+  # THE ONE FILE, READ LIVE. A bind of the copy's own dir showed a worker every file beside it (dispatch-login keeps
+  # other logins' copies there), and a bind of the file alone pins the inode a renewal renames away (#1413's bug). So the
+  # dir bound is this one, made per launch under ~/.cc/sandbox, which no bind reaches, and a watcher on the host renames
+  # a fresh stripped copy into it whenever the copy changes (inode, size or mtime), checked each second. It runs while
+  # its parent is this launch's pid, which becomes bwrap's at the exec, and removes the dir once bwrap is gone. A copy
+  # that does not parse mid-write is retried the next second, and the one already in the mirror stays until then.
+  local m p=$$ src="$1" last; LM=""
+  mkdir -p "$H/.cc/sandbox/.login" && chmod 700 "$H/.cc/sandbox/.login" && m=$(mktemp -d "$H/.cc/sandbox/.login/XXXXXX") || return 1
+  last=$(stat -c '%i %s %y' -- "$src" 2>/dev/null) && login_strip "$src" "$m" || { rm -rf "$m"; return 1; }
+  # The watcher's own pid is read into w here, not in the loop's $(…): there $BASHPID names that substitution's
+  # subshell, whose parent is the watcher and never $p, so the watcher quit and removed the dir before bwrap bound it.
+  ( trap 'rm -rf "$m"' EXIT; w=$BASHPID
+    while [ "$(awk '{print $4}' "/proc/$w/stat" 2>/dev/null)" = "$p" ]; do sleep 1
+      s=$(stat -c '%i %s %y' -- "$src" 2>/dev/null) || continue
+      [ "$s" = "$last" ] || { login_strip "$src" "$m" && last=$s; }; done ) </dev/null >/dev/null 2>&1 &
+  LM=$m; }
 egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
 cred_left(){ local e; e=$(jq -r '.claudeAiOauth.expiresAt // 0' "$1" 2>/dev/null); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
 refresher_flag(){   # true while the host refresher (dispatch-login) is the one refresher of the workers' login: its flag is
@@ -627,8 +651,8 @@ refresher_copy(){   # → the host refresher's copy of the workers' login, or re
   local c d why="" perm left
   c=$("$BIN/cc-config" get WORKER_CLAUDE_LOGIN_COPY 2>/dev/null); c="${c/#\~/$H}"; c="${c:-/var/lib/dispatch-login-workers/claude-login.json}"
   d=$(dirname -- "$c")
-  # THE DIRECTORY GOES IN WHOLE, ro (launch), so a running worker reads each renewal: its checks are the file's own.
-  # Everything in it this user can read is readable inside, so no file there may carry a refresh token either.
+  # THE DIRECTORY IS NOT BOUND (login_mirror): only a stripped copy of this one file goes in, so the files beside it
+  # (dispatch-login keeps other logins' copies there) never reach a worker. It must still be the copy's alone to write.
   if [ -L "$d" ] || [ ! -d "$d" ]; then why='in a directory that is a symlink or not a directory'
   elif perm=$(stat -c %a -- "$d") && [ $(( 8#$perm & 0022 )) -ne 0 ]; then why='in a directory writable by group or others'
   elif [ -L "$c" ]; then why='a symlink'
@@ -637,8 +661,9 @@ refresher_copy(){   # → the host refresher's copy of the workers' login, or re
   elif perm=$(stat -c %a -- "$c") && [ $(( 8#$perm & 0022 )) -ne 0 ]; then why='writable by group or others'
   elif [ ! -r "$c" ]; then why='unreadable by this user'
   elif ! cred_usable "$c"; then why='signed out (no access token)'
-  # the KEY, quoted: dispatch-login's copies carry refreshTokenExpiresAt with no token, and a bare word refused them all
-  elif grep -rqsF '"refreshToken"' -- "$d"; then why='in a directory holding a refresh token'
+  # THE KEY, PARSED: jq decodes the file, so "refreshToken" is the key it spells, at any depth. A grep for the
+  # quoted word missed an escaped one, and a bare word matched refreshTokenExpiresAt, which every real copy carries.
+  elif ! jq -e '[.. | objects | has("refreshToken")] | any | not' -- "$c" >/dev/null 2>&1; then why='holding a refresh token'
   # 25 min: above dispatch-login's hard renewal at 20 min left plus one of its ticks, and under the hour, or every
   # cycle stalls ~40 min. The renewal revokes the old token; a worker already running reads the new one through the bind.
   elif left=$(cred_left "$c") && [ "$left" -lt 1500 ]; then
@@ -724,12 +749,13 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # fd 3: the ~/.claude.json copy — BUILT FROM A WHITELIST (projects, mcpServers), never the file minus a mask: Claude Code keeps
   #       oauthAccount (the owner's email) and userID at the top level, and a mask copied them inside (review-156e)
   #       fd 4: the credentials copy — claudeAiOauth minus its refresh token, nothing else of the file
-  # …or, LIVE, the copy's directory ro at ~/.cc/worker-login and claude's path a link into it. dispatch-login revokes
+  # …or, LIVE, login_mirror's dir ro at ~/.cc/worker-login and claude's path a link into it. dispatch-login revokes
   # the old token when it renews, at 20 min left, and a copy taken once at launch died with it, and the worker with it.
-  # A directory bind sees the renamed-in file a file bind would miss (board_dir has the same reason). refresher_copy
-  # has just refused a copy or a directory with a refresh token in it; the token is dispatch-login's to keep out after.
+  # A directory bind sees the renamed-in file a file bind would miss (board_dir has the same reason), and the dir is
+  # the mirror's, holding the one stripped copy, never the copy's own dir with the other logins' copies beside it.
   ca=(--perms 0600 --file 4 "$H/.claude/.credentials.json")
-  [ -n "$live" ] && ca=(--ro-bind "$(dirname -- "$cred")" "$H/.cc/worker-login" --symlink "$H/.cc/worker-login/${cred##*/}" "$H/.claude/.credentials.json")
+  if [ -n "$live" ]; then login_mirror "$cred" || { echo "cc-sandbox: could not make the mirror of the workers' login under ~/.cc/sandbox/.login — nothing was started." >&2; exit 2; }
+    ca=(--ro-bind "$LM" "$H/.cc/worker-login" --symlink "$H/.cc/worker-login/${cred##*/}" "$H/.claude/.credentials.json"); fi
   # THE WINDOW BETWEEN THE PINS AND THE MOUNT, WIDENED ON DEMAND — the same knob launch_member uses, for the same reason:
   # a race case that has to hit a microsecond is a case that passes by luck, and one that passes by luck cannot go red.
   # A NUMBER, never a command, and only ever set on the host — build --unsetenv's it, so nothing inside carries it on.
@@ -2897,7 +2923,7 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   local cf="$fh/dl/claude-login.json" fl="$fh/login-refresh" me; me=$(id -u)
   mkdir -p "$fh/dl" && : > "$fl" || return 1
   cpy(){ rm -f "$cf"; jq -n --argjson e "$1" '{claudeAiOauth: {accessToken: "copy-access", expiresAt: $e, scopes: ["user:inference"], subscriptionType: "max"}}' > "$cf" && chmod 640 "$cf"; }
-  fresh(){ rm -f "$fh/refreshed" "$fh/.claude-workers/.cc-worker-refresh.lock" "$fh/dl/real.json" "$fh/dl/other.json"; chmod 750 "$fh/dl"
+  fresh(){ rm -f "$fh/refreshed" "$fh/.claude-workers/.cc-worker-refresh.lock" "$fh/dl/real.json" "$fh/dl/other.json" "$fh/dl/max1.json" "$fh/dl/max2.json"; chmod 750 "$fh/dl"
     wk wk-old $(( ($(date +%s) + 600) * 1000 )); cpy 99999999999999; }
   fresh; out=$(RC="$cf" run "$wf")
   t "host refresher: no flag → the workers' login is refreshed as before and the copy is not read" \
@@ -2919,8 +2945,8 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
     echo w=$( (: > ~/.cc/worker-login/x) 2>/dev/null && echo wrote || echo ro); echo ls=$(ls -A ~/.cc/worker-login | paste -sd, -)'
   fresh; rm -f "$fh/.cc/state/r/t/seen"; probe="$lp" RF="$fl" RU="$me" RC="$cf" run "$wf" > "$fh/live.out" & local lpid=$! k=0
   while [ ! -s "$fh/.cc/state/r/t/seen" ] && [ $k -lt 600 ] && kill -0 "$lpid" 2>/dev/null; do sleep 0.1; k=$((k + 1)); done
-  jq '.claudeAiOauth.accessToken = "copy-renewed"' "$cf" > "$fh/dl/.n" && chmod 640 "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; wait "$lpid"; out=$(cat "$fh/live.out")
-  t "host refresher: a renewal while the worker runs → it reads the new token, still with no refresh token" "$(g tok)/$(g tok2)/$(g rt)" copy-access/copy-renewed/false
+  jq '.claudeAiOauth.accessToken = "copy-renewed" | .claudeAiOauth.refreshToken = "renewed-refresh"' "$cf" > "$fh/dl/.n" && chmod 640 "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; wait "$lpid"; out=$(cat "$fh/live.out")
+  t "host refresher: a renewal while the worker runs → it reads the new token, still with no refresh token, though the renewed copy carries one" "$(g tok)/$(g tok2)/$(g rt)" copy-access/copy-renewed/false
   t "host refresher: …and the copy's directory is ro inside, holding the copy and nothing of the host's beside it" "$(g w)/$(g ls)" ro/claude-login.json
   if [ "$(stat -c %u /etc/passwd 2>/dev/null)" = 0 ]; then   # where root is mapped: a real root-owned file, no RU
     fresh; out=$(RF=/etc/passwd RC="$cf" run "$wf")
@@ -2941,9 +2967,21 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   # 2026-10-16: an hour's floor sat above dispatch-login's 20 min renewal, so no worker started for ~40 min of each cycle
   fresh; cpy $(( ($(date +%s) + 1800) * 1000 )); out=$(RF="$fl" RU="$me" RC="$cf" run "$wf")
   t "host refresher: a copy with 30 min left, above the renewal → the worker runs on it" "$(g tok)" copy-access
-  # the directory goes in whole, so a refresh token anywhere in it, or a directory someone else could write, refuses
-  fresh; jq '.claudeAiOauth.refreshToken = "copy-refresh"' "$cf" > "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; chmod 640 "$cf"; refused 'in a directory holding a refresh token'
-  fresh; jq -n '{claudeAiOauth: {refreshToken: "other-refresh"}}' > "$fh/dl/other.json"; refused 'in a directory holding a refresh token'
+  # a refresh token in the copy refuses, the key read by jq: an escaped key is the same key (a grep for it missed this)
+  fresh; jq '.claudeAiOauth.refreshToken = "copy-refresh"' "$cf" > "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; chmod 640 "$cf"; refused 'holding a refresh token'
+  fresh; printf '%s\n' '{"claudeAiOauth": {"accessToken": "copy-access", "expiresAt": 99999999999999, "refreshToken": "copy-refresh"}}' > "$cf"; refused 'holding a refresh token'
+  fresh; jq '.claudeAiOauth.extra = {refreshToken: "copy-refresh"}' "$cf" > "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; chmod 640 "$cf"; refused 'holding a refresh token'
+  # the key spelled with \u escapes, top level and nested: the raw bytes never say refreshToken, jq's key does
+  fresh; printf '%s\n' '{"claudeAiOauth": {"accessToken": "copy-access", "expiresAt": 99999999999999, "\u0072efresh\u0054oken": "copy-refresh"}}' > "$cf"; chmod 640 "$cf"; refused 'holding a refresh token'
+  fresh; printf '%s\n' '{"claudeAiOauth": {"accessToken": "copy-access", "expiresAt": 99999999999999, "extra": {"\u0072\u0065freshToken": "copy-refresh"}}}' > "$cf"; chmod 640 "$cf"; refused 'holding a refresh token'
+  # 2026-10-16: the copy's directory went in whole, and dispatch-login keeps the other logins' copies beside it. Only
+  # the copy goes in now, so the files beside it are neither read inside nor a reason to refuse.
+  fresh; jq '.claudeAiOauth.accessToken = "max1-access"' "$cf" > "$fh/dl/max1.json"; jq -n '{claudeAiOauth: {accessToken: "max2-access", refreshToken: "max2-refresh"}}' > "$fh/dl/max2.json"
+  out=$(probe='echo tok=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json); echo ls=$(ls -A ~/.cc/worker-login | paste -sd, -); echo max=$(cat ~/.cc/worker-login/max1.json ~/.cc/worker-login/max2.json 2>/dev/null | grep -c max)' RF="$fl" RU="$me" RC="$cf" run "$wf")
+  t "host refresher: other logins' copies beside the workers' → the worker runs on its own, and sees only it" "$(g tok)/$(g ls)/$(g max)" copy-access/claude-login.json/0
+  # the mirror is the launch's own: gone once its bwrap is, so no stripped token is left on the host after a run
+  k=0; while [ -n "$(ls -A "$fh/.cc/sandbox/.login" 2>/dev/null)" ] && [ $k -lt 50 ]; do sleep 0.1; k=$((k + 1)); done
+  t "host refresher: …and the mirror it read is removed when the launch ends" "$([ -d "$fh/.cc/sandbox/.login" ] && echo made || echo none)/$(ls -A "$fh/.cc/sandbox/.login" 2>/dev/null | wc -l)" made/0
   # 2026-10-16: every real copy carries refreshTokenExpiresAt and no refreshToken; the bare word refused each launch
   fresh; jq '.claudeAiOauth.refreshTokenExpiresAt = 99999999999999' "$cf" > "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; chmod 640 "$cf"
   out=$(RF="$fl" RU="$me" RC="$cf" run "$wf")
@@ -3114,7 +3152,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   local held='echo tmux=${TMUX:-unset}; echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}")'   # the probe's two lines its control below runs again with the opt-in removed
   out=$(CC_WORKER_SANDBOX=1 TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak "$SELF" "$r" t -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
-    echo cred=$(jq -c "[(.claudeAiOauth.accessToken != null), (.claudeAiOauth.refreshToken != null), (keys | length)]" ~/.claude/.credentials.json 2>/dev/null)$(stat -c %a ~/.claude/.credentials.json 2>/dev/null)
+    echo cred=$(jq -c "[(.claudeAiOauth.accessToken != null), (.claudeAiOauth.refreshToken != null), (keys | length)]" ~/.claude/.credentials.json 2>/dev/null)$(stat -L -c %a ~/.claude/.credentials.json 2>/dev/null)
     echo gh=$(e ~/.config/gh); echo ccbox=$(e ~/ccbox); echo ccconfig=$(e ~/.cc/config); echo hooks=$(touch ~/dev/'"$r"'/.git/hooks/x 2>/dev/null && echo writable || echo ro)
     echo ssh=$(e ~/.ssh); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock)
     echo dockergrp=$(id -Gn | tr " " "\n" | grep -c "^docker$"); '"$held"'
