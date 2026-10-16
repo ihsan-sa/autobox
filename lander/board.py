@@ -22,7 +22,9 @@ row (an id of letters, digits, `-` and `_`, as `req-<stamp>-<pid>` is): one stil
 requests answer`, from the box's hand (cards.box_hand), so the repo that asked hears its fix landed; an answered one is
 skipped. ONLY A REQUEST THE ROW'S BRIEF ALSO CLOSES is answered: the brief (~/.cc/state/<project>/<row>/task.md, a
 regular file) is the planning seat's text, and the PR body is the track's, so a track cannot answer other repos' asks
-by listing their ids. At most REQUEST_CAP per PR, each answer bounded by REQUEST_TIMEOUT seconds, and each one logged
+by listing their ids. Every request the body and the brief both name is answered, with no count cap (owner 10-16:
+past a cap of three, asks were only listed, and their askers waited on a fix that had landed); each answer is bounded
+by REQUEST_TIMEOUT seconds and logged
 (`request-answered`, with the asker) to queue.log. A member's PR answers none, since its body is the member's text.
 The answers run after the row's own close, and answer_requests never raises, so a bad request file cannot keep the
 row from going merged. ece298a's PLL worker sat blocked a day on a fix chip-flow had merged 44 minutes after it asked.
@@ -183,7 +185,6 @@ def request_file(name):
     return p if os.path.isfile(p) and not os.path.islink(p) else ""
 
 
-REQUEST_CAP = 3       # answers one PR may send; past it the ids are reported, not answered
 REQUEST_TIMEOUT = 20  # seconds per answer: they run one after another before the landed card
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
@@ -216,7 +217,7 @@ def _answer_requests(job):
         return ""
     # brief: "Answer only ids that the row's brief (task.md, written by the planning seat) also names with 'Closes'"
     allowed = set(brief_closes(project_of(job), track_for(job)))
-    done, failed, over, unbriefed = [], [], [], []
+    done, failed, unbriefed = [], [], []
     for r in closes(job.extra.get("body", "")):
         f = request_file(r)
         if not f:
@@ -226,9 +227,6 @@ def _answer_requests(job):
             continue
         if r not in allowed:
             unbriefed.append(r)
-            continue
-        if len(done) + len(failed) >= REQUEST_CAP:
-            over.append(r)
             continue
         rc, out = C.sh([tool("cc-notify"), "requests", "answer", r,
                         f"Fixed: {job.repo} {what(job)} has merged, and it closes request {r}."],
@@ -242,8 +240,6 @@ def _answer_requests(job):
     parts = [f"answers request {', '.join(done)}"] if done else []
     if failed:
         parts.append(f"could not answer request {', '.join(failed)}")
-    if over:
-        parts.append(f"more than {REQUEST_CAP} requests, left open: {', '.join(over)}")
     if unbriefed:
         parts.append(f"its brief does not close request {', '.join(unbriefed)}, left open")
     return "; ".join(parts)

@@ -44,9 +44,11 @@ runs on it, or it adds or changes no code nothing owns) needs no read: LAND with
 Otherwise the lander buys one:
   - the usage limit binds (`cc-limit status` exit 0) -> INCOMPLETE, no read counted, nothing posted; extra
     `until` (limit_until) says when to ask again, and the lane holds the job till then.
-  - two reads already spent on this PR (the family: repo + PR number, so a push or a reopen does not reset it) ->
-    HANDBACK with extra cap=True and no read bought; the lane sends a query card to the planning seat.
-  - else one read by EACH model on CC_LAND_REVIEWERS (the passwd home's ~/.cc/config only, cards.REVIEWER_CONFIG;
+  - no count of reads stops one (owner, 10-16: the two-read cap turned a PR that still needed a read into a planning
+    query and a stall). The PR's reads are summed in dollars (spent(): the family, repo + PR number, so a push or a
+    reopen does not reset it), and the read that takes them past READ_CEILING_USD tells the planning seat once
+    (over_ceiling: a planner request naming the PR and its spend) and the reading goes on.
+  - one read by EACH model on CC_LAND_REVIEWERS (the passwd home's ~/.cc/config only, cards.REVIEWER_CONFIG;
     default READERS: Fable 5.1 and Astra 6 — owner, 2026-09-24: "a review goes to Fable 5.1 and Astra 6
     together"), at CC_LAND_REVIEW_EFFORT (default high; one of EFFORTS, checked before any read). A `claude-*`
     model or a claude alias (CLAUDE_ALIASES) is one `claude -p` call, no tools; any other is one `codex exec`
@@ -149,7 +151,7 @@ from lander import cards as C
 from lander import types as T
 
 MARK = "cc-land-review"
-MAX_READS = 2
+READ_CEILING_USD = 15.0   # a PR's reads past this tell the planning seat once; nothing stops reading
 READERS = "claude-fable-5-1 gpt-6-astra"   # the default of CC_LAND_REVIEWERS
 READ_TIMEOUT = 1200
 PROMPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "lander")
@@ -579,6 +581,25 @@ def charge(repo, pr, **bump):
 def reads_used(repo, pr):
     j = spent(repo, pr)
     return int(j.get("reviews") or 0)
+
+
+def over_ceiling(repo, pr):
+    """Once the PR's reads have cost READ_CEILING_USD or more, tell the planning seat, once in the PR's life (the spend
+    file's `ceiling_said`), and go on: an alert, never a stop. -> True when it told it now. A request cc-notify
+    refused is asked again by the next read's charge."""
+    j = spent(repo, pr)
+    usd = float(j.get("review_usd") or 0)
+    if usd < READ_CEILING_USD or j.get("ceiling_said"):
+        return False
+    rc, _ = C.sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", f"land:{repo}:{pr}:read-ceiling", "-t",
+                  f"{repo} landing", f"[{repo}] PR #{pr}: its review reads have cost ${usd:.2f}, past the "
+                  f"${READ_CEILING_USD:g} ceiling. The reading goes on; look at why this PR keeps needing reads."],
+                 timeout=60, **C.box_hand())
+    if rc:
+        return False
+    charge(repo, pr, ceiling_said=C.now())
+    C.log("read-ceiling", repo, pr, usd=f"{usd:.2f}")
+    return True
 
 
 # --- the box around a read -----------------------------------------------------------------------------------------
@@ -1396,10 +1417,6 @@ def post(root, pr, body):
 
 # --- review / delta_review -----------------------------------------------------------------------------------------
 
-def _stop(job, why, **extra):
-    return T.Verdict(verdict=T.HANDBACK_VERDICT, digest=job.digest, blocking=[why], extra=extra)
-
-
 def _no_diff(job):
     """The PR changes files but git gave no diff (a fetch that did not land, a merge-base it cannot find): a read of
     nothing would judge nothing, so none is bought and the next tick asks again."""
@@ -1635,8 +1652,6 @@ def _buy(job, template, diff, more, prior=None):
         return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
                          extra={"why": f"usage limit: {lim.strip()}", "until": limit_until(lim)})
     j = spent(repo, pr)
-    if int(j.get("reviews") or 0) >= MAX_READS:
-        return _stop(job, f"two reads already spent on PR #{pr}; the planning seat decides", cap=True)
     if effort() not in EFFORTS:
         return _held(job, f"the review cannot run: CC_LAND_REVIEW_EFFORT={effort()!r} is not one of "
                           f"{', '.join(EFFORTS)}", fault=True)
@@ -1652,6 +1667,7 @@ def _buy(job, template, diff, more, prior=None):
         if cost:
             charge(repo, pr, review_usd=cost)
             usd += cost
+            over_ceiling(repo, pr)
         if v is None:
             return _silent(job, j, model, why)
         v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` holds it too
@@ -1870,8 +1886,6 @@ def would_read(job, comments):
         return False, "perms recorded its security read of this change, and the landing lands on that"
     if not (job.plan and job.plan.paid) and not standing(job, comments):
         return False, "it touches no paid-review path and no unchecked code, so nothing reads it"
-    if reads_used(job.repo, job.pr) >= MAX_READS:
-        return False, f"its {MAX_READS} reads are spent; record the verdict of a read you buy (`lander record`)"
     return True, "the landing reads it — do not buy a read of your own"
 
 

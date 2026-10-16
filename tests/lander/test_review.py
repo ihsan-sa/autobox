@@ -667,12 +667,36 @@ class TestReview(Case):
         self.assertEqual(v.verdict, T.INCOMPLETE)
         self.assertEqual(R.reads_used("demo", 7), 0)
 
-    def test_two_reads_is_the_cap_across_pushes(self):
-        R.charge("demo", 7, reviews=2)
-        box = self.box(claude=claude_says("LAND"))
-        v = R.review(self.job(), comments=[])
-        self.assertEqual((v.verdict, v.extra.get("cap")), (T.HANDBACK_VERDICT, True))
-        self.assertEqual(box.called("claude"), [])
+    def test_no_count_of_reads_stops_a_read(self):
+        # owner 10-16: the two-read cap made a PR that still needed a read a planning query and a stall
+        R.charge("demo", 7, reviews=5, review_usd=2.0)
+        box = self.box(claude=claude_says("LAND"), **{"cc-notify --ask": (0, "")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+        self.assertEqual(len(box.called("claude")), 1)
+        self.assertEqual((R.reads_used("demo", 7), box.called("cc-notify --ask")), (6, []))
+        self.assertEqual(R.would_read(self.job(), []), (True, "the landing reads it — do not buy a read of your own"))
+
+    def test_the_read_that_crosses_the_dollar_ceiling_tells_planning_once_and_reading_goes_on(self):
+        R.charge("demo", 7, reviews=9, review_usd=R.READ_CEILING_USD - 0.1)
+        box = self.box(claude=claude_says("LAND", usd=0.42), **{"cc-notify --ask": (0, "")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+        told = box.called("cc-notify --ask")
+        self.assertEqual(len(told), 1)
+        self.assertIn("land:demo:7:read-ceiling", told[0]["argv"])
+        self.assertIn("$15.32, past the $15 ceiling. The reading goes on", told[0]["argv"][-1])
+        self.assertTrue(R.spent("demo", 7).get("ceiling_said"))
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)   # the next read: no second alert
+        self.assertEqual((len(box.called("claude")), len(box.called("cc-notify --ask"))), (2, 1))
+
+    def test_a_refused_ceiling_alert_is_asked_again_by_the_next_read(self):
+        R.charge("demo", 7, review_usd=R.READ_CEILING_USD + 1)
+        box = self.box(**{"cc-notify --ask": (1, "refused")})
+        self.assertFalse(R.over_ceiling("demo", 7))
+        self.assertFalse(R.spent("demo", 7).get("ceiling_said"))
+        box.answers["cc-notify --ask"] = (0, "")
+        self.assertTrue(R.over_ceiling("demo", 7))
+        self.assertFalse(R.over_ceiling("demo", 7))
+        self.assertEqual(len(box.called("cc-notify --ask")), 2)
 
     def test_one_read_spent_still_buys_the_second(self):
         R.charge("demo", 7, reviews=1)

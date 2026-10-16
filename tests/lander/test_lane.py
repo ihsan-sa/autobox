@@ -2083,7 +2083,8 @@ class Repair(Fixture):
         self.assertEqual(len(stops), 1)
         self.assertEqual(stops[0][3], "planning")
         self.assertIn(f"PR #1 conflicts with main: a/x — the launch of its rebase round in row-1 was refused "
-                      f"{RP.REFUSALS} times (the last: cc: demo is paused): a/x", stops[0][2])
+                      f"{RP.REFUSALS} times (the last: cc: demo is paused): a/x — next: clear that refusal, or merge main into "
+                      f"it by hand and push; the push queues it again", stops[0][2])
         self.assertEqual(len(self.gos()), RP.REFUSALS)
         self.assertTrue(os.path.exists(J.handed_path("demo", 1)))   # a push re-queues it
 
@@ -2115,7 +2116,8 @@ class Repair(Fixture):
         self.assertEqual(len(self.gos()), 2)
         stops = [c for c in cards.calls if c[0] == "stopped"]
         self.assertEqual([c[3] for c in stops], ["planning"])
-        self.assertIn("2 rebase rounds in row-1 did not resolve it", stops[0][2])
+        self.assertIn("2 rebase rounds in row-1 did not resolve it: a/x — next: merge main into it by hand, or brief "
+                      "row-1 on the conflict, and push; the push queues it again", stops[0][2])
 
     def test_a_new_head_after_a_refusal_streak_gets_its_round(self):
         self.pr(1, {"a/x": "pr\n"})
@@ -2887,7 +2889,8 @@ class Review(Fixture):
             self.assertEqual(f.read(), "untouched\n")               # nothing appended through the link
         self.assertTrue(os.path.islink(J.attic_path("demo", 1)))
 
-    def test_reads_cap_goes_to_planning(self):
+    def test_no_read_count_turns_a_handback_into_a_query(self):
+        # owner 10-16: the second handback went to planning as a query and stalled; every one goes back to the seat
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
         u, _ = self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.HANDBACK_VERDICT, blocking=["bug"])))
@@ -2899,11 +2902,11 @@ class Review(Fixture):
         J.submit("demo", 1)
         rv = Reviewer(V(T.HANDBACK_VERDICT, blocking=["still"]))
         u, _ = self.land(planner=Planner(paid=True), reviewer=rv)
-        j = self.job()
-        self.assertEqual((j.state, j.reads_used), (T.QUERY, 2))
+        self.assertIsNone(self.job())                               # second: handed back again, not a query
+        self.assertEqual(J.read_json(J.handed_path("demo", 1))["reads_used"], 2)
         # the prior verdict is not carried by the lane: the reviewer finds it among the box's own PR markers
         self.assertEqual([c[0] for c in rv.calls], ["review"])
-        self.assertEqual(u["cards"].calls[0][3], "planning")
+        self.assertEqual(u["cards"].calls[0][3], "seat")
 
     def test_a_read_the_host_failed_twice_goes_to_planning_never_back_to_the_author(self):
         # owner, 10-12: "If it fails again, the PR is held with that reason recorded and no fix asked of the author"
@@ -2991,7 +2994,8 @@ class Review(Fixture):
             self.land(runner=Runner(status={"a": T.UNRUNNABLE}, notes={"a": "No space left on device"}))
         j = self.job()
         self.assertEqual(j.state, T.QUERY)
-        self.assertEqual(j.extra["why"], "check a could not run 3 times: No space left on device")
+        self.assertEqual(j.extra["why"], "check a could not run 3 times: No space left on device — next: clear what "
+                                         "stops the check on the box (the reason above), then queue the PR again")
 
     # a gate's output line: an ANSI colour, broadcasts, mrkdwn, a handle split by a zero-width space, a bidi
     # override, a newline, and far more than fits
@@ -3026,7 +3030,9 @@ class Review(Fixture):
             self.land(runner=Runner(status={"a": T.UNRUNNABLE}, notes={"a": self.RAW_NOTE}))
         j = self.job()
         self.assertEqual((j.state, j.extra["attempts"]), (T.QUERY, 3))
-        self.assert_clean(j.extra.get("why") or "", re.escape("check a could not run 3 times: "))
+        why = j.extra.get("why") or ""
+        self.assertTrue(why.endswith(L.NEXT_UNRUNNABLE), why)
+        self.assert_clean(why[:-len(L.NEXT_UNRUNNABLE)], re.escape("check a could not run 3 times: "))
 
     def test_failed_handback_quotes_clean(self):
         """A failed check's handback, kept in the handed record and sent as the stopped card, carries the clean line."""
@@ -3421,6 +3427,8 @@ class Branches(Fixture):
             self.land()
         j = self.job()
         self.assertEqual((j.state, j.extra["attempts"]), (T.QUERY, 3))
+        self.assertTrue(j.extra["why"].startswith("the merge was refused 3 times: "), j.extra["why"])
+        self.assertTrue(j.extra["why"].endswith(L.NEXT_REFUSED), j.extra["why"])   # the reason and the next step
         self.assertNotIn("merge_attempt", j.extra)
         self.assertNotIn("updates", self.box())   # a refusal that is not BEHIND never updates the branch
         ok, text = GH.merge(self.root, 1, "x" * 40, "t")

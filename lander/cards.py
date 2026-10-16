@@ -679,6 +679,19 @@ def main_red(job, secs, now=None):
 
 QUERY_ROUTES = ("query", "planning", "lander-self")
 PROTECTED_RE = re.compile(r"\(CC_PROTECTED_PATHS_[^)]*\)")
+NEXT_MARK = " — next: "
+
+
+def shorten_stop(why):
+    """`why` cut to STOP_CARD_MAX. A why that ends in NEXT_MARK and its next action keeps that action whole and cuts
+    the reason before it: the next step is what the reader acts on (owner 10-16)."""
+    if len(why) <= STOP_CARD_MAX:
+        return why
+    head, sep, tail = why.rpartition(NEXT_MARK)
+    room = STOP_CARD_MAX - len(sep + tail) - 1
+    if sep and room >= 40:
+        return head[:room] + "…" + sep + tail
+    return why[:STOP_CARD_MAX - 1] + "…"
 
 
 def stopped(job, why, route):
@@ -701,7 +714,7 @@ def stopped(job, why, route):
         return protected_door(job, why)
     if route == "owner":
         return protected_stop(job, why)
-    short = why if len(why) <= STOP_CARD_MAX else why[:STOP_CARD_MAX - 1] + "…"
+    short = shorten_stop(why)
     who = {"seat": "The track's seat fixes it and pushes; the lane takes the new head",
            "query": "The planning seat decides what happens to it",
            "planning": "The planning seat decides what happens to it",

@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -178,6 +179,31 @@ class TestDeploy(Box):
         self.assertIn("did not deploy", card[0]["argv"][-1])
         self.assertIn(f"{D.MOVED} to /x/deploy-aside: docs/d.md", card[0]["argv"][-1])
 
+    def test_a_failed_target_is_retried_on_backoff_with_no_cap_and_posts_once(self):
+        # owner 10-16: no TRIES cap that leaves a failed target waiting for a new request; one card, at the first failure
+        POST = "cc-slack " + "post"
+        box = self.fake(**{"install.sh": (1, "install broke\n")})
+        with mock.patch.object(D, "fast_forward", lambda *a: ""):
+            D.request("demo", NEW)
+            t0 = time.time()
+            with mock.patch.object(D.time, "time", lambda: t0):
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+                self.assertEqual((st["state"], st["tries"], st["retry_at"]), ("failed", 1, t0 + D.BACKOFF))
+                self.assertIn("tried again in 10 min", box.called(POST)[0]["argv"][-1])
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]   # inside the wait: not tried
+            self.assertEqual((st["tries"], len(box.called("install.sh"))), (1, 1))
+            for n in range(2, 7):   # past the old TRIES=3, where a target waited for a new request
+                with mock.patch.object(D.time, "time", lambda: t0 + 10 * D.BACKOFF_MAX * n):
+                    st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+                self.assertEqual((st["state"], st["tries"]), ("failed", n))
+            self.assertEqual(len(box.called("install.sh")), 6)
+            self.assertEqual(len(box.called(POST)), 1)
+            self.assertEqual((D.retry_wait(1), D.retry_wait(2), D.retry_wait(9)), (D.BACKOFF, 2 * D.BACKOFF, D.BACKOFF_MAX))
+            self.fake()
+            with mock.patch.object(D.time, "time", lambda: t0 + 100 * D.BACKOFF_MAX):
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual(st["state"], "verified")
+
     def test_a_moved_aside_draft_rides_on_the_restart_mention(self):
         self.unit("demo-daemon.service")
         box = self.fake(**{"cc-units restart-for": (0, "demo-daemon.service\towner\n"), "cc-scope add": (0, "")})
@@ -246,7 +272,9 @@ class TestDeploy(Box):
         self.assertEqual(D.run("demo", green=lambda r, s: True)["targets"]["demo"]["state"], "failed")
         self.assertEqual(at["head"], NEW)
         box.answers["install.sh"] = (0, "linked\n")
-        st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        later = time.time() + D.BACKOFF + 1   # the retry waits out its backoff
+        with mock.patch.object(D.time, "time", lambda: later):
+            st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
         self.assertEqual(st["state"], "verified")
         self.assertIn("demo-daemon.service (pid 100 -> 101)", st["why"])
 

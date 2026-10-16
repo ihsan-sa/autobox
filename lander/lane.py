@@ -127,7 +127,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              read the host failed twice at one head: a 4xx, a timeout, its own cap; or a security path with no
              record by perms of this head and digest) -> query "planning", never a
              handback; HANDBACK ->
-             reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
+             reads_used+1 and a handback, however many reads came before (owner 10-16: no count of reads turns
+             it into a query; review.py's dollar ceiling alerts instead); LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it. A read whose job leaves
              checking (or its digest) mid-read keeps its REVIEW_SLOTS place until it ends, and is charged then.
   mergeable  the head moved -> queued. main moved -> main_moved (brief, 10-13: "At merge time, re-check only when
@@ -257,8 +258,10 @@ def compiled(root, base, head):
 
 
 HOLD_SECS = 900          # a held job waits this long before the lane tries it again
-UNRUNNABLE_TRIES = 3     # the 3rd unrunnable check (or refused merge) is a query, not another hold
-READS_CAP = 2            # reads per change family; the 2nd handback is a query to the planning seat
+UNRUNNABLE_TRIES = 3     # the 3rd unrunnable check (or refused merge) is a query naming its cause and the next step
+# owner 10-16: a stop says its reason and the next action in one line, so the planning seat acts on it, never asks
+NEXT_UNRUNNABLE = " — next: clear what stops the check on the box (the reason above), then queue the PR again"
+NEXT_REFUSED = " — next: clear what GitHub names, then queue the PR again"
 HANDED_DAYS = 7
 MAX_STEPS = 40
 PLACE_HOLDS = 4          # holds a job keeps its queued_at through; the next one stamps it afresh (Lane.hold)
@@ -1421,7 +1424,7 @@ class Lane:
                 # the last try's reason goes with the query: "could not run 3 times" alone sent a full /tmp to
                 # planning as a mystery (#1087, 2026-10-11), its cause left in the hold history and a gone log
                 return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times"
-                                       + (f": {note}" if note else ""), "planning")
+                                       + (f": {note}" if note else "") + NEXT_UNRUNNABLE, "planning")
             return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
                                   f"{UNRUNNABLE_TRIES}): {note}", kind="box")
         if (job.extra.get("main_red") or {}).get("check") == n:
@@ -1479,11 +1482,7 @@ class Lane:
         job.extra["verdict"], job.review_key = v.to_dict(), v.digest
         if v.verdict == T.HANDBACK_VERDICT:
             job.reads_used += 1
-            why = "the review handed it back: " + ("; ".join(v.blocking) or "no finding named")
-            if job.reads_used >= READS_CAP:
-                self.query(job, f"{why} — {job.reads_used} reads spent on this change", "planning")
-            else:
-                self.handback(job, why)
+            self.handback(job, "the review handed it back: " + ("; ".join(v.blocking) or "no finding named"))
             return False
         if v.tokens > 0:
             job.reads_used += 1
@@ -1672,7 +1671,8 @@ class Lane:
                     return self.behind(job, base, text)
                 job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
                 if job.extra["attempts"] >= UNRUNNABLE_TRIES:
-                    self.query(job, f"the merge was refused {job.extra['attempts']} times: {text}", "planning")
+                    self.query(job, f"the merge was refused {job.extra['attempts']} times: {text}{NEXT_REFUSED}",
+                               "planning")
                 else:
                     self.hold(job, text, kind="box" if GH.backoff() else "pr")
                 return "held"

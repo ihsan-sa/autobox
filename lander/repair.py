@@ -25,10 +25,10 @@ Lane.conflict asks start(lane, job, paths) and acts on what it answers, (kind, w
     the round's own worker, does not start the count again; only a merge ends it, so a close and a reopen buy no more.
     The budget is the PR's for its whole life: a round that repaired it gives nothing back for a later conflict.
     A round that pushed a head that still conflicts, or did not push by REPAIR_WAIT, has failed. The ROUNDS+1th
-    conflict is `planning`, naming the PR and its files;
+    conflict is `planning`, naming the PR, its files and the next action (owner 10-16: one line a seat acts on);
   · a launch `cc` refused (paused, the tier, the brief judge) spends no round, since nothing ran: it gives its round
     back and counts a refusal instead; a launch that goes out clears the count, and the REFUSALS-th refusal in a row
-    hands the PR to `planning`. A record that is there but will not read is `planning` too: it is no licence for
+    hands the PR to `planning`, with the last refusal and the next action. A record that is there but will not read is `planning` too: it is no licence for
     more rounds.
 
 A path is the branch's to name, so every one shown (the brief, the why, the board note) goes through jobs.path_names:
@@ -123,11 +123,14 @@ def start(lane, job, paths):
         return "wait", f"its rebase round in {track} has until {E.stamp(deadline)} to push"
     if r.get("head") != job.head:
         refusals = 0   # a new head starts a new streak: a long pause before it doesn't take this head's rounds
+    # owner 10-16: these stops stay, but each says its reason and the next action in one line
     if done >= ROUNDS:
-        return "planning", f"{done} rebase rounds in {track} did not resolve it: {files}"
+        return "planning", (f"{done} rebase rounds in {track} did not resolve it: {files} — next: merge {base} into "
+                            f"it by hand, or brief {track} on the conflict, and push; the push queues it again")
     if refusals >= REFUSALS:
         return "planning", (f"the launch of its rebase round in {track} was refused {refusals} times (the last: "
-                            f"{_last(str(r.get('refused') or ''))}): {files}")
+                            f"{_last(str(r.get('refused') or ''))}): {files} — next: clear that refusal, or merge "
+                            f"{base} into it by hand and push; the push queues it again")
     branch = job.extra.get("branch") or ""
     task = _task(lane.repo, track)
     if task is None:

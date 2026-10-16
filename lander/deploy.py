@@ -109,7 +109,15 @@ def held(target):
 
 WAITING = ("requested", "held")
 MOVED = "untracked file(s) that stood where the merge adds tracked ones"   # deploy_one's line; run() says it
-TRIES = 3   # a failed target is deployed again by this many calls of run(), then waits for a new request
+# A failed target is tried again by a later run(), with no count cap: BACKOFF seconds after its first failure,
+# doubling to BACKOFF_MAX. Only the first failure posts (owner 10-16: a cap that left a target waiting for a new
+# request was a stop nobody was told of; a fix that lands on the box, or a unit that comes back, now deploys).
+BACKOFF, BACKOFF_MAX = 600, 6 * 3600
+
+
+def retry_wait(tries):
+    """-> seconds a target failed `tries` times waits before the next try."""
+    return min(BACKOFF * 2 ** max(int(tries) - 1, 0), BACKOFF_MAX)
 
 
 def waiting(repo):
@@ -734,7 +742,7 @@ def deploy_one(repo, target, sha, since=None):
 
 def run(repo, green=None):
     """Deploy the repo's request to every target the tip passed and nobody holds. -> the request dict, or None.
-    A failed target is tried again by the next call, TRIES times in all; after that only a new request moves it."""
+    A failed target is tried again once its retry_wait has passed, with no cap on the tries."""
     if "--" in repo:
         with contextlib.suppress(OSError):
             os.unlink(req_path(repo))
@@ -754,7 +762,7 @@ def run(repo, green=None):
     for target, st in req["targets"].items():
         if st.get("state") in ("deployed", "verified", "unverified"):
             continue
-        if st.get("state") == "failed" and int(st.get("tries") or 0) >= TRIES:
+        if st.get("state") == "failed" and time.time() < float(st.get("retry_at") or 0):
             continue
         h = held(target)
         if h:
@@ -764,14 +772,19 @@ def run(repo, green=None):
         st.update(state=state, why=line, at=C.now())
         if state == "failed":
             st["tries"] = int(st.get("tries") or 0) + 1
+            st["retry_at"] = time.time() + retry_wait(st["tries"])
         C.log("deployed" if state != "failed" else "deploy-failed", repo, "deploy", target=target, sha=sha[:12],
               state=state)
         pid = f"land:{repo}:deploy:{target}:{state}@{sha[:12]}"
         if state == "failed":
             # --major: the owner was told "merged", so a deploy that failed is his to know, on #<repo> and not only in
-            # the -updates lane (#770 was called live by hand while its deploy had failed, 2026-09-28)
+            # the -updates lane (#770 was called live by hand while its deploy had failed, 2026-09-28). Once, on the
+            # first failure: the retries that follow on backoff are queue.log lines, not more cards
+            if st["tries"] > 1:
+                continue
             C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--major", "--id", pid,
-                        f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}"], repo, 0)
+                        f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}. It is tried "
+                        f"again in {retry_wait(1) // 60} min and then less often, without another post"], repo, 0)
             continue
         text = f"[{repo}] deployed {sha[:12]}" + (f" to {target}" if target != repo else "")
         if state == "unverified":

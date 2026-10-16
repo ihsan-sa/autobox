@@ -183,6 +183,18 @@ class Routes(Stubbed):
             ["cc-slack", "inject", "demo", "[demo] PR #7 landing stopped: a check is red. The way back in: fix it and "
              "push; the lane takes the new head."]])
 
+    def test_a_long_stop_keeps_its_next_action_whole(self):
+        # owner 10-16: a stop carries its reason and the next action in one line; the cut falls on the reason
+        nxt = " — next: merge main into it by hand and push; the push queues it again"
+        why = "PR #7 conflicts with main: " + "a/" * 150 + nxt
+        short = C.shorten_stop(why)
+        self.assertEqual(len(short), C.STOP_CARD_MAX)
+        self.assertTrue(short.endswith("…" + nxt), short)
+        C.stopped(self.job(), why, "planning")
+        self.assertIn(nxt, self.argvs("cc-slack post")[0][-1])
+        self.assertEqual(C.shorten_stop("x" * 300), "x" * (C.STOP_CARD_MAX - 1) + "…")   # no next action: as before
+        self.assertEqual(C.shorten_stop("short" + nxt), "short" + nxt)
+
     def test_a_behind_update_is_said_and_put_into_the_repos_session_once(self):
         """Row note (10-13): the lane updated a BEHIND branch "and say so to the repo's seat"."""
         why = "GitHub refused the merge because the branch is behind main, so the lane updated the branch"
@@ -456,15 +468,17 @@ class Board(Stubbed):
         B.close(self.job(body="Closes req-1 and req-2"))
         self.assertEqual(self.answered(), ["req-1"])
 
-    def test_at_most_three_requests_per_pr(self):
+    def test_every_request_the_brief_closes_is_answered_with_no_cap(self):
+        # owner 10-16: no count cap; five requests are five answers
         self.board("demo", {"own": {"pr": "7"}})
         ids = [f"req-{n}" for n in range(1, 6)]
         for r in ids:
             self.request(r)
         self.brief("Closes " + ", ".join(ids))
         line = B.close(self.job(body="Closes " + ", ".join(ids)))
-        self.assertEqual(self.answered(), ids[:3])
-        self.assertIn("more than 3 requests, left open: req-4, req-5", line)
+        self.assertEqual(self.answered(), ids)
+        self.assertNotIn("left open", line)
+        self.assertIn("answers request " + ", ".join(ids), line)
 
     def test_a_bad_request_file_never_keeps_the_row_from_merged(self):
         # "read_json returning a list or string raises AttributeError ... the row never goes merged"
