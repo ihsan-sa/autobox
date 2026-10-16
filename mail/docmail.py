@@ -15,6 +15,7 @@ NOTHING HERE SENDS. `compose` runs send_to's recipient gate (outbound.cold_gate,
 look at the caps and both templates BEFORE a link is asked for, so no link names an address that is not on the owner's
 list or is minted for a mail a bad template would refuse, and returns the subject, text and HTML for cc-mail to hand
 to outbound.send_to, whose list, caps and log are the same as every other mail's."""
+import datetime
 import html as H
 import json
 import os
@@ -59,15 +60,12 @@ def unknown(text):
 
 
 def render(text, fields, escape):
-    """The template with each {{name}} filled, or a str saying which name it does not know."""
-    why = unknown(text)
-    if why:
-        return None, why
-
+    """The template with each {{name}} filled. template() has already refused a template naming a field that is not
+    one of FIELDS, so every slot here is known and render cannot refuse after the link is minted."""
     def fill(m):
         v = fields.get(m.group(1), "")
         return H.escape(v).replace("\n", "<br>\n") if escape else v
-    return SLOT.sub(fill, text), None
+    return SLOT.sub(fill, text)
 
 
 def document(number, root=None):
@@ -88,11 +86,9 @@ def document(number, root=None):
         return None, "no document %s in the library" % number
     date = rev.get("date") or ""
     try:
-        y, mo, dd = (int(x) for x in date.split("-"))
-        if not 1 <= mo <= 12:
-            raise ValueError(mo)
-        date = "%d %s %d" % (dd, "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[mo - 1], y)
-    except ValueError:                       # not a Y-M-D date: the register's own text stands
+        day = datetime.date(*(int(x) for x in date.split("-")))
+        date = "%d %s %d" % (day.day, "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[day.month - 1], day.year)
+    except (ValueError, TypeError):          # not a real Y-M-D date (2026-13-01, 2026-09-31): the register's text stands
         pass
     proj = reg.get("projects", {}).get(d.get("project"), {})
     return {"title": d.get("title") or number, "number": "%s-%s" % (m.group(1), rev.get("rev")),
@@ -125,10 +121,5 @@ def compose(cfg, number, to, subject="", note="", run=None, channel=""):
     if r.returncode != 0 or len(out) != 1 or not re.fullmatch(r"https?://\S+", out[0].strip()):
         return ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
     fields.update(link=out[0].strip(), note=(note or "").strip())
-    html, why = render(h, fields, True)
-    if why:
-        return why
-    text, why = render(t, fields, False)
-    if why:
-        return why
+    html, text = render(h, fields, True), render(t, fields, False)
     return (subject or "").strip() or fields["title"], text.strip() + "\n", html

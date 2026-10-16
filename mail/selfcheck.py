@@ -4495,7 +4495,9 @@ def run():
                 "project": "001", "title": "Q3 <plan>", "revisions": [{"rev": "A", "date": "2026-09-01"},
                                                                       {"rev": "B", "date": "2026-09-07"}]},
                 "001-0004": {"project": "001", "title": "odd dates", "revisions": [{"rev": "A", "date": "2026-13-01"},
-                                                                                  {"rev": "B", "date": "2026-00-05"}]}}}, f)
+                                                                                  {"rev": "B", "date": "2026-00-05"},
+                                                                                  {"rev": "C", "date": "2026-09-00"},
+                                                                                  {"rev": "D", "date": "2026-09-31"}]}}}, f)
         fake28 = os.path.join(b.tmp, "cc-docs")
         with open(fake28, "w") as f:
             f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argv28 + "\necho https://lib.test/l/abc\n")
@@ -4554,6 +4556,8 @@ def run():
                 import docmail                    # noqa: E402
                 dC, wC = docmail.document("001-0004-A", docs28)
                 dD, wD = docmail.document("001-0004-B", docs28)
+                dE, wE = docmail.document("001-0004-C", docs28)
+                dF, wF = docmail.document("001-0004-D", docs28)
                 os.remove(os.path.join(tpl28, "library-document.html"))
                 defaults28, docmail.DEFAULTS = docmail.DEFAULTS, os.path.join(b.tmp, "no-defaults")
                 try:
@@ -4602,6 +4606,8 @@ def run():
           "…and with no template in either place the mail is refused by that line before cc-docs is asked")
         k(wC is None and wD is None and dC["date"] == "2026-13-01" and dD["date"] == "2026-00-05",
           "…and a register date whose month is outside 1-12 stands as written instead of crashing or naming Dec")
+        k(wE is None and wF is None and dE["date"] == "2026-09-00" and dF["date"] == "2026-09-31",
+          "…and so does one whose day the month does not have, instead of rendering as 0 Sep or 31 Sep")
         k(rc5 == 1 and n5 == n4b and a5 == [] and "not sent — " in err28 and "MAIL_OUT_PER_HOUR=1" in err28,
           "…and a mail the caps would stop is refused before cc-docs is asked, so no link is minted for it")
 
