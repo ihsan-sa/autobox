@@ -182,9 +182,12 @@ MODULE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 def run_files(run: str) -> list:
     """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
     tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after
-    `-m` (`python3 -m unittest tests.test_x`, up to the next `&&`, `;` or `|`) names its file, tests/test_x.py."""
+    `-m` (`python3 -m unittest tests.test_x`, up to the next `&&`, `;` or `|`) names its file, tests/test_x.py. A
+    redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a trailing `;` is not
+    part of the word."""
     words = run.replace("'", " ").replace('"', " ").split()
-    out = [w.rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "$", "~"))]
+    out = [w.rstrip(";").rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "~"))
+           and not any(c in w for c in "<>$")]
     for i, w in enumerate(words):
         if w == "-m":
             for x in words[i + 1:]:

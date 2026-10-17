@@ -446,6 +446,23 @@ def _selfcheck():
         rc2, o2 = run("fold", "901-0002", "901-0003")
         ok("retiring a retired number is refused, and so is folding a document with a retired revision",
            rc == 2 and rc2 == 2 and "901-0003" in load()["documents"])
+        # a board's own project under a Boards group, while a project outside any group is still named Boards:
+        # the filer cannot rename a shared project, so it files, the old project stays as it was, and it is told
+        ROOT = os.path.join(t, "r7b")
+        b1, b2 = (mkpdf(src, f"b{i}", f"Board paper {w}") for i, w in enumerate(("one", "two"), 1))
+        run("file", b1, "--project", "Boards", "--kind", "work", "--title", "Board index")
+        rc, o = run("file", b2, "--project", "Boards/PCB-0024-A rf-load-50ohm", "--title", "Highlight")
+        ps = load()["projects"]
+        ok("Group/Name files while a project outside any group has the group's name, of that project's kind, "
+           "and leaves that project as it was",
+           rc == 0 and o.startswith("002-0001-A") and "--rename" in o
+           and (ps["002"]["group"], ps["002"]["name"], ps["002"]["kind"]) == ("Boards", "PCB-0024-A rf-load-50ohm", "work")
+           and (ps["001"]["group"], ps["001"]["name"]) == (None, "Boards"))
+        rc, o = run("file", b2, "--project", "PCB-0024-A rf-load-50ohm", "--title", "Highlight")
+        rc2, o2 = run("project", "001", "--rename", "Boards/Index")
+        ok("the board's project is found by its bare name, and the old project can still be renamed into the group",
+           rc == 0 and "unchanged" in o and rc2 == 0
+           and (load()["projects"]["001"]["group"], load()["projects"]["001"]["name"]) == ("Boards", "Index"))
         # groups and move: a Career project whose letters move into projects of their own under a Career group
         ROOT = os.path.join(t, "r7")
         g1, g2, g3, g4 = (mkpdf(src, f"g{i}", f"Gamma paper {w}") for i, w in enumerate(("one", "two", "three", "four"), 1))
@@ -454,9 +471,6 @@ def _selfcheck():
         run("file", g4, "--project", "Kid", "--member", "kid1", "--title", "Kid paper")
         tok = run("public", "001-0002-A", "on")[1].strip()
         run("star", "001-0002", "on")
-        rc, o = run("file", g3, "--project", "Career/Cover letter", "--title", "Cover letter, Zeta")
-        ok("a group cannot share its name with a project outside any group: nothing filed, no project made",
-           rc == 2 and "--rename" in o and sorted(load()["projects"]) == ["001", "901"])
         rc, o = run("project", "001", "--rename", "Career/Resume")
         p1 = load()["projects"]["001"]
         ok("rename puts a project in a group and keeps its number", rc == 0 and (p1["group"], p1["name"]) == ("Career", "Resume"))
@@ -486,6 +500,13 @@ def _selfcheck():
            rc == 0 and o.split("\t")[:2] == ["001-0002-A", "002-0002-A"] and "001-0002" not in reg["documents"]
            and d.get("revisions", [{}])[0].get("file") == os.path.relpath(nf, ROOT)
            and os.path.isfile(nf) and not os.path.exists(os.path.join(ROOT, old)))
+        mt = pdftext(nf) if os.path.isfile(nf) else ""
+        with open(nf, "rb") as f:
+            msha = hashlib.sha256(f.read()).hexdigest()
+        ok("move stamps the new number where the old one was, and records the copy's new bytes",
+           "002-0002-A" in mt and "001-0002" not in mt and carried_numbers(mt) == {"002-0002-A"}
+           and d["revisions"][0]["sha256"] == msha and d["revisions"][0]["bytes"] == os.path.getsize(nf)
+           and "prints" not in d["revisions"][0] and not os.path.exists(nf + ".part"))
         ok("a moved document keeps a note of its old number, its stars and its source",
            d.get("moved_from") == ["001-0002"] and "owner" in starred_by(d) and d.get("source", "").endswith("g2.tex"))
         ok("the old number is retired with where it went, and its public link stops working",
@@ -909,6 +930,27 @@ def _selfcheck():
             ok("a new revision under the new number answers feedback left on the old one",
                rc == 0 and o.startswith("002-0001-B\t") and it["status"] == "done"
                and it["reply"] == "answered by rev B")
+            # a move whose copy's stamp cannot be redone (a register of its own: the filed copy is swapped for its
+            # unstamped build, as a re-rendered one carries no appended stamp to cut): it keeps the old number, says
+            # so, and the same content filed again is the next letter under the new number, not unchanged
+            ROOT = os.path.join(t, "r-pr")
+            p1 = mkpdf(src, "pr1", "Prints one")
+            run("file", p1, "--project", "Src", "--kind", "work", "--title", "P doc")
+            pf = os.path.join(ROOT, load()["documents"]["001-0001"]["revisions"][0]["file"])
+            os.chmod(pf, 0o644)
+            shutil.copy(p1, pf)
+            rcm, om = run("move", "001-0001", "Other", "--kind", "work")
+            pr = load()["documents"].get("002-0001", {}).get("revisions", [{}])[0]
+            ok("a moved copy whose stamp cannot be redone is recorded as printing the old number, and named",
+               rcm == 0 and pr.get("prints") == "001-0001-A" and "002-0001-A\tstill prints 001-0001-A" in om)
+            rc, o = run("file", p1, "--project", "Other", "--title", "P doc")
+            nr = load()["documents"].get("002-0001", {}).get("revisions", [])
+            ok("the same content filed after it is the next letter, stamped with the new number",
+               rc == 0 and o.startswith("002-0001-B\t") and "unchanged" not in o and len(nr) == 2
+               and "prints" not in nr[-1] and carried_numbers(pdftext(os.path.join(ROOT, nr[-1]["file"])))
+               == {"002-0001-B"})
+            rc, o = run("file", p1, "--project", "Other", "--title", "P doc")
+            ok("and filed once more it is unchanged", rc == 0 and o.startswith("002-0001-B\t") and "unchanged" in o)
             # a member view (a register of its own) never carries the filer the owner's copy does
             ROOT = os.path.join(t, "r-view")
             run("file", mkpdf(src, "v1", "View one"), "--project", "Src", "--kind", "work", "--title", "V doc")

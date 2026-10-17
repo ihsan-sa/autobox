@@ -594,6 +594,24 @@ class DeadWeight(unittest.TestCase):
         self.assertEqual(self.faults(self.drop("member", unit), member, unit), ["check 'member' was removed"])
         self.assertEqual(self.faults(self.drop("member", unit), member + ("tests/slack.py",), unit), [])
 
+    def test_a_redirection_or_a_variable_names_no_run_file(self):
+        """the Opus read of #1311: `2>/dev/null`, `</dev/null` and `core/bin/$t` are no files, and `;` is no part of
+        a word."""
+        self.assertEqual(M.run_files("bin/x selfcheck 2>/dev/null </dev/null >/dev/null; for t in a; do core/bin/$t"
+                                     " -n; done"), ["bin/x"])
+        self.assertEqual(M.run_files("bash -n bin/x; bin/y selfcheck"), ["bin/x", "bin/y"])
+        # a check whose only slash-words are redirections names no run file, so never_ran cannot let the head drop it
+        member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",
+                  "tests/member-lib.sh")
+        quiet = self.BASE.replace('run = "bin/cc-member selfcheck"', 'run = "cc-member selfcheck 2>/dev/null"')
+        self.assertEqual(self.faults(self.drop("member", quiet), member, quiet), ["check 'member' was removed"])
+        self.assertEqual(self.faults(self.drop("member", quiet), (), quiet), ["check 'member' was removed"])
+
+    def test_an_added_check_running_only_redirections_is_not_refused_for_its_tool(self):
+        quiet = self.GHOST.replace("bin/cc-ghost selfcheck", "cc-ghost selfcheck </dev/null >/dev/null")
+        base, head = AddOnly.two(None, self.BASE + quiet, self.BASE)
+        self.assertEqual(M.widen_faults(base, head, self.trees()), [])
+
     def test_a_check_whose_run_names_no_file_or_a_survivor_never_goes(self):
         # `-m unittest discover` names no file: the check stays even with every path and fixture gone
         member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",

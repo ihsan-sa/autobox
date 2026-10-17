@@ -594,6 +594,16 @@ class TestReview(Case):
         self.assertIn("`moot`", R.load_prompt("delta.md"))
         self.assertIn("moot", R.strict(R.SCHEMA)["required"])   # codex's closed schema asks for it too
 
+    def test_every_read_is_told_what_it_never_sees(self):
+        """dispatch #1111: a brief asked for facts in the PR body, which no read is given past its Tested section, and
+        three heads were handed back on 'the body was not provided'; another asked for process ids an hour stale."""
+        for name in ("review.md", "delta.md", "security.md"):
+            text = R.load_prompt(name)
+            self.assertIn("You are given nothing else: not the rest of the PR's description", text)
+            self.assertIn("never a blocker, because no push can show you a\n  description", text)
+            self.assertIn("never\n  a reading that only holds when it is taken (a process id", text)
+        self.assertIn("`moot` too when no push could carry it", R.load_prompt("delta.md"))
+
     def test_a_carried_blocker_keeps_its_text_and_kind_tag_every_round(self):
         """An unresolved prior row is carried with its own text and its [security] tag in front, so a delta read of
         that handback still has a [security] row to pin; a row the read resolved is not carried."""

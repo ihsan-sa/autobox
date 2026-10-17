@@ -7,6 +7,7 @@
 def selfcheck():
     global PEER_LAUNCH_TIMEOUT
     import shutil
+    import signal
     import tempfile
     n = bad = 0
 
@@ -270,6 +271,7 @@ esac''')):
             PEER_LAUNCH_TIMEOUT = keep_to
         t("to_peer: a launch that never returns is bounded, and the peer rested",
           ("did not take it" in got, time.time() - t0 < 10, _peer_rest[0] > time.time()), (True, True, True))
+        t("to_peer: …and the launch waits here again with no placing stamp", read_entry(ent).get("placing"), None)
         ok_ssh = f"{d}/ok-ssh"
         open(ok_ssh, "w").write("#!/bin/sh\nexit 0\n")
         os.chmod(ok_ssh, 0o755)
@@ -346,6 +348,75 @@ esac''')):
                 break
             time.sleep(0.2)
         t("restart: it runs by itself once the slot is freed", os.path.exists(mark), True)
+
+        # PLACING (landing's security read of #1159): the waiter is killed with its tmux server after the peer took
+        # the launch and before the hub recorded it. resume must not start it a second time here.
+        def placing(name):
+            """a busy home whose waiter is killed, with its server, while a peer with room is starting the launch"""
+            d = fixture(name)
+            hub = f"{d}/hubhome"
+            os.makedirs(f"{hub}/.cc/peer")
+            os.makedirs(f"{hub}/.cc/state/r/p")
+            open(f"{hub}/.cc/peer/dest", "w").write("user@peerbox\n")
+            open(f"{hub}/.cc/state/r/p/task.md", "w").write("Goal: a worker.\n")
+            ssh = f"{d}/accept-ssh"   # the peer says it has room, then takes the launch and is still answering
+            open(ssh, "w").write(f'#!/bin/sh\n[ "$1" = room ] && exit 0\ntouch {d}/accepted\nexec sleep 60\n')
+            os.chmod(ssh, 0o755)
+            loop = f"{d}/cc-loop"
+            open(loop, "w").write(f"#!/bin/sh\ntouch {d}/ran-here\n")
+            os.chmod(loop, 0o755)
+            srv = subprocess.Popen(["sleep", "60"])
+            procs.append(srv)
+            w = subprocess.Popen([sys.executable, __file__, "admit", "r/p", "--log", f"{d}/loop.log", "--", loop, "r",
+                                  "p"], env=dict(os.environ, TMUX=f"{d}/sock,{srv.pid},0", TMUX_PANE="%1", HOME=hub,
+                                                 CC_PEER_DIR=f"{hub}/.cc/peer", CC_PEER_SSH=ssh, LANDER_LOADAVG=hot),
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            procs.append(w)
+            e = queued("r/p")
+            for _ in range(100):
+                if os.path.exists(f"{d}/accepted"):
+                    break
+                time.sleep(0.1)
+            stamped = read_entry(e).get("placing") if e else None
+            os.killpg(w.pid, signal.SIGKILL)   # the waiter and the cc-peer it is waiting on
+            w.wait()
+            srv.kill()
+            srv.wait()
+            open(f"{d}/up", "w").close()
+            os.environ["CC_PEER_DIR"] = f"{hub}/.cc/peer"
+            return d, e, hub, stamped
+
+        d, e, hub, stamped = placing("placing")
+        t("placing: the entry is stamped before the peer is asked to launch", isinstance(stamped, float), True)
+        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        t("placing: resume leaves a launch the peer may be running, and opens no window",
+          ("left r/p" in r.stdout, "resumed" in r.stdout, bool(e) and os.path.exists(e), lines(f"{d}/spawned")),
+          (True, False, True, []))
+        subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        t("placing: …and its log says so once, however often resume runs",
+          open(f"{d}/loop.log").read().count("not relaunched: its waiter died while handing it to the peer"), 1)
+        t("placing: status names it as one to check on the peer",
+          "lost    r/p — its waiter died while handing it to the peer" in subprocess.run(
+              [sys.executable, __file__, "status"], capture_output=True, text=True).stdout, True)
+        t("placing: …and it never ran here", os.path.exists(f"{d}/ran-here"), False)
+        os.environ["CC_PEER_DIR"] = f"{base}/nopeer"
+
+        d, e, hub, stamped = placing("placed")
+        os.makedirs(f"{hub}/.cc/peer/placed/r", exist_ok=True)   # cc-peer recorded the start just before it died
+        open(f"{hub}/.cc/peer/placed/r/p", "w").write(f"{'a' * 32} peerbox {int(time.time())}\n")
+        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        t("placed: a launch the hub recorded on the peer is dropped from the queue, not relaunched",
+          ("dropped r/p: it was started on peerbox" in r.stdout, bool(e) and os.path.exists(e), lines(f"{d}/spawned"),
+           os.path.exists(f"{d}/ran-here")), (True, False, [], False))
+        os.environ["CC_PEER_DIR"] = f"{base}/nopeer"
+
+        d, e, hub, stamped = placing("placed-before")
+        os.makedirs(f"{hub}/.cc/peer/placed/r", exist_ok=True)   # an older launch's record says nothing of this one
+        open(f"{hub}/.cc/peer/placed/r/p", "w").write(f"{'a' * 32} peerbox {int(stamped or time.time()) - 3600}\n")
+        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        t("placed-before: a placed record older than the stamp is not taken for this launch",
+          ("left r/p" in r.stdout, bool(e) and os.path.exists(e), lines(f"{d}/spawned")), (True, True, []))
+        os.environ["CC_PEER_DIR"] = f"{base}/nopeer"
 
         # …and the case kept apart from it: a waiter whose tmux server is still up was ended on purpose
         d = fixture("killed", cap=1)

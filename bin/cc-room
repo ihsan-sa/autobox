@@ -74,6 +74,13 @@ goes to the window with `tmux new-window -e`, never into its command line. An en
 `resume` does its tmux calls outside the room lock, one `resume` at a time, and re-reads an entry under the lock
 before it changes it, so a cancel or an adoption in between is never written over.
 
+PLACING (landing's security read of #1159). Before a waiter calls `cc-peer launch` it stamps its entry `placing`
+under the lock, and a peer that did not take the launch clears the stamp. A waiter killed between the two leaves a
+lost entry `resume` never relaunches blind, since the peer may already run it: when cc-peer's placed/REPO/TRACK
+record is as new as the stamp, the launch runs there and the entry goes; otherwise the entry stays, the log says so
+once and status names it, until a person checks the peer and cancels it or launches it again (a fresh `cc … --go`
+adopts it and drops the stamp).
+
 NOTICE (2026-10-01: a light website worker sat 3 h behind "the box is busy" while the owner chased it twice). A
 launch queued CC_ROOM_NOTICE_AFTER seconds (cc-config, 3600) tells the seat that dispatched it, once: `cc-broker
 inject --source room` to `<repo>@<alias>` when an orch dispatched it (CC_SLACK_ALIAS, which `cc … --go` carries into
@@ -529,6 +536,9 @@ def to_peer(what, cmd, log, me, name):
     with Lock():
         if not os.path.exists(me):
             return "cancelled"
+        e = read_entry(me)
+        e["placing"] = time.time()   # PLACING, in the header: a waiter killed from here on is never relaunched blind
+        rewrite(me, e)
     try:   # cc-peer's own three tries take at most about 280 s; this bounds a call that never returns
         rc = subprocess.run([f"{BIN}/cc-peer", "launch", what] + (["--log", log] if log else []) + ["--"] + list(cmd),
                             timeout=PEER_LAUNCH_TIMEOUT).returncode
@@ -537,6 +547,10 @@ def to_peer(what, cmd, log, me, name):
         rc = 1
     if rc:
         _peer_rest[0] = time.time() + PEER_REST
+        with Lock():
+            e = read_entry(me)
+            if e.pop("placing", None):   # it waits here again, so a restart may relaunch it as before
+                rewrite(me, e)
         return "the peer did not take it (cc-peer launch above); it waits here"
     with Lock():   # started there: whatever came in meanwhile, the entry goes, so nothing runs it here too
         tomb = f"{room_dir()}/cancelled/{name}"
@@ -726,6 +740,26 @@ def resume_one(p, e):
         print(f"dropped {what}: {why}")
         return 0
 
+    # the brief: "have resume check the peer (or skip) for an entry left in 'placing' and not relaunch blindly"
+    if e.get("placing"):   # PLACING: its waiter died while it handed this launch to the peer
+        repo, _, track = what.partition("/")
+        try:
+            rec = open(f"{peer_dir()}/placed/{repo}/{track}").read().split()
+        except OSError:
+            rec = []
+        # cc-peer stamps whole seconds, so the stamp is compared floored; the same second counts as this launch
+        if len(rec) >= 3 and rec[2].isdigit() and int(rec[2]) >= int(float(e["placing"])):
+            return drop(f"it was started on {rec[1]} before the restart and runs there")
+        if not e.get("placing_said"):
+            with Lock():
+                if read_entry(p) == e:
+                    e["placing_said"] = time.time()
+                    rewrite(p, e)
+            logline(e.get("log"), f"cc-room: {what} not relaunched: its waiter died while handing it to the peer, "
+                                  f"which may be running it; check the peer, then `cc-room cancel {what}` or "
+                                  f"launch it again")
+        print(f"left {what}: it may already run on the peer")
+        return 0
     try:
         if subprocess.run(tm + ["has-session", "-t", sess], capture_output=True, timeout=10).returncode:
             return 0   # its server is not back yet: the next tick tries again
@@ -841,7 +875,9 @@ def status():
         for p, (pid, what) in live("queue").items():
             print(f"queued  {what} (pid {pid})")
         for p, e in lost_entries().items():
-            print(f"lost    {e.get('what')} — its waiter died with a restart; `cc-room resume` starts it again")
+            print(f"lost    {e.get('what')} — " + ("its waiter died while handing it to the peer; check the peer, "
+                  "then cancel it or launch it again" if e.get("placing") else
+                  "its waiter died with a restart; `cc-room resume` starts it again"))
         for p, (pid, what) in live("heavy").items():
             print(f"heavy   {what} (pid {pid})")
         for p, (pid, what) in live("heavy-queue").items():

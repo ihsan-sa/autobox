@@ -10,7 +10,9 @@ def selfcheck():
     rows = f"{d}/rows"
     stub = f"{d}/board"
     with open(stub, "w") as f:
-        f.write(f"#!/bin/sh\n[ -f {d}/refuse ] && exit 1\nprintf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n")
+        f.write(f"#!/bin/sh\n[ \"$1\" = get ] && {{ grep -q \"^$3|\" {rows} 2>/dev/null && echo t; exit 0; }}\n"
+                f"[ -f {d}/writes ] && printf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n"
+                f"[ -f {d}/refuse ] && exit 1\nprintf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n")
     os.chmod(stub, 0o755)
     os.environ.update(CC_STALL_BOARD=stub, CC_STALL_REPO="ctl")
     ok = bad = 0
@@ -29,7 +31,7 @@ def selfcheck():
             return []
 
     def fresh():
-        for p in (STATE, rows, f"{d}/refuse"):
+        for p in (STATE, rows, f"{d}/refuse", f"{d}/writes"):
             if os.path.exists(p):
                 os.remove(p)
 
@@ -135,6 +137,20 @@ def selfcheck():
             run(t, True, s)
     k(t.keys == [] and raised() == [], "a ready session and a busy one: no key, no row")
     k(not any("dialog" in x for x in load()), "…and no dialog state kept for them")
+    # 7b an idle session whose last reply asks its reader something: a dialog word above an empty input box is no
+    # dialog (a 2026-10-14 member window was raised from exactly this screen); the same word below the box still is
+    idle = ("⏺ The draft is ready. Do you want to send it now, or edit it first?\n\n✻ Cooked for 15s · done 5:33 PM\n"
+            "────────────────\n❯\u00a0\n────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+    fresh(); t = Fake(); t.add("member-test", idle)
+    with q:
+        for s in (1000, 1000 + STAND_S, 1000 + 2 * STAND_S):
+            run(t, True, s)
+    k(t.keys == [] and raised() == [], f"a question in a finished reply above an empty input box raises nothing: {raised()}")
+    fresh(); t = Fake(); t.add("box", "❯\u00a0\n" + ODD)
+    with q:
+        for s in (1000, 1000 + STAND_S):
+            run(t, True, s)
+    k(len(raised()) == 1, "…but a dialog drawn below an empty prompt line is still raised")
     # 8 a board that refuses: tried again next pass, TRIES times at most
     fresh(); open(f"{d}/refuse", "w").close(); t = Fake(); t.add("box", ODD)
     with q:
@@ -142,6 +158,14 @@ def selfcheck():
             run(t, True, 1000 + i * STAND_S)
     st = load()
     k(st.get("box\tdialog", {}).get("tries") == TRIES, f"a refused row is retried {TRIES} times, then left: {st}")
+    # 8b a board that writes the row and then exits non-zero (a timeout after the save): one row, never three
+    fresh(); open(f"{d}/refuse", "w").close(); open(f"{d}/writes", "w").close(); t = Fake(); t.add("box", ODD)
+    with q:
+        for i in range(8):
+            run(t, True, 1000 + i * STAND_S)
+    st = load()
+    k(len(raised()) == 1 and st.get("box\tdialog", {}).get("told"),
+      f"a row the board wrote but refused is found on the retry and raised once: {raised()} {st}")
     # 9 a window that is gone takes its state with it; a long window name still makes a dispatchable row name
     t.wins = []
     with q: run(t, True, 9000)
@@ -165,6 +189,12 @@ def selfcheck():
           "cc-rc clears the screen before each launch's accept-dialog")
     except OSError:
         k(False, "cc-rc is beside cc-stall")
+
+    # 12 a row quotes the dialog, never the prose the session printed above it (10-14: "Sending the repairs now.")
+    qa = question(ASKED)
+    k("cc fund --repair ideas-2" in qa and "Do you want to proceed?" in qa and "Sending the repairs" not in qa,
+      f"a permission dialog is quoted by its command and question: {qa!r}")
+    k(question(ODD) == "Something new happened", f"a dialog with no rule above it is quoted from its top: {question(ODD)!r}")
 
     print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0

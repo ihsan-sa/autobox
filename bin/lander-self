@@ -94,8 +94,10 @@ A planning seat runs it by hand; the lander never installs itself.
         fetched from the pinned remote and matched against ls-remote) that `check` would refuse were it new — a
         compiled name anywhere, a binary or gitlink under core/ or bin-private/, an executable binary anywhere — and
         each symlink outside config/system/ whose target names a compiled path or resolves to one of those, or out
-        of the repo from under core/ or bin-private/. One path per line, then a summary line. Exit 0 clean, 2 found
-        (a cc-watch check's BAD), 3 could not run.
+        of the repo from under core/ or bin-private/. A plain .png under core/docs/ that opens with PNG's signature
+        is let stand (PICTURES), here and in `check`. One path per line, then a summary line. Exit 0 clean, 2 found
+        (a cc-watch check's BAD), 3 could not run. The shipped watcher config/watch/lander-sweep.json runs it hourly
+        through `cc-watch run`, and a BAD posts to #alerts once.
     lander-self rollback [--legacy]
         Point `current` back at `previous` (and `previous` at what current was). --legacy instead sends every
         `cc-land` call to the release pinned by `lander-self legacy` (the old lander, before the switch), and first
@@ -1449,6 +1451,20 @@ def not_source(path, data):
     return "__pycache__" in path.split("/") or path.endswith(NOT_SOURCE) or data is None or b"\0" in data[:8000]
 
 
+# The Opus read of #1306: "it reports the five PNGs under core/docs/tour/ … add an explicit allowlist, or it stays red
+# and hides a real hit". A picture in a docs tree is let stand when it is a plain (100644) .png whose bytes open with
+# PNG's signature: Python imports no .png, and a link, an x bit or any other name still counts. docs/ is the core
+# tree's docs when the core tree is the repo (core_prefix '').
+PICTURES = ("core/docs/", "docs/")
+PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def picture(path, mode, data):
+    """True when binaries() and tree_binaries() let a binary blob stand: see PICTURES."""
+    return (mode == b"100644" and path.startswith(PICTURES) and path.endswith(".png")
+            and "__pycache__" not in path.split("/") and (data or b"").startswith(PNG))
+
+
 def git_bytes(root):
     """run(*git_args) -> (rc, stdout bytes) for `git -C root`: binaries()'s default reader."""
     def run(*a):
@@ -1513,7 +1529,8 @@ def binaries(root, base, head, pres=BINARY_ROOTS, run=None, peek=None):
     '' is the whole repo): also a symlink (mode 120000) or a blob not_source calls binary, read from the blob, so a
     .gitattributes in the PR cannot call it text; a path whose blob cannot be read (a submodule) counts too; a root
     itself ('bin-private', 'core') counts as under it. Anywhere else but under LINKS_OK: any symlink, whatever its
-    target, and an executable (mode 100755) blob not_source calls binary. A symlink the PR leaves as it is (main's
+    target, and an executable (mode 100755) blob not_source calls binary. A picture() (a plain .png under a docs tree)
+    is let stand. A symlink the PR leaves as it is (main's
     core/bin/cc-mail and bin-private's) is not in the diff, so it is not named.
     `run` reads git as git_bytes does and `peek` reads blobs as git_peek does (the lane passes its sealed repo's for
     both). None when git cannot list them or read them."""
@@ -1545,7 +1562,7 @@ def binaries(root, base, head, pres=BINARY_ROOTS, run=None, peek=None):
             if f[1] == b"120000":
                 hits.add(p)
                 continue
-            read.append((p, f[3].decode()))
+            read.append((p, f[3].decode(), f[1]))
         elif f[1] == b"120000" and not p.startswith(LINKS_OK):
             # Opus delta read of #1301 at b57c0deb: "refuse EVERY added or changed mode-120000 entry anywhere in the
             # repo except under config/system/, whatever its target" — a target read lexically escapes through
@@ -1555,17 +1572,17 @@ def binaries(root, base, head, pres=BINARY_ROOTS, run=None, peek=None):
         elif f[1] == b"100755":
             # perms, after #1301: "a NUL-bearing executable outside core/ and bin-private/ still lands" — such as
             # dashboard/server.py, which bin-private/box-dash links to
-            read.append((p, f[3].decode()))
-    data = peek([sha for _, sha in read])
+            read.append((p, f[3].decode(), f[1]))
+    data = peek([sha for _, sha, _ in read])
     if data is None:
         return None
-    hits.update(p for p, sha in read if not_source(p, data.get(sha)))
+    hits.update(p for p, sha, mode in read if not_source(p, data.get(sha)) and not picture(p, mode, data.get(sha)))
     return sorted(hits)
 
 
 def tree_binaries(root, rev, pres=BINARY_ROOTS, run=None, peek=None):
     """What binaries() would refuse in the whole tree at `rev`, as if every path were new, less the symlinks it
-    already holds: a compiled name anywhere; under `pres`, a binary blob or a gitlink; an executable binary blob
+    already holds and the picture()s it lets stand: a compiled name anywhere; under `pres`, a binary blob or a gitlink; an executable binary blob
     anywhere; and a symlink, anywhere but LINKS_OK, whose target names a compiled path or resolves (lexically, through
     the tree's other links) to a path this list names, or out of the repo from under `pres`. The brief: "a compiled
     file (.so, .pyc, __pycache__, a symlink into one) that reaches main another way is never caught". None when git
@@ -1599,14 +1616,34 @@ def tree_binaries(root, rev, pres=BINARY_ROOTS, run=None, peek=None):
             if under(p):
                 hits.add(p)
         elif under(p) or mode == b"100755":
-            read.append((p, sha))
-    data = peek([sha for _, sha in read] + list(links.values()))
+            read.append((p, sha, mode))
+    data = peek([sha for _, sha, _ in read] + list(links.values()))
     if data is None:
         return None
-    hits.update(p for p, sha in read if not_source(p, data.get(sha)))
+    hits.update(p for p, sha, mode in read if not_source(p, data.get(sha)) and not picture(p, mode, data.get(sha)))
+
+    # The Opus read of #1306: "symlink resolution is exponential … so cache resolved links". A link names others
+    # once per segment, so without the cache each level doubles the work. Only an answer is kept: a None (a loop,
+    # through `busy`, or past 40 hops) returns at once to the link that asked, so it is never walked twice.
+    done, busy = {}, set()
 
     def land(p, depth=0):
-        """Where link p points in the tree, through other links; '..' when it leaves the repo, None past 40 hops."""
+        """Where link p points in the tree, through other links; '..' when it leaves the repo, None in a loop or
+        past 40 hops."""
+        if p in done:
+            return done[p]
+        if p in busy:
+            return None
+        busy.add(p)
+        try:
+            to = walk(p, depth)
+        finally:
+            busy.discard(p)
+        if to is not None:
+            done[p] = to
+        return to
+
+    def walk(p, depth):
         target = (data.get(links[p]) or b"").decode(errors="surrogateescape")
         if depth > 40 or not target or target.startswith("/"):
             return None if depth > 40 else ".."
@@ -2592,6 +2629,36 @@ def sweep_cases(case):
             sys.stderr.close()
             sys.stderr = _err
         case("…while a REV it cannot resolve is 3, not a pass", rc_bad == 3)
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        base = commit("base")
+        png = PNG + b"\0\0\0\rIHDR"
+        put("core/docs/tour/1-what-it-is.png", png)
+        put("core/docs/tour/fake.png", b"\0not a png")
+        put("core/docs/tour/run.png", png, mode=0o755)
+        put("core/lander/pic.png", png)
+        put("bin-private/docs/x.png", png)
+        head = commit("pictures")
+        want = ["bin-private/docs/x.png", "core/docs/tour/fake.png", "core/docs/tour/run.png", "core/lander/pic.png"]
+        # the Opus read of #1306: "it reports the five PNGs under core/docs/tour/ … add an explicit allowlist"
+        case("a plain PNG under core/docs/ stands in check and sweep; a fake, an executable or one elsewhere does not",
+             binaries(repo, base, head) == want and tree_binaries(repo, head) == want)
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        put("docs/l0/ok.py", "print(1)\n")
+        # each link names the one before it twice, so resolving l30 without a cache walks 2^30 links
+        for i in range(1, 31):
+            put(f"docs/l{i}", None, link=f"l{i - 1}/../l{i - 1}")
+        put("docs/top", None, link="l30/ok.py")
+        head = commit("chain")
+        import time
+        t0 = time.monotonic()
+        got = tree_binaries(repo, head)
+        # the Opus read of #1306: "symlink resolution is exponential … so cache resolved links"
+        case("sweep resolves a link that names another twice per level in time linear in the links",
+             got == [] and time.monotonic() - t0 < 20)
 
 
 def hold_cases(case):

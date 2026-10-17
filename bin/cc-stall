@@ -25,9 +25,12 @@ WHAT IT REPORTS (a `raised-stall-<window>-<kind>` row on the control repo's boar
   loop    a relaunch loop: cc-rc's "claude exited (N) - restarting" line grew by LOOP_MIN or more between two passes,
           or grew on LOOP_STREAK passes running. Nothing is pressed: a loop has a cause a key cannot know.
   dialog  any other dialog standing STAND_S or longer at a live, idle claude: the same screen on two passes.
+          The row quotes the dialog itself (its lines below the last rule, up to its options, and its question),
+          never the session's prose above it.
 ONCE PER STALL: a report is stamped in ~/.cc/state/stall.json and re-armed only after a pass where that stall is
 gone (the dialog closed, the count stood still past LOOP_REARM, cc-rc's longest wait), so the same stall never raises twice. A board that refused the row
-is retried on the next pass, TRIES times at most.
+is retried on the next pass under the same row name, TRIES times at most, and a retry that finds the row already on the
+board (an add that wrote it, then timed out or exited non-zero) counts it raised.
 A healthy window — no dialog, or mid-turn, or a count that does not move — is left alone and its state dropped.
 """
 import hashlib, json, os, re, subprocess, sys, tempfile, time
@@ -48,6 +51,7 @@ SETTLE = float(os.environ.get("CC_STALL_SETTLE") or 1.5)      # after a key, bef
 
 RELAUNCH_RE = re.compile(r"^claude exited \(\d+\) - restarting", re.M)     # cc-rc's own line, one per relaunch
 WORKING = "esc to interrupt"
+PROMPT_LINE = re.compile(r"^[^\w>❯]*[>❯](.*)$")   # the input box, as cc-handoff reads it (`❯` since 2.1)
 DIALOG_MARKS = ("Enter to confirm", "Esc to cancel", "Do you want to", "Would you like to proceed?",
                 "No, and tell Claude what to do differently")
 PERMISSION_MARKS = ("Do you want to", "No, and tell Claude what to do differently", "Would you like to proceed?",
@@ -131,6 +135,17 @@ class Tmux:
         return self.run("send-keys", "-t", wid, "-l", "--", key) is not None
 
 
+def on_board(repo, name):
+    """True when the board already holds this row: an add that wrote it and then timed out or exited non-zero."""
+    board = os.environ.get("CC_STALL_BOARD") or f"{BIN}/cc-board"
+    try:
+        r = subprocess.run([board, "get", repo, name, "title"], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
 def raise_row(repo, name, title, brief):
     board = os.environ.get("CC_STALL_BOARD") or f"{BIN}/cc-board"
     try:
@@ -168,16 +183,40 @@ def known(screen):
 
 
 def is_dialog(screen):
-    return any(m in l for l in tail(screen) for m in DIALOG_MARKS)
+    """A dialog word in the bottom block, below the bottom-most EMPTY input box. A dialog replaces the box, so words
+    above an empty one are a finished reply asking its reader something (2026-10-14 a member window: an idle screen,
+    "✻ Cooked for 15s", raised as a dialog). A dialog's own `❯ 1. …` cursor line is not an empty box."""
+    lines = tail(screen)
+    for i in range(len(lines) - 1, -1, -1):
+        m = PROMPT_LINE.match(lines[i])
+        if m and (not m.group(1).strip() or m.group(1).strip().startswith('Try "')):   # strip() takes the NBSP
+            lines = lines[i + 1:]
+            break
+    return any(m in l for l in lines for m in DIALOG_MARKS)
+
+
+RULE = set("─━▔╌ ")
+ASKS = ("Do you want to", "Would you like to proceed?")
 
 
 def question(screen):
-    """The dialog's first line worth quoting (the top of the bottom block), for the row."""
-    for l in tail(screen):
-        s = l.strip(" │─╭╮╰╯")
-        if s and not s.startswith("─"):
-            return s[:160]
-    return "(unreadable)"
+    """What the dialog says, for the row: its lines below the last rule or box top in the bottom block, up to its
+    options, and the question it asks. Never the session's own prose above the dialog: on 2026-10-14 a row quoted
+    "Sending the repairs now." and nobody could tell which dialog had stood."""
+    lines, start = tail(screen), 0
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith("╭") or (s and set(s) <= RULE):
+            start = i + 1
+    body = [s for s in (l.strip(" │─╭╮╰╯") for l in lines[start:]) if s and not set(s) <= RULE]
+    head = []
+    for s in body:
+        if s.startswith("❯") or re.match(r"\d+\. ", s) or any(m in s for m in ASKS):
+            break
+        head.append(s)
+    ask = next((s for s in body if any(m in s for m in ASKS)), None)
+    quote = " · ".join(head[:3] + ([ask] if ask else [])) or (body[0] if body else "")
+    return quote[:240] or "(unreadable)"
 
 
 def report(st, key, repo, window, kind, what, detail, apply_):
@@ -185,7 +224,14 @@ def report(st, key, repo, window, kind, what, detail, apply_):
     ent = st.setdefault(key, {})
     if ent.get("told") or ent.get("tries", 0) >= TRIES:
         return False
-    name = row_name(window, kind)
+    # ONE NAME PER STALL, KEPT ACROSS RETRIES (raised-stall-ai-lab-dialog-10140621): a retry used to stamp a new
+    # minute into the name, so an add that wrote its row and then reported failure raised the same dialog three
+    # times (main:ai-lab, 2026-10-14 06:19/06:21/06:23Z, three workers on one stall). A retry looks first.
+    name = ent.setdefault("name", row_name(window, kind))
+    if ent.get("tries", 0) and on_board(repo, name):
+        ent["told"] = True
+        log(f"{window}\t{kind}\tfound {repo}/{name} on the board after a refused add")
+        return False
     title = f"main:{window} is stuck: {what}"
     brief = (f"GOAL: main:{window} runs again, and whatever stalled it is fixed at its cause.\n"
              f"WHY: cc-stall saw it at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}: {what}. "
@@ -329,6 +375,19 @@ READY = """ ▐▛███▛█   Claude Code
 """
 BUSY = "⏺ Reading files…\n  ✻ Thinking… (esc to interrupt)\n"
 ODD = "  Something new happened\n\n  ❯ 1. Carry on\n    2. Stop\n\n  Enter to confirm · Esc to cancel\n"
+ASKED = """⏺ The box confirmed the pause is lifted, and told members that I'm handling these six.
+  Sending the repairs now.
+
+────────────────────────────────
+ Bash command
+
+   cc fund --repair ideas-2
+   Send the repair for ideas-2
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No, and tell Claude what to do differently (esc)
+"""
 PERM = "  Do you want to make this edit?\n  WARNING: Loading development channels\n  1. I am using this for local development\n  2. Exit\n  Enter to confirm · Esc to cancel\n"
 
 

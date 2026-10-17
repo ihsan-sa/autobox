@@ -249,15 +249,19 @@ J
   # (2026-10-12: every deploy failed on "duplicate session: main"); no server, or only a "main2", still starts one.
   if command -v tmux >/dev/null; then
     u=$(sed -n 's/^ExecCondition=//p' "$UD/tmux-main.service")
-    T=$(mktemp -d /tmp/ccu.XXXXXX); mkfifo "$T/hold"
+    # The server is ended by kill-server, and each pane's sleep bounds it if this shell dies first. EOF on a shared
+    # hold FIFO did not: a pane whose cat opened it after the write closed blocked for good, and 520 servers piled up
+    # holding ~1040 pipe fds (2026-10-17), which pushed the user past pipe-user-pages-soft and broke dispatch's pipes.
+    T=$(mktemp -d /tmp/ccu.XXXXXX)
     tx(){ env -u TMUX TMUX_TMPDIR="$T" "$@"; }
     k "$(t tx bash -c "$u")" "tmux-main starts a server when none runs (a fresh boot, or the old server died)"
-    tx tmux new-session -d -s main2 "cat $T/hold"
+    tx tmux new-session -d -s main2 "sleep 120"
     k "$(t tx bash -c "$u")" "…and when the only session is main2, which a prefix match would have taken for main"
-    tx tmux new-session -d -s main "cat $T/hold"
+    tx tmux new-session -d -s main "sleep 120"
     k "$(nt tx bash -c "$u")" "a session main started outside the unit counts as up: the start is skipped, not failed"
-    : > "$T/hold"   # both panes read EOF and exit; the empty server exits with them
+    tx tmux kill-server 2>/dev/null
     for _ in 1 2 3 4 5 6 7 8 9 10; do tx tmux has-session 2>/dev/null || break; sleep 0.2; done
+    k "$(nt tx tmux has-session)" "the throwaway tmux server is gone when the check ends (none left running)"
     rm -rf "$T"
   else
     k 1 "tmux is installed, so tmux-main's ExecCondition can be checked"

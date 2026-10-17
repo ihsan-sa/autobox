@@ -30,6 +30,10 @@ def selfcheck():
            pick(ancestry(20, proc), None)["pid"] == 20)
         ok("a claude under the manager is still the owner its runtime names",
            pick(ancestry(50, proc), "1")["pid"] == 40)
+        fake(60, 1, "bash", ["bash", str(BIN / "cc")]); fake(70, 60, "bash", ["bash", str(BIN / "cc")])
+        ok("a detached `cc --go` whose shell exited, adopted by pid 1 with only `cc` above cc-task, is still a "
+           "caller: the nearest `cc` owns it, not 'cannot identify the calling process' (2026-10-12)",
+           pick(ancestry(70, proc), "1")["pid"] == 70)
     with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
         env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
         def run(*args):

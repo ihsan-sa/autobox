@@ -156,9 +156,10 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         Group/Name (`Career/Cover letter`) is a project under a parent group: a group is a name, not a number, and
         each of its projects has a PPP of its own, of the kind the group's other projects share when --kind is left
         out. Anywhere a project is named, Group/Name finds it, and so does its bare name when no other group has one.
-        A group's own name is not a project, so `file --project <group>` is refused and names its projects, and a
-        Group/Name is refused while a project outside any group has the group's name (rename that one into it
-        first). Given a group's name, `project` lists its projects.
+        A group's own name is not a project, so `file --project <group>` is refused and names its projects. A
+        project outside any group may share the group's name: Group/Name is still made, of that project's kind when
+        the group has no other, and a note says how to rename that one into the group, which is left to a person.
+        Given a group's name, `project` lists its projects, unless a project outside any group holds the name.
     cc-docs project <name|PPP> --rename <Group/Name | name>
         Rename a project or put it in a group (`project 006 --rename Career/Resume`). Its number, documents and
         files stay as they are.
@@ -172,7 +173,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         none, exit 1.
     cc-docs list [--project <name|PPP|group>]
         One line per document: number of the current revision, date, visibility, title. A group lists every
-        document under its projects.
+        document under its projects, and a project outside any group that shares its name lists only its own.
     cc-docs star <PPP-NNNN> on|off [--viewer owner|<workspace id>]
         Star or unstar a document for one viewer (the owner by default). Stars are per viewer, and a viewer can
         star only a document visible to it.
@@ -209,11 +210,14 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs move <PPP-NNNN> <project> [--kind work|course|member]
         Renumbers a document into another project, made the way `file --project` makes one when it does not exist:
         it takes that project's next number, keeps its letters, title, source, stars and history, and records the
-        old number in its moved_from. Its filed copies and kept sources are renamed to match (their bytes, and any
-        stamp printed in them, are not rewritten), feedback left on the old number is answered by its next revision
-        under the new one, each public link stops working, and the old number is retired. A move that would
-        change who can see the document (to or from a member's project) is refused. Prints
-        `<old number>\t<new number>\t<path>` per revision.
+        old number in its moved_from. Its filed copies and kept sources are renamed to match, and a copy carrying
+        the stamp `file` appended has it cut off and the new number stamped in its place (nothing else in its bytes
+        changes). A copy whose stamp cannot be redone that way (its own build printed the number, or it was
+        re-rendered) keeps it, is recorded as printing the old number, and is named on stderr; filing the same
+        content again then files the next letter rather than finding it unchanged. Feedback left on the old number
+        is answered by its next revision under the new one, each public link stops working, and the old number is
+        retired. A move that would change who can see the document (to or from a member's project) is refused.
+        Prints `<old number>\t<new number>\t<path>` per revision.
     cc-docs link <PPP-NNNN | PPP-NNNN-R | path of a filed PDF> [--kind signed-in|private|public] [--to <email>]…
                  [--name <n>] [--pin]
         Mints a link to a filed document on the library site and prints exactly its url, one line, exit 0: hand that
@@ -418,11 +422,15 @@ def make_project(reg, name, number=None, kind=None, member=None):
         raise Refused(f"{sub!r} is a group: file under {sub}/<project> ("
                       + ", ".join(reg["projects"][p]["name"] for p in group_projects(reg, sub)) + ")")
     if group is not None:
+        # a project outside any group with the group's name stays as it is: renaming a shared project is a person's
+        # call, so the filer is only told, and the group takes that project's kind until it has projects of its own
         flat = find_project(reg, group)
-        if flat and not reg["projects"][flat].get("group"):
-            raise Refused(f"project {flat} is named {group!r}: put it in the group first, "
-                          f"`cc-docs project {flat} --rename '{group}/<its name>'`")
-        kinds = {reg["projects"][q]["kind"] for q in group_projects(reg, group)}
+        flat = flat if flat and not reg["projects"][flat].get("group") else None
+        if flat:
+            print(f"cc-docs: project {flat} is also named {group!r}, outside the group; "
+                  f"`cc-docs project {flat} --rename '{group}/<its name>'` puts it in", file=sys.stderr)
+        kinds = {reg["projects"][q]["kind"] for q in group_projects(reg, group)} or (
+            {reg["projects"][flat]["kind"]} if flat else set())
         kind = kind or (kinds.pop() if len(kinds) == 1 else None)
     if member:
         kind = kind or "member"
@@ -520,6 +528,13 @@ def next_doc(reg, proj):
 
 def current(d):
     return d["revisions"][-1] if d["revisions"] else None
+
+
+def same(d, fp, text):
+    """A build is unchanged when it prints like d's current revision, unless that copy still prints the number it had
+    before a move: then the same content files the next letter, stamped with the number the document has now."""
+    cur = d and current(d)
+    return bool(cur and cur.get("fingerprint") in (fp, textprint(text)) and not cur.get("prints"))
 
 
 # ── the PDF ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -939,6 +954,43 @@ def stamp(src, dst, text):
         if r.returncode != 0 or not os.path.isfile(out) or pages(out) != pages(src):
             raise Refused(f"{src}: the stamp overlay failed (pdflatex exit {r.returncode}); nothing filed")
         shutil.copy(out, dst)
+
+
+def restamp(path, fp, dst, text):
+    """The filed copy at `path` with its appended stamp cut off and `text` stamped in its place, written to dst.
+    The cut is where the stamp's font object starts, the first thing overlay() appends; it holds only when what is
+    left prints `fp`, the fingerprint the revision was filed with. -> True, or False with nothing written when the
+    copy carries no appended stamp (re-rendered, or a number from its own build) or the cut does not match."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        pdf, at = _PDF(data), set()
+        for _, page, inh in pdf.pages():
+            res = pdf.get(page.get("Resources", inh.get("Resources"))) or {}
+            ref = (pdf.get(res.get("Font")) or {}).get("CCDocsStamp")
+            e = pdf.xref.get(ref[0], (0,)) if isinstance(ref, _Ref) else (0,)
+            at.add(e[1] if e[0] == 1 else None)
+    except (_Unreadable, KeyError, ValueError, IndexError, TypeError, AttributeError, zlib.error):
+        return False
+    if len(at) != 1 or None in at:
+        return False
+    with tempfile.TemporaryDirectory(prefix="cc-docs-rs-") as t:
+        orig = os.path.join(t, "orig.pdf")
+        with open(orig, "wb") as f:
+            f.write(data[:at.pop()])
+        try:
+            words = pdftext(orig)
+        except Refused:
+            return False
+        if not fp or fp not in (fingerprint(orig, words), textprint(words)):
+            return False
+        try:
+            stamp(orig, dst, text)
+        except Refused:
+            if os.path.exists(dst):
+                os.unlink(dst)
+            return False
+    return True
 
 
 # ── the source ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -1702,7 +1754,7 @@ def cmd_file(a):
         refuse_quarantined(reg, a)
         proj, num, d, rev = plan(reg, a)
         check_filer_editor(proj, d, a)
-        fresh = not (d and current(d) and current(d).get("fingerprint") in (fp, textprint(text)))
+        fresh = not same(d, fp, text)
         # an unchanged rebuild with --source keeps a source for the current revision when it has none
         full = f"{num}-{rev}" if fresh else f"{num}-{current(d)['rev']}"
         want = fresh or bool(a.source and "sources" not in current(d))
@@ -1731,7 +1783,7 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
         check_filer_editor(proj, d, a)
         # brief: "a changed finished version = next letter, unchanged content = no new letter"
         # a revision filed before page images were hashed carries a text-only print: that still counts as unchanged
-        if d and current(d) and current(d).get("fingerprint") in (fp, textprint(text)):
+        if same(d, fp, text):
             cur = current(d)
             # an unchanged build's supporting files go on the revision it matches, the same way `attach` puts them
             lst, said = merge_attachments(cur.get("attachments") or [], extra, False, f"{num}-{cur['rev']}")
@@ -2410,9 +2462,6 @@ def rename_project(reg, name, new):
         raise Refused(f"project name {new!r} needs a name on each side of the /")
     if group is None and group_projects(reg, sub):
         raise Refused(f"{sub!r} is a group already; name the project inside it, {sub}/<name>")
-    flat = find_project(reg, group) if group else None
-    if flat and flat != p and not reg["projects"][flat].get("group"):
-        raise Refused(f"project {flat} is named {group!r}: put it in the group first")
     reg["projects"][p].update(name=sub, group=group)
     return p
 
@@ -3120,11 +3169,40 @@ def cmd_move(a):
         clash = [n for _, n in moves + srcs if os.path.lexists(os.path.join(ROOT, n))]
         if missing or clash:
             raise Refused(f"{(missing + clash)[0]} is {'missing' if missing else 'in the way'}; nothing changed")
+        # brief: the page carried the old stamp after a move. A stamp cc-docs appended is cut off and the new number
+        # stamped in its place, before anything is renamed; one it cannot redo is recorded as what the copy prints
+        fixed, kept = {}, []
+        os.makedirs(os.path.join(ROOT, "files", proj), exist_ok=True)
+        try:
+            for r, n in moves:
+                if r.get("prints") or r.get("stamped") not in ("overlay", "carried"):
+                    continue
+                part = os.path.join(ROOT, n) + ".part"
+                text = " · ".join([f"{new}-{r['rev']}"] + ([r["describes"]] if r.get("describes") else [])
+                                  + [stampdate(datetime.date.fromisoformat(r["date"]))])
+                if r["stamped"] == "overlay" and restamp(os.path.join(ROOT, r["file"]), r.get("fingerprint"), part,
+                                                         text):
+                    os.chmod(part, 0o444)
+                    fixed[id(r)] = part
+                else:
+                    kept.append(r)
+        except BaseException:
+            for part in fixed.values():
+                os.unlink(part)
+            raise
         # brief: "the old number is retired and never reused, and a note of the old number is kept on the document"
         retire_record(reg, old, d, {"moved_to": new})
-        os.makedirs(os.path.join(ROOT, "files", proj), exist_ok=True)
         for r, n in moves:
-            os.rename(os.path.join(ROOT, r["file"]), os.path.join(ROOT, n))
+            if id(r) in fixed:
+                os.replace(fixed[id(r)], os.path.join(ROOT, n))
+                os.unlink(os.path.join(ROOT, r["file"]))
+                with open(os.path.join(ROOT, n), "rb") as f:
+                    r["sha256"] = hashlib.sha256(f.read()).hexdigest()
+                r["bytes"] = os.path.getsize(os.path.join(ROOT, n))
+            else:
+                os.rename(os.path.join(ROOT, r["file"]), os.path.join(ROOT, n))
+        for r in kept:
+            r["prints"] = f"{old}-{r['rev']}"
         if srcs:
             os.makedirs(os.path.join(ROOT, "sources", proj), exist_ok=True)
         for r, n in srcs:
@@ -3146,6 +3224,9 @@ def cmd_move(a):
     revoke_dropped(dropped)
     for r, n in moves:
         print(f"{old}-{r['rev']}\t{new}-{r['rev']}\t{os.path.join(ROOT, n)}")
+    for r in kept:
+        print(f"{new}-{r['rev']}\tstill prints {r['prints']}: its stamp could not be redone; filing its PDF again "
+              f"(rebuilt with `cc-docs number` if it prints its own) files the next letter", file=sys.stderr)
     return 0
 
 
