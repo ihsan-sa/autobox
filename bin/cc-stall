@@ -32,6 +32,14 @@ gone (the dialog closed, the count stood still past LOOP_REARM, cc-rc's longest 
 is retried on the next pass under the same row name, TRIES times at most, and a retry that finds the row already on the
 board (an add that wrote it, then timed out or exited non-zero) counts it raised.
 A healthy window — no dialog, or mid-turn, or a count that does not move — is left alone and its state dropped.
+
+A DEAD ORCH (a window named <repo>@<alias> with no interactive claude under it, seen on two passes DEAD_S apart, not
+in copy mode and with no open handoff record) is said ONCE to its repo's planning seat, the window named <repo>, by
+cc-msg: the window, since when, and its last screen lines. When cc-msg refuses (that seat is down too) it is raised as
+a `raised-stall-<window>-dead-*` row instead, like a stall. A claude back under the window re-arms it. Nothing is
+restarted: cc-recover brings orchs back only after a mass loss, a boot or an outage, and treats one lone exit as
+deliberate. (2026-10-17: main:<repo>@landing sat as a bare shell, cc-msg refused every handback with "runs no
+interactive claude", and #1458, #1465 and two dispatch stalls waited until planning happened to look.)
 """
 import hashlib, json, os, re, subprocess, sys, tempfile, time
 
@@ -47,6 +55,10 @@ LOOP_GAP = 900                                                # passes further a
 LOOP_REARM = 300                                              # a count still longer than this is a stopped loop: cc-rc's
                                                               # longest wait between relaunches (120 s backoff, 300 s limit fallback)
 TRIES = 3                                                     # a row the board refused is tried this many times
+DEAD_S = int(os.environ.get("CC_STALL_DEAD_S") or 360)      # an orch with no claude this long is dead: past cc-rc's
+                                                              # longest relaunch wait (LOOP_REARM) and a handoff's swap
+ORCH_RE = re.compile(r"([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)")  # <repo>@<alias>; `~next`/`~old` handoff windows never match
+HANDOFF = os.environ.get("CC_HANDOFF_DIR") or f"{HOME}/.cc/state/handoff"
 SETTLE = float(os.environ.get("CC_STALL_SETTLE") or 1.5)      # after a key, before the pane is read again
 
 RELAUNCH_RE = re.compile(r"^claude exited \(\d+\) - restarting", re.M)     # cc-rc's own line, one per relaunch
@@ -249,7 +261,53 @@ def report(st, key, repo, window, kind, what, detail, apply_):
     return False
 
 
+def tell_seat(seat, text):
+    """cc-msg the planning seat. True when it was typed or spooled (rc 0); a seat with no claude refuses (rc 1)."""
+    msg = os.environ.get("CC_STALL_MSG") or f"{BIN}/cc-msg"
+    try:
+        r = subprocess.run([msg, seat, text], capture_output=True, text=True, timeout=120,
+                           env={**os.environ, "CC_MSG_FROM": "cc-stall"}, stdin=subprocess.DEVNULL)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def check_orch(t, st, now, ctl_repo, win, apply_):
+    """An orch window whose claude is gone: one word to its repo's planning seat (the module doc, A DEAD ORCH)."""
+    wid, name, pane_pid, in_mode = win
+    m = ORCH_RE.fullmatch(name)
+    if not m:
+        return
+    dk = f"{name}\tdead"
+    if t.live_claude(pane_pid):
+        st.pop(dk, None)                               # alive (again): re-armed
+        return
+    if in_mode or os.path.exists(f"{HANDOFF}/{name.replace('/', '--')}.json"):
+        return                                         # somebody is scrolling it, or a handoff is swapping it
+    d = st.setdefault(dk, {})
+    d.setdefault("first", now)
+    d["passes"] = d.get("passes", 0) + 1
+    if d["passes"] < 2 or now - d["first"] < DEAD_S or d.get("told") or d.get("tries", 0) >= TRIES:
+        return
+    seat = m.group(1)
+    since = time.strftime("%H:%MZ", time.gmtime(d["first"]))
+    last = " | ".join(tail(t.history(wid) or t.screen(wid) or "", 4))[:300] or "(empty)"
+    what = f"orch window main:{name} ({wid}) has had no claude since {since} or earlier"
+    text = (f"{what}: anything routed to it (lane handbacks, lander stalls) sits unworked. Its last lines: {last}. "
+            f"Reroute its work, or start it again with: cc {seat} --orch {m.group(2)} \"\"")
+    print(f"  dead       main:{name:<24} orch, no claude since {since}")
+    if not apply_:
+        return
+    if tell_seat(seat, text):
+        d["told"] = True
+        log(f"{name}\tdead\ttold {seat}\t{what}")
+        return
+    log(f"{name}\tdead\tcc-msg {seat} refused; raising a row")
+    report(st, dk, ctl_repo, name, "dead", what + f" (and the planning seat main:{seat} refused the message)", last, apply_)
+
+
 def check_window(t, st, now, repo, win, apply_):
+    check_orch(t, st, now, repo, win, apply_)
     wid, name, pane_pid, in_mode = win
     # ── the relaunch loop, read from scrollback whatever runs in the pane now ──
     hist = t.history(wid)

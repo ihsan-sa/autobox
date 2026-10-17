@@ -4,7 +4,7 @@
 # module docstring (it would replace the tool's __doc__) and no top-level name but the defs below.
 
 def selfcheck():
-    global STATE, LOG, SETTLE
+    global STATE, LOG, SETTLE, HANDOFF
     d = tempfile.mkdtemp(prefix="cc-stall-sc.")
     STATE, LOG, SETTLE = f"{d}/stall.json", f"{d}/stall.log", 0
     rows = f"{d}/rows"
@@ -207,6 +207,64 @@ def selfcheck():
     k("cc fund --repair ideas-2" in qa and "Do you want to proceed?" in qa and "Sending the repairs" not in qa,
       f"a permission dialog is quoted by its command and question: {qa!r}")
     k(question(ODD) == "Something new happened", f"a dialog with no rule above it is quoted from its top: {question(ODD)!r}")
+
+    # 13 a dead orch: one cc-msg to its repo's planning seat, with the window and its last lines; a live one, none
+    HANDOFF = f"{d}/handoff"
+    msgs, msub = f"{d}/msgs", f"{d}/msg"
+    with open(msub, "w") as f:
+        f.write(f"#!/bin/sh\n[ -f {d}/msgrefuse ] && exit 1\nprintf '%s|%s|%s\\n' \"$1\" \"$2\" \"$CC_MSG_FROM\" >> {msgs}\n")
+    os.chmod(msub, 0o755)
+    os.environ["CC_STALL_MSG"] = msub
+
+    def sent():
+        try:
+            return open(msgs).read().splitlines()
+        except OSError:
+            return []
+
+    def dead_fresh():
+        fresh()
+        for p in (msgs, f"{d}/msgrefuse"):
+            if os.path.exists(p):
+                os.remove(p)
+    dead_fresh(); t = Fake()
+    t.add("demo@landing", "$ ", hist="⏺ Queued #1458 for the lander.\nme@host:~$ ", live=False)
+    t.add("fab2@boards", READY)
+    with q:
+        for s in (1000, 1000 + DEAD_S // 2, 1000 + DEAD_S, 1000 + DEAD_S + 120, 1000 + DEAD_S + 240):
+            run(t, True, s)
+    got = sent()
+    k(len(got) == 1, f"a dead orch is said once across five passes, and the live orch never: {got}")
+    k(got and got[0].startswith("demo|orch window main:demo@landing (@0) has had no claude since")
+      and "Queued #1458" in got[0] and got[0].endswith("|cc-stall"),
+      f"…to its repo's planning seat, naming the window, its id and its last lines: {got}")
+    k(raised() == [], "…and a told seat means no row")
+    dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    with q: run(t, True, 1000); run(t, True, 1000 + DEAD_S - 1)
+    k(sent() == [], "an orch dead for less than DEAD_S (a cc-rc relaunch wait) is not said yet")
+    dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False); t.add("demo@landing~next", "$ ", live=False)
+    t.add("demo", "$ ", live=False); t.add("demo/fix", "$ ", live=False)
+    os.makedirs(HANDOFF, exist_ok=True); open(f"{HANDOFF}/demo@landing.json", "w").close()
+    with q:
+        for s in (1000, 1000 + DEAD_S):
+            run(t, True, s)
+    os.remove(f"{HANDOFF}/demo@landing.json")
+    k(sent() == [] and raised() == [], "mid-handoff, a ~next window, a seat and a track window are never called dead orchs")
+    dead_fresh(); t = Fake(); w = t.add("demo@landing", "$ ", live=False)
+    with q:
+        run(t, True, 1000); run(t, True, 1000 + DEAD_S)
+        t.live[w] = True; run(t, True, 2000)
+        t.live[w] = False; run(t, True, 3000); run(t, True, 3000 + DEAD_S)
+    k(len(sent()) == 2, f"a claude back under the window re-arms it: a second death is said again: {sent()}")
+    dead_fresh(); open(f"{d}/msgrefuse", "w").close(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    with q:
+        for s in (1000, 1000 + DEAD_S, 1000 + DEAD_S + 120):
+            run(t, True, s)
+    k(len(raised()) == 1 and re.match(r"raised-stall-demo-landing-dead-\d{8}\|", raised()[0]),
+      f"a planning seat that refuses the message (down too) gets one row instead: {raised()}")
+    dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    with q: run(t, False, 1000); run(t, False, 1000 + DEAD_S)
+    k(sent() == [], "without --apply: nothing said")
 
     print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0
