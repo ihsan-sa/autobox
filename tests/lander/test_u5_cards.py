@@ -58,7 +58,8 @@ class Stubbed(unittest.TestCase):
                           U5_STUB_LOG=self.log, U5_STUB_ANSWERS=self.answers_path,
                           CC_LAND_STATE=os.path.join(self.tmp, "land"), CC_BOARDS=os.path.join(self.tmp, "boards"),
                           CC_SLACK_DIR=os.path.join(self.tmp, "slack"), CC_CONFIG=os.path.join(self.tmp, "config"),
-                          CC_LANDER_STATE=os.path.join(self.tmp, "land"), CC_ROLE="track")
+                          CC_LANDER_STATE=os.path.join(self.tmp, "land"), CC_ROLE="track",
+                          CC_BOX="demo")   # demo is the control repo: its stops are the planning seat's
         # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
         for name, val in (("PASSWD_HOME", self.home), ("REVIEWER_CONFIG", os.path.join(self.home, ".cc", "config"))):
             p = mock.patch.object(C, name, val)
@@ -224,6 +225,35 @@ class Routes(Stubbed):
             ["cc-slack", "inject", "demo", "[demo] PR #12 landing stopped: the review budget for this change is spent. "
              "The way back in: fix it and push; the lane takes the new head."]])
         self.assertFalse([a for a in self.argvs("cc-slack") if "#approvals" in a])
+
+    def test_another_repos_stop_goes_to_its_own_seat_not_planning(self):
+        """Row raised-dispatch-landing-asks-flood-planning: 15 dispatch stops were 15 planner requests."""
+        why = "no row owns it, so no round runs for it: merge main into it by hand (a.py)"
+        for i, route in enumerate(("planning", "query")):
+            C.stopped(T.Job(repo="dispatch", pr=20 + i, extra={"queued_at": Q}), why, route)
+            C.stopped(T.Job(repo="dispatch", pr=20 + i, extra={"queued_at": Q}), why, route)   # told once
+        text = f"[dispatch] PR #20: NOT merged ❌ — {why}. It is dispatch's own seat's to settle."
+        self.assertEqual(self.argvs("cc-slack post")[0][-1], text)
+        self.assertEqual([a[:6] + a[-1:] for a in self.argvs("cc-broker inject")], [
+            ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text],
+            ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text.replace("#20", "#21")]])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        self.assertEqual(self.argvs("cc-slack inject"), [])   # no second wake on top of the broker's
+        # lander-self stays the planning seat's, and so does a member's stop
+        C.stopped(T.Job(repo="dispatch", pr=22, extra={"queued_at": Q}), why, "lander-self")
+        C.stopped(T.Job(repo="h--t", pr=23, member="h", extra={"queued_at": Q}), why, "planning")
+        self.assertEqual([a[3] for a in self.argvs("cc-notify")],
+                         [f"land:dispatch:22:query@{Q}", f"land:h--t:23:query@{Q}"])
+        self.assertEqual(len(self.argvs("cc-broker inject")), 2)
+
+    def test_a_stop_the_broker_refuses_still_reaches_planning(self):
+        self.answer({"cc-broker inject": [1, "broker down"]})
+        C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
+        self.assertEqual([a[:4] for a in self.argvs("cc-notify")],
+                         [["cc-notify", "--ask", "--id", f"land:dispatch:30:query@{Q}"]])
+        self.answer({})
+        C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
+        self.assertEqual(len(self.argvs("cc-broker inject")), 2)   # not marked told: the next stop tries it again
 
     def state_file(self, track, name, rec, repo="demo"):
         d = os.path.join(self.home, ".cc", "state", repo, track)

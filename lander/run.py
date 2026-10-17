@@ -3,9 +3,10 @@
 THE TREE. A run never touches a checkout. materialise() writes the tree's files out of git into
 `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.gates.<repo>.<pr>.<rand>/head` (the shape cc-tmp-reap and `cc-sandbox member
 --tree` accept), makes it a git repo with one commit and proves `git write-tree` there equals the tree asked for
-(B1: the identity check greps a real work tree). The files are read out of the checkout's objects in a borrowed repo
-(git.borrowed) and every git there runs with git.blind_env(), so no config, attributes, filter or replace ref of the
-checkout's runs or shapes them. Everything under the run directory goes when the run ends.
+(B1: the identity check greps a real work tree); given the base tree, the repo also holds it as refs/lander/base,
+for a check that compares against main (the guard's differential). The files are read out of the checkout's objects
+in a borrowed repo (git.borrowed) and every git there runs with git.blind_env(), so no config, attributes, filter or
+replace ref of the checkout's runs or shapes them. Everything under the run directory goes when the run ends.
 
 THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` for a member's landing):
   box      by class — static, hermetic and timing in the bwrap profile (sandbox.py); host and box on the host with
@@ -110,6 +111,8 @@ BLOCKED = "blocked-by-main"
 # run_plan(caged=True), `lander check --caged-only`: a check that would run anywhere but the default bwrap on this box
 # is not run and says so. Never a pass: the landing runs it (uncaged).
 DEFERRED = "deferred"
+# materialise(base_tree=): the base (main at the PR's base_sha) as a commit in the check's repo
+BASE_REF = "refs/lander/base"
 
 
 class Unrunnable(RuntimeError):
@@ -118,10 +121,14 @@ class Unrunnable(RuntimeError):
 
 # --- the tree ------------------------------------------------------------------------------------------------------
 
-def materialise(repo_root: str, tree: str, label: str = "lander.0") -> tuple:
-    """-> (run_dir, head_dir). Raises Unrunnable when the tree cannot be written out exactly."""
+def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: str = "") -> tuple:
+    """-> (run_dir, head_dir). Raises Unrunnable when the tree cannot be written out exactly. base_tree, when it is
+    another tree: the head repo also holds it as the commit BASE_REF (only the objects the head lacks are copied in,
+    none written out), so a check can compare against main without an origin/main (tests/guard-replay.sh)."""
     if not re.fullmatch(r"[0-9a-f]{40}", tree or ""):
         raise Unrunnable(f"not a tree id: {tree!r}")
+    if base_tree and not re.fullmatch(r"[0-9a-f]{40}", base_tree):
+        raise Unrunnable(f"not a base tree id: {base_tree!r}")
     run_dir = tempfile.mkdtemp(prefix=f"cc-land.run.{os.getpid()}.", dir=os.environ.get("TMPDIR") or "/tmp")
     try:
         gates = tempfile.mkdtemp(prefix=f"cc-land.gates.{label}.", dir=run_dir)
@@ -157,6 +164,18 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0") -> tuple:
         if got != tree:
             raise Unrunnable(f"the tree written out is {got or 'none'}, not {tree}")
         subprocess.run(g + ["commit", "-qm", f"tree {tree}", "--no-verify"], env=henv, check=True, capture_output=True)
+        if base_tree and base_tree != tree:
+            with G.borrowed(repo_root) as scratch:
+                benv = dict(G.blind_env(), GIT_DIR=scratch, GIT_NO_REPLACE_OBJECTS="1")
+                pack = subprocess.run(["git", "pack-objects", "--revs", "--stdout", "-q"], env=benv, cwd=scratch,
+                                      input=f"{base_tree}\n^{tree}\n".encode(), capture_output=True)
+            if pack.returncode:
+                raise Unrunnable(f"could not copy the base tree in: {pack.stderr.decode(errors='replace')[-300:]}")
+            subprocess.run(g + ["index-pack", "--stdin"], env=henv, input=pack.stdout, check=True,
+                           capture_output=True)
+            base = subprocess.run(g + ["commit-tree", base_tree, "-m", f"base {base_tree}"], env=henv, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            subprocess.run(g + ["update-ref", BASE_REF, base], env=henv, check=True, capture_output=True)
         return run_dir, head
     except (Unrunnable, OSError, subprocess.CalledProcessError, G.GitError) as e:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -519,8 +538,9 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
-    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen. lane: a landing
-    lane's run, whose slot ticket goes before a worker's (admission). first: main health's or a main-red fix's run,
+    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen and as the check
+    repo's refs/lander/base (materialise). lane: a landing lane's run, whose slot ticket goes before a worker's
+    (admission). first: main health's or a main-red fix's run,
     whose ticket goes ahead of every younger one (admission FIRST CLAIM)."""
     t0 = time.monotonic()
 
@@ -539,7 +559,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
                    tail=text.splitlines()[-TAIL:])
     env_extra = {"CC_LAND_CHANGED": " ".join(changed)} if changed else {}
     try:
-        run_dir, head = materialise(repo_root, tree_sha, label)
+        run_dir, head = materialise(repo_root, tree_sha, label, base_tree)
     except Unrunnable as e:
         return res(T.UNRUNNABLE, str(e))
     try:

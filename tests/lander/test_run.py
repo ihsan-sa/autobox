@@ -158,6 +158,31 @@ class Tree(Env):
         self.assertTrue(os.access(os.path.join(head, "core/bin/tool"), os.X_OK))
         self.assertEqual(git(head, "status", "--porcelain"), "")
 
+    def test_the_base_tree_rides_along_as_a_ref_so_a_check_can_diff_against_main(self):
+        # the guard's differential (tests/guard-replay.sh) reads main's bin/cc-guard out of this ref: the check repo
+        # has no origin/main, so without it every landing skipped the differential (#1221's guard cut landed so)
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho head\n", "core/new.txt": "n\n"})
+        git(self.repo, "add", "-A")
+        head_tree = git(self.repo, "write-tree")
+        run_dir, head = RUN.materialise(self.repo, head_tree, base_tree=self.tree)
+        self.addCleanup(lambda: shutil.rmtree(run_dir, ignore_errors=True))
+        self.assertEqual(git(head, "rev-parse", "HEAD^{tree}"), head_tree)
+        self.assertEqual(git(head, "rev-parse", RUN.BASE_REF + "^{tree}"), self.tree)
+        self.assertEqual(git(os.path.join(head, "core"), "show", RUN.BASE_REF + ":./bin/tool"), "#!/bin/sh\necho tool")
+        self.assertEqual(git(head, "status", "--porcelain"), "")   # the work tree is the head's alone
+        self.assertEqual(git(head, "fsck", "--no-dangling"), "")
+
+    def test_no_base_ref_without_another_side(self):
+        for base in ("", self.tree):   # main's own health run: no base, or the base is the tree itself
+            run_dir, head = RUN.materialise(self.repo, self.tree, base_tree=base)
+            self.addCleanup(lambda d=run_dir: shutil.rmtree(d, ignore_errors=True))
+            self.assertEqual(subprocess.run(["git", "-C", head, "rev-parse", "-q", "--verify", RUN.BASE_REF],
+                                            capture_output=True).returncode, 1)
+
+    def test_a_base_tree_the_repo_lacks_is_unrunnable(self):
+        with self.assertRaises(RUN.Unrunnable):
+            RUN.materialise(self.repo, self.tree, base_tree="1" * 40)
+
     def test_a_tree_with_a_submodule_is_written_out_and_proved(self):
         git(self.repo, "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",vendor/sub")
         git(self.repo, "update-index", "--add", "--cacheinfo", "160000," + "2" * 40 + ",a dir/deeper/sub two")

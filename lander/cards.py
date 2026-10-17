@@ -24,7 +24,9 @@ thread and its post-merge steps wait on it.
 That orch is the one cc-loop recorded host-side at dispatch (~/.cc/state/<repo>/.dispatch/<track>), never a seat.
 
 stopped()'s route "seat" and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
-a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. owner_card() is the 🔐 card
+a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. A "query" or "planning" stop in a
+repo that is not the box's control repo (own_seat) goes to that repo's own seat through cc-broker instead, and planning
+hears of it only if the broker will not take it. owner_card() is the 🔐 card
 in #approvals, the one cc-slack turns the owner's 👍 into a queue from: the protected door's refusal ("door"), a
 protected head stopped in the lane ("owner"), and what cc-units policy keeps for the owner at deploy.
 
@@ -45,6 +47,7 @@ import json
 import os
 import pwd
 import re
+import socket
 import stat
 import subprocess
 import time
@@ -703,7 +706,9 @@ def stopped(job, why, route):
                      the planning seat decides: the stop is said where a stop is said and a planner request
                      (`cc-notify --ask`) is filed, never a page to the owner; only "query" also wakes the repo's
                      session, because "planning" and "lander-self" are the planning seat's own, and an inject on top of
-                     the request would wake it twice
+                     the request would wake it twice. A "query" or "planning" stop in another repo (own_seat) is that
+                     repo's seat's instead: it goes to it through cc-broker as source `lander` (no planner request,
+                     no second inject), and only a broker that refuses it files the planner request after all
         owner        a protected head the owner has not 👍'd, found in the lane: said once in the thread or routed,
                      then the 🔐 card (say_protected_stop)
         door         the queue call's own refusal at the protected door: only the 🔐 card (say_protected_door)
@@ -715,7 +720,9 @@ def stopped(job, why, route):
     if route == "owner":
         return protected_stop(job, why)
     short = shorten_stop(why)
-    who = {"seat": "The track's seat fixes it and pushes; the lane takes the new head",
+    mine = own_seat(job, route)
+    who = f"It is {job.repo}'s own seat's to settle" if mine else {
+           "seat": "The track's seat fixes it and pushes; the lane takes the new head",
            "query": "The planning seat decides what happens to it",
            "planning": "The planning seat decides what happens to it",
            "lander-self": "It changes the lander itself, so the planning seat lands it by hand"}.get(route, "")
@@ -726,10 +733,10 @@ def stopped(job, why, route):
     if not known and not job.extra.get("chat"):
         args = ["--route", route]
     said = post(job, "stopped", text, args)
-    if route in QUERY_ROUTES:
+    if (not tell_own_seat(job, text)) if mine else route in QUERY_ROUTES:   # a refused hand-off still reaches planning
         sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", producer_id(job, "query"), "-t", f"{job.repo} landing",
             text], timeout=60, **box_hand())
-    if not job.member and route in ("seat", "query"):
+    if not job.member and not mine and route in ("seat", "query"):
         sent = read_json(_sent_path(), []) or []
         pid = producer_id(job, "inject")
         if pid not in sent:
@@ -737,6 +744,37 @@ def stopped(job, why, route):
                 f"fix it and push; the lane takes the new head."], timeout=120)
             mark_sent(pid)
     return said
+
+
+def control_repo():
+    """The box's control repo, the one its planning seat runs in, by cc's ctl_repo rule (cc-notify's CTL too): the repo
+    this copy lives in under ~/dev, else CC_BOX, else the short hostname."""
+    dev = os.path.join(PASSWD_HOME, "dev") + os.sep
+    if BIN.startswith(dev):
+        return BIN[len(dev):].split(os.sep)[0]
+    return conf("CC_BOX") or socket.gethostname().split(".")[0]
+
+
+def own_seat(job, route):
+    """A "query" or "planning" stop that is its repo's own seat's to settle, not the planning seat's: a box repo (no
+    member) other than the control repo. On 10-16 about 15 dispatch PRs no row owned stopped one by one over 30 min,
+    each a planner request the planning seat could only forward to the repo that runs dispatch."""
+    return route in ("query", "planning") and not job.member and job.repo != control_repo()
+
+
+def tell_own_seat(job, text):
+    """The stop into the repo's own seat through cc-broker, once: source `lander`, so ordinary stops that come in a
+    run are one broker digest there rather than a wake each (a line asking for a choice still wakes it at once).
+    True when the broker took it (or did before); False files the planner request instead (stopped)."""
+    pid = producer_id(job, "own-seat")
+    if pid in (read_json(_sent_path(), []) or []):
+        return True
+    rc, out = sh([broker(), "inject", "--no-start", "--source", "lander", job.repo, text], timeout=120)
+    if rc == 0:
+        mark_sent(pid)
+        return True
+    log("unsaid", job.repo, job.pr, id=pid, to=job.repo, why=out.strip()[-120:].replace("\n", " "))
+    return False
 
 
 def behind(job, why):
