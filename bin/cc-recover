@@ -28,6 +28,10 @@ or `cc-loop`, with its kind and what relaunches it.
           by `--say`; a plain `cc <repo>` would find the workspace's own window up and bring nothing back.
   track   <repo>/<track>, `cc __run`: `cc <repo> <track>`, which resumes on the board's own session id.
   worker  <repo>/<track> running cc-loop: `cc <repo> <track> --go "" --loop N <its flags> --resume-last`.
+  A handoff successor, `cc __runnext <target> …`, is saved once cutover has given its window the target's name, as
+  the kind that name has (a `/` is a track, or a member track in a member workspace; an `@` an orch; else a seat or
+  a member), and comes back like any other of that kind; a seat or orch with no tasks fd is resumed on the
+  `--session-id` its claude was started with.
   Never saved: `box` (tmux-main starts it), `_*` test windows, `~next`/`~old` handoff windows, and the perms
   session — a window named `perms` or a claude run with --dangerously-skip-permissions. Its relaunch is the
   planning seat's alone.
@@ -268,6 +272,11 @@ def claude_under(pid):
     return None
 
 
+def flag(a, name):
+    """The value after `name` in argv a, or ""."""
+    return a[a.index(name) + 1] if name in a[:-1] else ""
+
+
 def sid_of(pid):
     try:
         fds = os.listdir(f"{PROC}/{pid}/fd")
@@ -338,7 +347,8 @@ def classify(name, pane):
     if any("--dangerously-skip-permissions" in argv(p) for p in tree):
         return None   # the perms session, however it was named
     mode = next((t for t in words(argv(pane)) if t.startswith("__run")), None)
-    kind = {"__runmain": "seat", "__runplain": "seat", "__runorch": "orch", "__runmember": "member", "__run": "track"}.get(mode)
+    kind = {"__runmain": "seat", "__runplain": "seat", "__runorch": "orch", "__runmember": "member", "__run": "track",
+            "__runnext": "next"}.get(mode)
     if not kind:
         for p in tree:
             toks = loop_args(argv(p))
@@ -347,6 +357,8 @@ def classify(name, pane):
         return None
     head, _, track = name.partition("/")
     repo, _, alias = head.partition("@")
+    if kind == "next":   # a handoff successor past cutover, under its target's name: the kind that name has
+        kind = ("member" if member_ws(repo) else "track") if track else "orch" if alias else "member" if member_ws(repo) else "seat"
     rec = {"kind": kind, "window": name, "repo": repo}
     if kind == "orch":
         rec["alias"] = alias
@@ -354,7 +366,7 @@ def classify(name, pane):
         rec["track"] = track
     if kind in ("seat", "orch"):
         c = claude_under(pane)
-        rec["sid"] = sid_of(c) if c else ""
+        rec["sid"] = (sid_of(c) or flag(argv(c), "--session-id")) if c else ""   # a successor's own id, if no fd shows it
         rec["claude"] = (env_of(c).get("CC_CLAUDE") or argv(c)[0]) if c else ""
     return rec
 
@@ -1279,6 +1291,42 @@ def selfcheck():
         check("scan: `cc-loop` inside a seat's argv text does not make it a worker", s["r2"]["kind"] == "seat" and s["r2"]["repo"] == "r2")
         check("scan: a cc-loop word (a path) under a shell -c is a worker; a look-alike word is not",
               s["r3/job2"]["kind"] == "worker" and s["r3/job2"]["repo"] == "r3" and s["r3/job2"]["loop"] == "2" and "r4/z" not in s and "r5/w" not in s)
+
+        # a handoff successor (`cc __runnext <target> <hid> <sid>`) is saved as the kind its window's name has, once
+        # cutover has given it that name, and comes back resumed on its own conversation. On 2026-10-14 the scan knew
+        # no __runnext, so two orchs that had handed off in the hour before a tmux crash were never in the set.
+        d = fixture(); os.makedirs(f"{DEV}/m1/.cc"); open(f"{DEV}/m1/.cc/member-workspace", "w").close()
+        proc(300, ["bash", "/b/cc", "__runnext", "r1", "h1", "sid-n1"], [301])
+        proc(301, ["/c/claude", "--name", "r1", "--session-id", "sid-n1"], env={"CC_CLAUDE": "/c/claude"}, sid="sid-n1")
+        proc(310, ["bash", "/b/cc", "__runnext", "r1@ops", "h2", "sid-n2"], [311])   # no tasks fd: the id comes off argv
+        proc(311, ["/c/claude", "--name", "r1@ops", "--session-id", "sid-n2"], env={"CC_CLAUDE": "/c/claude"})
+        proc(320, ["bash", "/b/cc", "__runnext", "r1/fix", "h3", "sid-n3"], [321]); proc(321, ["/c/claude", "--session-id", "sid-n3"])
+        proc(330, ["bash", "/b/cc", "__runnext", "m1", "h4", "sid-n4"], [331]); proc(331, ["bwrap", "--", "claude"])
+        proc(340, ["bash", "/b/cc", "__runnext", "r2", "h5", "sid-n5"], [341]); proc(341, ["/c/claude", "--session-id", "sid-n5"])
+        proc(350, ["bash", "/b/cc", "__runorch", "r2@x"], [351]); proc(351, ["/c/claude"])
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t300\nr1@ops\t310\nr1/fix\t320\nm1\t330\nr2~next\t340\nr2@x~old\t350\n")
+        s = scan()
+        check("scan: handed-off successors are saved as seat, orch, track and member; ~next and ~old are not",
+              sorted(s) == ["m1", "r1", "r1/fix", "r1@ops"] and s["r1"]["kind"] == "seat" and s["r1@ops"]["kind"] == "orch"
+              and s["r1@ops"]["alias"] == "ops" and s["r1/fix"]["kind"] == "track" and s["r1/fix"]["track"] == "fix"
+              and s["m1"]["kind"] == "member" and "track" not in s["m1"])
+        check("scan: a successor seat's sid comes off its tasks fd, an orch's off its --session-id",
+              s["r1"]["sid"] == "sid-n1" and s["r1"]["claude"] == "/c/claude" and s["r1@ops"]["sid"] == "sid-n2")
+        save({}); open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        globals()["claude_pid"], globals()["net_probe"] = (lambda w: "999"), (lambda: "up")
+        with open(f"{BIN}/cc", "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s|' cc \"$@\" >> {d}/calls; printf 'CC_CLAUDE=%s' \"$CC_CLAUDE\" >> {d}/calls; echo >> {d}/calls\n")
+        os.chmod(f"{BIN}/cc", 0o755)
+        restore(boot=True)
+        cc_calls = [c for c in open(f"{d}/calls").read().splitlines() if c.startswith("cc|")]
+        seat = next((c for c in cc_calls if c.startswith("cc|r1|CC_CLAUDE=")), "")
+        orch = next((c for c in cc_calls if c.startswith("cc|r1|--orch|ops||CC_CLAUDE=")), "")
+        check("restore: a handed-off seat and orch come back resumed on their own conversations",
+              seat and "--resume sid-n1" in open(seat.split("CC_CLAUDE=", 1)[1]).read()
+              and orch and "--resume sid-n2" in open(orch.split("CC_CLAUDE=", 1)[1]).read())
+        check("restore: a handed-off track comes back `cc <repo> <track>`, a member workspace's successor `cc <repo>`",
+              any(c.startswith("cc|r1|fix|CC_CLAUDE=") for c in cc_calls) and any(c.startswith("cc|m1|CC_CLAUDE=") for c in cc_calls))
+        globals()["claude_pid"], globals()["net_probe"] = real["claude_pid"], real["net_probe"]
 
         # 2. save: a healthy tick writes; a mass loss holds the old set; a small loss is saved
         d = fixture(); live_box(d)

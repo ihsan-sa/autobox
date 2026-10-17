@@ -23,7 +23,8 @@ def selfcheck():
                                           "CC_WORKER_PACE_MARGIN", "CC_ROOM_POLL", "CC_CONFIG", "LANDER_LOADAVG",
                                           "TMUX", "TMUX_PANE", "CC_SLACK_ALIAS", "CC_ROOM_TMUX", "CC_ROOM_BIN",
                                           "CC_ROOM_NOTICE_AFTER", "CC_HEAVY_CAP", "CC_HEAVY_SCOPE",
-                                          "CC_ROOM_GRACE", "CC_ROOM_NOTICE_RETRY", "CC_PEER_DIR", "CC_PEER_SSH", "HOME")}
+                                          "CC_ROOM_GRACE", "CC_ROOM_NOTICE_RETRY", "CC_PEER_DIR", "CC_PEER_SSH", "HOME",
+                                          "CC_ROOM_TRICKLE")}
     procs = []
     strays = []   # (pid, start) of what a stub window ran: ended in the finally only while still that process
 
@@ -48,7 +49,8 @@ def selfcheck():
         os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_WORKER_CAP=str(cap),
                           CC_WORKER_PACE_MARGIN=str(margin), CC_ROOM_POLL="0.2", CC_CONFIG=f"{d}/config",
                           CC_ROOM_NOTICE_AFTER="3600", CC_HEAVY_CAP="1", CC_HEAVY_SCOPE="0", CC_ROOM_BIN=f"{d}/bin",
-                          CC_ROOM_TMUX=f"{d}/bin/tmux", CC_ROOM_GRACE="1", CC_ROOM_NOTICE_RETRY="300")
+                          CC_ROOM_TMUX=f"{d}/bin/tmux", CC_ROOM_GRACE="1", CC_ROOM_NOTICE_RETRY="300",
+                          CC_ROOM_TRICKLE="0")   # a hot load holds every case but TRICKLE's own
         for k in ("TMUX", "TMUX_PANE", "CC_SLACK_ALIAS"):   # never the session's own tmux server or orch
             os.environ.pop(k, None)
         # stubs: the broker and cc-notify write down what they were told, and refuse while {d}/down exists; with
@@ -127,6 +129,52 @@ esac''')):
         admission.LOADAVG = calm
         os.environ["LANDER_LOADAVG"] = calm
         t("busy: a calm load average is room again", why_not(), "")
+
+        # TRICKLE: a hold by the load average alone lets the oldest launch through once no worker has started here
+        # for CC_ROOM_TRICKLE seconds; cpu or memory pressure still holds. Run as subprocesses, the only way the
+        # lander's PSI dir (read at import) is the case's own and never the box's
+        def trickle(name, psi_cpu=None, started_ago=None, every="600"):
+            d = fixture(name)
+            psi = f"{d}/psi"
+            os.makedirs(psi)
+            if psi_cpu is not None:
+                open(f"{psi}/cpu", "w").write(f"some avg10={psi_cpu} avg60=0.00 avg300=0.00 total=0\n")
+            if started_ago is not None:
+                os.makedirs(f"{d}/room", exist_ok=True)
+                open(f"{d}/room/started", "w").close()
+                os.utime(f"{d}/room/started", (time.time() - started_ago,) * 2)
+            env = dict(os.environ, LANDER_LOADAVG=hot, LANDER_PSI_DIR=psi, CC_ROOM_TRICKLE=every)
+            return d, env
+
+        d, env = trickle("trickle-none")
+        r = subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True, env=env)
+        t("trickle: a load-only hold with no worker started yet is room", r.returncode, 0)
+
+        d, env = trickle("trickle-admit")
+        mark = f"{d}/ran"
+        r = subprocess.run([sys.executable, __file__, "admit", "r/trickle", "--", "touch", mark], timeout=20,
+                           capture_output=True, env=env)
+        t("trickle: admit starts the launch through a load-only hold and stamps the start",
+          (r.returncode, os.path.exists(mark), os.path.exists(f"{d}/room/started")), (0, True, True))
+
+        d, env = trickle("trickle-recent", started_ago=60)
+        r = subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True, env=env)
+        t("trickle: a worker started 60s ago keeps a load-only hold",
+          (r.returncode, "the box is busy" in r.stdout), (1, True))
+
+        d, env = trickle("trickle-old", started_ago=900)
+        r = subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True, env=env)
+        t("trickle: the last start 900s ago (over 600) is room again", r.returncode, 0)
+
+        d, env = trickle("trickle-pressure", psi_cpu="100.00")
+        r = subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True, env=env)
+        t("trickle: cpu pressure holds even with no worker started yet",
+          (r.returncode, "the box is busy" in r.stdout), (1, True))
+
+        d, env = trickle("trickle-off", every="0")
+        r = subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True, env=env)
+        t("trickle: CC_ROOM_TRICKLE=0 holds a load-only hold as before",
+          (r.returncode, "the box is busy" in r.stdout), (1, True))
 
         # cap reached means queued, and one under it is not
         d = fixture("cap", cap=2)

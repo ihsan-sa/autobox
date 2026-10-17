@@ -33,7 +33,8 @@ ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as
   the box is not busy       the lander's own overloaded() (core/lander/admission.py): memory or cpu pressure, or a
                               1-minute load average at LANDER_LOAD_FACTOR (2) times the cores or more. It is the
                               same call the lander serializes on, so while the box is overloaded new workers wait
-                              and the landing queue gets the room the load frees as it drains.
+                              and the landing queue gets the room the load frees as it drains. A hold by the
+                              load average alone still lets one through now and then (TRICKLE, below).
 Nothing here reads the weekly limit. The one thing it ever ends is a tmux window `resume` itself opened, and only
 while every process in it is the `cc-room admit --resume` waiter that window was opened for, the shell line around
 it, or the idle shell it leaves behind: a launch that never started. Anything else in that window (the launch it
@@ -110,6 +111,14 @@ sessions' tmux-spawn scopes sit directly in app.slice, so the run gets ten sessi
 bounds how many such runs there are. lander.slice, a peer of app.slice, keeps the share landings had. Nothing
 system-level: a user scope, no unit file. With no user bus (or CC_HEAVY_SCOPE=0) it runs unscoped and says so in
 one line. Heavy runs take no worker slot.
+
+TRICKLE (2026-10-01, after the 18:32Z restart: load 22-30 on 6 cores from landings, git, lualatex, ffmpeg and ~63
+sessions coming back, not from the 7 workers running, held 14 launches for over an hour, two of them the owner had
+put first; again on the tower 2026-10-12, load 40-50 on 20 cores held 15 for about four hours). Load nobody can stop
+would hold the queue for as long as it lasts. So while the box is overloaded() by its load average alone, with no
+cpu or memory pressure (the lander's loaded()), the oldest launch still starts once no worker has started here for
+CC_ROOM_TRICKLE seconds (cc-config, 600; 0 turns it off). Pressure still holds every launch, and the lander's own
+overloaded() is unchanged. The last start here is the mtime of `started` in CC_ROOM_DIR; none yet counts as long ago.
 Env (tests): CC_ROOM_TMUX the tmux binary · CC_ROOM_BIN where cc-broker and cc-notify are.
 """
 # recurring-defect-ok: pause-hold-missing — cc refuses --go on a paused repo before admit, and cc-loop checks cc-pause as its first act
@@ -167,7 +176,7 @@ RELAUNCH_ENV = ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_LIMIT_STAMP", "CC_FAI
                 "CC_EGRESS_ALLOW", "CC_WORKER_MODEL", "CC_LOOP_TRIM", "CC_SPEND_TIER", "CC_ROOM_DIR", "CC_WORKER_CAP",
                 "CC_WORKER_PACE_MARGIN", "LANDER_LOADAVG", "LANDER_PSI_DIR", "CC_SLACK_ALIAS", "CC_ORCH_REPO", "CC_DISPATCH_WIN",
                 "CC_CLAUDE", "CC_CONFIG", "CC_STATUSLINE_DIR", "CC_ROOM_POLL", "CC_ROOM_NOTICE_AFTER", "CC_ROOM_NOTICE_RETRY",
-                "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX",
+                "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX", "CC_ROOM_TRICKLE",
                 # a worker the hub placed here: resumed after a restart, its board, notices and DONE still go home
                 "CC_PEER_SPOOL", "CC_PEER_REPO", "CC_PEER_TRACK")
 NOTICE_TRIES = 8
@@ -306,9 +315,23 @@ def host_why():
     if held >= cap:
         return f"{held} worker loops are running and the cap is {cap} (CC_WORKER_CAP)"
     busy = admission.overloaded()
-    if busy:
+    if busy and not trickle_due():
         return f"the box is busy: {busy}; landings go first"
     return ""
+
+
+def trickle_due():
+    """True when a hold by the load average alone may let one launch through: no cpu or memory pressure (loaded()),
+    and no worker has started here for CC_ROOM_TRICKLE seconds (TRICKLE in the doc; 0 turns it off)"""
+    # the brief: "the load came from landing gates, git, lualatex, ffmpeg and session churn ... nothing a seat could
+    # stop would make room" — so the load average alone never holds forever; pressure (loaded()) still does
+    every = cfg("CC_ROOM_TRICKLE", 600)
+    if every <= 0 or admission.loaded():
+        return False
+    try:
+        return time.time() - os.stat(f"{room_dir()}/started").st_mtime >= every
+    except OSError:
+        return True   # no worker has started here yet
 
 
 def peer_why():
@@ -512,6 +535,8 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
             spot = "here" if first and not why else ""   # `spot`, since where() is the pane's
             if spot == "here":
                 write_entry(ssub, str(os.getpid()), what)
+                if kind == "worker":   # TRICKLE counts from the last worker started here
+                    open(f"{room_dir()}/started", "w").close()
                 os.unlink(me)
                 if said is not None:
                     logline(log, f"cc-room: room now — {what} starts")
