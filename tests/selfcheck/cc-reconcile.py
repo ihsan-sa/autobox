@@ -1929,6 +1929,31 @@ def selfcheck():
         ok("UNPUSHED ONCE: three passes at --repeat 0 tell an ended row's unpushed branch once, not every pass, "
            "beside the plain row that is told three times",
            sum(f"{repo}/unpushed-t-row " in ln and "not pushed" in ln for ln in told) == 1)
+    # ORPHAN ONCE (raised-orphan-worktree-nags-wake-a-sleeping-seat): a worktree with no board entry is told once while
+    # its directory stands, even when a pass in between skips it (here a fresh mtime inside --grace), which used to
+    # drop its memo and make the next pass call it news; once the directory is gone and comes back, it is news again.
+    with tempfile.TemporaryDirectory() as th:
+        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
+                   CC_SLACK_DIR=f"{th}/.cc/slack", CC_RECONCILE_INJECT=f"{th}/inj")
+        repo = f"selfcheckorphan{os.getpid()}"
+        open(f"{th}/inj", "w").write(f'#!/bin/sh\necho "$@" >> {th}/inj.log\n'); os.chmod(f"{th}/inj", 0o755)
+        subprocess.run([f"{BIN}/cc-board", "init", repo, f"{th}/dev/{repo}", "main"], env=env, capture_output=True, timeout=30)
+        owt = f"{th}/.cc/worktrees/{repo}/left-x"
+
+        def opass(grace):
+            subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--notify", "--no-net", "--grace", str(grace),
+                            "--repeat", "0"], env=env, capture_output=True, text=True, timeout=120)
+            return sum(f"{repo}/left-x " in ln and ORPHAN_WHY in ln
+                       for ln in (open(f"{th}/inj.log").read().splitlines() if os.path.exists(f"{th}/inj.log") else []))
+        os.makedirs(owt)
+        n1 = opass(0)
+        os.utime(owt)                                   # touched: inside a 600 s grace the next pass skips it
+        n2 = opass(600)
+        n3 = opass(0)
+        ok("ORPHAN ONCE: a worktree with no board entry is told on the first pass, not again after a pass that "
+           "skipped it, nor on the pass after that, at --repeat 0", (n1, n2, n3) == (1, 1, 1))
+        shutil.rmtree(owt); opass(0); os.makedirs(owt)
+        ok("…and once its directory has gone, a worktree made again at that path is told again", opass(0) == 2)
     # (b1) OWNER-HELD (brief C6): "a row that is waiting on an open owner ask, held for his yes, or noted as parked on
     # purpose wakes its seat once and not every day. When a wake does fire, it says an owner ask is already pending."
     T = now()
