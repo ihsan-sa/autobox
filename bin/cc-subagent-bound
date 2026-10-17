@@ -19,8 +19,8 @@ and never on a session's. It reads that subagent's transcript (agent_transcript_
 else <transcript_path minus .jsonl>/subagents/agent-<agent_id>.jsonl) and takes USED as cc-context does: the last
 assistant entry's input + cache_creation + cache_read, or a later compact_boundary's postTokens.
   used < SAVE                    nothing: no output, the call runs
-  SAVE <= used < BOUND, first    the call is REFUSED once with the save order (write what you have to the
-                                 deliverable file now and keep writing as you go; the next calls run normally);
+  SAVE <= used < BOUND, first    the call is REFUSED once with the save order (if the brief names a file, write
+                                 what you have to it now and keep writing as you go; the next calls run normally);
                                  the save is claimed by an atomic create of <session>-<agent>.json.saved beside
                                  the per-agent file below, so it never fires twice, even for parallel calls
   SAVE <= used < BOUND, saved    nothing: the call runs
@@ -35,6 +35,11 @@ GRACE is CC_SUBAGENT_WRAPUP_TOKENS (default 30000). SAVE is CC_SUBAGENT_SAVE_TOK
 0 = off): a long reader that has written nothing by the bound has only GRACE left to write a large deliverable, and
 at 60% it still has 60k of room to write it. At the bound counts as past it. No model call is made, and any error
 decides nothing: a hook that cannot read its input or transcript, or cannot record the save, leaves the call alone.
+The three figures cost one cc-config call at most per hook, and only for those the environment does not set.
+
+PRUNING. Each subagent leaves <session>-<agent>.json.lock in the state dir, and one past SAVE or BOUND also leaves
+.json and .json.saved. A hook that creates a new lock first deletes the files there older than PRUNE_DAYS (7): no
+subagent runs that long, and a missing record only means a fresh save order.
 
 MEASURE prints, per the method the brief used: the files, the sum of cache_read_input_tokens over every assistant
 line, the count of files whose largest context passed --over (default 300000) and their share of that sum. The
@@ -49,6 +54,9 @@ PROJECTS = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TAIL = 256 * 1024
 MAX_TAIL = 32 * 1024 * 1024
+PRUNE_DAYS = 7
+CFG_KEYS = ("CC_SUBAGENT_CONTEXT_TOKENS", "CC_SUBAGENT_WRAPUP_TOKENS", "CC_SUBAGENT_SAVE_TOKENS")
+PAUSE = 0.0                                   # selfcheck only: widens the read-to-write gap; nothing else sets it
 
 WRAP = ("CONTEXT BOUND: this subagent's context is {used:,} tokens, at or past the box's bound of {bound:,} "
         "(CC_SUBAGENT_CONTEXT_TOKENS), and every further call re-reads all of it. This call was NOT run. Wrap up now, "
@@ -59,24 +67,40 @@ WRAP = ("CONTEXT BOUND: this subagent's context is {used:,} tokens, at or past t
         "tool call is refused.")
 SAVE = ("SAVE NOW: this subagent's context is {used:,} tokens, {left:,} short of the box's bound of {bound:,} "
         "(CC_SUBAGENT_CONTEXT_TOKENS), where its calls start being refused. This one call was NOT run; run it again "
-        "after this. First write what you have to your deliverable file now (your edits, findings or draft so far, "
-        "in the worktree or the file your brief names) and keep writing to it as you go, so the work survives if you "
-        "reach the bound. Your next calls run normally.")
+        "after this. If your brief names a file to write, or you are editing a worktree, write what you have there now "
+        "(your edits, findings or draft so far) and keep writing as you go, so the work survives if you reach the "
+        "bound. If your brief says to write no files, write none. Your next calls run normally.")
 STOP = ("CONTEXT BOUND: this subagent is {used:,} tokens in, past the bound of {bound:,} plus its {grace:,}-token "
         "wrap-up. Every tool call is refused from here. End your turn now with your final report: that you stopped "
         "at the context bound, what is done and where it is, what is left, and the exact next step.")
 
 
+_file_cfg = None
+
+
+def file_cfg():
+    """CFG_KEYS as ~/.cc/config sets them, from ONE cc-config call per process (it never sources the file); the
+    other keys it lists are dropped here."""
+    global _file_cfg
+    if _file_cfg is None:
+        _file_cfg = {}
+        try:
+            r = subprocess.run([os.path.join(BIN, "cc-config"), "list", *CFG_KEYS], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=5)
+            for line in r.stdout.splitlines() if r.returncode == 0 else ():
+                k, _, v = line.partition("=")
+                if k in CFG_KEYS:
+                    _file_cfg[k] = v.strip()
+        except Exception:
+            pass
+    return _file_cfg
+
+
 def cfg(name, default):
-    """A number from the environment, else ~/.cc/config through cc-config (which never sources the file)."""
+    """A number from the environment, else ~/.cc/config."""
     v = os.environ.get(name)
     if v is None:
-        try:
-            r = subprocess.run([os.path.join(BIN, "cc-config"), "get", name], capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=5)
-            v = r.stdout.strip() if r.returncode == 0 else None
-        except Exception:
-            v = None
+        v = file_cfg().get(name)
     try:
         return int(float(v))
     except (TypeError, ValueError):
@@ -129,6 +153,24 @@ def transcript_of(p):
     return os.path.join(base[:-len(".jsonl")], "subagents", f"agent-{p['agent_id']}.jsonl")
 
 
+def prune():
+    """Delete the state dir's files older than PRUNE_DAYS; any error leaves that file."""
+    cut = time.time() - PRUNE_DAYS * 86400
+    try:
+        names = os.listdir(STATE)
+    except OSError:
+        return
+    for n in names:
+        if not n.endswith((".json", ".json.lock", ".json.saved")):
+            continue
+        f = os.path.join(STATE, n)
+        try:
+            if os.lstat(f).st_mtime < cut:
+                os.unlink(f)
+        except OSError:
+            pass
+
+
 def deny(reason):
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": reason}}))
@@ -166,6 +208,8 @@ def hook(raw):
     lk = None
     try:
         os.makedirs(STATE, exist_ok=True)
+        if not os.path.lexists(mark + ".lock"):
+            prune()                           # once per subagent, not per call
         lk = os.open(mark + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         fcntl.flock(lk, fcntl.LOCK_EX)
     except OSError:
@@ -190,7 +234,8 @@ def hook(raw):
                 # the early save: once, and only when it is recorded, or a subagent that cannot record it never runs again.
                 # The claim is an O_EXCL create of <mark>.saved, atomic on its own, so only one hook can issue it even when
                 # the lock above could not be taken (review of #1319: the check and the record are one step).
-                time.sleep(float(os.environ.get("CC_SUBAGENT_BOUND_PAUSE") or 0))   # test hook: widens the read-to-write gap
+                if PAUSE:
+                    time.sleep(PAUSE)
                 try:
                     os.makedirs(STATE, exist_ok=True)
                     os.close(os.open(mark + ".saved", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))

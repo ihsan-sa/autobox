@@ -11,7 +11,7 @@
   - Planning seats never commit on the default branch; tracks never commit, push or merge.
   - The owner approves: merging to the default branch unless they grant it standing (then review, run the gates, say what landed), deploying, spend over budget, host/network/service changes, the destructive, the outward in their name, widening a non-owner, opening the box (SSH, a host port, a tunnel or connector into a shell; a public web app for a stated goal, served through Cloudflare to one app port, is not). Only real money, opening the box, minting or rotating a secret or giving one to a member or third party (moving one the box holds between its own services is perms' call), the never-touch list, unplanned deletion of shared state, widening a non-owner and the outward in their name always need them; anything else a stated goal needs is approved by it, so do it and tell them after; perms weighs the rest with `cc-approve decide` (`~/COMMS.md`).
   - Never touch the arrival interface, `<rescue-ip>` or the hotspot SSID `<hotspot-ssid>`; no firewall, partitioning, reboot or shutdown unasked.
-  - No Artifacts: their links are dead for other accounts. Answer where asked (Slack only for a `<channel>` message). Record an admitted failure: `cc-failures record`.
+  - No Artifacts: their links are dead for other accounts. No AskUserQuestion: nobody watches the terminal, so decide or ask in Slack. Answer where asked (Slack only for a `<channel>` message). Record an admitted failure: `cc-failures record`.
 
 ## Writing
 

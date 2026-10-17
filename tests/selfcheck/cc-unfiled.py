@@ -98,6 +98,26 @@ def selfcheck():
         found = [p for p, *_ in unfiled([os.path.join(t, "c5", "dev")], 24, reg)]
         ok("the same bytes at two paths are listed once", len(found) == 1)
 
+        # the register's recorded hash is trusted, so a run never re-reads the whole library; an old revision with
+        # no recorded hash still has its filed copy read
+        reg = os.path.join(t, "c8", "docs")
+        os.makedirs(os.path.join(reg, "files"))
+        for name in ("new.pdf", "old.pdf"):
+            with open(os.path.join(reg, "files", name), "wb") as f:
+                f.write(name.encode())
+        with open(os.path.join(reg, "register.json"), "w") as f:
+            json.dump({"documents": {"1": {"revisions": [{"file": "files/new.pdf", "sha256": "recorded"}]},
+                                     "2": {"revisions": [{"file": "files/old.pdf"}]}}}, f)
+        global sha
+        real, read = sha, []
+        sha = lambda path: read.append(os.path.basename(path)) or real(path)
+        try:
+            shas = known(register(reg), reg)[0]
+        finally:
+            sha = real
+        ok("a revision with a recorded hash is not read again", "new.pdf" not in read and "recorded" in shas)
+        ok("…and one with none still has its filed copy read", read == ["old.pdf"])
+
         # --to appends one entry when there is something to say, and nothing when there is not
         dev, reg = os.path.join(t, "c6", "dev"), os.path.join(t, "c6", "docs")
         kept = mkpdf(os.path.join(dev, "w"), "summary", "A summary\\newpage two")

@@ -10,7 +10,7 @@ and what a member session may do all keep coming from the path rules — no fiel
 
   cc-task show <repo> <row>                              print the record
   cc-task check <repo> <row> [--executor subagent|worker]  would this owner be refused? writes nothing
-  cc-task claim <repo> <row> --executor subagent|worker  claim a track `cc claim` has already prepared
+  cc-task claim <repo> <row> --executor subagent|worker [--launch]  claim a track `cc claim` has already prepared
   cc-task begin <claim-token>                            read the native bootstrap after its tool hook binds it
   cc-task renew <repo> <row> <claim-id> <generation>     stamp this owner's claim as still active
   cc-task release <repo> <row> <claim-id> <generation> --reason <text>   end it after stopping work
@@ -191,6 +191,16 @@ def pick(chain, runtime):
     if not candidates: raise ValueError("cannot identify the calling process")
     return next((p for p in candidates if runtime and p["command"] in ("claude", "codex")), candidates[0])
 
+def launcher(chain):
+    """The `cc` that is launching, out of an ancestry: the farthest of the `cc` processes this one sits under
+    directly — a `$(…)` around cc-task is a forked copy of the same `cc`, and it is the outer one that stays alive
+    until the launch is over. None when cc-task was not run by `cc`."""
+    run = []
+    for p in chain:
+        if not p["cc"]: break
+        run.append(p)
+    return {k: run[-1][k] for k in ("pid", "start_ticks")} if run else None
+
 IDENTITY = ("process", "boot_id", "agent_id")   # the window and the session ids are evidence, not identity
 
 def same_owner(a, b): return all((a or {}).get(k) == (b or {}).get(k) for k in IDENTITY)
@@ -205,14 +215,23 @@ def alive(who):
 
 # ---- the record ----------------------------------------------------------------------------------------------
 def takeover(held, who, executor):
-    """Is this owner allowed past the claim already there? A claim that has ended, is this owner's own, or whose
-    owner is provably gone holds nothing. The one live claim that can be taken is a SUBAGENT's, and only by a
+    """Is this owner allowed past the claim already there? A claim that has ended, is this owner's own, whose
+    owner is provably gone, or a worker's whose launching `cc` is gone (gone_launch) holds nothing. The one live claim that can be taken is a SUBAGENT's, and only by a
     worker dispatch — a repair (`cc … --go --repair`) is exactly that, onto the canonical worktree the
     subagent built, and a subagent that never reached `cc done` must not be able to block it for the life of its
     session. Nothing takes a live worker's, and a subagent takes nothing that is live."""
     if not held or held.get("ended_at"): return True
     if same_owner(held.get("owner"), who) or not alive(held.get("owner")): return True
+    if gone_launch(held): return True
     return executor == "worker" and held.get("executor") == "subagent"
+
+def gone_launch(held):
+    """A WORKER'S CLAIM IS THE LAUNCH'S, and lasts no longer than the `cc` that is launching it. Its owner is the
+    session that typed `cc … --go`, which outlives the launch by hours; `cc` hands the claim back once the window
+    is up, so a `cc` killed before that (a Bash timeout on a loaded box, 2026-10-04) left the row held by a live
+    seat, and every other dispatcher was refused for that seat's whole life. A launcher that is gone ends it."""
+    if held.get("executor") != "worker" or not held.get("launcher"): return False
+    return not alive({"process": held["launcher"], "boot_id": (held.get("owner") or {}).get("boot_id")})
 
 def delivery_pending(record):
     """Is this task's change out of the box's hands? Its PR is recorded and nothing has closed it, so the landing
@@ -312,18 +331,23 @@ def new_record(repo, row, wt):
             "artifact": {"committed_sha": None, "pushed_sha": None, "errors": []},
             "pr": None, "card": None, "closed": None}
 
-def do_claim(d, who, executor, phase="build"):
-    """0 = already this owner's, nothing to write. 1 = a new generation was taken."""
-    c = d.get("claim")
+def do_claim(d, who, executor, phase="build", by=None):
+    """0 = already this owner's, nothing to write. 1 = a new generation was taken, or this owner's own claim was
+    handed to the `cc` now launching it. `by` is that `cc` (launcher()), passed only by `cc … --go` (claim --launch)
+    and recorded on a worker's claim only: a subagent's claim, and a worker claim taken by `cc claim`, are meant to
+    outlive the `cc` that took them."""
+    c = d.get("claim"); by = by if executor == "worker" else None
     if phase == "build" and c and not c.get("ended_at") and same_owner(c.get("owner"), who) and c.get("executor") == executor:
-        return 0
+        if c.get("launcher") == by: return 0
+        c["launcher"] = by; return 1
     if c and not c.get("ended_at") and d["executions"]:   # superseded: the old token can no longer do anything
         why = ("same owner, new executor" if same_owner(c.get("owner"), who)
-               else "a worker took over from a subagent" if alive(c.get("owner")) else "owner gone")
+               else "owner gone" if not alive(c.get("owner"))
+               else "its launch was killed" if gone_launch(c) else "a worker took over from a subagent")
         d["executions"][-1]["outcome"] = f"superseded ({why})"
     c = {"claim_id": str(uuid.uuid4()), "generation": c["generation"] + 1 if c else 1, "executor": executor,
-         "phase": "starting" if phase == "build" else phase, "owner": who, "started_at": stamp(), "activity_at": stamp(),
-         "ended_at": None, "reason": None}
+         "phase": "starting" if phase == "build" else phase, "owner": who, "launcher": by, "started_at": stamp(),
+         "activity_at": stamp(), "ended_at": None, "reason": None}
     d["claim"] = c
     d["executions"].append({"execution_id": str(uuid.uuid4()), "task_id": d["task_id"], "claim_id": c["claim_id"],
                             "generation": c["generation"], "phase": phase, "source_transcript": None,
@@ -558,6 +582,8 @@ def main(argv):
         if cmd == "close": s.add_argument("status", choices=("done", "merged"))
         if cmd in ("claim", "check"):
             s.add_argument("--executor", choices=("subagent", "worker"), required=(cmd == "claim"))
+        if cmd == "claim":   # `cc … --go` only: the claim is that launch's (gone_launch). `cc claim` holds it for its owner
+            s.add_argument("--launch", action="store_true")
         if cmd in ("renew", "release"):
             s.add_argument("claim_id"); s.add_argument("generation", type=int)
         if cmd == "release": s.add_argument("--reason", required=True)
@@ -588,7 +614,7 @@ def main(argv):
         if a.cmd == "claim":
             prepared(a.repo, a.row, wt)
             if d is None: d = new_record(a.repo, a.row, wt)
-            took = do_claim(d, who, a.executor)
+            took = do_claim(d, who, a.executor, by=launcher(ancestry(os.getppid())) if a.launch else None)
             write_marker(wt, a.repo, a.row, d["task_id"])   # refused here = nothing claimed: the record is unwritten
             if took or moved: save(state, d)
         else:

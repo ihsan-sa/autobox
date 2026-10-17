@@ -48,6 +48,8 @@ def selfcheck():
         return json.dumps(d)
 
     def run(raw):
+        global _file_cfg
+        _file_cfg = None                                          # a hook is one process: its config is read afresh
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = hook(raw)
@@ -65,7 +67,8 @@ def selfcheck():
             if pid == 0:
                 os.close(gate_w)
                 os.read(gate_r, 1)   # every child blocks here until the gate closes
-                os.environ["CC_SUBAGENT_BOUND_PAUSE"] = "0.05"   # so without a claim every child reads no record
+                global PAUSE
+                PAUSE = 0.05                                      # so without a claim every child reads no record
                 try:
                     said = run(payload(parent, agent))[1]
                     os.write(res_w, b"1" if said and said["permissionDecision"] == "deny" else b"0")
@@ -183,7 +186,8 @@ def selfcheck():
         sub("s10", "a10", [asst(95000)])
         rc, d = run(payload("s10", "a10"))
         ok("at the save line: refused once with the save order", rc == 0 and d and d["permissionDecision"] == "deny"
-           and "deliverable file now" in d["permissionDecisionReason"]
+           and "names a file to write" in d["permissionDecisionReason"]
+           and "write no files, write none" in d["permissionDecisionReason"]
            and "next calls run normally" in d["permissionDecisionReason"])
         rec = json.load(open(os.path.join(STATE, "s10-a10.json")))
         ok("the save is recorded, not as a crossing", rec.get("saved") == 95105 and "used" not in rec)
@@ -229,6 +233,59 @@ def selfcheck():
         for ag in ("a11", "a11n"):
             ok(f"sixteen parallel hooks at the save line ({ag}): one save refusal, the rest run", parallel("s11", ag) == 1)
         ok("an unobtainable lock is never followed", not os.path.exists(os.path.join(home, "elsewhere")))
+
+        # 12. the test pause is never read from the environment: a bad value there neither crashes nor slows the hook
+        sub("s12", "a12", [asst(95000)])
+        os.environ["CC_SUBAGENT_BOUND_PAUSE"] = "not-a-number"
+        try:
+            ok("a bad pause in the environment: the save order as before",
+               "names a file to write" in ((run(payload("s12", "a12"))[1] or {}).get("permissionDecisionReason") or ""))
+        finally:
+            os.environ.pop("CC_SUBAGENT_BOUND_PAUSE", None)
+
+        # 13. the three figures from ~/.cc/config cost one cc-config call, and the environment still wins
+        with open(os.environ["CC_CONFIG"], "w") as fh:
+            fh.write("CC_SUBAGENT_CONTEXT_TOKENS=50000\nCC_SUBAGENT_WRAPUP_TOKENS=1000\nCC_SUBAGENT_SAVE_TOKENS=40000\n"
+                     "SLACK_OTHER=x\n")
+        calls, real_run = [], subprocess.run
+        subprocess.run = lambda cmd, *a, **k: (calls.append(cmd), real_run(cmd, *a, **k))[1]
+        try:
+            sub("s13", "a13", [asst(35000)])                      # past 60% of 50k, under the file's 40k
+            ok("config figures: the save line is read from the file", run(payload("s13", "a13"))[1] is None)
+            ok("config figures: one cc-config call for all three", len(calls) == 1)
+            sub("s13", "a13", [asst(45000)])
+            ok("config figures: the bound is read from the file", "50,000" in
+               ((run(payload("s13", "a13"))[1] or {}).get("permissionDecisionReason") or ""))
+            sub("s13", "a13b", [asst(52000)])
+            run(payload("s13", "a13b"))
+            sub("s13", "a13b", [asst(53200)])
+            ok("config figures: the wrap-up room is read from the file", "End your turn now" in
+               ((run(payload("s13", "a13b"))[1] or {}).get("permissionDecisionReason") or ""))
+            calls.clear()
+            os.environ.update({k: "0" for k in CFG_KEYS})
+            ok("all three in the environment: no cc-config call, and 0 is off",
+               run(payload("s13", "a13"))[1] is None and calls == [])
+        finally:
+            subprocess.run = real_run
+            for k in CFG_KEYS:
+                os.environ.pop(k, None)
+            open(os.environ["CC_CONFIG"], "w").close()
+
+        # 14. pruning: a new agent's first lock deletes state older than PRUNE_DAYS, keeps the rest and other files
+        old = time.time() - (PRUNE_DAYS + 1) * 86400
+        for n in ("old-x.json", "old-x.json.lock", "old-x.json.saved", "keep.txt"):
+            open(os.path.join(STATE, n), "w").close()
+            os.utime(os.path.join(STATE, n), (old, old))
+        open(os.path.join(STATE, "new-y.json.lock"), "w").close()
+        sub("s14", "a14", [asst(1000)])
+        run(payload("s14", "a14"))
+        left = set(os.listdir(STATE))
+        ok("prune: old state is deleted", not {"old-x.json", "old-x.json.lock", "old-x.json.saved"} & left)
+        ok("prune: fresh state and other files stay", {"new-y.json.lock", "keep.txt", "s14-a14.json.lock"} <= left)
+        open(os.path.join(STATE, "old-z.json"), "w").close()
+        os.utime(os.path.join(STATE, "old-z.json"), (old, old))
+        run(payload("s14", "a14"))
+        ok("prune: an agent's later calls do not sweep", os.path.exists(os.path.join(STATE, "old-z.json")))
     finally:
         STATE = state0
         for k, v in env0.items():

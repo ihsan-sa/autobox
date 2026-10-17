@@ -507,4 +507,66 @@ def selfcheck():
            and not same_owner(me, {**me, "boot_id": "another-boot"})
            and not alive({**me, "boot_id": "another-boot"})
            and not same_owner(me, {**me, "agent_id": "sibling"}))
+
+        # A KILLED LAUNCH (2026-10-04): a `cc … --go` stopped by a Bash timeout between taking the worker claim and
+        # opening the window left the claim held by the seat that typed it, alive for hours. Each case writes its
+        # own row's record: the owner is a live process that is not this check's, the launcher one that has exited.
+        # recurring-defect-ok: pause-hold-missing — these cases write delivery.json under the check's temp root; nothing launches a worker or writes the board
+        seat = subprocess.Popen(["sleep", "60"]); gone = subprocess.Popen(["sleep", "60"])
+        try:
+            def ident(pid): return {k: process(pid)[k] for k in ("pid", "start_ticks")}
+            live_owner = {"process": ident(seat.pid), "boot_id": boot_id(), "agent_id": None}
+            live_cc, dead_cc = ident(seat.pid), ident(gone.pid)
+            gone.kill(); gone.wait()
+            def held(row, executor, launcher):
+                d = new_record("r", row, root / f".cc/worktrees/r/{row}")
+                do_claim(d, live_owner, executor, by=launcher)
+                if launcher and executor != "worker": d["claim"]["launcher"] = launcher   # a record nothing writes, to prove it is ignored
+                f = root / f".cc/state/r/{row}/delivery.json"; f.parent.mkdir(parents=True); f.write_text(json.dumps(d))
+                return d
+            held("k1", "worker", dead_cc)
+            ok("a worker's claim whose launching cc has exited is free to the next dispatcher, though its seat lives",
+               alive(live_owner) and run("check", "r", "k1", "--executor", "worker").returncode == 0)
+            held("k2", "worker", live_cc)
+            ok("…while its launcher still runs, the claim is that launch's and the next dispatcher is refused",
+               run("check", "r", "k2", "--executor", "worker").returncode != 0)
+            held("k3", "worker", None)
+            ok("…and a worker claim that names no launcher holds for its live owner, as before",
+               run("check", "r", "k3", "--executor", "worker").returncode != 0)
+            held("k4", "subagent", dead_cc)
+            ok("a subagent's claim outlives the cc that took it: a launcher on it frees nothing",
+               run("check", "r", "k4", "--executor", "subagent").returncode != 0)
+            d = held("k5", "worker", dead_cc); c = d["claim"]
+            ok("the same seat launching again hands its own claim to the new cc, and the same cc changes nothing",
+               do_claim(d, live_owner, "worker", by=live_cc) == 1 and d["claim"] is c and c["launcher"] == live_cc
+               and c["generation"] == 1 and do_claim(d, live_owner, "worker", by=live_cc) == 0)
+            sub = new_record("r", "k6", root / ".cc/worktrees/r/k6"); do_claim(sub, live_owner, "subagent", by=live_cc)
+            ok("…and a subagent's claim never records one", sub["claim"]["launcher"] is None)
+            killed = held("k7", "worker", dead_cc); other = {**live_owner, "agent_id": "next-dispatcher"}
+            ok("the dispatcher that takes a killed launch's claim says so on the old execution",
+               do_claim(killed, other, "worker", by=live_cc) == 1 and killed["claim"]["generation"] == 2
+               and killed["executions"][0]["outcome"] == "superseded (its launch was killed)")
+            def under_cc(row, *flag):   # cc-task run by a shell whose argv[0] is bin/cc, as `cc` runs it
+                git("-C", str(dev), "worktree", "add", "-q", "-b", f"track/{row}", str(root / f".cc/worktrees/r/{row}"))
+                r = subprocess.run([str(BIN / "cc"), "-c", '"$@"; :', "cc", sys.executable, __file__, "claim", "r", row,
+                                    "--executor", "worker", *flag], executable="/bin/bash", env=env,
+                                   capture_output=True, text=True, timeout=60)
+                return r.returncode, json.loads(r.stdout or "{}").get("claim") or {}
+            rc8, c8 = under_cc("k8"); rc9, c9 = under_cc("k9", "--launch")
+            ok("only a --go's claim (--launch) is tied to its cc; `cc claim --executor worker` holds for its owner",
+               rc8 == 0 and rc9 == 0 and c8.get("launcher") is None and (c9.get("launcher") or {}).get("pid"))
+        finally:
+            seat.kill(); seat.wait()
+    with tempfile.TemporaryDirectory(prefix="cctask-launch-") as proc:   # the launcher read off a fake /proc
+        def fake(pid, ppid, comm, argv, ticks=100):
+            d = Path(proc, str(pid)); d.mkdir()
+            (d / "stat").write_text(f"{pid} ({comm}) S {ppid} " + " ".join(["0"] * 17) + f" {ticks}\n")
+            (d / "comm").write_text(comm + "\n"); (d / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+        fake(40, 1, "claude", ["claude"], 7); fake(45, 40, "bash", ["bash", "-c", "cc r t --go x"], 8)
+        fake(50, 45, "bash", ["bash", str(BIN / "cc"), "r", "t", "--go", "x"], 9)
+        fake(60, 50, "bash", ["bash", str(BIN / "cc"), "r", "t", "--go", "x"], 11)   # the `$(…)` around cc-task
+        fake(70, 40, "bash", ["bash", "-c", "cc-task claim r t --executor worker"], 12)
+        ok("the launcher is the outer cc, not the `$(…)` copy of it that runs cc-task",
+           launcher(ancestry(60, proc)) == {"pid": 50, "start_ticks": 9})
+        ok("…and cc-task run by anything but cc has none", launcher(ancestry(70, proc)) is None)
     print(f"cc-task selfcheck: {n} failed"); return 1 if n else 0
