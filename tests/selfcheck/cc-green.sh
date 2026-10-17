@@ -64,10 +64,75 @@ EOS
   D2=$(mktemp -d); R=$(newrepo caged); echo bwrap > "$D/pid1"; echo systemd > "$D/pid1-host"
   ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 )
   k "$(t grep -qx caged=1 "$D2"/*.verdict)" "a run where pid 1 is bwrap writes caged=1 into its verdict"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
+  k "$(t test -n "$(grep 'green   lander check — passed' <<<"$out")" -a -z "$(grep 'caged checks only' <<<"$out")")" \
+    "…and its green line does not say caged checks only: it ran every check it could"
   rm -rf "$D2"; D2=$(mktemp -d)
   ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 )
   k "$(nt grep -q caged "$D2"/*.verdict)" "…and a run on the host does not"
   rm -rf "$D2"
+  # 1c A WORKER IN ITS FENCE ASKS AND RUNS NOTHING: under cc-loop (CC_GREEN_ASK) where pid 1 is bwrap, `start` writes the
+  # request and starts no run, so nothing is left to die with the fence; the loop runs it on the host (green_kick).
+  D2=$(mktemp -d); R=$(newrepo asked); mkdir -p "$D/askst"
+  out=$( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/askst/green.ask")" "in a fence under cc-loop, start writes the request and exits 0"
+  k "$(t grep -q 'asked the loop to run lander check on this tree on the host' <<<"$out")" "…and says the loop runs it on the host"
+  k "$(t test ! -e "$D/asked.args" -a -z "$(ls -A "$D2")")" "…having run no check and taken no lock, status or log"
+  rm -f "$D/askst/green.ask"
+  out=$( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" start -- core/tests/check.sh 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2 -a ! -e "$D/askst/green.ask" -a -n "$(grep 'the loop runs lander check for you on the host and no suite' <<<"$out")")" "in a fence, start -- SUITE is refused (exit 2) and asks nothing: the host runs no suite for a worker"
+  ( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" wait 1 >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "in a fence, wait exits 1 and never 3, so a worker does not sit in it"
+  out=$( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep -F "journaled in $D/askst/progress.md" <<<"$out")" -a -n "$(grep -F "copied to $D/askst/green.log" <<<"$out")")" \
+    "in a fence, a bare cc-green exits 1 and points at the journal line and the green.log copy"
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo askhost)
+  ( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
+      && CC_GREEN_DIR="$D2" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/askhost.args" -a ! -e "$D/askst/green.ask")" "on the host, CC_GREEN_ASK changes nothing: start runs the check itself"
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo outside)
+  ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/outside.args")" "in a fence with no CC_GREEN_ASK (a member's loop), run still runs the check in there"
+  rm -rf "$D2"
+  # 1d A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the pinned lander, caged checks only, and none of
+  # the tree's own code: the fixture's core/lander/cli.py writes <name>.args when it runs, so its absence is the proof.
+  printf '#!/bin/sh\necho "$*" > "%s/pinned.args"\necho "lander check: fake pinned"\n' "$D" > "$D/pinned"; chmod +x "$D/pinned"
+  D2=$(mktemp -d); R=$(newrepo forw)
+  ( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/pinned" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a "$(cat "$D/pinned.args" 2>/dev/null)" = "check --caged-only $(git -C "$R" rev-parse --show-toplevel)")" \
+    "for a worker, the run is the pinned lander's \`check --caged-only <root>\`, exit 0"
+  k "$(nt test -e "$D/forw.args")" "…and the worktree's own core/lander/cli.py never ran"
+  k "$(t grep -qx caged=1 "$D2"/*.verdict)" "…its verdict carries caged=1 though pid 1 is not bwrap"
+  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
+  k "$(t grep -q 'green   lander check — passed on this tree at .* (caged checks only)' <<<"$out")" "…and its green line says caged checks only"
+  # A pinned release older than --caged-only refuses it as an unknown option: said loudly, no verdict, nothing else run.
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo forwold)
+  printf '#!/bin/sh\necho "lander check: unknown option --caged-only" >&2\nexit 2\n' > "$D/oldpin"; chmod +x "$D/oldpin"
+  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/oldpin" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -ne 0 -a ! -e "$D/forwold.args" -a -n "$(grep 'PINNED LANDER PREDATES' <<<"$out")" -a -n "$(grep 'no verdict (exit 3' <<<"$out")")" \
+    "for a worker, a pinned lander without --caged-only fails loudly with no verdict, and the tree's own never runs"
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo forwnone)
+  ( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/absent" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -ne 0 -a ! -e "$D/forwnone.args")" "for a worker with no pinned lander: no verdict, and still not the tree's own"
+  # …and no suite, on a fixture whose suite HEAD tracks, so suite_ok alone would let it run (the control below does).
+  rm -rf "$D2"; D2=$(mktemp -d); mkdir -p "$R/tests"
+  printf '#!/bin/sh\ntouch "%s/forwsuite.ran"\n' "$D" > "$R/tests/check-x.sh"; chmod +x "$R/tests/check-x.sh"
+  git -C "$R" add tests/check-x.sh && git -C "$R" commit -qm suite
+  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/pinned" CC_GREEN_DIR="$D2" "$SELF" run -- tests/check-x.sh 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2 -a ! -e "$D/forwsuite.ran" -a -n "$(grep 'a run for a worker is lander check only, never a suite' <<<"$out")")" \
+    "for a worker, -- SUITE is refused (exit 2) and the suite never ran"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run -- tests/check-x.sh >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/forwsuite.ran")" "…control: the same suite runs when the run is not for a worker"
+  rm -rf "$D2"
+  # 1e THE SLOT-WAIT RECORD'S NAMES come from .cc/track, which the worker writes: one carrying '/' or '..' is not taken.
+  R=$(newrepo trk); mkdir -p "$R/.cc"
+  printf '../../escape\nrow/../../x\n' > "$R/.cc/track"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trk.tsv trk")" \
+    "a .cc/track repo and row carrying '/' or '..' are refused: the record stays in the green dir under the fallback names"
+  printf '..\n.hidden\n' > "$R/.cc/track"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trk.tsv trk")" "…and so are a bare '..' and a leading dot"
+  printf 'somerepo\nmy-row.2\n' > "$R/.cc/track"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-somerepo.tsv my-row.2")" "…control: plain names are taken as written"
   D2=$(mktemp -d); R=$(newrepo never)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'no verdict on this worktree' <<<"$out")")" "a worktree nothing has run on is not green, exit 1"

@@ -16,7 +16,9 @@
 #                            classifier as a bypass and refused (twice on 2026-09-25). A worker then ENDS ITS ITERATION
 #                            rather than wait in a model turn: cc-loop's green_wait waits on the run with no model call
 #                            and journals its exit and log for the next one. Anyone else: `cc-green wait` until it
-#                            does not exit 3. exit 0 once the run is going, 3 when one already is
+#                            does not exit 3. exit 0 once the run is going, 3 when one already is. Inside a worker's
+#                            sandbox under cc-loop it runs nothing and asks the loop to run it on the host (A WORKER
+#                            IN ITS FENCE ASKS, below): exit 0 once asked
 #   cc-green start -- SUITE  the same for one of the repo's own suites: a `[core/]tests/check*.sh` or `selftest*.sh`
 #                            (`tests/check-slow.sh`), or a tool's `[core/]bin/<tool> selfcheck` for a tool that ships
 #                            one — nothing else, no other arguments, and only a file the branch's HEAD already tracks,
@@ -60,6 +62,27 @@
 # branch carries, and never needs a pinned release to exist — else the `lander` on PATH. Neither is no verdict.
 # The check runs with no *_TOKEN / *_KEY / *_SECRET / *_CREDS / *_WEBHOOK / *_PASSWORD or named API token from this
 # shell, and with the live ~/.cc/config denied (CC_CONFIG_DENY).
+# A WORKER IN ITS FENCE ASKS; THE HOST RUNS IT. A sandboxed worker's `start` used to run inside its bwrap, whose $HOME is
+# a private tmpfs: the lock, status and log went there, the run died with the fence when the iteration ended
+# (--unshare-pid --die-with-parent), and cc-loop's green_wait on the host found no run. All 12 workers stalled that way
+# on 2026-10-16. So where pid 1 is bwrap and cc-loop has said where to ask (CC_GREEN_ASK, its $ST/green.ask), `start`
+# runs nothing: it writes that file and says so, and the worker ends its iteration. cc-loop reads only that the file
+# is there, consumes it and runs `cc-green start` itself on the host, in the worktree it launched, with
+# CC_GREEN_FOR_WORKER=1 (green_kick). What the file holds chooses nothing. `start -- SUITE` there is refused: the host
+# runs no suite for a worker, and a detached one in the fence dies with it unseen; `run -- SUITE` runs it in the
+# foreground. `wait` there says the same and exits 1, and a bare `cc-green` there, whose state would be the fence's own
+# empty tmpfs, names the journal line and the green.log copy the loop writes, and exits 1. A member's loop sets no CC_GREEN_ASK: it runs inside that
+# boundary itself, and a run there outlives the iteration as before.
+# A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the PINNED lander beside this bin (`lander`, which
+# runs ~/.cc/lander/current), never the worktree's core/lander/cli.py, which the worker wrote and which would run on
+# the host outside its fence. It runs `check --caged-only`: only the checks that run whole in the lander's bwrap
+# profile; host, box, network and mount checks wait for the landing. Its verdict carries caged=1 as a fenced run's
+# does, so cc-try puts nothing live on it, and caged_only=1, which alone makes its green line say "(caged checks
+# only)": a run inside a fence ran every check it could. A pinned release older than the flag refuses it as an unknown
+# option; that is said loudly and kept as no verdict, never retried as a full check on the host. green.sh and
+# recurring_defects.py come from beside this bin only, never the checkout's copy, and it takes no `-- SUITE`. The host
+# git it runs in the tree reads no config, hook or redirect the worker can write: cc-sandbox binds the worktree's .git,
+# commondir and config.worktree ro, and cc-loop passes the main checkout's hooksPath (HG).
 # A RED IS NOT WRITTEN TO THE FAILURES LEDGER from here. lander check holds a check that is red on the base too
 # against main, not the change, so a red it reports is red only on the branch: that is the worker's own work.
 #
@@ -93,9 +116,30 @@ USAGE="usage: cc-green [run|start [-- SUITE]|wait [SECONDS]|stop|red SCOPE KIND 
 # "No such file" here, then "started", and each ended an iteration waiting on a run that never began.
 tests_dir(){   # → the first dir holding green.sh: beside this bin, then the checkout's core/tests, then its tests
   local t w; w=$(git rev-parse --show-toplevel 2>/dev/null) || w=""
+  [ "${CC_GREEN_FOR_WORKER:-}" = 1 ] && w=""   # a run for a worker sources none of the worker's own code
   for t in "$CORE/tests" ${w:+"$w/core/tests" "$w/tests"}; do [ -f "$t/green.sh" ] && { echo "$t"; return 0; }; done
   return 1
 }
+caged(){ [ "$(cat "${CC_GREEN_PID1_COMM:-/proc/1/comm}" 2>/dev/null)" = bwrap ]; }   # inside a fence: bwrap is pid 1
+# The fence's `start` and `wait` come before the tests are looked for: they need none, and a repo with no green.sh
+# (anything but this one) has its request filed all the same.
+if [ -n "${CC_GREEN_ASK:-}" ] && caged; then
+  case "${1:-}" in
+    start)
+      [ $# = 1 ] || { echo "cc-green: inside your sandbox the loop runs lander check for you on the host and no suite; a detached suite here dies with this iteration unseen — run it in the foreground: cc-green run -- ${*:3}. Nothing was started." >&2; exit 2; }
+      git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "cc-green: not in a git checkout" >&2; exit 2; }
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$CC_GREEN_ASK" 2>/dev/null || { echo "cc-green: could not write the request $CC_GREEN_ASK — nothing was asked" >&2; exit 2; }
+      echo "cc-green: asked the loop to run lander check on this tree on the host once this iteration ends (request $CC_GREEN_ASK)."
+      echo "  End your iteration now: the loop runs it with no model call and journals its verdict, and a copy of its log at $(dirname "$CC_GREEN_ASK")/green.log, for your next one."
+      exit 0 ;;
+    wait)
+      echo "cc-green: no run goes inside your sandbox — the loop runs your green on the host after this iteration ends$([ -e "$CC_GREEN_ASK" ] && echo ', and it has your request'). End your iteration; its verdict is in your journal next time." >&2
+      exit 1 ;;
+    "")   # the fence's own state is a private tmpfs that never held the host's run: point at where its verdict lands
+      echo "cc-green: no verdict lives inside your sandbox — the host's run for this worktree is journaled in $(dirname "$CC_GREEN_ASK")/progress.md (its '- cc-loop: the cc-green run …' line, with the verdict) and its log copied to $(dirname "$CC_GREEN_ASK")/green.log$([ -e "$CC_GREEN_ASK" ] && echo '; your request is still waiting for this iteration to end')."
+      exit 1 ;;
+  esac
+fi
 TESTS=$(tests_dir) || [ "${1:-}" = red ] || { echo "cc-green: no tests/green.sh beside $BIN, nor in this checkout's core/tests or tests — nothing was started" >&2; exit 2; }
 # shellcheck source=/dev/null
 [ -z "$TESTS" ] || . "$TESTS/green.sh" || { echo "cc-green: $TESTS/green.sh did not load — nothing was started" >&2; exit 2; }
@@ -161,7 +205,10 @@ secret_names(){
 
 # ── the check: lander check on the root, and its verdict note ──────────────────────────────────────────────────
 lander_cmd(){   # $1 = root → sets LCMD to the lander check to run there; 1 when there is none
-  if [ -f "$1/core/lander/cli.py" ]; then LCMD=(python3 -P "$1/core/lander/cli.py" check "$1")
+  if [ "${CC_GREEN_FOR_WORKER:-}" = 1 ]; then   # for a worker, on the host: the pinned lander, caged checks, never the tree's code
+    local hl="${CC_GREEN_LANDER:-$BIN/lander}"   # CC_GREEN_LANDER: test hook
+    if [ -x "$hl" ]; then LCMD=("$hl" check --caged-only "$1"); else return 1; fi
+  elif [ -f "$1/core/lander/cli.py" ]; then LCMD=(python3 -P "$1/core/lander/cli.py" check "$1")
   elif command -v lander >/dev/null 2>&1; then LCMD=(lander check "$1")
   else return 1; fi
 }
@@ -179,12 +226,17 @@ verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
 # for an admission slot went with it. The check is told a durable per-repo file, $GDIR/waits-<repo>.tsv
 # (LANDER_WAIT_LOG), and the row (LANDER_WAIT_ROW); lander/admission.py appends `start end row who secs` there for
 # every slot it holds, and cc-i2m reads that as the green stage. Repo and row come from the worktree's .cc/track,
-# else the main checkout's directory name and the worktree's.
+# else the main checkout's directory name and the worktree's. .cc/track is in the tree, which the worker writes, and
+# the run for a worker is the host's: a repo of `../../x` would point the host's append outside $GDIR. So a name
+# carrying '/', '..', a leading '.' or anything but [A-Za-z0-9._-] is not taken, and the fallback stands for it.
+name_ok(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] && [[ "$1" != *..* ]]; }
 wait_log(){   # $1 = root → "FILE ROW", the run's slot-wait record
   local repo="" row="" c
   { read -r repo; read -r row; } < "$1/.cc/track" 2>/dev/null
+  name_ok "$repo" || repo=""; name_ok "$row" || row=""
   [ -n "$repo" ] || { c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && repo=$(basename "$(dirname "$c")"); }
   [ -n "$row" ] || row=$(basename "$1")
+  name_ok "$repo" || repo=unknown; name_ok "$row" || row=unknown
   echo "$GDIR/waits-${repo:-unknown}.tsv $row"
 }
 run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to run
@@ -203,6 +255,12 @@ run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
   wait "$gp" || rc=$?
   run_traps
+  # A pinned release older than `check --caged-only` (6a5859e9, 2026-10-11) refuses the flag as an unknown option.
+  # Never fall back to a full check on the host for a worker's tree: say so loudly and keep no verdict.
+  if [ "${CC_GREEN_FOR_WORKER:-}" = 1 ] && [ "$rc" != 0 ] && grep -q -- 'unknown option --caged-only' "$LOG" 2>/dev/null; then
+    echo "cc-green: THE PINNED LANDER PREDATES \`check --caged-only\` — no green for a worker can run until a newer release is promoted; nothing else was run in its place, no verdict"
+    return 3
+  fi
   return "$rc"
 }
 
@@ -212,7 +270,7 @@ report(){   # $1 = tree → one line for lander check's last verdict on this roo
   if [ -z "$t" ]; then echo "  RUN     lander check — no verdict on this worktree"; return 1; fi
   [ "$t" = "$1" ] || { echo "  RUN     lander check — its last verdict ($at) is on ${t:0:12}, not this tree"; return 1; }
   case "$c" in
-    0) echo "  green   lander check — passed on this tree at $at"; return 0 ;;
+    0) echo "  green   lander check — passed on this tree at $at$([ "$(verdict_field caged_only)" = 1 ] && echo ' (caged checks only)')"; return 0 ;;
     1) echo "  RED     lander check — a check it selected failed on this tree at $at; log $lg"; return 1 ;;
     *) echo "  RUN     lander check — no verdict (exit $c: a check could not run, or no lander) at $at; log $lg"; return 1 ;;
   esac
@@ -454,7 +512,7 @@ stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this
 }
 
 main(){
-  local mode=${1:-} r tree tree2 moved crc
+  local mode=${1:-} r tree tree2 moved crc cg
   r=$(root) || true
   [ -n "${r:-}" ] || { echo "cc-green: not in a git checkout" >&2; exit 2; }
   # Wait BEFORE taking the tree: the report is on what the working copy holds once the run is over, not before.
@@ -468,7 +526,8 @@ main(){
   # Every door that takes `-- …` checks it the same way, __run too: the check is on what runs, not on who asked.
   # (The dispatcher below has already taken the `--` off for run/start; __run still carries it.)
   case "$mode" in
-    run|start) [ $# -lt 2 ] || suite_ok "$r" "${@:2}" || exit 2 ;;
+    run|start) [ $# -lt 2 ] || [ "${CC_GREEN_FOR_WORKER:-}" != 1 ] || { echo "cc-green: a run for a worker is lander check only, never a suite — nothing was started" >&2; exit 2; }
+               [ $# -lt 2 ] || suite_ok "$r" "${@:2}" || exit 2 ;;
     __run)     [ "${2:-}" != -- ] || suite_ok "$r" "${@:3}" || exit 2 ;;
   esac
   [ "$mode" = run ] && { shift; launch_run "$r" 1 "$@"; exit $?; }
@@ -494,10 +553,13 @@ main(){
       echo "cc-green: the run itself moved the tree ($tree -> $tree2): ${moved:-<unnameable>} — no verdict is kept"
       tree=$tree2; rm -f "$VERDICT"
     else
-      printf 'tree=%s\ncheck=%s\nat=%s\nlog=%s\n' "$tree" "$crc" "$(now)" "$LOG" > "$VERDICT"
-      # caged=1: this run was inside a worker's fence (bwrap is pid 1 there), whose files the worker writes itself.
-      # cc-try puts nothing live on such a verdict; only a run on the host counts (security read of #1086).
-      [ "$(cat "${CC_GREEN_PID1_COMM:-/proc/1/comm}" 2>/dev/null)" != bwrap ] || echo caged=1 >> "$VERDICT"
+      # caged=1: this run was inside a worker's fence (bwrap is pid 1 there), whose files the worker writes itself, or
+      # the host ran it for a worker and so ran only the caged checks. cc-try puts nothing live on such a verdict
+      # (security read of #1086). One write with the record, so no reader sees the verdict without its mark.
+      # caged_only=1 marks only the latter: an in-fence run ran every check it could, so its line says nothing more.
+      cg=""; { caged || [ "${CC_GREEN_FOR_WORKER:-}" = 1 ]; } && cg=$'caged=1\n'
+      [ "${CC_GREEN_FOR_WORKER:-}" = 1 ] && cg+=$'caged_only=1\n'
+      printf 'tree=%s\ncheck=%s\nat=%s\nlog=%s\n%s' "$tree" "$crc" "$(now)" "$LOG" "$cg" > "$VERDICT"
     fi
   elif [ -z "$mode" ] && [ -e "$LOCK" ] && ! flock -n "$LOCK" true 2>/dev/null; then
     echo "cc-green: a run is going on this worktree (pid $(status_field pid), since $(status_field started)) — \`cc-green wait\` for its verdict"

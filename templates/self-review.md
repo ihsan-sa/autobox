@@ -27,7 +27,10 @@ which detaches the run itself and returns. **Then end your iteration: do not sit
 that the run is going, and leave `STATUS: DONE` for the iteration that has read a green log. The loop waits on the run
 with no model call and journals its exit and log, and your next iteration reads that log and finishes. A worker that
 waited in its own turn instead was killed at the hour cap 15 times out of 16 on 2026-09-30. One of your repo's own suites the plan does not select goes the same way, `cc-green start --
-tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
+tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Inside
+your sandbox `cc-green start` runs nothing there: it asks the loop, which runs `lander check` (caged checks only) on the
+host once your iteration ends and journals the verdict with a copy of its log you can read. It takes no suite there, so
+run one in the foreground with `cc-green run -- SUITE`. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
 refuses those as a bypass, and a `run_in_background` job dies with your iteration. If you edit while it runs, its
 verdict no longer answers for your tree: `cc-green stop` ends your own run (never `kill` it), then `start` again.
 

@@ -95,6 +95,16 @@
 # still counts it), and at the step limit it buys ONE more iteration to read that result — once per round (gext:
 # the grant is not repeated until a commit starts a new round, or a worker re-running a red suite every iteration
 # would never be stopped by anything), not a batch, and not under --no-extend, whose bound is the caller's promise.
+# A SANDBOXED WORKER'S RUN GOES ON THE HOST (green_kick). Inside cc-sandbox the run lived on the fence's private
+# tmpfs and died with it at the iteration's end, so green_wait found nothing and all 12 workers stalled at their last
+# step on 2026-10-16. Each iteration is told where to ask (CC_GREEN_ASK=$ST/green.ask, not inside a member boundary,
+# whose own loop is in bwrap with the run); a fenced `cc-green start` writes that file and runs nothing. After the
+# iteration, BEFORE the DONE branch (a worker asks in the iteration it writes STATUS: DONE), the loop consumes the
+# file and runs `cc-green start` in $WT itself with CC_GREEN_FOR_WORKER=1 (the pinned lander, `check --caged-only`)
+# and the main checkout's hooksPath, then waits it out as above and copies its log to $ST/green.log, where the
+# fence can read it. Only the file's being there is read: the command, the tree and the lander are the loop's own.
+# The kicked run is remembered in $ST's parent (gk_mark, out of the fence's reach) until green_wait collects it, so one
+# still going at the 40-wait bound, or left by a loop that died, is journaled with its log copy later, and once.
 # One that ends with ANY OTHER RUN OF ITS OWN STILL GOING in its worktree (own_run_live: a detached EDA run, a heavy
 # slot) is not waited for, so it gets neither of those (a stray shell or dev server there must not switch the barren
 # stops off), but neither kind is COUNTED: the hour limit, a capped turn or an error that ended an iteration whose gate
@@ -759,6 +769,15 @@ say_send(){   # $1 repo  $2 track  $3 text → the verdict above, and its rc
   else echo "cc-loop: kept for $1/$2, not yet heard — the loop ended before its worker took it; the next dispatch's first iteration takes it" >&2; fi
   return 3; }
 green_wait(){   # a cc-green run on THIS worktree still going when the iteration ended → wait it out here, journal its result, return 0; none → 1
+  # $1 = kicked: the loop started this run itself (green_kick), so it is live by construction and the `wait 0` probe is
+  # skipped (a check with nothing to run can end inside that probe's grace, and its verdict would go unjournaled), and
+  # every call carries CC_GREEN_FOR_WORKER=1, since the report takes the tree with host git and reads its defects.
+  # THE LOG IS COPIED INTO $ST/green.log: the run's own is under ~/.cc/state/land/green, which the fence does not bind.
+  # The copy is a fresh file renamed over the name (mv -T), never a write through what the worker left there, and the
+  # fresh file is made in $ST's parent, which the fence does not bind, on the same filesystem.
+  # A KICKED RUN IS REMEMBERED UNTIL IT IS COLLECTED (gk_mark, in $ST's parent, so the worker cannot plant or clear it;
+  # it holds the iteration that asked). A run still going at the 40-wait bound, or one a loop that died had started,
+  # is waited on and journaled the next time this runs, kicked or not, with the worker flag and the log copy, once.
   # "a live cc-green run of its own = not idle" (the brief). `cc-green wait` answers 3 while a run holds the root's lock,
   # else the tree's report (0/1) or 2 for no checkout at all. WHETHER A RUN IS LIVE is asked first, with `wait 0` (the
   # lock tried once, after cc-green's 1 s grace), and kept: a run that ends 60 s into the first `wait 540` answers 0 there,
@@ -768,17 +787,43 @@ green_wait(){   # a cc-green run on THIS worktree still going when the iteration
   # for a check slot sat 2 h+ and an 8-wait bound gave up on it, so the iteration read as "committed nothing" and the
   # track paused. The bound is 40 × 540 s (6 h), and a run still live at it is journaled and handed to the next
   # iteration as progress (return 0), never as an empty one; the spend-since-commit rule still bounds a runaway.
-  local o rc n=0 lg g="${CC_GREEN:-$BIN/cc-green}"   # CC_GREEN: test hook
-  o=$(cd "$WT" && "$g" wait 0 2>&1); [ $? = 3 ] || return 1   # no run live as the iteration ended: nothing to wait on
-  log "iter $i ended with its own cc-green run still going — waiting on it, no model call: ${o##*$'\n'}"
-  while :; do o=$(cd "$WT" && "$g" wait 540 2>&1); rc=$?; [ "$rc" = 3 ] || break
+  local o rc n=0 lg cp="" vd tmp who="iteration $i started" g="${CC_GREEN:-$BIN/cc-green}" gfw=() km="${1:-}" ki=$i mk   # CC_GREEN: test hook
+  mk=$(gk_mark); [ -f "$mk" ] && { km=kicked; ki=$(head -c 12 "$mk" | tr -cd 0-9); ki=${ki:-$i}; }
+  if [ "$km" = kicked ]; then who="the loop started on the host after iteration $ki"; gfw=("${HG[@]}" CC_GREEN_FOR_WORKER=1)
+  else
+    o=$(cd "$WT" && "$g" wait 0 2>&1); [ $? = 3 ] || return 1   # no run live as the iteration ended: nothing to wait on
+    log "iter $i ended with its own cc-green run still going — waiting on it, no model call: ${o##*$'\n'}"; fi
+  while :; do o=$(cd "$WT" && env "${gfw[@]}" "$g" wait 540 2>&1); rc=$?; [ "$rc" = 3 ] || break
     n=$((n+1)); [ "$n" -ge 40 ] && { log "…still going after $n waits — handing it to the next iteration"
-      printf -- '- cc-loop: the cc-green run iteration %s started is still going after %s waits (%s) — do not start another; end your turn and the loop waits again\n' \
-        "$i" "$n" "${o##*$'\n'}" >> "$ST/progress.md"; return 0; }; done
+      printf -- '- cc-loop: the cc-green run %s is still going after %s waits (%s) — do not start another; end your turn and the loop waits again\n' \
+        "$who" "$n" "${o##*$'\n'}" >> "$ST/progress.md"; return 0; }; done
   lg=$(grep -oE -- '— log [^ ]+' <<<"$o" | head -1 | sed 's/^— log //')
+  rm -f -- "$mk"   # collected: journaled below, never twice
+  if [ "$km" = kicked ] && [ -n "$lg" ] && [ -f "$lg" ] && tmp=$(mktemp "$(dirname "$ST")/.green.log.XXXXXX" 2>/dev/null); then
+    if tail -c 262144 "$lg" > "$tmp" && mv -fT "$tmp" "$ST/green.log" 2>/dev/null; then cp="$ST/green.log"; else rm -f "$tmp"; fi; fi
+  vd=$(grep -m1 -E '^ +(green|RED|RUN) +lander check —' <<<"$o" | tr -s ' ' | sed 's/^ //')   # the report's own verdict line
   log "the cc-green run ended: exit $rc — ${o##*$'\n'}"
-  printf -- '- cc-loop: the cc-green run iteration %s started ended while the loop waited on it (exit %s%s) — read that log before you run another\n' \
-    "$i" "$rc" "${lg:+, log $lg}" >> "$ST/progress.md"; return 0; }
+  printf -- '- cc-loop: the cc-green run %s ended while the loop waited on it (exit %s%s) — read that log before you run another%s%s\n' \
+    "$who" "$rc" "${lg:+, log $lg}" "${cp:+; its last 256 KiB, readable inside your sandbox: $cp}" "${vd:+; verdict: $vd}" >> "$ST/progress.md"; return 0; }
+gk_mark(){ printf '%s/.%s.green-kicked' "$(dirname "$ST")" "$(basename "$ST")"; }   # → where a kicked run is remembered
+green_kick(){   # ON THE HOST, after an iteration: the worker asked ($ST/green.ask) → start its green run here; 0 when a run is going, 1 when none
+  # The ask is a file the worker writes, so only its being there is read, and it is consumed (rm, which takes a link
+  # away and follows none). What runs is fixed here: `cc-green start` with no argument, in $WT, with
+  # CC_GREEN_FOR_WORKER=1 (the pinned lander, caged checks only, no suite, none of the tree's own code) and HG.
+  # Not inside a member boundary: that loop is in bwrap itself and sets no CC_GREEN_ASK.
+  local o rc ask="$ST/green.ask" g="${CC_GREEN:-$BIN/cc-green}"   # CC_GREEN: test hook
+  inside_boundary && return 1
+  { [ -e "$ask" ] || [ -L "$ask" ]; } || return 1
+  rm -rf -- "$ask"
+  o=$(cd "$WT" && env "${HG[@]}" CC_GREEN_FOR_WORKER=1 "$g" start 2>&1); rc=$?
+  case "$rc" in 0|3) printf '%s\n' "$i" > "$(gk_mark)";; esac   # remembered until green_wait collects it
+  case "$rc" in
+    0) log "started the worker's green run on the host, as it asked: ${o%%$'\n'*}"; return 0;;
+    3) log "the worker asked for its green run, and one was already going on its tree — waiting on that one"; return 0;;
+  esac
+  log "could not start the worker's green run on the host: exit $rc — ${o//$'\n'/ }"
+  printf -- '- cc-loop: you asked for your green run and the loop could not start it on the host after iteration %s: cc-green said exit %s: %s\n' \
+    "$i" "$rc" "$(tail -1 <<<"$o")" >> "$ST/progress.md"; return 1; }
 own_run_live(){   # a process of the worker's own still running in $WT once claude has exited (a detached EDA run, a
   # `cc-room heavy` slot) → prints "pid command" and 0; none → 1. This loop's own tree (its subshells, the hook) is not
   # one, nor is anything it runs under (the window's shell, a sandbox's pid 1).
@@ -1006,6 +1051,62 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
     "$(grep -c '^- cc-loop: the cc-green run iteration 4 started is still going after 40 waits' "$d/gw/starved/st/progress.md")" 1
   t 'no run going: nothing waited on' "$(gw none 0 0)" "rc=1 asks=1"
   t '…and nothing journaled' "$(wc -c < "$d/gw/none/st/progress.md")" 0
+  # THE LOOP RUNS A FENCED WORKER'S GREEN ON THE HOST WHEN IT ASKED (green_kick): only the file's being there is read,
+  # and what runs is `cc-green start` with no argument, in $WT, with CC_GREEN_FOR_WORKER=1 and HG. Each case on a
+  # fixture of its own. The fake cc-green logs each call's argv, the worker flag and the hooksPath HG gave it; `start`
+  # exits GK_START (0 unless the case says); `wait` says the run ended green with a log and the report's verdict line.
+  gk(){ ( k="$d/gk/$1"; mkdir -p "$k/wt" "$k/st"; : > "$k/st/progress.md"; : > "$k/calls"; echo "fixture log line" > "$k/run.log"
+          cat > "$k/fake" <<EOS
+#!/bin/sh
+echo "\$* FW=\${CC_GREEN_FOR_WORKER:-} hp=\${GIT_CONFIG_VALUE_0:-}" >> "$k/calls"
+case "\$1" in
+  start) case "${GK_START:-0}" in 0) echo "cc-green: started lander check on $k/wt (pid 1) — log $k/run.log";;
+           3) echo "cc-green: a run is already going on $k/wt (pid 1)";; *) echo "cc-green: not in a git checkout";; esac; exit ${GK_START:-0};;
+  wait) [ "\$(grep -c '^wait' "$k/calls")" -le "\${GK_WAIT3:-0}" ] && { echo "cc-green: a run is going (pid 1)"; exit 3; }
+        echo "cc-green: the run (pid 1, started 00:00) has ended (exit 0) — log $k/run.log"
+        echo "cc-green: what lander check found on abc"; echo "  green   lander check — passed on this tree at T1 (caged checks only)"; exit 0;;
+esac
+exit 9
+EOS
+          chmod +x "$k/fake"
+          case "$2" in ask) : > "$k/st/green.ask";; cmd) echo 'rm -rf / ; start -- tests/x.sh' > "$k/st/green.ask";;
+            link) echo untouched > "$k/victim"; ln -s "$k/victim" "$k/st/green.ask";; esac
+          [ "${3:-}" = loglink ] && echo untouched > "$k/victim" && ln -s "$k/victim" "$k/st/green.log"
+          log(){ printf '%s\n' "$*" >> "$k/loop.log"; }
+          HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/host/hooks) WT="$k/wt" ST="$k/st" CC_GREEN="$k/fake" i=4
+          CC_MEMBER_SANDBOX=${GK_MEM:-}   # no member boundary unless the case says, whatever this selfcheck inherited
+          [ -n "${GK_AGAIN:-}" ] && { i=5; : > "$k/calls"; green_wait; echo "rc=$?|$(tr '\n' '|' < "$k/calls")"; exit; }
+          if green_kick; then green_wait kicked; echo "kicked|$(tr '\n' '|' < "$k/calls")"; else echo "none|$(tr '\n' '|' < "$k/calls")"; fi ); }
+  gkrun="kicked|start FW=1 hp=/host/hooks|wait 540 FW=1 hp=/host/hooks|"
+  t 'the worker asked (green.ask): the loop runs cc-green start on the host for it, flagged for a worker with the main hooksPath, and waits it out' \
+    "$(gk ask ask)" "$gkrun"
+  t '…the ask is consumed' "$([ -e "$d/gk/ask/st/green.ask" ] && echo there || echo gone)" gone
+  t '…and the journal names who started it, the verdict and a copy the sandbox can read' \
+    "$(grep -c "^- cc-loop: the cc-green run the loop started on the host after iteration 4 ended while the loop waited on it (exit 0, log $d/gk/ask/run.log) — read that log before you run another; its last 256 KiB, readable inside your sandbox: $d/gk/ask/st/green.log; verdict: green lander check — passed on this tree at T1 (caged checks only)$" "$d/gk/ask/st/progress.md")" 1
+  t '…the copy holds the log' "$(cat "$d/gk/ask/st/green.log")" "fixture log line"
+  t '…and its temp file was made outside the worker'"'"'s dir and left nowhere' "$(find "$d/gk" -name '.green.log.*' | wc -l)" 0
+  t 'no ask: nothing started' "$(gk idle none)" "none|"
+  t 'an ask that holds a command runs exactly the same: its content chooses nothing' "$(gk cmd cmd)" "$gkrun"
+  t 'an ask planted as a link: the link is taken away, what it names is untouched, and the same run starts' \
+    "$(gk link link)|$([ -e "$d/gk/link/st/green.ask" ] || [ -L "$d/gk/link/st/green.ask" ] && echo there || echo gone)|$(cat "$d/gk/link/victim")" "$gkrun|gone|untouched"
+  t 'a run already going on the tree (start exit 3): the loop waits on that one' "$(GK_START=3 gk going ask)" "$gkrun"
+  t 'a start that fails (exit 2): nothing waited on' "$(GK_START=2 gk failed ask)" "none|start FW=1 hp=/host/hooks|"
+  t '…and the journal tells the worker' \
+    "$(grep -c '^- cc-loop: you asked for your green run and the loop could not start it on the host after iteration 4: cc-green said exit 2: cc-green: not in a git checkout$' "$d/gk/failed/st/progress.md")" 1
+  t 'inside a member boundary, even asked: nothing started (that loop is in bwrap itself)' "$(GK_MEM=1 gk member ask)" "none|"
+  gk loglink ask loglink >/dev/null
+  t 'a link the worker left at green.log is replaced, never written through' \
+    "$(cat "$d/gk/loglink/victim")|$([ -L "$d/gk/loglink/st/green.log" ] && echo link || echo file)|$(cat "$d/gk/loglink/st/green.log")" "untouched|file|fixture log line"
+  # A KICKED RUN STILL GOING AT THE 40-WAIT BOUND IS COLLECTED LATER: the next green_wait, though not told "kicked",
+  # waits on it with the worker flag, journals it as the loop's run for iteration 4, copies its log, and only once.
+  GK_WAIT3=40 gk late ask >/dev/null
+  t 'a kicked run still going at the bound is handed on, and remembered outside the worker'"'"'s dir' \
+    "$(grep -c '^- cc-loop: the cc-green run the loop started on the host after iteration 4 is still going after 40 waits' "$d/gk/late/st/progress.md")|$(cat "$d/gk/late/.st.green-kicked" 2>/dev/null)" "1|4"
+  t '…the next iteration'"'"'s plain green_wait collects it with the worker flag' "$(GK_AGAIN=1 gk late ask)" "rc=0|wait 540 FW=1 hp=/host/hooks|"
+  t '…journaled as the loop'"'"'s run for iteration 4, with its log copy and verdict' \
+    "$(grep -c "^- cc-loop: the cc-green run the loop started on the host after iteration 4 ended while the loop waited on it (exit 0, log $d/gk/late/run.log) — read that log before you run another; its last 256 KiB, readable inside your sandbox: $d/gk/late/st/green.log; verdict: green" "$d/gk/late/st/progress.md")|$(cat "$d/gk/late/st/green.log")" "1|fixture log line"
+  t '…and once: the mark is gone, and the call after finds nothing to collect' \
+    "$(test -e "$d/gk/late/.st.green-kicked" && echo left)|$(GK_AGAIN=1 gk late ask | cut -d'|' -f1)" "|rc=1"
   # …AND ALL SIX REACH THE WORKER. selfrev_block lifts the headings by their `N. **Heading**` shape, so a checklist
   # reformatted another way yields a prompt that says "fix what it finds:" and lists nothing. Read off the real
   # file and the real worker prompt, each heading by its own number; the fixture above is one entry, not six.
@@ -1347,6 +1448,7 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_SHELL_PREFIX-UNSET}" > "%s"\nshift; exec "$@"\n' "$d/lb.ns" > "$lb/cc-nosignal"   # records the prefix it was handed, then runs what follows --
   printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-UNSET}" > "$FK_ST/bgceil"\n[ -n "$FK_LINE" ] && printf "%%s\\n" "$FK_LINE" >> "$FK_ST/progress.md"\n[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step\nprintf "%%s\\n" "{\\"type\\":\\"result\\",\\"subtype\\":\\"success\\",\\"is_error\\":false,\\"num_turns\\":3,\\"total_cost_usd\\":1.25,\\"result\\":\\"did a step\\"}"\n' > "$lb/claude"
   sed -i '1a printf "%s\\n" "$@" > "$FK_ST/argv"' "$lb/claude"   # what the loop handed claude, one arg a line
+  sed -i '1a printf "%s\\n" "${CC_GREEN_ASK-UNSET}" > "$FK_ST/gask"' "$lb/claude"   # where a fenced cc-green start would ask
   sed -i '1a printf "%s/%s\\n" "${CC_LIMIT_STAMP-UNSET}" "${CC_MODEL_CRED-UNSET}" > "$FK_ST/acct"' "$lb/claude"   # whose limit stamp and model record it ran under
   printf '#!/bin/sh\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/9\\",\\"landing\\":{\\"message\\":\\"It is queued to land.\\"}}"\n' > "$lb/cc-land"
   chmod +x "$lb"/*
@@ -1354,7 +1456,7 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
     git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     [ "$c" = dn ] && echo '{}' > "$lh/.cc/state/lp/$c/delivery.json"
     : > "$d/lb.n"
-    ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+    ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" ${lgreen:+CC_GREEN=$lgreen} \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
   lrun it '- did one step, more to do' 0 --max-iter 1
@@ -1597,6 +1699,14 @@ EDA
     "# MESSAGES FROM YOUR DISPATCHER (arrived after the last iteration stopped reading — they come first)|1"
   t '…the worker runs with the inbox hook, and the loop.pid it was reachable by is gone once it exits' \
     "$(grep -A1 -x -- --settings "$lh/.cc/state/lp/sy/argv" | tail -1 | jq -r '.hooks.PostToolUse[0].hooks[0].command | test("cc-loop inbox-hook .*/lp/sy$")')|$(test -e "$lh/.cc/state/lp/sy/loop.pid" && echo left)" "true|"
+  # A DONE ITERATION THAT ASKED FOR ITS GREEN STILL GETS IT: the kick runs before the DONE branch exits. And the worker
+  # was told where to ask.
+  mkdir -p "$d/dg" "$lh/.cc/state/lp/dg"; : > "$lh/.cc/state/lp/dg/green.ask"
+  printf '#!/bin/sh\necho "$1" >> "%s/dg/calls"\ncase "$1" in start) echo "cc-green: started (pid 1)"; exit 0;;\n  wait) echo "cc-green: the run (pid 1, started 00:00) has ended (exit 0) — log %s/dg/run.log"; exit 0;;\nesac\nexit 1\n' "$d" "$d" > "$d/dg/cc-green"
+  chmod +x "$d/dg/cc-green"; lgreen="$d/dg/cc-green" lrun dg 'STATUS: DONE' 0 --max-iter 1; unset lgreen
+  t 'an iteration that writes STATUS: DONE and asked for its green gets the run started and waited on before the loop finishes' \
+    "$(grep -c '^start$' "$d/dg/calls" 2>/dev/null)|$(grep -c '^wait$' "$d/dg/calls" 2>/dev/null)|$(test -e "$lh/.cc/state/lp/dg/green.ask" && echo left)" "1|1|"
+  t '…and the worker ran told where a fenced cc-green start asks' "$(cat "$lh/.cc/state/lp/dg/gask" 2>/dev/null)" "$lh/.cc/state/lp/dg/green.ask"
   lrun dn 'STATUS: DONE' 0 --max-iter 3
   t 'a DONE posts exactly one card' "$(slackn)" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
@@ -2103,7 +2213,8 @@ while [ $i -lt "$MAXI" ]; do
   # $BIN: there a test can still signal this claude, though not the user manager, tmux or another session. Never over
   # a caller's prefix.
   SPENV=(); [ "${CC_WORKER_SANDBOX:-}" = 0 ] && [ -z "${CLAUDE_CODE_SHELL_PREFIX:-}" ] && SPENV=("CLAUDE_CODE_SHELL_PREFIX=$BIN/cc-nosignal-shell")
-  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
+  GAENV=(); inside_boundary || GAENV=("CC_GREEN_ASK=$ST/green.ask")   # where a fenced `cc-green start` asks (green_kick)
+  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
@@ -2132,6 +2243,9 @@ while [ $i -lt "$MAXI" ]; do
   log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost$costsrc total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
   [ "$QUIET" = 1 ] || jq -r '.result // ""' "$out" 2>/dev/null | tail -c 600 | sed 's/^/  │ /' >&2
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
+  # THE ASKED-FOR GREEN COMES BEFORE THE DONE BRANCH, which exits: a worker that asks in the iteration it writes
+  # STATUS: DONE still gets the run, and its verdict in the journal.
+  gated=no; green_kick && green_wait kicked && gated=yes
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
     if throwaway; then   # its branch is the delivery (`cc done`: no remote, no PR): no deliverable post, no card, nobody told
@@ -2236,7 +2350,7 @@ while [ $i -lt "$MAXI" ]; do
       refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
       stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;
   esac
-  gated=no; green_wait && gated=yes   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
+  [ "$gated" = yes ] || { green_wait && gated=yes; }   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
   # a process of its own still in the worktree (own_run_live) only keeps an error or a cap from counting: it is never
   # waited for, so it must not also switch off the barren checks or buy an iteration below, which stay green_wait's
   ownrun=no; if [ "$gated" = no ] && orl=$(own_run_live); then ownrun=yes; log "iter $i ended with a run of its own still going in its worktree (${orl}) — not idle"; fi
