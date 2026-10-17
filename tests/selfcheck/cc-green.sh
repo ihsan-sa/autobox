@@ -12,6 +12,7 @@ selfcheck(){
   # bin/cc-green returns, with this local gone and whatever $D means out there (unset, which set -u turns into exit 1).
   D=$(mktemp -d); trap 'rm -rf "$D"; trap - RETURN' RETURN
   unset CC_GREEN_RUNID CC_GREEN_SCOPE   # a selfcheck run under a cc-green run must not pass for that run
+  unset CC_GREEN_ASK CC_ROLE CC_MEMBER_SANDBOX   # …nor take a worker's fence from the shell it runs in: a case sets these itself
   export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
   export CC_REVIEWS_DIR="$D/reviews" CC_STATE_BASE="$D/state"   # …and the review record the report reads is a scratch one
 
@@ -93,6 +94,20 @@ EOS
   rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo outside)
   ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -e "$D/outside.args")" "in a fence with no CC_GREEN_ASK (a member's loop), run still runs the check in there"
+  rm -rf "$D2"
+  # 1c' A WORKER WHOSE LOOP PREDATES THE ASK: a loop started before #1420 sets CC_ROLE=worker and no CC_GREEN_ASK, and
+  # its worker's start ran the check in the fence and left no verdict (2026-10-17). Now it runs nothing and says why.
+  D2=$(mktemp -d); R=$(newrepo stale)
+  out=$( cd "$R" && CC_ROLE=worker CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2 -a ! -e "$D/stale.args" -a -z "$(ls -A "$D2")")" "a worker in its fence with no CC_GREEN_ASK: start exits 2, having run no check and taken no lock, status or log"
+  k "$(t grep -q 'set no CC_GREEN_ASK' <<<"$out")" "…and says its loop set no CC_GREEN_ASK"
+  ( cd "$R" && CC_ROLE=worker CC_MEMBER_SANDBOX=1 CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
+      && CC_GREEN_DIR="$D2" CC_GREEN_PID1_COMM="$D/pid1" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/stale.args")" "…while inside a member boundary, where no loop asks, start still runs the check in there"
+  rm -rf "$D2" "$D/stale.args"; D2=$(mktemp -d)
+  ( cd "$R" && CC_ROLE=worker CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
+      && CC_GREEN_DIR="$D2" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -e "$D/stale.args")" "…and a worker on the host (sandbox off) still starts its own run"
   rm -rf "$D2"
   # 1d A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the pinned lander, caged checks only, and none of
   # the tree's own code: the fixture's core/lander/cli.py writes <name>.args when it runs, so its absence is the proof.

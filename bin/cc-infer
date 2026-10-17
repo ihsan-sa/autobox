@@ -90,10 +90,11 @@ THE ASK (JSON). `ask` is required, and is the command itself; every other key is
               now, its user is SLACK_OWNER_ID with no bot_id, it is a message he wrote (no subtype but
               thread_broadcast or file_share, so never a channel_topic or join line), the quote names the ask's own
               key, every word of it whole (CC_ASK_TURNS: "ask" and "turns"), or the unit's whole name (cc-slackd, never
-              cc-slackd-old), and the value it sets as the only number, and the quote is his WHOLE message in its
+              cc-slackd-old, nor a path like ~/cc-slackd/x), and the value it sets as the only number with no word
+              that bounds it (at most, up to, by, …), or for a restart the word restart, and the quote is his WHOLE message in its
               current text (only a final . or ! may drop), after any edit, with his markup read as its words: one
               line, one sentence, no code, mention, struck text or question, opening with a go verb (give, set,
-              raise, enable, allow, approve, go ahead, yes do). It fails closed on his meaning (#1129): a message in which any
+              raise, enable, allow, approve, go ahead, yes do) in plain words with no emoji or sign. It fails closed on his meaning (#1129): a message in which any
               negation, condition, retraction, rejection or reported-speech word stands anywhere (not, never, no, n't,
               unless, until, only, but, wait, hold, if, maybe, kidding, ignore, rejected, asked, said, wants, …), or a sentence opens
               like a question (should, can, would, what, …) with no ?, grants nothing, so "Never …", "If Bob
@@ -569,7 +570,8 @@ def names_the_shape(quote, ask):
     is not cc-slackd. An ask that is no shape names nothing, so fails."""
     shape = parse_shape(squash(ask))
     if shape and shape[0] == "service":
-        return bool(re.search(rf"(?<![a-z0-9_.-]){re.escape(shape[1].lower())}(?:\.service)?(?![a-z0-9_-]|\.[a-z0-9])",
+        # a path is no unit: ~/cc-slackd/x names a folder (Opus read of #1129 at cc8323ea)
+        return bool(re.search(rf"(?<![a-z0-9_.~/-]){re.escape(shape[1].lower())}(?:\.service)?(?![a-z0-9_/-]|\.[a-z0-9])",
                               fold(quote)))
     words = {w for w in re.split(r"[^a-z0-9]+", (shape[2] or shape[1]).lower()) if w not in ("", "cc", "service")} \
         if shape else set()
@@ -706,7 +708,11 @@ HEDGE = re.compile(r"\b(?:not|never|no|nope|nah|unless|until|only|but|wait|hold|
                    r"kidding|joking|joke|jk|scratch|ignore|disregard|cancel|retract|undo|forget|"
                    r"asked|asks|asking|said|says|wrote|writes|wants|wanted|requested|suggested|suggests|proposed|"
                    r"wonder|wondering|thoughts|reject|rejected|rejecting|refuse|refused|deny|denied|decline|declined|veto|vetoed|"
-                   r"once|when|whenever|after|before|later|tomorrow|tonight|soon|eventually|yet)\b"
+                   r"once|when|whenever|after|before|later|tomorrow|tonight|soon|eventually|yet|"
+                   # Opus delta read of #1129 at f9fcd778: a go verb with a particle is its opposite ("Give up on …",
+                   # "Set aside …"), and a refusal or a laugh in another tongue stops a grant as "not" does
+                   r"up|aside|away|off|apart|"
+                   r"nicht|nein|kein|keine|nee|non|pas|nunca|nada|nyet|niet|lol|lmao|lmfao|rofl|haha\w*|hehe\w*|nvm)\b"
                    r"|n['`\u2018\u2019\u02bc\u00b4]t\b"
                    r"|(?:^|[.!:;,\n]\s*)(?:should|could|would|can|will|shall|do|does|did|is|are|was|were|may|must|"
                    r"what|why|how|which|who|whom|whose|where|any)\b")
@@ -729,6 +735,10 @@ def his_go(text):
     body = t.rstrip(" .!")
     if len(unmark(str(text or "")).strip().splitlines()) > 1 or CUT in body or STOPS.search(body) or not GO.match(body):
         return ""
+    # only plain words, digits and their joiners: an emoji (🚫, 👎) or a sign beside the value (~16, <16, 16+) may
+    # carry his meaning, so it is no plain go (Opus delta read of #1129 at f9fcd778)
+    if not re.fullmatch(r"[a-z0-9 ,'_-]+", body):
+        return ""
     return body
 
 
@@ -738,13 +748,24 @@ def said(text, quote):
     return bool(go) and sentence(unmark(quote)).rstrip(" .!") == go
 
 
+# a word that bounds or shifts the number beside it, so "at most 16" or "by 16" doesn't set 16 (Opus delta read of
+# #1129 at f9fcd778)
+QUALIFIER = re.compile(r"\b(?:at most|at least|up to|max|maximum|min|minimum|under|over|below|above|around|about|"
+                       r"roughly|approx\w*|nearly|almost|more|less|fewer|than|between|or|by|cap|capped|limit\w*|"
+                       r"ceiling|floor|beyond|within|plus|minus|extra|another|additional|double|triple|half|times|"
+                       r"percent|per cent)\b")
+
+
 def names_the_value(text, ask):
-    """When the ask sets a value, his go says that value and no other number (round 4 of #1129: "Set cc-ask turns to
-    4." or "Give cc-ask fewer turns." must not grant 16). An ask that sets nothing (a restart) needs none."""
-    shape = parse_shape(squash(ask))
-    if not shape or shape[0] != "config":
-        return bool(shape)
-    return set(re.findall(r"\d+(?:[.,]\d+)*", his_go(text))) == {shape[1].split("=", 1)[1]}
+    """His go asks for what the ask does. A config ask: his go says its value, no other number and no word that
+    bounds or shifts it (round 4 of #1129: "Set cc-ask turns to 4." or "Give cc-ask fewer turns." must not grant 16;
+    delta read: nor "at most 16"). A restart: his go says restart, so "Allow cc-slackd to keep running" is none."""
+    shape, go = parse_shape(squash(ask)), his_go(text)
+    if not shape:
+        return False
+    if shape[0] != "config":
+        return bool(re.search(r"\brestart\w*\b", go))
+    return set(re.findall(r"\d+(?:[.,]\d+)*", go)) == {shape[1].split("=", 1)[1]} and not QUALIFIER.search(go)
 
 
 def check_slack(chat, ts, quote, ask):
@@ -776,7 +797,8 @@ def check_slack(chat, ts, quote, ask):
         return ("the quote is not his whole statement: his whole message must be the quote, one sentence that opens "
                 "with a go verb (give, set, raise, enable, allow, approve, go ahead, yes do)"), ""
     if not names_the_value(m.get("text"), ask):
-        return "his go doesn't say the value the ask sets, and no other number", ""
+        return ("his go doesn't say what the ask does: the value it sets, with no other number or bound, or the "
+                "word restart"), ""
     return "", str(m.get("text") or "")
 
 
@@ -1409,6 +1431,19 @@ def selfcheck():
             v, why = chat(n, text, "Give cc-ask 16 turns.")
             check(f"code or struck text taken out leaves a boundary the quote can't cross: {text!r}",
                   v == "ASK-OWNER" and "not his whole statement" in why)
+        # Opus reads of #1129 at cc8323ea and f9fcd778: each of these grants nothing, and each has its own fixture
+        for n, text, ask in (
+                ("301", "Give up on cc-ask 16 turns.", None), ("302", "Set aside cc-ask 16 turns.", None),
+                ("303", "Allow cc-slackd to keep running.", svc["ask"]),
+                ("304", "Give cc-ask 16 turns 🚫", None), ("305", "Give cc-ask 16 turns 👎", None),
+                ("306", "Give cc-ask 16 turns nicht.", None), ("307", "Give cc-ask 16 turns lol", None),
+                ("308", "Set cc-ask turns to at most 16.", None), ("309", "Raise cc-ask turns by 16.", None),
+                ("310", "Give cc-ask up to 16 turns.", None), ("311", "Give cc-ask ~16 turns.", None),
+                ("312", "Give cc-ask 16+ turns.", None),
+                ("313", "Allow restarts of ~/cc-slackd/x on a landing.", svc["ask"])):
+            v, why = chat(n, text, text, ask or "cc-config set CC_ASK_TURNS 16")
+            check(f"a particle, a restart with no restart word, an emoji, a foreign or laughing no, a bounded value or a "
+                  f"path is no go: {text!r}", v == "ASK-OWNER" and why != "")
         check("a quote with a zero-width character in it is refused",
               chat("196", hard, hard.replace("cc-ask", "cc-ask\u200b"))[0] == "ASK-OWNER")
         for sub in ("channel_topic", "channel_purpose", "channel_join", "bot_message", "me_message"):

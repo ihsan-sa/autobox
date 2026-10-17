@@ -53,7 +53,7 @@ A planning seat runs it by hand; the lander never installs itself.
         prints how many of each. Each sweep runs as a transient `systemd-run --user` service, as the
         lane does: the user manager's environment, a private TMUX_TMPDIR, and none of the caller's tmux, CC_*
         variables, sandbox or Landlock domain. The proof is one run capped at PROVE_CAP (an hour); `--cap SECONDS`
-        sets another for this run only. While it runs it HOLDS THE LANE (perms, 10-13): a ticket in the landing
+        sets another for this run only, at most PROVE_CAP_MAX (4 h; more is refused, exit 2). While it runs it HOLDS THE LANE (perms, 10-13): a ticket in the landing
         queue that sorts before every lane ticket (hold_lane), so no new check of the lane's takes a box slot while
         the ones already running finish, and the candidate's sweep, told the ticket's name, waits only behind what
         was there first. The hold goes when the proof ends, however it ends: lander-self drops it, and a crash drops
@@ -84,7 +84,8 @@ A planning seat runs it by hand; the lander never installs itself.
         promote without the switch: the same refusals for REV, its selfcheck and the proof on main (and its hold),
         against
         `current` (against nothing when REV is current). Run it on a host before that host takes over landing.
-        Exit 0 proven, 1 refused, 3 could not run.
+        Since the proof holds the lane, only the perms seat proves, by promote's caller check; any other seat is
+        refused (exit 1) before anything is built or held. Exit 0 proven, 1 refused, 3 could not run.
     lander-self reads [REV] [--repo DIR]
         The commits perms reads before a promote: those from the current release to REV (default origin/main) that
         touch a path on origin/main's `lander` list in tests/LANDING-policy.toml, one `<sha12> <subject>` per line,
@@ -534,6 +535,9 @@ def release_green(rel):
 # list of checks is the current release's reading of the manifest, and every sweep runs as a user unit (sweep_under).
 
 PROVE_CAP = 3600
+# --cap's ceiling: a proof holds the lane for as long as it runs (THE HOLD), so no run may ask for more than 4 h,
+# a third of a lane ticket's 12 h TICKET_CAP (perms' read of #1302).
+PROVE_CAP_MAX = 4 * PROVE_CAP
 SWEEP_LINE = re.compile(r"^lander sweep: (\S+) (passed|failed|unrunnable) \d+s$", re.M)
 SEAT_ENV = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "STY", "WINDOW")
 
@@ -1067,7 +1071,7 @@ def cmd_promote(args, opts):
     if not root:
         return die("promote: no checkout (--repo DIR)", 2)
     if not cap:
-        return die("promote: --cap takes a whole number of seconds above 0", 2)
+        return die(f"promote: --cap takes a whole number of seconds above 0 and at most {PROVE_CAP_MAX}", 2)
     if opts.get("no-prove") and opts.get("pr"):    # security read of #1313: no unproven release off an unmerged head
         return die("promote: refused — --no-prove takes no --pr; an unproven release is built only from a commit on "
                    "origin/main (current is unchanged)", 2)
@@ -1204,6 +1208,9 @@ def cmd_prove(args, opts):
     root, cap = repo_of(opts.get("repo", "")), cap_of(opts)
     if len(args) > 1 or not root or not cap or opts.get("no-prove"):   # --no-prove is promote's alone
         return die("usage: lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]", 2)
+    if not perms_caller(root):   # the proof holds the lane's admissions (THE HOLD), up to --cap: perms' alone
+        return die("prove: refused — only the perms seat proves a release, since the proof holds the lane "
+                   f"(run it from {os.path.basename(root)}'s perms seat); nothing was built or held")
     for ln in pin_remotes(root):
         print(f"lander-self: {ln}")
     main = main_sha(root)
@@ -2141,7 +2148,15 @@ def selfcheck():
                 globals()["perms_caller"] = lambda root: False
                 r_np_notperms = cmd_promote([a], np)
                 cur_np_notperms = link_target("current")
+                r_prove_notperms = cmd_prove([a], o)    # prove holds the lane: perms' alone
+                r_prove_notperms_cap = cmd_prove([a], {**o, "cap": "600"})
+                proofs_notperms = len(proofs)
                 globals()["perms_caller"] = lambda root: True
+                r_prove_perms = cmd_prove([a], o)       # the perms seat reaches the (stubbed, refusing) proof
+                proofs_perms = len(proofs) - proofs_notperms
+                r_prove_overcap = cmd_prove([a], {**o, "cap": str(PROVE_CAP_MAX + 1)})
+                proofs_overcap = len(proofs) - proofs_notperms - proofs_perms
+                del proofs[:]
                 r_np_red = cmd_promote([red], np)
                 cur_np_red = link_target("current")
                 r_np_pr = cmd_promote([side], {**np, "pr": "7"})   # an open PR's head, unproven: refused first
@@ -2274,6 +2289,11 @@ def selfcheck():
              "proof skipped (--no-prove) on the owner's 2026-10-13 17:33Z direction" in said.getvalue())
         case("rollback after a --no-prove promote puts the one before back", r_np_rb == 0 and cur_np_rb == cur_b)
         case("prove refuses --no-prove (promote's alone)", r_np_prove == 2)
+        case("prove from a seat that is not perms is refused before any proof or hold, with or without --cap",
+             r_prove_notperms == 1 and r_prove_notperms_cap == 1 and proofs_notperms == 0)
+        case("prove from the perms seat runs the proof", r_prove_perms == 1 and proofs_perms == 1)
+        case("prove with --cap above PROVE_CAP_MAX is refused before any proof", r_prove_overcap == 2
+             and proofs_overcap == 0)
         case("promote --no-prove --pr N is refused (exit 2) before a proof or a switch: unproven means on main",
              r_np_pr == 2 and cur_np_pr == cur_b and proofs_np_pr == 0)
         case("a --no-prove promote appends a no-prove line for its sha with the caller to promote.log",
@@ -2767,6 +2787,9 @@ def hold_cases(case):
     case("--cap: whole seconds are taken for this run", cap_of({"cap": "5400"}) == 5400)
     case("--cap: 0, a sign, a word or a superscript is refused",
          not any(cap_of({"cap": v}) for v in ("0", "-5", "+5", "1h", "", "\u00b2", "9" * 12)))
+    case("--cap: PROVE_CAP_MAX is taken and one second more is refused",
+         cap_of({"cap": str(PROVE_CAP_MAX)}) == PROVE_CAP_MAX and cap_of({"cap": str(PROVE_CAP_MAX + 1)}) == 0
+         and PROVE_CAP_MAX < 43200)
     case("--cap: parse() takes its value", parse(["x", "--cap", "90"])[1].get("cap") == "90")
 
 
@@ -3288,12 +3311,12 @@ def parse(argv):
 
 
 def cap_of(opts):
-    """The proof's cap in seconds: --cap when given (a whole number above 0, ASCII digits), else PROVE_CAP; 0 when
-    --cap is not such a number."""
+    """The proof's cap in seconds: --cap when given (a whole number above 0 and at most PROVE_CAP_MAX, ASCII
+    digits), else PROVE_CAP; 0 when --cap is not such a number."""
     v = opts.get("cap")
     if v is None:
         return PROVE_CAP
-    return int(v) if v.isascii() and v.isdigit() and len(v) < 9 and int(v) > 0 else 0
+    return int(v) if v.isascii() and v.isdigit() and len(v) < 9 and 0 < int(v) <= PROVE_CAP_MAX else 0
 
 
 def perms_caller_cases(case):
