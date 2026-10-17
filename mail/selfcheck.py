@@ -3353,11 +3353,11 @@ def run():
       == {"forwarding-noreply@google.com": "box-mail"} and router.pins("") == {},
       "MAIL_PIN reads `addr=channel` rows like MAIL_WORKSPACE: lower-cased address, `#` dropped, an empty or "
       "malformed row pins nothing")
-    NOTEXT = "quotes@tufenkian.example, @rugs.example"
-    k(router.textless("Quotes@Tufenkian.example", NOTEXT) and router.textless("a@rugs.example", NOTEXT)
+    NOTEXT = "quotes@vendor.example, @rugs.example"
+    k(router.textless("Quotes@Vendor.example", NOTEXT) and router.textless("a@rugs.example", NOTEXT)
       and router.textless("a@eu.rugs.example", NOTEXT),
       "MAIL_NO_TEXT names a sender by address or by @domain, subdomains included, case folded")
-    k(not router.textless("other@tufenkian.example", NOTEXT) and not router.textless("a@evilrugs.example", NOTEXT)
+    k(not router.textless("other@vendor.example", NOTEXT) and not router.textless("a@evilrugs.example", NOTEXT)
       and not router.textless("a@rugs.example", "rugs.example") and not router.textless("", NOTEXT)
       and not router.textless(ALLOWED, ""),
       "…and nobody else: another address at the same domain, a look-alike domain, a bare word with no `@`, no "

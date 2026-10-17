@@ -11357,6 +11357,27 @@ def run_selfcheck():
               "not filed as the gone mail's",
               msaid and msaid[0][2].startswith(":email: _Re: the gone hold, clean_ ") and msaid[0][2].endswith(" · held")
               and holdE.get("cards") == {"C-MEM": rootE} and holdE.get("ats") == {"C-SITE": rootEF})
+        # …moved out and BACK: the conversation gets a second card in #mem, and the first one there used to lose
+        # its place in `cards` (keyed by channel), so `drop it` left it reading "held" for good
+        mail_write("VM", to=["mem@box.example"], subject="there and back")
+        msaid.clear(); mhanded.clear()
+        dmA.take_mail("VM")
+        rootM1 = msaid[0][3]
+        msaid.clear()
+        dmA.mail_move("C-MEM", rootM1, "move #mem--site", "UOWNER", True)
+        rootM2 = msaid[0][3] if msaid else ""
+        msaid.clear()
+        dmA.mail_move("C-SITE", rootM2, "move #mem", "UOWNER", True)
+        rootM3 = msaid[0][3] if msaid else ""
+        msaid.clear()
+        dmA.restated.clear()
+        dmA.mail_decide("C-MEM", rootM3, "drop it", "UOWNER", True)
+        dropM = ":email: _there and back_ · `friend@allowed.example` · dropped"
+        check("mail: a held mail moved out and back into #mem — `drop it` rewrites every card it left, the first "
+              "one in #mem included, not only the newest there",
+              rootM3 and rootM3 != rootM1
+              and sorted(dmA.restated) == sorted([("C-MEM", rootM1, dropM), ("C-SITE", rootM2, dropM),
+                                                   ("C-MEM", rootM3, dropM)]))
         # …and a hold recorded before `cards` existed is restated off its `ats`, as it was
         mail_write("VG", to=["mem@box.example"], subject="the old record")
         msaid.clear(); mhanded.clear()

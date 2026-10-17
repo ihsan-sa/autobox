@@ -89,11 +89,17 @@ set and no restore runs beside it, and a repo named in --except is left exactly 
      whose credential looks blank is not launched.
   perms is never relaunched (its relaunch is the planning seat's); bring-up only says when it is down.
 
+NOT THE HUB. ~/.cc/roles is the roles tool's record of which host runs what; its `hub=<host>` line names the host whose
+tmux holds the sessions. When it names another host (the old machine after the hub moved), restore and bring-up
+launch nothing and log the hub's host, the detector logs a mass loss once and starts no restore, and status says so.
+No file, no hub line, or this host's own name is the hub here, so a box that never moved is unchanged. On 10-16 the
+old machine rebooted with no such record and relaunched about 30 sessions on four-day-old state.
+
 KEYS (cc-config; the environment wins): CC_RECOVER_REBOOT off|on · CC_RECOVER_RESTORE on|off (off = the boot
 restore does nothing) · CC_RECOVER_NET_MIN · CC_RECOVER_GAP_H · CC_RECOVER_HOLD_MIN · CC_RECOVER_MASS_MIN · CC_RECOVER_PROBES
 ("host:port …", default 1.1.1.1:443 8.8.8.8:53 9.9.9.9:443) · CC_RECOVER_STAGGER (20 s between launches) ·
 CC_RECOVER_SETTLE (15 s from a claude coming up to its catch-up). Fixtures only: CC_RECOVER_STATE (the state dir),
-CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
+CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_ROLES, CC_RECOVER_HOSTNAME, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
 CC_RECOVER_RESTORE_CMD, CC_RECOVER_MANAGER_CMD.
 """
 import calendar, fcntl, json, math, os, random, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
@@ -121,6 +127,9 @@ NET_WAIT_S = 15 * 60    # the restore's wait for the network, by the wall clock
 REBOOT_TRIES, REBOOT_RETRY_S = 3, 10 * 60   # a reboot command that fails: this many tries an episode, this far apart
 SHELLS = ("sh", "bash", "dash", "zsh")
 LOOP_WORD = re.compile(r"(?:[^\s=]*/)?cc-loop")
+# which host runs the hub: the roles tool's record, `hub=<host>` (docs/architecture/two-hosts.md). Fixtures set both.
+ROLES = os.environ.get("CC_RECOVER_ROLES") or os.path.join(HOME, ".cc/roles")
+HERE = os.environ.get("CC_RECOVER_HOSTNAME") or socket.gethostname().split(".")[0]
 
 
 def now():
@@ -533,6 +542,22 @@ def reboot_clear(st):
     st.pop("reboot_fail", None)
 
 
+def hub_elsewhere():
+    """The host ~/.cc/roles names for the hub when that is not this machine, else None. A missing file, no hub line,
+    or `hub` naming this machine (or `hub`) is the hub here, as the roles tool reads it."""
+    try:
+        with open(ROLES) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for ln in lines:
+        k, sep, v = ln.partition("=")
+        if sep and k.strip() == "hub":
+            v = v.strip()
+            return v if v and v not in ("hub", HERE) else None
+    return None
+
+
 def start_restore():
     if os.environ.get("CC_RECOVER_RESTORE_CMD"):
         return subprocess.run(shlex.split(os.environ["CC_RECOVER_RESTORE_CMD"])).returncode == 0
@@ -548,8 +573,13 @@ def tick():
         reboot_clear(st)
     st["last_tick"] = t
     status, lost = save(st)
-    # sessions
-    if status == "mass-loss":
+    # sessions: a host that is not the hub brings nothing back, so its mass loss is logged once and left
+    hub = hub_elsewhere()
+    if status == "mass-loss" and hub:
+        if st.get("mass_said") != st["mass_since"]:
+            st["mass_said"] = st["mass_since"]
+            decide(f"mass loss: {len(lost)} saved sessions gone, not restored: {ROLES} says the hub runs on {hub}, not {HERE}")
+    elif status == "mass-loss":
         if st.get("mass_said") != st["mass_since"]:
             st["mass_said"] = st["mass_since"]
             decide(f"mass loss: {len(lost)} saved sessions gone ({', '.join(lost[:8])}{' …' if len(lost) > 8 else ''}) — set held")
@@ -760,6 +790,10 @@ def take_lock():
 def restore(boot=False):
     if cfg("CC_RECOVER_RESTORE", "on") == "off":
         log("restore.log", "CC_RECOVER_RESTORE is off — nothing restored")
+        return 0
+    hub = hub_elsewhere()
+    if hub:
+        log("restore.log", f"not the live host: {ROLES} says the hub runs on {hub}, not {HERE} — nothing restored")
         return 0
     # two triggers at once (a tmux crash's watcher and the detector's mass loss) must start each session once: the
     # restoring guard below is a check then a write, so two could both pass it, and the lock closes that gap
@@ -1018,6 +1052,12 @@ def bringup(args):
 
 
 def bringup_here(excluded):
+    hub = hub_elsewhere()
+    if hub:
+        msg = f"not the live host: {ROLES} says the hub runs on {hub}, not {HERE} — this bring-up does nothing"
+        log("bringup.log", msg)
+        print(msg)
+        return 1
     # the restore guard: no tick rewrites the saved set, and no restore or second bring-up runs, until this one ends
     if restoring():
         msg = "a restore or bring-up is already running — this bring-up does nothing"
@@ -1126,6 +1166,8 @@ def bringup_held(excluded):
 
 
 def status():
+    hub = hub_elsewhere()
+    print(f"hub: {hub + ' (not this host: restore and bring-up do nothing here)' if hub else HERE + ' (this host)'}")
     s = load("live.json", {})
     print(f"saved {s.get('saved', 'never')}: {len(s.get('sessions', {}))} sessions")
     for r in sorted(s.get("sessions", {}).values(), key=lambda r: (ORDER.index(r["kind"]), r["window"])):
@@ -1140,7 +1182,7 @@ def status():
 # ---- selftest ----
 
 def selfcheck():
-    global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK
+    global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, ROLES, HERE
     fails, passed, made = [], [0], []
 
     def check(name, cond):
@@ -1152,9 +1194,10 @@ def selfcheck():
 
     def fixture():
         """A fresh state dir, fake /proc, fake tmux and fake bin of its own: no case reads another's leftovers."""
-        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, CCSTATE, MEMBERS
+        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, CCSTATE, MEMBERS, ROLES, HERE
         d = tempfile.mkdtemp(prefix="cc-recover-st.")
         made.append(d)
+        ROLES, HERE = f"{d}/roles", "here"   # no roles file: the hub is here, as on a box that never moved
         STATE, PROC, BIN, DEV, CLAUDE = f"{d}/state", f"{d}/proc", f"{d}/bin", f"{d}/dev", "/c/claude"
         LOCK = f"{d}/lock/.lock"   # never the real ~/.cc/recover/.lock: a selfcheck must not stop a real restore
         CCSTATE, MEMBERS = f"{d}/ccstate", f"{d}/members"
@@ -1404,6 +1447,37 @@ def selfcheck():
         check("tick: a mass loss is logged first and restored on the next tick", not first and os.path.exists(f"{d}/restore-started"))
         os.remove(f"{d}/restore-started"); clock[0] += 60; tick()
         check("tick: no second restore within 30 min", not os.path.exists(f"{d}/restore-started"))
+
+        # 5b. a host ~/.cc/roles says is not the hub (the old machine after the hub moved) brings nothing back
+        d = fixture(); live_box(d)
+        open(ROLES, "w").write("box=the-box\nhub=there\ncompute=hub\n")
+        os.environ["CC_RECOVER_RESTORE_CMD"] = f"touch {d}/restore-started"
+        globals()["net_probe"] = lambda: "up"
+        tick(); clock[0] += 60
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        tick(); clock[0] += 60; tick()
+        check("tick: on a host that is not the hub, a mass loss is logged once with the hub's host and starts no restore",
+              not os.path.exists(f"{d}/restore-started")
+              and open(path("decisions.log")).read().count("not restored: " + ROLES + " says the hub runs on there, not here") == 1)
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(ROLES, "w").write("hub=there\n")
+        os.environ.pop("CC_RECOVER_RESTORE", None)
+        rc = restore(boot=True)
+        check("restore: on a host that is not the hub it launches nothing and says where the hub is",
+              rc == 0 and not os.path.exists(f"{d}/calls") and "not the live host" in open(path("restore.log")).read()
+              and "hub runs on there, not here" in open(path("restore.log")).read())
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(ROLES, "w").write("hub=here\nworkers=there\n")
+        restore(boot=True)
+        check("restore: a roles file naming this host as the hub restores as before",
+              any(c.startswith("cc|r1|") for c in open(f"{d}/calls").read().splitlines()))
+        d = fixture(); live_box(d); save({})
+        open(ROLES, "w").write("hub=there\n")
+        rc = bringup(["--here"])
+        check("bringup: on a host that is not the hub it does nothing and says where the hub is",
+              rc == 1 and not os.path.exists(f"{d}/calls") and "hub runs on there, not here" in open(path("bringup.log")).read())
 
         # 6. tmux down: cc-boot at 3 min, reboot due at 15
         d = fixture(); live_box(d); os.environ["CC_RECOVER_REBOOT"] = "off"

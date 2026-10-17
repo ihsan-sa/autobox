@@ -431,6 +431,13 @@ retick_due(){   # $1 the signature before the pass → 0 when something wrote a 
                 # old signature lacks counts: the pass's own write is consuming a confirm answer, a removed entry, and
                 # that must not buy it another pass (#953's review)
   [ -n "$(comm -13 <(sort <<<"$1") <(watched_sig | sort))" ]; }
+retick_in_time(){   # $1 the epoch the unit's first pass started, $2 now → 0 while a retick still fits. Every retick is
+                    # exec'd inside the one oneshot cc-model.service starts, under its one TimeoutStartSec=120, so a slow
+                    # pass plus a retick could be killed mid-run; past CC_MODEL_RETICK_BUDGET (40 s) the 10 min scan
+                    # picks the write up instead (perms' read of #953)
+  local b=${CC_MODEL_RETICK_BUDGET:-40}; [[ "$b" =~ ^[0-9]+$ ]] || b=40
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+  [ $(( ${2:-$(date +%s)} - $1 )) -lt "$b" ]; }
 limstamp(){ lim_till=0; lim_model=""; lim_seen=0   # cc-limit's stamp: "<until>\t<how>\t<first-seen>\t<model>\t<observers>"
   local o=""
   # Split by awk, not by `IFS=$'\t' read`: tab is IFS whitespace and bash folds "\t\t" into one delimiter, so a
@@ -2513,6 +2520,10 @@ TXT
   rm -rf "$ST/confirm-answers"; cp "$(head -1 <<<"$wp")" "$d/stamp.keep"; sig0=$(watched_sig); rm -f "$(head -1 <<<"$wp")"
   t '(p) …and so does a stamp REMOVED mid-pass (a file that is gone is a line of its own)' "$(retick_due "$sig0" && echo gone)" gone
   mv "$d/stamp.keep" "$(head -1 <<<"$wp")"
+  t '(p) a retick 10 s into the unit still fits its start timeout' "$(CC_MODEL_RETICK_BUDGET=40 retick_in_time 1000 1010 && echo fits)" fits
+  t '(p) …one 40 s in does not: the 10 min scan takes the write instead of a pass the timeout could kill' \
+    "$(CC_MODEL_RETICK_BUDGET=40 retick_in_time 1000 1040 || echo skip)" skip
+  t '(p) …and a start that is not a number buys no retick' "$(retick_in_time '' 1010 || echo skip)" skip
   printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" aaaaaaaa,bbbbbbbb > "$(head -1 <<<"$wp")"
   tick; unset -f probe
   t '(p) two runs'"'"' stamp at the watched path: that pass switches the box to the fallback, unpaid' \
@@ -3137,11 +3148,13 @@ case "${1:-}" in
   chain)   chain ;;
   next)    chain_next "${2:-}" || exit 1 ;;
   tick)    [ -z "$CRED" ] || exit 0   # the pass moves the box's own sessions: never on another login's record
-           w0=$(watched_sig); tick
+           t0=${CC_MODEL_TICK_T0:-$(date +%s)}; w0=$(watched_sig); tick
            # a stamp written mid-pass fired cc-model.path into a service already running, and systemd dropped it: one
-           # more pass in a fresh process, at most twice, so it does not wait for the 10 min scan
+           # more pass in a fresh process, at most twice and only while the unit's start timeout leaves room for it, so
+           # it does not wait for the 10 min scan. The first pass's start rides the exec, so the budget is the unit's
            rt=${CC_MODEL_RETICK:-0}; [[ "$rt" =~ ^[0-9]+$ ]] || rt=2
-           retick_due "$w0" && [ "$rt" -lt 2 ] && CC_MODEL_RETICK=$((rt + 1)) exec "$0" tick ;;
+           retick_due "$w0" && [ "$rt" -lt 2 ] && retick_in_time "$t0" \
+             && CC_MODEL_RETICK=$((rt + 1)) CC_MODEL_TICK_T0=$t0 exec "$0" tick ;;
   return)  return_cmd "${2:?usage: cc-model return <window>}" || exit 1 ;;
   selfcheck) selfcheck || exit 1 ;;
   *) sed -n '2,25p' "$0" >&2; exit 2 ;;

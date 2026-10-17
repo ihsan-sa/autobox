@@ -8,9 +8,11 @@
 #   2. ../tests/guard-replay-box.jsonl, the private overlay's true-catch set, when that file is present: every row
 #      refused. The public core has no such file and skips it.
 #   3. tests/guard-probe.jsonl, the differential: every row goes through the BASE guard ($GUARD_BASE, a ref, default
-#      origin/main) and through this tree's. A row the base refuses and this tree lets through is a REGRESSION and
-#      fails the run. Skipped, and said so, when GUARD_BASE=none or the base ref is not in this clone (the lander
-#      runs checks in a one-commit tree with no origin/main, so run it in a clone to get the differential).
+#      refs/lander/base when the repo has it, else origin/main) and through this tree's. A row the base refuses and
+#      this tree lets through is a REGRESSION and fails the run. The lander runs checks in a one-commit tree with no
+#      origin/main and puts main at the PR's base there as refs/lander/base (run.materialise), so a landing runs it.
+#      Skipped, and said so, when GUARD_BASE=none or the base ref is not in the repo (main's own health run, which
+#      has no other side).
 #
 # It fails closed: a missing guard-replay.jsonl or guard-probe.jsonl fails, a corpus that checked no row fails, and a
 # guard exit that is neither 0 (pass) nor 2 (refuse) fails, on the base as on this tree.
@@ -25,7 +27,9 @@
 #        never reads, so it is left to that selfcheck. The fixture HOME holds a seat dir under ~/.cc/state/demo.
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd); G=$R/bin/cc-guard
-GUARD_BASE=${GUARD_BASE:-origin/main}
+if [ -z "${GUARD_BASE:-}" ]; then
+  GUARD_BASE=origin/main; (cd "$R" && git rev-parse -q --verify 'refs/lander/base^{commit}') >/dev/null 2>&1 && GUARD_BASE=refs/lander/base
+fi
 v=0; [ "${1:-}" = -v ] && v=1
 for f in guard-replay.jsonl guard-probe.jsonl; do
   [ -s "$R/tests/$f" ] || { echo "guard-replay: tests/$f is missing or empty, so nothing would be checked" >&2; exit 1; }
@@ -105,7 +109,7 @@ if [ "$GUARD_BASE" != none ] && (cd "$R" && git show "$GUARD_BASE:./bin/cc-guard
   echo "differential: $n rows against $GUARD_BASE, $reg REGRESSION"
   [ "$n" -gt 0 ] || { echo "guard-replay: the differential checked no row" >&2; fail=$((fail+1)); }
 elif [ "$GUARD_BASE" = none ]; then echo "differential: GUARD_BASE=none, skipped"
-else echo "differential: base $GUARD_BASE is not in this clone (the lander's one-commit check tree has none), skipped; run it in a clone"; fi
+else echo "differential: base $GUARD_BASE is not in this repo (the lander gave no base: a run on main itself), skipped; run it in a clone"; fi
 
 echo "guard-replay: $pass passed, $fail failed"
 [ "$fail" = 0 ]
