@@ -229,10 +229,25 @@ verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
 # else the main checkout's directory name and the worktree's. .cc/track is in the tree, which the worker writes, and
 # the run for a worker is the host's: a repo of `../../x` would point the host's append outside $GDIR. So a name
 # carrying '/', '..', a leading '.' or anything but [A-Za-z0-9._-] is not taken, and the fallback stands for it.
+# The file itself is read only when it is a regular file reached with no symlink: a FIFO there would stall the run,
+# and a symlink (track, or .cc) would put two lines of a host file into a file name under $GDIR. track_lines opens
+# it without following either link and without blocking, then checks what it opened, so a swap after the check
+# changes nothing. Anything else reads as no .cc/track, and the fallback stands.
 name_ok(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] && [[ "$1" != *..* ]]; }
+track_lines(){   # $1 = root → the first lines of $1/.cc/track if it is a regular file, nothing otherwise
+  python3 -I -c '
+import os, stat, sys
+try:
+    d = os.open(os.path.join(sys.argv[1], ".cc"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    f = os.open("track", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=d)
+    if stat.S_ISREG(os.fstat(f).st_mode):
+        sys.stdout.write(os.read(f, 4096).decode("utf-8", "replace"))
+except OSError:
+    pass' "$1" 2>/dev/null
+}
 wait_log(){   # $1 = root → "FILE ROW", the run's slot-wait record
   local repo="" row="" c
-  { read -r repo; read -r row; } < "$1/.cc/track" 2>/dev/null
+  { read -r repo; read -r row; } < <(track_lines "$1")
   name_ok "$repo" || repo=""; name_ok "$row" || row=""
   [ -n "$repo" ] || { c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && repo=$(basename "$(dirname "$c")"); }
   [ -n "$row" ] || row=$(basename "$1")

@@ -437,6 +437,14 @@ def selfcheck():
               (ran, p.stderr))
         check("shipped spec: no shell ever runs its text", not os.path.exists(pw), lines(t, "pwned"))
 
+    # The sweep of main runs as a shipped spec too, but only as the two bare words: no REV, repo or shell text.
+    sweep = shipped_argv("lander-self sweep")
+    check("shipped spec: `lander-self sweep` runs the lander-self beside this tool, as argv",
+          sweep == [sys.executable, os.path.join(BIN, "lander-self"), "sweep"], sweep)
+    check("…and one that names a REV, a repo or more text is refused",
+          all(shipped_argv(c) is None for c in ("lander-self sweep HEAD~1", "lander-self sweep --repo /tmp/x",
+                                                 "lander-self sweep; touch /tmp/x", "lander-self promote")))
+
     def shipped_ok(root):
         """None when root carries no config/ (core published on its own), else (passed, what was wrong)."""
         shipped = os.path.join(root, "config", "watch")
@@ -450,7 +458,8 @@ def selfcheck():
                 argv = shlex.split(s.get("check", ""))
             except ValueError:
                 argv = []
-            if s.get("revert") != "tell" or argv[:2] != ["cc-watch", "url"] or s.get("owner") != "#alerts":
+            if (s.get("revert") != "tell" or (argv[:2] != ["cc-watch", "url"] and argv != ["lander-self", "sweep"])
+                    or s.get("owner") != "#alerts"):
                 bad.append(os.path.basename(p))
         return bool(files) and not bad, bad or "no specs in " + shipped
 
@@ -462,12 +471,12 @@ def selfcheck():
         check("shipped host watchers: no config/ is a skip, a config/ with no watch dir fails",
               bare is None and gone is not None and not gone[0], (bare, gone))
 
-    # The shipped specs for the box's own hosts parse, and each is a tell-only url watcher.
+    # The shipped specs for the box's own hosts parse, and each is a tell-only url watcher or the sweep of main.
     got = shipped_ok(os.path.dirname(os.path.dirname(os.path.dirname(tool))))
     if got is None:   # core published on its own carries no config/
         print("  skip shipped host watchers: no config/ beside core")
     else:
-        check("shipped host watchers: present, tell-only url checks, owner #alerts", got[0], got[1])
+        check("shipped host watchers: present, tell-only url checks or the sweep, owner #alerts", got[0], got[1])
 
     print(f"cc-watch selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0

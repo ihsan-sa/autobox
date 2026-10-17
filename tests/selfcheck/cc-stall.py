@@ -91,6 +91,8 @@ def selfcheck():
     t.scr["@0"] = ODD
     with q: run(t, True, 2100); run(t, True, 2100 + STAND_S)
     k(len(raised()) == 2, "the same dialog back after it closed is a new stall, raised again")
+    # 5b a rule line under a dialog is never part of its quote
+    k("What do you want to do?" in question(LIMIT) and "▔" not in question(LIMIT), "a rule line is never quoted")
     # 6 a relaunch loop: raised once while it runs, re-armed when it stops
     fresh(); t = Fake(); line = "claude exited (1) - restarting in 15s (Ctrl-C for a shell)\n"
     t.add("box", "$ ", hist=line, live=False)
@@ -180,6 +182,16 @@ def selfcheck():
     t.history = lambda wid: (_ for _ in ()).throw(RuntimeError("boom")) if wid == "@0" else orig(wid)
     with q: run(t, True, 1000)
     k(t.keys == [("@1", "1")], "a window that throws is logged and skipped; the next is still cleared")
+
+    # 10b the row quotes what the dialog asks, never a rule: the 2026-10-13 row's screen was one ╌ line
+    rule = "╌" * 40
+    edit = (f" {rule}\n  1 -old\n  1 +new\n {rule}\n  Do you want to make this edit to notes.md?\n"
+            "  ❯ 1. Yes\n    2. No, and tell Claude what to do differently (esc)\n")
+    k(question(edit) == "Do you want to make this edit to notes.md?", f"the edit dialog's question is quoted: {question(edit)!r}")
+    plain = question(f" {rule}\n  Something new happened\n  Enter to confirm · Esc to cancel\n")
+    k(plain.startswith("Something new happened") and "╌" not in plain,
+      f"with no question on it, the dialog's own words are quoted, not the rule above it: {plain!r}")
+    k(question(f" {rule}\n ▔▔▔▔\n") == "(unreadable)", "a screen of rules only is unreadable, not a rule")
 
     # 11 the other half of the 2026-09-23 fix: cc-rc beside this copy clears the dead screen before it starts
     # accept-dialog, so the dialog text that one reads is the new claude's, never the last one's

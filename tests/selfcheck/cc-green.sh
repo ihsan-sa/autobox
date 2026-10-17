@@ -133,6 +133,16 @@ EOS
   k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trk.tsv trk")" "…and so are a bare '..' and a leading dot"
   printf 'somerepo\nmy-row.2\n' > "$R/.cc/track"
   k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-somerepo.tsv my-row.2")" "…control: plain names are taken as written"
+  # 1f …and the file is read only when it is a regular one reached through no symlink. Each case is its own repo.
+  R=$(newrepo trkfifo); mkdir -p "$R/.cc"; mkfifo "$R/.cc/track"
+  out=$(GDIR="$D/g" timeout 10 bash -c "$(declare -f name_ok track_lines wait_log); wait_log \"\$1\"" _ "$R"); rc=$?
+  k "$(t test "$rc" -eq 0 -a "$out" = "$D/g/waits-trkfifo.tsv trkfifo")" "a FIFO at .cc/track is not read: no stall, the fallback names stand"
+  R=$(newrepo trklink); mkdir -p "$R/.cc"; printf 'hostrepo\nhostrow\n' > "$D/host-file"; ln -s "$D/host-file" "$R/.cc/track"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trklink.tsv trklink")" "…nor a symlink at .cc/track, so a host file's lines never name the record"
+  R=$(newrepo trkdir); mkdir -p "$D/hostdir"; printf 'hostrepo\nhostrow\n' > "$D/hostdir/track"; ln -s "$D/hostdir" "$R/.cc"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trkdir.tsv trkdir")" "…nor a track reached through a symlinked .cc"
+  R=$(newrepo trkreg); mkdir -p "$R/.cc"; printf 'regrepo\nregrow\n' > "$R/.cc/track"
+  k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-regrepo.tsv regrow")" "…control: a regular .cc/track on its own repo is read"
   D2=$(mktemp -d); R=$(newrepo never)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'no verdict on this worktree' <<<"$out")")" "a worktree nothing has run on is not green, exit 1"

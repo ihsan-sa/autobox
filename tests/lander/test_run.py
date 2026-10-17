@@ -106,6 +106,7 @@ class Status(unittest.TestCase):
                  ((1, "Failed to connect to user scope bus via local transport"), T.UNRUNNABLE),
                  # no signal scope on the kernel: cc-nosignal refuses and nothing ran, so it isn't the tree's red
                  ((3, "cc-nosignal: Landlock ABI 5 has no signal scope — refused, nothing ran. A check here"), T.UNRUNNABLE),
+                 ((125, S.SETUP_FAILED + ": cp: cannot stat '/tmp/.lander-stub'"), T.UNRUNNABLE),
                  ((0, "bwrap: a line of the check's own that says bwrap:"), T.PASSED)]
         for (rc, text), want in cases:
             self.assertEqual(RUN.status_of(rc, text)[0], want, (rc, text))
@@ -841,8 +842,11 @@ class Sandbox(Env):
         m = os.path.join(self.tmp, "venv")
         os.mkdir(m)
         write(m, {"marker": "here"})
-        r = self.run_(chk(run=f'grep -q here {m}/marker && ! touch {m}/w 2>/dev/null', mounts=[m]))
+        # the refusal itself, not any failure of touch (a fork or memory error would also make `! touch` true)
+        r = self.run_(chk(run=f'grep -q here {m}/marker && {{ touch {m}/w 2>&1; echo "rc=$?"; }} '
+                              f'| tr "\\n" " " | grep -Eq "Read-only file system rc=[1-9]"', mounts=[m]))
         self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertFalse(os.path.exists(os.path.join(m, "w")))
         r = self.run_(chk(run="true", mounts=[m + "-gone"]))
         self.assertEqual(r.status, T.UNRUNNABLE)
         self.assertIn("mount", r.extra["why"])
@@ -860,6 +864,15 @@ class Sandbox(Env):
         r = self.run_(chk(run="sleep 30", cap=1))
         self.assertEqual((r.status, r.extra["why"]), (T.UNRUNNABLE, "stopped at its cap"))
         self.assertLess(r.secs, 15)
+
+    def test_a_stub_that_does_not_install_stops_the_run_unrunnable(self):
+        stub_dir = os.path.join(self.tmp, "stub-is-a-dir")   # cp without -r refuses a directory
+        os.mkdir(stub_dir)
+        with mock.patch.object(S, "write_stub", return_value=stub_dir):
+            r = self.run_(chk(run="echo 0 failed"))
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("sandbox did not start", r.extra["why"])
+        self.assertIn(S.SETUP_FAILED, r.extra["why"])
 
     def test_no_bwrap_makes_a_sandboxed_class_unrunnable_never_a_host_run(self):
         with mock.patch.object(S, "available", return_value=False):

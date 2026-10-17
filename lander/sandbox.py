@@ -29,8 +29,11 @@ TMUX_IN = "/tmp/tmux"
 PATH_IN = f"{HOME_IN}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 STUB = ("#!/bin/sh\n# the lander's sandbox stub: the suite stubs every model call; this only keeps a window up\n"
         "exec sleep 3600\n")
-PRELUDE = (f'mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" && chmod 700 "{TMUX_IN}" && '
-           f'cp "$LANDER_STUB" "{HOME_IN}/.local/bin/claude" && chmod +x "{HOME_IN}/.local/bin/claude"; '
+# a setup step that fails stops the run with this as its first line, which run.SETUP_RE reads as unrunnable
+SETUP_FAILED = "lander-sandbox: setup failed, nothing ran"
+PRELUDE = (f'err=$({{ mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" && chmod 700 "{TMUX_IN}" && '
+           f'cp "$LANDER_STUB" "{HOME_IN}/.local/bin/claude" && chmod +x "{HOME_IN}/.local/bin/claude"; }} 2>&1) || '
+           f'{{ printf "%s: %s\\n" "{SETUP_FAILED}" "$err" >&2; exit 125; }}; '
            'command -v tmux >/dev/null 2>&1 && tmux new-session -d -s main -x 200 -y 50 >/dev/null 2>&1; '
            'exec /bin/sh -c "$1"')
 

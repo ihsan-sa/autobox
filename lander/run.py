@@ -41,8 +41,9 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
 
 THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite that says "1 failed" failed whatever
 it exited with). unrunnable — never red: killed at the check's cap, killed by a signal or the scope's MemoryMax
-(exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork), a sandbox that did not start, a
-mount that is not there, a tree that did not reproduce. failed: anything else.
+(exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork) from a run that exited non-zero (a
+passing check may quote that text itself), a sandbox that did not start (its stub not installed included), a mount
+that is not there, a tree that did not reproduce. failed: anything else.
 
 JUDGE (a red, per check): the same check on the BASE tree — main's own record of it on exactly that tree when the
 tip run made one (health.py): green there is no base red, and red there stands as `blocked-by-main` with no run when
@@ -98,7 +99,7 @@ BOX_STATE_RE = re.compile(r"Disk quota exceeded|No space left on device|Cannot a
                           r"|Resource temporarily unavailable")
 SETUP_RE = re.compile(r"^(bwrap:|systemd-run:|Failed to start transient scope"
                       r"|Failed to connect to (user )?(scope )?bus"
-                      r"|cc-nosignal: .*refused, nothing ran).*", re.M)
+                      r"|cc-nosignal: .*refused, nothing ran|" + re.escape(S.SETUP_FAILED) + r").*", re.M)
 RED_RE = re.compile(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback")
 PASS_RE = re.compile(r"^\W*[✓✔]|^\s*(?:ok|pass(?:ed)?)\b", re.I)
 KILLED = (124, 137, 143)
