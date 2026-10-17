@@ -3096,7 +3096,30 @@ def prove_cases(case, t, real_names=names_under):
     case("private_tmux falls back to the temp dir when /run/user is not writable",
          d.startswith(tempfile.gettempdir() + "/lander-prove-tmux-"))
     shutil.rmtree(d, ignore_errors=True)
+    # a /run/user/<uid> that passes the access check but refuses the mkdtemp (full, or a race) falls back the same way
     kept_mk = tempfile.mkdtemp
+
+    def run_user_refuses(**kw):
+        if (kw.get("dir") or "").startswith("/run/user/"):
+            raise OSError("no space left")
+        return kept_mk(**kw)
+    os.access = lambda p, m: True if p.startswith("/run/user/") else kept_access(p, m)  # noqa: E731
+    tempfile.mkdtemp = run_user_refuses
+    try:
+        d = private_tmux()
+    finally:
+        os.access, tempfile.mkdtemp = kept_access, kept_mk
+    case("private_tmux falls back to the temp dir when /run/user's mkdtemp raises OSError",
+         d.startswith(tempfile.gettempdir() + "/lander-prove-tmux-"))
+    shutil.rmtree(d, ignore_errors=True)
+    # a uid passwd has no entry for gives the cards.PASSWD_HOME fallback, not a KeyError
+    kept_pw = pwd.getpwuid
+    pwd.getpwuid = lambda uid: (_ for _ in ()).throw(KeyError(uid))
+    try:
+        h = passwd_home()
+    finally:
+        pwd.getpwuid = kept_pw
+    case("passwd_home gives /nonexistent when passwd has no entry for the uid", h == "/nonexistent")
     tempfile.mkdtemp = lambda **kw: (_ for _ in ()).throw(OSError("read-only"))
     try:
         nov = sweep_under(rel, t, "s")
@@ -3127,7 +3150,7 @@ def prove_cases(case, t, real_names=names_under):
     alone = os.path.join(t, "self", "abc123", "lander-self")
     os.makedirs(os.path.dirname(alone))
     shutil.copy(os.path.realpath(__file__), alone)
-    rc, out, err = sh([sys.executable, "-P", "-c",
+    rc, out, err = sh([sys.executable, "-I", "-c",
                        "import json, runpy, sys\ng = runpy.run_path(sys.argv[1], run_name='alone')\n"
                        "print(json.dumps(g['proven'](sys.argv[2], sys.argv[2], sys.argv[3], 'good')))",
                        alone, lr, t], cwd=t, timeout=120, stdin=subprocess.DEVNULL)

@@ -1901,6 +1901,19 @@ echo https://github.com/o/site/pull/7
         reg = load()
         run("file", pa, "--project", "Boards", "--title", "Board", "--attach", d1)
         ok("…and the same bytes alone leave the register exactly as it was", load() == reg)
+        board("a1f", g1, d1)
+        reg = load()
+        rc, o = run("file", pa, "--project", "Boards", "--title", "Board", "--attach", g2)
+        same = load() == reg
+        rc2, o2 = run("file", pa, "--project", "Boards", "--title", "Board", "--attach", g2, "--replace")
+        cur = load()["documents"]["001-0001"]["revisions"]
+        x = {y["name"]: y for y in cur[0]["attachments"]}
+        ok("an unchanged build's --attach with other bytes under a name is refused naming --replace and changes "
+           "nothing; with --replace it swaps that name on the current revision and files no revision",
+           rc == 2 and "--replace" in o and same
+           and rc2 == 0 and "unchanged, nothing filed" in o2 and len(cur) == 1
+           and open(os.path.join(ROOT, x["board-F_Cu.gbr"]["blob"]), "rb").read() == b"G04 top v2*\n"
+           and x["board.drl"]["sha256"] == reg["documents"]["001-0001"]["revisions"][0]["attachments"][1]["sha256"])
         # a different board revision carries nothing
         ROOT = os.path.join(t, "a2")
         run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board", "--describes", "PCB-0001-A",

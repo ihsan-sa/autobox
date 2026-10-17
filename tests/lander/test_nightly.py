@@ -177,6 +177,13 @@ class Guards(unittest.TestCase):
         rec = {"first": 1, "runs": {n: NG.MIN_RUNS for n in m.checks}, "pr_reds": {}, "nightly_reds": {}}
         out = NG.moved("box", m, rec, NOW)
         self.assertEqual([n for n in GUARD_CHECKS + tuple(cloudflare) if n in out], [])
+        # perms' read of #1190: the library's public links, the org fence, the Slack app and mail stay per PR
+        library = sorted({q for c in m.checks.values() for q in c.paths if M.match(["bin-private/*library-public*"], q)})
+        self.assertTrue(library, "no check covers the library's public-link tool")
+        for probe in (*library, "core/bin/cc-gh-org", "core/mail/router.py", "core/slack/app-manifest.json"):
+            owners = [n for n in m.checks if m.owns(n, probe)]
+            self.assertTrue(owners, f"no check covers {probe}")
+            self.assertEqual([n for n in owners if n in out], [], probe)
         cal = [n for n in m.checks if n.startswith("py-compile-") and n.endswith("-cal")]
         self.assertTrue(cal and all(n in out for n in cal))   # the rule still moves a check that guards nothing
 
@@ -282,8 +289,9 @@ class Tick(State):
         few += [f"{E.stamp()}\tstage demo#1 gate gate=quiet ok=yes secs=5\n"] * (NG.MIN_RUNS - 1)
         self.write_log(few)
         self.assertFalse(NG.due("demo"))   # moved() would move nothing, so a sweep has nothing to cover
-        NG._cache.clear()   # the cache keys on the log's stat, which a same-size rewrite may not change
-        self.write_log(few + [few[-1]])
+        NG._cache.clear()   # record() caches the log for an hour
+        # a second check with a single run: due() must ask whether any check ran enough, not whether all did
+        self.write_log(few + [few[-1], f"{E.stamp()}\tstage demo#1 gate gate=broke ok=yes secs=5\n"])
         self.assertTrue(NG.due("demo"))
 
     def test_a_failed_start_does_not_spend_the_day(self):

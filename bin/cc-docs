@@ -9,7 +9,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
 
     cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--latex <main.tex>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
-                 [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]… [--attach <file>]…
+                 [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]… [--attach <file>]… [--replace]
                  [--filer-editor <email>] [--no-source <why>]
         Called by a maker at the end of a finished build: only a finished document meant for a person is filed, never
         a draft, a figure, test output or a PDF somebody else wrote, and one with no natural project goes into the
@@ -58,8 +58,11 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         (filer: repo, session, cc-slack target, Slack channel and thread) from the track worktree, orch alias or
         ~/dev/<repo> the filing ran under. --attach, once per file, adds SUPPORTING FILES (below) to the revision
         it files, or to the current one when the content is unchanged; one that `attach` would refuse refuses the
-        whole call before anything is filed. A new revision marks its document's open feedback (feedback.json, written
-        by the box's library poller) done, "answered by rev X", for the poller to tell the site.
+        whole call before anything is filed. On an unchanged build a name the current revision already has with other
+        bytes (Gerbers and drill files carry the date they were made) is refused unless --replace, which swaps it as
+        `attach --replace` does; a new revision's own --attach always takes that name. A new revision marks its
+        document's open feedback (feedback.json, written by the box's library poller) done, "answered by rev X", for
+        the poller to tell the site.
         --filer-editor <email> is the library editor filing a draft written in the site's editor by someone the site
         let edit that document (the site decides who may; no session sees the draft): the revision's filer is
         {"editor": the address lower-cased}, with no session in it, so the library never hands questions on it to one
@@ -104,7 +107,8 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         nothing attached: a directory (name its files), a file over 25 MiB (what Cloudflare Pages serves), over 100
         on one revision, or every supporting file in the register, counted once each, past 1 GiB (the mirror's GitHub
         repo). A NEW REVISION CARRIES the one before's files (each marked carried_from), except a name its own
-        --attach gives, and carries none when it --describes a different board revision than the one before did;
+        --attach gives, and carries none when it --describes a different board revision than the one before did
+        (one side naming no board revision still carries them);
         stderr says which it carried or left. Prints `<number>\t<name>\tattached|unchanged|replaced|removed`.
     cc-docs related <PPP-NNNN> [<PPP-NNNN>…] [--remove <PPP-NNNN>]…
         RELATED FILES: links from a document's page to other library documents, never copies, kept on the document
@@ -1786,7 +1790,8 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
         if same(d, fp, text):
             cur = current(d)
             # an unchanged build's supporting files go on the revision it matches, the same way `attach` puts them
-            lst, said = merge_attachments(cur.get("attachments") or [], extra, False, f"{num}-{cur['rev']}")
+            lst, said = merge_attachments(cur.get("attachments") or [], extra, getattr(a, "replace", False),
+                                          f"{num}-{cur['rev']}")
             if extra:
                 check_attachments(reg, num, cur["rev"], lst)
             print(f"{num}-{cur['rev']}\t{os.path.join(ROOT, cur['file'])}\tunchanged, nothing filed")
@@ -1811,7 +1816,7 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
                 recorded.append("supporting files " + ", ".join(n for n, w in said if w != "unchanged"))
             if recorded:
                 save(reg)
-                write_views(reg, set(d["visibility"]) - {"owner"})
+                write_views(reg, set(d.get("visibility", ())) - {"owner"})
                 print(f"cc-docs: {num}-{cur['rev']}: recorded {' and '.join(recorded)}", file=sys.stderr)
             return 0
         full = f"{num}-{rev}"
@@ -1880,7 +1885,7 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
                 print(f"cc-docs: {full} keeps no source, like {num}-{prev['rev']}: marked gone as it was ({why})",
                       file=sys.stderr)
         save(reg)
-        write_views(reg, set(d["visibility"]) - {"owner"})
+        write_views(reg, set(d.get("visibility", ())) - {"owner"})
         # brief: "When cc-docs files a new revision of a document with open feedback, mark those done"; a member's
         # kept edit (--filer-editor) answers none of the owner's feedback, which no session has read yet
         answered = 0 if (who or {}).get("editor") else answer_feedback(num, rev, d.get("moved_from", ()))
@@ -1961,7 +1966,7 @@ def file_markdown(a, decl=None):
             r.update(st.commit(proj, full), source_files=[name], source_main=name, source_sha256=sha)
             d["revisions"].append(r)
             save(reg)
-            write_views(reg, set(d["visibility"]) - {"owner"})
+            write_views(reg, set(d.get("visibility", ())) - {"owner"})
             # a member's kept edit (--filer-editor) answers none of the owner's feedback, as file_locked's doesn't
             answered = 0 if (who or {}).get("editor") else answer_feedback(num, rev, d.get("moved_from", ()))
         finally:
@@ -2231,8 +2236,8 @@ def merge_attachments(have, new, replace, full):
             out[i] = e
             said.append((x["name"], "replaced"))
         else:
-            raise Refused(f"{full} already has a supporting file {x['name']} with other bytes; "
-                          f"`cc-docs attach {full} <file> --replace` swaps it")
+            raise Refused(f"{full} already has a supporting file {x['name']} with other bytes; --replace on "
+                          f"`file`, or `cc-docs attach {full} <file> --replace`, swaps it")
     return out, said
 
 
@@ -2253,7 +2258,9 @@ def check_attachments(reg, num, rev, lst):
 
 def carry_attachments(prev, describes, new, full):
     """What a new revision starts from: the one before's supporting files, the names this filing attaches taken
-    out, and none when the two describe different board revisions. Says on stderr what it carried or dropped."""
+    out, and none when the two describe different board revisions. A revision or the one before with no --describes
+    carries them: only two different board revisions named on both sides drop them. Says on stderr what it carried
+    or dropped."""
     have = (prev or {}).get("attachments") or []
     if not have:
         return []
@@ -2303,7 +2310,7 @@ def cmd_attach(a):
             else:
                 r.pop("attachments", None)
             save(reg)
-            write_views(reg, set(d["visibility"]) - {"owner"})
+            write_views(reg, set(d.get("visibility", ())) - {"owner"})
     finally:
         staged.close()
     for name, what in said:
@@ -2366,7 +2373,7 @@ def cmd_related(a):
         else:
             d.pop("related", None)
         save(reg)
-        write_views(reg, set(d["visibility"]) - {"owner"})
+        write_views(reg, set(d.get("visibility", ())) - {"owner"})
     for n, what in said:
         print(f"{d['number']}\t{n}\t{what}")
     return 0
@@ -2607,7 +2614,7 @@ def cmd_star(a):
         d["starred_by"] = sorted(who)
         d.pop("starred", None)
         save(reg)
-        write_views(reg, set(d["visibility"]) - {"owner"})
+        write_views(reg, set(d.get("visibility", ())) - {"owner"})
     print(f"{a.number}\t{'starred' if a.state == 'on' else 'not starred'}")
     return 0
 
@@ -2653,7 +2660,7 @@ def cmd_public(a):
             r.pop("public_token")
         d.pop("public", None)
         save(reg)
-        write_views(reg, set(d["visibility"]) - {"owner"})
+        write_views(reg, set(d.get("visibility", ())) - {"owner"})
     token = r.get("public_token")
     if not token:
         print("private")
@@ -3607,6 +3614,7 @@ def main(argv):
             p.add_argument("--cost", action="append")
             p.add_argument("--latex")
             p.add_argument("--attach", action="append")
+            p.add_argument("--replace", action="store_true")
             p.add_argument("--filer-editor")
             p.add_argument("--no-source")
         else:

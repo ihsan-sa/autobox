@@ -1373,6 +1373,9 @@ class Admission(unittest.TestCase):
             write(d, {"config": f"LANDER_SLOTS={'9' * 5000}\n"})   # past int()'s 4300 digits: no ValueError
             with mock.patch("os.cpu_count", return_value=8):
                 self.assertEqual(A.slots(now=8800.0), 8)                       # the cores, like 300
+            write(d, {"config": f"LANDER_SLOTS={'0' * 5000}3\n"})   # leading zeros past int()'s 4300: no ValueError
+            with mock.patch("os.cpu_count", return_value=8):
+                self.assertEqual(A.slots(now=8900.0), 3)                       # the 3 they pad
             os.unlink(cfg)
             self.assertEqual(A.slots(now=9000.0), 4)                           # unset: the host's
             with mock.patch.object(A, "SLOTS", 9):

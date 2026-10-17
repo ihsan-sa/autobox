@@ -53,7 +53,10 @@ GUARD_PATHS = ("dashboard/auth.py",              # Cloudflare Access on the dash
                "core/bin/cc-broker", "core/bin/cc-msg", "core/bin/cc-mail", "core/bin/cc-publish",
                "core/bin/cc-loop", "core/bin/cc-sandbox",   # the worker sandbox launch
                "core/bin/gh",                    # the org-fence shim
-               "core/bin/cc-refusals", "bin-private/*cloudflare*", "core/bin/cc-tmp-reap")
+               "core/bin/cc-refusals", "bin-private/*cloudflare*", "core/bin/cc-tmp-reap",
+               "bin-private/*library-public*",   # the library's public links
+               "core/bin/cc-gh-org",             # the member org fence
+               "core/slack/**", "core/mail/**")  # the Slack app and inbound/outbound mail
 HOOK_SETTINGS = ("config/claude-managed.json", "config/claude-settings.json")
 LINE_RE = re.compile(r"^(\S+)\t(\S+) ([\w.-]+)(?:#(\d+))?(?: (.*))?$")
 KV_RE = re.compile(r"(\w+)=(\S*)")

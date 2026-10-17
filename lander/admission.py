@@ -196,8 +196,9 @@ def host_slots(meminfo: str | None = None, cores: int | None = None) -> int:
 
 def config_slots() -> int | None:
     """LANDER_SLOTS as cc-config reads it, when it is a whole number of at least 1 (ASCII digits: '²' is a digit to
-    isdigit()), and no more than the box's cores (a number too long for int(), which refuses past 4300 digits, is
-    taken as above them); None when it is unset, not such a number, or cc-config did not answer."""
+    isdigit()), and no more than the box's cores (leading zeros dropped, and a number too long for int(), which
+    refuses past 4300 digits, taken as above them); None when it is unset, not such a number, or cc-config did not
+    answer."""
     from lander import jobs as J   # here: jobs imports events, and admission is imported by the runner's every caller
     try:
         p = subprocess.run([f"{J.bin_dir()}/cc-config", "get", "LANDER_SLOTS"], capture_output=True, text=True,
@@ -205,10 +206,11 @@ def config_slots() -> int | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     v = p.stdout.strip()
-    if p.returncode != 0 or not (v.isascii() and v.isdigit()) or not v.lstrip("0"):
+    n = v.lstrip("0")   # int() counts leading zeros toward its 4300 digits, so '0' * 5000 + '7' would raise
+    if p.returncode != 0 or not (v.isascii() and v.isdigit()) or not n:
         return None
     cores = os.cpu_count() or 1
-    return cores if len(v.lstrip("0")) > 9 else min(int(v), cores)
+    return cores if len(n) > 9 else min(int(n), cores)
 
 
 _read: tuple = (None, 0.0)   # (K, when): config_slots() spawns cc-config, and slot() asks every poll (2 s)
