@@ -1834,6 +1834,42 @@ def selfcheck():
            and sum("the PR half is met" in m for m in msgs("x")) == 1)
     finally:
         restore(); shutil.rmtree(th_, ignore_errors=True)
+    # PR STATES IN ONE BATCH: a board sorted late still has its PRs read when earlier boards spent the PRMAX budget
+    tq = tempfile.mkdtemp(prefix="cc-reconcile-prbatch-")
+    try:
+        gql = ('{"data":{"repository":{"p5":{"state":"MERGED"},"p6":{"state":"OPEN"},"p7":null}},'
+               '"errors":[{"message":"Could not resolve to a PullRequest with the number of 7."}]}')
+        scratch(tq, dict(NOOP, gh=f'echo "$*" >> {tq}/gh.log; [ "$1" = api ] && [ -f {tq}/gql ] && cat {tq}/gql && exit 1; '
+                                  f'[ "$2" = view ] && echo "$3" >> {tq}/view.log; exit 1'))
+        os.makedirs(f"{tq}/dev/zz")
+        json.dump({"repo": "zz", "tracks": {
+            "a": {"status": "review", "pr": "https://github.com/o/zz/pull/5", "updated": old},
+            "b": {"status": "review", "pr": "6", "updated": old},
+            "c": {"status": "review", "pr": "https://github.com/o/zz/pull/7", "updated": old},
+            "m": {"status": "merged", "pr": "https://github.com/o/zz/pull/8", "updated": old}}},
+                  open(f"{tq}/.cc/boards/zz.json", "w"))
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}),
+                         PRMAX=0)
+        open(f"{tq}/gql", "w").write(gql)
+        got = {tr: fa["pr_state"] for _, tr, _, fa in facts(["zz"])}
+        calls = open(f"{tq}/gh.log").read().splitlines()
+        ok("PR BATCH: with the one-at-a-time budget spent, one GraphQL query still reads the board's PRs — a URL "
+           "and a bare number alike — and a PR it could not answer stays unknown, never guessed",
+           got == {"a": "MERGED", "b": "OPEN", "c": "?", "m": None}
+           and sum(c.startswith("api graphql") for c in calls) == 2 and not os.path.exists(f"{tq}/view.log"))
+        ok("…and a merged row's PR is not asked at all",
+           not any("p8:" in c for c in calls))
+        ok("…and decide() moves the merged one to merged and keeps the open one in review, with no 'worktree gone'",
+           decide(F(status="review", pr="u", pr_state=got["a"], wt_exists=False, worked=True))[0][:2] == ("fix", "merged")
+           and not any("worktree" in w for _, _, w in decide(F(status="review", pr="u", pr_state=got["b"],
+                                                                 wt_exists=False, worked=True))))
+        os.remove(f"{tq}/gql"); os.remove(f"{tq}/gh.log"); globals()["PRMAX"] = 1
+        got = {tr: fa["pr_state"] for _, tr, _, fa in facts(["zz"])}
+        ok("…and when the batch fails (GraphQL rate-limited), the budget reads one PR alone and the rest are unknown",
+           sorted(got.values(), key=str) == ["?", "?", "?", None]
+           and len(open(f"{tq}/view.log").read().split()) == 1)
+    finally:
+        restore(); shutil.rmtree(tq, ignore_errors=True)
     # (b) the tick wakes an idle seat once for a startable row, not again for the same state, never for a channel repo
     tb = tempfile.mkdtemp(prefix="cc-reconcile-wake-")
     try:

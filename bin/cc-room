@@ -11,6 +11,10 @@
                                     queued launch.
   cc-room cancel <repo/track>       drop that launch from the queue: its waiting admit finds the tombstone on its next
                                     poll and exits 0 without running CMD. Nothing is killed. exit 1 when none is queued
+  cc-room bump <repo/track>         move that launch to the head of the queue (PRIORITY, below). exit 1 when none is
+                                    queued
+  cc-room now <repo/track>          start that launch on its waiter's next poll, room or not (PRIORITY). exit 1 when
+                                    none is queued
   cc-room resume                    relaunch each launch a restart left behind (LOST, below) in a tmux window of its
                                     own, in its old place in the queue. cc-reconcile's tick runs it every 20 min
   cc-room heavy [--name L] [--log FILE] -- CMD
@@ -90,6 +94,14 @@ that arrived and a failed one is not taken for one: both refused, it tries again
 later, doubling up to 6 h, NOTICE_TRIES times at most; after the last refused try it says so once in its repo's
 channel (a plain `cc-notify --major`), and the launch keeps waiting.
 
+PRIORITY (2026-10-03: the owner said "bump it up in priority" about a worker sixth in the queue behind five
+launches all waiting on load, and nothing could reorder it: the waiter's own path is its entry's name, so renaming
+the file breaks it). `bump` stamps `bumped` (the time) in the launch's entry, waiting or lost; the FIFO puts bumped
+entries first, the latest bump first, then the rest oldest first. Being first still waits for room. `now` stamps
+`now`, and its waiter takes a slot and starts on its next poll whatever the room says, cap, pace and load
+included; it is a person's ask, so nothing sets it on its own. Both stamps live in the entry on disk, the waiter
+reads them back under the lock on every poll before it writes the entry again, and a resumed entry keeps them.
+
 HEAVY (2026-09-27: place_anneal ran at 4% CPU at load 160 beside ~20 sessions). `heavy` is FIFO over CC_HEAVY_CAP
 slots (cc-config, default a third of the cores, at least 1) and waits on nothing else: the load is the sessions',
 so waiting for it to fall would never end. The slot taken, CMD runs in a transient `systemd-run --user --scope`
@@ -160,6 +172,7 @@ RELAUNCH_ENV = ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_LIMIT_STAMP", "CC_FAI
                 "CC_PEER_SPOOL", "CC_PEER_REPO", "CC_PEER_TRACK")
 NOTICE_TRIES = 8
 SHELLS = ("sh", "bash", "dash", "zsh")
+MARKS = ("bumped", "now")   # a person's priority stamps (PRIORITY): only `bump` and `now` write them
 
 
 def read_entry(p):
@@ -242,6 +255,11 @@ def live(sub):
             except OSError:
                 pass
     return out
+
+
+def ordered(sub):
+    """the live entries of sub/ in the order they go: bumped first, the latest bump first, then oldest first"""
+    return sorted(live(sub), key=lambda p: (-float(read_entry(p).get("bumped") or 0), p))
 
 
 def lost_entries():
@@ -451,7 +469,7 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
         old = read_entry(f"{room_dir()}/{qsub}/{name}")
         rec = {"queued": old.get("queued") or time.time(), "noticed": bool(old.get("noticed")), "cmd": cmd,
                "cwd": os.getcwd(), "log": log, "notice_tries": int(old.get("notice_tries") or 0),
-               "notice_next": float(old.get("notice_next") or 0)}
+               "notice_next": float(old.get("notice_next") or 0), **{k: old[k] for k in MARKS if k in old}}
         if kind == "worker":
             server, sess, win, sock = where()
             alias = os.environ.get("CC_SLACK_ALIAS", "")
@@ -476,8 +494,15 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                 # gone with no tombstone: a waiter still running the older code read this JSON entry as a dead
                 # one and removed it (the deploy window) — write it again rather than take it for a cancel
                 write_entry(qsub, name, what, rec)
-            waiting = live(qsub)
-            first = next(iter(waiting), me) == me   # FIFO: the oldest launch still waiting goes first
+            cur = read_entry(me)   # a `bump` or `now` since the last poll: kept in every write from here on
+            rec.update({k: cur[k] for k in MARKS if k in cur})
+            waiting = ordered(qsub)
+            first = (waiting or [me])[0] == me   # FIFO, bumped first: the launch at the head goes first
+            if rec.get("now"):   # a person said start it now (PRIORITY): no room, pace or turn is asked
+                write_entry(ssub, str(os.getpid()), what)
+                os.unlink(me)
+                logline(log, f"cc-room: {what} starts now, as asked with `cc-room now`, room or not")
+                return "here"
             if kind == "worker":   # this host here, under the lock; the peer (TWO HOSTS) below, once it is released
                 pace = pace_why() if first else ""
                 why = (pace or host_why()) if first else ""
@@ -492,7 +517,7 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                     logline(log, f"cc-room: room now — {what} starts")
                 return "here"
             if not first:
-                ahead = list(waiting).index(me) if me in waiting else 0
+                ahead = waiting.index(me) if me in waiting else 0
                 why = f"{ahead} launch(es) queued ahead of it"
             # the brief: "tells the seat that dispatched it when it has waited past a bound" — once delivered, kept in
             # the entry; a try is stamped before it is made, so a restart mid-try waits out its backoff too
@@ -516,6 +541,8 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                 rec["unheard_said"] = unheard(what, rec, why, log)
             with Lock():
                 if os.path.exists(me):   # a cancel in between moved it away: never write it back
+                    cur = read_entry(me)   # nor drop a bump or now made while the notice went out
+                    rec.update({k: cur[k] for k in MARKS if k in cur})
                     write_entry(qsub, name, what, rec)
         # one line when the reason changes, and one an hour while it holds, so a long wait is seen and not re-logged
         if why != said or time.time() - last >= 3600:
@@ -588,7 +615,8 @@ def notice(what, rec, why, log):
     """-> True once someone has it: the broker took it, or cc-notify exited 0 (a test namespace has nobody to tell)"""
     mins = int((time.time() - rec["queued"]) // 60)
     line = (f"{what} has waited {mins // 60} h {mins % 60:02d} min in the worker queue and has not started: {why}. "
-            f"It starts on its own when there is room; `cc-room cancel {what}` drops it.")
+            f"It starts on its own when there is room; `cc-room cancel {what}` drops it, "
+            f"`cc-room bump {what}` moves it to the head of the queue and `cc-room now {what}` starts it now.")
     if test_namespace(what):   # a suite's scratch namespace has no seat, and must not reach the box's broker
         logline(log, f"cc-room: told nobody (a test namespace): {line}")
         return True
@@ -833,6 +861,22 @@ def cancel(what):
     return n
 
 
+def mark(what, key, val):
+    """stamp key=val in every queued entry of that launch, waiting or lost; -> how many"""
+    n = 0
+    os.makedirs(room_dir(), exist_ok=True)
+    with Lock():
+        for sub in ("queue", "heavy-queue"):
+            for p in glob.glob(f"{room_dir()}/{sub}/*"):
+                e = read_entry(p)
+                if p.endswith(".tmp") or e.get("what") != what:
+                    continue
+                e[key] = val
+                rewrite(p, e)
+                n += 1
+    return n
+
+
 def heavy_cap():
     return max(1, cfg("CC_HEAVY_CAP", max(1, (os.cpu_count() or 1) // 3)))
 
@@ -872,16 +916,20 @@ def status():
     with Lock():   # its sweep removes and stamps entries: never between a cancel and the entry it read before it
         for p, (pid, what) in live("slots").items():
             print(f"running {what} (pid {pid})")
-        for p, (pid, what) in live("queue").items():
-            print(f"queued  {what} (pid {pid})")
+        q = live("queue")
+        for p in ordered("queue"):
+            e = read_entry(p)
+            note = " — starting now" if e.get("now") else " — bumped" if e.get("bumped") else ""
+            print(f"queued  {q[p][1]} (pid {q[p][0]}){note}")
         for p, e in lost_entries().items():
             print(f"lost    {e.get('what')} — " + ("its waiter died while handing it to the peer; check the peer, "
                   "then cancel it or launch it again" if e.get("placing") else
                   "its waiter died with a restart; `cc-room resume` starts it again"))
         for p, (pid, what) in live("heavy").items():
             print(f"heavy   {what} (pid {pid})")
-        for p, (pid, what) in live("heavy-queue").items():
-            print(f"heavy queued {what} (pid {pid})")
+        q = live("heavy-queue")
+        for p in ordered("heavy-queue"):
+            print(f"heavy queued {q[p][1]} (pid {q[p][0]})")
     spot, w = place()
     print({"here": "room: yes", "peer": "room: on the peer"}.get(spot, f"room: no — {w}"))
 
@@ -912,6 +960,11 @@ def main(a):
     if a[:1] == ["cancel"] and len(a) == 2:
         n = cancel(a[1])
         print(f"cancelled {a[1]}: its waiting launch exits on its next poll" if n else f"nothing queued for {a[1]}")
+        return 0 if n else 1
+    if a[:1] in (["bump"], ["now"]) and len(a) == 2:
+        n = mark(a[1], "bumped", time.time()) if a[0] == "bump" else mark(a[1], "now", True)
+        print((f"bumped {a[1]} to the head of the queue; it still waits for room" if a[0] == "bump" else
+               f"{a[1]} starts on its waiter's next poll") if n else f"nothing queued for {a[1]}")
         return 0 if n else 1
     if a[:1] in (["admit"], ["heavy"]) and "--" in a:
         i = a.index("--")

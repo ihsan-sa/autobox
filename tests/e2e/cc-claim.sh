@@ -172,12 +172,25 @@ c6head=$(git -C ~/.cc/worktrees/$REPO/c6 rev-parse HEAD)
   && ok "cc … --go --repair reserves a repair of the delivered PR at the worktree's HEAD and launches it on the same task" \
   || bad "--repair did not dispatch the delivered row: rc=$p6 $(cat "$T/c6rp.out")"
 for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
-cp "$d6" "$T/c6before.json"
+# A REPAIR WHOSE WORKER STOPPED BEFORE IT PUSHED IS RELAUNCHED AT THAT HEAD (raised-a-limit-stopped-repair-cannot-restart,
+# 2026-10-17): #1104's rebase stopped on a usage limit, its head never moved, and every --repair after it was refused
+# as "already dispatched". The window killed above is that worker gone with nothing pushed.
+e6=$(jq -r '.executions[-1].execution_id' < "$d6")
 "$B/cc" $REPO c6 --go "" --repair >"$T/c6rp2.out" 2>&1; p6=$?
-{ [ "$p6" != 0 ] && grep -q 'already dispatched' "$T/c6rp2.out" && cmp -s "$d6" "$T/c6before.json" \
-  && [ -z "$(wins "$REPO/c6")" ]; } \
-  && ok "…and a second --repair at that same head is refused, with no window and no record write" \
-  || bad "a second repair at one head launched or wrote: rc=$p6 $(cat "$T/c6rp2.out")"
+{ [ "$p6" = 0 ] && grep -q 'relaunching' "$T/c6rp2.out" && [ -n "$(wins "$REPO/c6")" ] \
+  && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] && [ "$(jq -r .claim.generation < "$d6")" = 4 ] \
+  && [ "$(jq -r '.executions[-1].repair.head' < "$d6")" = "$c6head" ] \
+  && [ "$(jq -r '.executions[-1].repair.relaunch_of' < "$d6")" = "$e6" ]; } \
+  && ok "…and a second --repair at that same head, once its worker is gone with nothing pushed, relaunches it on the same task" \
+  || bad "a stopped repair at one head could not be relaunched: rc=$p6 $(cat "$T/c6rp2.out")"
+for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
+tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'"   # a worker still running that head
+cp "$d6" "$T/c6before.json"
+"$B/cc" $REPO c6 --go "" --repair >"$T/c6rp3.out" 2>&1; p6=$?
+{ [ "$p6" != 0 ] && grep -q 'live session\|still running it' "$T/c6rp3.out" && cmp -s "$d6" "$T/c6before.json"; } \
+  && ok "…while a --repair at that head with its loop still in the window is refused, with no record write" \
+  || bad "a repair raced a live worker at one head: rc=$p6 $(cat "$T/c6rp3.out")"
+for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
 # NOTHING THE HOST OPENS IN A TRACK'S OWN DIRECTORIES IS WRITTEN THROUGH A PLANTED NAME. $wt/.cc and $st are
 # bound read-write into that track's worker sandbox and into a member workspace, so a link left at a name the
 # DISPATCH path opens would have the next `--go` — cc-land's repair round, which needs no person — truncate any
@@ -249,6 +262,40 @@ mkdir -p ~/.cc/state/$REPO/c3; printf 'a channel, not a task\n' > ~/.cc/state/$R
 { [ "$c4rc" != 0 ] && [ ! -e ~/.cc/state/${REPO}x ] && [ ! -e ~/.cc/worktrees/${REPO}x ]; } \
   && ok "a repository that is not there prepares nothing and stamps no claim" || bad "claimed a track in a repo that does not exist: rc=$c4rc $(cat "$T/c4.out")"
 rm -rf ~/.cc/state/${REPO}x ~/.cc/worktrees/${REPO}x ~/.cc/boards/${REPO}x.json ~/.cc/boards/${REPO}x.lock
+# TRACKS DISPATCHED TOGETHER (raised-go-dispatch-race-recurs). `worktree add` writes .git/config, so three
+# dispatches at once lost the race on config.lock and the loser left its branch behind. Three at once all land:
+for d in d1 d2 d3; do mkdir -p ~/.cc/state/$REPO/$d; printf 'Do the %s thing.\n' "$d" > ~/.cc/state/$REPO/$d/task.md; done
+dp=""; for d in d1 d2 d3; do ( "$B/cc" claim $REPO $d --executor subagent >"$T/$d.out" 2>&1; echo $? > "$T/$d.rc" ) & dp="$dp $!"; done; wait $dp
+drc=""; for d in d1 d2 d3; do [ "$(cat "$T/$d.rc")" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/$d symbolic-ref --short HEAD 2>/dev/null)" = "track/$d" ] || drc="$drc $d:$(cat "$T/$d.rc") $(tr '\n' ' ' < "$T/$d.out")"; done
+[ -z "$drc" ] && ok "three tracks claimed at once each get their worktree" || bad "concurrent claims collided:$drc"
+# A config.lock nobody clears fails every try, and the branch the failed add made goes with it, so a plain retry works.
+gcd=$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir); : > "$gcd/config.lock"
+"$B/cc" claim $REPO d4 --executor subagent >"$T/d4.out" 2>&1; d4rc=$?; rm -f "$gcd/config.lock"
+{ [ "$d4rc" != 0 ] && ! git -C ~/dev/$REPO show-ref --verify --quiet refs/heads/track/d4 && [ ! -e ~/.cc/worktrees/$REPO/d4 ] \
+  && grep -q 'no branch was made' "$T/d4.out"; } \
+  && ok "a worktree add that keeps failing leaves no branch and no worktree behind" \
+  || bad "a failed add left something: rc=$d4rc branch=$(git -C ~/dev/$REPO show-ref refs/heads/track/d4) $(tr '\n' ' ' < "$T/d4.out")"
+# …and one that clears between tries is retried rather than failed.
+mkdir -p ~/.cc/state/$REPO/d5; printf 'Do the d5 thing.\n' > ~/.cc/state/$REPO/d5/task.md
+: > "$gcd/config.lock"; ( sleep 1.5; rm -f "$gcd/config.lock" ) & clr=$!
+"$B/cc" claim $REPO d5 --executor subagent >"$T/d5.out" 2>&1; d5rc=$?; wait $clr; rm -f "$gcd/config.lock"
+{ [ "$d5rc" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/d5 symbolic-ref --short HEAD 2>/dev/null)" = track/d5 ] && grep -q 'trying again' "$T/d5.out"; } \
+  && ok "a config.lock that clears between tries is retried, not failed" || bad "the retry did not take: rc=$d5rc $(tr '\n' ' ' < "$T/d5.out")"
+# Two dispatches of one track race: the first fails every try on a held config.lock and the second, waiting on the
+# repo lock, makes the worktree once it clears. The loser's cleanup is all under the lock, so it never removes the
+# winner's worktree. Each dispatch closes the test's own lock fd first: a flock belongs to the open file, so a
+# child that inherits it holds the lock for as long as it lives, and both would wait on themselves.
+mkdir -p ~/.cc/state/$REPO/d6; printf 'Do the d6 thing.\n' > ~/.cc/state/$REPO/d6/task.md
+exec {tl}>>"$gcd/cc-worktree.lock"; flock "$tl"; : > "$gcd/config.lock"
+( exec {tl}>&-; "$B/cc" claim $REPO d6 --executor subagent >"$T/d6a.out" 2>&1; echo $? > "$T/d6a.rc" ) & d6a=$!
+( exec {tl}>&-; sleep 0.5; "$B/cc" claim $REPO d6 --executor subagent >"$T/d6b.out" 2>&1; echo $? > "$T/d6b.rc" ) & d6b=$!
+sleep 1; exec {tl}>&-
+for _ in $(seq 100); do grep -qs 'could not create the worktree' "$T/d6a.out" "$T/d6b.out" && break; sleep 0.1; done; rm -f "$gcd/config.lock"
+wait $d6a $d6b
+{ grep -qs 'could not create the worktree' "$T/d6a.out" "$T/d6b.out" && { [ "$(cat "$T/d6a.rc")" = 0 ] || [ "$(cat "$T/d6b.rc")" = 0 ]; } \
+  && [ "$(git -C ~/.cc/worktrees/$REPO/d6 rev-parse --abbrev-ref HEAD 2>/dev/null)" = track/d6 ] && [ -s ~/.cc/worktrees/$REPO/d6/.cc/track ]; } \
+  && ok "two dispatches of one track racing: the loser's cleanup leaves the winner's worktree whole" \
+  || bad "racing dispatches of one track: a=$(cat "$T/d6a.rc") b=$(cat "$T/d6b.rc") wt=$(ls -A ~/.cc/worktrees/$REPO/d6 2>&1 | tr '\n' ' ') $(tr '\n' ' ' < "$T/d6a.out") | $(tr '\n' ' ' < "$T/d6b.out")"
 fi
 e2e_end
 # recurring-defect-ok: pause-hold-missing — a test of cc on a fixture repo; the pause check is the tool's, not the stanza's

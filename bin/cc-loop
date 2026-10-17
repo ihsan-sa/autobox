@@ -69,7 +69,7 @@
 # thread, and a worker's BLOCKED question that no seat took, as the owner's decision card (cc-notify --decision).
 # A question the seat heard is the seat's to settle, or to take to the owner itself as a --decision card. Iteration
 # totals, spend, a round that is over, a limit wait and the command to resume stay in loop.log, the board note and the journal.
-# Exit: 0 done | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
+# Exit: 0 done, or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
 #     | 12 completion has no usable receipt, board `blocked` (notified); delivery is unconfirmed
@@ -349,6 +349,18 @@ raise_block(){   # → that shared rule with a leading space, or NOTHING if the 
                  # a stop nobody was told about, works around it and the next worker pays the same price. Its route
                  # is the board its prompt already names, so raising costs it a command and wakes nobody.
   local r; r=$(cat "$RAISE" 2>/dev/null); [ -n "$r" ] || return 0; printf ' %s' "$r"; }
+onto_block(){   # → a row whose board PR is ANOTHER branch's open PR (a hive dispatch/<n>) is told where its fix goes, or
+                # NOTHING. `cc done` pushes it there on the host (cc's onto_pr); before this the prompt said only
+                # track/<row>, so every such worker blocked asking who would push (raised-repair-push-no-creds). The
+                # branch is fetched here, on the host, from the PUSH url: onto_pr chose the PR against that repository,
+                # and an origin that fetches from another one (o/upstream) has no such branch. A fetch that fails says
+                # so and tells the worker to block, never to build on an origin/<branch> that is not there.
+  local o br url rurl cred=()
+  o=$("$BIN/cc" onto-pr "$repo" "$track" 2>/dev/null) && [ -n "$o" ] || return 0; read -r br url <<<"$o"
+  rurl=$(git -C "$WT" remote get-url --push origin 2>/dev/null) && mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$rurl" "$repo" 2>/dev/null)
+  if [ -z "$rurl" ] || ! timeout -k 5 60 env GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$WT" -c core.hooksPath=/dev/null fetch --quiet "$rurl" "+refs/heads/$br:refs/remotes/origin/$br" >/dev/null 2>&1; then
+    printf ' This row fixes the open PR %s, whose branch is %s, but the host could not fetch that branch this iteration, so origin/%s is not there to build on: make no edits, and append STATUS: BLOCKED: cannot fetch %s for %s.' "$url" "$br" "$br" "$br" "$url"; return 0; fi
+  printf ' This row fixes the open PR %s, whose branch is %s: build your commits on origin/%s (merge origin/%s into track/%s before your first edit if it is not already in it; never reset, so track/%s stays a fast-forward). At DONE, cc done pushes them onto %s as a plain fast-forward and that PR carries the fix, so do not block on the push and do not expect a second PR.' "$url" "$br" "$br" "$br" "$track" "$track" "$br"; }
 SPEND="$(dirname "$BIN")/config/spend-prompt.md"   # what a session spends — written ONCE, in core/, for every session kind
 spend_block(){   # → that shared rule with a leading space, or NOTHING if the file is missing, like the three above.
                  # The worker is the kind this bites hardest: it runs unattended in a loop, so an iteration that
@@ -391,7 +403,7 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
     "$1" "$(sed -n 's/^\([0-9]\)\. \*\*\([^*]*\)\*\*.*/ \1. \2/p' "$CHECKLIST" | tr -d '\n')"; }
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself, and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself, and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -451,6 +463,13 @@ worker_base(){   # $1 repo → the branch a worker is told never to touch and re
   case "$b" in track/*|'') b=main ;; esac
   printf '%s\n' "$b"; }
 
+# A ROW CLOSED WHILE ITS LAUNCH WAITED (raised-done-row-still-launches-its-queued-worker): a seat folded a row and set it
+# done while its --go sat in cc-room, the worker started anyway, ended DONE with nothing to deliver, and the row went
+# back to blocked with a "retry cc done" nobody should follow. Every --go claims the row (queued or running) before
+# the launch, so a row that says done or merged when the loop starts was closed after it was dispatched. Prints the
+# status when it is one of those; a board that cannot be read is not closed.
+row_closed(){ local s; s=$("$BOARD" get "$repo" "$track" status 2>/dev/null) || return 1
+  case "$s" in done|merged) printf '%s\n' "$s" ;; *) return 1 ;; esac; }
 row_title(){ "$BOARD" get "$repo" "$track" title 2>/dev/null | grep . || printf '%s\n' "${track//-/ }"; }   # what the row is ABOUT; its name in words when the board has no title for it
 # THE DONE CARD. A person reads it, so it names the work by its title and prints no empty slot ("PR: ." was a real
 # card): $1 the PR link or nothing, $2 a sentence on the landing or nothing. The title still routes it to the thread.
@@ -519,6 +538,11 @@ dispatch_receipt(){   # WHO SENT THIS TRACK OFF, one line in the hop receipts (~
                                     + (if $from != "" then {from:$from} else {} end)' >> "$d/$(date -u +%F).jsonl"; } 2>/dev/null
   return 0; }
 ORCH_KEY=""   # what orch_record wrote, held by THIS process: $ST/orch is writable by the worker, so the file is trusted less
+# THE RESTART LINE A STOP PRINTS (raised-a-limit-stopped-repair-cannot-restart, 2026-10-17): a row whose PR is out for
+# landing refuses a plain --go as delivery-pending, so a repair round that stopped (#1104's rebase, on a usage limit)
+# printed a restart line that could not restart it. Such a row is restarted through --repair; any other with a plain --go.
+again(){ if "$BIN/cc-task" show "$repo" "$track" 2>/dev/null | jq -e 'select(.closed == null) | .pr.url // empty' >/dev/null 2>&1
+  then printf 'cc %s %s --go "" --repair' "$repo" "$track"; else printf 'cc %s %s --go ""' "$repo" "$track"; fi; }
 stop_target(){   # the broker key a stop goes to: "a track dispatched by an orch has its stop notice addressed to that orch's alias,
                  # the repo seat only when none is recorded" (the brief). A record `<orchrepo>@<alias>` is used as it is; a bare alias
                  # (an older record, or no orch repo found) is `<track repo>@<alias>`; anything else is the repo seat.
@@ -1408,6 +1432,19 @@ down still leaves the board write, which is the half of this that must never be 
   HOME="$d/bh" "$BIN/cc-board" add titled t1 "worker stop reaches the planner" >/dev/null
   t 'the done line names the row' \
     "$(repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" "worker stop reaches the planner"
+  # ── a row closed while its launch waited in cc-room starts nothing (row_closed) ──
+  HOME="$d/bh" "$BIN/cc-board" add titled closed1 "folded while queued" >/dev/null
+  rc_(){ local o r; o=$(repo=titled track="$1" BOARD="$BIN/cc-board" HOME="$d/bh"; row_closed); r=$?; printf '%s|%s' "$o" "$r"; }
+  t 'a queued row is not closed' "$(rc_ closed1)" '|1'
+  HOME="$d/bh" "$BIN/cc-board" status titled closed1 done >/dev/null
+  t 'a row set done while queued is closed, and says so' "$(rc_ closed1)" 'done|0'
+  HOME="$d/bh" "$BIN/cc-board" status titled closed1 merged >/dev/null
+  t '…and so is a merged one' "$(rc_ closed1)" 'merged|0'
+  HOME="$d/bh" "$BIN/cc-board" status titled closed1 blocked >/dev/null
+  t '…but a blocked one is not' "$(rc_ closed1)" '|1'
+  t 'a board that has no such row is not closed' "$(rc_ nosuch-closed)" '|1'
+  t 'the start reads row_closed before the fence, the running status and the first iteration' \
+    "$(awk '/^if closed=\$\(row_closed\)/{a=NR} /^fw=\$\("\$BIN\/cc-sandbox" probe/{b=NR} /^"\$BOARD" status "\$repo" "\$track" running/{c=NR} END{print (a && a<b && b<c) ? "before" : "after"}' "$0")" before
   t '…and a track the board has no row for says its own name rather than nothing at all' \
     "$(repo=titled track=nosuch BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" nosuch
   t 'neither done line spends the reader on an iteration count and a dollar figure' \
@@ -1965,6 +2002,12 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   t 'exit 8 (the limit outlasted the wait) is worker-loop/limit-outlasted-wait' "$(sr c 8 waiting 'x' >/dev/null; CC_FAILURES="$d/fl/c" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].kind')" worker-loop/limit-outlasted-wait
   t 'exit 3 (the worker asked) is not a failure and writes nothing' "$(sr e 3 waiting 'a question')|$(ls "$d/fl/e" 2>/dev/null | wc -l)" "not a failure (exit 3)|0"
   t 'exit 11 (parked) and 13 (tier) write nothing either' "$(sr f 11 parked x | cut -c1-13),$(sr f 13 tier x | cut -c1-13)|$(ls "$d/fl/f" 2>/dev/null | wc -l)" "not a failure,not a failure|0"
+  # THE RESTART LINE: a row whose PR is out for landing is restarted through --repair, any other with a plain --go.
+  mkdir -p "$d/ag"; printf '#!/bin/sh\nprintf "%%s" "$AG"\n' > "$d/ag/cc-task"; chmod +x "$d/ag/cc-task"
+  ag(){ ( export AG="$1"; BIN="$d/ag" repo=lp track=t1; again ); }
+  t 'a delivery-pending stop says --repair; a merged PR, no PR and no record say a plain --go' \
+    "$(ag '{"closed":null,"pr":{"url":"u"}}')|$(ag '{"closed":{"status":"merged"},"pr":{"url":"u"}}')|$(ag '{"closed":null,"pr":null}')|$(ag '')" \
+    'cc lp t1 --go "" --repair|cc lp t1 --go ""|cc lp t1 --go ""|cc lp t1 --go ""'
   # A MEMBER LOOP'S STOP: inside the boundary nothing is written (the ledger is not there); the host writes it after.
   t 'inside a member boundary stop_record leaves the stop to the host and writes nothing' \
     "$(CC_MEMBER_SANDBOX=1 sr g 12 'no receipt' x | cut -c1-13)|$(ls "$d/fl/g" 2>/dev/null | wc -l)" "left to the h|0"
@@ -2023,6 +2066,18 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   mkdir -p "$d/fl/ro"; chmod 500 "$d/fl/ro"
   t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 9 runaway x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
   chmod 700 "$d/fl/ro"
+  # onto_block: the PR's branch is fetched from the PUSH url onto_pr chose it against. Each case its own repos.
+  ob(){   # $1 case dir  $2 1 when the push repo carries dispatch/1042 → the prompt's line|whether origin/dispatch/1042 landed
+    local c="$d/ob/$1"; mkdir -p "$c/bin"; printf '#!/bin/sh\necho "dispatch/1042 https://github.com/o/d/pull/7"\n' > "$c/bin/cc"
+    printf '#!/bin/sh\n' > "$c/bin/cc-gh-token"; chmod +x "$c/bin/cc" "$c/bin/cc-gh-token"
+    git init -q --bare "$c/up.git"; git init -q --bare "$c/push.git"; git init -q "$c/wt"
+    git -C "$c/wt" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+    [ "$2" = 1 ] && git -C "$c/wt" push -q "$c/push.git" HEAD:refs/heads/dispatch/1042
+    printf '[remote "origin"]\n\turl = %s\n\tpushurl = %s\n' "$c/up.git" "$c/push.git" >> "$c/wt/.git/config"
+    ( BIN="$c/bin"; WT="$c/wt"; repo=r; track=t; onto_block ) | grep -o 'build your commits on origin/dispatch/1042\|could not fetch that branch'
+    git -C "$c/wt" rev-parse -q --verify refs/remotes/origin/dispatch/1042 >/dev/null && echo fetched || echo none; }
+  t 'onto_block fetches the PR branch from the push repo, though origin fetches from another' "$(ob push 1 | paste -sd'|' -)" "build your commits on origin/dispatch/1042|fetched"
+  t '…and a branch it cannot fetch tells the worker to block, never to build on a missing ref' "$(ob nofetch 0 | paste -sd'|' -)" "could not fetch that branch|none"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
@@ -2061,6 +2116,9 @@ mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/tas
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
 log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
+if closed=$(row_closed); then   # read before anything is recorded, charged or posted: the row is not touched again
+  "$BOARD" note "$repo" "$track" "loop exit 0: the row was already $closed when its launch started; nothing ran" >/dev/null 2>&1
+  log "exit 0: $repo/$track is already $closed on the board — not starting it"; exit 0; fi
 orch_record; dispatch_receipt; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
 pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
 trap 'say_io pidrm "$ST" $$' EXIT   # only a loop.pid that is still this loop's, and never through a link (say_io)
@@ -2085,7 +2143,7 @@ signalled(){ local s="$1" had="$child"; redispatching && { kill_child; log "sign
     log "signalled (TERM) — iteration ${i:-?} aborted and its claude killed; the loop goes on"
     "$BOARD" note "$repo" "$track" "iteration ${i:-?} was killed (TERM); the loop goes on" >/dev/null 2>&1; return 0; fi
   stopped || :; trap '' HUP INT TERM   # one ending: a second signal does not start a second stop()
-  stop 130 "was stopped" "The loop was signalled ($s) during iteration ${i:-0} and has ended; its claude was killed. To start it again: cc $repo $track --go \"\""; }
+  stop 130 "was stopped" "The loop was signalled ($s) during iteration ${i:-0} and has ended; its claude was killed. To start it again: $(again)"; }
 trap 'signalled HUP' HUP; trap 'signalled INT' INT; trap 'signalled TERM' TERM
 stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid="" tg=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
@@ -2130,9 +2188,9 @@ parked(){ "$BIN/cc-pause" is "$repo" 2>/dev/null || return 1
 stopped(){ [ -e "$ST/stop" ] || return 1
   local why; why=$(head -c 200 "$ST/stop" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//'); rm -f "$ST/stop"
   "$BOARD" status "$repo" "$track" blocked >/dev/null 2>&1
-  "$BOARD" note "$repo" "$track" "loop exit 14: stopped by $ST/stop after iteration $i${why:+ — $why}; cc $repo $track --go \"\" resumes it" >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop exit 14: stopped by $ST/stop after iteration $i${why:+ — $why}; $(again) resumes it" >/dev/null 2>&1
   printf -- '- cc-loop: stopped by %s after iteration %s%s\n' "$ST/stop" "$i" "${why:+ — $why}" >> "$ST/progress.md"
-  log "exit 14: stopped by $ST/stop after iteration $i${why:+ — $why} (\$$spent); cc $repo $track --go \"\" resumes it"; exit 14; }
+  log "exit 14: stopped by $ST/stop after iteration $i${why:+ — $why} (\$$spent); $(again) resumes it"; exit 14; }
 # THE SPEND TIER, the same way but box-wide and only at the iteration boundary: `cc-tier set` signals nothing, so
 # the iteration in flight finishes and the NEXT one asks `cc-tier allows continue` before anything is charged. Under
 # stop no worker goes on; under essential only a row marked critical does. Standing down leaves the board honest
@@ -2141,7 +2199,7 @@ tiered(){ [ "$i" -gt 0 ] || return 1   # iteration 1 was let through by the star
   tier_hold continue "$repo/$track" || return 1
   "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
   "$BOARD" note "$repo" "$track" "loop exit 13: $("$BIN/cc-tier" line) — a wider tier, or critical=yes on this row, re-dispatches it" >/dev/null 2>&1
-  log "exit 13: $("$BIN/cc-tier" line) — standing down after iteration $i; cc $repo $track --go \"\" resumes it"; exit 13; }
+  log "exit 13: $("$BIN/cc-tier" line) — standing down after iteration $i; $(again) resumes it"; exit 13; }
 # THE WORKERS' LOGIN (WORKER_CLAUDE_CREDENTIALS, cc-sandbox's WORKERS' LOGIN): its usage limit is that account's, not the
 # box's. So the stamp and the unavailable-model record are its own, and the wait-then-exit-8 below handles it the same way
 # without making the box's sessions wait on it. But the key being set does not mean the worker runs on it: cc-sandbox
@@ -2182,7 +2240,7 @@ while [ $i -lt "$MAXI" ]; do
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     hm=$(sed -n 's/.*until \([0-9][0-9]:[0-9][0-9]\)Z.*/\1/p' <<<"$p")   # status speaks UTC; a person reads local time
     at=$([ -n "$hm" ] && "$BIN/cc-time" slack "$(date -u +%Y-%m-%d)T$hm:00Z" 2>/dev/null || echo "${hm:-later}${hm:+Z}")
-    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: cc $repo $track --go \"\""
+    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: $(again)"
     parked; stopped; fi   # that wait can be hours: a pause or a stop file written during it is read before anything is charged (review of #541)
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
@@ -2219,7 +2277,7 @@ while [ $i -lt "$MAXI" ]; do
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
     log "usage limit — waiting until ${resets}Z, then rerunning iteration $i"
-    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $("$BIN/cc-time" slack "${lim#LIMIT }" 2>/dev/null || echo "${resets}Z"), which is longer than the loop waits. To start it again: cc $repo $track --go \"\""
+    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $("$BIN/cc-time" slack "${lim#LIMIT }" 2>/dev/null || echo "${resets}Z"), which is longer than the loop waits. To start it again: $(again)"
     i=$((i-1)); continue; fi
   "$BIN/cc-limit" clear   # the API answered: whatever else went wrong, it was not a limit
   cost=$(jq -r '.total_cost_usd // empty' "$out" 2>/dev/null); costsrc=""
@@ -2329,7 +2387,7 @@ while [ $i -lt "$MAXI" ]; do
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     # The question, then how to answer it, as sentences rather than an aside in brackets. The two paths stay: whoever
     # answers has to type them, and the planning session this goes to has no other way to find the worker's files.
-    stop 3 "needs you" "$q  Settle it yourself if you can; only if it is the owner's to decide, ask him with cc-notify --decision. To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: cc $repo $track --go \"\"" waiting \
+    stop 3 "needs you" "$q  Settle it yourself if you can; only if it is the owner's to decide, ask him with cc-notify --decision. To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: $(again)" waiting \
       "$(sed 's/^STATUS: BLOCKED:[[:space:]]*//' <<<"$q")"; fi
   rn=$(refusal_next "$out" "$out.err" "$m"); rnrc=$?; rwhy=${rn#*$'\t'}; nx=""; [ "$rnrc" = 0 ] && nx=${rn%%$'\t'*}
   case "$(refusal_step "$rnrc" "$moved")" in
@@ -2348,7 +2406,7 @@ while [ $i -lt "$MAXI" ]; do
       { [ -n "$nx" ] && ! "$BIN/cc-model" out "$m" >/dev/null 2>&1; } && MODEL="$nx"; :;;   # pinned only when the box has no record of it (see above); on into the normal accounting below
     stop)
       refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
-      stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;
+      stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: $(again)";;
   esac
   [ "$gated" = yes ] || { green_wait && gated=yes; }   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
   # a process of its own still in the worktree (own_run_live) only keeps an error or a cap from counting: it is never
@@ -2401,6 +2459,6 @@ if [ "$ended" = over ]; then   # bounded and still committing: the round did its
   log "exit 0: round over at its step limit with work committed"
   # THE SEAT'S TURN, as a DONE: a round that ended is an end, and the seat that dispatched it gets the line by the
   # broker (a digest, not a page). Nothing is posted to Slack for it: the board note and loop.log carry it.
-  tell_planner "$(planner_line 'round over' "Ran its $MAXI iteration(s) (\$$spent) and committed on the last one — the round is over, not stalled. More with: cc $repo $track --go \"\" --loop N")" || true
+  tell_planner "$(planner_line 'round over' "Ran its $MAXI iteration(s) (\$$spent) and committed on the last one — the round is over, not stalled. More with: $(again) --loop N")" || true
   exit 0; fi
-stop 6 "$ended" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: cc $repo $track --go \"\" --loop N" "$bst"
+stop 6 "$ended" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: $(again) --loop N" "$bst"

@@ -16,7 +16,8 @@ and what a member session may do all keep coming from the path rules — no fiel
   cc-task release <repo> <row> <claim-id> <generation> --reason <text>   end it after stopping work
   cc-task receipt <repo> <row>                           print completion evidence and pending work
   cc-task reserve-repair <repo> <row> --generation N --branch BRANCH --pr URL --head SHA
-                                                         reserve once; JSON launch=false means do not launch again
+                    [--relaunch]                         reserve once; JSON launch=false means do not launch again.
+                                                         --relaunch: that head again, once its last claim has ended
   cc-task artifact <repo> <row> --generation N [--committed-sha SHA] [--pushed-sha SHA]
   cc-task error <repo> <row> --generation N <stage> [message]   omit message to clear that error
   cc-task pr <repo> <row> --generation N <url> [--card]    record a PR and the projections it needs
@@ -67,7 +68,8 @@ inside a change already delivered, which is how the remainder of a track kept ru
 landed twice (arch review 2026-09-08 rec 6). So every ordinary claim is refused from the PR to the closure, and
 `cc … --go` asks `check` before it writes a brief or buys a turn. The ONE re-entry is `reserve-repair` for that
 same PR and head, which launches once: `cc … --go "<findings>" --repair` makes it and then claims, and that claim,
-the same dispatcher's, adopts the reservation. No landing reserves one by itself; whoever read the PR sends it back.
+the same dispatcher's, adopts the reservation. Once that launch's claim has ended, `--relaunch` launches the same head
+again: `cc` asks it only when the row's window has no loop left, a worker that stopped before it pushed a new head. No landing reserves one by itself; whoever read the PR sends it back.
 New work is a new task, not this one carried on.
 """
 # recurring-defect-ok: pause-hold-missing — this file records claims and launches nothing; `cc --go` checks cc-pause (bin/cc, before repair_reserve) first
@@ -339,10 +341,14 @@ def reserve_repair(d, a, wt, who):
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", a.head): raise ValueError("repair needs a full head SHA")
     if a.branch != f"track/{a.row}": raise ValueError("repair needs the canonical branch")
     prepared(a.repo, a.row, wt)
-    for e in d["executions"]:
-        r = e.get("repair") or {}
-        if e["phase"] == "repair" and (r.get("pr_url"), r.get("head")) == (a.pr, a.head):
-            return dict(e, launch=False)
+    spent = [e for e in d["executions"] if e["phase"] == "repair"
+             and ((e.get("repair") or {}).get("pr_url"), (e.get("repair") or {}).get("head")) == (a.pr, a.head)]
+    # --relaunch (raised-a-limit-stopped-repair-cannot-restart, 2026-10-17): a repair's worker that stopped before it
+    # pushed (a usage limit, exit 8) leaves the head where it was, so the key alone would refuse that head for ever and
+    # nothing could restart it. The dispatcher asks it only once it has seen no loop left in the row's window; here,
+    # under the row lock, it is granted only while no claim is live, so two relaunching dispatchers still get one launch.
+    if spent and not (getattr(a, "relaunch", False) and (d.get("claim") or {}).get("ended_at")):
+        return dict(spent[-1], launch=False)
     if a.generation != (d.get("claim") or {}).get("generation"):
         raise ValueError("repair generation does not match the claim")
     check(d, a.repo, a.row, wt, who, "worker", claiming=False)   # the reservation IS the delivery-pending re-entry
@@ -350,6 +356,7 @@ def reserve_repair(d, a, wt, who):
     do_claim(d, who, "worker", "repair")
     e = d["executions"][-1]
     e["repair"] = {"pr_url": a.pr, "head": a.head, "resume": resume, "at": stamp()}
+    if spent: e["repair"]["relaunch_of"] = spent[-1]["execution_id"]
     return dict(e, launch=True)
 
 def receipt(d):
@@ -542,6 +549,7 @@ def main(argv):
         if cmd == "reserve-repair":
             s.add_argument("--generation", type=int, required=True)
             for opt in ("branch", "pr", "head"): s.add_argument(f"--{opt}", required=True)
+            s.add_argument("--relaunch", action="store_true")
         if cmd == "artifact": s.add_argument("--committed-sha"); s.add_argument("--pushed-sha")
         if cmd == "error": s.add_argument("stage"); s.add_argument("message", nargs="?", default="")
         if cmd == "pr": s.add_argument("url"); s.add_argument("--card", action="store_true")

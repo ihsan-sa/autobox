@@ -37,9 +37,10 @@ the wake's look wakes the seat once, never again after 24 h; the line that does 
 pending (or that the row is parked on purpose). A `held` row stays out of both, as before.
 
 DRIFT: decidable (the PR merged, a worker is in the worktree, it finished and its PR is open) is applied through
-cc-board with a `reconciled:` note. Undecidable (closed PR, gone worktree, refused checkpoint, unpushed branch,
-no worker and nothing says why) is reported and, with --notify, offered to the repo's live session through the
-broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A row
+cc-board with a `reconciled:` note. Every board's PRs are read in one GraphQL query per GitHub repo, so no row
+waits on a budget another board spent; only a PR that query did not answer is read alone, 40 a run. Undecidable
+(closed PR, gone worktree, refused checkpoint, unpushed branch, no worker and nothing says why) is reported and,
+with --notify, offered to the repo's live session through the broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A row
 that never ran — no claim, never started, no journal, no worktree — is reported as never started, not as lost. A
 `blocked` or `review` row with nothing alive in it, no PR of its own or one closed unmerged, whose branch has nothing
 left to land on origin's main is set `merged`, naming the PR that carried it: merging its tip into main changes nothing,
@@ -179,7 +180,7 @@ BOARDS, WTS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME
 PROJECTS = f"{HOME}/.claude/projects"                # transcripts, one directory per cwd (path with / and . as -)
 GRACE = 600        # a track the board touched less than this ago is left alone: claude takes a moment to appear
 REPEAT = 86400     # a finding that persists is worth one push a day
-PRMAX = 40         # PR lookups per run
+PRMAX = 40         # one-at-a-time PR lookups per run, for what board_pr_states() did not answer
 ORPHANPRS = 10     # branch→PR lookups orphans() makes
 WEDGED = 3 * 3600  # a worker alive with nothing moved for this long is stuck (cc-loop caps an iteration at 1 h)
 IDLE = 2 * 3600    # a live pane with nobody typing at it for this long is idle, not running
@@ -634,6 +635,45 @@ def pr_state(repo, url, net=True):
            cwd=cwd if os.path.isdir(cwd) else None, timeout=20)
     s = (p.stdout if p is not None else "").strip().upper()
     return s if s in ("MERGED", "OPEN", "CLOSED") else "?"
+
+
+PR_URL = re.compile(r"\Ahttps://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)\Z")
+
+
+def board_pr_states(repo, prs, net=True):
+    """{pr: STATE} for the PRs one board names, read in one aliased GraphQL query per GitHub repo (100 a query): a
+    URL names its own repo, a bare number is the board repo's (gh's {owner}/{repo} from its checkout). A PR GitHub
+    did not answer is left out, and pr_state() under PRMAX reads it. Read one at a time, the 40-a-run budget went in
+    board order, so the boards sorted ahead of a big one spent it every run and its 72 rows were never asked: 22 sat in
+    review long after their PRs merged and each was raised as 'worktree gone' (raised-merged-rows-stay-in-review)."""
+    cwd = f"{DEV}/{repo}"
+    if not net or not prs or not shutil.which("gh"):
+        return {}
+    groups = {}
+    for pr in dict.fromkeys(str(x).strip() for x in prs):
+        m = PR_URL.match(pr)
+        key = (m.group(1), m.group(2)) if m else (("{owner}", "{repo}") if pr.isdigit() else None)
+        if key is not None:
+            groups.setdefault(key, []).append((int(m.group(3) if m else pr), pr))
+    out = {}
+    for (owner, name), want in groups.items():
+        if owner == "{owner}" and not os.path.isdir(cwd):
+            continue
+        for i in range(0, len(want), 100):
+            chunk = want[i:i + 100]
+            q = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+                 + " ".join(f"p{n}:pullRequest(number:{n}){{state}}" for n, _ in chunk) + "}}")
+            p = sh("gh", "api", "graphql", "-f", f"query={q}", "-F" if owner == "{owner}" else "-f", f"owner={owner}",
+                   "-F" if name == "{repo}" else "-f", f"name={name}", cwd=cwd if os.path.isdir(cwd) else None, timeout=30)
+            try:                                # a missing PR fails the call but still answers the rest
+                got = (json.loads(p.stdout).get("data") or {}).get("repository") or {} if p is not None else {}
+            except Exception:
+                got = {}
+            for n, pr in chunk:
+                s = str((got.get(f"p{n}") or {}).get("state") or "").upper()
+                if s in ("MERGED", "OPEN", "CLOSED"):
+                    out[pr] = s
+    return out
 
 
 def branch_prs(repo, branch, net=True):
@@ -1347,10 +1387,12 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         if repos and repo not in repos:
             continue
+        batch = board_pr_states(repo, [t.get("pr") for t in d.get("tracks", {}).values()
+                                       if t.get("pr") and t.get("status", "") != "merged"], net)
         for track, t in sorted(d.get("tracks", {}).items()):
             st, pr = t.get("status", ""), t.get("pr", "")
             want_pr = bool(pr) and st != "merged"       # `merged` is derived from the PR: re-reading it buys nothing
-            ask_pr = want_pr and prs < PRMAX
+            ask_pr = want_pr and str(pr).strip() not in batch and prs < PRMAX
             prs += bool(ask_pr)
             wt = t.get("worktree") or f"{WTS}/{repo}/{track}"
             if repo not in remotes:
@@ -1365,7 +1407,8 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                  "held": str(t.get("held") or "").strip(),
                  "notes": [str((n or {}).get("msg") or "") for n in (t.get("notes") or [])[-3:] if isinstance(n, dict)],
                  "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",
-                 "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
+                 "pr_state": batch.get(str(pr).strip()) or (pr_state(repo, pr, net) if ask_pr
+                                                            else ("?" if want_pr and net else None)),
                  "live": key in live, "wt_exists": os.path.isdir(wt),
                  "delivery": os.path.exists(f"{STATE}/{repo}/{track}/delivery.json"),   # cc-task's claim record
                  "started": bool(t.get("started")),                                      # `cc <repo> <track>` / cc-handoff

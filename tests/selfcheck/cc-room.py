@@ -768,6 +768,50 @@ esac''')):
         t("cancel: nothing queued for it is exit 1",
           subprocess.run([sys.executable, __file__, "cancel", "r/drop"], capture_output=True).returncode, 1)
 
+        # PRIORITY: `bump` moves a queued launch to the head; `now` starts one whatever the room says
+        d = fixture("bump", cap=1)
+        h = holder("r/held")
+        ran_a, ran_b = f"{d}/ran-a", f"{d}/ran-b"
+        wa = subprocess.Popen([sys.executable, __file__, "admit", "r/a", "--", "sh", "-c", f"touch {ran_a}; sleep 60"],
+                              stderr=subprocess.DEVNULL)
+        procs.append(wa)
+        queued("r/a")
+        wb = subprocess.Popen([sys.executable, __file__, "admit", "r/b", "--log", f"{d}/b.log", "--",
+                               "sh", "-c", f"touch {ran_b}; sleep 60"], stderr=subprocess.DEVNULL)
+        procs.append(wb)
+        eb = queued("r/b")
+        t("bump: before it, the queue is oldest first", [live("queue")[p][1] for p in ordered("queue")], ["r/a", "r/b"])
+        r = subprocess.run([sys.executable, __file__, "bump", "r/b"], capture_output=True, text=True)
+        t("bump: a queued launch is bumped", r.returncode, 0)
+        t("bump: …to the head of the queue", [live("queue")[p][1] for p in ordered("queue")], ["r/b", "r/a"])
+        time.sleep(0.6)   # a few polls: the waiter reads the stamp back
+        os.unlink(eb)     # its waiter writes the entry again from what it holds
+        t("bump: …and the waiter's own rewrite keeps the stamp", bool(read_entry(queued("r/b") or eb).get("bumped")), True)
+        t("bump: …but it still waits for room", os.path.exists(ran_b), False)
+        h.kill()
+        h.wait()
+        for _ in range(100):
+            if os.path.exists(ran_b):
+                break
+            time.sleep(0.1)
+        t("bump: once the slot frees, the bumped launch starts ahead of the older one",
+          (os.path.exists(ran_b), os.path.exists(ran_a), wa.poll()), (True, False, None))
+        r = subprocess.run([sys.executable, __file__, "now", "r/a"], capture_output=True, text=True)
+        t("now: a queued launch is told to start", r.returncode, 0)
+        for _ in range(100):
+            if os.path.exists(ran_a):
+                break
+            time.sleep(0.1)
+        t("now: …and it starts with the cap still full, taking a slot of its own",
+          (os.path.exists(ran_a), sorted(w for _, w in live("slots").values()), live("queue")),
+          (True, ["r/a", "r/b"], {}))
+        t("bump: nothing queued for it is exit 1",
+          subprocess.run([sys.executable, __file__, "bump", "r/none"], capture_output=True).returncode, 1)
+        t("now: nothing queued for it is exit 1",
+          subprocess.run([sys.executable, __file__, "now", "r/none"], capture_output=True).returncode, 1)
+        for w in (wa, wb):
+            stray(w.pid)
+
         # HEAVY: a heavy run waits for a heavy slot, takes no worker slot, and runs in its scope
         d = fixture("heavy", cap=1)
         h = subprocess.Popen([sys.executable, __file__, "heavy", "--name", "anneal-a", "--", "sleep", "60"],

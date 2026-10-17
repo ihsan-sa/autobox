@@ -87,6 +87,10 @@ class Env(unittest.TestCase):
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-qm", "base")
         self.tree = RUN.tree_of(self.repo, "HEAD")
+        # a dozen fds held, as a lane holds them: the run's started pipe is then above 9, which dash cannot name
+        for _ in range(12):
+            fd = os.open(os.devnull, os.O_RDONLY)
+            self.addCleanup(os.close, fd)
 
     def run_(self, check, where="box", **kw):
         return RUN.run(check, self.tree, where, repo_root=self.repo, **kw)
@@ -113,6 +117,21 @@ class Status(unittest.TestCase):
         self.assertEqual(RUN.status_of(0, "", capped=True)[0], T.UNRUNNABLE)
         self.assertEqual(RUN.status_of(1, "cp: No space left on device"),
                          (T.UNRUNNABLE, "the box, not the tree: No space left on device"))
+
+    def test_setup_said_out_of_band_decides_whether_the_sandbox_started(self):
+        # perms on #1452: a check that prints setup's words first is the check's red, never unrunnable
+        for text in ("bwrap: Can't mount proc on /newroot/proc\n1 failed",
+                     "cc-nosignal: Landlock ABI 5 has no signal scope — refused, nothing ran."):
+            self.assertEqual(RUN.status_of(1, text, started=True)[0], T.FAILED, text)
+            self.assertEqual(RUN.status_of(0, text.split("\n")[0], started=True)[0], T.PASSED, text)
+        # never said it started: nothing of the check ran, whatever the exit and whatever it printed
+        for rc, text in ((1, "bwrap: Unknown option --bogus"), (0, "all good"), (125, "")):
+            st, why = RUN.status_of(rc, text, started=False)
+            self.assertEqual(st, T.UNRUNNABLE, (rc, text))
+            self.assertTrue(why.startswith("the sandbox did not start: "), why)
+        self.assertIn("bwrap: Unknown option", RUN.status_of(1, "warn\nbwrap: Unknown option", started=False)[1])
+        # a cap or a kill still says so first
+        self.assertEqual(RUN.status_of(0, "", capped=True, started=False)[1], "stopped at its cap")
 
     def test_red_lines_leave_out_pass_lines(self):
         self.assertEqual(RUN.red_lines("ok 1 fine\n✗ broke here\nFAIL two\n✓ FAIL-looking pass"),
@@ -855,6 +874,18 @@ class Sandbox(Env):
         r = self.run_(chk(run="test -x bin/tool"), cwd="core/")
         self.assertEqual(r.status, T.PASSED, r.extra)
 
+    def test_a_check_that_prints_bwraps_words_inside_the_sandbox_is_failed(self):
+        r = self.run_(chk(run="echo 'bwrap: Can not mount proc on /newroot/proc' >&2; exit 1"))
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertTrue(r.runner.startswith("box:bwrap:"), r.runner)
+
+    def test_a_sandbox_that_does_not_start_is_unrunnable(self):
+        real = S.argv
+        with mock.patch.object(S, "argv", lambda *a, **kw: ["bwrap", "--no-such-option"] + real(*a, **kw)[1:]):
+            r = self.run_(chk(run="true"))
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("bwrap:", r.extra["why"])
+
     def test_a_red_carries_its_red_lines_as_cases(self):
         r = self.run_(chk(run='echo "ok 1 fine"; echo "FAIL the thing"; exit 1'))
         self.assertEqual(r.status, T.FAILED)
@@ -933,6 +964,58 @@ class HostAndRunners(Env):
             self.assertTrue(argv[0].endswith("/cc-nosignal"), argv)
             self.assertEqual(argv[1], "--")
             self.assertEqual((how, wd), ("host", "/head"))
+
+    def test_the_started_word_is_said_inside_cc_nosignal_and_before_the_checks_shell(self):
+        for bare in (False, True):
+            argv, _wd, _env, _how = RUN._box_argv(chk(run="echo hi", klass=T.HOST, bare=bare), "/head", "", "/run",
+                                                  {}, started_fd=7)
+            at = argv.index("lander-started")
+            self.assertEqual(argv[at - 3:at + 1], S.started(S.FD))
+            self.assertEqual(argv[at + 1:], ["/bin/sh", "-c", "echo hi"])
+            self.assertEqual(argv[:len(S.pin(7))], S.pin(7))   # moved to FD before anything else
+            self.assertEqual(argv[len(S.pin(7))].endswith("/cc-nosignal"), not bare, argv)
+
+    def test_a_started_pipe_above_9_is_said_on_through_dash(self):
+        r, w = os.pipe()
+        os.close(r), os.close(w)
+        self.assertGreater(w, 9)   # Env holds a dozen fds, so the run's own pipe is above 9 as well
+        for bare in (False, True):
+            got = self.run_(chk(run="echo '0 failed'", klass=T.HOST, bare=bare))
+            if not bare and got.status == T.UNRUNNABLE and "Landlock" in str(got.extra):
+                continue   # cc-nosignal cannot scope a check on this kernel
+            self.assertEqual(got.status, T.PASSED, (bare, got.extra))
+
+    def test_the_lander_closes_its_write_end_once_the_run_has_it(self):
+        # a host check is the lander's user with no pid namespace: an open write end in the lander would let it say
+        # STARTED through /proc/<lander>/fd/N
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        ino = os.fstat(r).st_ino
+        probe = (f'for i in $(seq 100); do readlink /proc/$PPID/fd/{w} | grep -qF "pipe:[{ino}]" || exit 0; '
+                 'sleep 0.1; done; exit 1')
+        log = os.path.join(self.tmp, "log")
+        rc = RUN.execute(["/bin/sh", "-c", probe], self.tmp, {"PATH": "/usr/bin:/bin"}, 60, log, keep=(w,))[0]
+        self.assertEqual(rc, 0, "the lander still held the write end while the run ran")
+        with self.assertRaises(OSError):   # execute closed it, so nothing closes it again
+            os.fstat(w)
+
+    def test_a_check_that_prints_setups_words_is_failed_and_a_setup_that_never_started_is_unrunnable(self):
+        for bare in (False, True):
+            r = self.run_(chk(run="echo 'bwrap: Can not mount proc'; echo 'cc-nosignal: x refused, nothing ran'; "
+                                  "exit 1", klass=T.HOST, bare=bare))
+            if not bare and r.status == T.UNRUNNABLE and "Landlock" in str(r.extra):
+                continue   # cc-nosignal cannot scope a check on this kernel
+            self.assertEqual(r.status, T.FAILED, (bare, r.extra))
+        # setup that exits 0 and says something, but never starts the check, is no pass
+        never = (["/bin/sh", "-c", "echo 'Failed to start transient scope'; exit 0"], "scope")
+        with mock.patch.object(A, "wrap", return_value=never):
+            r = self.run_(chk(run="true", klass=T.HOST, bare=True))
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("Failed to start transient scope", r.extra["why"])
+        # the check never holds the pipe: it cannot say started for a setup, or write to it at all
+        r = self.run_(chk(run='for f in /proc/self/fd/*; do [ -p "$f" ] && echo "FAIL a pipe at $f"; done; '
+                              'exit 0', klass=T.HOST, bare=True))
+        self.assertEqual(r.status, T.PASSED, r.extra)
 
     def test_a_bare_check_is_not_wrapped_in_cc_nosignal(self):
         for klass in (T.HOST, T.BOX):

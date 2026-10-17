@@ -14,6 +14,8 @@
             opened under 10 min ago (its seat may queue it itself) or over 48 h ago, and any PR with a job, a rest
             file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
             a refusal is not undone by a sweep.
+            Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
+            `dispatch/`) whose files touch no path on the base's security list; any doubt queues it as before.
   ended     for each repo with a job stopped in query (rest/) or held, at most every $LANDER_ENDED_SECS (900) per repo:
             GitHub is asked what became of each such PR, with no lock held. A held job the lane itself tried to
             merge (merge_attempt set, or held from past queued/planned/checking) is left to the lane, which proves it.
@@ -91,6 +93,7 @@ from lander import lane as L
 from lander import manifest as MF
 from lander import members as M
 from lander import nightly as NG
+from lander import review as R
 from lander import tip as TP
 from lander import types as T
 
@@ -149,6 +152,31 @@ def self_lands(repo) -> bool:
         return False
 
 
+def self_merge_heads(repo) -> list:
+    """LANDER_SELF_MERGE_HEADS_<repo> (cc-config, whitespace-separated branch namespaces, each ending in "/", such
+    as `dispatch/`): the head prefixes the repo merges on its own read. Kept on the box, so a repo cannot switch off
+    its own sweep; [] when unset, when cc-config did not answer, or when any word is not such a namespace."""
+    key = "LANDER_SELF_MERGE_HEADS_" + re.sub(r"[^A-Za-z0-9]", "_", repo)
+    rc, out, _ = L.run([f"{J.bin_dir()}/cc-config", "get", key], timeout=30)
+    heads = out.split() if rc == 0 else []
+    return heads if all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) for h in heads) else []
+
+
+def merges_itself(root, slug, repo, p) -> bool:
+    """PR p touches no path on its base's security list (review.security_globs, the lane's own read), a rename's old
+    name included. False, so the sweep queues it, when the files, the base or the list will not read, when the list
+    is empty (nothing then tells a security head from another), or at 100 files or more (one page of GitHub's)."""
+    files = GH.api_json(root, f"repos/{slug}/pulls/{p['number']}/files?per_page=100")
+    if not isinstance(files, list) or not 0 < len(files) < 100:
+        return False
+    try:
+        paths = [f["filename"] for f in files] + [f["previous_filename"] for f in files if "previous_filename" in f]
+        globs = R.security_globs(root, G.rev(root, "refs/remotes/origin/" + p["baseRefName"]), repo)
+        return bool(globs) and not any(MF.match(globs, x) for x in paths)
+    except Exception:   # noqa: BLE001 — any read that fails queues the PR as before
+        return False
+
+
 def logged_prs(repo) -> set:
     """Every PR number of `repo` that queue.log names at all: one the lander has ever seen, whatever became of it."""
     pat = re.compile(r"^\S+\t\S+ " + re.escape(repo) + r"#([0-9]+)(?:\s|$)")
@@ -170,7 +198,8 @@ def has_record(repo, pr) -> bool:
 def sweep_strays(repos) -> list:
     """Queue the box's own open PRs that nothing queued (raised-seat-pr-never-reaches-the-lane, 2026-10-03: a seat's
     `gh pr create` wrote no lane entry, and the PR sat 2.5 h unqueued while the owner had been told it was queued).
-    cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back."""
+    cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back.
+    A head on a self_merge_heads prefix that merges_itself (no security path) is left to its repo; any doubt queues."""
     lines = []
     for repo in repos:
         root = J.repo_root(repo)
@@ -180,7 +209,7 @@ def sweep_strays(repos) -> list:
         if not s or not due_every(C.state("tip", f"{repo}.strays"), "LANDER_STRAY_SECS") or not self_lands(repo):
             continue
         rc, out, err = GH.gh(["pr", "list", "--state", "open", "--author", "@me", "--limit", "100",
-                              "--json", "number,isDraft,headRefName,createdAt", "-R", s], root)
+                              "--json", "number,isDraft,headRefName,baseRefName,createdAt", "-R", s], root)
         try:
             prs = json.loads(out) if not rc else None
         except ValueError:
@@ -188,18 +217,21 @@ def sweep_strays(repos) -> list:
         if not isinstance(prs, list):
             lines.append(f"[{repo}] strays: gh could not list the open PRs — {GH.last(err or out) or f'exit {rc}'}")
             continue
-        now, seen = time.time(), None
+        now, seen, heads = time.time(), None, None
         for p in prs:
             if not isinstance(p, dict) or not isinstance(p.get("number"), int) or p.get("isDraft"):
                 continue
-            n = p["number"]
-            if str(p.get("headRefName") or "").startswith("track/"):
+            n, head = p["number"], str(p.get("headRefName") or "")
+            if head.startswith("track/"):
                 continue
             if not STRAY_GRACE <= now - E.epoch_of(p.get("createdAt")) <= STRAY_MAX_AGE or has_record(repo, n):
                 continue
             seen = logged_prs(repo) if seen is None else seen
             if n in seen:   # landed, refused, stopped or handed back once: what happens next is a person's call
                 continue
+            heads = self_merge_heads(repo) if heads is None else heads
+            if any(head.startswith(h) for h in heads) and merges_itself(root, s, repo, p):
+                continue    # the repo merges it on its own read; a head on a security path still comes here
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 qrc = L.cmd_queue([repo, str(n), "--who", "tick", "--no-start"])

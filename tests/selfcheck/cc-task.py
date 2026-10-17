@@ -355,6 +355,19 @@ def selfcheck():
            worker["repair"]["resume"] and worker["launch"] and changed["launch"]
            and changed["execution_id"] != worker["execution_id"]
            and not json.loads(run(*reserve).stdout)["launch"])
+        # R5: --relaunch is that spent head again once its claim has ended — a repair whose worker stopped on a usage
+        # limit before it pushed (raised-a-limit-stopped-repair-cannot-restart) — and never while a claim is live.
+        again = (*reserve[:4], str(changed["generation"]), *reserve[5:-1], other, "--relaunch")
+        before = record2.read_bytes(); live = run(*again)
+        held = live.returncode == 0 and not json.loads(live.stdout)["launch"] and record2.read_bytes() == before
+        run("release", "r", "t2", changed["claim_id"], str(changed["generation"]), "--reason", "worker launched")
+        relaunched = json.loads(run(*again).stdout)
+        twice = json.loads(run(*(*again[:4], str(relaunched["generation"]), *again[5:])).stdout)
+        ok("R5: --relaunch while the repair's claim is live grants nothing; once it ended it launches that head once, "
+           "naming the execution it replaces",
+           held and relaunched["launch"] and relaunched["repair"]["relaunch_of"] == changed["execution_id"]
+           and relaunched["execution_id"] != changed["execution_id"] and relaunched["generation"] == changed["generation"] + 1
+           and not twice["launch"] and twice["execution_id"] == relaunched["execution_id"])
 
         # D1-D4: DELIVERY-PENDING. From the PR to the closure the change belongs to the landing queue, so an
         # ordinary claim is refused — `cc … --go` asks `check` before it writes a brief or buys a turn, so the

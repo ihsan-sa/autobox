@@ -31,8 +31,9 @@
 #                             --resume-last: the first iteration continues this track's last session instead of
 #                             a cold one — for a repair round, where re-deriving what it already found is the cost
 #                             --repair: the one way back into a row whose PR is out for landing (delivery-pending) —
-#                             cc-task reserves a repair of that PR at the worktree's HEAD, once per head, and the worker
-#                             pushes its fix onto the same branch and PR. A row with no open PR dispatches as usual
+#                             cc-task reserves a repair of that PR at the worktree's HEAD, once per head (again only
+#                             once that head's worker stopped with no new head), and the worker pushes its fix onto the
+#                             same branch and PR. A row with no open PR dispatches as usual
 #   cc <repo> <track> --say "text"           reach that track's running turn: its interactive session (cc-msg --turn), or its
 #                                            headless --go worker after its next tool call (cc-loop say). Exit 0 only once a
 #                                            turn took it; 1 nothing runs there, nothing sent · 2 a live worker loop whose spool
@@ -684,11 +685,44 @@ repair_reserve(){
   [ "$(jq -r .launch <<<"$res")" = true ] && return 0
   # launch=false: this PR and head were reserved before. A reservation no launch has ended yet (a door after it
   # failed) is still open, and claim_track adopts it or refuses its live owner; one a launch ended is a repair
-  # already dispatched at this head, and a second worker on the same head would only race it.
+  # already dispatched at this head, and a second worker on the same head would only race it while that one runs.
   [ "$(jq -r '.claim.phase + " " + (.claim.ended_at // "")' <<<"$("$BIN/cc-task" show "$repo" "$track")")" = "repair " ] && return 0
+  # A LAUNCH THAT ENDED WITH NO LOOP LEFT IS RELAUNCHED (raised-a-limit-stopped-repair-cannot-restart, 2026-10-17): cc
+  # ends every worker claim once its window is up, so "ended" alone never meant the worker finished. #1104's rebase
+  # stopped on a usage limit before it pushed, the head never moved, and this refusal kept it dead until a seat took
+  # it over by hand. A window still running or queueing the loop is that worker, asked again here, after the
+  # reservation, so a dispatcher racing this one sees its window; cc-task grants the relaunch only while no claim is live.
+  case "$(win_state "$win")" in
+    loop|queued) echo "cc: a repair of $pr at ${head:0:12} was already dispatched and $win is still running it — its worker pushes a new head, and the next --repair starts from that"; exit 1 ;;
+  esac
+  res=$("$BIN/cc-task" reserve-repair "$repo" "$track" --generation "$gen" --branch "track/$track" --pr "$pr" --head "$head" --relaunch) || exit 1
+  if [ "$(jq -r .launch <<<"$res")" = true ]; then
+    echo "cc: the repair of $pr at ${head:0:12} stopped before it pushed a new head — relaunching it"; return 0; fi
   echo "cc: a repair of $pr at ${head:0:12} was already dispatched — its worker pushes a new head, and the next --repair starts from that"
   exit 1
 }
+
+# A FIX FOR SOMEBODY ELSE'S OPEN PR (raised-repair-push-no-creds, 2026-10-16): a row briefed to fix a hive PR (its
+# branch dispatch/<n>, not track/<row>) committed the fix, but the worker has no GitHub credential and every push here
+# goes to track/<row> — so the commit sat in its worktree, the worker blocked, and a seat pushed it by hand (seven rows
+# on the dispatch board that day). The row names that PR in its board `pr` field; this reads gh's view of it and
+# answers "<branch> <url>" when the fix belongs on that branch, else nothing. Only an OPEN PR of the repository the
+# push goes to, from that same repository, on a branch that is neither this track's own (that is a plain repair) nor
+# the base. Pure — stdin is `gh pr view --json url,state,isCrossRepository,headRefName` — so `cc selfcheck` feeds it.
+onto_pr_branch(){   # $1 this track's branch  $2 the base  $3 owner/repo of the push remote
+  jq -r --arg own "$1" --arg base "$2" --arg slug "$3" 'select(.state == "OPEN" and .isCrossRepository == false
+    and (.url | startswith("https://github.com/" + $slug + "/pull/")) and (.headRefName // "") != ""
+    and .headRefName != $own and .headRefName != $base and (.headRefName | IN("main", "master") | not)
+    and (.headRefName | test("^[A-Za-z0-9._/-]+$")) and (.headRefName | startswith("track/") | not))
+    | .headRefName + " " + .url' 2>/dev/null; }
+onto_pr(){   # $1 repo $2 track $3 worktree → "<branch> <url>" for a row whose board PR is another branch's open PR, else nothing
+  member_workspace "$1" && return 0   # a member's tree is never read from the host for this; its PRs keep the track door
+  local pr rurl slug; pr=$("$BOARD" get "$1" "$2" pr 2>/dev/null); case "$pr" in https://github.com/*/pull/[0-9]*) ;; *) return 0;; esac
+  rurl=$(git "${GITNH[@]}" -C "$3" remote get-url --push origin 2>/dev/null) || return 0
+  case "$rurl" in https://*|http://*|ssh://*) slug=${rurl#*://}; slug=${slug#*@}; slug=${slug#github.com/} ;; *@*:*) slug=${rurl#*:} ;; *) return 0;; esac
+  slug=${slug%.git}; local v   # a PR gh could not read is rc 1, never "nothing": cc done would open a second PR over it
+  v=$(cd / && timeout -k 5 30 gh pr view "$pr" --json url,state,isCrossRepository,headRefName 2>/dev/null) || return 1
+  onto_pr_branch "track/$2" "$(default_branch "$DEV/$1")" "$slug" <<<"$v"; }
 
 done_write(){ "$BIN/cc-task" "$1" "$repo" "$track" --generation "$done_generation" "${@:2}" >/dev/null || exit 1; }
 done_fail(){ done_write error "$1" "$2"; echo "cc: $2"; exit 1; }
@@ -794,20 +828,47 @@ done_result(){
   exit "$rc"
 }
 
+add_worktree(){  # $1 repo $2 branch $3 wt $4 base -> 0 once $3 is a worktree on $2. Called under the repo's cc-worktree.lock.
+  local repo="$1" branch="$2" wt="$3" base="$4" g=(git "${GITNH[@]}" -C "$DEV/$1") had try err pre
+  [ -e "$wt/.git" ] && git "${GITNH[@]}" -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 && return 0   # a twin dispatch of this track made it while we waited
+  for try in 1 2 3; do
+    "${g[@]}" worktree prune   # a hand-deleted dir stays registered ("missing but already registered")
+    had=0; "${g[@]}" show-ref --verify --quiet "refs/heads/$branch" && had=1
+    pre=0; [ -e "$wt" ] && pre=1   # a path that was there before the add is not this attempt's to remove
+    if [ "$had" = 1 ]; then err=$("${g[@]}" worktree add -q "$wt" "$branch" 2>&1)
+    elif "${g[@]}" show-ref --verify --quiet "refs/remotes/origin/$branch"; then err=$("${g[@]}" worktree add -q --track -b "$branch" "$wt" "origin/$branch" 2>&1)   # re-created track: keep its upstream, don't fork from local HEAD
+    elif "${g[@]}" show-ref --verify --quiet "refs/remotes/origin/$base"; then err=$("${g[@]}" worktree add -q -b "$branch" "$wt" "origin/$base" 2>&1)
+    else err=$("${g[@]}" worktree add -q -b "$branch" "$wt" 2>&1); fi
+    [ -n "$err" ] && printf '%s\n' "$err" >&2
+    git "${GITNH[@]}" -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 && return 0
+    # A FAILED ADD CAN STILL HAVE MADE THE BRANCH (`-b` runs before the upstream is written), and a branch left
+    # behind turns the next plain retry into "already exists". One this attempt made holds no work: it goes.
+    [ "$pre" = 1 ] || rm -rf "$wt"; "${g[@]}" worktree prune
+    [ "$had" = 1 ] || ! "${g[@]}" show-ref --verify --quiet "refs/heads/$branch" || "${g[@]}" branch -q -D "$branch" >/dev/null 2>&1
+    # Only a lock another git process holds clears by waiting; any other error fails the same way again.
+    grep -qiE "could not lock config file|unable to create '[^']*\.lock'" <<<"$err" || return 1
+    [ "$try" = 3 ] || { echo "cc: worktree add for $branch failed on a git lock (attempt $try of 3) — trying again" >&2; sleep "$try"; }
+  done
+  return 1
+}
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
-  local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
+  local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base lk
   valid_name "$repo"; valid_name "$track"
   git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "cc: ~/dev/$repo is not a git repo — tracks need git"; exit 1; }
   git "${GITNH[@]}" -C "$DEV/$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "cc: '$branch' is not a usable branch name"; exit 1; }
   if [ ! -d "$wt" ]; then
-    mkdir -p "$WTBASE/$repo"; git "${GITNH[@]}" -C "$DEV/$repo" worktree prune   # a hand-deleted dir stays registered ("missing but already registered")
-    git "${GITNH[@]}" -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")
-    if git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/heads/$branch"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q "$wt" "$branch"
-    elif git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$branch"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q --track -b "$branch" "$wt" "origin/$branch"   # re-created track: keep its upstream, don't fork from local HEAD
-    elif git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q -b "$branch" "$wt" "origin/$base"
-    else git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q -b "$branch" "$wt"; fi
-    git "${GITNH[@]}" -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 || { rm -rf "$wt"; echo "cc: could not create the worktree $wt (git error above) — nothing was stamped"; exit 1; }
+    mkdir -p "$WTBASE/$repo"
+    git "${GITNH[@]}" -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")   # outside the lock: the network is the slow part
     gcd=$(git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$repo/.git")
+    # TRACKS DISPATCHED TOGETHER (raised-go-dispatch-race-recurs): three `cc <repo> <row> --go` at once each ran
+    # `worktree add`, which writes .git/config, and the third lost the race on config.lock. One dispatch at a time
+    # per repo adds its worktree; a writer outside cc (a worker's first push -u) is what the retry is for. Every
+    # cleanup of a failed add happens inside add_worktree, under the lock: once it is released, $wt may be a twin
+    # dispatch's worktree, so nothing here removes it.
+    nolink "$gcd/cc-worktree.lock" || exit 1; exec {lk}>>"$gcd/cc-worktree.lock"
+    flock -w 300 "$lk" || { echo "cc: another dispatch has held the worktree lock on ~/dev/$repo for 5 min — nothing was stamped; run it again"; exit 1; }
+    add_worktree "$repo" "$branch" "$wt" "$base" || { exec {lk}>&-; echo "cc: could not create the worktree $wt (git error above) — nothing was stamped and no branch was made"; exit 1; }
+    exec {lk}>&-
     mkdir -p "$gcd/info"; grep -qxF '.cc/' "$gcd/info/exclude" 2>/dev/null || echo '.cc/' >> "$gcd/info/exclude"
     mkdir -p "$wt/.cc"; printf '%s\n%s\n' "$repo" "$track" > "$wt/.cc/track"
     "$BIN/cc-trust" "$wt" >/dev/null 2>&1 || true
@@ -1524,7 +1585,7 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   eq "$(bc 'a brief that says about $70 and 8 h launched with 1 iteration and $8\n')" ""; rc=$?; t "control: prose that mentions dollars is not a cost line" "$rc"
   eq "$(bc 'Cost: $30\n<!-- cc-brief:inflight -->\nCost: $500\n<!-- /cc-brief:inflight -->\n')" 30; rc=$?; t "…and the board's inflight block is not the brief's" "$rc"
   cost_says 70 8 1 | grep -q 'about \$70, but this launch allows \$8.00 (1 × \$8)'; t "cost_says: a launch under the brief's figure says so" $?
-  [ -z "$(cost_says 70 25 3)" ] && [ -z "$(cost_says 70 70 1)" ] && [ -z "$(cost_says "" 8 1)" ]; rc=$?; t "…a launch that covers it, matches it, or a brief with no cost line, says nothing" "$rc"
+  if [ -z "$(cost_says 70 25 3)" ] && [ -z "$(cost_says 70 70 1)" ] && [ -z "$(cost_says "" 8 1)" ]; then rc=0; else rc=1; fi; t "…a launch that covers it, matches it, or a brief with no cost line, says nothing" "$rc"
   cost_says 20 25 3 | grep -q 'over three times'; t "…and one over three times the brief's figure says that" $?
   rdy(){ : > "$T/sb.log"; echo "$1" > "$T/cc-msg.rc"; echo "$2" > "$T/cc-notify.rc"
     ( BIN="$T/sb"; OWNW="${3:-}"; own_window(){ echo "$OWNW"; }; ready_tell r t "${4-pushed to origin}" "${5-origin}" ) 2>"$T/err" >"$T/out"; }
@@ -1538,9 +1599,19 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   fin(){ echo "$1" > "$T/bs"; echo "$2" > "$T/bn"; echo "${3:-task}" > "$T/bk"; ( BOARD="$T/sb/board"; finished_row r t ); }
   fin done "[]"; t "a merged/done row counts as finished: an interactive open is refused" $?
   fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}, {'ts': 'y', 'msg': 'loop: DONE'}]"; t "…as does a running row cc-land landed under a live loop (its note, then the loop's)" $?
-  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}, {'ts': 'y', 'msg': 'reopened: a follow-up'}]"; [ "$?" = 1 ]; t "control: a landed row reopened by a note opens again" $?
-  fin running "[{'ts': 'x', 'msg': 'dispatched headless worker (loop 2)'}]"; [ "$?" = 1 ]; t "control: a running row with no landing opens" $?
-  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}]" session; [ "$?" = 1 ]; t "a kind=session row whose branch cc-land landed is a living project: it opens again" $?
+  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}, {'ts': 'y', 'msg': 'reopened: a follow-up'}]"; rc=$?; t "control: a landed row reopened by a note opens again" "$(( rc != 1 ))"
+  fin running "[{'ts': 'x', 'msg': 'dispatched headless worker (loop 2)'}]"; rc=$?; t "control: a running row with no landing opens" "$(( rc != 1 ))"
+  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}]" session; rc=$?; t "a kind=session row whose branch cc-land landed is a living project: it opens again" "$(( rc != 1 ))"
+  # onto_pr_branch: which board PRs cc done pushes a row onto. Each case is its own gh answer.
+  opb(){ printf '{"url":"https://github.com/%s/pull/7","state":"%s","isCrossRepository":%s,"headRefName":"%s"}' "${4:-o/d}" "$1" "$2" "$3" | onto_pr_branch track/fix main o/d; }
+  eq "$(opb OPEN false dispatch/1042)" "dispatch/1042 https://github.com/o/d/pull/7"; t "an open hive PR on dispatch/1042 is where the fix goes" $?
+  eq "$(opb MERGED false dispatch/1042)" ""; t "control: a merged one is not pushed onto" $?
+  eq "$(opb OPEN true dispatch/1042)" ""; t "…nor a PR from a fork" $?
+  eq "$(opb OPEN false dispatch/1042 o/other)" ""; t "…nor a PR of another repository than the push goes to" $?
+  eq "$(opb OPEN false track/fix)" ""; t "…nor the row's own PR (that is a plain repair)" $?
+  eq "$(opb OPEN false track/other)" ""; t "…nor another track's branch" $?
+  eq "$(opb OPEN false main)" ""; t "…nor the base" $?
+  eq "$(opb OPEN false 'a b')" ""; t "…nor a branch name with a space in it" $?
   printf 'cc selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]
 }
@@ -1562,6 +1633,8 @@ case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;
   selfcheck) selfcheck; exit $? ;;
+  onto-pr)   # cc onto-pr <repo> <row>: "<branch> <url>" when cc done will push this row onto another branch's open PR (cc-loop's prompt)
+    valid_name "${2:?repo}"; valid_name "${3:?row}"; onto_pr "$2" "$3" "$WTBASE/$2/$3"; exit $? ;;
   board) shift; exec "$BOARD" "$@" ;;
   claim)   # prepare the canonical track and claim it — no tmux window, no model, no worker. What a subagent
     # gets before it starts, and what `--go` does for itself below. The brief is NOT written here: task.md is its
@@ -1873,6 +1946,25 @@ case "${1:-}" in
         echo "done: track/$track is pushed to ${slug:-$rem} — no other branch there (no main or master, and its default is this one) to open a PR against"; exit 0; fi
       [ -n "$rbase" ] && base="$rbase"
       [ "$done_managed" = 1 ] || { [ -n "$slug" ] && export GH_REPO="$slug"; }; fi
+    # …AND A FIX FOR ANOTHER BRANCH'S OPEN PR GOES ONTO THAT BRANCH (onto_pr above), pushed here on the host with the
+    # repo's own credential, never forced: a plain push is a fast-forward or nothing, so a branch somebody (a live hive
+    # run) moved meanwhile refuses it and is said, and nothing is overwritten. That PR is the delivery: no second PR.
+    onto=""; if [ "$rem" = origin ] && ! member_workspace "$repo" && ! onto=$(onto_pr "$repo" "$track" "$wt"); then
+      m="cannot read the row's PR ($("$BOARD" get "$repo" "$track" pr 2>/dev/null)) from GitHub, so it is not known whether the fix belongs on that PR's branch — nothing pushed beyond track/$track, no PR opened; run cc done again"
+      [ "$done_managed" = 0 ] || done_fail pr "$m"
+      # BY HAND it is what it was before onto_pr: a person running cc done is told and the PR opens on track/<row>
+      onto=""; echo "cc: cannot read the row's PR from GitHub, so it is not known whether the fix belongs on that PR's branch — opening the usual PR from track/$track; close it if the fix belongs on the other one" >&2; fi
+    if [ -n "$onto" ]; then
+      read -r obr ourl <<<"$onto"; tip=$(git -C "$wt" rev-parse HEAD)
+      orurl=$(git -C "$wt" remote get-url --push origin)
+      cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$orurl" "$repo" 2>/dev/null)
+      if ! oerr=$(timeout -k 5 "${CC_PUSH_TIMEOUT:-120}" env GIT_TERMINAL_PROMPT=0 "${HG[@]}" git "${cred[@]}" -C "$wt" push --porcelain "$orurl" "$tip:refs/heads/$obr" 2>&1); then
+        m="the fix is on track/$track, but its push onto $obr for $ourl was refused (not a fast-forward of that branch, or no credential), so nothing was overwritten: ${oerr//$'\n'/ }"
+        [ "$done_managed" = 0 ] || done_fail push "$m"
+        "$BOARD" note "$repo" "$track" "cc done: $m" >/dev/null 2>&1 || true; echo "cc: $m"; exit 1; fi
+      done_board review "$ourl"
+      "$BOARD" note "$repo" "$track" "cc done: pushed ${tip:0:12} onto $obr — $ourl carries the fix, no second PR" >/dev/null 2>&1 || true
+      echo "pushed ${tip:0:12} onto $obr, the branch of $ourl — no second PR. The board's PR is $ourl, so a loop's DONE queues it to land again as it does any PR (or waits on the 👍 where this repo does not land its own); started by hand, nothing re-queues it"; echo "PR: $ourl"; exit 0; fi
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
     if [ "$done_managed" = 1 ]; then
       # THE BRIEF COMES FROM ITS ONE HOME, not through the board: a board that cannot be read must not cost a

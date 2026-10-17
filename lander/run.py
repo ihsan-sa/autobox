@@ -43,7 +43,11 @@ THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite t
 it exited with). unrunnable — never red: killed at the check's cap, killed by a signal or the scope's MemoryMax
 (exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork) from a run that exited non-zero (a
 passing check may quote that text itself), a sandbox that did not start (its stub not installed included), a mount
-that is not there, a tree that did not reproduce. failed: anything else.
+that is not there, a tree that did not reproduce. failed: anything else. On the box, setup says it started OUT OF
+BAND (sandbox.started: a pipe the innermost setup writes and closes before the check runs, inside bwrap, cc-nosignal and
+the scope), so a check that prints `bwrap:` or cc-nosignal's refusal is failed, never unrunnable, and a run that never
+said it started is unrunnable whatever it exited (perms on #1452). A member's or a runner's run has no such pipe, and
+its first line is read for those words as before.
 
 JUDGE (a red, per check): the same check on the BASE tree — main's own record of it on exactly that tree when the
 tip run made one (health.py): green there is no base red, and red there stands as `blocked-by-main` with no run when
@@ -217,17 +221,24 @@ def stopped() -> bool:
     return bool(ev is not None and ev.is_set())
 
 
-def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None) -> tuple:
+def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, keep: tuple = ()) -> tuple:
     """-> (rc, secs, cpu_secs, capped). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
+    when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
+    write STARTED through /proc/<lander>/fd/N.
     A plan's `cancel` set (the lane: the job's PR merged, closed or moved on) kills the group the same way, and a
     stopped plan starts nothing more: rc -SIGTERM, which status_of calls unrunnable, never red."""
     t0 = time.monotonic()
-    if stopped():
-        return -signal.SIGTERM, 0.0, 0.0, False
-    with open(log, "wb") as out:
-        p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
-                             stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
-                             preexec_fn=None, restore_signals=True)
+    try:
+        if stopped():
+            return -signal.SIGTERM, 0.0, 0.0, False
+        with open(log, "wb") as out:
+            p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
+                                 preexec_fn=None, restore_signals=True)
+    finally:
+        for fd in keep:
+            os.close(fd)
     capped, ru = False, None
     while True:
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
@@ -264,9 +275,11 @@ def read_log(log: str, limit: int = 400_000) -> str:
         return ""
 
 
-def status_of(rc: int, text: str, capped: bool = False) -> tuple:
+def status_of(rc: int, text: str, capped: bool = False, started: bool | None = None) -> tuple:
     """-> (status, why). A clean exit with no 'N failed' above zero passes whatever it prints: a check that quotes
-    a box-state error (a case that fills a disk on purpose) is not the box failing, so that text counts on rc != 0."""
+    a box-state error (a case that fills a disk on purpose) is not the box failing, so that text counts on rc != 0.
+    started: what setup said out of band (read_started) — False is unrunnable whatever the exit, True never reads
+    the output for setup's words; None (no pipe: a member, a runner) reads its first line for them."""
     if capped:
         return T.UNRUNNABLE, "stopped at its cap"
     if rc < 0 or rc in KILLED:
@@ -276,7 +289,11 @@ def status_of(rc: int, text: str, capped: bool = False) -> tuple:
         return T.UNRUNNABLE, f"the box, not the tree: {m.group(0)}"
     head = text.lstrip()[:2000]
     s = SETUP_RE.match(head)
-    if rc and s:
+    if started is False:   # setup's own line wherever it is (a warning may come first), else the first line
+        said = SETUP_RE.search(head)
+        said = said.group(0) if said else (head.splitlines() or [f"exit {rc} with no output"])[0]
+        return T.UNRUNNABLE, f"the sandbox did not start: {said[:200]}"
+    if started is None and rc and s:
         return T.UNRUNNABLE, f"the sandbox did not start: {s.group(0)[:200]}"
     n = [int(x) for x in FAILED_RE.findall(text)]
     if rc == 0 and not (n and n[-1] > 0):
@@ -399,17 +416,31 @@ def prune_logs(d: str, now: float | None = None) -> None:
 
 # --- the runners ---------------------------------------------------------------------------------------------------
 
-def _box_argv(check, head, cwd, run_dir, env_extra):
+def read_started(fd: int) -> bool:
+    """Whether the run said sandbox.STARTED on its pipe; every writer is gone, so this never waits."""
+    os.set_blocking(fd, False)
+    try:
+        return os.read(fd, 64) == S.STARTED
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _box_argv(check, head, cwd, run_dir, env_extra, started_fd=None):
+    """started_fd: the write end that sandbox.started() says STARTED on, innermost: after cc-nosignal or bwrap's
+    setup, before the check's own shell. sandbox.pin() moves it to sandbox.FD first, outermost, since dash takes no
+    fd above 9 and the lander's own is often higher."""
+    pin, said = (S.pin(started_fd), S.started(S.FD)) if started_fd is not None else ([], [])
     if check.klass in M.UNSANDBOXED:
         scope = [] if check.bare else [os.path.join(BIN, "cc-nosignal"), "--"]
-        return (scope + ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
+        return (pin + scope + said + ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
                 clean_env(env_extra), "host")
     if not S.available():
         raise Unrunnable("bwrap is not installed, so a sandboxed check has nowhere to run")
     if check.klass == T.TIMING and A.loaded():
         raise Unrunnable("box busy: a timing check waits for an idle box")
     try:
-        argv = S.argv(check, head, S.write_stub(run_dir), cwd, env_extra)
+        argv = pin + S.argv(check, head, S.write_stub(run_dir), cwd, env_extra,
+                            started_fd=S.FD if started_fd is not None else None)
     except S.MissingMount as e:
         raise Unrunnable(str(e)) from None
     # bwrap clears the environment inside; outside, systemd-run still needs the user bus to open the scope
@@ -608,6 +639,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
     runner that took it: `laptop:<user@host>:-` off the box."""
     kind = where.split(":")[0]
     log = os.path.join(run_dir, "log")
+    pipe = list(os.pipe()) if kind == "box" else []   # [read, write]: setup says it started on it (sandbox.started)
     try:
         stdin, tar = None, None
         if kind == "laptop":
@@ -617,7 +649,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         elif kind == "member":
             argv, wd, env, how = _member_argv(check, head, cwd, where, env_extra)
         else:
-            argv, wd, env, how = _box_argv(check, head, cwd, run_dir, env_extra)
+            argv, wd, env, how = _box_argv(check, head, cwd, run_dir, env_extra, started_fd=pipe[1])
         scope = "-"
         # the laptop's work is the laptop's: it takes no slot of the box's; nor does an express run (lane EXPRESS)
         free = kind == "laptop" or (express and not alone)
@@ -628,8 +660,13 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
                 argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
-            rc, secs, cpu, capped = execute(argv, wd, env, check.cap, log, stdin)
+            # the write end is execute's from here: it closes it once the run has it (pipe keeps only the read end)
+            rc, secs, cpu, capped = execute(argv, wd, env, check.cap, log, stdin,
+                                            keep=(pipe.pop(),) if pipe else ())
             loaded = loaded or A.loaded()   # under load at either end of the run
+        said = None
+        if pipe:   # each fd is closed once: another thread's run may take its number next
+            said = read_started(pipe[0])
         if tar is not None:
             tar.stdout.close()
             tar.wait()
@@ -637,7 +674,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         if kind == "laptop":
             started = {"never_started": never_started(text, capped)} if dest else {}
             text, rc = _laptop_verdict(text, rc)
-        st, why = status_of(rc, text, capped)
+        st, why = status_of(rc, text, capped, started=said)
         if kind == "laptop" and rc == -1 and not capped:   # capped: it ran there, and "stopped at its cap" says so
             why = text.splitlines()[0] if text else "the laptop did not answer"
         kept = {}
@@ -654,6 +691,10 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
     except Unrunnable as e:
         return T.Result(check=check.name, tree=tree_sha, status=T.UNRUNNABLE, secs=0.0, load=os.getloadavg()[0],
                         runner=f"{where}:{dest}:-" if dest else where, extra={"why": str(e), "not_sent": True})
+    finally:
+        for fd in pipe:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _laptop_verdict(text: str, rc: int) -> tuple:

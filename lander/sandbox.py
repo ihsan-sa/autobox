@@ -15,11 +15,17 @@ stay allowed: cc-sandbox's own selfcheck, lessons and the library editor nest bw
 
 The run itself is `/bin/sh -c <run>` from the check's directory inside the tree; CC_SELFTEST_HELD tells selftest.sh
 this run already holds its slot, and CC_SELFTEST_SPILL=0 keeps it from spilling to a laptop from in here.
+
+SETUP SAYS IT STARTED OUT OF BAND (started(), say()): given started_fd, the sandbox's own SETUP (the stub and its
+directories) runs first, then STARTED is written to that fd and the fd closed before tmux or anything of the check's
+runs, so the check never holds it. The lander reads the pipe's other end: no STARTED means the sandbox never started, and the check's own output — which may say
+`bwrap:` as well as anything — is never what decides that (perms on #1452).
 """
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 
 from lander import types as T
 
@@ -27,15 +33,21 @@ HOME_IN = "/tmp/home"
 TREE_IN = "/work/tree"
 TMUX_IN = "/tmp/tmux"
 PATH_IN = f"{HOME_IN}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+STARTED = b"started"
+# the fd the run says STARTED on: dash (/bin/sh) takes no fd above 9 in `>&N` or `exec N>&-`, and the lander's own
+# pipe is often 10 or more, so pin() moves it here before anything else of the run starts
+FD = 3
+PIN = (f"import os, sys\nn = int(sys.argv[1])\nif n != {FD}:\n    os.dup2(n, {FD})\n    os.close(n)\n"
+       "os.execvp(sys.argv[2], sys.argv[2:])\n")
 STUB = ("#!/bin/sh\n# the lander's sandbox stub: the suite stubs every model call; this only keeps a window up\n"
         "exec sleep 3600\n")
 # a setup step that fails stops the run with this as its first line, which run.SETUP_RE reads as unrunnable
 SETUP_FAILED = "lander-sandbox: setup failed, nothing ran"
-PRELUDE = (f'err=$({{ mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" && chmod 700 "{TMUX_IN}" && '
-           f'cp "$LANDER_STUB" "{HOME_IN}/.local/bin/claude" && chmod +x "{HOME_IN}/.local/bin/claude"; }} 2>&1) || '
-           f'{{ printf "%s: %s\\n" "{SETUP_FAILED}" "$err" >&2; exit 125; }}; '
-           'command -v tmux >/dev/null 2>&1 && tmux new-session -d -s main -x 200 -y 50 >/dev/null 2>&1; '
-           'exec /bin/sh -c "$1"')
+SETUP = (f'err=$({{ mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" && chmod 700 "{TMUX_IN}" && '
+         f'cp "$LANDER_STUB" "{HOME_IN}/.local/bin/claude" && chmod +x "{HOME_IN}/.local/bin/claude"; }} 2>&1) || '
+         f'{{ printf "%s: %s\\n" "{SETUP_FAILED}" "$err" >&2; exit 125; }}; ')
+CHECK = ('command -v tmux >/dev/null 2>&1 && tmux new-session -d -s main -x 200 -y 50 >/dev/null 2>&1; '
+         'exec /bin/sh -c "$1"')
 
 
 class MissingMount(RuntimeError):
@@ -77,10 +89,28 @@ def write_stub(scratch: str) -> str:
     return p
 
 
+def pin(fd: int) -> list:
+    """The argv prefix that moves `fd` to FD (inheritable) and execs the rest; the host's own python, outside every
+    sandbox and scope. A failure exits non-zero having said nothing: unrunnable."""
+    return [sys.executable, "-I", "-c", PIN, str(fd)]
+
+
+def started(fd: int) -> list:
+    """The argv prefix that says STARTED on `fd`, closes it, then execs the rest; it exits 125, running nothing,
+    when it cannot say it."""
+    return ["/bin/sh", "-c", say(fd) + 'exec "$@"', "lander-started"]
+
+
+def say(fd: int) -> str:
+    """Shell that says STARTED on `fd` (at most 9: dash) and closes it, or exits 125."""
+    return f'printf {STARTED.decode()} >&{fd} || exit 125; exec {fd}>&-; '
+
+
 def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | None = None,
-         home: str | None = None) -> list:
+         home: str | None = None, started_fd: int | None = None) -> list:
     """The full bwrap command line that runs check.run in `tree` (a host directory). stub: write_stub()'s file.
-    cwd: the check's directory inside the tree (its manifest prefix)."""
+    cwd: the check's directory inside the tree (its manifest prefix). started_fd: said on (say()) once the
+    sandbox is up and its SETUP (the stub) is in, before tmux or the check starts."""
     a = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--hostname", "lander", "--clearenv",
          "--ro-bind", "/usr", "/usr"]
     if check.net:
@@ -101,6 +131,7 @@ def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | 
     for k, v in env(extra_env).items():
         a += ["--setenv", k, v]
     a += ["--ro-bind", stub, "/tmp/.lander-stub", "--chdir", os.path.join(TREE_IN, cwd.rstrip("/")) if cwd else TREE_IN,
-          "--", "/bin/sh", "-c", PRELUDE, "lander-run", check.run]
+          "--", "/bin/sh", "-c", SETUP + (say(started_fd) if started_fd is not None else "") + CHECK, "lander-run",
+          check.run]
     return a
 

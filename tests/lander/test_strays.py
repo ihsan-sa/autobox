@@ -18,14 +18,23 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
 from lander import events as E  # noqa: E402
 from lander import gh as GH  # noqa: E402
+from lander import git as G  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
+from lander import review as R  # noqa: E402
 from lander import tick as TK  # noqa: E402
 from lander import types as T  # noqa: E402
 
+SELF_MERGE_HEADS = TK.self_merge_heads   # setUp fakes it for the sweep
 
-def pr(n, branch="fix-docs", age=3600, draft=False):
-    return {"number": n, "headRefName": branch, "isDraft": draft, "createdAt": E.stamp(time.time() - age)}
+
+def pr(n, branch="fix-docs", age=3600, draft=False, base="main"):
+    return {"number": n, "headRefName": branch, "baseRefName": base, "isDraft": draft,
+            "createdAt": E.stamp(time.time() - age)}
+
+
+def changed(*paths, old=None):
+    return [dict({"filename": f}, **({"previous_filename": old} if old else {})) for f in paths]
 
 
 class Strays(unittest.TestCase):
@@ -44,9 +53,14 @@ class Strays(unittest.TestCase):
         self.open = {"demo": [], "other": []}   # what gh pr list answers, per repo
         self.lists, self.queued, self.lands = [], [], {"demo": True, "other": True}
         self.gh_rc = 0
+        self.heads, self.files, self.asked = {}, {}, []   # the box's self-merge prefixes; each PR's files (None fails)
 
         def gh(argv, root, token=None, timeout=120):
             repo = os.path.basename(root)
+            if argv[0] == "api":
+                n = int(argv[1].split("/")[4])
+                self.asked.append((repo, n))
+                return (0, json.dumps(self.files[n]), "") if self.files.get(n) is not None else (1, "", "HTTP 502")
             self.lists.append(repo)
             return (self.gh_rc, "" if self.gh_rc else json.dumps(self.open[repo]), "boom" if self.gh_rc else "")
 
@@ -54,8 +68,18 @@ class Strays(unittest.TestCase):
             self.queued.append((argv[0], int(argv[1])))
             print(f"[{argv[0]}] PR #{argv[1]} queued")
             return 0
+
+        def rev(root, ref):
+            if ref.endswith("/gone"):
+                raise G.GitError(f"git rev-parse {ref}: unknown revision")
+            return ref.rsplit("/", 1)[-1]
+
+        globs = ["tests/LANDING-security.toml", "host/**", "fx.py"]
         for target, name, fake in ((GH, "slug", lambda root: "o/" + os.path.basename(root)), (GH, "gh", gh),
-                                   (TK, "self_lands", lambda repo: self.lands[repo]), (L, "cmd_queue", queue)):
+                                   (TK, "self_lands", lambda repo: self.lands[repo]), (L, "cmd_queue", queue),
+                                   (TK, "self_merge_heads", lambda repo: self.heads.get(repo, [])), (G, "rev", rev),
+                                   (R, "security_globs",
+                                    lambda root, base, repo: {"nolist": None, "nosec": []}.get(base, globs))):
             p = mock.patch.object(target, name, fake)
             p.start()
             self.addCleanup(p.stop)
@@ -135,6 +159,57 @@ class Strays(unittest.TestCase):
         self.assertEqual((self.lists, self.queued), ([], []))
         TK.sweep_strays(["demo"])
         self.assertEqual(self.queued, [("demo", 5)])
+
+    def test_a_declared_head_that_touches_no_security_path_is_left_to_its_repo(self):
+        self.heads["demo"] = ["dispatch/"]
+        self.open["demo"] = [pr(5, branch="dispatch/run-5"), pr(6)]
+        self.files[5] = changed("README.md", "host.md", "docs/host/x.md")   # a glob, never a substring
+        lines = TK.sweep_strays(["demo"])
+        self.assertEqual(self.queued, [("demo", 6)])     # kept: a head on no declared prefix queues as before
+        self.assertEqual(self.asked, [("demo", 5)])      # only a declared head's files are asked for
+        self.assertEqual(len(lines), 1)                  # and the one left says nothing
+
+    def test_a_declared_head_on_a_security_path_is_queued(self):
+        self.heads["demo"] = ["hive/", "dispatch/"]
+        self.open["demo"] = [pr(5, branch="dispatch/a"), pr(6, branch="dispatch/b"), pr(7, branch="dispatch/c")]
+        self.files.update({5: changed("README.md", "host/unit.service"),
+                           6: changed("fx2.py", old="fx.py"),            # a rename off the list counts its old name
+                           7: changed("tests/LANDING-security.toml")})   # the list itself, a removal included
+        TK.sweep_strays(["demo"])
+        self.assertEqual(self.queued, [("demo", 5), ("demo", 6), ("demo", 7)])
+
+    def test_a_repo_with_no_declared_heads_is_unchanged(self):
+        self.heads["demo"] = ["dispatch/"]
+        self.open["other"] = [pr(6, branch="dispatch/a")]
+        self.files[6] = changed("README.md")
+        TK.sweep_strays(["other"])
+        self.assertEqual((self.queued, self.asked), ([("other", 6)], []))
+
+    def test_a_declared_head_whose_files_or_list_will_not_read_is_queued(self):
+        self.heads["demo"] = ["dispatch/"]
+        self.open["demo"] = [pr(5, branch="dispatch/a"), pr(6, branch="dispatch/b"), pr(7, branch="dispatch/c"),
+                             pr(8, branch="dispatch/d", base="gone"), pr(9, branch="dispatch/e", base="nolist"),
+                             pr(10, branch="dispatch/f"), pr(12, branch="dispatch/g", base="nosec"),
+                             pr(11, branch="dispatch/ok")]
+        self.files.update({6: changed(*(f"docs/{i}.md" for i in range(100))),   # gh's page is full: maybe more
+                           7: [], 8: changed("README.md"), 9: changed("README.md"),
+                           10: [{"path": "README.md"}], 11: changed("README.md"), 12: changed("README.md")})
+        TK.sweep_strays(["demo"])          # 5: the lookup fails; 7: no file; 8: no base; 9: no list; 10: no filename
+        self.assertEqual([n for _, n in self.queued], [5, 6, 7, 8, 9, 10, 12])   # 12: an empty list tells nothing
+
+    def test_self_merge_heads_reads_the_repo_key_on_the_box(self):
+        answers = {"LANDER_SELF_MERGE_HEADS_dispatch": (0, "dispatch/ hive/\n", ""),
+                   "LANDER_SELF_MERGE_HEADS_a_b": (1, "", ""), "LANDER_SELF_MERGE_HEADS_slow": (125, "", "timeout"),
+                   "LANDER_SELF_MERGE_HEADS_deep": (0, "hive/runs/\n", "")}
+        bad = ["dispatch", "dispatch/ d", "*/", "/", "../", "dispatch/ -x/", "a//"]
+        answers.update({f"LANDER_SELF_MERGE_HEADS_bad{i}": (0, v, "") for i, v in enumerate(bad)})
+        with mock.patch.object(L, "run", lambda argv, timeout=60: answers[argv[2]]):
+            self.assertEqual(SELF_MERGE_HEADS("dispatch"), ["dispatch/", "hive/"])
+            self.assertEqual(SELF_MERGE_HEADS("deep"), ["hive/runs/"])
+            self.assertEqual(SELF_MERGE_HEADS("a.b"), [])     # unset
+            self.assertEqual(SELF_MERGE_HEADS("slow"), [])    # cc-config did not answer: queue as before
+            for i, v in enumerate(bad):                       # one word that is no namespace voids the whole setting
+                self.assertEqual(SELF_MERGE_HEADS(f"bad{i}"), [], v)
 
 
 if __name__ == "__main__":
