@@ -74,7 +74,12 @@ A planning seat runs it by hand; the lander never installs itself.
         perms-*` makes, or it is refused (exit 1) before anything is built.
         --no-prove skips the proof on main (its sweeps and its lane hold) and nothing else: the perms check, the
         build, the release's own selfcheck and `previous` all stand, and the promoted line says the proof was
-        skipped (owner, 2026-10-13 17:33Z: a fix to the lander must not wait on the proof sweep).
+        skipped (owner, 2026-10-13 17:33Z: a fix to the lander must not wait on the proof sweep). It refuses `--pr`
+        (exit 2, before anything is built), so an unproven release is always built from a commit on origin/main.
+        Every promote that switches appends a line to ~/.cc/lander/promote.log (time, sha, `proven` or `no-prove`,
+        the calling Claude session's pid and cwd) before it moves `current`, and refuses with current unchanged if it
+        cannot; `status` reads it to say whether the live release was proven. Nothing is written into the release
+        directory, whose tree is compared byte for byte.
     lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]
         promote without the switch: the same refusals for REV, its selfcheck and the proof on main (and its hold),
         against
@@ -108,7 +113,9 @@ A planning seat runs it by hand; the lander never installs itself.
         names no head (the old lander's files do not) takes its head from GitHub and its base from origin/main.
         Exit 1 when the candidate cannot plan a job it was given a head for, 0 otherwise, 3 when it could not run.
     lander-self status
-        The links, then each running lane: its repo, pid, the release it runs from, and `current` or `STALE` (a
+        The links; whether `current` was proven (`yes`, `no` with when and who promoted it with --no-prove, or
+        `unknown` when promote.log holds no line for it, as for a release promoted before the log); then each
+        running lane: its repo, pid, the release it runs from, and `current` or `STALE` (a
         stale lane switches before its next job; one still stale after its job ended predates that switch).
     lander-self selfcheck
 
@@ -118,6 +125,7 @@ self/<sha>/lander-self, self/current -> self/<sha>, legacy/<sha>/<core>, legacy-
 checkout releases are built from). A release is always laid out with the core tree under `core/`, whatever prefix
 the repo keeps it under, because bin/lander execs `current/core/lander/cli.py`.
 """
+import datetime
 import fcntl
 import io
 import json
@@ -976,6 +984,45 @@ def perms_caller(root, pid=None, proc="/proc", state=None, versions=None):
     return cwd == os.path.realpath(os.path.join(state, os.path.basename(os.path.realpath(root)), "perms"))
 
 
+def seat_of(pid=None, proc="/proc"):
+    """The calling Claude session as promote.log records it: its pid and cwd, or this process's pid when no Claude
+    session is above it."""
+    seat = claude_ancestor(pid, proc)
+    if seat is None:
+        return f"pid {os.getpid()} (no Claude session above it)"
+    try:
+        return f"pid {seat} cwd {os.path.realpath(os.readlink(os.path.join(proc, str(seat), 'cwd')))}"
+    except OSError:
+        return f"pid {seat} cwd ?"
+
+
+PROMOTE_LOG = "promote.log"
+
+
+def log_promote(sha, proven_, caller):
+    """Append `<time>\t<sha>\tproven|no-prove\t<caller>` to ROOT/promote.log. Security read of #1313: a --no-prove
+    promote said so only on stdout. Outside the release directory, whose tree is compared byte for byte."""
+    os.makedirs(ROOT, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = "\t".join((stamp, sha, "proven" if proven_ else "no-prove", caller.replace("\t", " ").replace("\n", " ")))
+    with open(os.path.join(ROOT, PROMOTE_LOG), "a") as f:
+        f.write(line + "\n")
+
+
+def promote_record(sha):
+    """The last promote.log line for sha as (time, mark, caller), or None."""
+    hit = None
+    try:
+        with open(os.path.join(ROOT, PROMOTE_LOG)) as f:
+            for ln in f:
+                p = ln.rstrip("\n").split("\t")
+                if len(p) == 4 and p[1] == sha:
+                    hit = (p[0], p[2], p[3])
+    except OSError:
+        return None
+    return hit
+
+
 def open_pr_head(root, pr):
     """(head sha, comments) GitHub names for PR #pr when it is OPEN, else ("", [])."""
     rc, out, _ = sh(["gh", "pr", "view", str(pr), *gh_repo(root), "--json", "headRefOid,state,comments"], cwd=root, timeout=60)
@@ -1019,6 +1066,9 @@ def cmd_promote(args, opts):
         return die("promote: no checkout (--repo DIR)", 2)
     if not cap:
         return die("promote: --cap takes a whole number of seconds above 0", 2)
+    if opts.get("no-prove") and opts.get("pr"):    # security read of #1313: no unproven release off an unmerged head
+        return die("promote: refused — --no-prove takes no --pr; an unproven release is built only from a commit on "
+                   "origin/main (current is unchanged)", 2)
     if not perms_caller(root):
         return die("promote: refused — only the perms seat moves the live lander to a new release "
                    f"(run it from {os.path.basename(root)}'s perms seat); current is unchanged")
@@ -1051,6 +1101,10 @@ def cmd_promote(args, opts):
         why, nov = proven(rel, cur, root, main, cap)
         if why:
             return die(f"promote: refused, current is unchanged — {why}", 3 if nov else 1)
+    try:
+        log_promote(sha, not skip, seat_of())
+    except OSError as e:
+        return die(f"promote: cannot append to {os.path.join(ROOT, PROMOTE_LOG)}, current is unchanged: {e}", 3)
     if cur:
         swap("previous", cur)
     swap("current", rel)
@@ -1333,6 +1387,10 @@ def cmd_status(args, opts):
         t = link_target(name)
         print(f"{name:13} {os.path.basename(t)[:12] if t else '-'}")
     q, cur = landq(), link_target("current")
+    if cur:
+        rec = promote_record(os.path.basename(cur))
+        print(f"{'proven':13} " + ("unknown (no promote.log line for it)" if rec is None else "yes" if rec[1] == "proven"
+                                   else f"no (--no-prove at {rec[0]} by {rec[2]})"))
     for repo in running_lanes(q):
         pid, rel = lane_release(q, repo)
         mark = "unknown" if not rel else "current" if os.path.realpath(rel) == cur else "STALE"
@@ -2049,6 +2107,8 @@ def selfcheck():
                 globals()["perms_caller"] = lambda root: True
                 r_np_red = cmd_promote([red], np)
                 cur_np_red = link_target("current")
+                r_np_pr = cmd_promote([side], {**np, "pr": "7"})   # an open PR's head, unproven: refused first
+                cur_np_pr, proofs_np_pr = link_target("current"), len(proofs)
                 r_np_proved = cmd_promote([a], o)       # without the flag the (stubbed, refusing) proof still runs
                 proofs_without = len(proofs)
                 del proofs[:]
@@ -2058,11 +2118,30 @@ def selfcheck():
                 finally:
                     sys.stdout = quiet
                 cur_np, prev_np = link_target("current"), link_target("previous")
+                rec_np, rec_b = promote_record(a), promote_record(b)
+                sys.stdout = st_np = io.StringIO()
+                try:
+                    cmd_status([], {})
+                finally:
+                    sys.stdout = quiet
                 r_np_prove = cmd_prove([a], np)
             finally:
                 globals()["proven"] = real_proven
             r_np_rb = cmd_rollback([], {})            # back to b current, a previous, for the cases below
             cur_np_rb = link_target("current")
+            sys.stdout = st_rb = io.StringIO()
+            try:
+                cmd_status([], {})
+            finally:
+                sys.stdout = quiet
+            # promote.log cannot be appended to (a directory in its place): refused before current moves
+            log_path = os.path.join(ROOT, PROMOTE_LOG)
+            os.rename(log_path, log_path + ".away")
+            os.mkdir(log_path)
+            r_np_nolog = cmd_promote([a], np)
+            cur_np_nolog = link_target("current")
+            os.rmdir(log_path)
+            os.rename(log_path + ".away", log_path)
             r_side = cmd_promote([side], o)
             cur_side = link_target("current")
             r_pin_side = cmd_pin([], o)
@@ -2158,6 +2237,19 @@ def selfcheck():
              "proof skipped (--no-prove) on the owner's 2026-10-13 17:33Z direction" in said.getvalue())
         case("rollback after a --no-prove promote puts the one before back", r_np_rb == 0 and cur_np_rb == cur_b)
         case("prove refuses --no-prove (promote's alone)", r_np_prove == 2)
+        case("promote --no-prove --pr N is refused (exit 2) before a proof or a switch: unproven means on main",
+             r_np_pr == 2 and cur_np_pr == cur_b and proofs_np_pr == 0)
+        case("a --no-prove promote appends a no-prove line for its sha with the caller to promote.log",
+             rec_np is not None and rec_np[1] == "no-prove" and rec_np[2].startswith("pid ") and
+             re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", rec_np[0]) is not None)
+        case("a proven promote appends a proven line", rec_b is not None and rec_b[1] == "proven")
+        case("status says current was not proven after a --no-prove promote",
+             f"proven        no (--no-prove at {rec_np[0]}" in st_np.getvalue() if rec_np else False)
+        case("status says yes once current is a proven release again (rollback)",
+             "proven        yes\n" in st_rb.getvalue())
+        case("promote refuses (exit 3) and keeps current when promote.log cannot be appended to",
+             r_np_nolog == 3 and cur_np_nolog == cur_b)
+        case("promote_record: no log line for a sha is None (status says unknown)", promote_record("0" * 40) is None)
         case("--no-prove: parse() takes it", parse(["promote", "--no-prove"])[1].get("no-prove") is True)
         case("a commit not on origin/main is refused", r_side != 0 and cur_side == cur_b)
         case("origin/main resolves to origin's, not to a local branch named origin/main",
