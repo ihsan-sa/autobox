@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 from lander import board as B  # noqa: E402
 from lander import cards as C  # noqa: E402
 from lander import events as E  # noqa: E402
+from lander import health as HL  # noqa: E402
 from lander import lane as L  # noqa: E402
 from lander import types as T  # noqa: E402
 
@@ -967,6 +968,25 @@ class MainRedAlert(Stubbed):
         os.remove(os.path.join(self.answers_path, "cc-notify.rc"))
         self.assertEqual(len(self.flag([self.held(7, fails=())], 3602)), 1)
         self.assertIn("none named, only its exit code", self.argvs("cc-notify")[-1][-1])
+
+    def main_record(self, status, at):
+        os.makedirs(os.path.dirname(HL.path("demo")), exist_ok=True)
+        C.write_json(HL.path("demo"), {"tip": "d" * 40, "checks": {"e2e-cc-context": {
+            "status": status, "tree": "t" * 40, "tip": "d" * 40, "at": at}}})
+
+    def test_a_pass_on_main_after_the_hold_began_clears_the_alert(self):
+        # 10-19: main-health logged the check passed on the tip at 22:48Z, and a job held since 19:46Z still sent
+        # "red on main for 203 min" at 23:09Z
+        self.main_record(T.PASSED, E.stamp(E.epoch_of(Q) + 1800))
+        self.assertEqual(self.flag([self.held(7)], 3601), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_pass_before_the_hold_or_a_red_record_still_alerts(self):
+        self.main_record(T.PASSED, E.stamp(E.epoch_of(Q) - 1))   # green, then the hold found it red
+        self.assertEqual(len(self.flag([self.held(7)], 3601)), 1)
+        self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
+        self.assertEqual(len(self.flag([self.held(7)], 3601 + 3601)), 1)
+        self.assertEqual(len(self.argvs("cc-notify")), 2)
 
 
 if __name__ == "__main__":

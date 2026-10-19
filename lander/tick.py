@@ -35,7 +35,8 @@
             noted (cards.held), and the age counts from the hold's end (the last hold seen, or the job's unheld_at).
   main-red  each repo (none in a GitHub backoff): a check red on main whose oldest hold on a job (extra.main_red
             since=) began more than cards.WAIT_FLAG_SECS ago -> one planner request (cards.main_red) naming the
-            check and main's failing cases, at most once an hour per repo and check, whichever PRs it holds.
+            check and main's failing cases, at most once an hour per repo and check, whichever PRs it holds. A
+            hold main's own record (health) has since seen pass on main says nothing: main went green on it.
   cards     each repo (those above, and each with a queued-card record) with no lane running whose queued card
             waits on a last edit the box-wide cap or a Slack 429 held (cards.left_held): cards.positions on its queue, so the edit goes once a slot is free; the rearm
             step arms a tick for when it will be (cards.edit_wait). A running lane hands its queue over itself.
@@ -674,14 +675,20 @@ def flag_main_red(repos, cards, now=None) -> list:
     and its failing IDs". For each repo, each job whose extra.main_red names a check with a since= more than
     cards.WAIT_FLAG_SECS ago (seconds against seconds; exactly an hour is not more) -> cards.main_red, which says it
     at most once an hour per repo and check, whichever PR it names; the oldest such job per check is the one asked.
+    A hold whose check main's own record (health) passed at or after its since= is skipped: a held job keeps
+    extra.main_red until its own run of the check, so without this main going green left the hold aging into an
+    alert (10-19: "red on main for 203 min" sent 21 min after main-health logged it passed on the tip).
     `cards` is the installed cards unit; with none, or in a GitHub backoff, nothing is flagged."""
     lines, t = [], int(now if now is not None else time.time())
     for r in (repos if cards and not GH.backoff() else []):
         try:
-            oldest = {}
+            oldest, rec = {}, HL.load(r)["checks"]
             for j in J.lane_jobs(r):
                 mr = j.extra.get("main_red")
                 at = E.epoch_of(mr.get("since") or "") if isinstance(mr, dict) else 0
+                main = rec.get(mr.get("check")) if at else None
+                if isinstance(main, dict) and main.get("status") == T.PASSED and E.epoch_of(main.get("at")) >= at:
+                    continue
                 if at and t - at > C.WAIT_FLAG_SECS and (mr.get("check") not in oldest
                                                          or at < oldest[mr.get("check")][0]):
                     oldest[mr.get("check")] = (at, j)
