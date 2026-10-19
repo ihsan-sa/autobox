@@ -19,7 +19,7 @@ def selfcheck():
             print(f"FAIL {name}: got {got!r}, want {want!r}")
 
     base = tempfile.mkdtemp(prefix="cc-room-sc.")
-    keep = {k: os.environ.get(k) for k in ("CC_ROOM_DIR", "CC_STATUSLINE_DIR", "CC_WORKER_CAP",
+    keep = {k: os.environ.get(k) for k in ("CC_ROOM_DIR", "CC_STATUSLINE_DIR", "CC_USAGE_DIR", "CC_WORKER_CAP",
                                           "CC_WORKER_PACE_MARGIN", "CC_ROOM_POLL", "CC_CONFIG", "LANDER_LOADAVG",
                                           "TMUX", "TMUX_PANE", "CC_SLACK_ALIAS", "CC_ROOM_TMUX", "CC_ROOM_BIN",
                                           "CC_ROOM_NOTICE_AFTER", "CC_HEAVY_CAP", "CC_HEAVY_SCOPE",
@@ -46,7 +46,7 @@ def selfcheck():
         """a room and a statusline dir of this case's own, nothing held, nothing queued"""
         d = f"{base}/{name}"
         os.makedirs(f"{d}/sl")
-        os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_WORKER_CAP=str(cap),
+        os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_USAGE_DIR=f"{d}/usage", CC_WORKER_CAP=str(cap),
                           CC_WORKER_PACE_MARGIN=str(margin), CC_ROOM_POLL="0.2", CC_CONFIG=f"{d}/config",
                           CC_ROOM_NOTICE_AFTER="3600", CC_HEAVY_CAP="1", CC_HEAVY_SCOPE="0", CC_ROOM_BIN=f"{d}/bin",
                           CC_ROOM_TMUX=f"{d}/bin/tmux", CC_ROOM_GRACE="1", CC_ROOM_NOTICE_RETRY="300",
@@ -200,6 +200,19 @@ esac''')):
         t("pace: the freshest file decides, not an older one", why_not(), "")
         os.unlink(f"{d}/sl/new.json")
         t("pace: …and with only the older one left it is queued", "90%" in why_not(), True)
+
+        # cc-usage-poll's live reading wins over the statusline files while it is fresh, and only then
+        def polled(used, left_s, age_s):
+            os.makedirs(f"{d}/usage", exist_ok=True)
+            json.dump({"at": time.time() - age_s, "five_hour": {"used_percentage": used,
+                                                                "resets_at": time.time() + left_s}},
+                      open(f"{d}/usage/now.json", "w"))
+        polled(64, 3 * 3600, 30)
+        t("pace: a fresh now.json decides over the statusline files", "64%" in why_not(), True)
+        polled(10, 3 * 3600, 600)
+        t("pace: a stale now.json falls back to the statusline files", "90%" in why_not(), True)
+        polled(10, -60, 30)
+        t("pace: a fresh now.json whose window has reset falls back too", "90%" in why_not(), True)
 
         # the queued launch runs on its own once room frees, and not before
         d = fixture("frees", cap=1)
