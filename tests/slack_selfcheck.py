@@ -12321,6 +12321,19 @@ def run_selfcheck():
             globals()["log"] = realLogW
         check("workspaces (c): a B channel that routes elsewhere logs its drop once, not once per message",
               genW == [False] * 3 and len([m for m in logsW if "CBGEN" in m]) == 1)
+        pokedW, doorWasW = [], globals()["door_poke"]
+        globals()["door_poke"] = lambda chat, now=None: pokedW.append(chat)
+        try:
+            hiveW = [dmW.ws_ingress(e) for e in (
+                {"type": "message", "user": "UOWNB", "channel": "CBHIVE", "ts": "9.1", "text": "testing", "_ws": "b"},
+                {"type": "message", "user": "UMEMB2", "channel": "CBHIVE", "ts": "9.2", "thread_ts": "9.1", "_ws": "b"},
+                {"type": "message", "subtype": "bot_message", "bot_id": "BB", "user": "UBOTB", "channel": "CBHIVE",
+                 "ts": "9.3", "_ws": "b"})]
+        finally:
+            globals()["door_poke"] = doorWasW
+        check("workspaces (c): a person's post in a B channel that routes to no session still wakes the hive loop "
+              "whose channel it is, and is dropped after; our own B post wakes nothing",
+              hiveW == [False] * 3 and pokedW == ["CBHIVE", "CBHIVE"])
         check("workspaces (c): a member of B is no owner anywhere — every owner check compares the default owner id, "
               "and a B id never equals it", dmW.role_of("UMEMB2") == "member" and dmW.role_of("UOWNB") == "member"
               and dmW.cfg["SLACK_OWNER_ID"] == "UOWNER")
