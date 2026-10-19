@@ -20,10 +20,10 @@ A planning seat runs it by hand; the lander never installs itself.
         path, a .pyc, .pyo, .so or .pyd, none under core/ or bin-private/ (or either one itself) is a symlink or
         binary (a NUL in its first 8000 bytes), none outside config/system/ is a symlink, and no executable
         (mode 100755) anywhere is binary:
-        binaries(), which the ordinary lane loads from this file and runs on every PR too; a
-        LAND record by exactly
-        `perms-security-read` (review.py's security reader) and a LAND record by another reader both stand at the PR's head (`lander record
-        --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
+        binaries(), which the ordinary lane loads from this file and runs on every PR too; perms'
+        own ledger (~/.cc/state/<repo>/perms/security-reads.json, review.py's perms_reads) records a security read
+        of exactly the PR's head, never a PR marker, and a LAND record by another reader stands at that head
+        (`lander record --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
         box identity in core/) and the candidate's own tests (`<core>/bin/lander selfcheck` and `<core>/tests/lander`)
         pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
         shadow plan: every job in the live queue planned by the current release and by the candidate, side by
@@ -136,6 +136,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1041,10 +1042,11 @@ def open_pr_head(root, pr):
     return j.get("headRefOid") or "", j.get("comments") or []
 
 
-def promotable(root, sha, pr="", head_of=open_pr_head, main=""):
+def promotable(root, sha, pr="", head_of=open_pr_head, main="", ledger=None):
     """'' when `sha` may be promoted, else why not. On origin/main (`main`, the sha main_sha verified, or an
     ancestor of it) always; otherwise only as the cutover's step 5: --pr N, N an OPEN PR whose head is exactly sha,
-    both LAND records `land` demands standing at that head, and a caller that is no worker."""
+    both reads `land` demands standing at that head (land_readers: perms' ledger for the security read), and a
+    caller that is no worker."""
     if not main:
         return "origin/main could not be fetched and checked against origin"
     if git(root, "merge-base", "--is-ancestor", sha, main)[0] == 0:
@@ -1060,7 +1062,7 @@ def promotable(root, sha, pr="", head_of=open_pr_head, main=""):
     if head != sha:
         return (f"{sha[:12]} is not the head of open PR #{pr} "
                 f"({'GitHub names ' + head[:12] if head else 'GitHub names no open head'})")
-    miss = reads_missing(readers(comments, head))
+    miss = reads_missing(land_readers(comments, head, os.path.basename(root), pr, ledger))
     if miss:
         return f"PR #{pr} at {head[:12]} needs {' and '.join(miss)} recorded as LAND at this head"
     return ""
@@ -1701,6 +1703,43 @@ def readers(comments, head):
 PERMS_SECURITY_READER = "perms-security-read"
 
 
+def perms_read(repo, pr, head, path=None):
+    """True when perms' own ledger (<passwd home>/.cc/state/<repo>/perms/security-reads.json, the box user's plain
+    0600 file reached through no symlink) records a read of exactly this repo, PR and head whose verdict is LAND or
+    absent. review.py's perms_reads, copied, since pin copies lander-self alone. A PR marker by perms-security-read
+    never counts: any seat can post one with `gh pr comment` (perms, 10-19)."""
+    name = str(repo).rsplit("/", 1)[-1]
+    path = path or os.path.join(passwd_home(), ".cc", "state", name, "perms", "security-reads.json")
+    if not (head and str(pr).isdigit()) or os.path.realpath(path) != os.path.abspath(path):
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+            return False
+        with os.fdopen(fd, encoding="utf-8") as f:
+            fd = None
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return isinstance(data, list) and any(
+        isinstance(e, dict) and e.get("repo") == name and e.get("pr") == int(pr) and e.get("head") == head
+        and e.get("verdict", "LAND") == "LAND" for e in data)
+
+
+def land_readers(comments, head, repo, pr, ledger=None):
+    """Who read this head: the box's own LAND markers for the other read, and perms' ledger alone for the security
+    read."""
+    by = readers(comments, head) - {PERMS_SECURITY_READER}
+    return by | {PERMS_SECURITY_READER} if perms_read(repo, pr, head, ledger) else by
+
+
 def reads_missing(by):
     sec = {b for b in by if b == PERMS_SECURITY_READER}
     miss = []
@@ -1932,11 +1971,12 @@ def cmd_check(args, opts):
                    f"config/system/) — "
                    f"{', '.join(bins[:8])}. The lander "
                    "imports from core/, so a compiled file there could run in place of the code that was read."), None
-    by = readers(facts.get("comments"), head)
+    by = land_readers(facts.get("comments"), head, repo, pr)
     miss = reads_missing(by)
     if miss:
-        return die(f"check: PR #{pr} at {head[:12]} needs {' and '.join(miss)} recorded at this head "
-                   f"(`lander record {repo} {pr} LAND --by <reader> --head {head[:12]}`); found: "
+        return die(f"check: PR #{pr} at {head[:12]} needs {' and '.join(miss)} recorded at this head (the "
+                   f"security read in perms' security-reads.json, the other with `lander record {repo} {pr} LAND "
+                   f"--by <reader> --head {head[:12]}`); found: "
                    f"{', '.join(sorted(by)) or 'none'}"), None
     tree = merge_tree(root, base_sha, head)
     if not tree:
@@ -2036,6 +2076,28 @@ def selfcheck():
          reads_missing({"opus-5.5", "perms-security-read"}) == [] and
          all(reads_missing({"opus-5.5", n}) == ["a security read"]
              for n in ("security-reviewer", "x-security", "perms-security-read-2", "Perms-Security-Read")))
+    # perms' ledger: only an entry for exactly this repo, PR and head, LAND or no verdict, in a 0600 plain file
+    hd = "ab" * 20
+    with tempfile.TemporaryDirectory() as t:
+        def ledger(name, entries, mode=0o600):
+            p = os.path.join(t, name)
+            with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w") as f:
+                json.dump(entries, f)
+            return p
+        ent = {"repo": "repo", "pr": 7, "head": hd, "change": "ab"}
+        case("ledger: an entry at this head counts", perms_read("repo", "7", hd, ledger("ok.json", [ent])))
+        case("ledger: another head does not", not perms_read("repo", "7", "cd" * 20, ledger("head.json", [ent])))
+        case("ledger: another PR does not", not perms_read("repo", "8", hd, ledger("pr.json", [ent])))
+        case("ledger: a HANDBACK entry does not",
+             not perms_read("repo", "7", hd, ledger("hb.json", [{**ent, "verdict": "HANDBACK"}])))
+        case("ledger: a group-readable file does not",
+             not perms_read("repo", "7", hd, ledger("mode.json", [ent], 0o644)))
+        real = ledger("real.json", [ent])
+        os.symlink(real, os.path.join(t, "link.json"))
+        case("ledger: a symlink does not", not perms_read("repo", "7", hd, os.path.join(t, "link.json")))
+        case("ledger: a marker alone is not the security read",
+             land_readers([mk(hd[:12], "LAND", "opus-5.5"), mk(hd[:12], "LAND", "perms-security-read")], hd, "repo",
+                          "7", ledger("empty.json", [])) == {"opus-5.5"})
     # pin / promote / rollback / legacy on a throwaway repo and HOME
     with tempfile.TemporaryDirectory() as t:
         HOME, ROOT = t, os.path.join(t, ".cc", "lander")
@@ -2319,18 +2381,26 @@ def selfcheck():
         role, here = os.environ.pop("CC_ROLE", None), os.getcwd()
         os.chdir(t)   # no .cc/track above: this selfcheck may itself run inside a worker's worktree
         both = [mk(side[:12], "LAND", "opus-5.5"), mk(side[:12], "LAND", "perms-security-read")]
+        led = os.path.join(t, "security-reads.json")   # perms' ledger, read at the exact head
+        with open(os.open(led, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            json.dump([{"repo": "repo", "pr": 5, "head": side, "change": "ab"}], f)
+        none = os.path.join(t, "no-reads.json")
+        with open(os.open(none, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            json.dump([], f)
         m = red
         try:
-            case("--pr allows exactly the open PR's head with both LAND records",
-                 promotable(repo, side, "5", lambda r, n: (side, both), main=m) == "")
-            case("--pr with another head is refused", promotable(repo, side, "5", lambda r, n: (a, both), main=m) != "")
-            case("--pr without a security LAND at the head is refused", "security" in promotable(
-                repo, side, "5", lambda r, n: (side, both[:1]), main=m))
-            case("--pr with a LAND by a name that only contains security is refused", "security" in promotable(
-                repo, side, "5", lambda r, n: (side, [both[0], mk(side[:12], "LAND", "x-security")]), main=m))
+            case("--pr allows exactly the open PR's head with the Opus LAND and perms' ledger entry",
+                 promotable(repo, side, "5", lambda r, n: (side, both[:1]), main=m, ledger=led) == "")
+            case("--pr with a perms-security-read marker and no ledger entry still needs the security read",
+                 "security" in promotable(repo, side, "5", lambda r, n: (side, both), main=m, ledger=none))
+            case("--pr with another head is refused",
+                 promotable(repo, side, "5", lambda r, n: (a, both), main=m, ledger=led) != "")
+            case("--pr with the ledger but no Opus LAND is refused", "Opus" in promotable(
+                repo, side, "5", lambda r, n: (side, both[1:]), main=m, ledger=led))
             case("--pr with LAND records at an older head is refused", promotable(
                 repo, side, "5", lambda r, n: (side, [mk(a[:12], "LAND", "opus-5.5"),
-                                                      mk(a[:12], "LAND", "perms-security-read")]), main=m) != "")
+                                                      mk(a[:12], "LAND", "perms-security-read")]), main=m,
+                ledger=none) != "")
             case("no --pr: a non-main commit is refused", promotable(repo, side, "", main=m) != "")
             case("no verified main: everything is refused", promotable(repo, b, "") != "")
             os.environ["CC_ROLE"] = "worker"

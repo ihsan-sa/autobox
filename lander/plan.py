@@ -19,23 +19,25 @@ SELECTION, per changed file:
   - ADD-ONLY (owner, 2026-09-28: "a brand-new standalone tool that nothing calls should be live in minutes"): a change
     that only adds files, and modifies or deletes none, does not widen to default_checks for an unowned path, and is
     leaf rather than wide — nothing that exists can break by a file appearing next to it. Every check that OWNS an
-    added path still runs, so under core/ the identity check (it owns core/**) runs as before, and the gate-first,
-    lander and protected lists still decide the class. Except a path in GLOB_LOADED: something picks a file up there
+    added path still runs, so under core/ the identity check (it owns core/**) runs as before, and the gate-first
+    and lander lists still decide the class. Except a path in GLOB_LOADED: something picks a file up there
     by its directory alone (a test runner, a hook, CI, units and environment.d, templates and instruction files,
     agents, skills, settings), so a new file there runs or configures something, and it widens as before.
     Plan.unowned still names every unowned path for the card; extra["add_only"] lists those that did not widen.
 Plan.checks holds what runs BEFORE the merge. Box-class checks run on main's tip after it and are listed in
 Plan.extra["tip"] instead — except for a gate-first change, which keeps them before the merge (owner, 2026-09-24).
 
-KLASS, first match wins: protected (a policy protected glob, or the caller's `protected` list — CC_PROTECTED_PATHS
-lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy or security file — bar a
+KLASS, first match wins: lander (a policy lander glob, or the policy or security file — bar a
 GENERATED reach file: one where every edge the change adds is one `lander reach` writes on merge-tree(base, head)
 and every edge it drops is one it does not, so the change follows from the code and lands with it; an edge the code
 does not make, or a change git cannot prove, stays lander, and a working copy proves nothing; and bar a CLEAN manifest
 edit (clean_manifest): on merge-tree(base, head), read by this release's code, manifest.clean_faults is empty and no
 changed reach file loses a line, so the manifest and reach files drop out and the change is classed by its other
 files, deleted ones included; the policy file never drops out) > gate-first
-> docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf.
+> docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf. A protected path
+is no class here: the lane's owner door holds CC_PROTECTED_PATHS, and a policy `protected` glob only keeps a change
+off the light lane (light.path_hit). A class ranked above lander, which the lane never acted on, let a file on both
+lists skip lander-self.
 paid: some file matches paid_review, or UNGATED: some unowned path is code (anything but an added data or asset file,
 inert()) and no check bar manifest-widen runs on the change, before the merge or after it (a repo with no manifest of
 its own and no host fallback, or an add-only change nothing owns). Such a change is read instead of landing on
@@ -104,7 +106,7 @@ def tool_name(path: str) -> str:
     return ""
 
 
-def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), clean=()) -> T.Plan:
+def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Plan:
     """The pure core of plan(), on an already-loaded manifest. Tests call this. added: the files in `files` that do
     not exist at the base (plan() works it out); when every file is one, the change is add-only. generated: the reach
     files in `files` whose change agrees with the generator on the merge tree (plan() works it out); they do not
@@ -155,17 +157,14 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
                 names.add(n)
             else:
                 faults.append(f"default check {n!r} is not in the manifest")
-    prot = list(pol.protected) + list(protected)
     lander = list(pol.lander) + [p + f for p in M.PREFIXES for f in (M.POLICY, M.SECURITY)]
-    if any(M.match(prot, f) for f in files):
-        klass = T.PROTECTED
     # brief: "a reach.tsv change that exactly matches what the generator writes on the PR's merge tree follows from
     # the code, so it's not a policy edit"; "a reach.tsv edit that doesn't match the generator still goes to
     # lander-self".
     # Matched edge by edge (generated_change), so drift main already carries does not stop a PR that adds its own.
     # perms' terms (#1234): "A LANDING.toml / reach.tsv edit stops counting toward LANDER when widen_faults(base, head)
     # is empty AND reach.tsv's diff is pure additions"; every other file, deleted ones included, still counts.
-    elif any(M.match(lander, f) for f in files if f not in generated and f not in clean):
+    if any(M.match(lander, f) for f in files if f not in generated and f not in clean):
         klass = T.LANDER
     elif any(M.match(pol.gate_first, f) for f in files):
         klass = T.GATE_FIRST
@@ -201,9 +200,9 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
                   paid=ungated or bool(security) or any(M.match(pol.paid_review, f) for f in files), extra=extra)
 
 
-def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=(), fallback: str = "") -> T.Plan:
+def plan(repo_root: str, base_sha: str, head_sha: str, files: list, fallback: str = "") -> T.Plan:
     """Planner.plan. base_sha must carry a manifest that parses (else ManifestError); head_sha "" is the working
-    copy. protected: the box's CC_PROTECTED_PATHS for this repo, which no tree may carry. fallback: a host manifest
+    copy. fallback: a host manifest
     for a repo that ships none. Ungated code (select) is judged on the base's checks alone, never the head's."""
     base = M.load(repo_root, base_sha, fallback=fallback)
     head = M.load(repo_root, head_sha, fallback=fallback, strict=False)
@@ -212,11 +211,10 @@ def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=()
     generated = generated_reach(repo_root, base_sha, head_sha, files)
     clean = clean_manifest(repo_root, base_sha, head_sha, files, generated, fallback)
     since = M.fork(repo_root, base_sha, head_sha, fallback)   # a check main retired since the head branched stays out
-    p = select(M.widen(base, head, M.Trees(repo_root, base_sha, head_sha), since), files, protected, added, generated,
-               clean)
+    p = select(M.widen(base, head, M.Trees(repo_root, base_sha, head_sha), since), files, added, generated, clean)
     # perms 10-12: "the lane can't build its plan from the PR's own head LANDING.toml". Whether code is ungated is
     # the base's word: a check the head adds (run = 'true' over **) would otherwise make it look gated, and unpaid.
-    if not p.extra.get("ungated") and select(base, files, protected, added, generated, clean).extra.get("ungated"):
+    if not p.extra.get("ungated") and select(base, files, added, generated, clean).extra.get("ungated"):
         p.paid, p.extra["ungated"] = True, True
     return p
 

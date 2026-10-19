@@ -29,9 +29,9 @@ HANDBACK, HELD, QUERY = "handback", "held", "query"
 JOB_STATES = (QUEUED, PLANNED, CHECKING, MERGEABLE, MERGED, DEPLOY_PENDING, DEPLOYED, DONE, HANDBACK, HELD, QUERY)
 
 # Plan.klass: what kind of change this is, which decides the lane's route (gate-first runs box checks pre-merge,
-# serially; lander goes to lander-self and is refused here; protected stops for a person).
-DOCS, LEAF, WIDE, GATE_FIRST, LANDER, PROTECTED = "docs", "leaf", "wide", "gate-first", "lander", "protected"
-PLAN_CLASSES = (DOCS, LEAF, WIDE, GATE_FIRST, LANDER, PROTECTED)
+# serially; lander goes to lander-self and is refused here).
+DOCS, LEAF, WIDE, GATE_FIRST, LANDER = "docs", "leaf", "wide", "gate-first", "lander"
+PLAN_CLASSES = (DOCS, LEAF, WIDE, GATE_FIRST, LANDER)
 
 # Result.status. `unrunnable` is killed, OOM or no result: never read as red.
 PASSED, FAILED, UNRUNNABLE = "passed", "failed", "unrunnable"

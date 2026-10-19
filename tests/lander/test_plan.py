@@ -773,8 +773,8 @@ class Select(unittest.TestCase):
         self.root, self.base = r.root, r.base
         self.m = M.load(r.root, r.base)
 
-    def sel(self, *files, protected=()):
-        return P.select(self.m, list(files), protected)
+    def sel(self, *files):
+        return P.select(self.m, list(files))
 
     def test_a_leaf_tool_selects_its_checks_and_its_callers_not_further(self):
         p = self.sel("core/bin/a")
@@ -904,11 +904,16 @@ class Select(unittest.TestCase):
         git(root, "commit", "-qm", "base")
         return M.load(root, git(root, "rev-parse", "HEAD"))
 
-    def test_the_class_order_protected_lander_gate_first(self):
+    def test_the_class_order_lander_gate_first(self):
         self.assertEqual(self.sel("core/lander/plan.py", "core/bin/guard").klass, T.LANDER)
-        self.assertEqual(self.sel("core/lander/plan.py", protected=["core/lander/**"]).klass, T.PROTECTED)
         self.assertEqual(self.sel("tests/LANDING-policy.toml").klass, T.LANDER)   # the policy file itself
         self.assertEqual(self.sel("core/bin/a").klass, T.LEAF)
+
+    def test_a_lander_file_on_a_policy_protected_list_still_goes_to_lander_self(self):
+        # tools simplification (#1508): a protected class ranked above lander, which the lane never acted on, let it
+        # skip lander-self
+        self.m.policy.protected = ["core/lander/**"]
+        self.assertEqual(self.sel("core/lander/plan.py").klass, T.LANDER)
 
     def test_a_manifest_change_selects_manifest_widen(self):
         p = self.sel("tests/LANDING.toml")
