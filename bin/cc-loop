@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # cc-loop — autonomous "ralph loop": run headless Claude on a task, fresh context each iteration, rehydrating
 # from a durable progress journal + git, until the task reports DONE / BLOCKED / stalls / caps are hit.
+# A BLOCKED line that only asks for a push ("cannot be pushed", "push from the host") of commits the track branch's
+# remote already holds, and asks nothing else, is not a stop: the loop takes it out of the journal, says why there,
+# and runs on (already_pushed).
 #   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M=CC_WORKER_MODEL] [--effort E] [--quiet]
 #                          [--resume-last]  iteration 1 continues this track's last claude session instead of a cold
 #                                           one — for a repair round, where the context that found the bug is the
@@ -403,7 +406,7 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
     "$1" "$(sed -n 's/^\([0-9]\)\. \*\*\([^*]*\)\*\*.*/ \1. \2/p' "$CHECKLIST" | tr -d '\n')"; }
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself, and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself (a push you cannot make is never a reason to stop), and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -416,6 +419,49 @@ this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken �
   # "already there", so the first STATUS line a new track ever writes was invisible (caught by selftest.sh's w11).
   awk -v f1="$1" 'FILENAME==f1{a[FNR]=$0; n=FNR; next} !f && FNR<=n && a[FNR]==$0 {next} {f=1; print}' \
       "$1" "$2" 2>/dev/null; }
+
+already_pushed(){   # $1 a STATUS: BLOCKED line → 0 and "<shas> on <remote>/<branch> (tip <short>)" when it only asks for a push the remote already has
+  # A sandboxed worker cannot push, so it sometimes stops on "merge <sha> is committed locally but cannot be pushed
+  # from the sandbox; push from the host". By then this loop's own cc-checkpoint --push (above it, every iteration)
+  # or the delivery path has already put that sha on the track branch, so the stop pages the seat for nothing: three
+  # rows on 10-13 cost a planning turn each to fetch, compare and clear it by hand. Cleared here only when the line
+  # is a push ask in that shape and asks NOTHING else: split at ';' and '.', with each commit-shaped word (hex with a
+  # digit) read as SHA, EVERY clause must be one whole sentence of the shape ("merge SHA is committed locally but
+  # cannot be pushed from the sandbox", "push from the host", "the sandbox has no credentials") and one of them a
+  # push clause. A word-by-word allowlist let "...; please merge it to branch track/release" through, since each of
+  # its words is a push-ask word; a clause in no shape, a '?' anywhere ("should I force-push SHA?"), or a tail on a
+  # shaped clause ("push from the host and decide the port") stays a stop. The words are split with `read -a`, so a
+  # glob character on the line is never expanded against the worktree. The line must also name at least one commit,
+  # and EVERY sha-shaped word in it must be a commit already contained in the branch's remote-tracking ref, which a
+  # push from any worktree of the repo updates. Anything else, an unknown sha, no tracking ref, stays the person's stop.
+  local q="$1" br r tip w n=0 said="" c="" pushc=0 ws own
+  br=$(git -C "$WT" symbolic-ref -q --short HEAD 2>/dev/null) || return 1
+  # A push "to track/<name>" is this row's push only when <name> is this row's: "push from the host to
+  # track/release" asks for a push to another branch, which no ref of this one answers.
+  own=$(sed 's/[][\.*^$+?(){}|/]/\\&/g' <<<"$br" | tr 'A-Z' 'a-z')
+  local subj="(SHA( (and )?SHA)*|it|this|them)"
+  local A="^((the )?(merge|commit|commits|head) )?$subj( (is|are|was))?( (committed|made))?( locally| local)?( but)? (cannot|can't|can not) be pushed( (from|in) (the |this )?sandbox)?( here)?( no (push )?credentials?)?$"
+  local B="^(so )?(please )?push( $subj)? from the host( to (origin|the (track )?branch|$own))?$"
+  local C="^((the )?sandbox has no (push )?credentials?|no (push )?credentials? in the sandbox)$"
+  case $q in *'?'*) return 1;; esac
+  read -ra ws <<<"$(sed -E 's/^STATUS: BLOCKED:[[:space:]]*//; s/([;,.:()])/ \1 /g' <<<"$q" | tr 'A-Z' 'a-z')"
+  for w in "${ws[@]}" ';'; do
+    case $w in
+      ';'|.) [ -z "$c" ] && continue
+             if [[ $c =~ $A || $c =~ $B ]]; then pushc=1; elif ! [[ $c =~ $C ]]; then return 1; fi; c="";;
+      ,|:|'('|')') ;;
+      *) [[ $w =~ ^[0-9a-f]{7,40}$ && $w =~ [0-9] ]] && w=SHA; c="${c:+$c }$w";;
+    esac; done
+  [ "$pushc" = 1 ] || return 1
+  r=$(git -C "$WT" config --get "branch.$br.remote" 2>/dev/null); r=${r:-origin}
+  tip=$(git -C "$WT" rev-parse -q --verify "refs/remotes/$r/$br^{commit}" 2>/dev/null) || return 1
+  for w in $(grep -oiE '\b[0-9a-f]{7,40}\b' <<<"$q" | grep '[0-9]' | tr 'A-F' 'a-f' | sort -u); do
+    git -C "$WT" rev-parse -q --verify "$w^{commit}" >/dev/null 2>&1 || return 1
+    git -C "$WT" merge-base --is-ancestor "$w" "$tip" 2>/dev/null || return 1
+    n=$((n+1)); said="${said:+$said, }$w"
+  done
+  [ "$n" -gt 0 ] || return 1
+  printf '%s on %s/%s (tip %s)' "$said" "$r" "$br" "${tip:0:8}"; }
 
 round_end(){   # $1 did the last iteration commit? · $2 the track's PR, if it has one → "<outcome>|<board word>"
   # Under --no-extend the limit IS the end of the round — a caller may ask for exactly one — so an
@@ -1621,6 +1667,49 @@ EDA
   t '…as the owner\047s decision card under a stable blocked: id, routed by the track, the row and the question alone — no STATUS line, no resume recipe' \
     "$(grep -v '^--ask|' "$d/lb.n" | sed -E 's/(blocked:lp\/bk:)[0-9a-f]+:[0-9]+/\1H:C/')" "--decision|--id|blocked:lp/bk:H:C|-t|lp/bk needs you|bk: which port do I use?|"
   t '…and no unmentioned --major post of it on #<repo>' "$(grep -c -- '--major' "$d/lb.n")" 0
+  # ── A PUSH ASK THE REMOTE ALREADY ANSWERED IS NOT A STOP (10-13: three rows paged the seat for one each) ── each case
+  # its own worktree with a bare origin: pp names (by full sha) a commit origin's track branch already holds, pn one it
+  # does not, pq a pushed commit in a question that is not about a push, pf one in a force-push question, pm one in the
+  # named shape with a second ask on the line, pr one whose push-ask clauses are followed by a whole clause asking a
+  # merge to another branch (every word of it a push-ask word), pd one in the deploy question an earlier review
+  # handed back, pt one asking the push to its own track branch, po one asking it to another track's branch. No
+  # cc-checkpoint on this copy, so nothing pushes here.
+  pfx(){ local w="$lh/.cc/worktrees/lp/$1"; mkdir -p "$lh/.cc/state/lp/$1" "$w"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
+    git init -q --bare "$d/$1.git"; git -C "$w" init -q -b "track/$1"; git -C "$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "$w" remote add origin "$d/$1.git"; git -C "$w" push -q -u origin "track/$1" 2>/dev/null
+    [ "$1" = pn ] && git -C "$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m local
+    if [ "$1" = pp ]; then git -C "$w" rev-parse HEAD; else git -C "$w" rev-parse --short HEAD; fi; }
+  for c in pp pn pq pf pm pr pd pt po; do
+    s=$(pfx "$c"); case $c in pq) l="STATUS: BLOCKED: is $s the right base, or should I rebase?";;
+      pf) l="STATUS: BLOCKED: should I force-push $s over the rebased branch?";;
+      pm) l="STATUS: BLOCKED: merge $s cannot be pushed from the sandbox; push from the host and decide which port the service takes";;
+      pr) l="STATUS: BLOCKED: merge $s cannot be pushed from the sandbox; push from the host; please merge it to branch track/release";;
+      pd) l="STATUS: BLOCKED: $s is pushed; may I deploy it to production?";;
+      pt) l="STATUS: BLOCKED: merge $s cannot be pushed from the sandbox; push from the host to track/pt";;
+      po) l="STATUS: BLOCKED: merge $s cannot be pushed from the sandbox; push from the host to track/other-row";;
+      *) l="STATUS: BLOCKED: merge $s is committed locally but cannot be pushed from the sandbox; push from the host";; esac
+    : > "$d/lb.n"
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+        FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$l" FK_COMMIT=0 "$lb/cc-loop" lp "$c" --max-iter 1 --no-extend ) >/dev/null 2>&1
+  done
+  t 'a BLOCKED push ask for a sha origin already holds stops nothing: no exit 3, its STATUS line gone from the journal, and the journal and loop.log say why' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pp/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pp/progress.md")/$(grep -c 'cc-loop: the BLOCKED line asked for a push, but [0-9a-f]* on origin/track/pp (tip [0-9a-f]*) already' "$lh/.cc/state/lp/pp/progress.md")/$(grep -c 'BLOCKED push ask cleared' "$lh/.cc/state/lp/pp/loop.log")" 0/0/1/1
+  t '…but one naming a commit origin does not have still stops as needs-you, its line kept' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pn/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pn/progress.md")" 1/1
+  t '…and so does a question that is not about a push, though the sha it names is on origin' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pq/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pq/progress.md")" 1/1
+  t '…and so does a push question in no push-ask shape (a force-push), though its sha is on origin' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pf/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pf/progress.md")" 1/1
+  t '…and so does a push ask in the named shape that asks something else too, its line kept whole' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pm/loop.log")/$(grep -c '^STATUS: BLOCKED: merge [0-9a-f]* cannot be pushed .* decide which port' "$lh/.cc/state/lp/pm/progress.md")" 1/1
+  t '…and so does a push ask followed by a clause asking a merge to another branch, its line kept whole' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pr/loop.log")/$(grep -c '^STATUS: BLOCKED: merge [0-9a-f]* cannot be pushed .*; please merge it to branch track/release$' "$lh/.cc/state/lp/pr/progress.md")" 1/1
+  t '…and so does a deploy question about a commit already pushed, its line kept whole' \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pd/loop.log")/$(grep -c '^STATUS: BLOCKED: [0-9a-f]* is pushed; may I deploy it to production?$' "$lh/.cc/state/lp/pd/progress.md")" 1/1
+  t "…a push from the host to this row's own track branch is cleared like the plain ask" \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pt/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pt/progress.md")/$(grep -c 'BLOCKED push ask cleared' "$lh/.cc/state/lp/pt/loop.log")" 0/0/1
+  t "…but one asking a push to another track's branch stops, its line kept whole" \
+    "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/po/loop.log")/$(grep -c '^STATUS: BLOCKED: merge [0-9a-f]* cannot be pushed .*push from the host to track/other-row$' "$lh/.cc/state/lp/po/progress.md")" 1/1
   # THE SEAT TAKES IT: the same run beside a broker that answers, on its own bin copy. Nothing is posted, and the
   # seat's one line carries the decision card it would raise, under the same id.
   # A seat that took it is a broker rc 0 AND an open window for its key (target_live): a tmux stub on the PATH says lp's is open.
@@ -2384,7 +2473,14 @@ while [ $i -lt "$MAXI" ]; do
       done_card "$("$BOARD" get "$repo" "$track" pr)" "$landed"; exit 0
     fi
   fi
-  if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
+  if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ] && ap=$(already_pushed "$q"); then
+    # a push ask the remote already answered: the STATUS line comes out of the journal (only this iteration's, matched
+    # whole and last), the journal says why for the next fresh context, and the loop goes on instead of paging the seat
+    awk -v n="$(grep -nxF -- "$q" "$ST/progress.md" | tail -1 | cut -d: -f1)" 'NR!=n' "$ST/progress.md" > "$ST/progress.md.tmp" && mv -f "$ST/progress.md.tmp" "$ST/progress.md"
+    printf '\n%s cc-loop: the BLOCKED line asked for a push, but %s already: pushed from the host after the iteration. The line is cleared; carry on with the task, and never stop to ask for a push (the loop pushes after every iteration).\n' "$(date -u +%FT%TZ)" "$ap" >> "$ST/progress.md"
+    log "iter $i: BLOCKED push ask cleared — $ap"; "$BOARD" note "$repo" "$track" "a BLOCKED push ask was already pushed ($ap): cleared, still running" >/dev/null 2>&1
+    q=""; fi
+  if [ -n "${q:-}" ]; then
     # The question, then how to answer it, as sentences rather than an aside in brackets. The two paths stay: whoever
     # answers has to type them, and the planning session this goes to has no other way to find the worker's files.
     stop 3 "needs you" "$q  Settle it yourself if you can; only if it is the owner's to decide, ask him with cc-notify --decision. To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: $(again)" waiting \
