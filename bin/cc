@@ -724,6 +724,23 @@ onto_pr(){   # $1 repo $2 track $3 worktree → "<branch> <url>" for a row whose
   v=$(cd / && timeout -k 5 30 gh pr view "$pr" --json url,state,isCrossRepository,headRefName 2>/dev/null) || return 1
   onto_pr_branch "track/$2" "$(default_branch "$DEV/$1")" "$slug" <<<"$v"; }
 
+# CC DONE ASKS GITHUB OVER REST (raised-graphql-hour-spent-stalls-landing, 2026-10-19): `gh pr list/create` spend the
+# login's GraphQL hour, which the lander's passes had used up at 18:1xZ while REST still held 4815 of 5000, so two
+# finished tracks ended "open PR lookup failed — no PR created". The lookups and the create are `gh api` on
+# repos/<owner>/<repo>/pulls, the repository being GH_REPO when set (the push remote's, set above), else the push
+# remote's own; gh's {owner}/{repo} placeholders do not follow GH_REPO.
+pr_slug(){   # $1 worktree $2 remote → owner/repo, or nothing
+  local s=${GH_REPO:-}
+  [ -n "$s" ] || s=$(git -C "$1" remote get-url --push "${2:-origin}" 2>/dev/null) || return 0
+  case "$s" in https://*|http://*|ssh://*) s=${s#*://}; s=${s#*@} ;; *@*:*) s=${s#*@}; s=${s/:/\/} ;; esac
+  s=${s%.git}; s=${s%/}; case "$s" in */*/*) s=${s#*/} ;; esac
+  case "$s" in [A-Za-z0-9]*/[A-Za-z0-9._-]*) case "$s" in */*/*) ;; *) echo "$s" ;; esac ;; esac; }
+gh_said(){   # $1 what failed  $2 gh's stderr → one plain line; GitHub's spent rate limit is named with its reset
+  local r; if grep -qi 'rate limit' <<<"$2"; then
+    r=$(gh api rate_limit -q '[.resources.core, .resources.graphql] | map(select(.remaining == 0)) | (.[0] // {}) | .reset // empty' 2>/dev/null)
+    echo "$1: GitHub's API rate limit for this login is spent${r:+ until $(date -u -d "@$r" +%H:%MZ 2>/dev/null)}"
+  else echo "$1${2:+: $(grep -v '^[[:space:]]*$' <<<"$2" | tail -1 | cut -c1-200)}"; fi; }
+
 done_write(){ "$BIN/cc-task" "$1" "$repo" "$track" --generation "$done_generation" "${@:2}" >/dev/null || exit 1; }
 done_fail(){ done_write error "$1" "$2"; echo "cc: $2"; exit 1; }
 pr_body(){   # the PR's body: the worker's own description and a link to the brief, or the brief itself when it left none; then cc's footer.
@@ -1986,26 +2003,35 @@ print(re.sub(r"<!-- cc-brief:inflight -->.*?<!-- /cc-brief:inflight -->\n?", "",
 PY
       ) || done_fail pr "cannot read the brief at $STBASE/$repo/$track/task.md — no PR opened"
     else instr=$("$BOARD" get "$repo" "$track" instructions); fi
-    url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
-    lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || done_fail pr "open PR lookup failed — no PR created"
+    slug=$(pr_slug "$wt" "$rem"); [ -n "$slug" ] || slug='{owner}/{repo}'   # unreadable: gh fills them from the cwd's remotes
+    pulls="repos/$slug/pulls"; gerr=$(mktemp)
+    url=$(cd "$wt" && gh api "$pulls?head=${slug%%/*}:$branch&state=open" -q '.[0].html_url // empty' 2>"$gerr")   # only OPEN: a MERGED PR would be silently reused
+    lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || { m=$(gh_said "open PR lookup failed" "$(cat "$gerr")"); rm -f "$gerr"; done_fail pr "$m — no PR created"; }
+    [ "$lrc" = 0 ] || url=""   # BY HAND too: gh api prints GitHub's error JSON on stdout when it fails, never a PR
     if [ -z "$url" ]; then   # no OPEN PR is not the same as no PR: a squash-merge deletes the branch, so the late caller
       tip=$(git -C "$wt" rev-parse "$branch" 2>/dev/null)   # saw nothing open and opened a duplicate of commits already merged
-      merged=$(cd "$wt" && gh pr list --head "$branch" --state merged --limit 20 --json url,headRefOid -q "[.[]|select(.headRefOid==\"$tip\")][0].url" 2>/dev/null)
-      lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || done_fail pr "merged PR lookup failed — no PR created"
+      merged=$(cd "$wt" && gh api "$pulls?head=${slug%%/*}:$branch&state=closed&per_page=100" -q "[.[]|select(.merged_at != null and .head.sha==\"$tip\")][0].html_url // empty" 2>"$gerr")
+      lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || { m=$(gh_said "merged PR lookup failed" "$(cat "$gerr")"); rm -f "$gerr"; done_fail pr "$m — no PR created"; }
+      [ "$lrc" = 0 ] || merged=""   # an error body is not a merged PR: by hand the PR is opened instead
       if [ -n "$merged" ]; then   # same tip, already merged: nothing to review — no second PR and no second approval card
         done_board merged "$merged"
         "$BOARD" note "$repo" "$track" "cc done: $branch was already merged as $merged (no new commits) — no duplicate PR" >/dev/null 2>&1 || true
-        echo "already merged: $merged (no commits on $branch beyond it)"
+        rm -f "$gerr"; echo "already merged: $merged (no commits on $branch beyond it)"
         [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1
         exit 0
       fi
       if [ "$done_managed" = 1 ]; then done_write error pr "PR create response pending; retry lookup by repository and head"; fi
       body=$(pr_body "$instr" "$repo" "$track")
-      url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
-      crc=$?; [ "$done_managed" = 0 ] || { [ "$crc" = 0 ] && [ -n "$url" ]; } || done_fail pr "PR creation failed or response lost — retry cc done"
+      # The title and body go in files, so the deny-list shim reads them as text, never as a target (core/bin/gh).
+      tf=$(mktemp); bf=$(mktemp); printf '%s' "$title" > "$tf"; printf '%s' "$body" > "$bf"
+      url=$(cd "$wt" && gh api -X POST "$pulls" -f base="$base" -f head="$branch" -F title=@"$tf" -F body=@"$bf" -q .html_url 2>"$gerr" | grep -oE 'https://github.com/[^ ]+' | head -1)
+      crc=$?; rm -f "$tf" "$bf"
+      [ "$done_managed" = 0 ] || { [ "$crc" = 0 ] && [ -n "$url" ]; } || { m=$(gh_said "PR creation failed or its response was lost" "$(cat "$gerr")"); rm -f "$gerr"; done_fail pr "$m — retry cc done"; }
       [ -n "$url" ] && pr_body_mark "$body" "$repo" "$track"
+      [ -n "$url" ] || [ ! -s "$gerr" ] || echo "cc: $(gh_said "PR creation failed" "$(cat "$gerr")")"
     else (cd "$wt" && pr_body_sync "$url" "$instr" "$repo" "$track") || true   # a stale body is reported, never a failed done
     fi
+    rm -f "$gerr"
     "$BIN/cc-scope" check "$repo" --track "$track" 2>/dev/null   # 'done' measured against what was asked: the unsettled asks this track was meant to close, printed where the session still sees them. Never fatal — a ledger does not get to block a PR
     if [ -n "$url" ]; then
       done_board review "$url"; echo "PR: $url"

@@ -149,8 +149,10 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
              the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. Perms reading the PR
-             (review.perms_reading: its read of any head still running, or a finished one at this head that is
-             not a LAND) -> held (box), so a read perms started is waited on. THE MERGE (S1),
+             (review.perms_reading: its read of any head still running, or its perms-hold stub at this head) ->
+             held (box), so a read perms started or claimed is waited on; any other read of the PR short of a LAND
+             at this head (or an older head's LAND at this change), or perms' reads that will not read -> query
+             "planning", so a read that died with no verdict surfaces. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else main_moved again); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
@@ -1475,9 +1477,11 @@ class Lane:
             self.query(job, f"the review read could not be made, so nothing is asked of the PR: "
                             f"{v.extra.get('why') or 'no reason given'}", "planning")
             return False
-        if v.verdict == T.INCOMPLETE:   # a usage or budget wall: wait for the reset it names, no read counted
+        if v.verdict == T.INCOMPLETE:   # a wall, a limit or a silent read: wait for the time it names, no read counted
             until = v.extra.get("until") or ""
-            self.hold(job, f"the review stopped on a usage or budget wall ({v.extra.get('why') or 'no reason given'}); "
+            what = ("a reader handed back without naming a blocker, or answered nothing; retrying"
+                    if v.extra.get("silent") else "the review stopped on a usage or budget wall")
+            self.hold(job, f"{what} ({v.extra.get('why') or 'no reason given'}); "
                            f"no read was counted" + (f", asked again at {until}" if until else ""),
                       kind="box", until=E.epoch_of(until), deferred=True)
             return False
@@ -1531,11 +1535,14 @@ class Lane:
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
             # row, 10-19: "the landing lane merged dispatch#1296 on its own one review read ... before perms'
-            # security read finished" — so a read perms has going holds the merge
+            # security read finished" — so a read perms has going holds the merge, and one that ended short of a
+            # LAND is a query (perms' read of #1525: a dead read held silently)
             from lander import review as R
-            reading = R.perms_reading(job.repo, job.pr, job.head)
-            if reading:
+            reading, wait = R.perms_reading(job.repo, job.pr, job.head, job.digest)
+            if reading and wait:
                 return self.hold(job, reading, kind="box")
+            if reading:
+                return self.query(job, reading, "planning")
             if self.merge(job) != "moved":
                 return
         self.hold(job, f"{base} kept moving under the merge", kind="box")

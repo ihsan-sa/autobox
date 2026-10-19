@@ -156,7 +156,7 @@ grep -q 'open PR lookup failed' ~/.cc/state/$REPO/w1/loop.log && ok "…and the 
 # …and the same command is safe to run again. Both real doors stay shut: the gh stub answers for GitHub, CC_SLACK
 # for #approvals — a fixture PR must never reach either.
 mkdir -p "$T/ghw1"
-printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/91";; esac\nexit 0\n' > "$T/ghw1/gh"
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/91";; esac\nexit 0\n' > "$T/ghw1/gh"
 printf '#!/bin/sh\ncase "$1" in post-approval) echo "W1CARD 1788000000.000200";; esac\nexit 0\n' > "$T/ghw1/slack"; chmod +x "$T/ghw1/gh" "$T/ghw1/slack"
 w1out=$(env SLACK_BOT_TOKEN= CC_SLACK="$T/ghw1/slack" PATH="$T/ghw1:$PATH" "$B/cc" done $REPO w1 --json 2>"$T/w1.err"); w1rc=$?
 { [ "$w1rc" = 0 ] && [ "$("$B/cc-board" get $REPO w1 status)" = review ] \

@@ -1,13 +1,15 @@
 """The lander's review read: one tool-less read per change digest, the delta read after a handback, and the records.
 
     lander record <repo> <pr> LAND|HANDBACK --by <who> [--head <sha>] [--findings TEXT|-]
-                                     write a read a seat made as the PR's marker comment; refused if --head moved,
+                                     write a read a seat made as the PR's marker comment (from the perms seat, a
+                                     LAND also goes in perms' ledger: "a security path"); refused if --head moved,
                                      if it is looser than a HANDBACK already standing (old words map as below), or
                                      if the head, the base or the change digest cannot be worked out right now (a
                                      marker with an empty change= matches no reader, so nothing is posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
     lander perms-read <repo> <pr>    perms only: start its security read of the PR's head in a session of its own, so
                                      a hand-off of the perms window does not end it ("perms' own reads", below)
+    lander perms-hold <repo> <pr>    perms only: hold the PR's merge at its head until perms' read of it says LAND
     lander perms-reads <repo> [<pr>] perms' read files, running and done, newest first
     lander perms-adopt <repo> <pr>   perms only: put its finished LAND read in its ledger, only when that read is of
                                      the PR's live head and change
@@ -115,7 +117,12 @@ which cc-guard lets no other session write (the Cloudflare door trusts perms-all
 must be the box user's own plain 0600 file, reached through no symlink, holding a JSON list of entries like
   {"repo": "<repo>", "pr": 1270, "head": "<40-hex head sha>", "change": "<the change digest>"}
 and one counts only when repo, pr and head are this job's exactly and change is one of keys(). The lander only
-reads that file; perms writes it, by hand or with `perms-adopt` (whose entry adds verdict, read, model and at).
+reads that file. Perms writes it in one of two ways, each run only from the perms seat (perms_seat_caller()), and
+each entry adds verdict LAND, read, model and at: `lander record <repo> <pr> LAND --by <who> --head <sha>` from the
+perms seat posts the marker and appends the entry for the PR's live head and change (read "perms" when <who> is
+perms or perms-*, else <who>), but only when <sha> is that live head in full 40-hex; without it the marker is
+posted and the ledger is not written. `perms-adopt` does the same for a finished `perms-read` (read naming its
+file). Both append under a flock on .security-reads.lock beside the file. No other caller writes it.
 With no such record the answer is INCOMPLETE with extra host=True and security=True, which the lane sends to the planning seat as a query, and no read is bought, because none the lander
 buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_READER included, does not merge it.
 With the record, a verdict recorded at this digest stands as on any change (a HANDBACK there still hands it back);
@@ -128,8 +135,9 @@ plan.select's own list). A delta that touches one, an old head that is gone, a c
 manifest that will not load carries nothing. The LAND then names the old head in extra carried_from, so nobody takes it
 for a fresh read. Only review(), delta_review() and would_read() carry; perms_recorded() itself, and so
 lane.landed_at() and release, still want the head exact.
-`lander record ... --by perms-*` is refused unless the calling Claude session works in the perms seat
-(perms_seat_caller()), but a marker by that name is only a comment: it clears nothing.
+`lander record ... --by perms` or `--by perms-*` is refused unless the calling Claude session works in the perms
+seat (perms_seat_caller()). The marker itself is only a comment and clears nothing; the ledger entry the perms
+seat's LAND appends is what clears the path.
 
 A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup).
 
@@ -140,6 +148,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import sys
 import json
@@ -312,6 +321,7 @@ CLAUDE_VERSIONS = os.path.join(C.PASSWD_HOME, ".local", "share", "claude", "vers
 CLAUDE_VERSIONS_FILE = "/etc/cc/claude-versions"
 ROOT_UID = 0
 PERMS_READS = "security-reads.json"
+PERMS_READS_LOCK = ".security-reads.lock"   # grant()'s flock, beside the ledger
 
 
 def perms_reads_path(repo):
@@ -472,8 +482,10 @@ def load_prompt(name):
 
 
 def parse(answer, digest, model="", tokens=0):
-    """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff).
-    Its unresolved prior blockers become blocking rows only once _buy() has run carried() on it."""
+    """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff), and so
+    is a HANDBACK that names no blocker and leaves no prior one unresolved: it asks a fix nobody can make, and a
+    re-queue at that head would meet it again (#919), so it is retried as a silent read. Its unresolved prior
+    blockers become blocking rows only once _buy() has run carried() on it."""
     try:
         j = json.loads(answer)
     except (TypeError, ValueError):
@@ -490,6 +502,8 @@ def parse(answer, digest, model="", tokens=0):
     unresolved = [str(x) for x in j.get("unresolved") or []]
     moot = [str(x) for x in j.get("moot") or [] if str(x) not in unresolved]
     verdict = j["verdict"]
+    if verdict == T.HANDBACK_VERDICT and not blocking and not unresolved:
+        return None
     if verdict == T.LAND and blocking:   # a blocker is a blocker whatever the verdict word says
         verdict = T.HANDBACK_VERDICT
     return T.Verdict(verdict=verdict, digest=digest, blocking=blocking, advisory=advisory, model=model,
@@ -1537,7 +1551,8 @@ def _security_unread(job, comments, digests):
     return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest, extra={
         "host": True, "security": True,
         "why": f"it changes {shown}, which merges only on perms' security read of this change, and perms' "
-               f"{PERMS_READS} holds no record of head {job.head[:12]} (perms adds it, then queue it again)"})
+               f"{PERMS_READS} holds no record of head {job.head[:12]} (perms records its LAND with `lander record "
+               "... --head <full sha>` from its seat, which writes it, then queue it again)"})
 
 
 def review(job, comments=None):
@@ -1683,7 +1698,7 @@ def _silent(job, j, model, why):
     again, the PR is held with that reason recorded and no fix asked of the author" (owner, 10-12). So the first fault,
     wall or silence at a head is INCOMPLETE (refunded, held till limit_until(), asked again), and the second at that
     head is _held(), which clears the mark so a re-queue starts again at the first try. A usage limit is INCOMPLETE
-    every time: it names its own reset."""
+    every time: it names its own reset. extra["silent"] tells the lane a fault or no answer from a wall or a limit."""
     repo, pr, head = job.repo, job.pr, job.head
     if why.startswith("wall"):
         if (j.get("wall") or {}).get("head") == head:
@@ -1700,7 +1715,8 @@ def _silent(job, j, model, why):
                          fault=why.startswith("fault"), reader=model)
         charge(repo, pr, silent={"head": head, "reader": model, "why": why, "at": C.now()})
     return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
-                     extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model})
+                     extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model,
+                            "silent": not why.startswith(("wall", "limit"))})
 
 
 def read_text(job, template, diff, more):
@@ -1879,9 +1895,10 @@ def perms_seat_caller(repo, pid=None, proc="/proc", state=None, versions=None):
 
 
 def cmd_record(argv):
-    """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]. A --by starting `perms-`
-    (perms-security-read among them) is refused unless perms_seat_caller(): only the perms seat writes perms' name.
-    No marker clears a security path; perms' own record does (perms_recorded)."""
+    """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]. A --by of `perms` or starting
+    `perms-` (perms-security-read among them) is refused unless perms_seat_caller(): only the perms seat writes
+    perms' name. No marker clears a security path; perms' ledger does (perms_recorded), and a LAND recorded from the
+    perms seat with --head at the PR's head in full goes there too (_perms_ledger)."""
     args, opts = [], {}
     it = iter(argv)
     for a in it:
@@ -1895,10 +1912,13 @@ def cmd_record(argv):
     if not opts.get("by"):
         print("lander record: --by names who read it; a verdict with no reader is refused")
         return 2
-    # perms, 10-13: "lander record refuses --by perms-* unless the calling Claude ancestor" runs in the perms seat
-    if re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]).lower().startswith("perms-") and not perms_seat_caller(args[0]):
+    # perms, 10-13: "lander record refuses --by perms-* unless the calling Claude ancestor" runs in the perms seat;
+    # a bare `perms` is its name too (#1523 was recorded --by perms)
+    seat = perms_seat_caller(args[0])
+    named = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]).lower()
+    if (named == "perms" or named.startswith("perms-")) and not seat:
         print(f"lander record: --by {opts['by']} is perms' name, and this was not run from the perms seat; "
-              "nothing posted")
+              "nothing posted. Perms records its own read from its seat, which also puts it in perms' ledger.")
         return 1
     head = (opts.get("head") or "").lower()
     if head and not re.fullmatch(r"[0-9a-f]{7,40}", head):
@@ -1928,8 +1948,8 @@ def cmd_record(argv):
     who = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"])
     # a second reader's LAND is posted too: lander-self needs an Opus read and a security read at one head
     if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
-        print(f"lander record: {word} is already recorded for this change; nothing to do")
-        return 0
+        print(f"lander record: {word} is already recorded for this change; nothing posted")
+        return _perms_ledger(job, seat, word, who, head)
     if stands and stands.verdict == T.HANDBACK_VERDICT and word == T.LAND:
         print(f"lander record: HANDBACK stands for this change and LAND is looser; push the fix instead")
         return 1
@@ -1942,6 +1962,31 @@ def cmd_record(argv):
     C.log("recorded", repo, pr, verdict=word, by=re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]),
           head=job.head[:12], change=job.digest[:12] or "-")
     print(f"lander record: {word} recorded on PR #{pr} at {job.head[:12]}")
+    return _perms_ledger(job, seat, word, who, head)
+
+
+def _perms_ledger(job, seat, word, who, head):
+    """The perms seat's LAND through `record` is its security read (perms_recorded), so it goes in perms' ledger in
+    the same step (#1523: a LAND marker by perms, and no ledger entry, was refused INCOMPLETE twice). Any other
+    caller, or any other verdict, writes nothing there. The entry is for job.head, the PR's head now, so it is
+    written only when --head names that head in full: with no --head, perms' read of an earlier head would stand in
+    the ledger for one it never read. The entry says `read: perms` only for perms' own name, but perms_recorded
+    ignores `read`, so a LAND recorded from the perms seat under any --by also counts as the security read: whoever
+    reads from that seat is within perms' trust. -> the exit code."""
+    if not (seat and word == T.LAND):
+        return 0
+    if not (SHA40.fullmatch(head) and head == job.head):
+        print(f"lander record: perms' ledger was not written: pass --head with the full 40-hex sha of the head "
+              f"you read (PR #{job.pr} is at {job.head}), and run this record again")
+        return 1
+    named = who.lower()
+    why = grant(job, "perms" if named == "perms" or named.startswith("perms-") else who, who)
+    if why:
+        print(f"lander record: the marker is on the PR, but perms' ledger {perms_reads_path(job.repo)} was not "
+              f"written ({why}), so a security path will not merge on it. Put that right and run this record again.")
+        return 1
+    C.log("perms-recorded", job.repo, job.pr, head=job.head[:12], change=job.digest[:12])
+    print(f"lander record: perms' LAND of PR #{job.pr} at {job.head[:12]} is in its ledger")
     return 0
 
 
@@ -2005,13 +2050,16 @@ def cmd_will_review(argv):
 #      head (GitHub's, _job_of) and appends perms' ledger entry (perms_recorded) only when that file read exactly
 #      that head at the change digest the PR has now, finished, and says LAND (adoptable()). A stale file names
 #      another head and is never the one found; any file must still match the live head and change.
-# The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge): a read of the PR
-# still running at any head, or a finished one at its head that is not a LAND, holds the merge (box).
+# The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge). It holds (box) while a
+# read of the PR runs at any head, or for a read's run window (HOLD_WINDOW) while perms' `perms-hold` stub stands at
+# its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change) is a
+# query for the planning seat, which is where a read that died with no verdict surfaces.
 
 PERMS_READ_DIR = "reads"
 SHA40 = re.compile(r"[0-9a-f]{40}")
 CLI = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cli.py")
 RUN_WAIT = 10   # seconds the detached read waits for the stub that names it
+HOLD_WINDOW = RUN_WAIT + READ_TIMEOUT   # seconds a perms-hold stub holds before it is a query (a read's run window)
 
 
 def read_dir(repo, make=False):
@@ -2073,7 +2121,8 @@ def load_read(repo, pr, head):
 
 
 def read_files(repo, pr=None):
-    """-> [(pr, head)]: the read files in perms' reads dir, of PR `pr` when given, newest first."""
+    """-> [(pr, head)]: the read files in perms' reads dir, of PR `pr` when given, newest first. A dir that will not
+    list raises OSError."""
     d, _ = read_dir(repo)
     found = []
     for n in os.listdir(d) if d else []:
@@ -2094,19 +2143,81 @@ def alive(pid):
     return True
 
 
-def perms_reading(repo, pr, head) -> str:
-    """Why the lane must not merge PR `pr` yet on account of perms' own reads, or "": a read of it at any head still
-    running (its process alive), or a finished read at `head` that is not a LAND. dispatch#1296 merged on the lane's
-    own read while perms' read of it ran (10-19), and #1298 had to go to draft by hand to wait for one."""
-    for _, h in read_files(repo, pr):
-        e, _ = load_read(repo, pr, h)
+def reads_absent(repo) -> bool:
+    """True when perms has no reads dir for `repo` at all (it never read one of its PRs): the seat dir is no symlink
+    and lstat of the reads dir's name says it is not there. Any other answer (EACCES, ELOOP, something there that
+    read_dir() refuses) is not absent, so the lane fails closed on it."""
+    seat = os.path.dirname(perms_reads_path(repo))
+    if os.path.realpath(seat) != os.path.abspath(seat):
+        return False
+    try:
+        os.lstat(os.path.join(seat, PERMS_READ_DIR))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def held_since(e):
+    """-> seconds since a perms-hold stub's `started`, or None when it carries no readable stamp."""
+    try:
+        at = datetime.datetime.strptime(str(e.get("started")), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - at.replace(tzinfo=datetime.timezone.utc)).total_seconds()
+
+
+def perms_reading(repo, pr, head, digest="") -> tuple:
+    """-> (why, wait): why the lane must not merge PR `pr` at `head` on account of perms' own reads, or ("", False).
+    dispatch#1296 merged on the lane's own read while perms' read of it ran (10-19), and #1298 had to go to draft by
+    hand to wait for one. `wait` is True only when time mends it: a read of the PR at any head still running (its
+    process alive), or a `perms-hold` stub at its head no older than a read's run window (HOLD_WINDOW), which perms
+    starts its read from; an older stub (perms died or handed off before its read began) is a query like a dead read. Everything else that holds is
+    perms' to act on, and the lane makes it a query (perms' read of #1525, 10-19: each of these let a merge through):
+    a finished read at `head` that is not a LAND; one at `head` that failed, went stale or died with no verdict; reads
+    of older heads and none at `head` (a push after perms' HANDBACK); a read file that will not load; a reads dir that
+    is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase)."""
+    d, why = read_dir(repo)
+    if not d:
+        return ("", False) if reads_absent(repo) else (f"perms' reads dir will not read ({why})", False)
+    try:
+        files = read_files(repo, pr)
+    except OSError as x:
+        return f"perms' reads dir will not list ({x.strerror or x})", False
+    at, old = None, []
+    for _, h in files:
+        e, why = load_read(repo, pr, h)
         if not e:
-            continue
+            return f"perms' read file of PR #{pr} at {h[:12]} will not load ({why})", False
         if e.get("state") == "running" and alive(e.get("pid")):
-            return f"perms' security read of PR #{pr} at {h[:12]} is still running"
-        if h == head and e.get("state") == "done" and e.get("verdict") != T.LAND:
-            return f"perms' security read of PR #{pr} at {h[:12]} says {e.get('verdict') or 'nothing'}"
-    return ""
+            return f"perms' security read of PR #{pr} at {h[:12]} is still running", True
+        if h == head:
+            at = e
+        else:
+            old.append((h, e))
+    if at is None:
+        if not old:
+            return "", False
+        h, e = old[0]   # the newest: a HANDBACK after an older LAND at this change still stands
+        if digest and e.get("state") == "done" and e.get("verdict") == T.LAND and e.get("change") == digest:
+            return "", False
+        return (f"perms read PR #{pr} at {h[:12]} ({e.get('verdict') or e.get('state') or 'no verdict'}) and has no "
+                f"read of its head {head[:12]}: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
+    state = at.get("state")
+    if state == "done" and at.get("verdict") == T.LAND:
+        return "", False
+    if state == "held":
+        age = held_since(at)
+        if age is not None and 0 <= age <= HOLD_WINDOW:
+            return f"perms holds PR #{pr} at {head[:12]} for its security read", True
+        return (f"perms held PR #{pr} at {head[:12]} for its security read and none started within "
+                f"{HOLD_WINDOW // 60} minutes: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
+    if state == "done":
+        return f"perms' security read of PR #{pr} at {head[:12]} says {at.get('verdict') or 'nothing'}", False
+    said = "died with no verdict" if state == "running" else f"is {state or 'unfinished'}"
+    return (f"perms' security read of PR #{pr} at {head[:12]} {said}" + (f" ({at['why']})" if at.get("why") else "")
+            + f": perms runs `lander perms-read {repo} {pr}` again, then queue it again"), False
 
 
 def adoptable(job):
@@ -2132,21 +2243,41 @@ def adoptable(job):
     return e, ""
 
 
-def grant(job, e):
-    """Append perms' ledger entry (perms_recorded's form) for read `e`, whole or not at all, 0600. -> why not, or ''."""
+def grant(job, read, model):
+    """Append perms' ledger entry (perms_recorded's form) for perms' LAND of the job's head, `read` naming the read
+    it rests on, whole or not at all: a 0600 file swapped in by rename, in a seat dir reached through no symlink.
+    Callers check perms_seat_caller() first. -> why not, or ''."""
     path = perms_reads_path(job.repo)
-    have, why = perms_reads(job.repo)
-    if why and os.path.lexists(path):
-        return f"perms' ledger will not read ({why}); nothing written over it"
-    if any((x.get("repo"), x.get("pr"), x.get("head"), x.get("change")) == (job.repo, job.pr, job.head, job.digest)
-           for x in have):
-        return ""
-    rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": T.LAND,
-           "read": read_name(job.pr, job.head), "model": e.get("model", ""), "at": C.now()}
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".", suffix=".tmp")   # 0600
-    with os.fdopen(fd, "w") as f:
-        json.dump(have + [rec], f, indent=1)
-    os.replace(tmp, path)
+    seat = os.path.dirname(path)
+    if not (SHA40.fullmatch(job.head or "") and job.digest):
+        return f"PR #{job.pr}'s head or change cannot be worked out right now"
+    if not os.path.isdir(seat) or os.path.realpath(seat) != os.path.abspath(seat):
+        return f"perms' seat dir {seat} is missing or reached through a symlink"
+    tmp = None
+    try:
+        # one writer at a time: two grants that each read the old list would drop one entry
+        lock = os.open(os.path.join(seat, PERMS_READS_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(lock, "w"):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            have, why = perms_reads(job.repo)
+            if why and os.path.lexists(path):
+                return f"perms' ledger will not read ({why}); nothing written over it"
+            if any((x.get("repo"), x.get("pr"), x.get("head"), x.get("change"))
+                   == (job.repo, job.pr, job.head, job.digest) for x in have):
+                return ""
+            rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": T.LAND,
+                   "read": read, "model": model, "at": C.now()}
+            fd, tmp = tempfile.mkstemp(dir=seat, prefix=".", suffix=".tmp")   # 0600
+            with os.fdopen(fd, "w") as f:
+                json.dump(have + [rec], f, indent=1)
+            os.replace(tmp, path)
+            tmp = None
+    except OSError as e:
+        return f"perms' ledger could not be written ({e.strerror or e})"
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
     return ""
 
 
@@ -2218,6 +2349,37 @@ def cmd_perms_read(argv):
     return 0
 
 
+def cmd_perms_hold(argv):
+    """perms-hold <repo> <pr>: hold the lane's merge of the PR at its live head before perms' read of it starts (the
+    held stub perms_reading waits on; `perms-read` replaces it with the running read). Perms seat only."""
+    if len(argv) != 2 or not REPO_RE.match(argv[0]) or not argv[1].isdigit():
+        print("usage: lander perms-hold <repo> <pr>")
+        return 2
+    repo, pr = argv[0], int(argv[1])
+    if not perms_seat_caller(repo):
+        print("lander perms-hold: only the perms seat holds a PR for its read; nothing held")
+        return 1
+    job, facts = _job_of(repo, pr)
+    if job is None:
+        print(f"lander perms-hold: {facts}")
+        return 1
+    if not SHA40.fullmatch(job.head or ""):
+        print(f"lander perms-hold: cannot work out PR #{pr}'s head right now; nothing held")
+        return 1
+    e, _ = load_read(repo, pr, job.head)
+    if e:
+        print(f"lander perms-hold: PR #{pr} at {job.head[:12]} already has a read ({e.get('state')}); nothing held")
+        return 0
+    path, why = write_read(repo, {"repo": repo, "pr": pr, "head": job.head, "change": job.digest, "state": "held",
+                                  "started": C.now()})
+    if not path:
+        print(f"lander perms-hold: {why}; nothing held")
+        return 1
+    print(f"lander perms-hold: PR #{pr} at {job.head[:12]} waits for perms' read; `lander perms-read {repo} {pr}` "
+          f"starts it")
+    return 0
+
+
 def cmd_perms_reads(argv):
     """perms-reads <repo> [<pr>]: perms' read files, newest first: what a successor seat finds running or done."""
     if len(argv) not in (1, 2) or not REPO_RE.match(argv[0]) or not all(a.isdigit() for a in argv[1:]):
@@ -2259,7 +2421,7 @@ def cmd_perms_adopt(argv):
         print(f"lander perms-adopt: PR #{pr} is merged; there is nothing to grant")
         return 1
     e, why = adoptable(job)
-    why = why or grant(job, e)
+    why = why or grant(job, read_name(job.pr, job.head), e.get("model", ""))
     if why:
         print(f"lander perms-adopt: {why}; nothing granted")
         return 1
@@ -2271,5 +2433,6 @@ def cmd_perms_adopt(argv):
 COMMANDS = {"record": (cmd_record, "record a seat's review verdict on a PR at its head"),
             "will-review": (cmd_will_review, "say whether the landing would buy a read of a PR now"),
             "perms-read": (cmd_perms_read, "perms: start a security read that outlives the perms window"),
+            "perms-hold": (cmd_perms_hold, "perms: hold a PR's merge until its read of it says LAND"),
             "perms-reads": (cmd_perms_reads, "perms: list its read files, running and done"),
             "perms-adopt": (cmd_perms_adopt, "perms: grant a merge on its finished read of the PR's live head")}

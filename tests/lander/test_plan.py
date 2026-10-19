@@ -645,6 +645,29 @@ class DeadWeight(unittest.TestCase):
         self.assertEqual(M.run_files("python3 -munittest tests.a tests.b"), ["tests/a.py", "tests/b.py"])
         self.assertEqual(M.run_files("python3 -mtests.a"), ["tests/a.py"])
 
+    def test_the_first_word_reads_past_a_paren_backtick_bang_or_brace(self):
+        """the Opus read of #1532: owns() takes the first word as the check's tool, so `(bin/x` must read bin/x."""
+        for run in ("(bin/x selfcheck)", "`bin/x selfcheck`", "! bin/x selfcheck", "!bin/x selfcheck",
+                    "{ bin/x selfcheck; }", "bin/x\\\n selfcheck"):
+            self.assertEqual(M.run_file(run), "bin/x", run)
+        m = M.Manifest(checks={"x": M.T.Check(name="x", run="(bin/x selfcheck)")})
+        self.assertTrue(m.owns("x", "bin/x"))
+        self.assertEqual(M.run_file("$(bin/x)"), "")
+
+    def test_a_clustered_m_names_its_modules(self):
+        """perms' read of this PR: `-Im` and `-BmX` are `-m` after python flags that take no value."""
+        self.assertEqual(M.run_files("python3 -Im unittest tests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("python3 -Bmunittest tests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("python3 -Bmtests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("python3 -Wm unittest tests.a"), [])   # -W takes a value: m is it
+
+    def test_a_backtick_word_does_not_reach_back_past_a_separator(self):
+        """perms' read of this PR: the backtick word ends at a `;`, `&`, `|`, `(`, `)` or redirection before it."""
+        self.assertEqual(M.run_files("core/bin/cc;x/`true`"), ["core/bin/cc"])
+        self.assertEqual(M.run_files("bin/x;foo/`true selfcheck`"), ["bin/x"])
+        self.assertEqual(M.run_files("bin/x&&y/`true`"), ["bin/x"])
+        self.assertEqual(M.run_files("(bin/x)|y/`true`"), ["bin/x"])
+
     def test_an_escaped_backtick_neither_hides_nor_invents_a_tool(self):
         """perms' read of #1532: a backslash before a backtick is dropped, so `` \\`bin/x\\` `` names bin/x and not
         `bin/x\\`, and `` core/bin/\\`uname\\` `` names nothing."""

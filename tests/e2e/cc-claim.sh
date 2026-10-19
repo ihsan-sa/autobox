@@ -107,7 +107,7 @@ touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
 # the lander and for the next dispatcher — from any process, not only the one that claimed. Completion now
 # needs an actual PR and card response; the missing-response control lives beside P7 below.
 mkdir -p "$T/ghc" "$T/ccslack"
-printf '#!/bin/sh\ncase "$*" in *"pr create"*) echo https://github.com/fixture/repo/pull/1;; esac\nexit 0\n' > "$T/ghc/gh"
+printf '#!/bin/sh\ncase "$*" in *"-X POST "*"/pulls"*) echo https://github.com/fixture/repo/pull/1;; esac\nexit 0\n' > "$T/ghc/gh"
 printf '#!/bin/sh\necho "fixture 1.2"\nexit 0\n' > "$T/ccslack/cc-slack"; chmod +x "$T/ghc/gh" "$T/ccslack/cc-slack"
 mkdir -p ~/.cc/state/$REPO/c6; printf 'Do the c6 thing.\n' > ~/.cc/state/$REPO/c6/task.md
 "$B/cc" claim $REPO c6 --executor subagent >/dev/null 2>&1

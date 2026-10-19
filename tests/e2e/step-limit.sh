@@ -272,7 +272,7 @@ mkclaude landclaude w19 'echo "work $n" > "land-$n.txt"; echo "- step $n" >> "$s
 # Its own copies of the two P8 stubs: a scoped run may skip the stanza that made them, and a case that borrows
 # another stanza's fixture is red for a reason that has nothing to do with what it tests.
 mkdir -p "$T/ghbin8"
-printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
 printf '#!/bin/sh\ncase "$1" in post-approval) echo "CAPPR 1788000000.000100";; esac\nexit 0\n' > "$T/slackstub"; chmod +x "$T/ghbin8/gh" "$T/landstub" "$T/slackstub"
 : > "$T/land.calls"
@@ -319,9 +319,9 @@ cat > "$D/bin/gh" <<'SH'
 #!/bin/bash
 echo "$*" >> "$D/gh.calls"
 case "$*" in
-  *'pr list'*'--state open'*) cat "$D/open" 2>/dev/null; exit 0;;
-  *'pr list'*) exit 0;;
-  *'pr create'*) echo create >> "$D/creates"; echo https://github.com/fixture/repo/pull/77 | tee "$D/open";;
+  *'/pulls?'*'state=open'*) cat "$D/open" 2>/dev/null; exit 0;;
+  *'/pulls?'*) exit 0;;
+  *'-X POST '*'/pulls'*) echo create >> "$D/creates"; echo https://github.com/fixture/repo/pull/77 | tee "$D/open";;
 esac
 SH
 cat > "$D/bin/cc-slack" <<'SH'

@@ -59,7 +59,8 @@
 # account can write ~/.claude, ~/.claude.json and ~/.local/bin, and a session loads all three as it starts. So:
 #   - MCP: the launch carries --strict-mcp-config and --mcp-config launch/mcp.json, which this script writes from a
 #     fixed template (the one server the seat had: cc-slack, the one beside this script, tools only), so no server
-#     from ~/.claude.json or a project file starts with the seat.
+#     from ~/.claude.json or a project file starts with the seat. It is told its target (<repo>, alias perms): the
+#     seat's cwd is no worktree or ~/dev path, so `cc-slack channel` on its own finds none and exits.
 #   - ~/.claude: CLAUDE.md, rules/, agents/, skills/, commands/, output-styles/, plugins/, settings.json and
 #     settings.local.json (all of each but its permission rules and autoMode text, which a session that skips
 #     permissions never consults), ~/.claude.json (but for what every session rewrites as it runs: see CJ_DROP), the
@@ -183,7 +184,9 @@ ctl_repo(){ local c=""
   [ -n "$c" ] || c=$("$HERE/cc-config" get CC_BOX 2>/dev/null)
   [ -n "$c" ] || c=$(hostname -s 2>/dev/null)
   printf %s "$c"; }
-ppid_of(){ awk '{print $4}' "/proc/$1/stat" 2>/dev/null; }   # the field after comm; a comm with spaces never reaches here (claude has none)
+# the field after state, counted from the LAST ')': comm may hold spaces and parens, so a bash copied to 'a b 4242 c'
+# made a plain field count read 4242 and walk to whichever claude that is (security read, PR #914)
+ppid_of(){ local s; s=$(cat "/proc/$1/stat" 2>/dev/null) || return 0; s=${s##*)}; set -f; set -- $s; set +f; echo "${2:-}"; }
 comm_of(){ cat "/proc/$1/comm" 2>/dev/null; }
 
 # session_pid — prints the nearest claude above this shell (a fixture may name a stand-in), or says why not (rc 1)
@@ -401,7 +404,8 @@ SEAT=()
 seat_argv(){
   local l=$1/launch/claude m=$1/launch/mcp.json u; u=$(id -un)
   mkdir -p "$1/launch" && ln -sfn -- "$2" "$l.$$" && mv -Tf -- "$l.$$" "$l" || return 1
-  jq -n --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" '{mcpServers: {"cc-slack": {command: $c, args: ["channel"]}}}' > "$m.$$" \
+  jq -n --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" --arg r "$(basename -- "$(dirname -- "$1")")" \
+    '{mcpServers: {"cc-slack": {command: $c, args: ["channel", $r], env: {CC_SLACK_ALIAS: "perms"}}}}' > "$m.$$" \
     && mv -f -- "$m.$$" "$m" || { rm -f -- "$m.$$"; return 1; }
   SEAT=(/bin/sh -c 'cd -- "$1" && shift && exec /usr/bin/env -i TMUX="${TMUX:-}" TMUX_PANE="${TMUX_PANE:-}" "$@"' cc-perms-seat "$1"
     HOME="$H" USER="$u" LOGNAME="$u" SHELL=/bin/bash PATH="$H/bin:/usr/local/bin:/usr/bin:/bin"
@@ -690,6 +694,15 @@ EOF
   fx forged; mkdir -p "$T/x"; cp "$(readlink -f /bin/bash)" "$T/x/claude"; c=$(SBIN=$T/x/claude stand "$H/dev/r1")
   pids="$pids $c"; echo "r1 $c" > "$F/panes"; out=$(run "${c:-0}"); rc=$?
   ok "$( [ -n "$c" ] && [ $rc = 1 ] && ! started && [[ $out == *"not the claude binary"* ]]; echo $?)" "a copy of another program named claude is refused"
+  fx spaced; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; mkdir -p "$T/sp" "$H/.cc"
+  echo 'CC_WORKER_SANDBOX=1' > "$H/.cc/config"
+  # a non-claude between the call and r1's seat, named so a plain field count of its stat reads r1's seat as its parent;
+  # no CC_PERMS_ROOT_PID, so the call walks its own process tree from there
+  b="$T/sp/a b ${c:-0} c"; cp "$(readlink -f /bin/bash)" "$b"
+  out=$(env -u CC_CONFIG -u CC_PERMS_ROOT_PID CC_WORKER_SANDBOX=1 HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 "$b" -c '"$1" relaunch 2>&1; exit $?' x "$0"); rc=$?
+  # run under a session (no pid namespace of its own) the walk goes on past the spaced name to that session's own
+  # claude, which is not this box's binary: either refusal says the walk did not land on r1's seat ("another session")
+  ok "$( [ -n "$c" ] && [ $rc = 1 ] && ! started && [[ $out == *"not called from a session"* || $out == *"not the claude binary"* ]]; echo $?)" "a parent whose name holds spaces and a pid does not lead the walk to that pid"
   fx window; c=$(stand "$H/dev/r1"); pids="$pids $c"; printf 'r1 %s\nperms 1\n' "$c" > "$F/panes"
   out=$(run "$c"); rc=$?
   ok "$( [ $rc = 1 ] && ! started; echo $?)" "an open perms window with no seat in it is left alone"
@@ -793,8 +806,8 @@ echo "x:x:%s:%s::%s:/bin/bash"
       && ! grep -qE '^(PLANTED|CC_PERMS_ROOT_PID)=' <<<"$e"; echo $?)" \
     "a CLAUDE.md in home that links into the repo, and .claude in home, are allowed, and the seat starts from its argument list under env -i (PATH ~/bin and the system's, no ~/.local/bin), through the program in versions/"
   ok "$( [ "$(sed -n 1p <<<"$a")" = --strict-mcp-config ] && [ "$(sed -n 2p <<<"$a")" = --mcp-config ] && [ "$(sed -n 3p <<<"$a")" = "$(sd)/launch/mcp.json" ] \
-      && [ "$(jq -c '.mcpServers | to_entries | map([.key, .value.command, .value.args])' "$(sd)/launch/mcp.json")" \
-           = "$(jq -nc --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" '[["cc-slack", $c, ["channel"]]]')" ] \
+      && [ "$(jq -c '.mcpServers | to_entries | map([.key, .value.command, .value.args, .value.env])' "$(sd)/launch/mcp.json")" \
+           = "$(jq -nc --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" '[["cc-slack", $c, ["channel", "r1"], {CC_SLACK_ALIAS: "perms"}]]')" ] \
       && ! grep -q planted <<<"$a"; echo $?)" \
     "the seat loads only the MCP servers in its own launch/mcp.json (cc-slack beside this script), never the account's"
 

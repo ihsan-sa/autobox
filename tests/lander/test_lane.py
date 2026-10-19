@@ -68,10 +68,23 @@ if me == "gh":
     if box.get("down"):
         out(1, "", "error connecting to api.github.com")
     prs = box.setdefault("prs", {})
+    import re
+    rest = re.fullmatch(r"repos/[^/]+/[^/]+/(pulls/(\d+)(/files\?per_page=100)?|commits/(\w+)/(check-runs|status)\?per_page=100)",
+                        a[1]) if a[:1] == ["api"] and len(a) > 1 else None
+    if a[:2] == ["api", "--paginate"]:
+        rest = re.fullmatch(r"repos/[^/]+/[^/]+/(pulls/(\d+)(/files)\?per_page=100)", a[2])
+    if rest:   # GitHub's REST answer, made from the same PR the pr view below gives (gh.pr_facts' REST path)
+        n, files, sha, what = rest.group(2), rest.group(3), rest.group(4), rest.group(5)
+        if sha:
+            n = next((k for k, v in prs.items() if v.get("state", "OPEN") == "OPEN"
+                      and g("rev-parse", "refs/heads/" + v["headRefName"]) == sha), None)
+        a = ["pr", "view", n or "0", "--json", "files" if files else
+             "statusCheckRollup" if sha else "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body,mergeCommit,mergeStateStatus"]
+        rest = (files, sha, what)
     if a[:2] == ["pr", "view"]:
         pr = prs.get(a[2])
         if pr is None:
-            out(1, "", "no pull requests found")
+            out(1, "", "Not Found (HTTP 404)" if rest else "no pull requests found")
         fields = a[a.index("--json") + 1].split(",")
         if "statusCheckRollup" in fields and box.get("checks_denied"):   # a token that reads the PR, not its checks
             out(1, "", box["checks_denied"])
@@ -84,6 +97,25 @@ if me == "gh":
         if "files" in fields:
             mb = g("merge-base", "refs/heads/main", d["headRefOid"])
             d["files"] = [{"path": p} for p in g("diff", "--name-only", mb, d["headRefOid"]).splitlines()]
+        if rest and rest[0]:
+            out(0, "\n".join(f["path"] for f in d["files"]))
+        if rest and rest[1]:
+            rows = d.get("statusCheckRollup") or []
+            if rest[2] == "status":
+                out(0, json.dumps({"statuses": [{"context": r.get("context"), "state": (r.get("state") or "").lower(),
+                                                 "target_url": r.get("targetUrl")} for r in rows if "context" in r]}))
+            out(0, json.dumps({"check_runs": [{"name": r.get("name"), "status": (r.get("status") or "").lower(),
+                                               "conclusion": (r.get("conclusion") or "").lower() or None,
+                                               "details_url": r.get("detailsUrl")} for r in rows if "context" not in r]}))
+        if rest:
+            mc = d.get("mergeCommit") if d["state"] == "MERGED" else None
+            out(0, json.dumps({"number": int(a[2]), "state": "open" if d["state"] == "OPEN" else "closed",
+                               "merged_at": "2026-10-19T00:00:00Z" if d["state"] == "MERGED" else None,
+                               "merge_commit_sha": (mc or {}).get("oid"), "draft": d["isDraft"],
+                               "mergeable": {"MERGEABLE": True, "CONFLICTING": False}.get(d["mergeable"]),
+                               "mergeable_state": d["mergeStateStatus"].lower(), "title": d["title"], "body": d["body"],
+                               "head": {"sha": d.get("headRefOid"), "ref": d.get("headRefName")},
+                               "base": {"ref": d["baseRefName"]}}))
         out(0, json.dumps({f: d.get(f) for f in fields}))
     if a[:2] == ["pr", "merge"]:
         pr = prs[a[2]]
@@ -2925,6 +2957,17 @@ class Review(Fixture):
         self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.INCOMPLETE, tokens=0, why="no answer")))
         self.assertEqual(self.job(2).state, T.HELD)
 
+    def test_a_silent_read_is_held_as_a_retry_not_a_wall(self):
+        # a reader that handed back naming no blocker (#919) is retried, and the hold says so, not "a budget wall"
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        quiet = V(T.INCOMPLETE, tokens=0, silent=True, why="codex: no answer: rc=0")
+        self.land(planner=Planner(paid=True), reviewer=Reviewer(quiet))
+        j = self.job()
+        self.assertEqual(j.state, T.HELD)
+        self.assertIn("handed back without naming a blocker", j.extra["why"])
+        self.assertNotIn("budget wall", j.extra["why"])
+
     def test_a_ratchet_pass_lands_and_logs_both_sets(self):
         # owner, 10-13: "a red check on main stops holding PRs that don't make it worse"
         class Ratchet(Runner):
@@ -3128,6 +3171,17 @@ class HeldRereads(Fixture):
         self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.CHECKING))
         self.assertEqual(len(self.pr_views()), before)     # gh is not called during a backoff
         self.assertEqual(rv.calls, [])
+
+    def test_a_spent_rest_quota_backs_off_though_stdout_is_json(self):
+        # gh api prints GitHub's error JSON on stdout and the reason on stderr: the reason still backs off,
+        # while a JSON body that merely says "timeout" (a PR title) with nothing on stderr does not
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(GH.backoff_path())
+        GH._note(1, '{"message":"timeout in the title"}', "")
+        self.assertFalse(os.path.exists(GH.backoff_path()))
+        GH._note(1, '{"message":"API rate limit exceeded for user ID 1."}', "gh: API rate limit exceeded for user ID 1. (HTTP 403)")
+        self.assertGreater(GH.backoff(), 0)
+        os.unlink(GH.backoff_path())
 
     def test_pending_merge_attempt_skips_the_reread(self):
         self.pr(1, {"a/x": "n\n"})
@@ -3616,14 +3670,16 @@ class Branches(Fixture):
         self.assertEqual(sorted(dirs[3:]), ["/home/owner/.local/bin", "/home/owner/bin"])
 
     def test_pr_facts_names_the_repo(self):
-        # a GH_REPO of the caller's would point gh pr view at a decoy PR: -R names the lander's own slug
+        # a GH_REPO of the caller's would point gh pr view at a decoy PR: -R, or the REST path, names the lander's own slug
         seen = []
         ran = mock.Mock(side_effect=lambda argv, **kw: seen.append(argv) or mock.Mock(returncode=0, stdout="{}",
                                                                                      stderr=""))
         with mock.patch.object(GH, "slug", lambda root: "o/demo"), mock.patch.object(GH.subprocess, "run", ran):
             GH.pr_facts(self.root, 5, "state")
             GH.pr_files(self.root, 5)
-        self.assertEqual([a[a.index("-R") + 1] if "-R" in a else "" for a in seen], ["o/demo", "o/demo"])
+            GH.pr_facts(self.root, 5, "comments")
+        self.assertEqual([next((x for x in a if x.startswith("repos/o/demo/pulls/5")), "") or a[a.index("-R") + 1]
+                          for a in seen], ["repos/o/demo/pulls/5", "repos/o/demo/pulls/5/files?per_page=100", "o/demo"])
         with mock.patch.object(GH, "slug", lambda root: ""), mock.patch.object(GH.subprocess, "run", ran):
             GH.pr_facts(self.root, 5, "state")
         self.assertNotIn("-R", seen[-1])
@@ -4884,13 +4940,14 @@ class LandedAt(unittest.TestCase):
 
 class PermsReading(Fixture):
     """dispatch#1296 (10-19): the lane merged a PR on its own read while perms' security read of it still ran. A
-    read perms has running, or a finished one at the head that is not a LAND, holds the merge; none lets it go."""
+    read perms has running (or its hold) holds the merge; a read that ended short of a LAND is a query, so a dead one
+    surfaces (perms' read of #1525); none lets it go."""
 
     def test_a_running_perms_read_holds_the_merge(self):
         from lander import review as R
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
-        with mock.patch.object(R, "perms_reading", lambda repo, pr, head: "perms' read of PR #1 is still running"):
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: ("perms' read of PR #1 is still running", True)):
             _, lines = self.land()
         j = self.job()
         self.assertEqual((j.state, j.extra.get("hold")), (T.HELD, "box"), lines)
@@ -4901,9 +4958,23 @@ class PermsReading(Fixture):
         from lander import review as R
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
-        with mock.patch.object(R, "perms_reading", lambda repo, pr, head: ""):
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: ("", False)):
             _, lines = self.land()
         self.assertEqual(self.job().state, T.DEPLOY_PENDING, lines)
+
+    def test_a_perms_read_that_ended_short_of_a_land_is_a_query(self):
+        from lander import review as R
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        asked = []
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: asked.append(digest) or (
+                "perms' security read of PR #1 died with no verdict", False)):
+            _, lines = self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY, lines)
+        self.assertIn("died with no verdict", j.extra["why"])
+        self.assertEqual(asked, [j.digest])   # the job's change, so an older head's LAND at it can carry
+        self.assertFalse(self.box().get("merges"))
 
 
 if __name__ == "__main__":

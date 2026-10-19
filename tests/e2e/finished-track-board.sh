@@ -132,9 +132,9 @@ cat > "$T/ghbin/gh" <<'F'
 #!/usr/bin/env bash
 D=$(dirname "$(dirname "$0")")
 case "$*" in
-  *"pr list"*"--state open"*)   exit 0 ;;                                            # nothing open on this branch
-  *"pr list"*"--state merged"*) [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/merged.url"; exit 0 ;;
-  *"pr create"*) echo create >> "$D/gh.create"; echo "(no url from this stub)"; exit 0 ;;
+  *"/pulls?"*"state=open"*)   exit 0 ;;                                            # nothing open on this branch
+  *"/pulls?"*"state=closed"*) [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/merged.url"; exit 0 ;;
+  *"-X POST "*"/pulls"*) echo create >> "$D/gh.create"; echo "(no url from this stub)"; exit 0 ;;
 esac
 exit 0
 F
@@ -202,12 +202,16 @@ cat > "$D/bin/gh" <<'SH'
 echo "$*" >> "$D/gh.calls"
 [ "${GH_REPO:-}" = "$(cat "$D/gh-repo" 2>/dev/null || echo "$D/remote.git")" ] || [ -e "$D/legacy" ] || exit 9
 case "$*" in
-  *"pr list"*"--state open"*) [ ! -e "$D/open.fail" ] || exit 1; cat "$D/open" 2>/dev/null; exit 0;;
-  *"pr list"*"--state merged"*)
+  *"api rate_limit"*) echo 1792444560; exit 0;;   # the reset gh_said reads: 21:16Z
+  *"/pulls?"*"state=open"*) [ ! -e "$D/open.fail" ] || exit 1
+    [ ! -e "$D/open.ratelimit" ] || { echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" >&2; exit 1; }
+    cat "$D/open" 2>/dev/null; exit 0;;
+  *"/pulls?"*"state=closed"*)
     [ ! -e "$D/merged.fail" ] || exit 1
+    [ ! -e "$D/merged.json.fail" ] || { echo '{"message":"Server Error","status":"502"}'; echo "gh: Server Error (HTTP 502)" >&2; exit 1; }
     [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/url"; exit 0;;
-  *"pr create"*)
-    echo create >> "$D/creates"; printf '%s\n' "$@" > "$D/create.args"
+  *"-X POST "*"/pulls"*)
+    echo create >> "$D/creates"; for a; do case $a in title=@*|body=@*) cat "${a#*=@}"; echo;; *) printf '%s\n' "$a";; esac; done > "$D/create.args"
     [ ! -e "$D/empty" ] || exit 0
     [ ! -e "$D/url-error" ] || { cat "$D/url" >&2; exit 1; }
     cp "$D/url" "$D/open"
@@ -244,7 +248,7 @@ newdone(){
   "$D/bin/cc-task" claim r "$row" --executor subagent >/dev/null
   printf 'Brief from task.md\n<!-- cc-brief:inflight -->\nprivate inflight\n<!-- /cc-brief:inflight -->\nAcceptance stays.\n' > "$st/task.md"
   echo work > "$wt/work.txt"
-  rm -f "$D/"*.fail "$D/zero" "$D/push-zero" "$D/lost" "$D/empty" "$D/card.empty" "$D/legacy" "$D/open" "$D/merged.oid" "$D/url-error" "$D/public-url" "$D/gh-repo"
+  rm -f "$D/"*.fail "$D/zero" "$D/push-zero" "$D/lost" "$D/empty" "$D/card.empty" "$D/legacy" "$D/open" "$D/merged.oid" "$D/url-error" "$D/open.ratelimit" "$D/public-url" "$D/gh-repo"
   : > "$D/creates"; : > "$D/cards"; : > "$D/gh.calls"; : > "$D/board.calls"
   echo https://github.com/fixture/repo/pull/42 > "$D/url"
 }
@@ -283,7 +287,10 @@ rundone
 newdone lookup; touch "$D/open.fail"; rundone
 { [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && hasreceipt '.pushed_sha != null and .errors[0].stage == "pr"'; } \
   && ok "P14: failed open lookup is not evidence of no PR" || bad "P14: $(cat "$D/out" "$D/err")"
-rm "$D/open.fail"; touch "$D/merged.fail"; rundone
+rm "$D/open.fail"; touch "$D/open.ratelimit"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && grep -q "rate limit for this login is spent until 21:16Z" "$D/out" "$D/err"; } \
+  && ok "P14 rate limit: a lookup refused on GitHub's rate limit says so with the reset time" || bad "P14 rate limit: $(cat "$D/out" "$D/err")"
+rm "$D/open.ratelimit"; touch "$D/merged.fail"; rundone
 { [ "$rc" != 0 ] && [ ! -s "$D/creates" ]; } && ok "P14 control: failed merged lookup also cannot create" || bad "P14 control: $(cat "$D/out" "$D/err")"
 rm "$D/merged.fail"; touch "$D/lost"; rundone
 { [ "$rc" != 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.pr_url == null and .errors[0].stage == "pr"'; } \
@@ -350,6 +357,12 @@ printf 'PR creation failed (no remote? try: cd %s && gh pr create --base main)\n
   && ok "P20 json control: --json is refused on a legacy row rather than printing a receipt nothing wrote" || bad "P20 json control: rc=$jrc $(cat "$D/jerr")"
 "$D/bin/cc" rm r "$row" >/dev/null 2>&1
 [ ! -e "$st" ] && ok "P19 control: legacy removal still removes state" || bad "P19 control: legacy state retained"
+newdone handmerged; rm "$st/delivery.json"; touch "$D/legacy" "$D/merged.json.fail"   # gh api prints the error JSON on stdout
+"$D/bin/cc" done r "$row" > "$D/hand.out" 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && ! grep -q 'already merged' "$D/hand.out" \
+  && grep -qx "PR: $(cat "$D/url")" "$D/hand.out" && [ "$("$B/cc-board" get r "$row" status)" = review ]; } \
+  && ok "P20 hand lookup: a hand-run done whose merged lookup fails opens the PR, never takes the error body for a merged one" || bad "P20 hand lookup: rc=$rc $(cat "$D/hand.out")"
+"$D/bin/cc" rm r "$row" >/dev/null 2>&1
 newdone empty; touch "$D/empty"; rundone
 { [ "$rc" != 0 ] && hasreceipt '.pr_url == null and .errors[0].stage == "pr"' \
   && [ "$("$B/cc-board" get r "$row" status)" != review ]; } \
@@ -404,7 +417,7 @@ read -r m2pass m2fail < "$T/done-fixture/counts"; pass=$((pass+m2pass)); fail=$(
 # hand over the card. `SLACK_BOT_TOKEN=` pins the real door: this is the first cc done case whose gh stub returns a
 # URL, so it is the first that could reach #approvals with a fixture PR.
 mkdir -p "$T/ghbin8"
-printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
 chmod +x "$T/ghbin8/gh" "$T/landstub"; : > "$T/land.calls"
 "$B/cc" $REPO w18 >/dev/null 2>&1; sleep 1
@@ -446,14 +459,14 @@ r8g=$(CC_SELF_LAND_EXCEPT= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
 # to queue it, and only the owner's own 👍 does (PR #551, 2026-09-19: the card said "the loop queues PR #551 …
 # nothing waits on a 👍" and nothing did, because it touched learn-fetch/). `cc done` now asks cc-land's OWN
 # protected_hit before saying that, rather than reading CC_PROTECTED_PATHS a second time.
-printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
 o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/)
 { [ ! -s "$T/land.calls" ] && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
   && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
   && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \
   && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' (P8f)" \
   || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
-printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done

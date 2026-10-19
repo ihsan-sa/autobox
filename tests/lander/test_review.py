@@ -3,6 +3,8 @@
 Every case builds its own state dir and its own fake box (FakeBox swaps cards.sh); nothing reaches git, gh, claude
 or Slack. Run: python3 -m unittest discover -s core/tests/lander -p 'test_review.py'
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -634,7 +636,7 @@ class TestReview(Case):
         self.box(claude=(0, answer[1].replace('"unresolved": ["1"]', '"unresolved": []').replace('"resolved": []',
                                                                                                    '"resolved": ["1"]')))
         v = R.delta_review(self.job(), prior, comments=[])
-        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, []))   # nothing open, nothing carried
+        self.assertEqual(v.verdict, T.INCOMPLETE)   # nothing open, nothing carried: no fix to ask for (#919)
 
     def test_a_security_pin_holds_in_the_round_after_the_one_that_pinned_it(self):
         """Round two calls the [security] row moot; pinned() keeps it and its row keeps the tag. Round three calls it
@@ -1528,6 +1530,13 @@ class TestTwoReaders(Case):
         self.assertIn("timed out", v.extra["why"])
         self.assertEqual(R.reads_used("demo", 7), 0)
 
+    def test_a_handback_naming_no_blocker_is_retried_never_handed_back(self):
+        # #919: a HANDBACK with nothing in it asks the author for a fix nobody can name
+        self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("HANDBACK")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.extra["silent"]), (T.INCOMPLETE, True))   # the lane's hold says "retrying"
+        self.assertEqual(R.reads_used("demo", 7), 0)
+
     def test_a_first_reader_that_answers_nothing_buys_no_second(self):
         box = self.box(claude=(1, "boom"), **{"codex exec": codex_says("LAND")})
         self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)
@@ -1861,7 +1870,8 @@ class TestRecord(Case):
         self.assertEqual(box.called("gh pr comment"), [])
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "x-security"), 0)   # not perms' name
         seat[0] = True
-        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "perms-security-read"), 0)
+        os.makedirs(os.path.join(R.PERMS_STATE, "demo", "perms"), mode=0o700)   # the seat's LAND goes in its ledger
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "perms-security-read", "--head", HEAD), 0)
         self.assertEqual(len(box.called("gh pr comment")), 2)
 
     def test_record_refuses_land_over_a_standing_handback(self):
@@ -2158,18 +2168,153 @@ class TestPermsReads(Case):
         self.assertEqual(len(self.ledger()), 1)
         self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o600)
 
-    def test_the_lane_waits_on_a_running_read_or_a_finished_handback(self):
-        self.assertEqual(R.perms_reading("demo", 7, HEAD), "")   # no read on file
+    # the lane's wait (perms_reading): it holds only while time mends it, and every other stop short of a LAND at the
+    # head is a query; perms' read of #1525 (10-19) found four ways the first version let a merge through
+    def test_the_lane_waits_on_a_running_read_and_a_land_lets_it_go(self):
+        self.assertEqual(R.perms_reading("demo", 7, HEAD), ("", False))   # no reads dir at all: perms read nothing
         R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid(), verdict=None))
-        self.assertIn("still running", R.perms_reading("demo", 7, HEAD))   # a read of any head of the PR
-        self.assertEqual(R.perms_reading("demo", 8, HEAD), "")   # another PR's read is not this one's
-        R.write_read("demo", self.entry(head=self.OLD, state="running", pid=2 ** 22 + 1, verdict=None))
-        self.assertEqual(R.perms_reading("demo", 7, HEAD), "")   # its process died: nothing to wait on
+        why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("still running", why)   # a read of any head of the PR
+        self.assertTrue(wait)
+        self.assertEqual(R.perms_reading("demo", 8, HEAD), ("", False))   # another PR's read is not this one's
+        R.write_read("demo", self.entry(head=self.OLD))
         R.write_read("demo", self.entry(verdict="HANDBACK"))
-        self.assertIn("says HANDBACK", R.perms_reading("demo", 7, HEAD))
-        self.assertEqual(R.perms_reading("demo", 7, "c" * 40), "")   # a HANDBACK of another head: the review's
+        why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("says HANDBACK", why)
+        self.assertFalse(wait)   # perms' to settle: a query, not a wait
         R.write_read("demo", self.entry())
-        self.assertEqual(R.perms_reading("demo", 7, HEAD), "")   # a finished LAND lets it go
+        self.assertEqual(R.perms_reading("demo", 7, HEAD), ("", False))   # a finished LAND at the head lets it go
+
+    def test_hole_1_a_push_after_perms_handback_waits_for_perms_read_of_the_new_head(self):
+        R.write_read("demo", self.entry(head=self.OLD, verdict="HANDBACK"))
+        why, wait = R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))
+        self.assertIn(f"has no read of its head {HEAD[:12]}", why)
+        self.assertIn("perms-read demo 7", why)
+        self.assertFalse(wait)
+
+    def test_hole_1_an_older_land_carries_only_at_the_same_change(self):
+        R.write_read("demo", self.entry(head=self.OLD))
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))   # a rebase
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, "f" * 64)[0])   # a new change
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD)[0])   # no change known: no carry
+
+    def test_hole_1_a_handback_after_an_older_land_at_the_same_change_stands(self):
+        R.write_read("demo", self.entry(head=self.OLD))
+        R.write_read("demo", self.entry(head="c" * 40, verdict="HANDBACK"))
+        os.utime(os.path.join(self.seat, "reads", f"7-{self.OLD}.json"), (1, 1))   # the LAND is the older read
+        self.assertIn("(HANDBACK) and has no read of its head",
+                      R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+
+    def test_hole_2_a_failed_stale_or_dead_read_at_the_head_is_a_query(self):
+        for state, extra, said in (("failed", {"why": "boom"}, "is failed (boom)"), ("stale", {}, "is stale"),
+                                   ("running", {"pid": 2 ** 22 + 1}, "died with no verdict")):
+            R.write_read("demo", self.entry(state=state, verdict=None, **extra))
+            why, wait = R.perms_reading("demo", 7, HEAD)
+            self.assertIn(said, why, state)
+            self.assertIn("perms-read demo 7` again", why, state)
+            self.assertFalse(wait, state)
+
+    def test_hole_3_perms_holds_a_pr_before_its_read_starts(self):
+        from unittest import mock
+        self.box(**{"gh pr view": self.facts()})
+        self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 0)
+        e = R.load_read("demo", 7, HEAD)[0]
+        self.assertEqual((e["state"], e["change"]), ("held", R.change_digest(DIFF)))
+        why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("perms holds PR #7", why)
+        self.assertTrue(wait)
+        with mock.patch.object(R.subprocess, "Popen", return_value=mock.Mock(pid=4242)) as popen:
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)   # the held stub starts a read
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(R.load_read("demo", 7, HEAD)[0]["state"], "running")
+        self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 0)   # a read on file: the hold writes nothing over it
+        self.assertEqual(R.load_read("demo", 7, HEAD)[0]["state"], "running")
+
+    def test_hole_3_only_the_perms_seat_holds(self):
+        self.box(**{"gh pr view": self.facts()})
+        R.perms_seat_caller = lambda repo, *a, **kw: False
+        self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 1)
+        self.assertEqual(R.read_files("demo"), [])
+
+    def test_hole_3_a_hold_no_read_follows_is_a_query_once_past_a_read_s_run_window(self):
+        # perms held the PR, then died or handed off before perms-read (or its Popen raised): the stub must surface
+        R.write_read("demo", self.entry(state="held", verdict=None, started=R.C.now()))
+        self.assertTrue(R.perms_reading("demo", 7, HEAD)[1])
+        old = (R.datetime.datetime.now(R.datetime.timezone.utc)
+               - R.datetime.timedelta(seconds=R.HOLD_WINDOW + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for started in (old, "not a time", None):
+            R.write_read("demo", self.entry(state="held", verdict=None, started=started))
+            why, wait = R.perms_reading("demo", 7, HEAD)
+            self.assertFalse(wait, started)
+            self.assertIn("none started within", why, started)
+            self.assertIn("perms-read demo 7`", why, started)
+
+    def test_hole_3_perms_hold_s_usage(self):
+        for argv in ([], ["demo"], ["demo", "x"], ["demo", "7", "8"], ["bad repo!", "7"]):
+            self.assertEqual(R.cmd_perms_hold(argv), 2, argv)
+        self.assertEqual(R.read_files("demo"), [])
+
+    def test_hole_3_perms_hold_with_no_pr_holds_nothing(self):
+        self.box(**{"gh pr view": (1, "HTTP 502")})
+        self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 1)
+        self.assertEqual(R.read_files("demo"), [])
+
+    def test_hole_3_perms_hold_with_no_readable_head_holds_nothing(self):
+        self.box(**{"gh pr view": self.facts(head="not-a-sha")})
+        self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 1)
+        self.assertEqual(R.read_files("demo"), [])
+
+    def test_hole_3_perms_hold_that_cannot_write_says_so(self):
+        self.box(**{"gh pr view": self.facts()})
+        import contextlib, io
+        out = io.StringIO()
+        os.chmod(self.seat, 0o777)   # read_dir refuses a seat dir others may write, so write_read writes nothing
+        try:
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 1)
+        finally:
+            os.chmod(self.seat, 0o700)
+        self.assertIn("nothing held", out.getvalue())
+        self.assertEqual(R.read_files("demo"), [])
+
+    def test_hole_4_a_symlinked_seat_is_not_absent(self):
+        os.rename(self.seat, self.seat + ".real")
+        os.symlink(self.seat + ".real", self.seat)
+        self.assertFalse(R.reads_absent("demo"))
+        why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("reads dir will not read", why)
+        self.assertFalse(wait)
+
+    def test_hole_4_a_reads_dir_lstat_refuses_is_not_absent(self):
+        from unittest import mock
+        self.assertTrue(R.reads_absent("demo"))   # nothing there: absent, and nothing holds
+        self.assertEqual(R.perms_reading("demo", 7, HEAD), ("", False))
+        real = os.lstat
+        with mock.patch.object(R.os, "lstat", side_effect=lambda p, *a, **kw: (
+                (_ for _ in ()).throw(PermissionError(13, "Permission denied")) if p.endswith("/reads")
+                else real(p, *a, **kw))):
+            self.assertFalse(R.reads_absent("demo"))
+            why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("reads dir will not read", why)
+        self.assertFalse(wait)
+
+    def test_hole_4_a_reads_dir_that_will_not_read_holds(self):
+        path, _ = R.write_read("demo", self.entry())
+        os.chmod(os.path.dirname(path), 0o750)
+        why, wait = R.perms_reading("demo", 7, HEAD)
+        self.assertIn("reads dir will not read", why)
+        self.assertFalse(wait)
+
+    def test_hole_4_a_reads_dir_that_will_not_list_holds(self):
+        from unittest import mock
+        R.write_read("demo", self.entry())
+        with mock.patch.object(R.os, "listdir", side_effect=PermissionError(13, "Permission denied")):
+            self.assertIn("reads dir will not list", R.perms_reading("demo", 7, HEAD)[0])
+
+    def test_hole_4_a_read_file_that_will_not_load_holds(self):
+        path, _ = R.write_read("demo", self.entry())
+        os.chmod(path, 0o644)
+        self.assertIn(f"read file of PR #7 at {HEAD[:12]} will not load", R.perms_reading("demo", 7, HEAD)[0])
 
     def test_3_adopt_is_the_perms_seat_s_and_needs_an_open_pr(self):
         R.write_read("demo", self.entry())
@@ -2190,6 +2335,115 @@ class TestPermsReads(Case):
         os.chmod(R.perms_reads_path("demo"), 0o644)
         self.assertEqual(self.adopt(), 1)
         self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o644)
+
+    # perms' hand read, recorded with `record` from its seat, is its ledger entry in the same step (#1523)
+    def record_as(self, seat, *argv):
+        R.perms_seat_caller = lambda repo, *a, **kw: seat
+        box = self.box(**{"gh pr view": self.facts()})
+        return R.cmd_record(["demo", "7", *argv]), box
+
+    def test_a_perms_seat_land_record_is_perms_recorded(self):
+        digest = R.change_digest(DIFF)
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
+        code, box = self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(box.called("gh pr comment")), 1)
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
+        e, = self.ledger()
+        self.assertEqual({k: e[k] for k in ("repo", "pr", "head", "change", "verdict", "read")},
+                         {"repo": "demo", "pr": 7, "head": HEAD, "change": digest, "verdict": "LAND", "read": "perms"})
+        self.assertTrue(e["at"])
+        self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o600)
+        self.assertEqual(sorted(os.listdir(self.seat)), sorted([R.PERMS_READS, R.PERMS_READS_LOCK]))   # no temp file
+        # run again (the marker already stands): one entry still, exit 0
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual(len(self.ledger()), 1)
+
+    def test_a_land_already_marked_by_perms_is_put_in_its_ledger_on_a_second_record(self):
+        """#1523's state: perms' LAND marker on the PR and no ledger entry. Recording it again writes the entry."""
+        digest = R.change_digest(DIFF)
+        R.perms_seat_caller = lambda repo, *a, **kw: True
+        facts = json.loads(self.facts()[1])
+        facts["comments"] = [self.comment("LAND", digest, by="perms")]
+        box = self.box(**{"gh pr view": (0, json.dumps(facts))})
+        self.assertEqual(R.cmd_record(["demo", "7", "LAND", "--by", "perms", "--head", HEAD]), 0)
+        self.assertEqual(box.called("gh pr comment"), [])
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
+
+    def test_no_other_caller_and_no_handback_writes_perms_ledger(self):
+        for by in ("seat", "perms", "perms-security-read"):
+            self.record_as(False, "LAND", "--by", by)
+        self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
+        # a full --head gets past the head check, so only the seat gate keeps the ledger shut
+        code, box = self.record_as(False, "LAND", "--by", "seat", "--head", HEAD)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(box.called("gh pr comment")), 1)
+        self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
+        self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--findings", "[security] x")[0], 0)
+        self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+
+    def test_a_perms_record_says_what_to_do_when_the_ledger_will_not_take_it(self):
+        with open(R.perms_reads_path("demo"), "w") as f:
+            f.write("[]")
+        os.chmod(R.perms_reads_path("demo"), 0o644)   # not perms' own 0600 file: never written over
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 1)
+        self.assertIn("run this record again", out.getvalue())
+        self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o644)
+        os.unlink(R.perms_reads_path("demo"))
+        os.rename(self.seat, self.seat + ".real")   # the seat dir reached through a link: nothing written
+        os.symlink(self.seat + ".real", self.seat)
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 1)
+        self.assertFalse(os.path.lexists(os.path.join(self.seat + ".real", R.PERMS_READS)))
+
+    def test_a_perms_land_with_no_full_head_posts_the_marker_and_writes_no_ledger(self):
+        """Opus read of #1537: perms read A, a track pushed B, and a LAND with no --head stood in the ledger for B."""
+        for argv in ((), ("--head", HEAD[:12])):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code, box = self.record_as(True, "LAND", "--by", "perms", *argv)
+            self.assertEqual(code, 1)
+            self.assertEqual(len(box.called("gh pr comment")), 1)
+            self.assertIn("pass --head", out.getvalue())
+            self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+
+    def test_a_perms_seat_land_by_another_name_is_not_read_perms(self):
+        self.assertEqual(self.record_as(True, "LAND", "--by", "opus-hand", "--head", HEAD)[0], 0)
+        e, = self.ledger()
+        self.assertEqual((e["read"], e["model"]), ("opus-hand", "opus-hand"))
+
+    def test_grant_refuses_a_short_head_or_no_digest_on_its_own(self):
+        import types
+        for head, digest in (("e" * 12, R.change_digest(DIFF)), (HEAD.upper(), R.change_digest(DIFF)), (HEAD, "")):
+            job = types.SimpleNamespace(repo="demo", pr=7, head=head, digest=digest)
+            self.assertIn("cannot be worked out", R.grant(job, "perms", "perms"))
+        self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
+
+    def test_grant_failing_to_write_is_one_line_and_leaves_no_temp_file(self):
+        from unittest import mock
+        import types
+        job = types.SimpleNamespace(repo="demo", pr=7, head=HEAD, digest=R.change_digest(DIFF))
+        with mock.patch.object(R.os, "replace", side_effect=OSError(28, "No space left on device")):
+            why = R.grant(job, "perms", "perms")
+        self.assertEqual(why, "perms' ledger could not be written (No space left on device)")
+        self.assertEqual(os.listdir(self.seat), [R.PERMS_READS_LOCK])
+
+    def test_grants_written_at_once_keep_every_entry(self):
+        import threading
+        import types
+        jobs = [types.SimpleNamespace(repo="demo", pr=n, head=HEAD, digest=R.change_digest(DIFF)) for n in range(1, 9)]
+        out = []
+        ts = [threading.Thread(target=lambda j=j: out.append(R.grant(j, "perms", "perms"))) for j in jobs]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(out, [""] * len(jobs))
+        self.assertEqual(sorted(e["pr"] for e in self.ledger()), list(range(1, 9)))
+        self.assertEqual(sorted(os.listdir(self.seat)), sorted([R.PERMS_READS, R.PERMS_READS_LOCK]))
 
     # the read itself: apart from the window, once per head
     def test_the_read_starts_in_a_session_of_its_own_and_only_once_a_head(self):

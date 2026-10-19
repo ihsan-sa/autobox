@@ -320,6 +320,82 @@ class CIState(unittest.TestCase):
                 self.assertEqual(GH.ci_state("/x", 1, pin, workflows=True)[0], want)
 
 
+class RestFacts(unittest.TestCase):
+    """pr_facts answers the lane's fields over REST, in gh pr view's shape; only comments and checks spend GraphQL."""
+    PULL = {"number": 7, "state": "closed", "merged_at": "2026-10-19T18:00:00Z", "merge_commit_sha": "m" * 40,
+            "draft": False, "mergeable": None, "mergeable_state": "behind", "title": "t", "body": None,
+            "head": {"sha": "h" * 40, "ref": "track/x"}, "base": {"ref": "main"}, "html_url": "https://github.com/o/r/pull/7"}
+
+    def run_gh(self, answers):
+        calls = []
+
+        def gh(argv, root, token=None, timeout=120, note=True):
+            calls.append(argv)
+            got = answers.get(" ".join(argv))
+            return got if isinstance(got, tuple) else (0, got, "") if got is not None else (1, "", "HTTP 404")
+        return calls, mock.patch.object(GH, "gh", gh)
+
+    def test_lane_fields_are_one_rest_get(self):
+        calls, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL)})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "state,headRefOid,headRefName,baseRefName,mergeCommit,mergeable,body,isDraft")
+        self.assertEqual((j, why), ({"state": "MERGED", "headRefOid": "h" * 40, "headRefName": "track/x",
+                                     "baseRefName": "main", "mergeCommit": {"oid": "m" * 40}, "mergeable": "UNKNOWN",
+                                     "body": "", "isDraft": False}, ""))
+        self.assertEqual(calls, [["api", "repos/o/r/pulls/7"]])
+        open_pr = dict(self.PULL, state="open", merged_at=None, mergeable=False)
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(open_pr)})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, _ = GH.pr_facts("/x", 7, "state,mergeCommit,mergeable,mergeStateStatus")
+        self.assertEqual(j, {"state": "OPEN", "mergeCommit": None, "mergeable": "CONFLICTING",
+                             "mergeStateStatus": "BEHIND"})
+
+    def test_files_are_the_rest_file_list(self):
+        calls, p = self.run_gh({"api --paginate repos/o/r/pulls/7/files?per_page=100 -q .[].filename": "a.py\nb/c.sh\n"})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertEqual(GH.pr_files("/x", 7), ["a.py", "b/c.sh"])
+        self.assertEqual(len(calls), 1)
+
+    def test_checks_are_the_heads_check_runs_and_statuses(self):
+        pin = "h" * 40
+        calls, p = self.run_gh({
+            "api repos/o/r/pulls/7": json.dumps(self.PULL),
+            f"api repos/o/r/commits/{pin}/check-runs?per_page=100": json.dumps({"check_runs": [
+                {"name": "check", "status": "completed", "conclusion": "success", "details_url": "u1"},
+                {"name": "slow", "status": "in_progress", "conclusion": None, "details_url": "u2"}]}),
+            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": [
+                {"context": "ci/x", "state": "failure", "target_url": "u3"}]})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, _ = GH.pr_facts("/x", 7, "headRefOid,statusCheckRollup")
+            self.assertEqual(GH.ci_state("/x", 7, pin), ("red", "ci/x failure (u3)"))
+        self.assertEqual(j["statusCheckRollup"], [
+            {"__typename": "CheckRun", "name": "check", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "u1"},
+            {"__typename": "CheckRun", "name": "slow", "status": "IN_PROGRESS", "conclusion": "", "detailsUrl": "u2"},
+            {"__typename": "StatusContext", "context": "ci/x", "state": "FAILURE", "targetUrl": "u3"}])
+        self.assertFalse([c for c in calls if c[:2] == ["pr", "view"]])
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL)})   # a checks list GitHub would not give
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):              # is unreadable, never "no CI"
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
+
+    def test_comments_still_go_through_graphql(self):
+        for fields in ("comments", "state,comments"):
+            calls, p = self.run_gh({f"pr view 7 --json {fields} -R o/r": "{}"})
+            with self.subTest(fields=fields), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+                self.assertEqual(GH.pr_facts("/x", 7, fields), ({}, ""))
+                self.assertEqual(calls[0][:2], ["pr", "view"])
+
+    def test_a_spent_rate_limit_is_said_with_its_reset(self):
+        limit = json.dumps({"resources": {"core": {"remaining": 4815, "reset": 1}, "graphql": {"remaining": 0, "reset": 1792444560}}})
+        for fields, ask in (("state", "api repos/o/r/pulls/7"), ("comments", "pr view 7 --json comments -R o/r")):
+            _, p = self.run_gh({ask: (1, "", "GraphQL: API rate limit already exceeded for user ID 1."), "api rate_limit": limit})
+            with self.subTest(fields=fields), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+                self.assertEqual(GH.pr_facts("/x", 7, fields),
+                                 (None, "GitHub's API rate limit for this login is spent until 21:16Z"))
+        _, p = self.run_gh({"api repos/o/r/pulls/7": (1, "", "HTTP 502: bad gateway")})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):   # any other failure keeps gh's own words
+            self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, "HTTP 502: bad gateway"))
+
+
 class Cause(unittest.TestCase):
     def test_internalerror_names_the_exception_and_the_file(self):
         text = ("tests/test_a.py ....F..\nINTERNALERROR> Traceback (most recent call last):\n"

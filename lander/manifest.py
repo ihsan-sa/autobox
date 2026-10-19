@@ -171,35 +171,42 @@ class Manifest:
 
 
 def run_file(run: str) -> str:
-    """The first word of a run line when it names a file relative to the tree, else ''."""
-    w = (run.split() or [""])[0]
+    """The first word of a run line when it names a file relative to the tree, else ''. A `(`, backtick, `!`, `{`
+    or quote before it is no part of it, and it ends where a run_files word does: `(bin/x selfcheck)`, `` `bin/x` ``,
+    `! bin/x`, `{ bin/x; }` and `bin/x\\<newline>` all name bin/x."""
+    w = (run.replace("\\\n", " ").lstrip(" \t\n({`!'\"").split() or [""])[0]
+    w = re.split(r"[;&|`()!<>'\"]", w)[0]
     return w if "/" in w and not w.startswith(("/", "-", "$", "~")) else ""
 
 
 MODULE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+# -m or -mX, alone or after python flags that take no value (-Im, -BmX)
+M_FLAG_RE = re.compile(r"-[bBdEhiIOPqsSuvVx]*m([A-Za-z_][\w.]*)?")
 
 
 def run_files(run: str) -> list:
     """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
-    tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after
-    `-m` or an attached `-mX` (`python3 -m unittest tests.test_x`, `python3 -munittest tests.test_x`, up to the
-    next `&`, `;` or `|` outside quotes) names its file, tests/test_x.py: a quoted one (`-k "a;b"`) does not end
-    the modules. A redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a word
-    ends at a redirection operator, `;`, `&` or `|`, quoted or not (`bin/x>/dev/null` and `bin/x&>/dev/null` name
-    bin/x, `>out/log` nothing), and a word built on a backtick (`` core/bin/`uname` ``) names nothing. A backtick,
-    `(`, `)`, `!` or a quote is a space (`` `bin/x` ``, `(bin/x)` and `!bin/x` name bin/x), so it ends a word but
-    not the modules after `-m` (`-m unittest $(echo -v) tests.a` names tests/a.py). A backslash before a backtick
-    is dropped (`` \\`bin/x\\` `` names bin/x, `` core/bin/\\`uname\\` `` nothing), and a backslash line
-    continuation joins its lines first, so `-m unittest tests.a\\<newline>tests.b` names both."""
+    tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after `-m`,
+    an attached `-mX` or one clustered after python's valueless flags (`python3 -m unittest tests.test_x`, `python3
+    -munittest tests.test_x`, `python3 -Im unittest tests.test_x`, up to the next `&`, `;` or `|` outside quotes) names
+    its file, tests/test_x.py: a quoted one (`-k "a;b"`) does not end the modules. A redirection or a variable
+    (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a word ends at a redirection operator, `;`, `&` or
+    `|`, quoted or not (`bin/x>/dev/null` and `bin/x&>/dev/null` name bin/x, `>out/log` nothing), and a word built on a
+    backtick (`` core/bin/`uname` ``) names nothing, back to the last space, quote, backtick, `;`, `&`, `|`, `(`, `)` or
+    redirection (`` bin/x;y/`true` `` still names bin/x). A backtick, `(`, `)`, `!` or a quote is a space (`` `bin/x`
+    ``, `(bin/x)` and `!bin/x` name bin/x), so it ends a word but not the modules after `-m` (`-m unittest $(echo -v)
+    tests.a` names tests/a.py). A backslash before a backtick is dropped (`` \\`bin/x\\` `` names bin/x, ``
+    core/bin/\\`uname\\` `` nothing), and a backslash line continuation joins its lines first, so `-m unittest
+    tests.a\\<newline>tests.b` names both."""
     out = []
-    run = re.sub(r"[^\s'\"]*/`", " ", run.replace("\\\n", " ").replace("\\`", "`"))
+    run = re.sub(r"[^\s'\"`;&|()<>]*/`", " ", run.replace("\\\n", " ").replace("\\`", "`"))
     for seg in _segments(run):
         words = [re.split(r"[<>]", p)[0]
                  for w in re.sub(r"[`()!'\"]", " ", seg).split() for p in re.split(r"[;&|]", w)]
         out += [w.rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "~")) and "$" not in w]
-        m = next((i for i, w in enumerate(words) if w == "-m" or re.fullmatch(r"-m[A-Za-z_][\w.]*", w)), None)
+        m = next((i for i, w in enumerate(words) if M_FLAG_RE.fullmatch(w)), None)
         if m is not None:
-            mods = words[m + 1:] if words[m] == "-m" else [words[m][2:]] + words[m + 1:]
+            mods = [M_FLAG_RE.fullmatch(words[m])[1] or ""] + words[m + 1:]
             out += [x.replace(".", "/") + ".py" for x in mods if MODULE_RE.fullmatch(x)]
     return out
 

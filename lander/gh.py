@@ -4,7 +4,9 @@
         it goes in GH_TOKEN (GH_CONFIG_DIR at an empty dir outside the clone, members.gh_config_dir, so the box's
         own login is never used) and is printed nowhere. A callable token (members.gh_token, the app's) is called
         for each gh run; when it gives nothing, gh is not run at all.
-    pr_facts(root, pr, fields) -> (dict, "") | (None, why)     one `gh pr view --json <fields> [-R <slug>]`
+    pr_facts(root, pr, fields) -> (dict, "") | (None, why)     `gh pr view --json <fields> [-R <slug>]`'s answer,
+        over REST (GET repos/<slug>/pulls/<pr>, .../files, the head's check-runs and status) when every field is in
+        REST_FIELDS, else through that GraphQL call; a spent rate limit is said with its reset (spent)
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
         ("", "") when gh would not answer — which is never read as "not merged".
@@ -64,7 +66,10 @@ def _note(rc: int, out: str, err: str) -> None:
             with contextlib.suppress(OSError):
                 os.unlink(backoff_path())
         return
-    if out.strip().startswith(("{", "[")) or not BACKOFF_RE.search(out + "\n" + err):
+    # a JSON stdout is a body (a title may say "timeout"), so only stderr counts then: gh api still says a spent
+    # quota or a 502 there with rc != 0 while stdout holds GitHub's error JSON
+    said = err if out.strip().startswith(("{", "[")) else out + "\n" + err
+    if not BACKOFF_RE.search(said):
         return
     fails = int((J.read_json(backoff_path()) or {}).get("fails", 0)) + 1
     secs = min(BACKOFF_MAX, BACKOFF_MIN * 2 ** (fails - 1))
@@ -72,7 +77,7 @@ def _note(rc: int, out: str, err: str) -> None:
         J.write_atomic(backoff_path(), {"until": time.time() + secs, "fails": fails})
 
 
-def gh(argv, root, token=None, timeout=120):
+def gh(argv, root, token=None, timeout=120, note=True):
     env = dict(os.environ)
     if callable(token):   # a member's app token (members.gh_token), asked for now: it lives an hour
         token = token()
@@ -93,7 +98,8 @@ def gh(argv, root, token=None, timeout=120):
         rc, out, err = 124, "", "gh timed out"
     except OSError as e:
         rc, out, err = 127, "", f"gh would not run: {e}"
-    _note(rc, out, err)
+    if note:   # spent()'s own ask leaves the backoff its failure set
+        _note(rc, out, err)
     return rc, out, err
 
 
@@ -101,11 +107,88 @@ def last(text, n=200) -> str:
     return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
 
 
+# THE LANE READS A PR OVER REST (raised-graphql-hour-spent-stalls-landing, 2026-10-19): `gh pr view` spends the
+# login's GraphQL hour, which ran out at 18:1xZ with REST still at 4815 of 5000, and every gh pr call on the box failed
+# until the reset. A read whose fields are all below is one GET of the pull (and its files), answered in the shape
+# `gh pr view --json` gives, so no caller changes; statusCheckRollup is the head's check runs and commit statuses
+# (two more GETs), the CI wait's every-two-minutes read. Only comments (viewerDidAuthor has no REST twin) still go
+# through GraphQL, and a refusal on the rate limit says so with its reset.
+REST_FIELDS = {"state", "isDraft", "mergeable", "headRefOid", "headRefName", "baseRefName", "title", "body",
+               "mergeCommit", "mergedAt", "mergeStateStatus", "files", "number", "url", "statusCheckRollup"}
+
+
+def rest_facts(p, want) -> dict:
+    """GitHub's REST pull object -> the `gh pr view --json` fields in `want` (files are not in it)."""
+    merged = bool(p.get("merged_at"))
+    head, base = p.get("head") or {}, p.get("base") or {}
+    every = {"state": "MERGED" if merged else str(p.get("state") or "").upper(), "isDraft": bool(p.get("draft")),
+             "mergeable": {True: "MERGEABLE", False: "CONFLICTING"}.get(p.get("mergeable"), "UNKNOWN"),
+             "headRefOid": head.get("sha") or "", "headRefName": head.get("ref") or "",
+             "baseRefName": base.get("ref") or "", "title": p.get("title") or "", "body": p.get("body") or "",
+             "mergeCommit": {"oid": p.get("merge_commit_sha") or ""} if merged else None,
+             "mergedAt": p.get("merged_at"), "mergeStateStatus": str(p.get("mergeable_state") or "unknown").upper(),
+             "number": p.get("number"), "url": p.get("html_url") or ""}
+    return {k: every[k] for k in want if k in every}
+
+
+def rollup(runs, statuses) -> list:
+    """REST check runs and commit statuses -> statusCheckRollup's rows, as gh pr view gives them."""
+    return ([{"__typename": "CheckRun", "name": r.get("name") or "", "status": str(r.get("status") or "").upper(),
+              "conclusion": str(r.get("conclusion") or "").upper(), "detailsUrl": r.get("details_url") or ""}
+             for r in runs if isinstance(r, dict)]
+            + [{"__typename": "StatusContext", "context": c.get("context") or "", "state": str(c.get("state") or "").upper(),
+                "targetUrl": c.get("target_url") or ""} for c in statuses if isinstance(c, dict)])
+
+
+def spent(root, text, token=None) -> str:
+    """One plain line when gh's failure is GitHub's rate limit, naming when it resets; else ""."""
+    if "rate limit" not in (text or "").lower():
+        return ""
+    rc, out, _ = gh(["api", "rate_limit"], root, token, 30, note=False)
+    try:
+        res = json.loads(out).get("resources") if not rc else {}
+        at = min(int(r["reset"]) for r in (res or {}).values() if isinstance(r, dict) and r.get("remaining") == 0)
+        when = " until " + time.strftime("%H:%MZ", time.gmtime(at))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        when = ""
+    return f"GitHub's API rate limit for this login is spent{when}"
+
+
 def pr_facts(root, pr, fields, token=None, timeout=120):
     s = slug(root)   # named, so a GH_REPO of the caller's cannot point the read at another repository's PR
+    want = [f for f in fields.split(",") if f]
+    if s and want and set(want) <= REST_FIELDS and str(pr).isdigit():
+        j = {}
+        if set(want) - {"files"}:   # statusCheckRollup needs the head this GET names
+            rc, out, err = gh(["api", f"repos/{s}/pulls/{int(pr)}"], root, token, timeout)
+            try:
+                p = json.loads(out) if not rc else None
+            except ValueError:
+                p = None
+            if not isinstance(p, dict):
+                return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+            j = rest_facts(p, want)
+            if "statusCheckRollup" in want:   # the checks of the head GitHub reports, as GraphQL's rollup is
+                sha, got = (p.get("head") or {}).get("sha") or "", []
+                for path, key in (("check-runs", "check_runs"), ("status", "statuses")):
+                    rc, out, err = gh(["api", f"repos/{s}/commits/{sha}/{path}?per_page=100"], root, token, timeout)
+                    try:
+                        got.append((json.loads(out) if not rc else {}).get(key))
+                    except (ValueError, AttributeError):
+                        got.append(None)
+                    if not isinstance(got[-1], list):
+                        return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+                j["statusCheckRollup"] = rollup(*got)
+        if "files" in want:
+            rc, out, err = gh(["api", "--paginate", f"repos/{s}/pulls/{int(pr)}/files?per_page=100", "-q",
+                               ".[].filename"], root, token, timeout)
+            if rc:
+                return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+            j["files"] = [{"path": f} for f in out.splitlines() if f]
+        return j, ""
     rc, out, err = gh(["pr", "view", str(pr), "--json", fields] + (["-R", s] if s else []), root, token, timeout)
     if rc:
-        return None, last(err or out) or f"gh exit {rc}"
+        return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
     try:
         j = json.loads(out)
     except ValueError:
