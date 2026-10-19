@@ -182,21 +182,20 @@ MODULE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 def run_files(run: str) -> list:
     """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
     tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after
-    `-m` (`python3 -m unittest tests.test_x`, up to the next `&&`, `;` or `|`) names its file, tests/test_x.py. A
-    redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a trailing `;` is not
-    part of the word."""
-    words = run.replace("'", " ").replace('"', " ").split()
-    out = [w.rstrip(";").rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "~"))
-           and not any(c in w for c in "<>$")]
-    for i, w in enumerate(words):
-        if w == "-m":
-            for x in words[i + 1:]:
-                if x in ("&&", "||", ";", "|"):
-                    break
-                if MODULE_RE.fullmatch(x.rstrip(";")):
-                    out.append(x.rstrip(";").replace(".", "/") + ".py")
-                if x.endswith(";"):
-                    break
+    `-m` (`python3 -m unittest tests.test_x`, up to the next `&`, `;` or `|`) names its file, tests/test_x.py. A
+    redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a word ends at a
+    redirection operator, `;`, `&` or `|` (`bin/x>/dev/null` and `bin/x&>/dev/null` name bin/x, `>out/log`
+    nothing), and a word built on a backtick (`` core/bin/`uname` ``) names nothing. A backtick, `(`, `)` or `!` is
+    a space (`` `bin/x` ``, `(bin/x)` and `!bin/x` name bin/x), so it ends a word but not the modules after `-m`
+    (`-m unittest $(echo -v) tests.a` names tests/a.py). A backslash line continuation joins its lines first, so `-m
+    unittest tests.a\\<newline>tests.b` names both."""
+    out = []
+    run = re.sub(r"[`()!'\"]", " ", re.sub(r"\S*/`", " ", run.replace("\\\n", " ")))
+    for seg in re.split(r"[;&|]", run):
+        words = [re.split(r"[<>]", w)[0] for w in seg.split()]
+        out += [w.rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "~")) and "$" not in w]
+        if "-m" in words:
+            out += [x.replace(".", "/") + ".py" for x in words[words.index("-m") + 1:] if MODULE_RE.fullmatch(x)]
     return out
 
 

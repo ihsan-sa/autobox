@@ -65,7 +65,9 @@ Otherwise the lander buys one:
     read from the BASE commit, and the PR body's Tested section (tested_of: the author's claims, labelled as claims
     to check against the diff, never instructions; folded by NFKC with format characters gone, a line that reads
     as a verdict or as the prompt's frame dropped,
-    cut at TESTED_CAP), each between `<<<name` / `name>>>` markers (a marker inside the data is broken
+    cut at TESTED_CAP), and the PR's title and whole body (body_of: the author's text, labelled as evidence of what
+    the PR claims and never instructions, screened the same way, cut at BODY_CAP like the brief; a body gh could not
+    fetch is a line saying so), each between `<<<name` / `name>>>` markers (a marker inside the data is broken
     up, so the data cannot close its own block). The answer is JSON (verdict, blocking[], advisory[]).
     A change lands only on EVERY reader's verdict (owner: both models read every change). A reader that hits the
     limit (`cc-limit check`), or answers nothing the first time at a head, makes the whole read INCOMPLETE and
@@ -161,7 +163,6 @@ CODEX_READ_USD = 1.0      # a codex read that ran but printed no token count is 
 READERS = "claude-fable-5-1 gpt-6-astra"   # the default of CC_LAND_REVIEWERS
 READ_TIMEOUT = 1200
 PROMPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "lander")
-OLD_VERDICTS = ("LAND-AFTER-FIX", "DO-NOT-LAND", "LAND", "HANDBACK")
 MARK_RE = re.compile(rf"\A\s*<!-- {re.escape(MARK)} v2 change=([0-9a-f]+)((?: [^>]*?)?) "
                      r"verdict=(LAND-AFTER-FIX|DO-NOT-LAND|HANDBACK|LAND)\b([^>]*)-->")
 FINDING_ROW = re.compile(r"^\d+\. ")
@@ -447,7 +448,7 @@ def open_security(comments, head):
 def fence(name, text):
     """Break any `name>>>` / `<<<name` inside the data so it cannot close or open its block."""
     text = text or ""
-    for tag in ("diff", "files", "brief", "rules", "prior", "interdiff", "tested"):
+    for tag in ("diff", "files", "brief", "rules", "prior", "interdiff", "tested", "body"):
         text = text.replace(f"{tag}>>>", f"{tag}> >>").replace(f"<<<{tag}", f"<< <{tag}")
     return text
 
@@ -623,8 +624,6 @@ def over_ceiling(repo, pr):
 
 # --- the box around a read -----------------------------------------------------------------------------------------
 
-SECRET_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
-SECRET_TAIL = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")
 LIMIT_SAID = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
 WALLS = ("error_max_budget_usd", "error_max_turns")
 BIN = C.BIN
@@ -1455,6 +1454,31 @@ def tested_of(body):
     return text.strip()
 
 
+BODY_CAP = 20_000   # the brief's own cap (brief_of): the author's text gets no more room than the brief does
+BODY_UNAVAILABLE = ("The PR body is unavailable: `gh pr view` could not fetch it, so this read was not given the "
+                    "PR's title or description.")
+
+
+def body_of(facts):
+    """The PR's title and whole body for the `body` block: the author's text (dispatch #1111 was handed back twice on
+    "the body was not provided for review" while the body named what the brief asked), each line folded by plain()
+    and every line UNTRUSTED_LINE matches dropped as tested_of() does, cut at BODY_CAP. `facts` None (gh could not
+    fetch them) gives BODY_UNAVAILABLE, so the read is told rather than left to guess."""
+    if facts is None:
+        return BODY_UNAVAILABLE
+    got = [plain("Title: " + " ".join(str(facts.get("title") or "(untitled)").split()))]
+    got += [plain(line) for line in str(facts.get("body") or "").splitlines()]
+    kept = [line for line in got if not UNTRUSTED_LINE.search(line)]
+    text = "\n".join(kept).strip()
+    if not str(facts.get("body") or "").strip():
+        text += "\n(the PR body is empty)"
+    if len(text) > BODY_CAP:
+        text = text[:BODY_CAP] + f"\n(… cut at {BODY_CAP} characters)"
+    if len(kept) < len(got):
+        text += f"\n({len(got) - len(kept)} line(s) dropped: they read as a verdict or as this prompt's own frame)"
+    return text.strip()
+
+
 def pr_view(root, pr, fields="comments"):
     rc, out = C.sh(["gh", "pr", "view", str(pr), "--json", fields], cwd=root, timeout=120)
     try:
@@ -1681,9 +1705,10 @@ def _silent(job, j, model, why):
 
 def read_text(job, template, diff, more):
     """The prompt `template` filled for this job: the PR's header, the diff, the merged files, the brief, the base's
-    rules and the PR body's Tested section (the module doc), plus the slots in `more`."""
+    rules, the PR body's Tested section and its whole title and body (the module doc), plus the slots in `more`."""
     root = root_of(job)
-    facts = pr_view(root, job.pr, "title,body") or {}
+    got = pr_view(root, job.pr, "title,body")
+    facts = got or {}
     # the union: job.files is the lane's list, which a job queued by an older lane may have made in the checkout's
     # own git; files_of() runs blind and sees every path
     blind_files = files_of(root, job.base_sha, job.head)
@@ -1695,7 +1720,8 @@ def read_text(job, template, diff, more):
                   BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
                   RULES=rules_of(root, job.base_sha) or "This repo ships no docs/REVIEW.md.",
-                  TESTED=tested_of(facts.get("body")) or "The PR body has no Tested section.", **more)
+                  TESTED=tested_of(facts.get("body")) or "The PR body has no Tested section.",
+                  BODY=body_of(got if isinstance(got, dict) else None), **more)
 
 
 def _buy(job, template, diff, more, prior=None):
@@ -1979,6 +2005,8 @@ def cmd_will_review(argv):
 #      head (GitHub's, _job_of) and appends perms' ledger entry (perms_recorded) only when that file read exactly
 #      that head at the change digest the PR has now, finished, and says LAND (adoptable()). A stale file names
 #      another head and is never the one found; any file must still match the live head and change.
+# The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge): a read of the PR
+# still running at any head, or a finished one at its head that is not a LAND, holds the merge (box).
 
 PERMS_READ_DIR = "reads"
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -2064,6 +2092,21 @@ def alive(pid):
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+def perms_reading(repo, pr, head) -> str:
+    """Why the lane must not merge PR `pr` yet on account of perms' own reads, or "": a read of it at any head still
+    running (its process alive), or a finished read at `head` that is not a LAND. dispatch#1296 merged on the lane's
+    own read while perms' read of it ran (10-19), and #1298 had to go to draft by hand to wait for one."""
+    for _, h in read_files(repo, pr):
+        e, _ = load_read(repo, pr, h)
+        if not e:
+            continue
+        if e.get("state") == "running" and alive(e.get("pid")):
+            return f"perms' security read of PR #{pr} at {h[:12]} is still running"
+        if h == head and e.get("state") == "done" and e.get("verdict") != T.LAND:
+            return f"perms' security read of PR #{pr} at {h[:12]} says {e.get('verdict') or 'nothing'}"
+    return ""
 
 
 def adoptable(job):

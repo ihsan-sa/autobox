@@ -894,6 +894,17 @@ def run_selfcheck():
     dm2.queues["boxtarget"].append((time.time(), {"type": "message", "content": "old text", "meta": {"chat_id": "CX", "ts": "200.3", "thread_ts": "200.3"}}))
     dm2.on_edit({"type": "message", "subtype": "message_changed", "channel": "CX", "message": {"ts": "200.3", "user": "UOWNER", "text": "new text"}})
     check("on_edit: edit rewrites content in place while still queued", dm2.queues["boxtarget"][0][1]["content"] == "new text")
+    long_edit = "the whole of a long edit " * 40
+    dm2.on_edit({"type": "message", "subtype": "message_changed", "channel": "CX", "message": {"ts": "200.3", "user": "UOWNER", "text": long_edit}})
+    check("on_edit: a long edit replaces the queued message whole — it was cut to 300 chars, losing the rest",
+          dm2.queues["boxtarget"][0][1]["content"] == long_edit.strip() and len(long_edit) > 900)
+    try:
+        globals()["api"] = lambda method, token, **kw: (_ for _ in ()).throw(RuntimeError("offline"))
+        long_hist = fmt_history({}, [{"user": "U1", "ts": "1", "text": "z" * 1200}])
+    finally:
+        globals()["api"] = real_api
+    check("fmt_history: a long message reads whole in history and thread — it was cut at 300 chars",
+          "z" * 1200 in long_hist and "truncated" not in long_hist)
     delivered.clear()
     dm2.on_edit({"type": "message", "subtype": "message_changed", "channel": "CX", "message": {"ts": "200.4", "user": "UOWNER", "text": "updated"}})
     check("on_edit: edit after delivery emits an update notice with the new text", bool(delivered) and "edited" in delivered[-1]["content"] and "updated" in delivered[-1]["content"])
@@ -4758,6 +4769,9 @@ def run_selfcheck():
         rt_verdict = (1, "cc-model: demo/t1 — handoff not started (demo/t1 already has an overlap open)")
         dmRt.on_reaction(rt_ev())
         rt_refused = (list(rt_rx), list(rt_said))
+        rt_before = list(rt_ran)
+        dmRt.on_reaction(rt_ev(user="UMEMBER"))                         # a member's 👍 on the same card
+        rt_member = (rt_ran[len(rt_before):], list(rt_woke))
     finally:
         globals()["api"] = real_api
         globals()["react"] = _rxRt
@@ -4772,6 +4786,8 @@ def run_selfcheck():
           rt_mention[-1] == [f"{BIN}/cc-model", "return", "demo@site"])
     check("…the same words in a person's message are nobody's card, and a plain reply of ours is still the ack rule: "
           "nothing runs, nothing wakes", rt_not_cards[0] == rt_mention and rt_not_cards[1] == rt_other[1])
+    check("WALL (member authority): a member's 👍 on cc-model's return card runs nothing and wakes no session — "
+          "only the owner's 👍 hands a session off", rt_member == ([], rt_not_cards[1]))
     check("…cc-model's refusal is the owner's answer: ❌ on the card and its one line in the thread",
           rt_refused[0][-1] == ("8200.1", "x")
           and rt_refused[1] == [("C1", "cc-model: demo/t1 — handoff not started (demo/t1 already has an overlap open)", "8200.1")])
@@ -9545,7 +9561,7 @@ def run_selfcheck():
           and dl[1].endswith("docs alice: file ok=True"))
     ttl_line = next((l for l in open(SELF).read().splitlines() if l.startswith("QUEUE_TTL =")), "")
     check("QUEUE_TTL's own comment names the time it holds (it said 15 min while the value was 4 h)",
-          QUEUE_TTL == 4 * 3600 and "after 4 h" in ttl_line and "15 min" not in ttl_line)
+          QUEUE_TTL == 24 * 3600 and "after 24 h" in ttl_line and "15 min" not in ttl_line)
     # A REFUSED HELLO IS LOGGED ONCE PER PROCESS: a dead session's channel server re-sends it every 3 s. Its own daemon.
     dmH = Daemon(use_slack=False)
     wh = "hello hb-1 from a process that is not that session"

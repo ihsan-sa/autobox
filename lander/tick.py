@@ -15,7 +15,8 @@
             file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
             a refusal is not undone by a sweep.
             Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
-            `dispatch/`) whose files touch no path on the base's security list; any doubt queues it as before.
+            `dispatch/`) whose base is the repo's default branch and whose files touch no path on that branch's
+            security list, read from a fresh fetch; any doubt queues it as before.
   ended     for each repo with a job stopped in query (rest/) or held, at most every $LANDER_ENDED_SECS (900) per repo:
             GitHub is asked what became of each such PR, with no lock held. A held job the lane itself tried to
             merge (merge_attempt set, or held from past queued/planned/checking) is left to the lane, which proves it.
@@ -62,8 +63,8 @@
             (failed). A job whose merge the tip run reverted -> done rc 1.
   backoff   while the GitHub backoff runs (gh.py) no gh work is done: said once, lanes and watches wait.
   rearm     every tick (--rearm is accepted and adds nothing): ONE transient timer per repo that still waits on
-            something — a job held with a not_before, a wanted tip run, a requested deploy, or a deploy-pending job
-            while the tip is not red. `systemd-run --user --on-active=<secs> --unit=lander-tick-<repo>-<epoch>
+            something — a job held with a not_before, a wanted tip run, a requested deploy, a deploy-pending job
+            while the tip is not red, or an owed main health pass (health.pending). `systemd-run --user --on-active=<secs> --unit=lander-tick-<repo>-<epoch>
             <core/bin/lander> tick --repo <repo> --rearm`, skipped when the user manager's list-timers shows an
             active lander-tick-<repo>-* timer. No unit files are written, and nothing depends on a caller ticking.
             A repo with no checkout (repo_root is not a directory) is never armed, so a gone repo's timer dies.
@@ -162,16 +163,25 @@ def self_merge_heads(repo) -> list:
     return heads if all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) for h in heads) else []
 
 
-def merges_itself(root, slug, repo, p) -> bool:
-    """PR p touches no path on its base's security list (review.security_globs, the lane's own read), a rename's old
-    name included. False, so the sweep queues it, when the files, the base or the list will not read, when the list
+def default_base(root, slug) -> tuple:
+    """(the repo's default branch, the commit a fresh fetch got for it), or ("", "") when either will not read."""
+    try:
+        name = (GH.api_json(root, f"repos/{slug}") or {}).get("default_branch") or ""
+        return (name, G.fetch(root, name)[name]) if name else ("", "")
+    except Exception:   # noqa: BLE001 — no default branch read: every declared head queues as before
+        return ("", "")
+
+
+def merges_itself(root, slug, repo, p, base) -> bool:
+    """PR p touches no path on the security list at commit `base` (review.security_globs, the lane's own read), a
+    rename's old name included. False, so the sweep queues it, when the files or the list will not read, when the list
     is empty (nothing then tells a security head from another), or at 100 files or more (one page of GitHub's)."""
     files = GH.api_json(root, f"repos/{slug}/pulls/{p['number']}/files?per_page=100")
     if not isinstance(files, list) or not 0 < len(files) < 100:
         return False
     try:
         paths = [f["filename"] for f in files] + [f["previous_filename"] for f in files if "previous_filename" in f]
-        globs = R.security_globs(root, G.rev(root, "refs/remotes/origin/" + p["baseRefName"]), repo)
+        globs = R.security_globs(root, base, repo)
         return bool(globs) and not any(MF.match(globs, x) for x in paths)
     except Exception:   # noqa: BLE001 — any read that fails queues the PR as before
         return False
@@ -199,7 +209,8 @@ def sweep_strays(repos) -> list:
     """Queue the box's own open PRs that nothing queued (raised-seat-pr-never-reaches-the-lane, 2026-10-03: a seat's
     `gh pr create` wrote no lane entry, and the PR sat 2.5 h unqueued while the owner had been told it was queued).
     cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back.
-    A head on a self_merge_heads prefix that merges_itself (no security path) is left to its repo; any doubt queues."""
+    A head on a self_merge_heads prefix whose base is the default branch and that merges_itself (no security path)
+    is left to its repo; a PR to another base, and any doubt, queues."""
     lines = []
     for repo in repos:
         root = J.repo_root(repo)
@@ -217,7 +228,7 @@ def sweep_strays(repos) -> list:
         if not isinstance(prs, list):
             lines.append(f"[{repo}] strays: gh could not list the open PRs — {GH.last(err or out) or f'exit {rc}'}")
             continue
-        now, seen, heads = time.time(), None, None
+        now, seen, heads, base = time.time(), None, None, None
         for p in prs:
             if not isinstance(p, dict) or not isinstance(p.get("number"), int) or p.get("isDraft"):
                 continue
@@ -230,8 +241,10 @@ def sweep_strays(repos) -> list:
             if n in seen:   # landed, refused, stopped or handed back once: what happens next is a person's call
                 continue
             heads = self_merge_heads(repo) if heads is None else heads
-            if any(head.startswith(h) for h in heads) and merges_itself(root, s, repo, p):
-                continue    # the repo merges it on its own read; a head on a security path still comes here
+            if any(head.startswith(h) for h in heads):
+                base = default_base(root, s) if base is None else base
+                if base[0] and p.get("baseRefName") == base[0] and merges_itself(root, s, repo, p, base[1]):
+                    continue    # the repo merges it on its own read; a head on a security path still comes here
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 qrc = L.cmd_queue([repo, str(n), "--who", "tick", "--no-start"])
@@ -387,7 +400,9 @@ def waits(repo) -> list:
     req = C.read_json(D.req_path(repo)) or {}
     requested = any((st or {}).get("state") == "requested" for st in (req.get("targets") or {}).values())
     pending = any(j.state in (T.DEPLOY_PENDING, T.DEPLOYED) for j in jobs)
-    if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))):
+    # HL.pending: a killed pass or a want a skipped tick left; health.TRIES bounds how long a pass stays owed
+    if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))) \
+            or HL.pending(repo):
         out.append(TICK_SECS)
     if C.left_held(repo):   # a held last card edit (retry_cards): a tick once the cap or the 429's back-off lets it go
         # …but a running lane hands it over itself and retry_cards skips it, so one TICK_SECS tick looks again after,

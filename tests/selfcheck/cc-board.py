@@ -7,7 +7,7 @@
 def selfcheck():
     """STATIC: the two rules this file owns, checked against fixtures — no board, no state dir, no clock beyond
     its own. Run by tests/check.sh, so a regression fails the commit rather than the next `cc board show`."""
-    global BOARDS, LOCK_WAIT   # two cases below shorten the wait and point the boards at the fixture, and put both back
+    global BOARDS, LOCK_WAIT, STATE   # two cases below shorten the wait and point the boards at the fixture, and put both back
     n = 0
     def ok(what, cond):
         nonlocal n
@@ -266,6 +266,11 @@ def selfcheck():
            isinstance(r1, Refused) and not os.path.exists(f"{th}/elsewhere"))
         ok("a link at task.md is refused, not read or written through, and leaves no temp file behind",
            isinstance(r2, Refused) and os.path.islink(f"{sroot}/r/lnk2/task.md") and not glob.glob(f"{sroot}/r/lnk2/*.tmp"))
+        real_state = STATE; STATE = sroot
+        try: leaked = read_brief("r", "lnk2")
+        finally: STATE = real_state
+        ok("WALL (secrets): read_brief — what show, get and cc done's PR body print — reads '' through a link at task.md, "
+           "never the file it names", leaked == "" and open("/etc/hostname").read() not in ("", leaked))
         ok("a brief that is not there is not made for an annotate", brief_edit("annotate", "r", "none", blk(1), state=sroot) == ("", "")
            and not os.path.exists(f"{sroot}/r/none"))
         # a shell-mangled emoji reaches argv as a lone surrogate; stored once, it turned every `show` into a traceback

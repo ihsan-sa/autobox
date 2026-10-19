@@ -149,7 +149,7 @@ CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as co
 CC_HANDOFF_V2=1 (opt-in, off by default: --brief, the --rotate line and the cutover row come from cc-handoff-v2,
 the rebuilt parts; docs/rebuilds/handoff-and-context.md says what each one changes and why).
 """
-import fcntl, glob, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time, uuid
+import fcntl, glob, json, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time, uuid
 
 STATE = os.path.expanduser("~/.cc/state")
 DEV = os.path.expanduser("~/dev")        # where the checkouts are: --brief asks gh inside the target's own
@@ -2167,8 +2167,6 @@ BOARD_HELD = BOARD_CONT + "held ("                        # a hold a person put 
 BOARD_FOOT = re.compile(r"^  \(\d+ finished — cc board show ")   # cc-board's own last line, after the rows
 DONE_ROWS = ("merged", "done")
 BACKLOG_ROWS = ("queued",)         # of cc-board's STATES, the one nobody has started: header only, see board_open
-LANE = re.compile(r"^lane[0-9]+$")                        # the tmux land-lane crutch (retired in #154, not gone)
-PR_IN = re.compile(r"(?<![0-9])([0-9]{1,6})(?![0-9])")
 
 
 def out(argv, timeout=25, cwd=None, fail=""):
@@ -2305,16 +2303,9 @@ def board_open(repo):
 
 
 def lanes():
-    """What is LANDING right now. Two shapes, because the box has both: a `lane<N>` tmux window (the crutch
-    #154 retired — one left running is exactly the thing a successor must be told about) and the queue that
-    replaced it, one job file per PR under ~/.cc/state/land/."""
+    """What is LANDING right now: the land queue, one job file per PR under ~/.cc/state/land/. (The `lane<N>`
+    tmux windows it replaced in #154 are gone: nothing makes one.)"""
     rows = []
-    for line in (tmux("list-windows", "-a", "-F",
-                      "#{window_name}\t#{window_id}\t#{pane_pid}\t#{pane_start_command}") or "").splitlines():
-        fields = line.split("\t")
-        if len(fields) == 4 and LANE.match(fields[0]):
-            pr = PR_IN.search(fields[3].replace(fields[0], " "))
-            rows.append(f"{fields[0]:<10} window {fields[1]:<6} PR {pr.group(1) if pr else '?':<6} waiter pid {fields[2]}")
     land = os.path.join(STATE, "land")
     try:
         jobs = sorted(f for f in os.listdir(land) if f.endswith(".json"))
@@ -2343,14 +2334,17 @@ def live_workers(repo):
     idle = cfg("CC_BRIEF_WORKER_IDLE", 3600)              # once, not once per track: a repo has scores of them
     for t in tracks:
         log = os.path.join(base, t, "loop.log")
-        try:
-            if time.time() - os.path.getmtime(log) > idle:
-                continue                                  # long finished: the board carries those
-            last = ""
-            for last in open(log, errors="replace"):
-                pass
-        except OSError:
+        try:                                              # the state dir is worker-writable: a link or a FIFO planted
+            fd = os.open(log, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)   # at loop.log is skipped,
+        except OSError:                                   # never read into the successor's prompt
             continue
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or time.time() - st.st_mtime > idle:
+                continue                                  # not one plain file, or long finished: the board carries those
+            f.seek(max(0, st.st_size - 4096))
+            lines = f.read().decode(errors="replace").splitlines()
+        last = lines[-1] if lines else ""
         rows.append(f"{t:<24} {last.strip()[:160]}")
     return "\n".join(rows)
 

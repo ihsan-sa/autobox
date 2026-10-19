@@ -191,6 +191,102 @@ class Run(Case):
         ran, asked = self.go(TIP3, ["app/y.py", "lib/z.py"])
         self.assertEqual(ran, {"app": T.PASSED, "lib": T.PASSED}, "every check the range reaches runs on the new tip")
 
+    def test_a_pass_that_never_finishes_on_one_tip_stops_being_owed_after_tries(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2] = TIP2, ["app/y.py"]
+        asked = []
+
+        def broken(name, sha):
+            asked.append(name)
+            raise RuntimeError("no tree")
+        for _ in range(HL.TRIES):
+            with self.assertRaises(RuntimeError):
+                HL.run("demo", broken)
+            self.assertTrue(HL.pending("demo"))
+        self.assertEqual(HL.run("demo", broken), {})
+        self.assertEqual(len(asked), HL.TRIES, "the pass after TRIES runs nothing")
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"]), (TIP1, ""))
+        self.assertFalse(HL.pending("demo"))
+        self.assertEqual(self.go(TIP2, ["app/y.py"])[0], {}, "a later tick on the same tip runs nothing")
+
+    def give_up(self, tip, broken):
+        """TRIES passes on `tip` that raise from `broken`, then the one that gives up. -> the (id, argv) said"""
+        said = []
+        self.tip, self.files[tip] = tip, ["app/y.py"]
+        with mock.patch.object(C, "say", lambda pid, argv, repo, pr: said.append((pid, argv))):
+            for _ in range(HL.TRIES):
+                with self.assertRaises(RuntimeError):
+                    HL.run("demo", broken)
+            self.assertEqual(said, [], "no card while a pass is still owed")
+            self.assertEqual(HL.run("demo", broken), {})
+        return said
+
+    def test_a_pass_that_raises_before_any_check_still_counts_its_tries(self):
+        self.go(TIP1, ["app/x.py"])
+
+        def early(*a, **k):
+            raise RuntimeError("manifest unreadable")
+        with mock.patch.object(M, "load", early):
+            said = self.give_up(TIP2, lambda n, s: T.Result(check=n, tree=s, status=T.PASSED))
+        rec = HL.load("demo")
+        self.assertEqual((rec["running"], rec["tries"], rec["gave_up"]), ("", [TIP2, HL.TRIES + 1], TIP2))
+        self.assertFalse(HL.pending("demo"), "a pass that fails early is not owed for good")
+        self.assertEqual(len(said), 1)
+
+    def test_a_tip_given_up_on_is_stamped_and_later_ticks_on_it_are_quiet(self):
+        self.go(TIP1, ["app/x.py"])
+        said = self.give_up(TIP2, lambda n, s: (_ for _ in ()).throw(RuntimeError("no tree")))
+        logged = []
+        with mock.patch.object(C, "log", lambda *a, **k: logged.append(a)), \
+                mock.patch.object(C, "say", lambda *a, **k: self.fail("a second card on the same tip")):
+            for _ in range(3):
+                self.assertEqual(HL.run("demo", lambda n, s: self.fail("ran a check on a given-up tip")), {})
+        self.assertEqual(logged, [], "no gave-up line every tick")
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["gave_up"], rec["tries"]), (TIP1, TIP2, [TIP2, HL.TRIES + 1]))
+        self.assertEqual(len(said), 1)
+        diffs = []
+        git = self.git
+        with mock.patch.object(C, "sh", lambda argv, **k: (diffs.append(argv[1:]) if argv[1:2] == ["diff"] else None,
+                                                           git(argv, **k))[1]):
+            self.go(TIP3, ["lib/z.py"])
+        self.assertEqual([d[-2:] for d in diffs], [[TIP1, TIP3]],
+                         "the next tip's range still reaches back over the given-up one: 'tip' did not move")
+
+    def test_giving_up_sends_one_card_naming_the_tip(self):
+        self.go(TIP1, ["app/x.py"])
+        said = self.give_up(TIP2, lambda n, s: (_ for _ in ()).throw(RuntimeError("no tree")))
+        self.assertEqual(len(said), 1)
+        pid, argv = said[0]
+        self.assertEqual(pid, f"land:demo:main-health-gave-up@{TIP2[:12]}")
+        self.assertEqual(argv[argv.index("--id") + 1], pid, "cc-slack's --id dedups it too")
+        self.assertIn(TIP2[:12], argv[-1])
+        self.assertIn("gave up", argv[-1])
+
+    def test_a_card_send_that_raises_leaves_the_tip_unstamped_and_the_next_tick_sends_it(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2] = TIP2, ["app/y.py"]
+        broken = lambda n, s: (_ for _ in ()).throw(RuntimeError("no tree"))  # noqa: E731
+        for _ in range(HL.TRIES):
+            with self.assertRaises(RuntimeError):
+                HL.run("demo", broken)
+
+        def down(*a, **k):
+            raise OSError("slack down")
+        with mock.patch.object(C, "say", down):
+            with self.assertRaises(OSError):
+                HL.run("demo", broken)
+        self.assertEqual(HL.load("demo")["gave_up"], "", "no stamp for a card that never went out")
+        # Opus read of #1527: the tick only calls run again while pending() holds, and run already took the want
+        self.assertTrue(HL.pending("demo"), "a card that never went out keeps the tip owed")
+        said = []
+        with mock.patch.object(C, "say", lambda pid, argv, repo, pr: said.append(pid)):
+            self.assertEqual(HL.run("demo", lambda n, s: self.fail("ran a check on a given-up tip")), {})
+            self.assertEqual(HL.run("demo", lambda n, s: self.fail("ran a check on a given-up tip")), {})
+        self.assertEqual(said, [f"land:demo:main-health-gave-up@{TIP2[:12]}"], "the next tick sends it, once")
+        self.assertEqual(HL.load("demo")["gave_up"], TIP2)
+
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])
         self.assertIn("e2e-flow", ran)
@@ -327,6 +423,33 @@ class Tick(Case):
         HL.want("demo")
         self.tick(lambda *a, **k: ran.append(1) or {}, st="idle")
         self.assertEqual(ran, [1], "an owed pass runs though the tip was idle")
+
+
+    def test_an_owed_pass_runs_when_the_tip_run_raised(self):
+        HL.want("demo")
+        tip, deploy = types.ModuleType("tip"), types.ModuleType("deploy")
+        tip.run = lambda repo, plan, check: (_ for _ in ()).throw(RuntimeError("tip broke"))
+        tip.catchup = lambda repo: False
+        deploy.run = lambda repo: None
+        ran = []
+        with mock.patch.object(HL, "run", lambda *a, **k: ran.append(1) or {"app": T.PASSED}), \
+                mock.patch.object(TK, "settle", lambda repo: []), \
+                mock.patch.object(TK, "due_catchup", lambda repo: False), \
+                mock.patch.object(TK.MF, "host_fallback", lambda repo: ""), \
+                mock.patch.object(TK.D, "root_of", lambda repo: self.tmp), \
+                mock.patch.object(TK.L, "paused", lambda repo: False), \
+                mock.patch.object(TK.E, "log", lambda *a, **k: None):
+            lines = TK.tip_and_deploy("demo", {"tip": tip, "deploy": deploy})
+        self.assertEqual(ran, [1], "the owed pass ran though the tip run raised")
+        self.assertTrue(any("tip run or the deploy failed" in x for x in lines), lines)
+        self.assertIn("[demo] main health: 1 check(s)", lines)
+
+    def test_an_owed_pass_rearms_the_tick(self):
+        with mock.patch.object(TK.J, "lane_jobs", lambda repo: []), \
+                mock.patch.object(TK.C, "left_held", lambda repo: False):
+            self.assertEqual(TK.waits("demo"), [])
+            HL.want("demo")
+            self.assertEqual(TK.waits("demo"), [TK.TICK_SECS])
 
 
 class E2E(unittest.TestCase):

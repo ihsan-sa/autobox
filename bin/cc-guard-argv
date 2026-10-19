@@ -48,7 +48,10 @@ Rules for both gated roles:
   destination is not a track/… branch; GIT_DIR/GIT_WORK_TREE name the checkout like --git-dir; any push in a
   command that also moves HEAD (git checkout|switch|symbolic-ref|worktree, branch -m, update-ref HEAD, gh pr
   checkout), or whose refspec, remote, -C, --git-dir, GIT_DIR or cd target is computed                 -> deny
-- a worker's gh pr|issue comment|create|close|reopen|edit|review|merge|lock|unlock|delete|transfer      -> deny
+- gh pr|issue comment|create|close|reopen|edit|review|merge|lock|unlock|delete|transfer; gh release create -> deny
+- cc-slack inject, cc-broker inject|ledger, cc-publish (but status/selfcheck/setup/--dry-run/-n/--help); a member's
+  cc-slack post|post-approval, cc-arch landed, force push or branch delete                           -> deny
+- an interpreter running one of the gated tools by its path (`python3 core/bin/cc-try on`) is judged as that tool
 - gh repo delete|archive; gh api -X DELETE repos/o/r or repos/o/r/git/refs/heads/main|master; gh api PATCH/POST/PUT
   (or fields given, so POST) on repos/o/r/git/refs/heads/main|master; gh api DELETE/PATCH/POST/PUT on
   repos/o/r/branches/main|master/protection[/..] or repos/o/r/rulesets[/..]; gh api graphql naming deleteRef,
@@ -93,11 +96,10 @@ Member only:
 - CC_MEMBER_SANDBOX= assignment; cc --go outside ~/dev/<mws> (cc board|quick exempt); cc-loop; `cc <repo>` naming
   another repo; claude -p/--print; cc slack / cc-slack off|setup|mkchannel|updates-sweep|archive|retire;
   cc-config                                                                                            -> never
-- cc-slack inject|post|post-approval, cc-broker inject|ledger, cc-publish (but status/selfcheck/setup/--dry-run/--help) -> deny
 Not here (cc-guard keeps them, they need /proc or the tool input): tmux kill-server/kill-session, pattern kills,
 the member kill fence, the Write/Edit rules.
 """
-import fnmatch, glob, json, os, re, sys, tempfile
+import fnmatch, glob, json, os, re, shlex, sys, tempfile
 
 class ParseError(Exception):
     pass
@@ -146,7 +148,7 @@ KW = {'!', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '
 WRITEV = {'cp', 'mv', 'ln', 'install', 'rsync', 'tee', 'dd', 'sed', 'perl', 'truncate', 'rm', 'rmdir', 'unlink',
           'shred', 'touch', 'mkdir', 'chmod', 'chown', 'chgrp', 'curl', 'wget', 'find', 'git'}
 TOOLS = {'service', 'gh', 'claude', 'cc', 'cc-loop', 'cc-room', 'cc-handoff', 'lander-self', 'cc-try', 'cc-config', 'cc-settings',
-         'cc-slack', 'cc-broker', 'cc-publish', 'tmux', 'pkill', 'killall', 'systemctl', 'loginctl', 'eval'}
+         'cc-slack', 'cc-broker', 'cc-publish', 'cc-arch', 'tmux', 'pkill', 'killall', 'systemctl', 'loginctl', 'eval'}
 GATED = ROOTV | POWERV | FW | PART | NET | CONT | SHELLS | set(WRAP) | WRITEV | TOOLS
 GITW = {'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'merge', 'mv', 'pull', 'rebase', 'reset',
         'restore', 'revert', 'rm', 'stash', 'switch', 'worktree', 'submodule', 'update-ref', 'symbolic-ref', 'init', 'clone'}
@@ -614,6 +616,12 @@ class Guard:
                 cmds += [rv[k + 1][1:] for k, x in enumerate(rv[:-1]) if re.match(r'alias\.', x, re.I) and rv[k + 1].startswith('!')]
             for t in cmds: out += g.script(t, cwd, 'git alias', depth + 1)
         elif INTERP.fullmatch(b or ''):   # the code's string literals as the commands it may run: each literal, and
+            # …and `python3 core/bin/cc-try on …`: a script file that IS one of the gated tools runs as that tool
+            k = 0
+            while k < len(a) and a[k].startswith('-') and a[k] not in ('-', '--') and not re.fullmatch(r'-[A-Za-z]*[cemr].*', a[k]):
+                k += 2 if a[k] in ('-W', '-X') else 1
+            if k < len(a) and not a[k].startswith('-') and os.path.basename(a[k]) in TOOLS:
+                out += g.script(' '.join(shlex.quote(x) for x in [os.path.basename(a[k])] + a[k + 1:]), cwd, b + ' script', depth + 1)
             lits, runs = [], []          # each run that one list or concatenation holds ("a", "b" -> `a b`; "a " + "b" -> `a b`)
             for code in progtext(b, a, []):
                 end = None
@@ -895,6 +903,7 @@ class Guard:
                 # copy in /tmp is a force push all the same (perms' replay set, row "force push or deleting refspec")
                 force = any(x in ('-f', '--force', '-d', '--delete') or x.startswith(('--force-', '--force=')) or
                             re.fullmatch(r'-[a-zA-Z]*[fd][a-zA-Z]*', x) for x in rv if x.startswith('-')) or any(x.startswith(('+', ':')) for x in p)
+                if g.role == 'member' and force: return 'deny', 'a force push or branch delete'
                 if g.role == 'worker' and force:
                     dsts = [re.sub(r'^refs/heads/', '', rs.lstrip('+').rpartition(':')[2] if ':' in rs else rs.lstrip('+')) for rs in p]
                     dsts = [cur() if d in ('HEAD', '@') else d for d in dsts] if p else [cur()]
@@ -905,8 +914,9 @@ class Guard:
         if v == 'gh':
             gn = [w.v for w in pos(R['argw'], {'-R', '--repo'})]
             if gn[:2] in (['repo', 'delete'], ['repo', 'archive']): return 'deny', f'gh repo {gn[1]}'
-            if g.role == 'worker' and gn[:1] in (['pr'], ['issue']) and gn[1:2] and gn[1] in GHPOST:
+            if gn[:1] in (['pr'], ['issue']) and gn[1:2] and gn[1] in GHPOST:
                 return 'deny', f"posting to a PR or issue (gh {gn[0]} {gn[1]}): a worker's PR text goes up through cc done"
+            if gn[:2] == ['release', 'create']: return 'deny', 'publishing a GitHub release (gh release create)'
             if gn[:1] == ['api']:
                 ep = [w.v for w in pos(R['argw'], {'-X', '--method', '-H', '--header', '-f', '-F', '--field', '--raw-field', '--input',
                                                    '-q', '--jq', '-t', '--template', '--cache', '--hostname', '-p', '--preview', '-R', '--repo'})][1:2]
@@ -954,6 +964,14 @@ class Guard:
         if v == 'cc-config' and first in ('set', 'unset') and len(n) > 1 and PROTKEY.match(n[1]):
             return 'never', f'cc-config {first} {n[1].split("=")[0]}: a key the landing gate reads'
         if v == 'cc-settings' and first in ('apply', 'grant'): return 'never', 'cc-settings rewrites the permission layer'
+        # typing into a session's prompt is text arriving with a seat's authority (both roles); a plain post to the owner's
+        # own channel reaches nobody outside, so only a member is held off it (a member's reach stays what it was)
+        if not help_ and ((v == 'cc-slack' and first == 'inject') or (v == 'cc-broker' and first in ('inject', 'ledger'))):
+            return 'deny', f"typing into a session's prompt ({v} {first})"
+        if mem and not help_ and ((v == 'cc-slack' and first in ('post', 'post-approval')) or (v == 'cc-arch' and first == 'landed')):
+            return 'deny', f"posting to the owner's Slack ({v} {first})"
+        if v == 'cc-publish' and not help_ and first not in ('status', 'selfcheck', 'setup') and '--dry-run' not in a and '-n' not in a:
+            return 'deny', "publishing the box's code outward (cc-publish)"
         h = g.fence(R)
         if h: return h
         if not mem: return None
@@ -978,10 +996,6 @@ class Guard:
             return 'never', "a headless claude spends the owner's budget"
         if v == 'cc-slack' and first in ('off', 'setup', 'mkchannel', 'updates-sweep', 'archive', 'retire'):
             return 'never', f"re-wiring the box's Slack (cc-slack {first})"
-        if not help_ and ((v == 'cc-slack' and first in ('inject', 'post', 'post-approval')) or (v == 'cc-broker' and first in ('inject', 'ledger'))):
-            return 'deny', f"posting to the owner's Slack ({v} {first})"
-        if v == 'cc-publish' and not help_ and first not in ('status', 'selfcheck', 'setup') and '--dry-run' not in a:
-            return 'deny', "publishing the box's code outward (cc-publish)"
         return None
 
 def progtext(v, a, redirs):   # the program text an interpreter -c/-e, awk or sed runs (data to the parser, read here as text)

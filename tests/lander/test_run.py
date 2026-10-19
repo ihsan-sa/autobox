@@ -1105,8 +1105,7 @@ exec bash {RUN.BIN}/cc-suites runner
             RUN.laptop_argv(chk(), self.tree, "")
         os.remove(os.path.join(d, "known_hosts"))
         self.assertEqual(RUN.laptop_dest(), "")
-        with mock.patch.object(A, "busy", return_value=True):
-            self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
+        self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
 
     def test_a_check_name_with_a_newline_never_reaches_the_laptop(self):
         # the security read of #866: ssh joins argv with spaces and the runner reads the first line, so this name
@@ -2429,9 +2428,8 @@ class Judge(unittest.TestCase):
                 self.assertEqual(RUN.choose_where(chk(klass=k, where=["box", "laptop"])), "box")
             # the lane saw the runners give no answer a moment ago: the box takes it without waiting out ssh
             self.assertEqual(RUN.choose_where(c, box_only=True), "box")
-        with mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "busy", return_value=True), \
-                mock.patch.object(A, "free", return_value=1):
-            # a quiet lander keeps it (a slot is free here, so the live box's own slots never decide this case) (owner 2026-10-12): busy() is not overloaded(), and nothing leaves
+        with mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "free", return_value=1):
+            # a quiet lander keeps it (a slot is free here, so the live box's own slots never decide this case) (owner 2026-10-12): nothing leaves
             self.assertEqual(RUN.choose_where(c), "box")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
             # ...unless the lane placed it on the runners (it had no box slot for it): then it goes, if it may
@@ -2504,24 +2502,13 @@ class Judge(unittest.TestCase):
             for n in ("selfcheck-cc-fence", "selfcheck-cc-sandbox", "selfcheck-lander"):
                 self.assertEqual((n, RUN.choose_where(by[n])), (n, "box"))
 
-    def test_a_busy_box_that_is_not_saturated_sends_to_the_laptop_and_keeps_its_slots(self):
+    def test_a_busy_box_that_is_not_saturated_keeps_its_slots(self):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         write(d.name, {"cpu": "some avg10=90.00 avg60=90.00 avg300=90.00 total=1\n",
                        "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"})
-        self.assertTrue(A.busy(d.name))
         self.assertFalse(A.loaded(d.name))
         self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
-        write(d.name, {"cpu": "some avg10=20.00 avg60=20.00 avg300=20.00 total=1\n"})
-        self.assertFalse(A.busy(d.name, "/nonexistent"))
-        # the box of 2026-09-29: cpu PSI near 38, load 9-27 on 6 cores, and 1 check of 200 went out
-        write(d.name, {"cpu": "some avg10=38.00 avg60=38.00 avg300=38.00 total=1\n"})
-        self.assertTrue(A.busy(d.name, "/nonexistent"))
-        write(d.name, {"cpu": "some avg10=10.00 avg60=10.00 avg300=10.00 total=1\n"})
-        n = os.cpu_count() or 1
-        write(d.name, {"la": f"{n:.2f} 0 0 1/1 1\n", "la2": f"{n - 0.5:.2f} 0 0 1/1 1\n"})
-        self.assertTrue(A.busy(d.name, os.path.join(d.name, "la")))      # a load of one per core is busy
-        self.assertFalse(A.busy(d.name, os.path.join(d.name, "la2")))
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")

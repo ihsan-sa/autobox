@@ -72,10 +72,7 @@ goes to the runners (run.spill and run.choose_where; owner 2026-10-12, which tur
 now the box has room to spare). The lane also sends a check out when it has no box place for it (its width() is
 full, or the job already holds its one box check), so no check waits for a box slot while a runner has room. The lane
 keeps up to LAPTOP_SLOTS (LANDER_LAPTOP_SLOTS, default 5) of them in flight beside the box's slots, which they do not
-take; a laptop that answers busy sends the check back to the box. busy() no longer places checks; it was the bar: cpu `some avg10` at PSI_LAPTOP (default 25), memory at
-PSI_MEM, or a 1-minute load average at LANDER_LAPTOP_LOAD (default 1) times the cores. A box under loaded()'s
-near-saturation mark all day is still slow: on 2026-09-29 it sat at load 9-27 on 6 cores with cpu PSI near 38, and
-sent 1 check of 200 out. busy() is not overloaded(): slots and cc-room ignore it.
+take; a laptop that answers busy sends the check back to the box.
 
 SCOPES. Each run goes into a transient `systemd-run --user --scope` on slice `lander.slice` (no unit file) with a low
 CPUWeight, a MemoryMax and no swap (a box already deep in swap is what this guards against), so the kernel,
@@ -112,9 +109,7 @@ CONFIG_TTL = 60.0
 MEMINFO = "/proc/meminfo"
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
-PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "25"))
 LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
-LAPTOP_LOAD = float(os.environ.get("LANDER_LAPTOP_LOAD", "1") or 1)
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 CPU_WEIGHT = "20"
@@ -153,15 +148,6 @@ def load1(loadavg: str | None = None) -> float | None:
             return float(f.read().split()[0])
     except (OSError, ValueError, IndexError):
         return None
-
-
-def busy(root: str = PSI_DIR, loadavg: str | None = None) -> bool:
-    """Busy enough that a check goes to the laptop; lower than loaded(), and slots ignore it. An unreadable load
-    average counts as calm."""
-    if psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_LAPTOP:
-        return True
-    l1 = load1(loadavg)
-    return l1 is not None and l1 >= LAPTOP_LOAD * (os.cpu_count() or 1)
 
 
 def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:

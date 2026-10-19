@@ -11,7 +11,11 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    passes it (code: the merge broke it) or fails it too (machine). -> {name: status}
                                    of what ran, {} when the tip was already checked. Each result is written as it
                                    finishes, with "running": tip; a pass killed part-way leaves those on disk, and the
-                                   next pass on the same tip runs only the checks it had not reached.
+                                   next pass on the same tip runs only the checks it had not reached. After TRIES
+                                   passes on one tip that never finished (a check that raises or is killed each time, or
+                                   the pass itself raises before any check), the next sends ONE card for it, then clears
+                                   "running", stamps the tip in "gave_up" and runs nothing more on it; a send that
+                                   raises writes nothing, so the pass stays pending and the next tick sends the card.
     lock(repo)                     the health lock: True when held, False when another pass holds it (never waits)
     pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way, or a tick
                                    found the lock taken and asked for one more (want(repo)), since the running pass
@@ -27,7 +31,8 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    blocked-by-main), so it waits for that check alone.
 
 THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked in full, "running": the tip a
-pass is on ("" between passes), "checks": {name: {"status", "tree", "tip",
+pass is on ("" between passes), "tries": [tip, passes started on it], "gave_up": the last tip given up on (its
+range stays owed to the next tip's pass, since "tip" is not moved), "checks": {name: {"status", "tree", "tip",
 "at", "since", "cause"}}}. since and cause are kept from the run that turned the check red until it is green again.
 An unrunnable result is never recorded, as red or green. Nothing here holds a deploy or reverts a merge: the tip run
 does that, for the box checks.
@@ -45,6 +50,7 @@ from lander import types as T
 
 PR_RE = re.compile(r"\(#(\d+)\)$")
 FRESH = 2 * 3600   # seconds a record of a base tree stands in for a run on it
+TRIES = 3          # passes started on one tip before an unfinished one stops being owed
 
 
 def path(repo):
@@ -53,7 +59,8 @@ def path(repo):
 
 def load(repo):
     rec = C.read_json(path(repo), {}) or {}
-    return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "checks": dict(rec.get("checks") or {})}
+    return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "tries": list(rec.get("tries") or []),
+            "gave_up": rec.get("gave_up") or "", "checks": dict(rec.get("checks") or {})}
 
 
 def red(repo):
@@ -151,8 +158,23 @@ def run(repo, check, fallback=""):
     root, base = D.root_of(repo), D.base_of(repo)
     tip = TP.origin_tip(root, base)
     rec = load(repo)
-    if not tip or rec["tip"] == tip:
+    if not tip or tip in (rec["tip"], rec["gave_up"]):
         return {}
+    resume = rec["running"] == tip
+    # Opus read of #1326: a check that raises on every try kept "running" set and ran again every tick. Counted before
+    # anything below can raise (the reads of #1518): a pass that failed early stayed owed for good.
+    tries = (rec["tries"][1] if rec["tries"][:1] == [tip] else 0) + 1
+    rec["running"], rec["tries"] = (tip if tries <= TRIES else ""), [tip, tries]
+    if tries > TRIES:
+        C.log("main-health", repo, "gave-up", tip=tip[:12], tries=TRIES)
+        gave_up(repo, base, tip)
+        # reads of #1518: stamped, so the next tick on this tip is quiet. Perms' read of #1522: only once the card
+        # went out. Opus read of #1527: nothing is written before the send either, so a send that raised leaves
+        # running=tip on disk, pending() stays true, and the next tick gives up again and sends.
+        rec["gave_up"] = tip
+        C.write_json(path(repo), rec)
+        return {}
+    C.write_json(path(repo), rec)
     rc, parent = git(root, "rev-parse", "--verify", "-q", f"{tip}^1")
     parent = parent if rc == 0 else ""
     last = rec["tip"] or parent
@@ -167,10 +189,8 @@ def run(repo, check, fallback=""):
     names = set(NG.trim(repo, m, plan).checks) | {n for n in rec["checks"] if n in m.checks and
                                                   rec["checks"][n].get("status") == T.FAILED}
     # brief: "a killed or interrupted run keeps what it already learned and the next run picks up from there"
-    if rec["running"] == tip:
+    if resume:
         names = {n for n in names if (rec["checks"].get(n) or {}).get("tip") != tip}
-    rec["running"] = tip
-    C.write_json(path(repo), rec)
     tree = RUN.tree_of(root, tip)
     rc, subject = git(root, "log", "-1", "--format=%s", tip)
     merge = subject if rc == 0 and subject else tip[:12]
@@ -213,3 +233,12 @@ def alert(repo, base, name, tip, merge, why):
             f"land without it until {base} is green on it again.")
     pid = f"land:{repo}:main-red:{name}@{tip[:12]}"
     C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] main red", "--id", pid, text], repo, 0)
+
+
+def gave_up(repo, base, tip):
+    """One card per tip main health stopped trying: until #1518's follow-up only a log line said so."""
+    text = (f"[{repo}] main health gave up on {base} at {tip[:12]}: {TRIES} passes started there and none finished, "
+            f"so its checks were not recorded on that tip. The next merge's pass covers its range again.")
+    pid = f"land:{repo}:main-health-gave-up@{tip[:12]}"
+    C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] main health", "--id", pid, text],
+          repo, 0)

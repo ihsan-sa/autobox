@@ -319,10 +319,12 @@ LOCK_WAIT = float(os.environ.get("CC_BOARD_LOCK_WAIT") or 30)   # CC_BOARD_LOCK_
                  # seconds a writer waits for the lock. A member's lock file is in its own directory, so a member session
                  # can hold it as long as it likes: the host takes it non-blocking and gives up in one line, never for good.
                  # No writer holds it longer than a load and a save (`add` runs the shape check BEFORE taking it).
-class Lock:
-    def __init__(self, repo):
-        os.makedirs(BOARDS, exist_ok=True)   # not "w": nothing is truncated, and a link or a pipe where the lock should be is refused
-        self.p = _target(os.path.join(BOARDS, repo + ".lock"))
+class _Flock:
+    """flock on one file, wait-then-refuse: the board's Lock and the brief's BriefLock are this, on their own paths.
+    Opened through _open, not "w": nothing is truncated, and a link or a pipe where the lock should be is refused."""
+    nap = 0.1
+    def __init__(self, p):
+        self.p = p
         self.f = os.fdopen(_open(self.p, os.O_WRONLY | os.O_CREAT), "w")
     def __enter__(self):
         end = time.monotonic() + LOCK_WAIT
@@ -331,8 +333,12 @@ class Lock:
             except BlockingIOError:
                 if time.monotonic() >= end:
                     self.f.close(); raise Refused(f"cc-board: {self.p} is held by another process — gave up after {LOCK_WAIT} s")
-                time.sleep(0.1)
-    def __exit__(self,*a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+                time.sleep(self.nap)
+    def __exit__(self, *a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+class Lock(_Flock):
+    def __init__(self, repo):
+        os.makedirs(BOARDS, exist_ok=True)
+        super().__init__(_target(os.path.join(BOARDS, repo + ".lock")))
 def _lib_touch(path):
     """INDEX-AT-WRITE (cc-lib): a note just written is searchable a minute later, not at the next sweep. It changes
     nothing this command decided: the exit code and output are discarded, a failure is one line in cc-lib's own
@@ -355,9 +361,8 @@ def need(repo):
 STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")   # CC_STATE: a test run keeps out of the box's own
 def tpath(repo, track, state=None): return os.path.join(state or STATE, repo, track, "task.md")
 def read_brief(repo, track):
-    try:
-        with open(tpath(repo, track), errors="replace") as f: return f.read()
-    except OSError: return ""
+    try: return _read_task(tpath(repo, track))       # never follows a link: show, get and cc done's PR body read this
+    except (OSError, Refused): return ""
 # cc-brief computes a delimited IN FLIGHT block into task.md and owns it; these are the markers. A reader asking
 # for the BRIEF gets what a person typed — `cc done` builds the PR body out of this.
 MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
@@ -401,21 +406,11 @@ def track_dir(repo, track, state=None):
     if os.path.realpath(d) != os.path.join(os.path.realpath(root), repo, track):
         raise Refused(f"cc-board: refusing {repo}/{track}'s state dir — {d} is a symlink or sits behind one")
     return d
-class BriefLock:
-    """flock on <track dir>/task.md.lock: the same wait-then-refuse as the board's Lock, on the brief's own file, so
-    two tracks' briefs never queue on each other and a member holding one holds only its own."""
-    def __init__(self, d):
-        self.p = os.path.join(d, "task.md.lock")
-        self.f = os.fdopen(_open(self.p, os.O_WRONLY | os.O_CREAT), "w")
-    def __enter__(self):
-        end = time.monotonic() + LOCK_WAIT
-        while True:
-            try: fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
-            except BlockingIOError:
-                if time.monotonic() >= end:
-                    self.f.close(); raise Refused(f"cc-board: {self.p} is held by another process — gave up after {LOCK_WAIT} s")
-                time.sleep(0.05)
-    def __exit__(self, *a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+class BriefLock(_Flock):
+    """flock on <track dir>/task.md.lock: the board's wait-then-refuse on the brief's own file, so two tracks' briefs
+    never queue on each other and a member holding one holds only its own."""
+    nap = 0.05
+    def __init__(self, d): super().__init__(os.path.join(d, "task.md.lock"))
 def _read_task(p):
     """task.md through _open: a link there would hand an owner-only file to whoever reads the brief (it is read
     back into every write), so it is refused, not followed. Nothing there reads as an empty brief."""

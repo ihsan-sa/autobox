@@ -148,7 +148,9 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
-             the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. THE MERGE (S1),
+             the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. Perms reading the PR
+             (review.perms_reading: its read of any head still running, or a finished one at this head that is
+             not a LAND) -> held (box), so a read perms started is waited on. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else main_moved again); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
@@ -1528,6 +1530,12 @@ class Lane:
                 return
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
+            # row, 10-19: "the landing lane merged dispatch#1296 on its own one review read ... before perms'
+            # security read finished" — so a read perms has going holds the merge
+            from lander import review as R
+            reading = R.perms_reading(job.repo, job.pr, job.head)
+            if reading:
+                return self.hold(job, reading, kind="box")
             if self.merge(job) != "moved":
                 return
         self.hold(job, f"{base} kept moving under the merge", kind="box")

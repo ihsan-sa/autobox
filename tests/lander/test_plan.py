@@ -600,12 +600,45 @@ class DeadWeight(unittest.TestCase):
         self.assertEqual(M.run_files("bin/x selfcheck 2>/dev/null </dev/null >/dev/null; for t in a; do core/bin/$t"
                                      " -n; done"), ["bin/x"])
         self.assertEqual(M.run_files("bash -n bin/x; bin/y selfcheck"), ["bin/x", "bin/y"])
+        # the Opus read of #1439: a redirection with no space splits off, so the tool before it still counts
+        self.assertEqual(M.run_files("bin/x>/dev/null 2>&1; bin/y 2>out/log; bin/z<in/f >out/g; bin/t2>e"),
+                         ["bin/x", "bin/y", "bin/z", "bin/t2"])
+        # the Opus read of #1524: `&`, `|` and `;` with no space end a word too, and `-m` reads past a redirection
+        self.assertEqual(M.run_files("bin/x&>/dev/null"), ["bin/x"])
+        self.assertEqual(M.run_files("bin/x|grep ok"), ["bin/x"])
+        self.assertEqual(M.run_files("bin/x;bin/y"), ["bin/x", "bin/y"])
+        self.assertEqual(M.run_files("bin/x&&bin/y"), ["bin/x", "bin/y"])
+        self.assertEqual(M.run_files("python3 -m unittest tests.test_x>/dev/null"), ["tests/test_x.py"])
         # a check whose only slash-words are redirections names no run file, so never_ran cannot let the head drop it
         member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",
                   "tests/member-lib.sh")
         quiet = self.BASE.replace('run = "bin/cc-member selfcheck"', 'run = "cc-member selfcheck 2>/dev/null"')
         self.assertEqual(self.faults(self.drop("member", quiet), member, quiet), ["check 'member' was removed"])
         self.assertEqual(self.faults(self.drop("member", quiet), (), quiet), ["check 'member' was removed"])
+
+    def test_a_backtick_paren_or_bang_ends_a_word(self):
+        """perms' read of #1524: a backtick, `(`, `)` or `!` attached to the only tool a check names still leaves it
+        named."""
+        self.assertEqual(M.run_files("echo `bin/x selfcheck`"), ["bin/x"])
+        self.assertEqual(M.run_files("(bin/x selfcheck)"), ["bin/x"])
+        self.assertEqual(M.run_files("!bin/x selfcheck"), ["bin/x"])
+        self.assertEqual(M.run_files("test -z $(bin/x list)"), ["bin/x"])
+        self.assertEqual(M.run_files("x=$(bin/x) <(bin/y) bin/z |& cat; { bin/t; }; if ! bin/u; then :; fi"),
+                         ["bin/x", "bin/y", "bin/z", "bin/t", "bin/u"])
+        self.assertEqual(M.run_files("cat <<< core/bin/$(uname); core/bin/`uname`"), [])
+
+    def test_a_backtick_paren_or_bang_keeps_the_modules_after_m(self):
+        """perms' read of #1532: a backtick, `(`, `)` or `!` inside a -m command does not end its module list."""
+        self.assertEqual(M.run_files("python3 -m unittest $(echo -v) tests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("python3 -m unittest -k 'x(y)' tests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("(python3 -m unittest tests.a)"), ["tests/a.py"])
+        self.assertEqual(M.run_files("echo `python3 -m unittest tests.a`"), ["tests/a.py"])
+
+    def test_a_backslash_continuation_keeps_the_first_module(self):
+        """perms' read of #1524: `tests.a\\<newline>` is joined to the next line, so tests.a is still named."""
+        self.assertEqual(M.run_files("python3 -m unittest tests.a\\\n  tests.b"), ["tests/a.py", "tests/b.py"])
+        self.assertEqual(M.run_files("python3 -m \\\n unittest tests.a"), ["tests/a.py"])
+        self.assertEqual(M.run_files("bin/x\\\n selfcheck"), ["bin/x"])
 
     def test_an_added_check_running_only_redirections_is_not_refused_for_its_tool(self):
         quiet = self.GHOST.replace("bin/cc-ghost selfcheck", "cc-ghost selfcheck </dev/null >/dev/null")

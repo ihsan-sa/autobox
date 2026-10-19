@@ -450,8 +450,8 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   # `cc … --go` inside the boundary is brokered to the daemon (the `go)` case below) and carries only the brief — and the
   # cap, the ceiling and the ledger are read out here from ~/.cc/config and ~/.cc/state, neither of which exists inside.
   member_workspace "$1" || return 0
-  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap ceiling ckey eff raised day cur spent mention=0
-  if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && budget="$a"; prev="$a"; done; fi
+  local repo="$1" budget loops="${LOOPN:-1}" want cap ceiling ckey eff raised day cur spent mention=0
+  budget=$(xtra_val --budget "")
   # `--budget 1e9` was charged as $8 (not a number → the default) and passed through as-is: a cap the dispatch it
   # gates then ignores. A budget the ledger cannot add up is refused here, before anything is charged (cc-loop too).
   if [ -n "$budget" ] && ! [[ "$budget" =~ ^[0-9]+([.][0-9]+)?$ ]]; then echo "cc: --budget must be a plain number in USD (got '$budget')"; return 1; fi
@@ -923,6 +923,11 @@ ready_tell(){   # $1 repo $2 track $3 where $4 the push remote ("" = none) → 0
     && { echo "cc done: no live planning turn in $1 took it — filed as a request for the control seat instead" >&2; return 7; }
   echo "cc done: no live planning turn in $1 took it, and the request could not be filed — nobody has been told" >&2
   return 6
+}
+xtra_val(){   # $1 a flag, $2 its default → the value after the last $1 in XTRA (the extra args cc passes to cc-loop)
+  local p="" a v="$2"
+  for a in ${XTRA[@]+"${XTRA[@]}"}; do [ "$p" = "$1" ] && v="$a"; p="$a"; done
+  printf %s "$v"
 }
 finished_row(){   # $1 repo $2 track → 0 when the row is merged/done, or its last note (or the one before a loop's own
   # "loop: …" line) says cc-land landed it — the row cc-land landed under a live loop kept status running (2026-09-22).
@@ -1587,6 +1592,9 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   cost_says 70 8 1 | grep -q 'about \$70, but this launch allows \$8.00 (1 × \$8)'; t "cost_says: a launch under the brief's figure says so" $?
   if [ -z "$(cost_says 70 25 3)" ] && [ -z "$(cost_says 70 70 1)" ] && [ -z "$(cost_says "" 8 1)" ]; then rc=0; else rc=1; fi; t "…a launch that covers it, matches it, or a brief with no cost line, says nothing" "$rc"
   cost_says 20 25 3 | grep -q 'over three times'; t "…and one over three times the brief's figure says that" $?
+  if [ "$(XTRA=(--model m1 --budget 3 --budget 5); xtra_val --budget 8)" = 5 ] && [ "$(XTRA=(--loop); xtra_val --budget 8)" = 8 ] \
+     && [ "$(XTRA=(); xtra_val --model "")" = "" ] && [ "$(XTRA=(--model m1); xtra_val --model "")" = m1 ]; then rc=0; else rc=1; fi
+  t "xtra_val: the last value after a flag in XTRA, else the default — what member_gate, the cost line and the model line read" "$rc"
   rdy(){ : > "$T/sb.log"; echo "$1" > "$T/cc-msg.rc"; echo "$2" > "$T/cc-notify.rc"
     ( BIN="$T/sb"; OWNW="${3:-}"; own_window(){ echo "$OWNW"; }; ready_tell r t "${4-pushed to origin}" "${5-origin}" ) 2>"$T/err" >"$T/out"; }
   rdy 0 0; [ "$?" = 0 ] && grep -q '^cc-msg --turn r READY TO LAND' "$T/sb.log" && ! grep -q '^cc-notify' "$T/sb.log"; t "cc done on a session row: the repo's planning turn takes READY TO LAND (0), no request filed" $?
@@ -2279,8 +2287,7 @@ case "$mode" in
        esac
        [ -n "$CLAIM" ] && claim_track worker "${full:+queued}" --launch   # the claim exists before the worker can write a line
        # THE BRIEF'S COST LINE (cost_says says when it speaks); the default per iteration is cc-loop's own, as in member_gate
-       pb=8; prev=""; if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && pb="$a"; prev="$a"; done; fi
-       cost_says "$(brief_cost < "$st/task.md" 2>/dev/null)" "$pb" "$LOOPN"
+       cost_says "$(brief_cost < "$st/task.md" 2>/dev/null)" "$(xtra_val --budget 8)" "$LOOPN"
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
          t=$("$BIN/cc-signal" ticks "$pid") || continue   # its start time BEFORE the cwd check, so the kill below is that process
          [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue
@@ -2316,7 +2323,7 @@ case "$mode" in
          tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %s%q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$room" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        fi
        [ -n "$CLAIM" ] && claim_end "$([ -n "$full" ] && echo "worker queued" || echo "worker launched")"   # the window is up: the loop (or the queue that starts it) owns the row from here, not this process
-       wm=""; k=0; while [ "$k" -lt "${#XTRA[@]}" ]; do [ "${XTRA[$k]}" = --model ] && wm="${XTRA[$((k+1))]:-}"; k=$((k+1)); done
+       wm=$(xtra_val --model "")
        unlock
        if [ -n "$full" ]; then
          "$BOARD" note "$repo" "$track" "worker queued: $full" >/dev/null
@@ -2327,9 +2334,10 @@ lock "$st/.lock"
 if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # dead window (claude exited, `exec bash`): recreate instead of attaching to a shell
 if ! have_window "$win"; then
   # A LANDED ROW HAS NOTHING TO DO: a fresh session opened on one sat idle and cost three planning turns to prove it
-  # (raised-a-finished-row-got-a-fresh-session-with-nothing-to-do). A liveness probe is `cc ls`, not an open.
-  if finished_row "$repo" "$track"; then unlock
-    echo "cc: $repo/$track has landed — no session opened. Use cc ls to see what runs; to work on it again, reopen it on the board first (status running, and a note saying why)" >&2; exit 1; fi
+  # (raised-a-finished-row-got-a-fresh-session-with-nothing-to-do). A liveness probe is `cc ls`, not an open. `cc -c`
+  # is a person (or seat) choosing to go back to it, so it opens anyway.
+  if [ -z "$CONT" ] && finished_row "$repo" "$track"; then unlock
+    echo "cc: $repo/$track has landed — no session opened. Use cc ls to see what runs; cc -c $repo $track opens it anyway" >&2; exit 1; fi
   if member_workspace "$repo"; then inside && { echo "cc: inside the boundary a track session is opened from Slack (the track's thread in #$repo) or by the owner, not from here"; exit 1; }
     member_credential "$repo" "$track" || { unlock; exit 1; }   # no credential: no window, and the row below never says running
     tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __runmember %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"   # the boundary

@@ -63,8 +63,6 @@ def run_selfcheck():
                 tmux(*a[:i], _log=False); tmux(*a[i + 1:], _log=False)
                 return ""
             if a[0] == "list-windows":
-                if "pane_start_command" in " ".join(a):   # lanes(): name, id, pane pid, the command it was made with
-                    return "\n".join("\t".join([n, i, "4242", f"cc-land {n[4:]} --wait"]) for n, i in wins.items())
                 if "pane_pid" in " ".join(a):       # orphans(): id, "pid", name
                     return "\n".join(f"{i} {i} {n}" for n, i in wins.items())
                 return "\n".join(wins.values())
@@ -1331,10 +1329,13 @@ def run_selfcheck():
         os.makedirs(os.path.join(STATE, "r9", "t9"), exist_ok=True)
         with open(os.path.join(STATE, "r9", "t9", "loop.log"), "w") as fh:
             fh.write("older line\n2026-01-02T01:00:00Z iter 2/3 LAST-LOOP-LINE\n")
+        os.makedirs(os.path.join(STATE, "r9", "t8"), exist_ok=True)       # a worker plants a link at its own loop.log
+        with open(os.path.join(STATE, "OWNER-ONLY-SECRET"), "w") as fh:
+            fh.write("OWNER-ONLY-SECRET-LINE\n")
+        os.symlink(os.path.join(STATE, "OWNER-ONLY-SECRET"), os.path.join(STATE, "r9", "t8", "loop.log"))
         os.makedirs(os.path.join(STATE, "land"), exist_ok=True)
         with open(os.path.join(STATE, "land", "r9-5.json"), "w") as fh:
             json.dump({"repo": "r9", "pr": 5, "stage": "gates", "attempts": 1, "queued_at": "2026-01-02T00:00:00Z"}, fh)
-        wins["lane7"] = "@70"                                          # a lane the #154 queue left running
         now = time.time()
         write({"id": "b0", "target": "r9/t9", "phase": "overlap", "live": "predecessor",
                "predecessor": {"session_id": "sid-9", "tmux": "@9", "window": "r9/t9"},
@@ -1446,9 +1447,10 @@ def run_selfcheck():
            + (" (v2: no footer to keep; the board section names the command for the rest)" if on_v2 else ""),
            ("`cc board show r9`" in b if on_v2 else "(1 finished \u2014 cc board show r9 --all)" in b and "A-TASK-ONLY-ROW" in b)
            and "LAST-TASK-CUT" not in b)
-        ok("...a live lane names its window, its PR and its waiter pid, and the queue its job and stage",
-           "lane7" in b and "@70" in b and "PR 7" in b and "4242" in b and "PR 5" in b and "stage gates" in b)
+        ok("...the land queue names each job and its stage", "PR 5" in b and "stage gates" in b)
         ok("...a live worker is one line, the last of its loop.log", "LAST-LOOP-LINE" in b and "older line" not in b)
+        ok("WALL (secrets): a link a worker plants at its loop.log is skipped — the file it names never reaches the brief",
+           "OWNER-ONLY-SECRET-LINE" not in b)
         ok("...the open PRs, the predecessor's window, tmux id and session are all in it"
            + (" (v2: the seat's own row carries its PR; the repo's PR list is dropped)" if on_v2 else ""),
            ("AN-OPEN-ROW  PR 5" in b if on_v2 else "track/t9" in b and "MERGEABLE" in b)
@@ -1535,7 +1537,6 @@ def run_selfcheck():
            and real_out(["printf", "hi"], fail="(unavailable: x)") == "hi"
            and real_out(["no-such-binary-here"], fail="(unavailable: x)") == "(unavailable: x)")
         clear("r9/t9")
-        wins.pop("lane7", None)
         DEV = dev0
         if home0 is None:
             os.environ.pop("HOME", None)

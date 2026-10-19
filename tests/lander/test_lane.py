@@ -4882,5 +4882,29 @@ class LandedAt(unittest.TestCase):
             self.assertFalse(L.landed_at(plain, bad))
 
 
+class PermsReading(Fixture):
+    """dispatch#1296 (10-19): the lane merged a PR on its own read while perms' security read of it still ran. A
+    read perms has running, or a finished one at the head that is not a LAND, holds the merge; none lets it go."""
+
+    def test_a_running_perms_read_holds_the_merge(self):
+        from lander import review as R
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head: "perms' read of PR #1 is still running"):
+            _, lines = self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra.get("hold")), (T.HELD, "box"), lines)
+        self.assertIn("still running", j.extra["why"])
+        self.assertFalse(self.box().get("merges"))
+
+    def test_no_perms_read_lets_it_merge(self):
+        from lander import review as R
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head: ""):
+            _, lines = self.land()
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING, lines)
+
+
 if __name__ == "__main__":
     unittest.main()
