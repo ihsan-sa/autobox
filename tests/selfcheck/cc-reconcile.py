@@ -69,6 +69,23 @@ def selfcheck():
     ok("journal DONE + no PR → asks (nobody opened one)", one(journal=("DONE", "")) == ("ask", "review"))
     ok("loop exit → blocked, with the loop's own reason", decide(F(loop_end="exit 4: stalled"))[0][:2] == ("ask", "blocked"))
     ok("nothing says why → blocked and the owner hears about it", one() == ("ask", "blocked"))
+    ok("…BUT A LAUNCH WAITING IN cc-room's QUEUE IS DISPATCHED, NOT ABANDONED: the word stands, nobody is asked, and "
+       "the one line says it waits for room (raised 2026-10-03: a lessons row 3 h in the queue was set blocked 'no "
+       "worker, and nothing says why' and its seat woken to find it only queued)",
+       decide(F(room="waiting")) == [("held", None, "its launch is waiting in cc-room's queue for room")]
+       and decide(F(status="waiting", room="waiting"))[0][:2] == ("held", None)
+       and eff(status="queued", room="waiting") == "queued")
+    ok("…and one a restart took (the waiter died with its tmux server, the entry kept for `cc-room resume`) says "
+       "that, not 'killed, or the box restarted'", decide(F(room="lost"))[0][:2] == ("held", None)
+       and "cc-room resume" in decide(F(room="lost"))[0][2])
+    ok("…and one whose worktree cc has not made yet (cc makes it at launch) gets the held line alone, never 'its "
+       "worktree is gone' beside it for the whole wait",
+       decide(F(room="waiting", wt_exists=False)) == [("held", None, "its launch is waiting in cc-room's queue for room")])
+    ok("…and a `blocked` row whose launch waits keeps its word and the report says the launch waits, not nothing",
+       decide(F(status="blocked", room="waiting")) == [("held", None, "its launch is waiting in cc-room's queue for room")]
+       and eff(status="blocked", room="waiting") == "blocked")
+    ok("…while a live worker still outranks the queue entry: it is running", one(status="queued", live=True, room="waiting")
+       == ("fix", "running"))
     ok("review + merged PR → merged", one(status="review", pr="u", pr_state="MERGED") == ("fix", "merged"))
     ok("a blocked or review row whose branch landed → merged, and no 'PR never opened' ask beside it",
        one(status="blocked", landed="its branch landed inside #5") == ("fix", "merged")
@@ -243,7 +260,10 @@ def selfcheck():
        snapshot([("r", "t", F(status="running", live=True), "waiting", "person", "which syllabus?")])
        ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "kind": "track", "live": True,
                              "waiting_on": "person", "why": "which syllabus?", "idle_for": 0,
-                             "loop": False, "agent": False, "held": ""})
+                             "loop": False, "agent": False, "launch": "", "held": ""})
+    ok("…and a launch waiting in cc-room, which the wake reads so it never offers that row for a second dispatch",
+       snapshot([("r", "t", F(status="queued", room="waiting"), "queued", "", "")])["tracks"]["r/t"]["launch"]
+       == "waiting")
     ok("…and the three facts the Home tab and the wake used to read for themselves: a live loop, a live agent mark, "
        "a person's hold — so neither needs a process table, a tmux or a board field of its own",
        {k: v for k, v in snapshot([("r", "t", F(status="queued", loops=[2], agent="@1:9", agent_live=True, held=" mine "),
@@ -1305,6 +1325,50 @@ def selfcheck():
         finally:
             loop.kill(); loop.wait()
             STARTS.pop(loop.pid, None)
+        waiter = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/b/cc-room", "admit", "_ccsc/wait",
+                                   "--log", "/s/loop.log", "--", "/b/cc-loop", "_ccsc", "wait", "--max-iter", "1"])
+        try:
+            for _ in range(50):
+                if b"cc-loop" in open(f"/proc/{waiter.pid}/cmdline", "rb").read():
+                    break
+                time.sleep(0.05)
+            got = procs()
+            ok("a `cc-room admit R/T -- cc-loop R T` waiter is no loop and no live track, though the loop's name is on "
+               "its command line: it flipped a `queued` row to running, 'a worker is in its worktree'",
+               "_ccsc/wait" not in got[0] and "_ccsc/wait" not in got[4])
+        finally:
+            waiter.kill(); waiter.wait()
+            STARTS.pop(waiter.pid, None)
+        with tempfile.TemporaryDirectory() as rd:
+            os.makedirs(f"{rd}/queue")
+            gone = subprocess.Popen(["true"])            # exited but not reaped: a zombie whose pid nobody can reuse
+            os.waitid(os.P_PID, gone.pid, os.WEXITED | os.WNOWAIT)
+            me, mine = os.getpid(), start_ticks(os.getpid())
+            for n, e in (("1-alive", {"what": "rq/alive", "pid": me, "start": str(mine)}),
+                         ("2-lost", {"what": "rq/lost", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
+                                     "server": [gone.pid, "1"], "queued": now() - 60}),
+                         ("3-killed", {"what": "rq/killed", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
+                                       "server": [me, str(mine)], "queued": now() - 60}),
+                         ("4-old", {"what": "rq/old", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
+                                    "server": [gone.pid, "1"], "queued": now() - 8 * 86400})):
+                json.dump(e, open(f"{rd}/queue/{n}", "w"))
+            json.dump({"what": "rq/half", "pid": me, "start": str(mine)}, open(f"{rd}/queue/5-half.tmp", "w"))
+            open(f"{rd}/queue/6-junk", "w").write("not json")
+            for n, srv in (("0-srvdict", {"pid": 1, "start": "1"}), ("8-srvstr", "ab"), ("9-srvshort", [1])):
+                json.dump({"what": f"rq/{n}", "server": srv, "cmd": ["cc-loop"], "queued": now() - 60},
+                          open(f"{rd}/queue/{n}", "w"))
+            prev = os.environ.get("CC_ROOM_DIR")
+            os.environ["CC_ROOM_DIR"] = rd
+            try:
+                got = room_launches()
+            finally:
+                os.environ.pop("CC_ROOM_DIR") if prev is None else os.environ.update(CC_ROOM_DIR=prev)
+                gone.wait()
+            ok("room_launches: a live waiter's entry is `waiting`, one whose waiter AND tmux server are gone is `lost` "
+               "(cc-room resume starts it again); one killed under a live server, one past 7 days, a half-written .tmp "
+               "and an unreadable file are none; an entry whose `server` is a dict, a two-letter string or one item "
+               "is skipped and the entries after it are still read (a dict raised KeyError and stopped the pass for "
+               "every repo)", got == {"rq/alive": "waiting", "rq/lost": "lost"})
         other = subprocess.Popen(["sleep", "300"])
         fx, own = f"_cctest{other.pid}", f"_cctest{os.getpid()}"
         try:
@@ -1926,6 +1990,13 @@ def selfcheck():
                                             "bundle-x-0000": {"status": "merged", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
         quietly(tick, {}, True)
         ok("…and once the bundle row is no longer live its member is queued again, and wakes the seat", woke() == ["start wr"] * 4)
+        json.dump({"repo": "wr", "tracks": {"q4": {"status": "queued", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
+        quietly(tick, {"wr/q4": {"state": "queued", "launch": "waiting"}}, True)
+        ok("…a queued row whose launch already waits in cc-room is dispatched, not startable: offering it sends a second "
+           "worker for the same work (raised 2026-10-03), so no wake",
+           woke() == ["start wr"] * 4 and "nothing a seat can act on" in open(f"{tb}/.cc/state/pulse.log").read().splitlines()[-1])
+        quietly(tick, {"wr/q4": {"state": "queued", "launch": ""}}, True)
+        ok("…and with no launch waiting the same row wakes the seat", woke() == ["start wr"] * 5)
     finally:
         restore(); shutil.rmtree(tb, ignore_errors=True)
     # OWNER-HELD ASKS, end to end: "it is waiting on you" goes out once for a parked or asked row, however short the

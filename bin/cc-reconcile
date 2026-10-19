@@ -27,6 +27,11 @@ moves a `blocked` or `waiting` row back to `running`: those are a session's word
 worker, a loop, a pane moved inside 2 h — overrides them. A mark flips a `queued` row and keeps a row off the
 abandoned path; it is not work in flight.
 
+QUEUED LAUNCH: a `cc-room admit` waiting for room is no loop, though the loop's name is on its command line. Its
+queue entry (CC_ROOM_DIR, else ~/.cc/state/room/queue) says the row is dispatched: waiting while its waiter lives,
+or lost to a restart until `cc-room resume` starts it again. Such a row keeps its word, is never called abandoned,
+gets one quiet `held` line, and the wake does not offer it for a second dispatch.
+
 WAITING: the worker's own `STATUS: BLOCKED: <question>` line makes a track `waiting` on a person, whatever is
 running; a loop sitting out a usage limit waits on the clock and never reaches the owner. Prose never raises an ask.
 
@@ -413,6 +418,11 @@ def procs():
             ppids.add(pp)
             parent[pid] = pp
         for i, a in enumerate(argv):
+            # A `cc-room admit R/T -- cc-loop R T` waiter carries the loop's name on its own command line and is no
+            # loop: nothing runs until it execs. Read as one, it flipped a `queued` row (cc's word for a waiting
+            # launch) to running, "a worker is in its worktree". room_launches() is what says a launch waits.
+            if os.path.basename(a) == "cc-room" and argv[i + 1:i + 2] == ["admit"]:
+                break
             if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
                 live.add(f"{argv[i + 1]}/{argv[i + 2]}")
                 loops.setdefault(f"{argv[i + 1]}/{argv[i + 2]}", []).append(int(pid))
@@ -436,6 +446,40 @@ def procs():
             sessions.add(up)
             up = parent.get(up, "")
     return live, ppids, sessions, workers, loops
+
+
+def room_launches():
+    """{repo/track: "waiting" | "lost"} off cc-room's launch queue (CC_ROOM_DIR, else ~/.cc/state/room): `waiting`
+    while the `cc-room admit` that wrote the entry is the same live process, `lost` when that waiter died with its
+    tmux server (a restart) and the entry holds what `cc-room resume` (this tool's tick, every 20 min) starts it
+    again with. Read-only: an entry neither alive nor lost is cc-room's to drop, and is left out. A launch waiting
+    here is dispatched work with no worker yet, which the abandoned path took for a worker that was killed: raised
+    2026-10-03, a lessons row sat 3 h in the queue, was set blocked "no worker, and nothing says why" and its seat
+    was woken to find it only queued."""
+    out = {}
+    for p in sorted(glob.glob(f"{os.environ.get('CC_ROOM_DIR') or HOME + '/.cc/state/room'}/queue/*")):
+        if p.endswith(".tmp"):                          # half written by its waiter
+            continue
+        try:
+            e = json.load(open(p))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(e, dict) or not str(e.get("what") or "").count("/"):
+            continue
+        what = str(e["what"])
+        try:
+            if e.get("pid") and str(start_ticks(int(e["pid"]))) == str(e.get("start")):
+                out[what] = "waiting"
+                continue
+            srv = e.get("server") or []                 # cc-room's lost(): the waiter's tmux server is gone too
+            if not (isinstance(srv, (list, tuple)) and len(srv) == 2):
+                continue                                # cc-room writes [pid, ticks]; anything else is no launch
+            if (str(start_ticks(int(srv[0]))) != str(srv[1]) and e.get("cmd")
+                    and now() - float(e.get("queued") or 0) < 7 * 86400):
+                out.setdefault(what, "lost")
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError):
+            continue                                    # one malformed entry never stops the pass for every repo
+    return out
 
 
 def idle_for(repo, track, wt):
@@ -992,6 +1036,15 @@ def decide(f):
         out.append(("fix", "running", "a worker is in its worktree" if f["live"]
                     else "a live session is doing it in a subagent"))
         settled = True
+    elif not live and f.get("room") and st in QUEUED + ("running", "waiting", "blocked"):
+        # DISPATCHED, NOT ABANDONED: its launch waits in cc-room's queue (no room yet), or a restart took the waiter
+        # and `cc-room resume` brings it back in its old place. Nothing was lost, so the word stands and nobody is
+        # asked; the abandoned path below told a seat "killed, or the box restarted" and the board then offered the
+        # row for a second dispatch while the first still waited (raised 2026-10-03). A `blocked` row keeps its word
+        # too, and the report says its launch waits rather than nothing.
+        out.append(("held", None, "its launch is waiting in cc-room's queue for room" if f["room"] == "waiting"
+                    else "a restart took its queued launch; cc-room resume starts it again in its old place"))
+        settled = True
     elif not live and st in ("running", "waiting") and f["age"] >= f.get("grace", GRACE):
         settled = True
         if jk == "DONE" and pr == "MERGED":
@@ -1033,7 +1086,7 @@ def decide(f):
     # a row nothing ever dispatched (no claim, never started, no journal) is supposed to have no worktree
     if (not f["wt_exists"] and not finished and word not in QUEUED
             and (f.get("delivery") or f.get("started") or f.get("worked"))
-            and not f.get("agent") and not landed_elsewhere):
+            and not f.get("agent") and not landed_elsewhere and not f.get("room")):   # cc makes it at launch
         out.append(("ask", None, "its worktree is gone"))
     safety = []                                          # work about to be lost: the host's, never muted by a hold
     if f.get("commit_err") and not finished:
@@ -1300,6 +1353,7 @@ def snapshot(rows, limit=0.0):
                                            "waiting_on": who, "why": why,
                                            "idle_for": int(f.get("pane_idle") or 0),
                                            "loop": bool(f.get("loops")), "agent": bool(f.get("agent_live")),
+                                           "launch": f.get("room") or "",
                                            "held": str(f.get("held") or "").strip()}
                        for repo, track, f, state, who, why in rows}}
 
@@ -1375,6 +1429,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
     """Every board track with what the box says about it. Yields (repo, track, board_track, facts). Only `save`
     (an --apply run) writes the patch-id cache; a report keeps what it reads in memory."""
     live, ppids, sessions, workers, loops = procs()
+    room = room_launches()
     tlive, pane_idle, wins = tmux_live(ppids, sessions)
     live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
@@ -1409,7 +1464,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                  "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",
                  "pr_state": batch.get(str(pr).strip()) or (pr_state(repo, pr, net) if ask_pr
                                                             else ("?" if want_pr and net else None)),
-                 "live": key in live, "wt_exists": os.path.isdir(wt),
+                 "live": key in live, "room": room.get(key, ""), "wt_exists": os.path.isdir(wt),
                  "delivery": os.path.exists(f"{STATE}/{repo}/{track}/delivery.json"),   # cc-task's claim record
                  "started": bool(t.get("started")),                                      # `cc <repo> <track>` / cc-handoff
                  "worked": os.path.exists(f"{STATE}/{repo}/{track}/progress.md")
@@ -2350,7 +2405,10 @@ def wake_repo(repo, rows, snap, net, on):
     def bundled(k):
         b = str(rows[k].get("bundle") or "").strip()
         return b in words and words[b][0] in ("queued", "running", "waiting", "review")
-    due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k))
+    # …AND NOT A ROW WHOSE LAUNCH ALREADY WAITS IN cc-room: it is dispatched, and offering it again sends a second
+    # worker for the same work while the first waits for room (raised 2026-10-03)
+    due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k)
+                 and not (snap.get(f"{repo}/{k}") or {}).get("launch"))
     due = [k for k in due if tier_allows("start", f"{repo}/{k}")]
     stopped = [k for k in due if words[k][0] == "blocked"]
     asks_ = open_asks() if stopped else []
