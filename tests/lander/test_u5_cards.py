@@ -988,6 +988,12 @@ class MainRedAlert(Stubbed):
         self.assertEqual(len(self.flag([self.held(7)], 3601 + 3601)), 1)
         self.assertEqual(len(self.argvs("cc-notify")), 2)
 
+    def test_a_health_file_of_the_wrong_shape_reads_as_no_record_and_still_alerts(self):
+        os.makedirs(os.path.dirname(HL.path("demo")), exist_ok=True)
+        for i, rec in enumerate(({"checks": ["e2e-cc-context"]}, {"checks": {"e2e-cc-context": "passed"}}, ["x"])):
+            C.write_json(HL.path("demo"), rec)
+            self.assertEqual(len(self.flag([self.held(7)], 3601 * (i + 1) + 1)), 1, rec)   # an hour apart: said each time
+
 
 if __name__ == "__main__":
     unittest.main()

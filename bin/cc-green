@@ -29,8 +29,9 @@
 #                            exits 0 when that was 0, else 1 — no report. `run -- SUITE` is the same, in the foreground
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
-#                            `still running (pid, since)`, exit 3 — call again. Killed or interrupted before it
-#                            finished: says so and exits 1, with no report
+#                            `still running (pid, since)`, exit 3 — call again; a check held on a lander slot past
+#                            admission's WAIT_SAY (10 min) adds that line, with the way forward. Killed or interrupted
+#                            before it finished: says so and exits 1, with no report
 #   cc-green stop            end THIS worktree's run, so a run whose tree has moved under it — a verdict nobody will
 #                            spend — does not hold `start` at exit 3 until it is over. The route for a worker, whose own
 #                            `kill` of the run the classifier refuses as interfering with a workload (2026-09-26, ~22 min
@@ -237,7 +238,9 @@ verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
 # THE SLOT WAIT OUTLIVES THE LOG. The log is one per root and the next run overwrites it, so the time a run waited
 # for an admission slot went with it. The check is told a durable per-repo file, $GDIR/waits-<repo>.tsv
 # (LANDER_WAIT_LOG), and the row (LANDER_WAIT_ROW); lander/admission.py appends `start end row who secs` there for
-# every slot it holds, and cc-i2m reads that as the green stage. Repo and row come from the worktree's .cc/track,
+# every slot it holds, and cc-i2m reads that as the green stage. It is told this run's status file too
+# (LANDER_WAIT_NOTE), where it adds one `waiting=` line once a slot wait passes its WAIT_SAY, and `wait` prints it, so
+# a run held behind landings says so rather than reading as hung. Repo and row come from the worktree's .cc/track,
 # else the main checkout's directory name and the worktree's. .cc/track is in the tree, which the worker writes, and
 # the run for a worker is the host's: a repo of `../../x` would point the host's append outside $GDIR. So a name
 # carrying '/', '..', a leading '.' or anything but [A-Za-z0-9._-] is not taken, and the fallback stands for it.
@@ -277,7 +280,7 @@ run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to
   while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
   read -r wl wrow < <(wait_log "$r")
   ( cd "$r" && exec setsid "$BIN/cc-nosignal" -- env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" \
-      LANDER_WAIT_LOG="$wl" LANDER_WAIT_ROW="$wrow" "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
+      LANDER_WAIT_LOG="$wl" LANDER_WAIT_ROW="$wrow" LANDER_WAIT_NOTE="$STATUS" "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
   printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
   wait "$gp" || rc=$?
@@ -442,7 +445,7 @@ run_cmd(){   # $1 = root, $2… = the suite (suite_ok has passed it). The RUN's 
   return "$rc"
 }
 wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock past that, 4 when the last run was killed
-  local pid rc
+  local pid rc w
   lock_files "$1"; mkdir -p "$GDIR"
   exec 9>"$LOCK"
   # A second's grace before the first try: a `wait` in the same breath as a detached `run` can reach the lock
@@ -452,6 +455,7 @@ wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock pa
   if ! flock -w "$(( $2 > 1 ? $2 - 1 : 0 ))" 9; then
     echo "cc-green: still running (pid $(status_field pid), since $(status_field started)) — log $(status_field log)"
     stale_hint "$1"
+    w=$(status_field waiting); [ -z "$w" ] || echo "  $w"   # held on a lander slot: since when, on what, the way forward
     return 3
   fi
   flock -u 9     # released at once: the report below is a second, and a run may start behind it

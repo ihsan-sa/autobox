@@ -9182,13 +9182,7 @@ class Daemon:
                 repo = d.get("repo") or os.path.basename(fn)[:-5]
                 want += [(repo, str(t["pr"])) for t in d.get("tracks", {}).values() if t.get("pr")]
             for repo, n in want[:8]:                       # bounded: the dashboard is never worth a long stall
-                try:
-                    p = subprocess.run(["gh", "pr", "view", n, "--json", "state,reviewDecision", "-q",
-                                        '.state + (if .reviewDecision != "" then "/" + .reviewDecision else "" end)'],
-                                       cwd=f"{DEV}/{repo}", capture_output=True, text=True, timeout=15)
-                    prs[(repo, n)] = p.stdout.strip() if p.returncode == 0 else "?"
-                except Exception:
-                    prs[(repo, n)] = "?"
+                prs[(repo, n)] = (gh_pr(repo, n, 15)[0] or {}).get("state") or "?"   # REST: no reviewDecision there
             self.home_prs = prs
             # home_land_title reads a merged PR's title from cc-land's landing commit (git log), cached.
             # Keyed on the named repo (home_land_wanted), not `box`; no landing commit caches "" to skip reruns.
@@ -10767,16 +10761,43 @@ def land_card(cfg, cid, m, state="MERGED", when=None):
             sent_write(rec["id"], dict(rec, landed=True))
     return True
 
+PULL_URL = re.compile(r"\Ahttps://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)\Z")
+
+def pull_path(n):
+    """The REST path of the pull a board's pr field names, as cc-reconcile's pull_path: a URL names its own repo (every
+    row of a box board holds one), a bare number or #N is the checkout's, gh filling {owner}/{repo}. None else."""
+    s = str(n or "").strip()
+    m = PULL_URL.match(s)
+    if m:
+        return f"repos/{m.group(1)}/{m.group(2)}/pulls/{m.group(3)}"
+    m = re.fullmatch(r"#?(\d+)", s)
+    return f"repos/{{owner}}/{{repo}}/pulls/{m.group(1)}" if m else None
+
+def gh_pr(repo, n, timeout=30):
+    """PR n of ~/dev/<repo> in `gh pr view --json`'s names ({state MERGED|OPEN|CLOSED, mergedAt, closedAt, title, url})
+    -> (dict, "") | (None, why). n is a number or a PR URL (pull_path). Over REST: gh pr view spends the login's GraphQL
+    hour, and on 2026-10-19 that ran out with REST to spare. rc first: a refusal's stdout is GitHub's error JSON, never
+    the PR."""
+    path = pull_path(n)
+    if not path:
+        return None, f"not a PR number or URL: {n!r}"
+    try:
+        r = subprocess.run(["gh", "api", path], cwd=f"{DEV}/{repo}",
+                           capture_output=True, text=True, timeout=timeout)
+        p = json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception as e:
+        return None, str(e)
+    if not isinstance(p, dict):
+        return None, (r.stderr or "").strip()[-300:] or f"gh exit {r.returncode}"
+    return {"state": "MERGED" if p.get("merged_at") else str(p.get("state") or "").upper(),
+            "mergedAt": p.get("merged_at"), "closedAt": p.get("closed_at"), "title": p.get("title") or "",
+            "url": p.get("html_url") or ""}, ""
+
 def pr_facts(repo, n):
-    """{"state", "mergedAt", "closedAt"} from gh, or None (no such repo here, no network, no such PR)."""
+    """{"state", "mergedAt", "closedAt", ...} from gh, or None (no such repo here, no network, no such PR)."""
     if not os.path.isdir(f"{DEV}/{repo}/.git"):
         return None
-    try:
-        r = subprocess.run(["gh", "pr", "view", str(n), "--json", "state,mergedAt,closedAt"], cwd=f"{DEV}/{repo}",
-                           capture_output=True, text=True, timeout=30)
-        return json.loads(r.stdout) if r.returncode == 0 else None
-    except Exception:
-        return None
+    return gh_pr(repo, n)[0]
 
 def run_log(line):
     """One line to the daemon's own log and to ~/.cc/approvals/run/log, the trail the owner (or a seat) reads for why a
@@ -11150,12 +11171,10 @@ def cmd_post_approval(argv):
     repo, n, cfg = argv[0], m.group(1), load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack post-approval: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
-    r = subprocess.run(["gh", "pr", "view", n, "--json", "title,url,state,mergedAt,closedAt"], cwd=f"{DEV}/{repo}",
-                       capture_output=True, text=True, timeout=60)
+    pr, why = gh_pr(repo, n, 60)
     cid, lane = card_lane(cfg, repo)
-    if r.returncode != 0 or not cid:
-        print(f"cc-slack post-approval: {r.stderr.strip()[-300:] or f'no #{APPROVALS} channel the bot is in (cc slack mkchannel {APPROVALS})'}", file=sys.stderr); return 1
-    pr = json.loads(r.stdout)
+    if pr is None or not cid:
+        print(f"cc-slack post-approval: {(why if pr is None else '') or f'no #{APPROVALS} channel the bot is in (cc slack mkchannel {APPROVALS})'}", file=sys.stderr); return 1
     def say(ts, chat=None):               # the channel goes in front only with --print-chat: the lane the card really stands in
         print(f"{chat or cid} {ts}" if pchat else (ts or ""))
     state = (pr.get("state") or "").upper()

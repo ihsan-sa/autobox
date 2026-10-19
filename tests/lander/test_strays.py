@@ -58,6 +58,14 @@ class Strays(unittest.TestCase):
 
         def gh(argv, root, token=None, timeout=120):
             repo = os.path.basename(root)
+            if argv[:2] == ["api", "user"]:   # gh.viewer: the login the box's PRs are by
+                return 0, "box\n", ""
+            if argv[:2] == ["api", "--paginate"] and "/pulls?state=open" in argv[2]:   # gh.my_open_prs, over REST
+                self.lists.append(repo)
+                if self.gh_rc:
+                    return self.gh_rc, json.dumps({"message": "Server Error"}), "boom"
+                return 0, "".join(json.dumps(dict(p, login=p.get("login", "box"))) + "\n"
+                                  for p in self.open[repo]), ""
             if argv[0] == "api" and argv[1].count("/") == 2:   # repos/<slug>: the repo itself
                 d = self.default[repo]
                 return (0, json.dumps({"default_branch": d}), "") if d is not None else (1, "", "HTTP 502")
@@ -96,6 +104,12 @@ class Strays(unittest.TestCase):
         self.assertEqual(self.queued, [("demo", 5)])   # kept: ready, not a track's, inside the window
         self.assertEqual(len(lines), 1)
         self.assertIn("PR #5 was open with no landing record — queued it", lines[0])
+
+    def test_a_pr_of_another_login_is_not_the_box_s(self):
+        # REST has no --author @me: the list is every open PR, kept only where its author is gh's own login
+        self.open["demo"] = [pr(5), dict(pr(6), login="someone")]
+        TK.sweep_strays(["demo"])
+        self.assertEqual(self.queued, [("demo", 5)])
 
     def test_a_pr_the_lander_holds_or_ever_logged_is_left_alone(self):
         self.open["demo"] = [pr(5), pr(10), pr(11), pr(50)]

@@ -479,20 +479,26 @@ grep -q 'capped' ~/.cc/state/$REPO/w2/loop.log && [ "$("$B/cc-board" get $REPO w
 "$B/cc" $REPO w3 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w3$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 echo "hang for a while" > ~/.cc/state/$REPO/w3/task.md
+# The kill proves something only if the fake claude was running when it came: no claude seen within the bound is a red
+# of its own, so a loop that never starts one cannot pass this as "no orphan".
 CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet >/dev/null 2>&1 & lp=$!
-for _ in $(seq 1 10); do pgrep -f "$T/sleepclaude" >/dev/null && break; sleep 1; done
+up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
-[ "$gone" = yes ] && ok "killing the loop kills its claude child (no orphan left in the worktree)" || { bad "orphaned claude survived the loop kill"; pkill -f "$T/sleepclaude"; }
+if [ "$up" = no ]; then bad "the loop's fake claude never started, so the HUP kill proved nothing"
+elif [ "$gone" = yes ]; then ok "killing the loop kills its claude child (no orphan left in the worktree)"
+else bad "orphaned claude survived the loop kill"; pkill -f "$T/sleepclaude"; fi
 wait $lp 2>/dev/null
 # H4b: …and from a launcher that IGNORES HUP — a `setsid nohup cc-loop` typed out of a session shell, the shape of the
 # relaunch-orphans incident. exec keeps SIG_IGN and bash cannot trap a signal ignored at entry, so the loop's HUP trap was a
 # no-op and its claude lived on. cc-loop puts its signals back to default at launch, before that trap is set.
 ( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet ) >/dev/null 2>&1 & lp=$!
-for _ in $(seq 1 10); do pgrep -f "$T/sleepclaude" >/dev/null && break; sleep 1; done
+up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
-[ "$gone" = yes ] && ok "…and from a launcher that ignores HUP (setsid nohup out of a session shell): the loop resets its signals at launch, so the kill still takes its claude" || { bad "HUP-ignoring launcher: the loop kept SIG_IGN and its claude survived (relaunch orphans)"; pkill -f "$T/sleepclaude"; kill -TERM $lp 2>/dev/null; }
+if [ "$up" = no ]; then bad "…the HUP-ignoring launcher's fake claude never started, so its kill proved nothing"; kill -TERM $lp 2>/dev/null
+elif [ "$gone" = yes ]; then ok "…and from a launcher that ignores HUP (setsid nohup out of a session shell): the loop resets its signals at launch, so the kill still takes its claude"
+else bad "HUP-ignoring launcher: the loop kept SIG_IGN and its claude survived (relaunch orphans)"; pkill -f "$T/sleepclaude"; kill -TERM $lp 2>/dev/null; fi
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
 fi
 e2e_end

@@ -19,7 +19,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from lander import cards as C  # noqa: E402
 from lander import review as R  # noqa: E402
+from lander import gh as GH  # noqa: E402
 from lander import types as T  # noqa: E402
+
+def gh_via_sh(argv, root, token=None, timeout=120, note=True, stdin=None):
+    """gh.gh through the case's fake C.sh, so `gh pr view` and `gh pr comment` (a root with no GitHub slug) are
+    answered and recorded there as before the lander's gh calls moved into gh.py."""
+    rc, out = C.sh(["gh", *argv], cwd=root, input=stdin, timeout=timeout)
+    return rc, out, ""
 
 DIFF = "diff --git a/x.py b/x.py\nindex 1..2 100644\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@ def f\n-a\n+b\n"
 BASE, HEAD = "b" * 40, "e" * 40
@@ -138,6 +145,9 @@ class Case(unittest.TestCase):
         with open(os.path.join(os.environ["CC_BOARDS"], "review-root.json"), "w") as f:
             json.dump({"path": self.tmp}, f)
         self.real_sh = C.sh
+        p = mock.patch.object(GH, "gh", gh_via_sh)
+        p.start()
+        self.addCleanup(p.stop)
         # the reviewer keys come from the passwd home's config, never the box's real one in a test
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME, R.PERMS_STATE)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")

@@ -103,6 +103,18 @@ def run_selfcheck():
     tmp_outbox_log = tempfile.mktemp(prefix="_selfcheck_outbox_")
     real_outbox = outbox                                     # kept for the 0600-permissions check (L22)
     globals()["outbox"] = lambda kind, chat, thread, text: open(tmp_outbox_log, "a").write(f"{kind}\t{chat}\t{thread or ''}\t{text}\n")
+    real_run_pp, asked_pp = subprocess.run, []
+    try:
+        subprocess.run = lambda cmd, **kw: asked_pp.append(cmd[2]) or type("R", (), {"returncode": 0, "stderr": "",
+            "stdout": json.dumps({"state": "closed", "merged_at": "2026-10-19T00:00:00Z", "title": "t"})})()
+        pp_url = gh_pr("demo", "https://github.com/o/r/pull/1541")[0]
+        pp_num, pp_bad = gh_pr("demo", "#12")[0], gh_pr("demo", "https://github.com/o/r/issues/3")
+    finally:
+        subprocess.run = real_run_pp
+    check("gh_pr: a board's pr field that is a URL (every row on a box board) is read from the repo and number it names, not "
+          "int()'d into a '?' on the dashboard; a bare #N is the checkout's; anything else is no PR and asks nothing",
+          (pp_url or {}).get("state") == "MERGED" and (pp_num or {}).get("state") == "MERGED" and pp_bad[0] is None
+          and asked_pp == ["repos/o/r/pulls/1541", "repos/{owner}/{repo}/pulls/12"])
     check("mrkdwn: heading/bold/list/link", mrkdwn("# Title\n**b** and [t](https://u/x)\n- item") == "*Title*\n*b* and <https://u/x|t>\n• item")
     check("mrkdwn: code blocks untouched", mrkdwn("```\n**x** # y\n```") == "```\n**x** # y\n```")
     # ---- @-mentions: a session addressing a real PERSON in a channel (linkify_mentions + the clean() round-trip)
@@ -675,8 +687,9 @@ def run_selfcheck():
                 globals()["api"] = api2
                 globals()["find_channel"] = lambda cfg, n: ("CAPPR", True)
                 globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: posted.append(text) or (1, "9.9")
-                subprocess.run = lambda cmd, **kw: type("R", (), {"returncode": 0, "stderr": "",
-                                                                  "stdout": json.dumps({"title": "t", "url": "https://x/7"})})()
+                subprocess.run = lambda cmd, **kw: type("R", (), {"returncode": 0, "stderr": "",   # REST's pull, gh_pr
+                                                                  "stdout": json.dumps({"title": "t", "html_url": "https://x/7",
+                                                                                        "state": "open"})})()
                 with contextlib.redirect_stdout(io.StringIO()) as o1:
                     rc1 = cmd_post_approval([rname, "7"])
                 check("post-approval: a card for that PR is already up → the second caller posts nothing and exits 0 with its ts",
@@ -727,9 +740,13 @@ def run_selfcheck():
                         marks.append((kw["timestamp"], kw["name"])); return {"ok": True}
                     raise AssertionError(method)
                 gh = {"7": {"title": "t", "url": "https://x/7", "state": "MERGED", "mergedAt": "2026-09-01T04:33:58Z"}}
-                def run3(cmd, **kw):
-                    asked.append(cmd[3]); f = gh.get(cmd[3])
-                    return type("R", (), {"returncode": 0 if f else 1, "stderr": "" if f else "no such PR", "stdout": json.dumps(f or {})})()
+                def run3(cmd, **kw):   # gh api repos/{owner}/{repo}/pulls/<n>: gh's PR, answered in REST's names
+                    n = cmd[2].rsplit("/", 1)[-1]; asked.append(n); f = gh.get(n)
+                    rest = f and {"title": f.get("title"), "html_url": f.get("url"), "merged_at": f.get("mergedAt"),
+                                  "closed_at": f.get("closedAt"),
+                                  "state": "open" if f.get("state") == "OPEN" else "closed"}
+                    return type("R", (), {"returncode": 0 if f else 1, "stderr": "" if f else "gh: Not Found (HTTP 404)",
+                                          "stdout": json.dumps(rest or {"message": "Not Found"})})()
                 globals()["api"], subprocess.run = api3, run3
                 with contextlib.redirect_stdout(io.StringIO()) as o6, contextlib.redirect_stderr(io.StringIO()):
                     rc6 = cmd_post_approval([rname, "7"]); rc6f = cmd_post_approval([rname, "--force", "7"])

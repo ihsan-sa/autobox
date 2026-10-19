@@ -377,16 +377,25 @@ class RestFacts(unittest.TestCase):
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):              # is unreadable, never "no CI"
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
 
-    def test_comments_still_go_through_graphql(self):
+    COMMENTS = ("api --paginate repos/o/r/issues/7/comments?per_page=100 -q "
+                ".[] | {body, login: .user.login, createdAt: .created_at}")
+
+    def test_comments_go_over_rest_too(self):
+        line = json.dumps({"body": "LAND", "login": "box", "createdAt": "2026-10-19T00:00:00Z"})
         for fields in ("comments", "state,comments"):
-            calls, p = self.run_gh({f"pr view 7 --json {fields} -R o/r": "{}"})
+            GH._VIEWER.clear()
+            calls, p = self.run_gh({self.COMMENTS: line, "api user -q .login": "box",
+                                    "api repos/o/r/pulls/7": json.dumps(self.PULL)})
             with self.subTest(fields=fields), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
-                self.assertEqual(GH.pr_facts("/x", 7, fields), ({}, ""))
-                self.assertEqual(calls[0][:2], ["pr", "view"])
+                j, why = GH.pr_facts("/x", 7, fields)
+                self.assertEqual((j["comments"], why), ([{"body": "LAND", "author": {"login": "box"},
+                                                          "createdAt": "2026-10-19T00:00:00Z",
+                                                          "viewerDidAuthor": True}], ""))
+                self.assertFalse(any(c[:1] != ["api"] for c in calls))   # no `gh pr view`: no GraphQL
 
     def test_a_spent_rate_limit_is_said_with_its_reset(self):
         limit = json.dumps({"resources": {"core": {"remaining": 4815, "reset": 1}, "graphql": {"remaining": 0, "reset": 1792444560}}})
-        for fields, ask in (("state", "api repos/o/r/pulls/7"), ("comments", "pr view 7 --json comments -R o/r")):
+        for fields, ask in (("state", "api repos/o/r/pulls/7"), ("comments", self.COMMENTS)):
             _, p = self.run_gh({ask: (1, "", "GraphQL: API rate limit already exceeded for user ID 1."), "api rate_limit": limit})
             with self.subTest(fields=fields), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
                 self.assertEqual(GH.pr_facts("/x", 7, fields),

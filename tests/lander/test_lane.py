@@ -72,7 +72,7 @@ if me == "gh":
     rest = re.fullmatch(r"repos/[^/]+/[^/]+/(pulls/(\d+)(/files\?per_page=100)?|commits/(\w+)/(check-runs|status)\?per_page=100)",
                         a[1]) if a[:1] == ["api"] and len(a) > 1 else None
     if a[:2] == ["api", "--paginate"]:
-        rest = re.fullmatch(r"repos/[^/]+/[^/]+/(pulls/(\d+)(/files)\?per_page=100)", a[2])
+        rest = re.fullmatch(r"repos/[^/]+/[^/]+/(pulls/(\d+)(/files)\?per_page=100)()()", a[2])
     if rest:   # GitHub's REST answer, made from the same PR the pr view below gives (gh.pr_facts' REST path)
         n, files, sha, what = rest.group(2), rest.group(3), rest.group(4), rest.group(5)
         if sha:
@@ -81,6 +81,35 @@ if me == "gh":
         a = ["pr", "view", n or "0", "--json", "files" if files else
              "statusCheckRollup" if sha else "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body,mergeCommit,mergeStateStatus"]
         rest = (files, sha, what)
+    if a[:2] == ["api", "user"]:   # gh.viewer: the box's own login
+        out(0, "box")
+    rcom = re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments(\?per_page=100)?", a[2] if a[1:2] == ["--paginate"]
+                        else a[1]) if a[:1] == ["api"] and len(a) > 2 else None
+    if rcom:   # an issue's comments over REST: listed (gh.comments, after its -q) or one posted (gh.comment)
+        pr = prs.get(rcom.group(1))
+        if pr is None:
+            out(1, json.dumps({"message": "Not Found"}), "gh: Not Found (HTTP 404)")
+        if rcom.group(2):
+            out(0, "\n".join(json.dumps({"body": c.get("body", ""), "login": "box" if c.get("viewerDidAuthor") else
+                                         "someone", "createdAt": c.get("createdAt", "")}) for c in pr.get("comments") or []))
+        box.setdefault("posted", []).append((rcom.group(1), json.load(sys.stdin)["body"] if "--input" in a
+                                             else a[a.index("-f") + 1][len("body="):]))
+        out(0, json.dumps({"id": len(box["posted"])}))
+    rmerge = re.fullmatch(r"repos/[^/]+/[^/]+/pulls/(\d+)/merge", a[3]) if a[:3] == ["api", "-X", "PUT"] else None
+    if rmerge:   # the REST squash merge (gh.merge_argv), recorded as the merge it is: pin, title, no branch delete
+        box.setdefault("rest_merges", []).append(a)
+        f = dict(x.split("=", 1) for x in a[4:] if "=" in x)
+        if rmerge.group(1) not in prs:
+            out(1, json.dumps({"message": "Not Found"}), "gh: Not Found (HTTP 404)")
+        a = ["pr", "merge", rmerge.group(1), "--squash", "--match-head-commit", f.get("sha", "")] \
+            + (["--subject", f["commit_title"]] if "commit_title" in f else [])
+    rdel = re.fullmatch(r"repos/[^/]+/[^/]+/git/refs/heads/(.+)", a[3]) if a[:3] == ["api", "-X", "DELETE"] else None
+    if rdel:
+        box.setdefault("deleted", []).append(rdel.group(1))
+        if box.get("delete_fail"):
+            out(1, "", box["delete_fail"])
+        g("update-ref", "-d", "refs/heads/" + rdel.group(1))
+        out(0)
     if a[:2] == ["pr", "view"]:
         pr = prs.get(a[2])
         if pr is None:
@@ -114,7 +143,8 @@ if me == "gh":
                                "merge_commit_sha": (mc or {}).get("oid"), "draft": d["isDraft"],
                                "mergeable": {"MERGEABLE": True, "CONFLICTING": False}.get(d["mergeable"]),
                                "mergeable_state": d["mergeStateStatus"].lower(), "title": d["title"], "body": d["body"],
-                               "head": {"sha": d.get("headRefOid"), "ref": d.get("headRefName")},
+                               "head": {"sha": d.get("headRefOid"), "ref": d.get("headRefName"),
+                                        "repo": {"full_name": d.get("headRepo", "o/demo")}},
                                "base": {"ref": d["baseRefName"]}}))
         out(0, json.dumps({f: d.get(f) for f in fields}))
     if a[:2] == ["pr", "merge"]:
@@ -130,13 +160,17 @@ if me == "gh":
                 box["lock_during_merge"] = "held"
             os.close(fd)
         if box.get("merge_fail"):
-            out(1, "", box["merge_fail"])
+            out(1, json.dumps({"message": box["merge_fail"]}) if rmerge else "", box["merge_fail"])
         if box.get("behind"):
-            out(1, "", 'GraphQL: Required status check "check" is expected. (mergePullRequest)')
+            out(1, "", 'gh: Required status check "check" is expected. (HTTP 405)' if rmerge else
+                'GraphQL: Required status check "check" is expected. (mergePullRequest)')
+        if pr.get("state") == "MERGED" and rmerge:
+            out(1, json.dumps({"message": "Pull Request is not mergeable"}), "gh: Pull Request is not mergeable (HTTP 405)")
         head = g("rev-parse", "refs/heads/" + pr["headRefName"])
         pin = a[a.index("--match-head-commit") + 1]
         if pin != head:
-            out(1, "", "GraphQL: Head branch was modified. Review and try the merge again.")
+            out(1, "", "gh: Head branch was modified. Review and try the merge again. (HTTP 409)" if rmerge else
+                "GraphQL: Head branch was modified. Review and try the merge again.")
         if box.pop("race", None):   # a third party lands in the window before the squash
             idx = os.path.join(os.path.dirname(box_path), "race.idx")
             env = dict(os.environ, GIT_INDEX_FILE=idx)
@@ -155,7 +189,8 @@ if me == "gh":
         if box.pop("merge_then_timeout", None):   # GitHub merged, gh gave up, and GitHub stops answering
             box["down"] = True
             out(124, "", "gh timed out")
-        out(0, "merged")
+        out(0, json.dumps({"sha": c, "merged": True, "message": "Pull Request successfully merged"}) if rmerge
+            else "merged")
     if a[:3] == ["api", "-X", "PUT"] and a[3].endswith("/update-branch"):   # GitHub merges main into the branch
         pr = prs[a[3].split("/")[-2]]
         box.setdefault("updates", []).append(a[3:])
@@ -411,6 +446,12 @@ class Fixture(unittest.TestCase):
         self.set_box(origin=self.origin, prs={}, config={}, paused=[])
         self.pin_remote(self.root, self.origin)
         p = mock.patch.object(G, "ALLOW_LOCAL", True)   # the pinned URL is this bare repo, not GitHub
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(GH, "slug", lambda root: "o/demo")   # GitHub's name for it: the lane asks over REST
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.dict(GH._VIEWER, clear=True)   # each case's gh says its own login
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(L, "spawn_tick", lambda repo: (True, "test"))
@@ -2487,13 +2528,36 @@ class Merge(Fixture):
         head = self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
         self.land()
-        argv = self.box()["merges"][0]
-        self.assertEqual(argv[:4], ["pr", "merge", "1", "--squash"])
-        self.assertIn("--delete-branch", argv)
-        self.assertEqual(argv[argv.index("--match-head-commit") + 1], head)
-        self.assertEqual(argv[argv.index("--subject") + 1], "row 1 change (#1)")
-        self.assertNotIn("--auto", argv)
+        argv = self.box()["rest_merges"][0]   # over REST: no GraphQL hour spent on the merge
+        self.assertEqual(argv[:4], ["api", "-X", "PUT", "repos/o/demo/pulls/1/merge"])
+        self.assertEqual(argv[4:], ["-f", "merge_method=squash", "-f", f"sha={head}",
+                                    "-f", "commit_title=row 1 change (#1)"])
+        self.assertEqual(self.box()["deleted"], ["track/row-1"])   # the branch, as --delete-branch did
         self.assertIn(f"stage demo#1 merged sha={head[:12]}", self.log())
+
+    def test_a_forks_branch_is_never_deleted(self):
+        head = self.pr(1, {"a/x": "n\n"}, headRepo="someone/demo")
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(len(self.box()["rest_merges"]), 1)
+        self.assertNotIn("deleted", self.box())   # not ours to delete
+        self.assertIn(f"stage demo#1 merged sha={head[:12]}", self.log())
+
+    def test_a_failed_branch_delete_still_reports_the_merge(self):
+        head = self.pr(1, {"a/x": "n\n"})
+        self.set_box(delete_fail="gh: Reference does not exist (HTTP 422)")
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.box()["deleted"], ["track/row-1"])
+        self.assertIn(f"stage demo#1 merged sha={head[:12]}", self.log())
+        # what merge() puts after "merged (squash, " instead of "remote branch deleted"
+        self.assertEqual(GH.delete_branch(self.work, 1), "the branch was left: gh: Reference does not exist (HTTP 422)")
+
+    def test_a_branch_name_with_a_hash_is_deleted_whole(self):
+        self.pr(1, {"a/x": "n\n"}, branch="track/x#y")
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.box()["deleted"], ["track/x%23y"])   # never DELETE …/heads/track/x, another branch
 
     def test_disjoint_delta_merges_without_rerun(self):
         self.pr(1, {"a/x": "n\n"})
@@ -3487,8 +3551,7 @@ class Branches(Fixture):
         self.assertNotIn("updates", self.box())   # a refusal that is not BEHIND never updates the branch
         ok, text = GH.merge(self.root, 1, "x" * 40, "t")
         self.assertFalse(ok)
-        self.set_box(merge_fail="--auto: auto-merge is not allowed")
-        self.assertIn("no auto-merge was armed", GH.merge(self.root, 1, "x" * 40, "t")[1])
+        self.assertFalse(any("auto" in x for m in self.box()["rest_merges"] for x in m))   # REST arms no auto-merge
 
     def unhold(self):
         j = self.job()
@@ -3678,8 +3741,10 @@ class Branches(Fixture):
             GH.pr_facts(self.root, 5, "state")
             GH.pr_files(self.root, 5)
             GH.pr_facts(self.root, 5, "comments")
-        self.assertEqual([next((x for x in a if x.startswith("repos/o/demo/pulls/5")), "") or a[a.index("-R") + 1]
-                          for a in seen], ["repos/o/demo/pulls/5", "repos/o/demo/pulls/5/files?per_page=100", "o/demo"])
+        self.assertEqual([next((x for x in a if x.startswith("repos/o/demo/")), "") or a[a.index("-R") + 1]
+                          for a in seen if a[1:3] != ["api", "user"]],   # comments too: none of them over GraphQL
+                         ["repos/o/demo/pulls/5", "repos/o/demo/pulls/5/files?per_page=100",
+                          "repos/o/demo/issues/5/comments?per_page=100"])
         with mock.patch.object(GH, "slug", lambda root: ""), mock.patch.object(GH.subprocess, "run", ran):
             GH.pr_facts(self.root, 5, "state")
         self.assertNotIn("-R", seen[-1])

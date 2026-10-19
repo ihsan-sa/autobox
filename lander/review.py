@@ -163,6 +163,7 @@ import time
 import unicodedata
 
 from lander import cards as C
+from lander import gh as GH
 from lander import types as T
 
 MARK = "cc-land-review"
@@ -1494,16 +1495,12 @@ def body_of(facts):
 
 
 def pr_view(root, pr, fields="comments"):
-    rc, out = C.sh(["gh", "pr", "view", str(pr), "--json", fields], cwd=root, timeout=120)
-    try:
-        return json.loads(out) if rc == 0 else None
-    except ValueError:
-        return None
+    """`gh pr view --json <fields>`'s answer, over REST when the repo is GitHub's (gh.pr_facts), else None."""
+    return GH.pr_facts(root, pr, fields)[0]
 
 
 def post(root, pr, body):
-    rc, out = C.sh(["gh", "pr", "comment", str(pr), "--body-file", "-"], cwd=root, input=body, timeout=120)
-    return rc == 0
+    return GH.comment(root, pr, body)
 
 
 # --- review / delta_review -----------------------------------------------------------------------------------------

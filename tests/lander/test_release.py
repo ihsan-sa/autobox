@@ -531,5 +531,58 @@ class Release(unittest.TestCase):
             self.assertEqual(RL.cmd_release(["demo", "5", "--by", "lean", "--wait", "0"]), 3)
 
 
+class GhViewer(unittest.TestCase):
+    """Opus FIX at 1d882403: with no viewer every comment read as someone else's, so a standing HANDBACK went
+    unseen and release carried on; the read now fails closed, as the GraphQL one did."""
+
+    def setUp(self):
+        from lander import gh as GH
+        self.GH, self.calls, self.user = GH, [], (0, "box-bot\n", "")
+        for p in (mock.patch.dict(GH._VIEWER, clear=True), mock.patch.object(GH, "slug", lambda root: "o/r"),
+                  mock.patch.object(GH, "gh", self.gh)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def gh(self, argv, root, token=None, timeout=120, note=True, stdin=None):
+        self.calls.append((argv, stdin))
+        if argv[:2] == ["api", "user"]:
+            return self.user
+        if argv[:1] == ["pr"]:
+            return 0, "", ""
+        if argv[-2:] == ["--input", "-"]:
+            return 0, '{"id": 1}', ""
+        body = R.marker(T.Verdict(verdict=T.HANDBACK_VERDICT, digest="c0ffee", blocking=["x"]), "d" * 40, HEAD,
+                        "opus-5.5")
+        return 0, json.dumps({"body": body, "login": "box-bot", "createdAt": "t"}) + "\n", ""
+
+    def test_no_viewer_fails_the_comment_read(self):
+        got, _ = self.GH.comments("/r", 5)
+        self.assertEqual(RL.standing_handback(got, HEAD), ("opus-5.5", HEAD[:12]))   # the box's own HANDBACK stands
+        self.GH._VIEWER.clear()
+        for fail in ((1, "", "HTTP 502"), (124, "", "gh timed out"), (0, "", "")):
+            self.user = fail
+            self.assertEqual(self.GH.comments("/r", 5), (None, "GitHub would not say which login gh runs as"))
+
+    def test_a_callable_token_is_never_cached(self):
+        def tok():
+            return "t"
+        self.assertEqual(self.GH.viewer("/r", tok), "box-bot")
+        self.assertEqual(self.GH._VIEWER, {})   # it would share the box login's "" key
+        self.user = (0, "other\n", "")
+        self.assertEqual(self.GH.viewer("/r", tok), "other")
+        self.assertEqual(self.GH.viewer("/r"), "other")
+        self.user = (0, "box-bot\n", "")
+        self.assertEqual(self.GH.viewer("/r"), "other")   # the box login's own answer is cached
+
+    def test_the_comment_body_goes_on_stdin(self):
+        big = "x" * 300000
+        self.assertTrue(self.GH.comment("/r", 5, big))
+        with mock.patch.object(self.GH, "slug", lambda root: ""):
+            self.assertTrue(self.GH.comment("/r", 5, big))
+        for argv, stdin in self.calls:
+            self.assertNotIn(big, argv)
+        self.assertEqual(self.calls[-1], (["pr", "comment", "5", "--body-file", "-"], big))
+
+
 if __name__ == "__main__":
     unittest.main()

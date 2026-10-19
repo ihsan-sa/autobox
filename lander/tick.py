@@ -220,14 +220,9 @@ def sweep_strays(repos) -> list:
         s = GH.slug(root)
         if not s or not due_every(C.state("tip", f"{repo}.strays"), "LANDER_STRAY_SECS") or not self_lands(repo):
             continue
-        rc, out, err = GH.gh(["pr", "list", "--state", "open", "--author", "@me", "--limit", "100",
-                              "--json", "number,isDraft,headRefName,baseRefName,createdAt", "-R", s], root)
-        try:
-            prs = json.loads(out) if not rc else None
-        except ValueError:
-            prs = None
-        if not isinstance(prs, list):
-            lines.append(f"[{repo}] strays: gh could not list the open PRs — {GH.last(err or out) or f'exit {rc}'}")
+        prs, why = GH.my_open_prs(root)
+        if prs is None:
+            lines.append(f"[{repo}] strays: gh could not list the open PRs — {why}")
             continue
         now, seen, heads, base = time.time(), None, None, None
         for p in prs:
@@ -682,7 +677,11 @@ def flag_main_red(repos, cards, now=None) -> list:
     lines, t = [], int(now if now is not None else time.time())
     for r in (repos if cards and not GH.backoff() else []):
         try:
-            oldest, rec = {}, HL.load(r)["checks"]
+            oldest = {}
+            try:
+                rec = HL.load(r)["checks"]
+            except (TypeError, ValueError, AttributeError):  # a wrong-shape health file reads as no record
+                rec = {}
             for j in J.lane_jobs(r):
                 mr = j.extra.get("main_red")
                 at = E.epoch_of(mr.get("since") or "") if isinstance(mr, dict) else 0

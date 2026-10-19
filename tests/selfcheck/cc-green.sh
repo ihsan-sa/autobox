@@ -266,6 +266,25 @@ EOS
   k "$(t test "$(cat "$D/waitbare.env")" = "$D2/waits-waitbare.tsv waitbare")" "…and with no .cc/track, the checkout's name and the worktree's"
   rm -rf "$D2"
 
+  # 8c A RUN HELD ON A LANDER SLOT SAYS SO. The check is told the run's status file (LANDER_WAIT_NOTE); the fake
+  # writes a `waiting=` line there as admission does past WAIT_SAY, and `wait` on the running run prints it. Before
+  # that line is written, the same wait prints none.
+  cat > "$D/slotwait.py" <<EOS
+open(f"{D}/slotwait.started", "w").close(); time.sleep(3)
+open(os.environ["LANDER_WAIT_NOTE"], "a").write("waiting=T0 lander: waiting for a check slot — not a hang\n")
+open(f"{D}/slotwait.noted", "w").close(); time.sleep(4)
+EOS
+  D2=$(mktemp -d); R=$(newrepo slotwait)
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 50); do [ -f "$D/slotwait.started" ] && break; sleep 0.1; done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3)" "a run on a lander slot: wait while it is going exits 3"
+  k "$(nt grep -q 'waiting for a check slot' <<<"$out")" "…and says nothing of a slot before the check notes one"
+  for _ in $(seq 80); do [ -f "$D/slotwait.noted" ] && break; sleep 0.1; done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
+  k "$(t grep -qx '  T0 lander: waiting for a check slot — not a hang' <<<"$out")" "…and once it has, wait prints the check's waiting= line under still running"
+  wait "$p"; rm -rf "$D2"
+
   # 9 `red` WRITES ONE LEDGER RECORD PER KEY, with a bounded excerpt of the log that outlives it, and never fails
   # its caller: cc-loop's stops call it.
   printf 'line\n  ✗ the thing that broke\nmore\n' > "$D/red.log"

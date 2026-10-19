@@ -35,6 +35,7 @@ import re
 from lander import cards as C
 from lander import deploy as D
 from lander import git as G
+from lander import gh as GH
 from lander import types as T
 
 PR_RE = re.compile(r"\(#(\d+)\)$")
@@ -236,7 +237,7 @@ def revert(repo, root, base, sha, why):
                 f"or fixes it.")
         C.log("revert-failed", repo, pr or "tip", sha=sha[:12], why=said[:160])
     if pr:
-        C.sh(["gh", "pr", "comment", str(pr), "--body", text], cwd=root, timeout=120)
+        GH.comment(root, pr, text)
         job = T.Job(repo=repo, pr=pr, extra={"queued_at": sha[:12]})
         tt = C.track_thread(job)
         pid = C.producer_id(job, "reverted" if made else "revert-failed")

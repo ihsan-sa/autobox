@@ -21,11 +21,12 @@
     update_branch(root, pr, head) -> (ok, text): `gh api -X PUT repos/<slug>/pulls/<pr>/update-branch -f
         expected_head_sha=<head>`, which merges the base into the PR's branch on GitHub; refused if the head moved.
     merge(root, pr, pin, title) -> (ok, text), ok True | False | None
-        `gh pr merge <pr> --squash --delete-branch --match-head-commit <pin> [-R <slug>] --subject "<title> (#<pr>)"`.
-        "already merged" is merged; "is closed" and any other failure are merged only when GitHub then reports the
-        PR MERGED (a second merge overlapped this one, or gh timed out after GitHub merged), refused when it reports
-        another state, and None — unknown — when GitHub cannot be read. An answer about auto-merge is a refusal:
-        auto-merge is never armed, since it would land with nothing gating or deploying it.
+        `gh api -X PUT repos/<slug>/pulls/<pr>/merge -f merge_method=squash -f sha=<pin> -f commit_title="<title>
+        (#<pr>)"`, over REST, then the branch deleted (delete_branch). Merged only when rc is 0 and GitHub's answer
+        says merged; any failure is merged only when GitHub then reports the PR MERGED (an earlier merge, a second
+        one overlapping this, or gh timing out after GitHub merged), refused when it reports another state, and
+        None — unknown — when GitHub cannot be read. REST never arms auto-merge, which would land with nothing
+        gating or deploying it.
 
 BACKOFF (B3). A failure that looks like GitHub or the network being down — rc != 0, no JSON on stdout, and text
 matching BACKOFF_RE — records <LANDQ>/lanes/gh.backoff {until, fails}: 1 minute, doubling per failure up to 30.
@@ -39,6 +40,7 @@ import os
 import re
 import subprocess
 import time
+from urllib.parse import quote
 
 BACKOFF_RE = re.compile(r"timeout|timed out|connect|\b502\b|\b503\b|rate limit|could not resolve", re.I)
 BACKOFF_MIN, BACKOFF_MAX = 60, 1800
@@ -77,7 +79,7 @@ def _note(rc: int, out: str, err: str) -> None:
         J.write_atomic(backoff_path(), {"until": time.time() + secs, "fails": fails})
 
 
-def gh(argv, root, token=None, timeout=120, note=True):
+def gh(argv, root, token=None, timeout=120, note=True, stdin=None):
     env = dict(os.environ)
     if callable(token):   # a member's app token (members.gh_token), asked for now: it lives an hour
         token = token()
@@ -92,7 +94,7 @@ def gh(argv, root, token=None, timeout=120, note=True):
         env.update(GH_TOKEN=token, GH_CONFIG_DIR=ghc)
     try:
         p = subprocess.run(["gh", *argv], cwd=root, capture_output=True, text=True, timeout=timeout, env=env,
-                           stdin=subprocess.DEVNULL)
+                           **({"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}))
         rc, out, err = p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         rc, out, err = 124, "", "gh timed out"
@@ -111,10 +113,88 @@ def last(text, n=200) -> str:
 # login's GraphQL hour, which ran out at 18:1xZ with REST still at 4815 of 5000, and every gh pr call on the box failed
 # until the reset. A read whose fields are all below is one GET of the pull (and its files), answered in the shape
 # `gh pr view --json` gives, so no caller changes; statusCheckRollup is the head's check runs and commit statuses
-# (two more GETs), the CI wait's every-two-minutes read. Only comments (viewerDidAuthor has no REST twin) still go
-# through GraphQL, and a refusal on the rate limit says so with its reset.
+# (two more GETs), the CI wait's every-two-minutes read. Comments are the issue's comments, each marked
+# viewerDidAuthor when its author is the login gh runs as (GET /user, once per process and token; no answer fails the read), and a refusal on
+# the rate limit says so with its reset.
 REST_FIELDS = {"state", "isDraft", "mergeable", "headRefOid", "headRefName", "baseRefName", "title", "body",
-               "mergeCommit", "mergedAt", "mergeStateStatus", "files", "number", "url", "statusCheckRollup"}
+               "mergeCommit", "mergedAt", "mergeStateStatus", "files", "number", "url", "statusCheckRollup",
+               "comments"}
+_VIEWER = {}
+
+
+def viewer(root, token=None) -> str:
+    """The login gh answers as, "" when GitHub will not say (a 502, the timeout, an app token with no user); the
+    readers that need it then fail closed. Cached per process for the box login or a token string; a callable token
+    is asked each time, as it would share the box login's key."""
+    key = token if isinstance(token, str) else "" if token is None else None
+    if key is None or key not in _VIEWER:
+        rc, out, _ = gh(["api", "user", "-q", ".login"], root, token, 30)
+        if rc or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?", out.strip()):   # rc first, then a login
+            return ""
+        if key is None:
+            return out.strip()
+        _VIEWER[key] = out.strip()
+    return _VIEWER[key]
+
+
+def comments(root, pr, token=None, timeout=120):
+    """The PR's comments over REST, in `gh pr view --json comments`' shape ({body, author, createdAt,
+    viewerDidAuthor}) -> (list, "") | (None, why)."""
+    s = slug(root)
+    rc, out, err = gh(["api", "--paginate", f"repos/{s}/issues/{int(pr)}/comments?per_page=100", "-q",
+                       ".[] | {body, login: .user.login, createdAt: .created_at}"], root, token, timeout)
+    if rc:   # rc first: a refusal's stdout is GitHub's error JSON, not a comment
+        return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+    me, got = viewer(root, token), []
+    if not me:   # fail closed: with no viewer no HANDBACK would be the box's own, and a standing one would be missed
+        return None, "GitHub would not say which login gh runs as"
+    for line in out.splitlines():
+        try:
+            c = json.loads(line) if line.strip() else None
+        except ValueError:
+            return None, "gh answered comments that are not JSON"
+        if isinstance(c, dict):
+            got.append({"body": c.get("body") or "", "author": {"login": c.get("login") or ""},
+                        "createdAt": c.get("createdAt") or "",
+                        "viewerDidAuthor": c.get("login") == me})
+    return got, ""
+
+
+def my_open_prs(root, token=None, timeout=120):
+    """The open PRs gh's own login opened, over REST (`gh pr list --author @me` spends the GraphQL hour), in that
+    list's shape ({number, isDraft, headRefName, baseRefName, createdAt}) -> (list, "") | (None, why)."""
+    s = slug(root)
+    rc, out, err = gh(["api", "--paginate", f"repos/{s}/pulls?state=open&per_page=100", "-q",
+                       ".[] | {number, isDraft: .draft, headRefName: .head.ref, baseRefName: .base.ref, "
+                       "createdAt: .created_at, login: .user.login}"], root, token, timeout)
+    if rc:   # rc first: a refusal's stdout is GitHub's error JSON, not a PR
+        return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+    me = viewer(root, token)
+    if not me:
+        return None, "GitHub would not say which login gh runs as"
+    got = []
+    for line in out.splitlines():
+        try:
+            p = json.loads(line) if line.strip() else None
+        except ValueError:
+            return None, "gh answered PRs that are not JSON"
+        if isinstance(p, dict) and p.pop("login", None) == me:
+            got.append(p)
+    return got, ""
+
+
+def comment(root, pr, body, token=None) -> bool:
+    """Post `body` as a PR comment over REST; True when GitHub took it."""
+    s = slug(root)   # the body on stdin, never in argv: a long review would pass the kernel's argument limit
+    if not s or not str(pr).isdigit():
+        rc, _, _ = gh(["pr", "comment", str(pr), "--body-file", "-"], root, token, 120, stdin=body)
+        return not rc
+    rc, out, _ = gh(["api", f"repos/{s}/issues/{int(pr)}/comments", "--input", "-"], root, token, 120,
+                    stdin=json.dumps({"body": body}))
+    try:
+        return not rc and bool(json.loads(out).get("id"))
+    except (ValueError, AttributeError):
+        return False
 
 
 def rest_facts(p, want) -> dict:
@@ -159,7 +239,7 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
     want = [f for f in fields.split(",") if f]
     if s and want and set(want) <= REST_FIELDS and str(pr).isdigit():
         j = {}
-        if set(want) - {"files"}:   # statusCheckRollup needs the head this GET names
+        if set(want) - {"files", "comments"}:   # statusCheckRollup needs the head this GET names
             rc, out, err = gh(["api", f"repos/{s}/pulls/{int(pr)}"], root, token, timeout)
             try:
                 p = json.loads(out) if not rc else None
@@ -185,6 +265,10 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
             if rc:
                 return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
             j["files"] = [{"path": f} for f in out.splitlines() if f]
+        if "comments" in want:
+            j["comments"], why = comments(root, pr, token, timeout)
+            if j["comments"] is None:
+                return None, why
         return j, ""
     rc, out, err = gh(["pr", "view", str(pr), "--json", fields] + (["-R", s] if s else []), root, token, timeout)
     if rc:
@@ -334,26 +418,45 @@ def slug(root) -> str:
 
 
 def merge_argv(root, pr, pin, title) -> list:
+    """The squash merge over REST, pinned: GitHub refuses it (409) when the head is no longer `pin`. REST never arms
+    auto-merge, and spends none of the login's GraphQL hour (2026-10-19: `gh pr merge` failed twice on it)."""
+    return (["api", "-X", "PUT", f"repos/{slug(root)}/pulls/{int(pr)}/merge", "-f", "merge_method=squash",
+             "-f", f"sha={pin}"] + (["-f", f"commit_title={title} (#{pr})"] if title else []))
+
+
+def delete_branch(root, pr, token=None) -> str:
+    """Delete a merged PR's branch on GitHub, as `gh pr merge --delete-branch` did: only a branch of this repository
+    (a fork's is not ours). -> "" when deleted, else why not; never a failure of the merge."""
     s = slug(root)
-    return (["pr", "merge", str(pr), "--squash", "--delete-branch", "--match-head-commit", pin]
-            + (["-R", s] if s else []) + (["--subject", f"{title} (#{pr})"] if title else []))
+    p = api_json(root, f"repos/{s}/pulls/{int(pr)}", token)
+    head = (p.get("head") or {}) if isinstance(p, dict) else {}
+    ref, repo = head.get("ref") or "", ((head.get("repo") or {}).get("full_name") or "")
+    if not ref or repo.lower() != s.lower():
+        return "the branch was left: GitHub did not name it as this repository's"
+    # quoted: a head named x#y would otherwise send DELETE …/heads/x and delete another branch
+    rc, out, err = gh(["api", "-X", "DELETE", f"repos/{s}/git/refs/heads/{quote(ref, safe='/')}"], root, token, 60)
+    return "" if not rc else f"the branch was left: {last(err or out) or f'gh exit {rc}'}"
 
 
 def merge(root, pr, pin, title, token=None):
     if not pin:
         return False, "no head to pin the merge to"
+    if not slug(root) or not str(pr).isdigit():
+        return False, "no GitHub repo or PR number to merge"
     rc, out, err = gh(merge_argv(root, pr, pin, title), root, token, timeout=300)
-    text = (out + "\n" + err).strip()
-    if "already merged" in text:
-        return True, f"PR #{pr} was already merged"
-    if rc and ("--auto" in text or "auto-merge" in text):
-        return False, f"PR #{pr} is not mergeable yet — nothing merged, and no auto-merge was armed"
-    if rc:
-        # "is closed" is merged only when GitHub says MERGED: a PR closed unmerged is not in
+    try:   # rc first: on a refusal stdout holds GitHub's error JSON, never a merge
+        merged = not rc and json.loads(out).get("merged") is True
+    except (ValueError, AttributeError):
+        merged = False
+    if not merged:
+        text = (err or out).strip() or f"gh exit {rc}"
+        # a refusal ("not mergeable", 405) is merged only when GitHub says MERGED: a PR closed unmerged is not in,
+        # and an earlier merge, or one GitHub finished after gh gave up, is
         state = merge_state(root, pr, token)[0]
         if state == "MERGED":
-            return True, f"PR #{pr} merged (gh failed, but GitHub says it is in)"
+            return True, f"PR #{pr} merged (the merge call failed, but GitHub says it is in)"
         if not state:
-            return None, f"gh pr merge #{pr}: {last(text)} — and GitHub could not say whether it merged"
-        return False, f"gh pr merge #{pr}: {last(text)}"
-    return True, f"PR #{pr} merged (squash, remote branch deleted)"
+            return None, f"merge #{pr}: {last(text)} — and GitHub could not say whether it merged"
+        return False, f"merge #{pr}: {spent(root, err, token) or last(text)}"
+    left = delete_branch(root, pr, token)
+    return True, f"PR #{pr} merged (squash, " + (left or "remote branch deleted") + ")"

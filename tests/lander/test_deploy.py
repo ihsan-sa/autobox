@@ -25,7 +25,14 @@ from lander import deploy as D  # noqa: E402
 from lander import git as G  # noqa: E402
 from lander import scope as S  # noqa: E402
 from lander import tip as TP  # noqa: E402
+from lander import gh as GH  # noqa: E402
 from lander import types as T  # noqa: E402
+
+def gh_via_sh(argv, root, token=None, timeout=120, note=True, stdin=None):
+    """gh.gh through the case's fake C.sh, so `gh pr view` and `gh pr comment` (a root with no GitHub slug) are
+    answered and recorded there as before the lander's gh calls moved into gh.py."""
+    rc, out = C.sh(["gh", *argv], cwd=root, input=stdin, timeout=timeout)
+    return rc, out, ""
 
 OLD, NEW = "a" * 40, "c" * 40
 
@@ -43,6 +50,9 @@ class Box(Case):
         os.environ["CC_DEV"], os.environ["CC_UNITS_DIR"] = self.dev, self.units
         self.root = os.path.join(self.dev, "demo")
         os.makedirs(os.path.join(self.root, ".git"))
+        p = mock.patch.object(GH, "gh", gh_via_sh)
+        p.start()
+        self.addCleanup(p.stop)
         os.makedirs(self.units)
         inst = os.path.join(self.root, "install.sh")
         with open(inst, "w") as f:
@@ -581,7 +591,7 @@ class Tip(Box):
         box = self.fake()
         box.answers.update({"git " + k: git for k in ("rev-parse", "rev-list", "diff", "log", "fetch", "merge",
                                                       "merge-tree", "commit-tree", "push", "merge-base", "ls-remote")})
-        box.answers["gh pr comment"] = (0, "")
+        box.answers["gh api repos/o/demo/issues/7/comments"] = (0, json.dumps({"id": 1}))   # the PR comment, over REST (gh.comment)
         return box
 
     def result(self, status):
@@ -649,7 +659,7 @@ class Tip(Box):
         self.assertEqual(box.called("git push")[0]["cwd"], os.path.join(self.tmp, "borrowed.git"))
         self.assertEqual([c for c in box.calls if c["argv"][1:2] in (["worktree"], ["revert"])], [])
         self.assertTrue(os.path.exists(TP.want_path("demo")), "a revert kicks the next tip run")
-        self.assertIn("REVERTED", box.called("gh pr comment")[0]["argv"][-1])
+        self.assertIn("REVERTED", json.loads(box.called("gh api repos/o/demo/issues/7/comments")[0]["input"])["body"])   # over REST
 
     def test_a_flaky_breaker_is_not_reverted(self):
         commits = ["1" * 40, NEW]

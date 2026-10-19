@@ -20,6 +20,14 @@ def selfcheck():
             f += 1
             print(f"  ✗ {name}")
 
+    def pulled(state, sha="0" * 40):
+        """A fake gh's answer to `gh api …/pulls/<n>`, in REST's shape: REST says closed for a merge and merged_at tells
+        them apart, here a minute from now, so it postdates any nag a case made before writing it."""
+        return json.dumps({"number": 9, "state": "closed" if state == "MERGED" else state.lower(),
+                           "merged_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+                           if state == "MERGED" else None,
+                           "created_at": "2026-01-01T00:00:00Z", "head": {"ref": "x", "sha": sha}})
+
     def F(**kw):
         d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
@@ -789,14 +797,14 @@ def selfcheck():
         ok("end to end: an answered question does not leave `waiting` stuck on the board",
            cb("get", repo, "t1", "status").stdout.strip() == "blocked")
         os.makedirs(f"{th}/.cc/worktrees/{repo}/t2", exist_ok=True)
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         open(f"{th}/inj", "w").write(f'#!/bin/sh\necho "$@" >> {th}/inj.log\n')
         os.chmod(f"{th}/gh", 0o755)
         os.chmod(f"{th}/inj", 0o755)
         open(f"{th}/inj.log", "w").close()
         cb("add", repo, "t2", "finished, PR open, nobody landed it", "")
         cb("status", repo, "t2", "review")
-        cb("set", repo, "t2", "pr", "https://example.invalid/pr/9")
+        cb("set", repo, "t2", "pr", "https://github.com/o/r/pull/9")
         argvP = [sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify", "--grace", "0"]
         penv = dict(env, PATH=f"{th}:{os.environ['PATH']}", CC_RECONCILE_INJECT=f"{th}/inj")
         seenp = f"{th}/.cc/state/reconcile.seen.json"
@@ -823,7 +831,7 @@ def selfcheck():
         ok("end to end: past the window nobody picked it up, so #alerts gets one line", alerted() == a0 + 1)
         nag = [ln for ln in open(f"{th}/notify.log").read().splitlines() if ln.startswith("alerts")][-1]
         ok("end to end: …a plain sentence with the span said aloud and the PR link, and no slug for a name",
-           "has been waiting to land for 5 hours, and nobody has picked it up. https://example.invalid/pr/9" in nag
+           "has been waiting to land for 5 hours, and nobody has picked it up. https://github.com/o/r/pull/9" in nag
            and f"{repo}/t2" not in nag)
         ok("end to end: …and it names the project, because #alerts carries every project's lines",
            nag.startswith(f"alerts\t⏳ {repo}: "))
@@ -846,8 +854,8 @@ def selfcheck():
            offered() == 1)
         ok("end to end: …and keeps the keys: one failed poll restarts neither the owner's clock nor the offer",
            all(x in json.load(open(seenp)) for x in (f"pending {repo}/t2", f"alerted {repo}/t2",
-                                                       f"offered {repo}/t2 https://example.invalid/pr/9")))
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+                                                       f"offered {repo}/t2 https://github.com/o/r/pull/9")))
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         os.chmod(f"{th}/gh", 0o755)
         json.dump({}, open(seenp, "w"))
         cb("status", repo, "t2", "waiting")
@@ -939,9 +947,9 @@ def selfcheck():
             except OSError:
                 return []
 
-        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://example.invalid/pr/9"])
+        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://github.com/o/r/pull/9"])
         json.dump({"repo": repo, "pr": 9, "first": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nag_at - 600))}, open(rootp, "w"))
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('MERGED')}'\n")
         rF = subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
         fl = failures()
         ok("a nag the landing's own record disproves — cc-land had the PR before the watchdog said 'land it' — is "
@@ -949,7 +957,7 @@ def selfcheck():
            "time, naming the PR",
            len(fl) == 1 and fl[0]["links"].get("pr") == "9" and fl[0]["writer"] == "cc-reconcile"
            and abs(epoch(fl[0]["ts"]) - nag_at) < 2 and "since" in fl[0]["observed"]
-           and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp)))
+           and f"offered {repo}/t2 https://github.com/o/r/pull/9" not in json.load(open(seenp)))
         ok("…and the pass itself decided what it always decides: the row reconciled to merged, the exit its own "
            "(1: the fixture's other rows still need a person), no traceback",
            rF.returncode == 1 and "Traceback" not in rF.stderr and cb("get", repo, "t2", "status").stdout.strip() == "merged")
@@ -957,27 +965,27 @@ def selfcheck():
         # nag that worked or a person's doing, and nothing is written. Back to review, nagged again, then merged
         # with nothing predating the nag.
         os.remove(rootp)
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         cb("status", repo, "t2", "review")
         json.dump({}, open(seenp, "w"))
         subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
         n0 = len(failures())
-        nagged = f"offered {repo}/t2 https://example.invalid/pr/9" in json.load(open(seenp))
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        nagged = f"offered {repo}/t2 https://github.com/o/r/pull/9" in json.load(open(seenp))
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('MERGED')}'\n")
         subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
         ok("a nag that cleared with nothing predating it — the PR merged after the session was told — records "
            "nothing: the memo dropped and the ledger holds what it held",
-           nagged and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp)) and len(failures()) == n0)
+           nagged and f"offered {repo}/t2 https://github.com/o/r/pull/9" not in json.load(open(seenp)) and len(failures()) == n0)
         # …AND A LEDGER THAT CANNOT BE WRITTEN CHANGES NOTHING ABOUT THE PASS. The disproving record again, with
         # CC_FAILURES pointing at a FILE: cc-failures cannot make its directory and dies; the pass still drops the
         # memo, still reconciles the row, still exits 0, and says why in reconcile.log.
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         cb("status", repo, "t2", "review")
         json.dump({}, open(seenp, "w"))
         subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
-        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://example.invalid/pr/9"])
+        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://github.com/o/r/pull/9"])
         json.dump({"repo": repo, "pr": 9, "first": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nag_at - 600))}, open(rootp, "w"))
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('MERGED')}'\n")
         open(f"{th}/notadir", "w").close()
         n0 = len(failures())
         rB = subprocess.run(argvP, env=dict(fenv, CC_FAILURES=f"{th}/notadir"), capture_output=True, text=True, timeout=120)
@@ -985,25 +993,25 @@ def selfcheck():
         ok("a ledger write that fails leaves the pass exactly as it was — the same exit, the memo dropped, the row "
            "merged — and reconcile.log says the writer failed",
            rB.returncode == rF.returncode and "Traceback" not in rB.stderr and cb("get", repo, "t2", "status").stdout.strip() == "merged"
-           and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp))
+           and f"offered {repo}/t2 https://github.com/o/r/pull/9" not in json.load(open(seenp))
            and "writer failed" in rlog and len(failures()) == n0)
         os.remove(rootp)
         # THE ORPHAN NAG: a worktree the board never heard of, reported while GitHub could not be asked (no
         # evidence, so it is reported as it always was); the next pass finds the directory gone and GitHub answering
         # that a PR from that branch had been OPEN since an hour before the nag → one line, the PR named. A gh that
-        # fails `pr list` at nag time and answers it at drop time, the way a blip does.
+        # fails the branch's pull list at nag time and answers it at drop time, the way a blip does.
         os.makedirs(f"{th}/dev/{repo}", exist_ok=True)   # branch_prs asks from the repo's own checkout, which a real box has
         owt = f"{th}/.cc/worktrees/{repo}/orph-x"
         os.makedirs(owt, exist_ok=True)
         old_ = now() - 7200
         os.utime(owt, (old_, old_))
-        open(f"{th}/gh", "w").write("#!/bin/sh\ncase \"$*\" in *\"pr list\"*) exit 1;; esac\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\ncase \"$*\" in *\"pulls?\"*) exit 1;; esac\necho '{pulled('OPEN')}'\n")
         json.dump({}, open(seenp, "w"))
         subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
         okey = f"{repo}/orph-x: {ORPHAN_WHY}"
         onag = float(json.load(open(seenp)).get(okey) or 0)
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((onag or now()) - 3600))
-        open(f"{th}/gh", "w").write("#!/bin/sh\ncase \"$*\" in *\"pr list\"*) echo '[{\"number\":11,\"state\":\"OPEN\",\"mergedAt\":null,\"createdAt\":\"" + created + "\"}]';; *) echo OPEN;; esac\n")
+        open(f"{th}/gh", "w").write("#!/bin/sh\ncase \"$*\" in *\"pulls?\"*) echo '[{\"number\":11,\"state\":\"open\",\"merged_at\":null,\"created_at\":\"" + created + "\"}]';; *) echo '" + pulled("OPEN") + "';; esac\n")
         shutil.rmtree(owt)
         subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
         fo = [r for r in failures() if r["links"].get("pr") == "11"]
@@ -1012,7 +1020,7 @@ def selfcheck():
            onag > 0 and len(fo) == 1 and abs(epoch(fo[0]["ts"]) - onag) < 2 and "already open" in fo[0]["observed"]
            and okey not in json.load(open(seenp)))
         # the fixture as the cases below expect it: t2 in review with an OPEN PR, a clean memo ledger
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         cb("status", repo, "t2", "review")
         json.dump({}, open(seenp, "w"))
 
@@ -1058,7 +1066,7 @@ def selfcheck():
         ok("end to end: …and --apply leaves the row itself exactly as it was — its word, its PR and its reason "
            "all stand, because a held row is one a person still has to be able to see and release",
            cb("get", repo, "t2", "status").stdout.strip() == "review"
-           and cb("get", repo, "t2", "pr").stdout.strip() == "https://example.invalid/pr/9"
+           and cb("get", repo, "t2", "pr").stdout.strip() == "https://github.com/o/r/pull/9"
            and cb("get", repo, "t2", "held").stdout.strip().startswith("behind #309"))
         ok("end to end: …and `show` still lists it with that reason: this view is the only place a held row is "
            "offered to a person at all", "held (" in cb("show", repo).stdout
@@ -1073,21 +1081,23 @@ def selfcheck():
         # merged 16 s before "review and land it" went out on the older read, and a seat woke on it (~110k cache
         # read) to find nothing to do (raised 2026-09-19). Own fixture: four fresh rows, a gh that answers per PR
         # and, for two of them, differently the second time it is asked — the run's first read and its send-time
-        # read are the two calls.
+        # read are the two calls. refused() GETs the same pull for its head, so its reads (one per comments read) are
+        # counted apart.
         open(f"{th}/gh", "w").write(f'''#!/bin/sh
         case "$*" in
-          *pr/77*"--json state"*) n=$(cat {th}/gh77.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh77.n
-                                  [ "$n" -ge 1 ] && echo MERGED || echo OPEN ;;
-          *pr/79*"--json state"*) n=$(cat {th}/gh79.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh79.n
-                                  [ "$n" -ge 1 ] && echo MERGED || echo CLOSED ;;
-          *pr/80*"--json state"*) echo CLOSED ;;
-          *) echo OPEN ;;
+          *issues/*/comments*) echo "$*" >> {th}/ghc.log ;;
+          *pulls/77) n=$(cat {th}/gh77.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh77.n
+                     [ "$n" -ge 1 ] && echo '{pulled("MERGED")}' || echo '{pulled("OPEN")}' ;;
+          *pulls/79) n=$(cat {th}/gh79.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh79.n
+                     [ "$n" -ge 1 ] && echo '{pulled("MERGED")}' || echo '{pulled("CLOSED")}' ;;
+          *pulls/80) echo '{pulled("CLOSED")}' ;;
+          *) echo '{pulled("OPEN")}' ;;
         esac
         ''')
         for tr, n in (("t7", 77), ("t8", 78), ("t9", 79), ("t10", 80)):
             cb("add", repo, tr, f"pr {n}", "")
             cb("status", repo, tr, "review")
-            cb("set", repo, tr, "pr", f"https://example.invalid/pr/{n}")
+            cb("set", repo, tr, "pr", f"https://github.com/o/r/pull/{n}")
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         inj6 = open(f"{th}/inj.log").read()
         led6 = json.load(open(seenp))
@@ -1097,16 +1107,20 @@ def selfcheck():
         ok("end to end: …while the row beside it whose PR still reads OPEN at send time is offered exactly as "
            "before — the re-read drops a merged PR, not the nag",
            sum(f"{repo}/t8: finished, PR open, not landed" in ln for ln in inj6.splitlines()) == 1
-           and f"offered {repo}/t8 https://example.invalid/pr/78" in led6)
+           and f"offered {repo}/t8 https://github.com/o/r/pull/78" in led6)
         ok("end to end: …and a NEEDS-YOU finding about a PR — 'closed without merging' — is re-read the same way: "
            "merged by send time it is not sent, and the row beside it whose PR is still closed is",
            "t9" not in inj6 and f"board watchdog: {repo}/t10 — its PR was closed without merging" in inj6)
+        def heads_read(n):
+            return sum(f"issues/{n}/comments" in c for c in open(f"{th}/ghc.log").read().splitlines()) \
+                if os.path.exists(f"{th}/ghc.log") else 0
+
         ok("end to end: …and the re-read was made — once per PR, only for a line about to go out: the two PRs "
            "that changed were each asked twice, and the two that did not, no more than the run's own read",
-           open(f"{th}/gh77.n").read().strip() == "2" and open(f"{th}/gh79.n").read().strip() == "2")
+           all(int(open(f"{th}/gh{n}.n").read()) - heads_read(n) == 2 for n in (77, 79)))
         for tr in ("t7", "t8", "t9", "t10"):
             cb("rm", repo, tr)
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         json.dump({}, open(seenp, "w"))
 
         # …AND IT DROPS ONLY WHAT THE MERGE ANSWERS. A `merged` row whose branch really holds commits origin lacks
@@ -1134,17 +1148,17 @@ def selfcheck():
         open(f"{wtU}/.cc/push.err", "w").close()
         open(f"{th}/gh", "w").write(f'''#!/bin/sh
         case "$*" in
-          *pr/82*"--json state"*) n=$(cat {th}/gh82.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh82.n
-                                  [ "$n" -ge 1 ] && echo MERGED || echo OPEN ;;
-          *) echo MERGED ;;
+          *pulls/82) n=$(cat {th}/gh82.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh82.n
+                     [ "$n" -ge 1 ] && echo '{pulled("MERGED")}' || echo '{pulled("OPEN")}' ;;
+          *) echo '{pulled("MERGED")}' ;;
         esac
         ''')
         cb("add", repo, "t11", "merged, and its branch never reached origin", "")
         cb("status", repo, "t11", "merged")
-        cb("set", repo, "t11", "pr", "https://example.invalid/pr/81")
+        cb("set", repo, "t11", "pr", "https://github.com/o/r/pull/81")
         cb("add", repo, "t12", "pr 82", "")
         cb("status", repo, "t12", "review")
-        cb("set", repo, "t12", "pr", "https://example.invalid/pr/82")
+        cb("set", repo, "t12", "pr", "https://github.com/o/r/pull/82")
         n7 = len(open(f"{th}/inj.log").read().splitlines())
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         inj7 = "\n".join(open(f"{th}/inj.log").read().splitlines()[n7:])
@@ -1161,7 +1175,7 @@ def selfcheck():
             cb("rm", repo, tr)
         shutil.rmtree(wtU, ignore_errors=True); shutil.rmtree(o11, ignore_errors=True)
         gu("worktree", "prune", d=dv); gu("remote", "remove", "origin", d=dv)
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         json.dump({}, open(seenp, "w"))
 
         # A ROW WAITING ON A PERSON IS NOT UNATTENDED. Its seat stood down and said so (STATUS: BLOCKED), and the
@@ -1191,7 +1205,7 @@ def selfcheck():
            offered() == o5 and alerted() == a5 and not any("t2" in k for k in json.load(open(seenp))))
         os.remove(f"{th}/gh")
         blocked_run()
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         os.chmod(f"{th}/gh", 0o755)
         blocked_run()
         ok("end to end: …and a poll flap is not a way round it: the pass that could not read the PR keeps no memo, "
@@ -1206,13 +1220,13 @@ def selfcheck():
         json.dump({}, open(seenp, "w"))
 
         vj, HD = f"{th}/verdict.json", "09dd584c561e9e18d3025a8db244809f9d5b776a"
-        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *headRefOid*) cat {vj} ;;\n  *) echo OPEN ;;\nesac\n')
+        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *comments*) cat {vj} ;;\n  *) echo \'{pulled("OPEN", HD)}\' ;;\nesac\n')
         os.chmod(f"{th}/gh", 0o755)
         mark = f"<!-- cc-land-review v2 change=369953f4b8fd base=a178c4925378 head={HD[:12]} verdict=%s by=w -->"
 
         def verdicts(*bodies):
             """Offers made in one run with exactly these comments on the PR, off a clean ledger."""
-            json.dump({"headRefOid": HD, "comments": [{"body": b} for b in bodies]}, open(vj, "w"))
+            open(vj, "w").write("".join(json.dumps({"body": b}) + "\n" for b in bodies))   # gh's -q: one a line
             json.dump({}, open(seenp, "w"))
             o_ = offered()
             subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
@@ -1237,7 +1251,7 @@ def selfcheck():
         ok("end to end: …and a finding that QUOTES a marker is text about the change, not the answer to it: the "
            "read is anchored at the start of the comment, as cc-land's own is",
            verdicts("1. cc-land:9 — a comment that starts " + mark % "DO-NOT-LAND") == 1)
-        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         os.chmod(f"{th}/gh", 0o755)
         json.dump({}, open(seenp, "w"))
 
@@ -1410,7 +1424,7 @@ def selfcheck():
         os.makedirs(f"{th}/dev/{repo}", exist_ok=True)      # branch_prs asks from the repo's own checkout or not at all
         subprocess.run(["git", "-C", f"{th}/dev/{repo}", "worktree", "add", "-q", "-b", "track/deliver-x", deliv],
                        capture_output=True, timeout=30)     # the repo's own checkout is a git repo since t11's case
-        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *"pr list"*) cat {prj} ;;\n  *) echo OPEN ;;\nesac\n')
+        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *"pulls?"*) cat {prj} ;;\n  *) echo \'{pulled("OPEN")}\' ;;\nesac\n')
         os.chmod(f"{th}/gh", 0o755)
 
         def orphaned(*flags):
@@ -1423,28 +1437,28 @@ def selfcheck():
            orphaned("[]", "--grace", "0"))
         ok("…but one whose branch has an OPEN PR is a delivery in flight — the builder's worktree is named for its "
            "branch, so no row will ever carry that name, and the offer is a wake-up that finds nothing to do",
-           not orphaned('[{"number":9,"state":"OPEN"}]', "--grace", "0"))
+           not orphaned('[{"number":9,"state":"open"}]', "--grace", "0"))
         ok("…and one whose PR MERGED a minute ago is that same delivery landing: the merge, the worktree's removal "
            "and this pass race each other, and a person was paged about a worktree whose PR had merged 106 s "
            "before the run (2026-09-11)",
-           not orphaned('[{"number":9,"state":"MERGED","mergedAt":"%s"}]'
+           not orphaned('[{"number":9,"state":"closed","merged_at":"%s"}]'
                         % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - 60)), "--grace", "0"))
         ok("…while one merged longer ago than a landing's own gap is a leftover nothing is coming back for, and "
            "is reported as a worktree with no board entry always was",
-           orphaned('[{"number":9,"state":"MERGED","mergedAt":"%s"}]'
+           orphaned('[{"number":9,"state":"closed","merged_at":"%s"}]'
                     % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - BETWEEN_ROUNDS - 60)),
                     "--grace", "0"))
         ok("…while a PR that is closed and nobody is landing leaves the worktree a leftover again: reported",
-           orphaned('[{"number":9,"state":"CLOSED"}]', "--grace", "0"))
+           orphaned('[{"number":9,"state":"closed"}]', "--grace", "0"))
         os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
         json.dump({"repo": repo, "pr": 9}, open(f"{th}/.cc/state/land/{repo}-9.json", "w"))
         ok("…and the same PR with a job in the landing queue is mid-delivery, whatever state GitHub says it is in",
-           not orphaned('[{"number":9,"state":"CLOSED"}]', "--grace", "0"))
+           not orphaned('[{"number":9,"state":"closed"}]', "--grace", "0"))
         os.remove(f"{th}/.cc/state/land/{repo}-9.json")
         ok("a worktree made inside the grace window is not reported before its row or its PR can exist",
            not orphaned("[]"))
         ok("…and with no network the branch cannot be looked up, so nothing is forgiven on suspicion",
-           orphaned('[{"number":9,"state":"OPEN"}]', "--grace", "0", "--no-net"))
+           orphaned('[{"number":9,"state":"open"}]', "--grace", "0", "--no-net"))
         cb("add", repo, "namedwt", "a row whose worktree is not named after it", "")
         cb("set", repo, "namedwt", "worktree", deliv)
         ok("a row that names the directory outright is the board having heard of it, under any row name and with "
@@ -1725,10 +1739,10 @@ def selfcheck():
         g("remote", "add", "origin", f"{tl}/origin.git"); g("push", "-q", "origin", "main")
         g("checkout", "-q", "-b", "track/unpushed"); put("u.txt", "u\n", "u1")   # merged into a main nobody pushed
         g("checkout", "-q", "main"); g("merge", "-q", "--no-ff", "-m", "local only", "track/unpushed")
-        heads = ",".join(f'{{"number": {n}, "headRefOid": "{g("rev-parse", b)}"}}' for n, b in ((5, "track/carrier"),
+        heads = ",".join(f'{{"number": {n}, "merged_at": "2026-09-20T00:00:00Z", "head": {{"sha": "{g("rev-parse", b)}"}}}}' for n, b in ((5, "track/carrier"),
                                                                     (8, "track/reverter"), (10, "track/adjcarrier"),
                                                                     (11, "track/combocarrier")))
-        scratch(tl, dict(NOOP, gh=f'case "$*" in *"--state merged"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
+        scratch(tl, dict(NOOP, gh=f'case "$*" in *"state=closed"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
         cbl = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
         cbl("init", "rl", R, "main")
         rows = (("stacked", "blocked"), ("half", "blocked"), ("fresh", "review"), ("plain", "review"), ("busy", "blocked"),
@@ -1907,9 +1921,9 @@ def selfcheck():
         put("a.txt", nine("LL", "9m"), "m2"); put("prices.py", "PP\n", "m3"); put("bt.py", "a\nB\nC\n", "m4")   # on again
         sh("git", "init", "-q", "--bare", f"{tm}/origin.git", timeout=30)
         g("remote", "add", "origin", f"{tm}/origin.git"); g("push", "-q", "origin", "main")
-        heads = ",".join(f'{{"number": {n}, "headRefOid": "{g("rev-parse", b)}"}}' for n, b in ((5, "track/kill-file-fixes"),
+        heads = ",".join(f'{{"number": {n}, "merged_at": "2026-09-20T00:00:00Z", "head": {{"sha": "{g("rev-parse", b)}"}}}}' for n, b in ((5, "track/kill-file-fixes"),
                                                                                             (7, "track/prices-fixes")))
-        scratch(tm, dict(NOOP, gh=f'case "$*" in *"--state merged"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
+        scratch(tm, dict(NOOP, gh=f'case "$*" in *"state=closed"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
         cbl = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
         cbl("init", "bs", R, "main")
         six = ("backtester", "backtester-fixes", "live-path", "live-path-fixes", "live-kill-fixes", "prices")
@@ -1945,8 +1959,8 @@ def selfcheck():
        and hold_prs("starts when #11 lands: same file core/bin/cc-slack; then a builder", "me", {"me": {}})[1] == "")
     th_ = tempfile.mkdtemp(prefix="cc-reconcile-holds-")
     try:
-        scratch(th_, dict(NOOP, gh=f'echo "$3" >> {th_}/gh.log; case "$3" in 11) echo MERGED;; 12) echo OPEN;; '
-                                    f'13) echo CLOSED;; esac'))
+        scratch(th_, dict(NOOP, gh=f'n=${{2##*/}}; echo "$n" >> {th_}/gh.log; case "$n" in 11) echo \'{pulled("MERGED")}\';; '
+                                    f'12) echo \'{pulled("OPEN")}\';; 13) echo \'{pulled("CLOSED")}\';; esac'))
         cbh = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
         cbh("init", "rh", f"{th_}/dev/rh", "main")
         for t, hold in (("m", "starts when #11 lands: same file; then a builder"), ("o", "waits for PR #12"),
@@ -1987,10 +2001,15 @@ def selfcheck():
     # PR STATES IN ONE BATCH: a board sorted late still has its PRs read when earlier boards spent the PRMAX budget
     tq = tempfile.mkdtemp(prefix="cc-reconcile-prbatch-")
     try:
-        gql = ('{"data":{"repository":{"p5":{"state":"MERGED"},"p6":{"state":"OPEN"},"p7":null}},'
-               '"errors":[{"message":"Could not resolve to a PullRequest with the number of 7."}]}')
-        scratch(tq, dict(NOOP, gh=f'echo "$*" >> {tq}/gh.log; [ "$1" = api ] && [ -f {tq}/gql ] && cat {tq}/gql && exit 1; '
-                                  f'[ "$2" = view ] && echo "$3" >> {tq}/view.log; exit 1'))
+        # one REST list per GitHub repo: o/zz's (5 merged, 8 open, 7 not in the page) and the board repo's (6 open)
+        lists = {"zz": [{"number": 5, "state": "closed", "merged_at": "2026-09-20T00:00:00Z"},
+                        {"number": 8, "state": "open", "merged_at": None}],
+                 "own": [{"number": 6, "state": "open", "merged_at": None}]}
+        for k, v in lists.items():
+            json.dump(v, open(f"{tq}/{k}.json", "w"))
+        scratch(tq, dict(NOOP, gh=f'echo "$*" >> {tq}/gh.log; [ -f {tq}/lists ] && case "$2" in '
+                                  f'*/o/zz/pulls\\?*) cat {tq}/zz.json; exit 0;; *pulls\\?*) cat {tq}/own.json; exit 0;; esac; '
+                                  f'case "$2" in */pulls/*) echo "$2" >> {tq}/view.log;; esac; exit 1'))
         os.makedirs(f"{tq}/dev/zz")
         json.dump({"repo": "zz", "tracks": {
             "a": {"status": "review", "pr": "https://github.com/o/zz/pull/5", "updated": old},
@@ -2000,22 +2019,37 @@ def selfcheck():
                   open(f"{tq}/.cc/boards/zz.json", "w"))
         globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}),
                          PRMAX=0)
-        open(f"{tq}/gql", "w").write(gql)
+        open(f"{tq}/lists", "w").close()
         got = {tr: fa["pr_state"] for _, tr, _, fa in facts(["zz"])}
         calls = open(f"{tq}/gh.log").read().splitlines()
-        ok("PR BATCH: with the one-at-a-time budget spent, one GraphQL query still reads the board's PRs — a URL "
+        ok("PR BATCH: with the one-at-a-time budget spent, one REST list per repo still reads the board's PRs — a URL "
            "and a bare number alike — and a PR it could not answer stays unknown, never guessed",
            got == {"a": "MERGED", "b": "OPEN", "c": "?", "m": None}
-           and sum(c.startswith("api graphql") for c in calls) == 2 and not os.path.exists(f"{tq}/view.log"))
-        ok("…and a merged row's PR is not asked at all",
-           not any("p8:" in c for c in calls))
+           and sum("pulls?state=all" in c for c in calls) == 2 and not os.path.exists(f"{tq}/view.log"))
+        ok("…and a merged row's PR is not asked at all, even when the list has it",
+           not any("pulls/8" in c for c in calls))
         ok("…and decide() moves the merged one to merged and keeps the open one in review, with no 'worktree gone'",
            decide(F(status="review", pr="u", pr_state=got["a"], wt_exists=False, worked=True))[0][:2] == ("fix", "merged")
            and not any("worktree" in w for _, _, w in decide(F(status="review", pr="u", pr_state=got["b"],
                                                                  wt_exists=False, worked=True))))
-        os.remove(f"{tq}/gql"); os.remove(f"{tq}/gh.log"); globals()["PRMAX"] = 1
+        real_rest, pages = rest, []
+        def rest_pages(repo, path, timeout=20):   # page 1 full of newer PRs; the board's old PR 5 is on page 2
+            pages.append(path)
+            if path.endswith("&page=1"):
+                return [{"number": 1000 + i, "state": "open", "merged_at": None} for i in range(100)]
+            return [{"number": 5, "state": "closed", "merged_at": "2026-09-20T00:00:00Z"}] if path.endswith("&page=2") else []
+        try:
+            globals()["rest"] = rest_pages
+            paged = board_pr_states("zz", ["https://github.com/o/zz/pull/5", "https://github.com/o/zz/pull/1003"])
+        finally:
+            globals()["rest"] = real_rest
+        ok("PR BATCH PAGES: a PR older than the 100 most recently updated is read off the next page, not left to the "
+           "capped one-at-a-time reads, and the paging stops once every PR the board names is seen",
+           paged == {"https://github.com/o/zz/pull/5": "MERGED", "https://github.com/o/zz/pull/1003": "OPEN"}
+           and len(pages) == 2)
+        os.remove(f"{tq}/lists"); os.remove(f"{tq}/gh.log"); globals()["PRMAX"] = 1
         got = {tr: fa["pr_state"] for _, tr, _, fa in facts(["zz"])}
-        ok("…and when the batch fails (GraphQL rate-limited), the budget reads one PR alone and the rest are unknown",
+        ok("…and when the lists fail (GitHub refusing), the budget reads one PR alone and the rest are unknown",
            sorted(got.values(), key=str) == ["?", "?", "?", None]
            and len(open(f"{tq}/view.log").read().split()) == 1)
     finally:
@@ -2339,7 +2373,7 @@ def selfcheck():
             with open(f"{tn}/.cc/state/land/queue.log", "a") as f:
                 f.writelines(f"{iso(t)}\t{ev.replace('PR', f'fr#{n}')}\n" for t, ev in log)
             del got[:]
-            false_nags({f"offered fr/t{n} https://example.invalid/pr/{n}": nag}, {}, net=False)
+            false_nags({f"offered fr/t{n} https://github.com/o/r/pull/{n}": nag}, {}, net=False)
             return [o for o in got if f"PR #{n} " in o]
         globals().update(HOME=tn, record_failure=lambda scope, kind, observed, ts, **k: got.append(observed))
         live = nagged(1, first=nag - 600, touched=nag - 300)
@@ -2432,8 +2466,8 @@ def selfcheck():
         # `later` merged at its first tip, then the row's worker pushed again: origin's tip is not the merged head
         git("-C", f"{tb}/dev/br", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "after")
         git("-C", f"{tb}/dev/br", "push", "-q", "origin", "HEAD:refs/heads/track/later")
-        prs = [{"number": n, "state": "MERGED", "headRefName": f"track/{t}", "headRefOid": heads[t],
-                "mergedAt": "2026-09-20T00:00:00Z"} for n, t in enumerate(("once", "later", "seat"), 1)]
+        prs = [{"number": n, "state": "closed", "head": {"ref": f"track/{t}", "sha": heads[t]},
+                "merged_at": "2026-09-20T00:00:00Z"} for n, t in enumerate(("once", "later", "seat"), 1)]
         scratch(tb, dict(NOOP, gh=f"cat {tb}/prs.json"))
         json.dump(prs, open(f"{tb}/prs.json", "w"))
         young = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2486,8 +2520,8 @@ def selfcheck():
                 os.utime(os.path.join(root, x), (0, 0), follow_symlinks=False)
         scratch(tm2, dict(NOOP, gh=f"cat {tm2}/prs.json", cc=f'echo "$*" >> {tm2}/cc.log',
                           **{"cc-msg": f'echo "$*" >> {tm2}/msg.log'}))
-        json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/once", "headRefOid": tip,
-                    "mergedAt": "2026-09-20T00:00:00Z"}], open(f"{tm2}/prs.json", "w"))
+        json.dump([{"number": 1, "state": "closed", "head": {"ref": "track/once", "sha": tip},
+                    "merged_at": "2026-09-20T00:00:00Z"}], open(f"{tm2}/prs.json", "w"))
         young = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         json.dump({"repo": "mb", "tracks": {"once": {"status": "merged", "updated": young},
                                             "gone": {"status": "merged", "updated": old}}},
