@@ -640,6 +640,26 @@ class DeadWeight(unittest.TestCase):
         self.assertEqual(M.run_files("python3 -m \\\n unittest tests.a"), ["tests/a.py"])
         self.assertEqual(M.run_files("bin/x\\\n selfcheck"), ["bin/x"])
 
+    def test_an_attached_m_names_its_modules(self):
+        """perms' read of #1532: `-mX` is `-m X`, so the modules after it are named."""
+        self.assertEqual(M.run_files("python3 -munittest tests.a tests.b"), ["tests/a.py", "tests/b.py"])
+        self.assertEqual(M.run_files("python3 -mtests.a"), ["tests/a.py"])
+
+    def test_an_escaped_backtick_neither_hides_nor_invents_a_tool(self):
+        """perms' read of #1532: a backslash before a backtick is dropped, so `` \\`bin/x\\` `` names bin/x and not
+        `bin/x\\`, and `` core/bin/\\`uname\\` `` names nothing."""
+        self.assertEqual(M.run_files("echo \\`bin/x selfcheck\\`"), ["bin/x"])
+        self.assertEqual(M.run_files("echo \\`bin/x\\`"), ["bin/x"])
+        self.assertEqual(M.run_files("core/bin/\\`uname\\` selfcheck"), [])
+
+    def test_a_quoted_separator_keeps_the_modules_after_it(self):
+        """the Opus read of #1532: a `;`, `|` or `&` inside quotes does not end the modules after `-m`."""
+        self.assertEqual(M.run_files('python3 -m unittest -k "a;b" tests.a'), ["tests/a.py"])
+        self.assertEqual(M.run_files("python3 -m unittest -k 'a|b' tests.a tests.b"), ["tests/a.py", "tests/b.py"])
+        self.assertEqual(M.run_files('python3 -m unittest -k "a&b" tests.a; echo x.y'), ["tests/a.py"])
+        self.assertEqual(M.run_files('python3 -m unittest -k "a\\";b" tests.a'), ["tests/a.py"])
+        self.assertEqual(M.run_files('echo "x;bin/y"'), ["bin/y"])
+
     def test_an_added_check_running_only_redirections_is_not_refused_for_its_tool(self):
         quiet = self.GHOST.replace("bin/cc-ghost selfcheck", "cc-ghost selfcheck </dev/null >/dev/null")
         base, head = AddOnly.two(None, self.BASE + quiet, self.BASE)

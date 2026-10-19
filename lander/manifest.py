@@ -23,8 +23,8 @@ an entry is gone when it names a file in the base tree and none in the head's (a
 itself or a directory above files), and no base file it names has its blob at any path in the head (a move or a
 rename keeps it). Given the two trees, a head may then remove a check whose run line names a file (run_files) and
 whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone. A run line names a file by
-a relative path or by a dotted module after `-m` (tests.test_x is tests/test_x.py); a file git's -M sees renamed,
-edited or not, is not gone. A check whose run line names files and none of them is in either tree never ran
+a relative path or by a dotted module after `-m` or `-mX` (tests.test_x is tests/test_x.py; run_files); a file
+git's -M sees renamed, edited or not, is not gone. A check whose run line names files and none of them is in either tree never ran
 here, so a head may remove it too (never_ran; 2026-10-13 #1046 and #1154 left checks on main for tools only unmerged
 PRs had, red on every run). A changed run line is
 always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
@@ -182,21 +182,46 @@ MODULE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 def run_files(run: str) -> list:
     """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
     tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after
-    `-m` (`python3 -m unittest tests.test_x`, up to the next `&`, `;` or `|`) names its file, tests/test_x.py. A
-    redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a word ends at a
-    redirection operator, `;`, `&` or `|` (`bin/x>/dev/null` and `bin/x&>/dev/null` name bin/x, `>out/log`
-    nothing), and a word built on a backtick (`` core/bin/`uname` ``) names nothing. A backtick, `(`, `)` or `!` is
-    a space (`` `bin/x` ``, `(bin/x)` and `!bin/x` name bin/x), so it ends a word but not the modules after `-m`
-    (`-m unittest $(echo -v) tests.a` names tests/a.py). A backslash line continuation joins its lines first, so `-m
-    unittest tests.a\\<newline>tests.b` names both."""
+    `-m` or an attached `-mX` (`python3 -m unittest tests.test_x`, `python3 -munittest tests.test_x`, up to the
+    next `&`, `;` or `|` outside quotes) names its file, tests/test_x.py: a quoted one (`-k "a;b"`) does not end
+    the modules. A redirection or a variable (`2>/dev/null`, `</dev/null`, `core/bin/$t`) names no file, and a word
+    ends at a redirection operator, `;`, `&` or `|`, quoted or not (`bin/x>/dev/null` and `bin/x&>/dev/null` name
+    bin/x, `>out/log` nothing), and a word built on a backtick (`` core/bin/`uname` ``) names nothing. A backtick,
+    `(`, `)`, `!` or a quote is a space (`` `bin/x` ``, `(bin/x)` and `!bin/x` name bin/x), so it ends a word but
+    not the modules after `-m` (`-m unittest $(echo -v) tests.a` names tests/a.py). A backslash before a backtick
+    is dropped (`` \\`bin/x\\` `` names bin/x, `` core/bin/\\`uname\\` `` nothing), and a backslash line
+    continuation joins its lines first, so `-m unittest tests.a\\<newline>tests.b` names both."""
     out = []
-    run = re.sub(r"[`()!'\"]", " ", re.sub(r"\S*/`", " ", run.replace("\\\n", " ")))
-    for seg in re.split(r"[;&|]", run):
-        words = [re.split(r"[<>]", w)[0] for w in seg.split()]
+    run = re.sub(r"[^\s'\"]*/`", " ", run.replace("\\\n", " ").replace("\\`", "`"))
+    for seg in _segments(run):
+        words = [re.split(r"[<>]", p)[0]
+                 for w in re.sub(r"[`()!'\"]", " ", seg).split() for p in re.split(r"[;&|]", w)]
         out += [w.rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "~")) and "$" not in w]
-        if "-m" in words:
-            out += [x.replace(".", "/") + ".py" for x in words[words.index("-m") + 1:] if MODULE_RE.fullmatch(x)]
+        m = next((i for i, w in enumerate(words) if w == "-m" or re.fullmatch(r"-m[A-Za-z_][\w.]*", w)), None)
+        if m is not None:
+            mods = words[m + 1:] if words[m] == "-m" else [words[m][2:]] + words[m + 1:]
+            out += [x.replace(".", "/") + ".py" for x in mods if MODULE_RE.fullmatch(x)]
     return out
+
+
+def _segments(run: str) -> list:
+    """run cut at every `;`, `&` and `|` outside quotes and not after a backslash: the commands an `-m` reads to
+    the end of."""
+    segs, cur, q, i = [], "", "", 0
+    while i < len(run):
+        c = run[i]
+        if c == "\\" and q != "'":
+            cur, i = cur + run[i:i + 2], i + 2
+            continue
+        if q:
+            q = "" if c == q else q
+        elif c in "'\"":
+            q = c
+        elif c in ";&|":
+            segs, cur, i = segs + [cur], "", i + 1
+            continue
+        cur, i = cur + c, i + 1
+    return segs + [cur]
 
 
 def renamed(out: str) -> set:
