@@ -262,15 +262,18 @@ def selfcheck():
         old = home("state", "improve", "snapshots", "2000-01-01")
         os.makedirs(old)
         os.utime(old, (time.time() - (KEEP_DAYS + 1) * 86400,) * 2)
+        # the run names its day between these two reads; a run straddling the noon boundary may name either
+        days = {default_name(datetime.now(timezone.utc).replace(microsecond=0))}
         p1 = subprocess.run([sys.executable, __file__], capture_output=True, text=True, env={**os.environ, "HOME": h}, timeout=60)
-        today = default_name(datetime.now(timezone.utc).replace(microsecond=0))
+        days.add(default_name(datetime.now(timezone.utc).replace(microsecond=0)))
         root = home("state", "improve", "snapshots")
+        today = os.readlink(os.path.join(root, "latest")) if os.path.islink(os.path.join(root, "latest")) else None
         at = lambda t: default_name(datetime.fromisoformat(t))
         case("the default name is the window's midpoint day: 23:50 names its own day; 00:00 and a 00:05 catch-up the day before",
              at("2026-10-12T23:50:00+00:00") == "2026-10-12" and at("2026-10-13T00:00:00+00:00") == "2026-10-12"
              and at("2026-10-13T00:05:00+00:00") == "2026-10-12" and at("2026-10-13T12:00:01+00:00") == "2026-10-13")
         case("a default run writes <today>/, points latest at it and removes a snapshot written over 90 days ago",
-             p1.returncode == 0 and os.readlink(os.path.join(root, "latest")) == today
+             p1.returncode == 0 and today in days
              and os.path.exists(os.path.join(root, today, "index.json")) and not os.path.exists(old))
         p2 = subprocess.run([sys.executable, __file__, "--since", "2026-01-01", "--until", "2026-01-03"], capture_output=True,
                             text=True, env={**os.environ, "HOME": h}, timeout=60)

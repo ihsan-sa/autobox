@@ -260,8 +260,16 @@ def selfcheck():
     with q:
         for s in (1000, 1000 + DEAD_S, 1000 + DEAD_S + 120):
             run(t, True, s)
+    k(raised() == [], f"a seat that refused for less than DEAD_S (mid-handoff) is asked again, no row yet: {raised()}")
+    os.remove(f"{d}/msgrefuse")
+    with q: run(t, True, 1000 + DEAD_S + 240)
+    k(len(sent()) == 1 and raised() == [], f"…and told once it answers again: {sent()} {raised()}")
+    dead_fresh(); open(f"{d}/msgrefuse", "w").close(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    with q:
+        for s in (1000, 1000 + DEAD_S, 1000 + DEAD_S + 120, 1000 + 2 * DEAD_S, 1000 + 2 * DEAD_S + 120):
+            run(t, True, s)
     k(len(raised()) == 1 and re.match(r"raised-stall-demo-landing-dead-\d{8}\|", raised()[0]),
-      f"a planning seat that refuses the message (down too) gets one row instead: {raised()}")
+      f"a planning seat that refuses the message for DEAD_S (down too) gets one row instead: {raised()}")
     dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)
     with q: run(t, False, 1000); run(t, False, 1000 + DEAD_S)
     k(sent() == [], "without --apply: nothing said")
