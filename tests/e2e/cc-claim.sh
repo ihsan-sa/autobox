@@ -184,7 +184,9 @@ e6=$(jq -r '.executions[-1].execution_id' < "$d6")
   && ok "…and a second --repair at that same head, once its worker is gone with nothing pushed, relaunches it on the same task" \
   || bad "a stopped repair at one head could not be relaunched: rc=$p6 $(cat "$T/c6rp2.out")"
 for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
-tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'"   # a worker still running that head
+# a worker still running that head, shaped as cc opens one: the pane's shell with the loop UNDER it. pane_kind skips
+# the pane's own pid, so a lone `bash -c 'exec -a cc-loop …'` (bash execs it in place) read as an empty window.
+tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'; exec bash"
 cp "$d6" "$T/c6before.json"
 "$B/cc" $REPO c6 --go "" --repair >"$T/c6rp3.out" 2>&1; p6=$?
 { [ "$p6" != 0 ] && grep -q 'live session\|still running it' "$T/c6rp3.out" && cmp -s "$d6" "$T/c6before.json"; } \
