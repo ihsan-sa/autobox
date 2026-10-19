@@ -5709,6 +5709,25 @@ def run_selfcheck():
               and not home_agent_done(hjl)
               and "c1" in {a["id"] for a in home_subagents(root=hagd, live=lambda sid: sid in hlive9,
                                                            now=time.time() - 3600)})
+        hhb_rec = lambda result, after=(): [{"type": "api-request"},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_hb", "name": "SubagentHandback", "input": {"message": "done"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [result]}}, *after]
+        hhb_ok = {"type": "tool_result", "tool_use_id": "toolu_hb",
+                  "content": [{"type": "text", "text": '{"success":true,"message":"Report delivered to your caller."}'}]}
+        def hhb(name, recs):
+            path = f"{hagd}/{name}.jsonl"
+            with open(path, "w") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            return path
+        check("home_agent_done: a transcript ending in the harness's answer to the agent's SubagentHandback call is "
+              "finished (the harness hands reports in through that tool since 2026-10-17); a handback answered with an "
+              "error, a result for some other call, or a parent resuming the agent after it, is not — cc-handoff's "
+              "reported() reads the same",
+              home_agent_done(hhb("hb-ok", hhb_rec(hhb_ok)))
+              and not home_agent_done(hhb("hb-err", hhb_rec(dict(hhb_ok, is_error=True))))
+              and not home_agent_done(hhb("hb-other", hhb_rec(dict(hhb_ok, tool_use_id="toolu_bash"))))
+              and not home_agent_done(hhb("hb-resumed", hhb_rec(hhb_ok, [{"type": "user", "message": {"role": "user", "content": "more"}}]))))
         globals()["HOME"], globals()["DEV"] = _homeA, _devA
     finally:
         shutil.rmtree(hagd, ignore_errors=True)

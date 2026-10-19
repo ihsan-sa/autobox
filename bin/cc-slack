@@ -4291,8 +4291,10 @@ def home_session_live(sid):
 
 def home_agent_done(path, tail=HOME_AGENT_TAIL):
     """Has this subagent finished? Its last transcript record says so: a final report is an `assistant` record
-    with text and no `tool_use`; anything else is mid-turn. Read from the tail, bounded — an unreadable file or
-    a cut mid-record both answer "not finished", since calling a live agent gone is the costly mistake."""
+    with text and no `tool_use`, or the harness's answer to the agent's `SubagentHandback` call (home_handed_back:
+    the harness hands a report in through that tool now, 2026-10-17); anything else is mid-turn. Read from the
+    tail, bounded — an unreadable file or a cut mid-record both answer "not finished", since calling a live agent
+    gone is the costly mistake. cc-handoff's reported() is the same rule; change the two together."""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -4308,10 +4310,37 @@ def home_agent_done(path, tail=HOME_AGENT_TAIL):
         rec = json.loads(lines[-1].decode("utf-8", "replace"))
     except Exception:
         return False                           # a record caught mid-write is not a finished agent
+    if isinstance(rec, dict) and rec.get("type") == "user":
+        return home_handed_back(rec, lines[:-1])
     if not isinstance(rec, dict) or rec.get("type") != "assistant":
         return False
     c = (rec.get("message") or {}).get("content")
     return not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (c if isinstance(c, list) else []))
+
+def home_handed_back(rec, before):
+    """Is `user` record `rec` the harness's answer to a `SubagentHandback` call: a `tool_result`, not an error,
+    whose tool_use_id names that call in an earlier `assistant` record of `before` (raw tail lines, oldest
+    first)? The same rule as cc-handoff's handed_back — change them together."""
+    c = (rec.get("message") or {}).get("content")
+    ids = {b.get("tool_use_id") for b in (c if isinstance(c, list) else [])
+           if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("is_error")}
+    ids.discard(None)
+    for ln in reversed(before):
+        if not ids:
+            return False
+        try:
+            r = json.loads(ln.decode("utf-8", "replace"))
+        except Exception:
+            continue                           # the first line of a tail read may be cut: it decides nothing
+        if not isinstance(r, dict) or r.get("type") != "assistant":
+            continue
+        rc = (r.get("message") or {}).get("content")
+        for b in (rc if isinstance(rc, list) else []):
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") in ids:
+                if b.get("name") == "SubagentHandback":
+                    return True
+                ids.discard(b.get("id"))       # answered some other call: that result says nothing
+    return False
 
 def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, target=None, pr_title=None,
                    land_titles=None):

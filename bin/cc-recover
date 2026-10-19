@@ -33,8 +33,16 @@ or `cc-loop`, with its kind and what relaunches it.
   a member), and comes back like any other of that kind; a seat or orch with no tasks fd is resumed on the
   `--session-id` its claude was started with.
   Never saved: `box` (tmux-main starts it), `_*` test windows, `~next`/`~old` handoff windows, and the perms
-  session — a window named `perms` or a claude run with --dangerously-skip-permissions. Its relaunch is the
-  planning seat's alone.
+  session — a window named `perms` or a claude run with --dangerously-skip-permissions. It is never resumed: see PERMS.
+
+PERMS (owner, 2026-10-14: "perms needs to be able to come back up automatically"). When no claude runs under a
+window named `perms`, the tick (and restore, once tmux and the network are up) runs `cc-perms revive`, which starts
+the box's own permission seat fresh from its brief and its journal's START HERE entry, with nothing from this script:
+no prompt, argument or model. cc-perms decides everything else: it lets only this unit and the restore unit call it
+(by cgroup), does nothing while a seat is live, leaves a seat that went down 3 times in 30 minutes down, and tells the
+owner once, with a line to paste, when it refuses. The tick logs each outcome to decisions.log on a change only, and
+CC_RECOVER_PERMS=off stops both callers, and a host ~/.cc/roles says is not the hub asks nothing. Bring-up runs in a unit of its own, which cc-perms refuses, so it leaves perms
+to the next tick and says so.
 A healthy tick rewrites the file, so it is never older than a minute or two while the box runs. A tick does NOT
 rewrite it while a restore is running, when the tmux server is down, or on a mass loss: at least half the saved
 set, and at least CC_RECOVER_MASS_MIN (3), gone at once. After an OUTAGE — a tick that found the tmux server down,
@@ -91,7 +99,7 @@ set and no restore runs beside it, and a repo named in --except is left exactly 
   6. Writes one summary to bringup.log and cc-notify: what it unpaused and relaunched, whom it asked, what it left
      and why, the dialog windows, and member credentials that look blank (296 bytes or fewer, or no file); a member
      whose credential looks blank is not launched.
-  perms is never relaunched (its relaunch is the planning seat's); bring-up only says when it is down.
+  perms is never relaunched by bring-up (see PERMS: the next tick does it); bring-up only says when it is down.
 
 NOT THE HUB. ~/.cc/roles is the roles tool's record of which host runs what; its `hub=<host>` line names the host whose
 tmux holds the sessions. When it names another host (the old machine after the hub moved), restore and bring-up
@@ -576,6 +584,22 @@ def start_restore():
     return subprocess.run(["systemctl", "--user", "start", "--no-block", "cc-recover-restore.service"]).returncode == 0
 
 
+def perms_live(ws):
+    return any(n == "perms" and claude_under(p) for n, p in ws)
+
+
+def revive_perms():
+    """`cc-perms revive` when the tmux server answers, no claude runs under a window named perms and
+    CC_RECOVER_PERMS is not off (see PERMS). Returns None when nothing was asked, else (rc, the last line it said)."""
+    if cfg("CC_RECOVER_PERMS", "on") == "off":
+        return None
+    ws = windows()
+    if ws is None or perms_live(ws):
+        return None
+    rc, out = run([os.path.join(BIN, "cc-perms"), "revive"], timeout=60)
+    return rc, (out.splitlines() or [""])[-1][:240]
+
+
 def tick():
     st = load("detector.json", {})
     t = now()
@@ -613,6 +637,12 @@ def tick():
             return
     elif st.pop("tmux_down_since", None) is not None:
         decide("tmux server back")
+    # perms: a seat that went down outside a full restore comes back here, on the hub only (see PERMS)
+    if status != "tmux-down" and not hub:
+        pr = revive_perms()
+        if pr is not None and (pr[0] == 0 or st.get("perms_said") != pr[1]):
+            st["perms_said"] = pr[1]
+            decide(f"perms down: cc-perms revive rc={pr[0]} {pr[1]}")
     # network
     net = net_probe()
     if net == "up":
@@ -841,9 +871,6 @@ def restore_held(boot):
     saved = load("live.json", {})
     ss = saved.get("sessions") if isinstance(saved, dict) else None
     sessions = list(ss.values()) if isinstance(ss, dict) else []
-    if not sessions:
-        log("restore.log", "no saved set — nothing to restore")
-        return 0
     run([os.path.join(BIN, "cc-boot")])
     for _ in range(30):
         if tmux_up():
@@ -852,6 +879,13 @@ def restore_held(boot):
     deadline = time.monotonic() + NET_WAIT_S   # by the wall clock: one probe can take ~11 s on its own
     while net_probe() != "up" and time.monotonic() < deadline:
         time.sleep(10)
+    # perms first, before the seats: approvals and refusals wait on it (see PERMS)
+    pr = revive_perms()
+    if pr is not None:
+        log("restore.log", f"perms: cc-perms revive rc={pr[0]} {pr[1]}")
+    if not sessions:
+        log("restore.log", "no saved set — nothing to restore")
+        return 0
     try:
         saved_at = calendar.timegm(time.strptime(saved.get("saved", ""), "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
@@ -1158,7 +1192,7 @@ def bringup_held(excluded):
             (told.append(n) if mrc == 0 else left.append(f"{n}: the resume message failed (rc={mrc})"))
             time.sleep(gap())
     if not any(n == "perms" and claude_under(p) for n, p in windows() or []):
-        left.append("perms: not live, and left alone — its relaunch is the planning seat's")
+        left.append("perms: not live; the next cc-recover tick brings it back (cc-perms revive)")
     # (6) one summary
     back = rep.get("back", [])
     lines = [f"unpaused: {', '.join(unpaused) or 'nothing'}",
@@ -1225,7 +1259,7 @@ def selfcheck():
                     # capture-pane -p -t main:=<w> prints {d}/pane.main__<w> with / : = @ as _; any other verb is logged
                     f"[ \"$1\" = capture-pane ] && {{ f={d}/pane.$(printf %s \"$4\" | tr '/:=@' '____'); [ -f \"$f\" ] && cat \"$f\"; exit 0; }}\n"
                     f"case \"$1\" in has-session|list-windows) ;; *) printf 'tmux|%s|' \"$@\" >> {d}/calls; echo >> {d}/calls;; esac\nexit 0\n")
-        for tool in ("cc", "cc-msg", "cc-boot", "cc-notify"):
+        for tool in ("cc", "cc-msg", "cc-boot", "cc-notify", "cc-perms"):
             with open(f"{BIN}/{tool}", "w") as f:
                 f.write(f"#!/bin/sh\nprintf '%s|' {tool} \"$@\" >> {d}/calls; echo >> {d}/calls\n")
         with open(f"{BIN}/cc-config", "w") as f:
@@ -1527,6 +1561,31 @@ def selfcheck():
         check("bringup: on a host that is not the hub it does nothing and says where the hub is",
               rc == 1 and not os.path.exists(f"{d}/calls") and "hub runs on there, not here" in open(path("bringup.log")).read())
 
+        # 5c. perms: the tick asks cc-perms revive when no claude runs under window perms, logs on a change only, and
+        # leaves a live seat, a down tmux server and CC_RECOVER_PERMS=off alone (see PERMS)
+        def perms_calls(d):
+            return [c for c in (open(f"{d}/calls").read().splitlines() if os.path.exists(f"{d}/calls") else []) if "perms" in c]
+        d = fixture(); live_box(d); globals()["net_probe"] = lambda: "up"
+        tick(); clock[0] += 60
+        live = perms_calls(d)
+        rows = [l for l in open(f"{d}/windows.tsv").read().splitlines() if not l.startswith("perms\t")]
+        open(f"{d}/windows.tsv", "w").write("\n".join(rows) + "\n")
+        tick(); clock[0] += 60
+        with open(f"{BIN}/cc-perms", "w") as f:   # a refusal now, said the same way twice
+            f.write(f"#!/bin/sh\nprintf '%s|' cc-perms \"$@\" >> {d}/calls; echo >> {d}/calls\necho 'cc-perms: refused — window main:perms is open with no seat in it. Nothing started.' >&2; exit 1\n")
+        tick(); clock[0] += 60; tick(); clock[0] += 60
+        lg = open(path("decisions.log")).read()
+        check("tick: a live perms is left alone; gone, each tick asks cc-perms revive with no argument, and a refusal said twice is logged once",
+              live == [] and perms_calls(d) == ["cc-perms|revive|"] * 3 and lg.count("perms down: cc-perms revive rc=0") == 1
+              and lg.count("perms down: cc-perms revive rc=1") == 1)
+        os.environ["CC_RECOVER_PERMS"] = "off"; tick(); clock[0] += 60
+        n_off = len(perms_calls(d)); os.environ.pop("CC_RECOVER_PERMS")
+        open(ROLES, "w").write("hub=there\n"); tick(); clock[0] += 60
+        n_hub = len(perms_calls(d)); os.remove(ROLES)
+        os.remove(f"{d}/windows.tsv"); tick(); clock[0] += 60
+        check("tick: CC_RECOVER_PERMS=off, a host that is not the hub, or the tmux server down, asks nothing of cc-perms",
+              n_off == 3 and n_hub == 3 and len(perms_calls(d)) == 3)
+
         # 6. tmux down: cc-boot at 3 min, reboot due at 15
         d = fixture(); live_box(d); os.environ["CC_RECOVER_REBOOT"] = "off"
         tick(); os.remove(f"{d}/windows.tsv")
@@ -1557,7 +1616,9 @@ def selfcheck():
         check("restore: a session already live is left alone", not any(c.startswith("cc|r1|fix|") and "--say" not in c for c in cc_calls))
         check("restore: seats, orchs and members get a catch-up; the worker none",
               sum(c.startswith("cc-msg|") for c in calls) == 3 and not any(c.startswith("cc-msg|r1/job") for c in calls))
-        check("restore: perms is never relaunched", not any("perms" in c for c in calls))
+        pc = [c for c in calls if "perms" in c]
+        check("restore: perms is never resumed or launched through cc; it is asked of cc-perms revive alone, once, before any seat",
+              pc == ["cc-perms|revive|"] and calls.index("cc-perms|revive|") < min([i for i, c in enumerate(calls) if c.startswith("cc|")] or [len(calls)]))
         check("restore: the restoring mark is gone once it ends", not os.path.exists(path("restoring")))
         check("restore: one notify line with the count", sum(c.startswith("cc-notify|") for c in calls) == 1 and "Brought back 4 of 4" in open(path("restore.log")).read() and rc == 0)
         d = fixture(); live_box(d); save({})
@@ -1840,8 +1901,8 @@ def selfcheck():
               and "owner asked for the whole box to be brought back up" in next(c for c in calls if c.startswith("cc-msg|r1|")))
         check("bringup: the dialog window is listed and no key is sent to any window",
               "on the usage-limit dialog, to answer by hand: r1@x" in blog and not any(c.startswith("tmux|") for c in calls))
-        check("bringup: perms is never relaunched or messaged, and its being down is said",
-              not any("perms" in c for c in calls) and "perms: not live, and left alone" in blog)
+        check("bringup: perms is never relaunched or messaged (its own unit is refused by cc-perms), and the next tick is named",
+              not any("perms" in c for c in calls) and "perms: not live; the next cc-recover tick brings it back" in blog)
         gaps = [x for x in slept if x >= 1 and x != 15]   # subprocess waits in steps under 0.1 s
         check("bringup: launches and messages are 2-4 s apart (6 of them), not restore's 20 s",
               len(gaps) == 6 and all(2 <= x <= 4 for x in gaps))

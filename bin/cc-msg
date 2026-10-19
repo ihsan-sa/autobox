@@ -36,8 +36,10 @@
 # `cc-slack inject`, which hands it to the live side of the overlap ("queued" when it holds it for that side).
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
 # again later are a second message and are queued as one.
-# Refuses windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
+# Refuses TRACK windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
 # would sit on its tty and execute as a command when the loop ends. Give those work by appending to task.md.
+# A seat's window (no `/`: planning, an orch, perms) that is a bare shell is between sessions instead: the text is
+# spooled and reported queued, and typed once its claude is back.
 # Note: between Claude sessions prefer the native SendMessage tool; this is the deterministic waker for scripts/humans.
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")
@@ -515,7 +517,7 @@ dialog_seen(){   # $1 window  $2 pane text
 }
 dialog_gone(){ rm -f "$(sdir "$1")/inbox.dialog"; }
 
-orphan_seen(){   # $1 window — its spool has NO window to drain into (a handoff rename, an exit; review-157b).
+orphan_seen(){   # $1 window — its spool has NO window, or a seat window with no claude, to drain into (review-157b).
                  # Same contract as dialog_seen: after STAND_MIN it is said ONCE, and only "delivered"/"typed"
                  # counts as heard; a report nobody could take reaches the owner on its first failure only.
   local f now first rep att res rc n text tgt sp
@@ -532,7 +534,7 @@ orphan_seen(){   # $1 window — its spool has NO window to drain into (a handof
   case "$att" in ''|*[!0-9]*) att=0;; esac
   report_due "$att" $((now - first)) || return 0   # paced exactly as dialog_seen's: each try is a new message there
   n=$(spool_n "$1")
-  text="cc-msg: $n message(s) are spooled for main:$1 but no such window exists — a rename or an exit left them behind ($(sdir "$1")/inbox.spool). Deliver or delete them; nothing drains this by itself."
+  text="cc-msg: $n message(s) are spooled for main:$1 but it has no window or no claude in it — a rename or an exit left them behind ($(sdir "$1")/inbox.spool). Deliver or delete them; nothing drains this by itself."
   tgt=${CC_MSG_REPORT_TO:-$(ctl)}
   if [ "$tgt" = "$1" ]; then res='it is the stuck session itself'; rc=1
   else res=$(tell_session "$tgt" "$text"); rc=$?; fi
@@ -688,7 +690,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
   sp="$(sdir "$1")/inbox.spool"; satf="$(sdir "$1")/inbox.sat"; [ -s "$sp" ] || return 0
   dest=$(win_host "$1"); [ -z "$dest" ] || { drain_remote "$1" "$dest" >/dev/null; return 0; }   # typed on its own host
   id=$(win_id "$1"); [ -n "$id" ] || { orphan_seen "$1"; return 0; }   # gone or not up yet: the spool waits, but not silently forever
-  live_claude "$id" || return 0
+  live_claude "$id" || { [ "${1#*/}" = "$1" ] && orphan_seen "$1"; return 0; }   # a seat left a shell: said, not forever
   ( flock -w 10 9 || exit 1
     while [ "$n" -lt "$MAX_DRAIN" ] && [ -s "$sp" ]; do
       hung_frozen "$1" "$id" && break     # a pane already known to take no keys, and still frozen: not one more key
@@ -1125,7 +1127,11 @@ send(){    # $1 window  $2 text — THE contract: delivered, or queued and repor
   fi
   id=$(win_id "$1") || true
   [ -n "$id" ] || { echo "cc-msg: no window main:$1" >&2; exit 1; }
-  live_claude "$id" || { echo "cc-msg: main:$1 runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
+  # A SEAT'S BARE SHELL IS A SEAT BETWEEN SESSIONS, not a worker: on 2026-10-18 main:<repo> was a shell when
+  # autobox2 relayed four owner directions, this refused them, and planning never had them. A window with no `/`
+  # (planning, an orch, perms) gets its claude back, and the 60 s drain and cc-started type the spool then; a
+  # track window's headless loop never takes typed text, so that one is still refused with the door it does read.
+  live_claude "$id" || [ "${1#*/}" = "$1" ] || { echo "cc-msg: main:$1 runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
   local line sp                                   # ALWAYS the spool first, even for a free pane: it is what keeps
   line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for main:$1" >&2; exit 1; }   # a burst in order
   drain_window "$1"                                       # …and what makes "never dropped" true of every path
@@ -2012,7 +2018,7 @@ $BUSY"; out=$(msg "hello mid-turn")
   touch -d '20 minutes ago' "$SP"
   CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "a spool with no window, older than STAND_MIN: the box session is told"
-  k "$(t grep -qF 'no such window' "$T/calls")" "…saying the window is gone, not that a dialog stands"
+  k "$(t grep -qF 'no window or no claude' "$T/calls")" "…saying the window is gone, not that a dialog stands"
   CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "…and ONCE: the next tick says nothing"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
@@ -2043,6 +2049,15 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(t test "$rc" != 0)" "a pane with no interactive claude is still refused (rc≠0) — the text would run as a command"
   k "$(t grep -q 'task.md' <<<"$out")" "…and still points at task.md"
   k "$(nt test -f "$SP")" "…and nothing is spooled for it: a headless worker has no keyboard to drain to"
+  # (10b) A SEAT'S BARE SHELL (2026-10-18): main:<repo> between sessions refused four relayed owner directions. A
+  # window with no `/` is spooled and reported queued, and the drain types it once a claude is back in the pane.
+  rm -rf "${T:?}/.cc/state/demo"; reset; scr "$FREE"
+  out=$(CC_FAKE_WIN=demo CC_FAKE_PROC=bash "$T/bin/cc-msg" demo "seat between sessions" 2>&1); rc=$?
+  k "$(t sh -c "[ '$rc' = 0 ] && [ '$out' = queued ] && ! grep -q . '$T/keys'")" "a seat window that is a bare shell queues the text: rc 0, 'queued', and not one key reaches the shell"
+  k "$(t grep -qF 'seat between sessions' "$T/.cc/state/demo/inbox.spool")" "…and it sits in that seat's spool"
+  CC_FAKE_WIN=demo "$T/bin/cc-msg" --drain demo >/dev/null 2>&1
+  k "$(t grep -qF 'seat between sessions' "$T/keys")" "…and the drain types it once claude is back in the pane"
+  rm -rf "${T:?}/.cc/state/demo"
   reset; scr "$FREE"; out=$(CC_FAKE_WIN=other "$T/bin/cc-msg" "$W" "nowhere" 2>&1); rc=$?
   k "$(t test "$rc" != 0)" "an unknown window is still an error, not a queue that nothing will ever read"
   # (10a) A CLAUDE THAT IS THE PANE PROCESS (2026-10-12): the tower restored the architect that way, and cc-msg

@@ -34,6 +34,7 @@
 #                                           the same checks and refresh; cc-loop asks it so the limit it waits on is that login's.
 #                                           In the host refresher's mode, its copy or nothing and exit 2 (THE HOST REFRESHER'S MODE).
 #   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
+#                                           — always in a HOME of its own (selfcheck_home); it refuses the account's real one
 #   cc-sandbox --help | -h                  this header, exit 0
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
@@ -3129,9 +3130,38 @@ print(\"dns=\"+dns())"
   t 'fence: an egress proxy that does not start → the launch runs nothing and says why' "$rc/$(grep -c RAN <<<"$out")/$(grep -c 'did not start' <<<"$out")" 2/0/1
   kill "$upp" 2>/dev/null; wait "$upp" 2>/dev/null
   git -C "$fh/dev/$w" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_home(){   # EVERY CASE RUNS IN A HOME OF ITS OWN, never the account's real one. selfcheck() used to plant
+  # _ccsbx<pid> repos, boards and members under the real ~/dev and ~/.cc: 60+ were left in ~/.cc/members, every worker
+  # launch bound their boards, and two runs in pid namespaces of their own got the same <pid> and met in each other's
+  # fixtures (2026-10-13). Its answers also hung on the caller: under e2e-cc-context's fixture HOME there were no
+  # credentials to strip, so "a stripped copy" went red there and green alone. So this builds one complete HOME —
+  # what the probes say is hidden is PLANTED here, so "absent" means the boundary hid it — and re-runs the selfcheck in it.
+  local real fh f rc
+  real=$(getent passwd "$(id -u)" | cut -d: -f6)
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxhome-XXXXXX") || return 1; chmod 700 "$fh"
+  mkdir -p "$fh/dev" "$fh/bin" "$fh/.local/bin" "$fh/.local/share" "$fh/.npm" "$fh/.cache" "$fh/.claude" "$fh/.ssh" \
+    "$fh/.config/gh" "$fh/ccbox" "$fh/.cc/boards" "$fh/.cc/members" "$fh/.cc/state" "$fh/.cc/worktrees" "$fh/.cc/secrets" || return 1
+  # The box's tools, each a link to what the real ~/bin names: probes run ~/bin/cc-board, and the launch finds the
+  # control repo's bin (and WRITING.md beside it) through ~/bin/cc-loop. The directory itself is the fixture's.
+  for f in "$real"/bin/*; do [ -e "$f" ] && ln -s "$(readlink -f "$f")" "$fh/bin/${f##*/}"; done
+  [ -e "$real/.local/bin/claude" ] && ln -s "$(readlink -f "$real/.local/bin/claude")" "$fh/.local/bin/claude"
+  [ -d "$real/.local/share/claude" ] && ln -s "$(readlink -f "$real/.local/share/claude")" "$fh/.local/share/claude"
+  [ -f "$real/.claude/settings.json" ] && cp "$real/.claude/settings.json" "$fh/.claude/settings.json"
+  ( umask 077
+    jq -n '{claudeAiOauth: {accessToken: "sbx-access", refreshToken: "sbx-refresh", expiresAt: 99999999999999}}' > "$fh/.claude/.credentials.json"
+    printf '{"hasCompletedOnboarding":true,"projects":{},"mcpServers":{}}\n' > "$fh/.claude.json"
+    printf 'github.com:\n    oauth_token: sbx-fixture\n' > "$fh/.config/gh/hosts.yml"
+    printf 'fixture-key\n' > "$fh/.ssh/id_fixture"; printf 'fixture\n' > "$fh/ccbox/fixture"
+    printf 'fixture=1\n' > "$fh/.cc/config" ) || return 1
+  env HOME="$fh" CC_SANDBOX_SELFCHECK_HOME="$fh" "$SELF" selfcheck; rc=$?
+  rm -rf "$fh"
+  return "$rc"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local sw lp of sname pw
   local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec vb
+  # Fail closed: only the HOME selfcheck_home built, and never the account's own, even if the marker was planted.
+  [ "${CC_SANDBOX_SELFCHECK_HOME:-}" = "$H" ] && [ "$(readlink -f "$H")" != "$(readlink -f "$(getent passwd "$(id -u)" | cut -d: -f6)")" ] \
+    || { echo "cc-sandbox selfcheck: refused: HOME $H is not a fixture HOME of selfcheck_home's"; return 1; }
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -3498,6 +3528,12 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
+  # The refusal selfcheck_home relies on, both halves: this run got past it in its own HOME (kept), and the same
+  # marker naming the account's real home, or a marker that is not HOME, stops before anything is planted (suppressed).
+  out=$(getent passwd "$(id -u)" | cut -d: -f6)
+  out="$(env HOME="$out" CC_SANDBOX_SELFCHECK_HOME="$out" "$SELF" selfcheck 2>&1; echo "rc=$?")|$(env CC_SANDBOX_SELFCHECK_HOME="$H/x" "$SELF" selfcheck 2>&1; echo "rc=$?")"
+  t 'selfcheck refuses the real HOME, and a marker that is not HOME, in one line each' \
+    "$(grep -c '^cc-sandbox selfcheck: refused: ' <<<"${out//|/$'\n'}")/$(grep -o 'rc=[0-9]*' <<<"$out" | tr '\n' ' ')" '2/rc=1 rc=1 '
   selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
@@ -3536,7 +3572,7 @@ fence_why(){   # → exit 0, or exit 1 and why a worker launch here would get no
   local e; e=$(bwrap --die-with-parent --unshare-net --unshare-pid --ro-bind /usr /usr --symlink usr/bin /bin \
     --symlink usr/lib /lib --symlink usr/lib64 /lib64 --proc /proc --dev /dev -- /usr/bin/true 2>&1) \
     || { echo "bwrap will not make a network and pid namespace here: ${e:-no reason given}"; return 1; }; }
-case "${1:-}" in selfcheck) selfcheck; exit $?;;
+case "${1:-}" in selfcheck) if [ -n "${CC_SANDBOX_SELFCHECK_HOME:-}" ]; then selfcheck; else selfcheck_home; fi; exit $?;;
   -h|--help|help) sed -n '2,/^set -/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; exit 0;;   # the header above IS the usage; before this line `--help` fell through to the positional parse and died on `2: track` (a member workspace, 2026-09-18)
   __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge — the MEMBER shape: the v2 profile (cc-member-v2) has no owner marker yet
   probe) fence_off && exit 0; why=$(fence_why) || { echo "$why" >&2; exit 2; }; exit 0;;   # cc-loop, before iteration 1

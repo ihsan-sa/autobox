@@ -678,7 +678,13 @@ def reported(path, tail=REPORT_TAIL):
     keyed on `stop_reason: end_turn`, and 431 of 824 finished transcripts on the box end in an assistant record
     with `stop_reason: null`, which the Home tab called done and --ready would have held the predecessor for).
     The rule: the transcript's last record is an `assistant` record whose content carries no `tool_use` block —
-    a final report is text; a tool call is mid-turn. A `user` record (the parent resumed it), a record cut
+    a final report is text; a tool call is mid-turn — OR it is the harness's answer to the agent's own HANDBACK
+    call (handed_back()): the harness now hands a report in through a `SubagentHandback` tool call, so a
+    finished transcript ends in that call and a `user` record whose `tool_result` answers it ("Report delivered
+    to your caller"). Read only as text, every finished agent was live for CC_HANDOFF_AGENT_IDLE, and the stay
+    held the cutover record — and the live seat's next hand-off — that long (autobox2, twice on 2026-10-17;
+    probed on a live transcript that day). A handback the harness answered with an error is not a report.
+    Any other `user` record (the parent resumed it), a record cut
     mid-write, a tail read that landed inside the last record (size over `tail` with fewer than two lines), a
     file that is unreadable or not JSON: False — the mtime rule below still decides, as it did before this existed,
     because calling a live agent finished is the costly mistake. Read from the tail, never the whole file (a
@@ -699,18 +705,50 @@ def reported(path, tail=REPORT_TAIL):
         rec = json.loads(lines[-1].decode("utf-8", "replace"))
     except Exception:
         return False                           # a record caught mid-write is not a finished agent
+    if isinstance(rec, dict) and rec.get("type") == "user":
+        return handed_back(rec, lines[:-1])
     if not isinstance(rec, dict) or rec.get("type") != "assistant":
         return False
     c = (rec.get("message") or {}).get("content")
     return not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (c if isinstance(c, list) else []))
 
 
+HANDBACK = "SubagentHandback"   # the tool a subagent hands its final report in with (probed 2026-10-17)
+
+
+def handed_back(rec, before):
+    """Is `user` record `rec` the harness's answer to the agent's HANDBACK call: a `tool_result`, not an error,
+    whose tool_use_id names a `SubagentHandback` tool_use in an earlier `assistant` record of the tail read
+    (`before`, raw lines, oldest first)? The parent resuming the agent writes a user record with no such
+    result, so it still reads live. Same rule as cc-slack's home_handed_back — change them together."""
+    c = (rec.get("message") or {}).get("content")
+    ids = {b.get("tool_use_id") for b in (c if isinstance(c, list) else [])
+           if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("is_error")}
+    ids.discard(None)
+    for ln in reversed(before):
+        if not ids:
+            return False
+        try:
+            r = json.loads(ln.decode("utf-8", "replace"))
+        except Exception:
+            continue                           # the first line of a tail read may be cut: it decides nothing
+        if not isinstance(r, dict) or r.get("type") != "assistant":
+            continue
+        rc = (r.get("message") or {}).get("content")
+        for b in (rc if isinstance(rc, list) else []):
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") in ids:
+                if b.get("name") == HANDBACK:
+                    return True
+                ids.discard(b.get("id"))       # answered some other call: that result says nothing
+    return False
+
+
 def subagents(sid, idle=None):
     """Session `sid`'s subagents that still look ALIVE, the busiest first. A `<id>.output` that is a SYMLINK is
     a subagent — it points at the transcript that agent is writing; a plain file beside it is a background shell
     command (a Monitor too), whose output nobody has to hand on. Two things say "finished": the transcript's own
-    last record (reported(): the agent's final report, an assistant record with no tool call in it, read by the
-    rule cc-slack's Home tab reads it — a report that is in is not waited for, whether it came in five minutes
+    last record (reported(): the agent's final report — an assistant record with no tool call in it, or the
+    harness's answer to its SubagentHandback call — read by the rule cc-slack's Home tab reads it — a report that is in is not waited for, whether it came in five minutes
     ago or five hours ago), and silence: a transcript
     untouched for CC_HANDOFF_AGENT_IDLE counts as done. The default is 30 min because an agent blocked inside a
     SINGLE Bash call — a gate run, a long build — writes nothing at all while it waits, and a live one read as

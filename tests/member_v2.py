@@ -5,6 +5,7 @@ import grp
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess as sp
 import tempfile
@@ -51,12 +52,26 @@ def selfcheck(m):
     # checkout lives there), so a vault under it refused the good record whenever an unrelated one bound a parent
     # (2026-09-24). No sandbox profile binds ~ or ~/.cc whole, so a directory of its own under ~/.cc is parent to
     # nothing a live sandbox holds. The cases after "inventory control" prove both halves.
-    scratch = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
+    # THE ACCOUNT'S HOME, NOT $HOME. A caller with a fixture HOME (e2e-cc-context runs cc-sandbox selfcheck under one)
+    # got a scratch and a lock of its own, so it ran beside a selfcheck under the real HOME and each refused on the
+    # other's non-dumpable case: "live namespace <pid> cannot be inspected (fd/: EACCES)" held main red (2026-10-13).
+    # The passwd entry names one directory whatever HOME says; each run still gets its own vault inside it.
+    scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cc/member-v2-selfcheck"
     scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
     # ONE SELFCHECK AT A TIME ON THE BOX. Its non-dumpable cases plant a live task the walk cannot read, which must
     # not be called clear, so a second selfcheck's inventory refused on it whenever two landings ran this suite
     # together (2026-10-02). The lock is released when the process exits.
-    fcntl.flock(os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), fcntl.LOCK_EX)
+    # A BOUNDED WAIT, so a run that holds the lock for good is a red that names it and not a hang: a worker's gate
+    # sat behind one until e2e-cc-context hit its 30 min cap (2026-10-13). One whole run fits well inside it.
+    lock, since = os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), time.monotonic()
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() - since > 900:
+                raise SystemExit(f"cc-member-v2 selfcheck: refused: another selfcheck has held {scratch / 'lock'} for 15 min")
+            time.sleep(1)
     with tempfile.TemporaryDirectory(prefix="cc-member-v2-", dir=scratch) as temp:
         root = Path(temp).resolve()
         h, v = root / "home", root / "vault"

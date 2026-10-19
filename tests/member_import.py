@@ -2,6 +2,7 @@
 import fcntl
 import json
 import os
+import pwd
 from pathlib import Path
 import runpy
 import select
@@ -29,9 +30,21 @@ def selfcheck(m):
     # plants a descriptor in flight and an unreadable task on purpose, which no walk may call clear. So the vault sits
     # where cc-member-v2 keeps its own, a directory under ~/.cc that no sandbox profile binds, and this suite takes the
     # same lock: two runs of either suite never overlap (2026-10-12). The lock is released when the process exits.
-    scratch = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
+    # It is the account's home from the passwd entry and not $HOME, as in member_v2.py: under a fixture HOME the
+    # lock was a different file, and the two suites ran together after all (2026-10-13).
+    scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cc/member-v2-selfcheck"
     scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fcntl.flock(os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), fcntl.LOCK_EX)
+    # A BOUNDED WAIT, so a run that holds the lock for good is a red that names it and not a hang: a worker's gate
+    # sat behind one until e2e-cc-context hit its 30 min cap (2026-10-13). One whole run fits well inside it.
+    lock, since = os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), time.monotonic()
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() - since > 900:
+                raise SystemExit(f"cc-member-import selfcheck: refused: another selfcheck has held {scratch / 'lock'} for 15 min")
+            time.sleep(1)
     with tempfile.TemporaryDirectory(prefix="cc-member-import-", dir=scratch) as temp:
         root = Path(temp).resolve(); home, v = root / "home", root / "v"
         for path in (home / ".claude", home / ".local/bin", home / ".cc/members/team", v / "registry", v / "repos"):

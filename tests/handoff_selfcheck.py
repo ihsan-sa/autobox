@@ -1032,6 +1032,33 @@ def run_selfcheck():
            not reported(ttext) and not reported(os.path.join(d, "no-such.jsonl"))
            and sorted(subagents("sid-sub")) == ["a-live", "a-text"])
         os.unlink(os.path.join(tasks, "a-text.output"))     # this case's own fixture; the cases below count a-live alone
+        def handback(name, result, after=()):
+            """A transcript ending the way the harness ends a finished agent now: a thinking record, a
+            SubagentHandback call, the harness's tool_result for it — `result` its block, `after` more records."""
+            t = os.path.join(d, name + ".jsonl")
+            with open(t, "w") as fh:
+                for r in ({"type": "api-request"},
+                          {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}},
+                          {"type": "assistant", "message": {"role": "assistant", "content": [
+                              {"type": "tool_use", "id": "toolu_hb", "name": "SubagentHandback", "input": {"message": "done"}}]}},
+                          {"type": "user", "message": {"role": "user", "content": [result]}}) + tuple(after):
+                    fh.write(json.dumps(r) + "\n")
+            os.utime(t, (clk[0], clk[0]))
+            return t
+        delivered = {"type": "tool_result", "tool_use_id": "toolu_hb",
+                     "content": [{"type": "text", "text": '{"success":true,"message":"Report delivered to your caller."}'}]}
+        thb = handback("a-hb", delivered)
+        os.symlink(thb, os.path.join(tasks, "a-hb.output"))
+        ok("a transcript that ends in the harness's answer to the agent's SubagentHandback call has DELIVERED its "
+           "report — however fresh — so it holds no stay (autobox2's cutover, twice on 2026-10-17)",
+           reported(thb) and "a-hb" not in subagents("sid-sub") and "a-hb" not in spawned("sid-sub"))
+        os.unlink(os.path.join(tasks, "a-hb.output"))
+        ok("...but a handback the harness answered with an error, a result that answers some other call, and a "
+           "parent resuming the agent after its handback all read live",
+           not reported(handback("a-hb-err", dict(delivered, is_error=True)))
+           and not reported(handback("a-hb-other", dict(delivered, tool_use_id="toolu_bash")))
+           and not reported(handback("a-hb-resumed", delivered,
+                                     [{"type": "user", "message": {"role": "user", "content": "one more thing"}}])))
         ok("an unknown session id, or one with no task files, reads as no subagents — and the handoff is then "
            "exactly the one it was before", subagents("") == [] and subagents("sid-none") == [])
 
