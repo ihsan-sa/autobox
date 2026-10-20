@@ -20,6 +20,9 @@ not a key at all
 DOLLAR=$(touch @T@/pwned-file)
 BACKTICK=`touch @T@/pwned-tick`
 SEMI=x; touch @T@/pwned-semi
+ALPHA_TOKEN=tok-by-name
+HOOK=https://hooks.slack.com/services/by-shape
+EMPTY_SECRET=
 EOF
   sed -i "s#@T@#$T#g" "$T/config"
   C(){ CC_CONFIG="$T/config" "$SELF" "$@"; }
@@ -42,19 +45,31 @@ EOF
   k "$(t test "$(C get BACKTICK)" = '`touch '"$T"'/pwned-tick`')" "…and a backtick value too"
   k "$(t test "$(C get SEMI)" = "x; touch $T/pwned-semi")" "…and a value with a ; command after it"
   k "$(t test ! -e "$T/pwned-file" -a ! -e "$T/pwned-tick" -a ! -e "$T/pwned-semi")" "reading the file executed NOTHING"
-  C list >/dev/null; k $? "list reads the same file without executing it"
+  C list >/dev/null 2>&1; k $? "list reads the same file without executing it"
   k "$(t test ! -e "$T/pwned-file")" "…still nothing executed"
   k "$(t grep -qx 'not a key at all' "$T/config")" "a line that is not KEY=VALUE is left alone"
   # list
-  out="$(C list)"
+  out="$(C list 2>/dev/null)"
   k "$(t grep -qx 'ALPHA=four' <<<"$out")" "list gives each file key once, at its resolved value"
   k "$(t test "$(grep -c '^ALPHA=' <<<"$out")" = 1)" "…once, not once per line"
-  k "$(t grep -qx 'ALPHA=env' <<<"$(export ALPHA=env; C list)")" "list applies the same precedence"
+  k "$(t grep -qx 'ALPHA=env' <<<"$(export ALPHA=env; C list 2>/dev/null)")" "list applies the same precedence"
   out="$(export DELTA=only-in-env; C list DELTA)"
   k "$(t test "$out" = 'DELTA=only-in-env')" "a named key the environment alone has is listed, and nothing else is"
   k "$(t test "$(C list ALPHA)" = 'ALPHA=four')" "list KEY prints that one file key, not the whole file"
   k "$(t test -z "$(C list NOSUCH)")" "…and a named key set nowhere prints nothing"
-  k "$(t test -z "$(export DELTA=only-in-env; C list | grep '^DELTA=')")" "…and is not, when it was not named"
+  k "$(t test -z "$(export DELTA=only-in-env; C list 2>/dev/null | grep '^DELTA=')")" "…and is not, when it was not named"
+  # a bare list masks what looks like a secret; naming the key, or --secrets, is asking for it
+  out="$(C list 2>/dev/null)"
+  k "$(t grep -qx 'ALPHA_TOKEN=\*\*\*\*' <<<"$out")" "a bare list masks a value whose key names a token"
+  k "$(t grep -qx 'HOOK=\*\*\*\*' <<<"$out")" "…and a value shaped like a Slack webhook, whatever its key"
+  k "$(t test -z "$(grep -e tok-by-name -e by-shape <<<"$out")")" "…so neither value is anywhere in the dump"
+  k "$(t grep -qx 'EMPTY_SECRET=' <<<"$out")" "…while an empty one still reads as empty (unset, not hidden)"
+  k "$(t grep -q 'list --secrets' <<<"$(C list 2>&1 >/dev/null)")" "…and it says on stderr how to see them"
+  k "$(t test "$(C list ALPHA_TOKEN)" = 'ALPHA_TOKEN=tok-by-name')" "a named key prints its value: naming it asked for it"
+  out="$(C list --secrets 2>&1)"
+  k "$(t grep -qx 'ALPHA_TOKEN=tok-by-name' <<<"$out")" "list --secrets prints the full dump unmasked"
+  k "$(t grep -qx 'ALPHA=four' <<<"$out")" "…the plain keys too"
+  C list --secrets ALPHA >/dev/null 2>&1; rc=$?; k "$(t test $rc = 2)" "--secrets is for the whole dump; with a key it is a usage error"
   # set / unset
   C set NEW 'a value with spaces' && k 0 "set exits 0" || k 1 "set exits 0"
   k "$(t test "$(C get NEW)" = 'a value with spaces')" "…and reads back exactly"

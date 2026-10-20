@@ -4,7 +4,8 @@
 #   cc-config get KEY [default]   the value; exit 0 it was set, 1 it fell back to <default> (empty if none given)
 #   cc-config set KEY VALUE       replaces every earlier line for KEY; mode 600, under a lock, atomic rename
 #   cc-config unset KEY           exit 0 it was there, 1 it was not
-#   cc-config list [KEY…]         KEY=VALUE for each KEY named (environment first, as get); with none, every key in the file
+#   cc-config list [KEY…]         KEY=VALUE for each KEY named (environment first, as get); with none, every key in the file,
+#                                 secret-looking values masked · list --secrets  that whole dump unmasked
 #   cc-config path                where the file is
 #   cc-config selfcheck           this reader's own invariants, in a config of its own
 #   CC_CONFIG=FILE                read/write FILE instead · CC_CONFIG_DENY=FILE  that one file reads as empty, is never written
@@ -33,7 +34,7 @@ CFG="${CC_CONFIG:-$HOME/.cc/config}"
 denied(){ [ -n "${CC_CONFIG_DENY:-}" ] && [ "$(realpath -m -- "$CFG")" = "$(realpath -m -- "$CC_CONFIG_DENY")" ]; }
 # shellcheck disable=SC2034   # read by the selfcheck, whose cases are tests/selfcheck/cc-config.sh
 SELF="$(realpath "$0")"
-USAGE="usage: cc-config get KEY [default] | set KEY VALUE | unset KEY | list [KEY…] | path | selfcheck"
+USAGE="usage: cc-config get KEY [default] | set KEY VALUE | unset KEY | list [KEY…] | list --secrets | path | selfcheck"
 umask 077   # this file is secrets: never create it, its lock or its temp file group- or world-readable
 
 key_ok(){ case "$1" in ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1;; esac; return 0; }
@@ -99,13 +100,26 @@ get(){
   printf '%s\n' "$def"; return 1
 }
 
+# Whether a value looks like a credential, by its key's name or its own shape. A bare `list` is how a session
+# looks around, and on 09-28 it printed the Slack webhook into a transcript; naming a key is asking for it, so
+# only the full dump masks. Over-masking a path costs a --secrets; under-masking a token can't be taken back.
+secret_like(){
+  case "$1" in *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*WEBHOOK*|*CREDENTIAL*|*AUTH*|*PRIVATE*|*COOKIE*|KEY|*_KEY|*_KEY_*|*APIKEY*) return 0;; esac
+  case "$2" in xox[abposr]-*|xapp-*|sk-*|ghp_*|gho_*|github_pat_*|AKIA*|*hooks.slack.com/*|*-----BEGIN*) return 0;; esac
+  return 1
+}
+
 list(){
-  local k
+  local k v show=0 masked=0
+  [ "${1:-}" = --secrets ] && { show=1; shift; [ $# -eq 0 ] || { echo "$USAGE" >&2; exit 2; }; }
   load_file
   if [ $# -eq 0 ]; then
     for k in ${FKEYS[@]+"${FKEYS[@]}"}; do
-      if [ -n "${!k+x}" ]; then printf '%s=%s\n' "$k" "${!k}"; else printf '%s=%s\n' "$k" "${FVAL[$k]}"; fi
+      if [ -n "${!k+x}" ]; then v="${!k}"; else v="${FVAL[$k]}"; fi
+      if [ "$show" = 0 ] && [ -n "$v" ] && secret_like "$k" "$v"; then v='****'; masked=$((masked+1)); fi
+      printf '%s=%s\n' "$k" "$v"
     done
+    [ "$masked" = 0 ] || echo "cc-config: $masked secret-looking value(s) shown as ****; list KEY or list --secrets prints them" >&2
     return 0
   fi
   for k in "$@"; do                                                # only the keys named, at the value get gives

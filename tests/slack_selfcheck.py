@@ -11207,6 +11207,24 @@ def run_selfcheck():
     check("selfcheck: a config naming another workspace, as the host's does, reaches no case — load_cfg is still the "
           "run's own at the end and registers no workspace but the default",
           globals()["load_cfg"] is fixture_cfg and "SLACK_WORKSPACES" not in pinned_cfg and pinned_ws == {})
+    # A bare `cc-config list` masks what looks like a token, so the bot reads the full dump with --secrets: without it
+    # every SLACK_BOT_TOKEN it loads would be the four stars.
+    cfg_dir = tempfile.mkdtemp(prefix="cc-slack-selfcheck-cfg-")
+    with open(f"{cfg_dir}/config", "w") as f:
+        f.write("SLACK_BOT_TOKEN_SELFCHECK=xoxb-unmasked\n")
+    was_cc_config = os.environ.get("CC_CONFIG")
+    os.environ["CC_CONFIG"] = f"{cfg_dir}/config"
+    try:
+        read_cfg = cfg_source["load"]()
+    finally:
+        if was_cc_config is None:
+            os.environ.pop("CC_CONFIG", None)
+        else:
+            os.environ["CC_CONFIG"] = was_cc_config
+        subprocess.run(["rm", "-rf", cfg_dir])
+        register_workspaces({})
+    check("load_cfg: a token in the config reaches the bot as itself, not as the mask a bare cc-config list prints",
+          read_cfg.get("SLACK_BOT_TOKEN_SELFCHECK") == "xoxb-unmasked")
     denied = list(EFFECTS.denied)
     real_effects.install()
     subprocess.run(["rm", "-rf", scratch_dev])
