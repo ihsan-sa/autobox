@@ -19,7 +19,10 @@ in ~/.cc/state/spend/offsets.json, keyed by full path; a file that shrank or who
 0, one that vanished is forgotten. Assistant records fold to one row per (session, model, UTC day), appended to
 ~/.cc/state/spend/<YYYY-MM-DD>.tsv, the day in the name being UTC's — one ledger, a member's rows beside
 everyone else's. Rows are dated by the RECORD's timestamp, not the tick's, so the first tick backfills every day
-this box already has instead of piling months of history onto today.
+this box already has instead of piling months of history onto today. A test suite's own project dir is skipped:
+the e2e suite runs in the real HOME and writes fixture transcripts under ~/.claude/projects named for its
+`_cc<suite><pid>` repo (`_cctest123-ctx`, or `-home-…--cctest123-w1` once the path is flattened), and a tick that
+caught one booked a fake claude-opus-5 row (2026-10-19).
 
 THE ONE TRAP. A single API response is written as MANY assistant records — one per content block, 15 seen on a
 long turn — and every one carries the FULL usage. Summing records triples the bill. Rows dedupe on requestId, and
@@ -125,6 +128,9 @@ SCRATCH_LANE = "landing"   # checkout a review or a gate round runs in, under th
 COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
 PCOLS = ["ts", "pid", "ppid", "etime_s", "cwd", "repo", "track", "kind", "model", "session"]
 PHCOLS = ["ts", "why", "what", "repo", "track", "kind", "detail", "cwd"]
+# A suite's scratch project dir, as the suite names it or as Claude Code flattens a path holding it (every
+# non-alphanumeric becomes `-`): cc-board's `_cc<suite><pid>`, its leading `_` possibly turned into `-`.
+FIXTURE_DIR = re.compile(r"(?:^|-)[-_]cc[a-z]+\d+(?:-|$)")
 
 # ONE rates table, $ per MILLION tokens: (input, output, cache read). Cache WRITES are 1.25x input at the 5-minute
 # TTL and 2x at the 1-hour one, and `usage.cache_creation` says which of the two a write was — so a write is
@@ -632,7 +638,8 @@ def tick():
     # session transcript from a subagent's.
     tutors = tutor_roots()                     # a tutor's root, not its cwd, says whose it is — see tutor_roots()
     roots = [PROJ] + member_roots() + list(tutors)
-    paths = sorted(((root, p) for root in roots for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)),
+    paths = sorted(((root, p) for root in roots for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
+                    if not FIXTURE_DIR.search(os.path.relpath(p, root).split(os.sep)[0])),
                    key=lambda rp: (is_session_transcript(rp[1], rp[0]), rp[1]))
     live_sub_sessions = set()                  # sessions this walk still finds a subagents/ file under
     for root, path in paths:
@@ -1459,6 +1466,30 @@ def selfcheck():
                said2.returncode == 0 and "s9sessio" in said2.stdout and "unwatched" in said2.stdout)
         finally:
             shutil.rmtree(th2, ignore_errors=True)
+        # A TEST SUITE'S TRANSCRIPT IS NOT SPEND: the e2e suite writes its fixtures into the real ~/.claude/projects,
+        # under its own repo's name or a worktree path holding it. Beside them a real project whose path merely
+        # holds `cc` (the box's own ~/.cc/worktrees) is still counted.
+        thf = tempfile.mkdtemp(prefix="ccspend-fix-")
+        try:
+            def recf(rid):
+                return json.dumps({"type": "assistant", "requestId": rid, "sessionId": rid,
+                                   "timestamp": "2026-09-01T10:00:00.000Z",
+                                   "message": {"model": "claude-opus-5", "id": "m_" + rid,
+                                               "usage": {"input_tokens": 1, "output_tokens": 1,
+                                                         "cache_read_input_tokens": 0,
+                                                         "cache_creation_input_tokens": 0}}}) + "\n"
+            for d, rid in (("_cctest123-ctx", "fx1"), ("-home-u--cc-worktrees--cctest123-w1", "fx2"),
+                           ("-home-u--cc-worktrees-demo-t1", "real")):
+                os.makedirs(os.path.join(thf, ".claude", "projects", d))
+                open(os.path.join(thf, ".claude", "projects", d, rid + ".jsonl"), "w").write(recf(rid))
+            rf = subprocess.run([sys.executable, me, "tick"], env={**os.environ, "HOME": thf},
+                                capture_output=True, text=True)
+            dayf = os.path.join(thf, ".cc", "state", "spend", "2026-09-01.tsv")
+            rowsf = [ln.split("\t") for ln in open(dayf) if not ln.startswith("#")] if os.path.exists(dayf) else []
+            ok("a suite's fixture transcript books no row, under its own name or a flattened worktree path; a real "
+               "project under ~/.cc/worktrees still does", rf.returncode == 0 and [x[1] for x in rowsf] == ["real"])
+        finally:
+            shutil.rmtree(thf, ignore_errors=True)
         # A SUBAGENT's transcript sits one level deeper, <project>/<session>/subagents/*.jsonl, and carries the
         # PARENT's sessionId and a real cwd — so it lands on the parent's session and the parent's lane. The
         # one-level glob this replaced never saw those files at all.
