@@ -314,8 +314,9 @@ STUB
   fresh; seatis "" 1; rm -f "$d/notified"
   id=$(CC_REFUSALS_PERMS_LIVE=0 CC_REFUSALS_NOTIFY=$d/notify sa repo --title "repo deploy" --run "systemctl --user restart x.service" -- 'secret-ish deploy' 2>"$d/err")
   k "$(t jq -e --arg id "$id" 'select(.id == $id and .source == "approval")' "$lg")" "perms down: an approval ask still prints its id and waits in the ledger"
+  k "$(t test -s "$d/notified")" "…the notify stub wrote \$d/notified"
   k "$(t test "$(wc -l < "$d/notified")" = 1)" "…the notify stub received exactly one call"
-  k "$(t grep -q -- '--decision --not-perms --id perms-down:repo:.* -- The permission session is down, so 1 ' "$d/notified")" "…and that the session is down goes out, with the count"
+  k "$(t grep -q -- '--decision --not-perms --id perms-down:repo:.* -- The permission session is down, so 1 ask(s) wait in its ledger' "$d/notified")" "…and that the session is down goes out, with the count"
   k "$(t test -z "$(grep 'secret-ish' "$d/notified")")" "…never the ask itself"
   k "$(t grep -q 'the ask waits in its ledger, and the owner was told it is down' "$d/err")" "…and the caller is told who was told"
   fresh; seatis "" 1; rm -f "$d/notified"

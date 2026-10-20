@@ -57,7 +57,8 @@ def selfcheck():
         # {d}/vanish, tmux's list-panes and new-window remove every queue entry, as a cancel in between would; tmux
         # writes each -S socket it is given to {d}/sockets, is "up" once {d}/up exists, lists the window names in
         # {d}/windows (with -a, the ids in {d}/winids), the pane pid in {d}/panepid, and a new window runs its command
-        # in the background with its -e environment (unless {d}/nospawn), its pid in {d}/panepid, and prints its id and the server pid in {d}/srv
+        # in the background with its -e environment (unless {d}/nospawn), its pid in {d}/panepid, and prints its id and the server pid in {d}/srv;
+        # with {d}/bumpit, new-window stamps `bumped` in every queue entry, as a `cc-room bump` in between would
         os.makedirs(f"{d}/bin")
         for name, body in (("cc-broker", f'echo "$*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
                            ("cc-notify", f'echo "notify $*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
@@ -72,6 +73,8 @@ case "$1" in
   new-window) for a; do last=$a; done; echo "$*" >> "{d}/spawned"
               prev=; for a; do [ "$prev" = -e ] && export "$a"; prev=$a; done   # as tmux does: -e is the window's env
               [ -e "{d}/vanish" ] && for f in "{d}"/room/queue/*; do rm -f "$f"; done
+              [ -e "{d}/bumpit" ] && for f in "{d}"/room/queue/*; do {shlex.quote(sys.executable)} -c \
+                'import json, sys; e = json.load(open(sys.argv[1])); e["bumped"] = 1.0; json.dump(e, open(sys.argv[1], "w"))' "$f"; done
               if [ ! -e "{d}/nospawn" ]; then sh -c "$last" </dev/null >/dev/null 2>&1 & echo $! > "{d}/panepid"; fi
               echo "@7 $(cat "{d}/srv" 2>/dev/null || echo 0)" ;;
 esac''')):
@@ -697,6 +700,24 @@ esac''')):
         t("race: a waiter window whose entry was cancelled after it was looked at is not closed",
           (lines(f"{d}/killed"), len(lines(f"{d}/spawned")) - n0, os.path.exists(e)), ([], 0, False))
 
+        # a `bump` stamped while resume opens the window is the same entry still: resumed, opened kept, stamp kept
+        d = fixture("stamped", cap=1)
+        srv = subprocess.Popen(["sleep", "60"])
+        procs.append(srv)
+        open(f"{d}/srv", "w").write(str(srv.pid))
+        open(f"{d}/up", "w").close()
+        open(f"{d}/nospawn", "w").close()
+        open(f"{d}/bumpit", "w").close()
+        os.makedirs(f"{d}/room/queue")
+        e = f"{d}/room/queue/1-9"
+        json.dump({"pid": 1, "start": "0", "what": "r/st", "cmd": ["true"], "server": ["1", "0"], "queued": time.time()},
+                  open(e, "w"))
+        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        x = read_entry(e)
+        t("stamped: a bump while resume opens the window still resumes it, records the window and keeps the stamp",
+          ("resumed r/st" in r.stdout, "changed meanwhile" in r.stdout, bool(x.get("opened")), x.get("bumped")),
+          (True, False, True, 1.0))
+
         # admit --resume of an entry whose waiter is alive (a fresh --go adopted it first) starts nothing
         d = fixture("twice", cap=1)
         os.makedirs(f"{d}/room/queue")
@@ -714,10 +735,15 @@ esac''')):
         os.makedirs(f"{d}/room/queue", exist_ok=True)
         old = f"{d}/room/queue/1-1"
         json.dump({"pid": 1, "start": "0", "what": "r/again", "cmd": ["true"], "server": ["1", "0"],
-                   "queued": time.time() - 60}, open(old, "w"))
+                   "queued": time.time() - 60, "bumped": 5.0}, open(old, "w"))
         w = subprocess.Popen([sys.executable, __file__, "admit", "r/again", "--", "true"], stderr=subprocess.DEVNULL)
         procs.append(w)
         t("adopt: a new launch of a lost track waits in the lost entry's place", queued("r/again"), old)
+        for _ in range(50):
+            if read_entry(old).get("pid") == w.pid:
+                break
+            time.sleep(0.1)
+        t("adopt: …and keeps its bump", (read_entry(old).get("pid"), read_entry(old).get("bumped")), (w.pid, 5.0))
 
         # NOTICE: a wait past the bound tells the seat that dispatched it, once; a wait under it tells nobody
         d = fixture("notice", cap=1)
@@ -733,6 +759,20 @@ esac''')):
           bool(told) and told[0].startswith("inject --no-start --source room r@comms r/slow has waited")
           and "cc-room cancel r/slow" in told[0], True)
         t("notice: …and the loop log says who was told", "told r@comms" in open(f"{d}/loop.log").read(), True)
+        # a bump made while the notice goes out survives the waiter's write after it
+        d = fixture("noticebump", cap=1)
+        os.environ["CC_ROOM_NOTICE_AFTER"] = "1"
+        open(f"{d}/bin/cc-broker", "w").write(f'#!/bin/sh\n{shlex.quote(sys.executable)} {shlex.quote(__file__)} '
+                                              f'bump r/nb >/dev/null\necho "$*" >> "{d}/told"\n')
+        holder("r/held")
+        w = subprocess.Popen([sys.executable, __file__, "admit", "r/nb", "--", "true"],
+                             env=dict(os.environ, CC_SLACK_ALIAS="comms"), stderr=subprocess.DEVNULL)
+        procs.append(w)
+        e = queued("r/nb")
+        time.sleep(3)
+        x = read_entry(e) if e else {}
+        t("noticebump: a bump stamped during notice delivery is kept in the entry the waiter writes after it",
+          (len(lines(f"{d}/told")), x.get("noticed"), bool(x.get("bumped"))), (1, True, True))
         d = fixture("scratch")
         notice(f"_cctest{os.getpid()}/t", {"queued": time.time() - 7200, "target": "r@comms"}, "x", f"{d}/loop.log")
         t("notice: a suite's scratch launch (cc-board's FIXTURE prefix) tells nobody, and the log says so",
@@ -779,9 +819,10 @@ esac''')):
         rec = {"queued": time.time() - 7200, "target": "r@comms", "notice_tries": UNHEARD_AFTER}
         said = unheard("r/deaf", rec, "the host is busy", f"{d}/loop.log")
         told = lines(f"{d}/told")
-        t("unheard: after UNHEARD_AFTER refused tries it says so once in the repo's channel, naming how to cancel",
+        t("unheard: after UNHEARD_AFTER refused tries it says so once in the repo's channel, naming cancel, bump and now",
           (said, len(told), bool(told) and "--major --id room-unheard:r/deaf:" in told[0]
-           and "cc-room cancel r/deaf" in told[0]), (True, 1, True))
+           and "cc-room cancel r/deaf" in told[0] and "cc-room bump r/deaf" in told[0]
+           and "cc-room now r/deaf" in told[0]), (True, 1, True))
         os.chmod(f"{d}/bin/cc-notify", 0o644)
         t("unheard: a channel that refuses too is logged, and the entry does not call it said",
           (unheard("r/deaf", rec, "x", f"{d}/loop.log"), "could not say in the channel" in open(f"{d}/loop.log").read()),
@@ -913,6 +954,10 @@ esac''')):
         time.sleep(1)
         t("heavy: a heavy run waits while the heavy cap is held", os.path.exists(mark), False)
         t("heavy: …and heavy runs take no worker slot", why_not(), "")
+        subprocess.run([sys.executable, __file__, "bump", "anneal-b"], capture_output=True)
+        r = subprocess.run([sys.executable, __file__, "status"], capture_output=True, text=True)
+        t("heavy: status names a bumped heavy run as bumped", "heavy queued anneal-b" in r.stdout
+          and "— bumped" in r.stdout.split("heavy queued anneal-b")[1].split("\n")[0], True)
         h.kill()
         h.wait()
         w.wait(timeout=20)
