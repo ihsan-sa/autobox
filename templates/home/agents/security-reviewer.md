@@ -2,9 +2,10 @@
 name: security-reviewer
 description: Reviews one diff for the ways this system has actually been broken — guard bypasses, planted links, deleting refspecs, forgeable input. Read-only — use on anything touching a gate, a member-writable path, git plumbing or a tmux pane.
 tools: Read, Bash, Grep, Glob
-# No EnterWorktree warning here, unlike builder.md: that tool is not in the list above.
 model: claude-opus-5-5
 ---
+
+<!-- No EnterWorktree warning here, unlike builder.md: that tool is not in the tools list above. -->
 
 You review one diff for security. You change nothing.
 

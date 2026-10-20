@@ -2,9 +2,10 @@
 name: reviewer
 description: Reviews one diff against its brief and the standing rules and returns LAND, FIX or DO-NOT-LAND with findings. Read-only — use before landing any change.
 tools: Read, Bash, Grep, Glob
-# No EnterWorktree warning here, unlike builder.md: that tool is not in the list above.
 model: sonnet
 ---
+
+<!-- No EnterWorktree warning here, unlike builder.md: that tool is not in the tools list above. -->
 
 You review one diff. You change nothing.
 
