@@ -4575,6 +4575,7 @@ class Daemon:
         self.hello_said = set()                             # (peer pid, why) of a refused hello already logged: a dead session's channel server re-sends it every 3 s (156k of 158k journal lines in 41 h)
         self.bot_user = None
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
+        self.team_id = None                                 # our own T… id (auth.test): public_channel reads only this workspace's channels
         self.ws_up = {}                                     # extra workspace -> {bot_user, bot_id, connected} (run_workspace)
         self.ws_dropped = set()                             # (workspace, chat) whose drop ws_ingress already logged
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
@@ -5029,6 +5030,16 @@ class Daemon:
         if (not cid.startswith("C") or ch.get("id") != cid or ch.get("is_private") is not False or not ch.get("is_channel")
                 or ch.get("is_im") or ch.get("is_mpim") or ch.get("is_group")):
             return None, f"{s} is not a public channel"
+        # A bare C id names no workspace, and a Slack Connect channel shared in from another org is public there too.
+        # So the channel must say it is ours (context_team_id) and be shared with no other team; a channel that names
+        # no team, or a team the bot cannot learn, is refused rather than guessed.
+        try:
+            team = self.team_id = self.team_id or api("auth.test", tok).get("team_id")
+        except Exception as e:
+            return None, f"{s}: cannot learn this workspace's team ({str(e)[:80]})"
+        if (not team or ch.get("context_team_id") != team or any(t != team for t in ch.get("shared_team_ids") or ())
+                or ch.get("is_ext_shared") or ch.get("is_org_shared")):
+            return None, f"{s} is not a channel of this workspace"
         mail = (self.cfg.get("MAIL_CHANNEL") or "").strip().lstrip("#").lower()
         if mail and mail in (cid.lower(), (ch.get("name") or "").lower()):
             return None, f"{s} is the mail channel"
@@ -8959,7 +8970,7 @@ class Daemon:
         while True:
             try:
                 me = api("auth.test", tok)
-                self.bot_user, self.bot_id = me["user_id"], me.get("bot_id"); BOT_ME[tok] = self.bot_user; break
+                self.bot_user, self.bot_id, self.team_id = me["user_id"], me.get("bot_id"), me.get("team_id"); BOT_ME[tok] = self.bot_user; break
             except Exception as e:
                 log(f"auth.test failed ({e}); retry in 30s"); time.sleep(30)
         if not self.cfg.get("SLACK_OWNER_ID"):

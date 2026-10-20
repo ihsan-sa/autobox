@@ -13530,17 +13530,27 @@ def run_selfcheck():
     # picks the channel, so only a public C channel answers (perms, 2026-10-20). Each refused kind is asked for by id
     # and by the #name that resolves to it; resolve_channel lists private channels too, so the info is what refuses.
     dmPR = Daemon(use_slack=False); dmPR.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "MAIL_CHANNEL": "#inbox"}
-    infoPR = {"CPUB": {"is_channel": True, "is_private": False, "name": "general"},
+    infoPR = {"CPUB": {"is_channel": True, "is_private": False, "name": "general", "context_team_id": "TOURS", "shared_team_ids": ["TOURS"]},
               "CPRIV": {"is_channel": True, "is_private": True, "name": "secret"},
               "CGRP": {"is_channel": False, "is_group": True, "is_private": True, "name": "oldsecret"},
               "CIM": {"is_im": True, "is_private": True},
               "CMPIM": {"is_mpim": True, "is_channel": False, "is_private": True, "name": "mpdm-a--b-1"},
-              "CMAIL": {"is_channel": True, "is_private": False, "name": "inbox"},
-              "CBARE": {"is_channel": True, "name": "unsaid"}}            # says neither way: not public
-    namesPR = {"general": "CPUB", "secret": "CPRIV", "oldsecret": "CGRP", "dm": "CIM", "mpdm-a--b-1": "CMPIM", "inbox": "CMAIL", "unsaid": "CBARE"}
+              "CMAIL": {"is_channel": True, "is_private": False, "name": "inbox", "context_team_id": "TOURS"},
+              "CBARE": {"is_channel": True, "name": "unsaid"},            # says neither way: not public
+              # public, but of another workspace: its own, shared in from another org, or naming no team at all
+              "CFOREIGN": {"is_channel": True, "is_private": False, "name": "theirs", "context_team_id": "TOTHER", "shared_team_ids": ["TOTHER"]},
+              "CCONNECT": {"is_channel": True, "is_private": False, "name": "joint", "context_team_id": "TOURS",
+                           "shared_team_ids": ["TOURS", "TOTHER"], "is_ext_shared": True},
+              "CNOTEAM": {"is_channel": True, "is_private": False, "name": "teamless"}}
+    teamPR = ["TOURS"]                                               # what auth.test says; emptied, it fails
+    namesPR = {"general": "CPUB", "joint": "CCONNECT", "secret": "CPRIV", "oldsecret": "CGRP", "dm": "CIM", "mpdm-a--b-1": "CMPIM", "inbox": "CMAIL", "unsaid": "CBARE"}
     callsPR = []
     def api_pr(method, token, **kw):
         callsPR.append((method, kw.get("channel")))
+        if method == "auth.test":
+            if not teamPR:
+                raise RuntimeError("invalid_auth")
+            return {"user_id": "UBOT", "team_id": teamPR[0]}
         if method == "conversations.info":
             if kw["channel"] not in infoPR:
                 raise RuntimeError("channel_not_found")
@@ -13582,6 +13592,11 @@ def run_selfcheck():
                              "D0ABC", "U0ABC", "G0ABC", "general", "", "C1; x")}
         reads_refused = [m for m, c in callsPR if m in ("conversations.history", "conversations.replies")]
         r_pr_member = pr_req({"history": "CPUB"}, member="alice")   # a member socket still has only its own channels
+        callsPR.clear()
+        foreign = {(v, q): pr_req({v: q, "ts": "1.0"}) for v in ("history", "thread") for q in ("CFOREIGN", "CCONNECT", "CNOTEAM", "#joint")}
+        dmPR.team_id = None; teamPR.clear()                      # the bot cannot learn its own team: nothing is read
+        foreign[("history", "CPUB, no team")] = pr_req({"history": "CPUB"})
+        reads_foreign = [m for m, c in callsPR if m in ("conversations.history", "conversations.replies")]
     finally:
         globals().update(real_pr)
     check("OWNER socket: history and thread read a public C channel, by id or by #name, oldest first",
@@ -13593,6 +13608,11 @@ def run_selfcheck():
           all(r.get("ok") is False and r.get("error") for r in refused.values()) and reads_refused == []
           and "mail channel" in refused[("history", "#inbox")]["error"] and "not a public channel" in refused[("thread", "#secret")]["error"]
           and r_pr_member.get("ok") is False)
+    check("OWNER socket: a public C id of another Slack workspace, a channel shared in from another team, one naming "
+          "no team, and any channel while the bot's own team is unknown are refused, and nothing is read",
+          all(r.get("ok") is False and r.get("error") for r in foreign.values()) and reads_foreign == []
+          and "not a channel of this workspace" in foreign[("history", "CFOREIGN")]["error"]
+          and "cannot learn" in foreign[("history", "CPUB, no team")]["error"])
 
     shutil.rmtree(scratch_dev, ignore_errors=True); globals()["DEV"] = real_dev
     leaked = sorted(n for n in (set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()) - dev_before
