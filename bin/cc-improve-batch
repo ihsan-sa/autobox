@@ -28,9 +28,9 @@ group with no model at all.
 
 MODELS, cheapest that holds: pass 1 and the fix picking of pass 3 on IMPROVE_BATCH_MODEL (sonnet), pass 2 on
 IMPROVE_BATCH_SMALL_MODEL (haiku), the quiet-fix judge and pass 4 on IMPROVE_BATCH_JUDGE_MODEL (opus). Every call is
-`claude -p` with no tools and one turn. IMPROVE_BATCH_BUDGET dollars (default 3) is a ceiling that alerts: its first
-crossing posts one ambient cc-notify line, the pass in hand finishes (its calls under OVER_CALL each), and the day
-stops before the next pass. The report and stdout say what the day cost, per pass. Under a spend tier that holds `goals`
+`claude -p` with no tools and one turn. IMPROVE_BATCH_BUDGET dollars (default 3) is a backstop that alerts and never
+stops work: its first crossing posts one ambient cc-notify line and every pass still runs. A single call costing more
+than OVER_CALL ($0.50) posts one line too, and is never cut off. The report and stdout say what the day cost, per pass. Under a spend tier that holds `goals`
 (cc-tier), it spends nothing and exits 0.
 
 OUTPUT, in ~/.cc/state/improve/reports/ (or --out DIR): <day>.md, the ranked report, and <day>.jsonl, one finding per
@@ -112,62 +112,55 @@ class ModelFailed(Exception):
     pass
 
 
-OVER_CALL = 0.50   # the per-call ceiling once the day's budget is crossed and the pass in hand is being finished
+OVER_CALL = 0.50   # one call costing more than this says so once; the call is never cut off
 
 
 class Models:
-    """Every model call goes through here, so the day's cost is counted in one place. The budget alerts rather than
-    cuts (owner 10-16): crossing it says so once, the pass in hand finishes with each further call under OVER_CALL,
-    and next_item() is where a crossed day stops."""
+    """Every model call goes through here, so the day's cost is counted in one place. Its dollar figures alert and never
+    stop work (owner 10-16/20): crossing the day's budget says so once, a single call over OVER_CALL says so once, and
+    every pass still runs."""
 
     def __init__(self, budget, workdir):
-        self.budget, self.workdir, self.cost, self.said, self.stopped = budget, workdir, {}, False, False
+        self.budget, self.workdir, self.cost, self.said = budget, workdir, {}, set()
 
     def spent(self):
         return sum(self.cost.values())
 
-    def crossed(self):
-        """True once the budget is spent; the first time, one ambient cc-notify line (--id keeps it to one a day).
-        CC_JOB_NOTIFY: test hook."""
-        if self.budget - self.spent() >= 0.05:
-            return False
-        if not self.said:
-            self.said = True
-            note = os.environ.get("CC_JOB_NOTIFY") or os.path.join(BIN, "cc-notify")
-            try:
-                subprocess.run([note, "-t", "cc-improve-batch budget crossed", "--id",
-                                f"budget:cc-improve-batch:{time.strftime('%Y-%m-%d')}", "--",
-                                f"cc-improve-batch: the day's ${self.budget:.2f} budget is crossed (${self.spent():.2f} so far). "
-                                "It finishes the pass it is on and stops there; nothing is cut off mid-pass."],
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
-            except (OSError, subprocess.SubprocessError):
-                pass
-        return True
-
-    def next_item(self):
-        """Between passes: a crossed budget stops the day here. Every later call refuses, so each pass falls back as it
-        does on a failed call (pass 2 keeps its groups with no model)."""
-        self.stopped = self.stopped or self.crossed()
+    def say(self, kind, what, figure, cost):
+        """One ambient cc-notify line the first time `kind` is crossed (--id keeps it to one a day). CC_JOB_NOTIFY: test hook."""
+        if kind in self.said:
+            return
+        self.said.add(kind)
+        note = os.environ.get("CC_JOB_NOTIFY") or os.path.join(BIN, "cc-notify")
+        try:
+            subprocess.run([note, "-t", "cc-improve-batch budget crossed", "--id",
+                            f"{kind}:cc-improve-batch:{time.strftime('%Y-%m-%d')}", "--",
+                            f"cc-improve-batch: {what}'s ${figure:.2f} budget is crossed (${cost:.2f} so far). "
+                            "The work goes on; this is the one notice."],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def ask(self, pass_name, prompt):
-        if self.stopped:
-            raise ModelFailed(f"the day's budget of ${self.budget:.2f} is spent (the pass it crossed in finished)")
         key, default = PASS_MODEL[pass_name]
         model = conf(key, default)
-        left = OVER_CALL if self.crossed() else self.budget - self.spent()
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
         env["CC_ROLE"] = "improve-batch"
         claude = os.environ.get("CC_CLAUDE") or home(".local", "bin", "claude")
         try:
             p = subprocess.run([claude, "-p", "--model", model, "--tools", "", "--strict-mcp-config",
                                 "--setting-sources", "", "--disable-slash-commands", "--max-turns", "1",
-                                "--no-session-persistence", "--output-format", "json",
-                                "--max-budget-usd", f"{left:.2f}"],
+                                "--no-session-persistence", "--output-format", "json"],
                                input=prompt, capture_output=True, text=True, timeout=CALL_TIMEOUT, env=env, cwd=self.workdir)
             d = json.loads(p.stdout)
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             raise ModelFailed(f"{model}: {cut(e, 160)}")
-        self.cost[pass_name] = self.cost.get(pass_name, 0.0) + float(d.get("total_cost_usd") or 0)
+        cost = float(d.get("total_cost_usd") or 0)
+        self.cost[pass_name] = self.cost.get(pass_name, 0.0) + cost
+        if cost > OVER_CALL:
+            self.say("call", f"one {model} call", OVER_CALL, cost)
+        if self.budget - self.spent() < 0.05:
+            self.say("budget", "the day", self.budget, self.spent())
         r = d.get("result")
         if d.get("is_error") or not isinstance(r, str):
             raise ModelFailed(f"{model}: {cut(r or d.get('subtype') or 'no result', 160)}")
@@ -497,11 +490,11 @@ def pass_fixes(snap, models, day, found, notes, errors):
 
 
 def pass_ideas(models, found, checks, notes, errors):
-    top = sorted(found, key=lambda f: (TIER[f["pass"]], -f["cost"] * f["freq"]))[:10]
+    top = sorted(found, key=lambda f: (TIER[f["pass"]], -f["cost"] * f["freq"]))
     if not top:
         return []
     covered = [f"{c['measure']}: {c['fix']} ({c['verdict']})" for c in checks]
-    prompt = ("PASS: ideas\nThese are today's worst findings on a self-running server that an owner steers from his phone, and "
+    prompt = ("PASS: ideas\nThese are today's findings, worst first, on a self-running server that an owner steers from his phone, and "
               "the fixes already built for them. Suggest at most four improvements that nothing covers yet, each one a thing "
               "the box would do unasked. Do not repeat a covered fix; if a covered fix went quiet, the answer is to repair it, "
               "not to suggest it again.\nReply with only a JSON array: "
@@ -593,17 +586,13 @@ def run(snapshot, out):
     models = Models(float(conf("IMPROVE_BATCH_BUDGET", "3")), work)
     notes, errors, findings = {}, {}, []
     try:
-        models.next_item()   # each pass is an item: a budget crossed inside one lets it finish, the next is where the day stops
         try:
             findings += pass_nudges(snap, models, out, day, notes)
         except ModelFailed as e:
             errors["nudges"] = str(e)
-        models.next_item()
         findings += pass_failures(snap, models, out, day, notes, errors)
-        models.next_item()
         quiet, checks = pass_fixes(snap, models, day, findings, notes, errors)
         findings += quiet
-        models.next_item()
         findings += pass_ideas(models, findings, checks, notes, errors)
         cost, per = write_report(out, day, snap, findings, checks, notes, errors, models)
     finally:
@@ -631,7 +620,7 @@ r = {"nudges": [{"i": 0, "class": "status-not-pushed"}, {"i": 1, "class": "statu
                     {"measure": "nudge:landing-chase", "fix": "bad", "ref": "r 0", "source": "nowhere", "regex": "x"}],
      "fixes-judge": [{"n": 0, "verdict": "quiet", "why": "the owner asked twice and no digest went out"}],
      "ideas": [{"title": "tell the owner when a PR lands", "addresses": ["nudge:landing-chase"], "why": "he asked", "cost": 2, "freq": 1}]}[pass_]
-print(json.dumps({"is_error": False, "result": "Here:\n```json\n" + json.dumps(r) + "\n```", "total_cost_usd": 0.02}))
+print(json.dumps({"is_error": False, "result": "Here:\n```json\n" + json.dumps(r) + "\n```", "total_cost_usd": float(os.environ.get("STUB_COST", "0.02"))}))
 '''
 
 

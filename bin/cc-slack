@@ -1582,12 +1582,20 @@ def is_voice_memo(f):
             or str(f.get("mimetype") or "").lower().startswith("audio/")) and f.get("mode") != "external"
 
 def voice_text(path, timeout=VOICE_MAX):
-    """The memo as {"transcript", "condensed"}, or None; every failure falls back to the plain attachment line."""
+    """The memo as {"transcript", "condensed"}, or None; every failure falls back to the plain attachment line.
+    A member can swap its files dir or plant the memo's name as a link (or a hard link) to an owner file, so the memo
+    is opened once by open_member_file, no link followed and only a plain file taken, and cc-voice is handed a private
+    copy of the bytes read through that fd, never the name (perms 10-20)."""
     try:
-        p = EFFECTS.run([f"{BIN}/cc-voice", "text", path], stdin=subprocess.DEVNULL,
-                        capture_output=True, text=True, timeout=timeout)
+        fd = open_member_file(path, [os.path.dirname(path)])
+        with os.fdopen(fd, "rb") as r, tempfile.TemporaryDirectory(prefix="cc-voice-") as td:
+            copy = os.path.join(td, os.path.basename(path))
+            with open(copy, "wb") as w:
+                shutil.copyfileobj(r, w)
+            p = EFFECTS.run([f"{BIN}/cc-voice", "text", copy], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=timeout)
     except Exception as e:
-        log(f"voice: cc-voice did not finish for {os.path.basename(path)} ({e.__class__.__name__})"); return None
+        log(f"voice: no transcript for {os.path.basename(path)} ({e!r})"); return None
     if p.returncode != 0:
         log(f"voice: no transcript for {os.path.basename(path)} — {(p.stderr or '').strip()[-200:]}"); return None
     try:
@@ -7565,7 +7573,8 @@ class Daemon:
     def save_file(self, f, url, path):
         """Streams one attachment to `path` in 1 MB chunks, with no size cap: refused (DiskFull) when it would leave
         under DISK_FLOOR free on that filesystem. A symlink at the dir or the name is refused (OSError), never followed.
-        A failed download leaves no partial file behind. Its size stays reserved (disk_room) until it has landed."""
+        A failed download leaves no partial file behind. Its size stays reserved (disk_room) until it has landed, and a
+        body that runs past that size is refused the same way once what's past it would cross the floor."""
         tok = self.cfg.get("SLACK_BOT_TOKEN")
         ftok = WS["extra"][f["_ws"]]["bot"] if f.get("_ws") in WS["extra"] else tok   # ws_ingress marks another workspace's files
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ftok}"})
@@ -7588,6 +7597,8 @@ class Daemon:
                 try:
                     with os.fdopen(fd, "wb") as w, slack_open(req, 60) as r:
                         while chunk := r.read(1 << 20):
+                            if len(chunk) > owed:   # past its declared size (or none was declared): the reservation is
+                                disk_room(dfd, len(chunk) - owed)   # spent, so each byte beyond it re-checks the floor
                             w.write(chunk)
                             n = min(len(chunk), owed); owed -= n; disk_release(dev, n)   # on disk now: free space counts it
                 except BaseException:

@@ -139,6 +139,13 @@ FAKE
   k "$(t sh -c 'for f in --tools --setting-sources --strict-mcp-config --disallowedTools; do
                   grep -qF -- "$f" "$1" || exit 1; done' sh "$d/argv")" \
     "the call carries its whole wall: no tools, no settings file, no MCP server, and the escape hatches named — \`Bash\` alone is not enough, a probe once reached the shell through \`Monitor\`"
+  k "$(t sh -c '! grep -qE -- "--max-(turns|budget-usd)" "$1"' sh "$d/argv")" \
+    "…and no turn cap and no dollar cap: CC_EVALS_BUDGET is a notice figure, never on the call"
+  # THE NOTICE, on its own fixture: a question that cost $0.90 against a $0.50 figure still answers, and says so once
+  : > "$d/calls"; : > "$d/argv"
+  out=$(A '{"is_error":false,"result":"PRICEY","total_cost_usd":0.90}' ask <<<'q')
+  k "$(t sh -c '[ "$(printf "%s\n" "$1" | grep -c "past CC_EVALS_BUDGET \$0.50 (a notice, not a cap)")" = 1 ] && printf "%s\n" "$1" | grep -qx PRICEY' sh "$out")" \
+    "a question past CC_EVALS_BUDGET still answers and says so once — a notice, not a cap"
   # THE DRIFT CASE. cc-audit's SECRET_PATHS is the canonical list and is READ from that file, never spelled out
   # again here: hand-copying it is what left .cc/secrets out of three files and .cc/members out of six. MISSING,
   # never DIFFERENT — this call may deny more than cc-audit does and may never deny less. A cc-audit that cannot

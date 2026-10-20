@@ -879,6 +879,9 @@ out=$("$B/cc-context" $REPO w1 2>&1)
 aout=$("$B/cc-context" --all 2>"$T/all.err"); rc=$?
 { [ $rc = 0 ] && grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" <<<"$aout"; } \
   && ok "--all names the track off the file's cwd, nine columns" || bad "--all: rc=$rc $(grep "	w1	" <<<"$aout") $(tail -3 "$T/all.err")"
+# the reader closes before cc-context writes (`true` has exited by the time python starts): exit 0, nothing on stderr
+"$B/cc-context" --all 2>"$T/pipe.err" | true; prc=${PIPESTATUS[0]}
+{ [ $prc = 0 ] && [ ! -s "$T/pipe.err" ]; } && ok "--all with a reader that closed the pipe exits 0, silent" || bad "--all | true: rc=$prc $(tail -3 "$T/pipe.err")"
 lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 18% handoff!" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column: $lsout"
 rm -f "$CC_STATUSLINE_DIR/$sid.json"
 # A HEADLESS WORKER DRAWS NO STATUS LINE. `claude -p` — every `--go` track — writes no status-line file at all, so
@@ -1631,7 +1634,7 @@ amiss=""
 printf '#!/usr/bin/env bash\nprintf "%%s alias=%%s\\n" "$*" "${CC_SLACK_ALIAS:-}" >> "%s"\n' "$T/mo.argv" > "$AM/cc-sandbox"; chmod +x "$AM/cc-sandbox"
 : > "$T/mo.argv"; : > "$T/am.argv"; am __runorch alice helper
 mo_in=$(cat "$T/mo.argv"); mo_bare=$(cat "$T/am.argv"); : > "$T/mo.argv"; : > "$T/am.argv"; am __runorch other a1
-grep -qE -- '^member alice  -- .*--model claude-sonnet-5.* alias=helper$' <<<"$mo_in" && ! grep -q -- '--remote-control' <<<"$mo_in" && [ -z "$mo_bare" ] \
+grep -qE -- '^member alice  -- .*--model claude-opus-5-5\[1m\] alias=helper$' <<<"$mo_in" && ! grep -q -- '--remote-control' <<<"$mo_in" && [ -z "$mo_bare" ] \
   && [ ! -s "$T/mo.argv" ] && grep -q -- '--remote-control other@a1' "$T/am.argv" \
   && ok "a member orch runs inside \`cc-sandbox member alice \"\"\` with CC_SLACK_ALIAS=helper on the member model and no --remote-control, while another repo's orch is still the owner's" \
   || bad "member __runorch not in the boundary: sandbox='$mo_in' bare='$mo_bare' other='$(cat "$T/am.argv")'"

@@ -2,10 +2,11 @@
 """cc-autoresearch — point a measured keep-or-discard loop at something you want to improve.
 
   cc-autoresearch run   --target PATH [--target PATH ...] --metric "CMD" --direction min|max --goal "TEXT"
-                        (--max-trials N | --max-usd X) [--trial-timeout S] [--metric-timeout S] [--repeat N]
+                        [--max-trials N] [--max-usd X] [--trial-timeout S] [--metric-timeout S] [--repeat N]
                         [--min-delta D] [--ruler PATH ...] [--model M] [--trial-usd X] [--max-minutes M]
                         [--out DIR] [--notify WINDOW] [--dir WORKTREE]
-      Run trials in the worktree (default: the current directory) until a cap is reached, then print the best score
+      Run trials in the worktree (default: the current directory) until a cap given or a pause stops it (with
+      neither it runs until the project is paused), then print the best score
       against the baseline. exit 0 when the run finished (kept or not), 2 when it refused to start or stopped early.
   cc-autoresearch start ...the same arguments
       The same run, detached: it returns once the run has started and prints the results directory. The run outlives
@@ -45,13 +46,14 @@ back to back, as two lines with trial `end` (recheck-baseline, recheck-best), an
 second look confirms the win. A metric that moves more between runs than --min-delta keeps luck; this says so.
 
 IT STOPS ON ITS OWN at --max-trials, --max-usd (the agents' summed cost as claude reports it) or --max-minutes,
-whichever comes first, and at no other point except the ruler check above and a pause: `cc-pause is <project>` is
+whichever comes first, when the caller gives any (none is needed: no cap is the default), and at no other point except the ruler check above and a pause: `cc-pause is <project>` is
 asked before every trial (the project is the main checkout's directory name), and a paused project gets no more. At the end it writes DIR/summary.txt and,
 with --notify WINDOW, wakes that window ONCE with the same line through cc-msg. A headless caller reads summary.txt,
 or watches for it: it is written last and only once.
 
 DIR defaults to ~/.cc/state/autoresearch/<worktree name>-<UTC stamp>/. The agent is `claude -p` on --model (default
-sonnet) with --trial-usd (default 1.00) as its own budget and --trial-timeout (default 900 s) as its wall clock.
+sonnet) with --trial-timeout (default 900 s) as its wall clock, and --trial-usd as its own budget when given (by
+default a trial has none).
 The metric gets --metric-timeout (default 300 s) per run and prints its number on the last non-empty line of stdout.
 CC_AUTORESEARCH_AGENT replaces the agent with an executable (the prompt on stdin, cwd the worktree; it prints the JSON
 claude would, or plain text) and CC_AUTORESEARCH_MSG replaces cc-msg: both exist for the selfcheck. Stdlib only, and
@@ -204,8 +206,9 @@ def agent(wt, text, a):
     fake = os.environ.get("CC_AUTORESEARCH_AGENT")
     cmd = [fake] if fake else [CLAUDE, "-p", "--model", a.model, "--allowedTools", TOOLS, "--disallowedTools", DENY_TOOLS,
                                "--permission-mode", "acceptEdits", "--strict-mcp-config", "--setting-sources", "",
-                               "--disable-slash-commands", "--no-session-persistence", "--output-format", "json",
-                               "--max-budget-usd", f"{a.trial_usd:.2f}"]
+                               "--disable-slash-commands", "--no-session-persistence", "--output-format", "json"]
+    if not fake and a.trial_usd is not None:
+        cmd += ["--max-budget-usd", f"{a.trial_usd:.2f}"]
     try:
         p = subprocess.run(cmd, input=text, cwd=wt, capture_output=True, text=True, timeout=a.trial_timeout,
                            start_new_session=True)
@@ -425,7 +428,7 @@ def parser():
     p.add_argument("--min-delta", type=float, default=0.0)
     p.add_argument("--ruler", action="append", default=[])
     p.add_argument("--model", default="sonnet")
-    p.add_argument("--trial-usd", type=float, default=1.0)
+    p.add_argument("--trial-usd", type=float)
     p.add_argument("--out")
     p.add_argument("--notify")
     return p
@@ -440,9 +443,6 @@ def main(argv):
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
     a = parser().parse_args(argv[1:])
-    if a.max_trials is None and a.max_usd is None:
-        print("cc-autoresearch: refused: give a cap, --max-trials N or --max-usd X", file=sys.stderr)
-        return 2
     if a.repeat < 1:
         print("cc-autoresearch: --repeat must be at least 1", file=sys.stderr)
         return 2
@@ -667,11 +667,21 @@ def selfcheck():
         rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt')
         ok("dirty: uncommitted work outside the target is refused", rc == 2 and "other.txt" in txt and not rows)
         ok("dirty: and left alone", "wip" in read(r, "other.txt"))
+        # no cap is the default: the run goes on until something stops it (here a pause that lands before trial 5)
         r = repo("nocap")
-        os.environ.update(CC_AUTORESEARCH_AGENT="/bin/false")
-        with contextlib.redirect_stderr(io.StringIO()) as e:
-            rc = main(["run", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "g"])
-        ok("cap: a run with no cap is refused", rc == 2 and "give a cap" in e.getvalue())
+        stop = os.path.join(root, "pause-after-4")
+        with open(stop, "w") as fh:
+            fh.write("#!/bin/sh\nc=$(cat \"$0.n\" 2>/dev/null || echo 0); c=$((c+1)); echo $c > \"$0.n\"; [ $c -gt 4 ]\n")
+        os.chmod(stop, 0o755)
+        os.environ.update(CC_AUTORESEARCH_AGENT=fake_agent("nocap", 'echo "CHANGE: nothing"'), CC_AUTORESEARCH_PAUSE=stop)
+        out = os.path.join(root, "out-nocap")
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["run", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "g",
+                       "--metric-timeout", "5", "--out", out])
+        n = len(open(os.path.join(out, "results.tsv")).read().splitlines()) - 2 if os.path.isfile(os.path.join(out, "results.tsv")) else -1
+        ok("cap: a run with no cap starts and runs trials until something stops it", n == 4 and "pause" in o.getvalue())
+        ok("cap: and a trial has no dollar budget unless --trial-usd gives one",
+           parser().parse_args(["--target", "t", "--metric", "m", "--direction", "min", "--goal", "g"]).trial_usd is None)
 
         # 8 AGENT FAILS: a non-zero agent is agent-failed and its half-edit is put back
         r = repo("agentfail")

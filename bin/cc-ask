@@ -48,8 +48,10 @@ outside the register; without cc-docs, or without --documents, there is no looku
 EVERY RUN IS A LINE in ~/.cc/state/ask/runs.jsonl (ts, repo, model, cost, turns, tokens, seconds, outcome, the tools it ran): with
 `--no-session-persistence` there is no transcript for cc-spend to price, so this is where the lane's spend is read.
 
-Knobs (env, else ~/.cc/config): CC_ASK_MODEL (sonnet) · CC_ASK_BUDGET (0.25 USD) · CC_ASK_TURNS (12) ·
-CC_ASK_TIMEOUT (120 s) · CC_ASK_PACKET (4096 bytes of cc-lib packet).
+Knobs (env, else ~/.cc/config): CC_ASK_MODEL (sonnet) · CC_ASK_TIMEOUT (120 s) · CC_ASK_PACKET (4096 bytes of
+cc-lib packet) · CC_ASK_BUDGET (0.25 USD), a notice and not a cap: a run that cost more says so once, on stderr and as
+`over_budget` in its log line, and is never stopped · CC_ASK_TURNS (unset), an opt-in turn cap: no --max-turns unless
+it is set.
 """
 import sys, os, json, re, time, subprocess, contextlib
 
@@ -171,6 +173,16 @@ def prompt(repo, question, context, pkt, tool_out=()):
     return "\n\n".join(parts)
 
 
+def over_budget(cost):
+    """The backstop: CC_ASK_BUDGET (0.25 USD) is a figure to notice, never a cap. A run whose reported cost passed it
+    returns the figure (answer() says so once, on stderr and in the run's log line); under it, or unreadable, None."""
+    try:
+        budget = float(conf("CC_ASK_BUDGET", "0.25"))
+        return budget if float(cost or 0) > budget else None
+    except (TypeError, ValueError):
+        return None
+
+
 def model(repo, text, timeout):
     """One `claude -p`. Returns (reply or None, usage dict). CC_ASK_FAKE (selfcheck) is the JSON claude would print."""
     fake = os.environ.get("CC_ASK_FAKE")
@@ -184,11 +196,14 @@ def model(repo, text, timeout):
         os.makedirs(cwd, exist_ok=True)
         env = dict(os.environ, CC_ROLE="steward", MAX_THINKING_TOKENS=str(int(conf("CC_ASK_THINK", 0))))
         try:
+            # No turn or dollar cap by default: an ask runs until it has its answer. CC_ASK_TURNS, when set, is an
+            # opt-in turn cap; CC_ASK_BUDGET is only the figure answer() notices once past (see over_budget).
+            turns = conf("CC_ASK_TURNS", "")
             p = subprocess.run([CLAUDE, "-p", "--model", conf("CC_ASK_MODEL", "sonnet"),
                                 "--allowedTools", TOOLS, "--disallowedTools", deny(),
                                 "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
-                                "--max-turns", conf("CC_ASK_TURNS", "12"), "--no-session-persistence",
-                                "--output-format", "json", "--max-budget-usd", conf("CC_ASK_BUDGET", "0.25")],
+                                *(["--max-turns", turns] if turns else []), "--no-session-persistence",
+                                "--output-format", "json"],
                                input=text, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         except subprocess.TimeoutExpired:
             return None, {"error": f"timed out ({timeout} s)"}
@@ -202,6 +217,9 @@ def model(repo, text, timeout):
     usage = {"model": ",".join((d.get("modelUsage") or {}).keys()), "in": u.get("input_tokens", 0),
              "cache_r": u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0),
              "turns": d.get("num_turns", 0), "cost": d.get("total_cost_usd", 0)}
+    over = over_budget(usage["cost"])
+    if over:
+        usage["over_budget"] = over
     r = d.get("result")
     if d.get("is_error") or not isinstance(r, str) or not r.strip():
         usage["error"] = (r if isinstance(r, str) and r.strip() else d.get("subtype") or "empty result")[:120]
@@ -324,9 +342,11 @@ def answer(repo, question, context, documents=False):
     record({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo": repo, "outcome": outcome,
             "secs": round(time.time() - t0, 1), "packet": len(pkt), "chars": len(reply or ""),
             "tools": [c.split()[0] for c, _ in tool_out], **usage})
+    note = (f"cc-ask: this ask cost ${usage['cost']:.2f}, past CC_ASK_BUDGET ${usage['over_budget']:.2f} "
+            "(a notice, not a cap)") if usage.get("over_budget") else ""
     if reply is None:
-        return 1, "", f"cc-ask: no reply — {usage.get('error', 'unknown')}"
-    return 0, reply, ""
+        return 1, "", (note + "\n" if note else "") + f"cc-ask: no reply — {usage.get('error', 'unknown')}"
+    return 0, reply, note
 
 
 def selfcheck(*a, **k):

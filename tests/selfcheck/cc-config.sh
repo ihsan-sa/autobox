@@ -23,6 +23,11 @@ SEMI=x; touch @T@/pwned-semi
 ALPHA_TOKEN=tok-by-name
 HOOK=https://hooks.slack.com/services/by-shape
 EMPTY_SECRET=
+VOICE_PIN=4321
+VOICE_PIN_HINT=pin-by-name
+NTFY_TOPIC=topic-by-name
+DOCS_PUBLIC_HOOK=hook-by-name
+TONE_MAPPING=linear
 EOF
   sed -i "s#@T@#$T#g" "$T/config"
   C(){ CC_CONFIG="$T/config" "$SELF" "$@"; }
@@ -63,6 +68,11 @@ EOF
   k "$(t grep -qx 'ALPHA_TOKEN=\*\*\*\*' <<<"$out")" "a bare list masks a value whose key names a token"
   k "$(t grep -qx 'HOOK=\*\*\*\*' <<<"$out")" "…and a value shaped like a Slack webhook, whatever its key"
   k "$(t test -z "$(grep -e tok-by-name -e by-shape <<<"$out")")" "…so neither value is anywhere in the dump"
+  for x in VOICE_PIN VOICE_PIN_HINT NTFY_TOPIC DOCS_PUBLIC_HOOK; do
+    k "$(t grep -qx "$x=\\*\\*\\*\\*" <<<"$out")" "…and a value whose key names a PIN, a topic or a hook ($x)"
+  done
+  k "$(t test -z "$(grep -e 4321 -e -by-name <<<"$out")")" "…none of whose values is in the dump either"
+  k "$(t grep -qx 'TONE_MAPPING=linear' <<<"$out")" "…but PIN is a whole word, so a MAPPING still prints"
   k "$(t grep -qx 'EMPTY_SECRET=' <<<"$out")" "…while an empty one still reads as empty (unset, not hidden)"
   k "$(t grep -q 'list --secrets' <<<"$(C list 2>&1 >/dev/null)")" "…and it says on stderr how to see them"
   k "$(t test "$(C list ALPHA_TOKEN)" = 'ALPHA_TOKEN=tok-by-name')" "a named key prints its value: naming it asked for it"

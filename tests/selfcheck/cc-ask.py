@@ -99,13 +99,32 @@ def selfcheck():
         c = open(calls).read() if os.path.exists(calls) else ""
         check("the call: `claude -p` on CC_ASK_MODEL with Read/Grep/Glob only, cc-steward's deny list (Bash, Monitor, "
               "the schedulers, the notifiers) and the secret stores denied by name, no settings source, no MCP, "
-              "a turn cap and CC_ASK_BUDGET, no transcript, at CC_ROLE=steward in ~/.cc/ask/<repo>; the prompt is stdin",
+              "no turn cap and no dollar cap, no transcript, at CC_ROLE=steward in ~/.cc/ask/<repo>; the prompt is stdin",
               rcC == 0 and outC == "ok\n_source: x_" and "--model haiku" in c and "--allowedTools Read,Grep,Glob" in c
               and "Bash,BashOutput" in c and "Monitor" in c and "CronCreate" in c and "PushNotification" in c
               and f"Read(/{th}/.cc/config)" in c and f"Grep(/{th}/.cc/secrets/**)" in c
               and "--setting-sources  --disable" in c and "--strict-mcp-config" in c and "--disable-slash-commands" in c
-              and "--max-turns 12" in c and "--max-budget-usd 0.05" in c and "--no-session-persistence" in c
-              and f"role=steward cwd={th}/.cc/ask/myrepo" in c and "THE QUESTION:\nwhat is cc-green?" in c)
+              and "--max-turns" not in c and "--max-budget-usd" not in c and "--no-session-persistence" in c
+              and f"role=steward cwd={th}/.cc/ask/myrepo" in c and "THE QUESTION:\nwhat is cc-green?" in c
+              and _ == "")
+        # the opt-in turn cap and the dollar notice, on their own stub: CC_ASK_TURNS set is passed as --max-turns; a
+        # run past CC_ASK_BUDGET still answers, says so once on stderr and marks its log line, and is never capped
+        calls2 = f"{th}/calls-over"
+        with open(f"{BIN}/claude-over", "w") as f:
+            f.write('#!/usr/bin/env bash\n{ printf "claude"; printf " %s" "$@"; echo; cat; } > "$CALLS"\n'
+                    'echo \'{"result":"ok\\n_source: x_","is_error":false,"num_turns":30,"total_cost_usd":0.40,"usage":{}}\'\n')
+        os.chmod(f"{BIN}/claude-over", 0o755)
+        CLAUDE = f"{BIN}/claude-over"
+        os.environ["CALLS"] = calls2; os.environ["CC_ASK_TURNS"] = "5"
+        rcO, outO, errO = answer("myrepo", "what is cc-green?", "")
+        c2 = open(calls2).read() if os.path.exists(calls2) else ""
+        last = json.loads(open(LOG).read().strip().splitlines()[-1])
+        check("an opt-in CC_ASK_TURNS is passed as --max-turns; a run past CC_ASK_BUDGET (0.05) still answers, says so "
+              "once on stderr as a notice and records over_budget, with no --max-budget-usd on the call",
+              rcO == 0 and outO == "ok\n_source: x_" and "--max-turns 5" in c2 and "--max-budget-usd" not in c2
+              and errO.count("past CC_ASK_BUDGET $0.05") == 1 and "not a cap" in errO
+              and last.get("over_budget") == 0.05 and last.get("cost") == 0.40)
+        del os.environ["CC_ASK_TURNS"]
         CLAUDE = wasC
         # ── a document by number, title or topic, from the register (a stub cc-docs with find's contract: the path on
         # stdout, exit 0; `<number>\t<title>` lines on stderr, exit 3; nothing, exit 1), and the visibility rule

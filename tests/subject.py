@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 
-CAP = {"SUBJECT_DAILY_RUNS": 20, "SUBJECT_DAILY_USD": 10.0, "SUBJECT_MAX_HOURS": 1.0, "SUBJECT_CONCURRENT": 2,
+CAP = {"SUBJECT_DAILY_USD": 10.0, "SUBJECT_MAX_HOURS": 1.0, "SUBJECT_CONCURRENT": 2,
        "SUBJECT_DISK_MB": 4096, "SUBJECT_DAILY_NET_MB": 16.0, "SUBJECT_KEEP_DAYS": 14,
        "SUBJECT_KEPT_MB": 8192}
 COST = {"input_tokens": 1000, "output_tokens": 1400}   # $0.008 on haiku: (1000 * 1 + 1400 * 5) / 1e6
@@ -319,11 +319,12 @@ def case_tree(m):
 
 def case_caps(m):
     root, h = fixture(m)
-    cap = dict(CAP, SUBJECT_DAILY_RUNS=1)
-    first = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
-    second = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
-    check(first["ok"] and not second["ok"] and "daily cap" in second["error"], "the run cap lets the first run through and refuses the next")
+    many = [m.start(h, {"op": "run", "argv": ["true"]}, dict(CAP, SUBJECT_CONCURRENT=100), spawn=False) for _ in range(25)]
+    check(all(r["ok"] for r in many), f"no count of runs a day: 25 start ({[r.get('error') for r in many if not r['ok']]})")
+    shutil.rmtree(root)
+    root, h = fixture(m)
     cap = dict(CAP, SUBJECT_CONCURRENT=2)
+    first = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
     third = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)   # the first is still "starting": one live
     fourth = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
     check(third["ok"] and not fourth["ok"] and "at once" in fourth["error"], "the concurrency cap counts live runs")
@@ -335,11 +336,8 @@ def case_caps(m):
     (src / "locked").write_text("x")
     (src / "locked").chmod(0)
     (src / "a.txt").write_text("partial")
-    cap = dict(CAP, SUBJECT_DAILY_RUNS=1)
-    bad = m.start(h, {"op": "run", "argv": ["true"], "input": str(src)}, cap, spawn=False)
-    again = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
-    check(not bad["ok"] and not again["ok"] and "daily cap" in again["error"],
-          f"a run whose input copy fails counts against the day's run cap ({bad.get('error')}; {again.get('error')})")
+    bad = m.start(h, {"op": "run", "argv": ["true"], "input": str(src)}, CAP, spawn=False)
+    check(not bad["ok"], f"a run whose input copy fails is refused ({bad.get('error')})")
     (src / "locked").chmod(0o600)
     rds = [m.subjects(h) / r for r, _ in m.runs_of(h)]
     check(len(rds) == 1 and m.runs_of(h)[0][1]["state"] == "failed" and not (rds[0] / "in").exists()
@@ -813,13 +811,12 @@ def case_input_size(m):
     got = m.copy_in(str(src), dst, 1 << 20)
     check(isinstance(got, str) and "SUBJECT_DISK_MB" in got and os.listdir(dst) == [],
           f"a 2 MB source is refused at 1 MB, and nothing was copied ({got}, {os.listdir(dst)})")
-    cap = dict(CAP, SUBJECT_DISK_MB=1, SUBJECT_DAILY_RUNS=1)
+    cap = dict(CAP, SUBJECT_DISK_MB=1)
     bad = m.start(h, {"op": "run", "argv": ["true"], "input": str(src)}, cap, spawn=False)
-    again = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
     rds = [m.subjects(h) / r for r, _ in m.runs_of(h)]
-    check(not bad["ok"] and "SUBJECT_DISK_MB" in bad["error"] and not again["ok"] and "daily cap" in again["error"]
+    check(not bad["ok"] and "SUBJECT_DISK_MB" in bad["error"]
           and len(rds) == 1 and m.runs_of(h)[0][1]["state"] == "failed" and not (rds[0] / "in").exists(),
-          f"through start it is a failed run, counted, with no in/ left ({bad.get('error')}; {again.get('error')})")
+          f"through start it is a failed run with no in/ left ({bad.get('error')})")
     # the count of the source misses the growth, and the copy then lingers 30s: only the check made while it runs
     # can stop it within a few seconds, since the one after it ends would wait the 30s out
     was, popen = m.tree_bytes, m.sp.Popen

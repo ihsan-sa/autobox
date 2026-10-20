@@ -136,10 +136,11 @@ selfcheck(){
 printf '%s\n' "$@" >> "$CC_SC_ARGV"
 p=""; n=0; for a in "$@"; do [ "$n" = 1 ] && { p=$a; n=0; }; [ "$a" = -p ] && n=1; done
 SPEND='{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your monthly spend limit · raise it at claude.ai/settings/usage","total_cost_usd":0,"num_turns":1}'
-case "$CC_SC_END" in   # how the BROAD pass ends without a result, the way `claude -p --output-format json` really does (probed 2026-09-12)
+case "$CC_SC_END" in   # how the BROAD pass ends without a result, the way `claude -p --output-format json` really does (probed 2026-09-12).
+  # cc-audit passes no dollar or turn cap any more; these two subtypes stay as shapes of a run that ran and failed.
   budget) printf '{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"total_cost_usd":0.44,"num_turns":9}'; exit 1;;
   turns) printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":null,"total_cost_usd":0.21,"num_turns":60}'; exit 1;;
-  timeout) exit 124;;   # what `timeout 20m` leaves the caller: rc 124 and nothing on stdout
+  timeout) exit 124;;   # what `timeout "$LLM_HUNG"` leaves the caller: rc 124 and nothing on stdout
   # AN UNLISTED SUBTYPE WITH AN EMBEDDED NEWLINE IN .result — llm_why's catch-all interpolates raw model text through
   # short(), which truncates at 160 chars but never collapses newlines: a marker with a real \n in it broke cc-failures'
   # one-line NOT_INVESTIGATED regex (`\A...`, `.` not matching newline) and the claim read back `reported`.
@@ -151,6 +152,8 @@ case "$CC_SC_END" in   # how the BROAD pass ends without a result, the way `clau
   # …and the same refusal reaching only the NARROW pass, which is what i-b3fc3b8b was: the broad pass answers
   # normally (no arm matches here, so the prompt case below runs) and only the band's model is refused.
   spend-narrow) case "$p" in *"You are the narrow pass"*) printf '%s' "$SPEND"; exit 0;; esac;;
+  # a narrow pass that answers and costs $1.80: past the routine notice figure, which must say so once and stop nothing
+  costly) case "$p" in *"You are the narrow pass"*) printf '{"result":"## hypothesis\\nx\\n## message\\n**Decision:** review the guard.\\n","total_cost_usd":1.80}'; exit 0;; esac;;
 esac
 case "$p" in
   *"You are the narrow pass"*) printf '{"result":"## hypothesis\\nthe guard reads the text, not the command\\n## message\\n**Decision:** review the guard.\\nPattern: three refusals on text.\\nHypothesis: text, not command.\\nCost so far: three turns.\\nNext review: the guard selfcheck.\\n","total_cost_usd":0.30}';;
@@ -190,7 +193,8 @@ S
   sck "$(tf test "$(grep -c -- '^--setting-sources$' "$CC_SC_ARGV")" = 2)" "failure: …and no settings file, so the allow-list is the whole permission surface"
   sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-opus-5-5')" "failure: the broad pass is Sonnet; BAND: interacting sends the narrow pass to Opus"
   sck "$(ntf grep -q -- '^--effort$' "$CC_SC_ARGV")" "…and neither pass names an effort: both run at their model's own default"
-  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 1.95')" "failure: the strong cap is \$2 for the job — the narrow pass gets what the broad pass left"
+  sck "$(ntf grep -qE -- '^--max-(budget-usd|turns)$' "$CC_SC_ARGV")" "failure: neither pass carries a dollar or a turn cap — the hung-run bound is the only wall"
+  sck "$(ntf grep -q 'notice figure' "$fh/.cc/failures/reports/$cl.md")" "…and a job under its band's notice figure (\$0.35 of \$2) says nothing about cost past the header"
   sck "$(tf test "$(grep -c '^post$' "$fh/slack.log")" = 1)" "failure: ONE message — no canvas, no second post"
   sck "$(tf grep -qx -- '--to' "$fh/slack.log" && grep -qx '#sc-test' "$fh/slack.log" && grep -q '^\*\*Review:\*\* review the guard\.' "$fh/slack.log" && grep -qx -- "$fh/.cc/failures/reports/$cl.md" "$fh/slack.log")" "…to the chat named, the five lines opening with what to review, the report as its file"
   sck "$(ntf grep -q 'Decision:' "$fh/slack.log")" "…and no \"Decision:\" head that reads like the owner's card"
@@ -216,23 +220,30 @@ S
   printf '%s\n' "$okslack" > "$fh/bin/cc-slack"; rm -f "$fh/notify.log"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
   out=$(fb CC_SC_BAND=routine 2>&1)
-  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 0.95')" "failure: BAND: routine — Sonnet both passes, \$1 for the job"
+  sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-sonnet-5')" "failure: BAND: routine — Sonnet both passes"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  # THE NOTICE FIGURE IS A BACKSTOP, NOT A CAP, on its own fixture: a routine job that cost $1.85 (past its $1) still
+  # runs both passes and posts its report; the cost is said once in the report and once in audit.log
+  out=$(fb CC_SC_BAND=routine CC_SC_END=costly 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 2 && test "$(grep -c '^post$' "$fh/slack.log")" = 1)" "failure: a job past its notice figure is never stopped — both passes ran and the one message went"
+  sck "$(tf test "$(grep -c 'past the \$1 notice figure for this band (a notice, not a cap)' "$fh/.cc/failures/reports/$cl.md")" = 1 && grep -q '^_cost \$1\.85, past' "$fh/.cc/failures/reports/$cl.md")" "…the report says the cost once: \$1.85 past \$1, a notice"
+  sck "$(tf test "$(grep -c "failure $cl: cost \\\$1\.85, past the \\\$1 notice figure" "$fh/.cc/state/audit/audit.log")" = 1)" "…and audit.log says it once"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
   # A BROAD PASS THAT ENDS WITHOUT A RESULT NAMES ITS CAUSE — in the report, the message and audit.log — never `rc=1`:
   # "the report said only '(audit run failed: rc=1)' ... and the owner had to ask why" (i-b3fc3b8b, 2026-09-12).
   local flog="$fh/.cc/state/audit/audit.log" frep="$fh/.cc/failures/reports/$cl.md"
   out=$(fb CC_SC_END=budget 2>&1); rc=$?
-  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1 && test -s "$frep")" "failure: a budget-killed broad pass still ends in a report, rc 0, and no narrow pass is bought on a missing handoff"
-  sck "$(tf grep -q 'audit run failed: budget ran out: \$0\.44 spent of the \$0\.60 cap after 9 turns (claude-sonnet-5, subtype error_max_budget_usd)' "$frep")" "…the report's broad pass names the cause: budget, what was spent against which cap, the subtype"
-  sck "$(tf grep -q 'no narrow pass: the broad pass ended without a handoff — budget ran out' "$frep")" "…and its narrow pass says the same where the reader lands"
-  sck "$(tf grep -q 'model run ended without a result — budget ran out: \$0\.44' "$fh/slack.log")" "…the one message carries it too"
-  sck "$(tf grep -q 'llm .*02-handoff.md failed: budget ran out: \$0\.44 .* subtype error_max_budget_usd' "$flog")" "…and so does audit.log"
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1 && test -s "$frep")" "failure: a broad pass that ran and failed (subtype error_max_budget_usd) still ends in a report, rc 0, and no narrow pass is bought on a missing handoff"
+  sck "$(tf grep -q 'audit run failed: subtype error_max_budget_usd, is_error true, \$0\.44 spent after 9 turns (claude-sonnet-5)' "$frep")" "…the report's broad pass names the cause: the subtype, what was spent, the turns"
+  sck "$(tf grep -q 'no narrow pass: the broad pass ended without a handoff — subtype error_max_budget_usd' "$frep")" "…and its narrow pass says the same where the reader lands"
+  sck "$(tf grep -q 'model run ended without a result — subtype error_max_budget_usd, is_error true, \$0\.44' "$fh/slack.log")" "…the one message carries it too"
+  sck "$(tf grep -q 'llm .*02-handoff.md failed: subtype error_max_budget_usd, is_error true, \$0\.44' "$flog")" "…and so does audit.log"
   sck "$(ntf grep -Eq 'rc=1\b' "$frep" "$fh/slack.log")" "…no bare exit code anywhere a reason belongs"
   sck "$(tf grep -q 'Sonnet \$0\.44 + \$0\.00' "$frep")" "…the report says what it cost"
   # A GENUINE MODEL FAILURE STAYS A FAILED RUN. The pass ran, spent $0.44 and died on the cap: that is a result, and
   # telling a postponement from a failure must not turn it into one — `failed`, never `deferred`, in the report and in
   # what cc-failures reads off it. It comes back a day on, not at once: repeating it spends the cap again.
-  sck "$(tf grep -qE '^\*\*Not investigated \(failed\):\*\* budget ran out: \$0\.44 .*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$frep")" "failure: a broad pass that ran and failed opens the report as failed, with the cause and when it comes back"
+  sck "$(tf grep -qE '^\*\*Not investigated \(failed\):\*\* subtype error_max_budget_usd, is_error true, \$0\.44 .*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$frep")" "failure: a broad pass that ran and failed opens the report as failed, with the cause and when it comes back"
   sck "$(tf grep -q "$cl failed" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…and cc-failures says failed, not reported: rc=1 is no longer a gravestone for a cluster nobody investigated"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   # A NEWLINE IN THE MODEL'S OWN TEXT MUST NOT BREAK THE ONE-LINE MARKER (the exact shape of the motivating incident,
@@ -245,10 +256,10 @@ S
   sck "$(tf grep -q "$cl failed" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…so cc-failures still reads failed, not reported — a two-line marker matches nothing there"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_END=turns 2>&1)
-  sck "$(tf grep -q 'audit run failed: turns ran out: 60 turns, \$0\.21 spent (claude-sonnet-5, subtype error_max_turns)' "$frep" && grep -q 'failed: turns ran out' "$flog")" "failure: a turn-capped broad pass names that (error_max_turns), report and log"
+  sck "$(tf grep -q 'audit run failed: subtype error_max_turns, is_error true, \$0\.21 spent after 60 turns (claude-sonnet-5)' "$frep" && grep -q 'failed: subtype error_max_turns' "$flog")" "failure: a broad pass that came back error_max_turns names that, report and log"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_END=timeout 2>&1)
-  sck "$(tf grep -q 'audit run failed: timed out: the 20 min cap fell before claude-sonnet-5 answered (rc=124, no result JSON)' "$frep" && grep -q 'failed: timed out' "$flog" && ! grep -q 'no narrow pass: the broad pass did not run' "$frep")" "failure: a timed-out broad pass names the cap, not a bare rc"
+  sck "$(tf grep -q 'audit run failed: hung: claude-sonnet-5 gave no answer within the 2h hung-run bound (rc=124, no result JSON)' "$frep" && grep -q 'failed: hung' "$flog" && ! grep -q 'no narrow pass: the broad pass did not run' "$frep")" "failure: a broad pass the hung-run bound stopped says so, not a bare rc"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   # A PASS THAT NEVER RAN IS NOT A PASS THAT RAN AND FAILED (raised-a-postponed-investigation-counts-as-reported).
   # BOTH PASSES POSTPONED, on its own fixture: a live shared stamp two runs have hit, which is what makes cc-limit

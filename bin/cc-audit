@@ -22,12 +22,12 @@
 # line cc-reconcile took with `cc-failures claim` (or a cluster id, by hand); `cc-failures packet` is the whole
 # evidence. Two passes of the SAME Claude child, behind the SAME wall: the broad pass (Sonnet) notices the pattern,
 # locates the origin and writes a hypothesis, a rival and one test into a handoff; the narrow pass (a fresh context
-# on the band the handoff names — routine Sonnet, interacting Opus, authority Opus at xhigh) runs that test. Caps for the job,
-# broad pass included: $1 routine, $2 the other two; BUD_FAIL_BROAD is the broad pass's share ($0.60: why, at its
-# line). `TEST: none` in the handoff means no narrow pass. A pass that ends without a result — budget, turns, timeout,
-# an error — is named as such in the report, the message and audit.log (the JSON's subtype and is_error, via
+# on the band the handoff names — routine Sonnet, interacting Opus, authority Opus at xhigh) runs that test. No pass
+# has a dollar or turn cap: a job that cost more than its notice figure ($1 routine, $2 the other two) says so once,
+# in the report and audit.log, and is never stopped; the only wall is a hung-run bound (2 h, at llm). `TEST: none` in
+# the handoff means no narrow pass. A pass that ends without a result — the hung-run bound, an error — is named as such in the report, the message and audit.log (the JSON's subtype and is_error, via
 # llm_why), never as a bare exit code.
-# THREE STATES, AND ONLY THE FIRST IS A RESULT. A pass RAN AND FAILED (budget, turns, timeout, a model error): it
+# THREE STATES, AND ONLY THE FIRST IS A RESULT. A pass RAN AND FAILED (the hung-run bound, a model error): it
 # happened and it cost money, and it stays booked as a failed run. A pass was REFUSED OR POSTPONED by a limit (the
 # shared usage-limit stamp, or the account's monthly spend cap in the run's own JSON — see SPEND_REFUSED_RE): nothing
 # ran and nothing was spent, so it is a deferral, not a try. A pass DID NOT RUN (no handoff to carry, no
@@ -50,8 +50,7 @@
 # ledger), every producer the design names still calls cc-failures (a writer refactored away records nothing, and
 # nothing else would notice), and an eligible cluster unclaimed for two reconcile passes while the investigation is on
 # and the tier allows it is the pipeline stalled, not a quiet day. See pipeline_check.
-# Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the model) · CC_AUDIT_BUDGET_FAILURE_BROAD (the broad pass's
-# share) · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>-updates).
+# Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the model) · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>-updates).
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
 R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # run the INSTALLED ~/bin/cc-audit: a worktree copy fails the suites (they assert against the live install)
@@ -63,12 +62,10 @@ CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; LIMIT="$(dirname "$(readlink -f 
 # on line 3 has already happened by here, so a relative `core/bin/cc-audit` no longer resolves through readlink -f.
 BOARD="${CC_BOARD:-$R/bin/cc-board}"
 cfgval(){ "$R/bin/cc-config" get "$1"; }   # the one reader of ~/.cc/config: it never sources that file, and exports nothing from it
-CAP_ROUTINE=1; CAP_STRONG=2   # the failure job: "$1 routine, $2 strong", two passes inside it; the split below moves, the caps do not
-# THE BROAD PASS'S SHARE. A Sonnet read of a real packet costs $0.33-0.35 when it finishes (i-a0410573, i-e9fb26ce), and
-# claude checks the budget BETWEEN turns, so a run passes the cap by a turn before it is killed: at $0.40 the first live
-# investigation (i-b3fc3b8b, 2026-09-12) died at $0.44 with no handoff, and the narrow pass never ran. $0.60 clears the
-# measured read with a turn to spare and still leaves the routine narrow pass (measured $0.32) its $0.40 of the $1 cap.
-BUD_FAIL_BROAD="${CC_AUDIT_BUDGET_FAILURE_BROAD:-0.60}"
+# THE FAILURE JOB'S NOTICE FIGURES, both passes together: "$1 routine, $2 strong". A notice, not a cap — a dollar cap
+# killed the first live investigation (i-b3fc3b8b, 2026-09-12) at $0.44 with no handoff, and the owner's rule
+# (2026-10-16/20) is that a dollar figure only ever posts once and never stops work. Past it, failure_run says so once.
+NOTICE_ROUTINE=1; NOTICE_STRONG=2
 stamp_init(){   # ONE UTC clock read for both: the header's date is the report's date, even at 23:59:59Z, and a
   local now      # CC_AUDIT_DATE (tests) pins the date beside the time rather than leaving the real day next to it.
   now="$(date -u +%FT%TZ)"; DAY="${CC_AUDIT_DATE:-${now%T*}}"; STAMP="${DAY}T${now#*T}"
@@ -299,14 +296,18 @@ dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf 
 postponed(){   # postponed <out> <why> [until-epoch] — the pass was refused or postponed: it never ran, so it is no result
   printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"   # $2 names the model too
   POSTPONED="$2"; DEFER_UNTIL=$(date -u -d "@${3:-$(( $(date +%s) + DEFER_AGAIN ))}" +%FT%TZ); }
-llm(){   # llm <out-file> <budget> <prompt> [model] [effort] — 20 min hard cap; a failed run leaves a stub and never aborts the audit
-  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5-5} eff=() j rc res p mins; j=$(mktemp)
-  [ -n "${5:-}" ] && eff=(--effort "$5")   # no effort named = the model's own default
+# THE HUNG-RUN BOUND. No dollar and no turn cap on a pass; the one wall is wall-clock, set far past any live
+# investigation (the longest measured ran minutes) so it only ever catches a run that hung. --output-format json writes
+# nothing until the end, so there is no output growth to watch instead.
+LLM_HUNG=2h
+llm(){   # llm <out-file> <prompt> [model] [effort] — no spend or turn cap, the hung-run bound only; a failed run leaves a stub and never aborts the audit
+  local out=$1 prompt=$2 model=${3:-claude-opus-5-5} eff=() j rc res p mins; j=$(mktemp)
+  [ -n "${4:-}" ] && eff=(--effort "$4")   # no effort named = the model's own default
   LLM_WHY=""; POSTPONED=""; DEFER_UNTIL=""; LLM_COST=0   # neither a postponed nor a failed run leaves the other's cause — or an earlier pass's cost — behind
   if p=$("$LIMIT" status 2>/dev/null); then   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
     mins=$(sed -n 's/.*(\([0-9]\{1,\}\)m left).*/\1/p' <<<"$p")   # "usage limit until HH:MMZ (37m left)": the reset, as a delta
     postponed "$out" "Claude $p" "$(( $(date +%s) + ${mins:-60} * 60 ))"; rm -f "$j"; return 1; fi
-  CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model "$model" "${eff[@]}" --max-budget-usd "$bud" --max-turns 60 \
+  CC_ROLE=worker timeout "$LLM_HUNG" "$CLAUDE" -p "$prompt" --model "$model" "${eff[@]}" \
     --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
     --allowedTools "$ALLOW" --disallowedTools "$DENY" >"$j" 2>>"$LOG"
   rc=$?
@@ -319,18 +320,16 @@ llm(){   # llm <out-file> <budget> <prompt> [model] [effort] — 20 min hard cap
   # A RUN THAT ENDED WITHOUT A RESULT SAYS WHY, never a bare exit code: the JSON's subtype and is_error name the cause
   # (i-b3fc3b8b, 2026-09-12: the report said `rc=1` and the owner had to ask what happened). is_error true is a failed run whatever `.result` holds — that text is the error, not a report.
   if [ -n "$res" ] && [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" != true ]; then printf '%s\n' "$res" > "$out"; LLM_WHY=""
-  else LLM_WHY=$(llm_why "$j" "$rc" "$bud" "$model"); printf '_(audit run failed: %s)_\n' "$LLM_WHY" > "$out"; log "llm $out failed: $LLM_WHY"; res=""; fi
+  else LLM_WHY=$(llm_why "$j" "$rc" "$model"); printf '_(audit run failed: %s)_\n' "$LLM_WHY" > "$out"; log "llm $out failed: $LLM_WHY"; res=""; fi
   rm -f "$j"; [ -n "$res" ]
 }
 LLM_WHY=""   # why the last llm() run ended without a result, for a report that has to say so downstream (failure_run)
-llm_why(){   # llm_why <json> <rc> <budget> <model> — one phone-readable clause from what the run left behind
-  local j=$1 rc=$2 bud=$3 model=$4 sub err cost turns
-  [ "$rc" = 124 ] && { printf 'timed out: the 20 min cap fell before %s answered (rc=124, no result JSON)' "$model"; return; }
+llm_why(){   # llm_why <json> <rc> <model> — one phone-readable clause from what the run left behind
+  local j=$1 rc=$2 model=$3 sub err cost turns
+  [ "$rc" = 124 ] && { printf 'hung: %s gave no answer within the %s hung-run bound (rc=124, no result JSON)' "$model" "$LLM_HUNG"; return; }
   sub=$(jq -r '.subtype // empty' "$j" 2>/dev/null); cost=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null); turns=$(jq -r '.num_turns // 0' "$j" 2>/dev/null)
   err=$(jq -r '[(.errors // [])[]?, (.error // empty), (if .is_error == true then .result else empty end)] | map(select(type == "string" and . != "")) | join("; ")' "$j" 2>/dev/null)
   case "$sub" in
-    error_max_budget_usd) printf 'budget ran out: $%.2f spent of the $%s cap after %s turns (%s, subtype %s)' "$cost" "$bud" "$turns" "$model" "$sub" ;;
-    error_max_turns) printf 'turns ran out: %s turns, $%.2f spent (%s, subtype %s)' "$turns" "$cost" "$model" "$sub" ;;
     '') if [ -s "$j" ]; then printf 'rc=%s and a result JSON with no result or subtype — stderr is in audit.log' "$rc"
         else printf 'rc=%s and nothing on stdout (%s) — stderr is in audit.log' "$rc" "$model"; fi ;;
     *) printf 'subtype %s, is_error %s, $%.2f spent after %s turns (%s)%s' "$sub" "$(jq -r '.is_error // false' "$j" 2>/dev/null)" "$cost" "$turns" "$model" "${err:+: $(short "$err")}" ;;
@@ -342,7 +341,7 @@ short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; p
 failure_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@ID@|$FID|g" "$R/config/audit-failure-$1-prompt.md"; }
 failure_run(){
   local FDIR="${CC_FAILURES:-$HOME/.cc/failures}" packet="$EV/01-packet.md" hand="$EV/02-handoff.md" narrow="$EV/03-narrow.md"
-  local rep band test model eff cap bud t0 secs cost_b cost_n why_b defer_b until_b msg msg_why kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL-updates}"
+  local rep band test model eff notice over t0 secs cost_b cost_n why_b defer_b until_b msg msg_why kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL-updates}"
   local outcome="" owhy="" oagain=""   # what the report IS, for cc-failures to read off its first line (THREE STATES, top of file)
   log "start mode=failure id=$FID dry=$dry post=$post ev=$EV"
   # the packet is the whole evidence; an id the ledger does not hold ends here, before any model runs
@@ -351,12 +350,12 @@ failure_run(){
   scrub; kind=$(sed -n 's/^kind: //p' "$packet" | head -1); t0=$(date +%s)
   [ "$llm_on" = 1 ] || { echo "$packet"; log "done mode=failure id=$FID no-llm: the packet only"; exit 0; }   # --no-llm: the packet, no spend, no post
   # steps 1-3, the broad pass: Sonnet, the packet, a handoff a fresh context can take
-  llm "$hand" "$BUD_FAIL_BROAD" "$(failure_prompt broad)" claude-sonnet-5 || ok=0
+  llm "$hand" "$(failure_prompt broad)" claude-sonnet-5 || ok=0
   cost_b=${LLM_COST:-0}; why_b=$LLM_WHY; defer_b=$POSTPONED; until_b=$DEFER_UNTIL   # the BROAD pass's own state: the narrow pass overwrites all three
   band=$(sed -n 's/^BAND:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1); test=$(sed -n 's/^TEST:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1)
   # "Sonnet for a single-tool mechanism, Opus for interacting tools or concurrency, Opus at xhigh for authority, security or system-level reasoning"
   # (Anthropic's launch table has Opus 5.5 ahead of Fable 5.1 on every row, at 40% of its price: 2026-09-23)
-  eff=""; case "$band" in interacting) model=claude-opus-5-5; cap=$CAP_STRONG ;; authority) model=claude-opus-5-5; eff=xhigh; cap=$CAP_STRONG ;; *) band=routine; model=claude-sonnet-5; cap=$CAP_ROUTINE ;; esac
+  eff=""; case "$band" in interacting) model=claude-opus-5-5; notice=$NOTICE_STRONG ;; authority) model=claude-opus-5-5; eff=xhigh; notice=$NOTICE_STRONG ;; *) band=routine; model=claude-sonnet-5; notice=$NOTICE_ROUTINE ;; esac
   if [ "$ok" = 0 ]; then
     # THE BROAD PASS DECIDES WHAT THE REPORT IS: it is the pass that writes the content, so no handoff means nothing was
     # investigated. Deferred — refused or postponed by a limit: nothing ran, nothing was spent, and it comes back at the
@@ -369,9 +368,8 @@ failure_run(){
     else outcome=failed; owhy=${why_b:-it did not run}; oagain=$(date -u -d "+1 day" +%FT%TZ); fi
     printf '_(no narrow pass: the broad pass ended without a handoff — %s)_\n' "$owhy" > "$narrow"; cost_n=0   # the cause, named again where the reader lands
   elif [ "$test" = none ]; then printf '_(no narrow pass: the broad pass found no discriminating test — see its ## test)_\n' > "$narrow"; cost_n=0   # "If no discriminating test exists, stop here"
-  else   # step 4, the narrow pass: a fresh context, the handoff and the packet, the band's model, what the cap has left
-    bud=$(awk -v c="$cap" -v b="$cost_b" 'BEGIN{r=c-b; if (r<0.10) r=0.10; printf "%.2f", r}')
-    llm "$narrow" "$bud" "$(failure_prompt narrow)" "$model" "$eff" || ok=0
+  else   # step 4, the narrow pass: a fresh context, the handoff and the packet, the band's model
+    llm "$narrow" "$(failure_prompt narrow)" "$model" "$eff" || ok=0
     cost_n=${LLM_COST:-0}
     # THE SAME BUG ONE PASS LATER (i-b3fc3b8b): the broad pass handed off and the NARROW pass was refused by the spend
     # cap. The discriminating test never ran and nothing was spent on it, so the report is not a result either — it
@@ -381,10 +379,14 @@ failure_run(){
       oagain=${DEFER_UNTIL:-$(date -u -d "+1 hour" +%FT%TZ)}; fi
   fi
   secs=$(( $(date +%s) - t0 ))
+  # THE BACKSTOP, ONCE: the job past its band's notice figure is one line in the report and one in audit.log; nothing stops
+  over=$(awk -v b="$cost_b" -v n="$cost_n" -v c="$notice" 'BEGIN{t=b+n; if (t>c) printf "$%.2f, past the $%s notice figure for this band (a notice, not a cap)", t, c}')
+  [ -z "$over" ] || log "failure $FID: cost $over"
   rep="$FDIR/reports/$FID.md"; [ "$dry" = 1 ] && rep="$OUTDIR/$FID.md"
   mkdir -p "$(dirname "$rep")" || exit 1
   { [ -z "$outcome" ] || printf '**Not investigated (%s):** %s · again after %s\n\n' "$outcome" "$(printf '%s' "$owhy" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')" "$oagain"   # cc-failures parses this line — ONE line: a model's raw text (llm_why's catch-all, short()) can carry an embedded newline, and cc-failures' NOT_INVESTIGATED regex is `\A...` with `.` not matching newline
     printf '_investigation %s · %s · band %s (%s) · Sonnet $%.2f + $%.2f · ran %s · %s_\n\n' "$FID" "$kind" "$band" "$model" "$cost_b" "$cost_n" "$(dur "$secs")" "$STAMP"
+    [ -z "$over" ] || printf '_cost %s_\n\n' "$over"
     printf '## broad pass (claude-sonnet-5)\n\n'; cat "$hand"; printf '\n---\n\n## narrow pass (%s)\n\n' "$model"; cat "$narrow"; } > "$rep"
   # the five lines the owner reads; a report with none gets one line and the file, never nothing
   # the narrow prompt opens them "**Decision:**"; in the -updates lane that head would read like the owner's card

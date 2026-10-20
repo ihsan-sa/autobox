@@ -226,8 +226,6 @@ def selfcheck():
 
     # ── the holds, each on its own fixture, and the dispatch
     board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"}})
-    for i in range(QUEUE_HOLD):
-        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
     os.environ["CC_FAKE_PAUSE_RC"] = "0"
     ok("a parked project holds it before anything else, and says so",
        holds(repo, B.board_of(repo)) == "the project is paused (cc-pause)")
@@ -241,9 +239,11 @@ def selfcheck():
         os.remove(log_path(repo))   # the hold it logged; the queue cases below count their own lines
     except OSError:
         pass
-    ok("the landing queue at the hold stops a dispatch, and says so", "landing queue holds 4" in holds(repo, B.board_of(repo)))
-    os.remove(os.path.join(state, "land", "x-0.json"))
-    ok("…and one job under it does not", holds(repo, B.board_of(repo)) == "")
+    for i in range(12):
+        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    ok("a deep landing queue holds nothing: no WIP cap (owner, 2026-10-20)", holds(repo, B.board_of(repo)) == "")
+    for i in range(12):
+        os.remove(os.path.join(state, "land", f"x-{i}.json"))
     os.environ["CC_FAKE_TIER_RC"] = "1"
     ok("the spend tier holds it", "spend tier" in holds(repo, B.board_of(repo)))
     os.environ.pop("CC_FAKE_TIER_RC")
@@ -260,15 +260,13 @@ def selfcheck():
     os.environ.pop("CC_BUNDLE_WIDTH")
 
     board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"}})
-    for i in range(QUEUE_HOLD):
-        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    os.environ["CC_FAKE_TIER_RC"] = "1"
     go(repo, dry=True, out=io.StringIO())
     ok("a dry run under a hold writes nothing", not os.path.exists(log_path(repo)))
     go(repo, out=io.StringIO()); go(repo, out=io.StringIO())
     ok("a hold is logged once, not once per tick while it stands",
        [json.loads(l)["event"] for l in open(log_path(repo))] == ["held"])
-    for i in range(QUEUE_HOLD):
-        os.remove(os.path.join(state, "land", f"x-{i}.json"))
+    os.environ.pop("CC_FAKE_TIER_RC")
     os.remove(log_path(repo))
     buf = io.StringIO()
     went = go(repo, dry=True, out=buf)
@@ -337,12 +335,12 @@ def selfcheck():
     with contextlib.redirect_stdout(buf):
         show(repo, as_json=True)
     ok("…and --json is the same answer as data", json.loads(buf.getvalue())[0]["rows"] == ["row-a", "row-b"])
-    for i in range(QUEUE_HOLD):
-        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    os.environ["CC_FAKE_TIER_RC"] = "1"
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         show(repo)
-    ok("…and names what holds them", "held: the landing queue holds 4" in buf.getvalue())
+    os.environ.pop("CC_FAKE_TIER_RC")
+    ok("…and names what holds them", "held: the spend tier holds" in buf.getvalue())
     board({"row-c": {"status": "queued"}})
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):

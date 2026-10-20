@@ -27,7 +27,7 @@ def selfcheck():
 
 
 def _selfcheck():
-    global ROOT, MEMBERS, HOME, IN_SANDBOX, SLACKSOCK, MEMBER_CAP, ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP
+    global ROOT, MEMBERS, HOME, IN_SANDBOX, SLACKSOCK, MEMBER_CAP, ATTACH_FILE_CAP, ATTACH_TOTAL_CAP
     n = [0, 0]
 
     def ok(name, cond):
@@ -1963,7 +1963,7 @@ echo https://github.com/o/site/pull/7
         os.makedirs(os.path.join(t, "outdir"), exist_ok=True)
         rcs = [run("attach", "001-0001", os.path.join(t, "outdir"))[1], run("attach", "001-0001", os.path.join(t, "nope"))[1],
                run("attach", "001-0001", blob(".hidden", b"x"))[1]]
-        caps = ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP
+        caps = ATTACH_FILE_CAP, ATTACH_TOTAL_CAP
         try:
             ATTACH_FILE_CAP = 10
             rc, o = run("file", pc, "--project", "Boards", "--title", "Board", "--attach", blob("big.zip", b"0" * 11))
@@ -1971,14 +1971,12 @@ echo https://github.com/o/site/pull/7
             ATTACH_TOTAL_CAP = 20
             rc2, o2 = run("attach", "001-0001", blob("more.bom", b"1" * 15))
             ATTACH_TOTAL_CAP = caps[1]
-            ATTACH_REV_CAP = 1
-            rc3, o3 = run("attach", "001-0001", d1)
         finally:
-            ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP = caps
+            ATTACH_FILE_CAP, ATTACH_TOTAL_CAP = caps
         ok("a directory, a missing file and a dot-name are refused; a file over the size cap refuses the whole filing; "
-           "the total and per-revision caps refuse; each says which, and the register is as it was",
+           "the total cap refuses; each says which, and the register is as it was",
            "is a directory" in rcs[0] and "no such file" in rcs[1] and "rename it" in rcs[2]
-           and rc == 2 and "Cloudflare Pages" in o and rc2 == 2 and "GitHub" in o2 and rc3 == 2 and "over 1 a revision" in o3
+           and rc == 2 and "Cloudflare Pages" in o and rc2 == 2 and "GitHub" in o2
            and load() == before and not [f for f in os.listdir(os.path.join(ROOT, "attachments")) if f.startswith(".part")])
         # member views: a member's document's files are linked into its view, and leave it when removed
         ROOT = os.path.join(t, "a4")

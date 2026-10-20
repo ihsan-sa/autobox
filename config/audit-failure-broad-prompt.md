@@ -21,7 +21,7 @@ excerpts. Transcripts are the last read, not the first.
 2. **Locate the origin.** Trace from the claim or the failed action to the record that should have informed it, and
    name which it was: absent, stale, wrong object, access denied, misleading tool output, or a source the session
    skipped. A missing file is a collection failure, never evidence that the fact was absent.
-3. **Write the hypothesis and the plan.** At most 500 words in total: the pattern, the leading hypothesis, ONE rival,
+3. **Write the hypothesis and the plan.** Keep it short: the pattern, the leading hypothesis, ONE rival,
    what would disprove each, ONE bounded test the narrow pass can run against the evidence, and the evidence ids it
    needs. If no discriminating test exists, say what evidence is missing and stop there.
 

@@ -154,13 +154,18 @@ def selfcheck():
         for s in (1000, 1000 + STAND_S):
             run(t, True, s)
     k(len(raised()) == 1, "…but a dialog drawn below an empty prompt line is still raised")
-    # 8 a board that refuses: tried again next pass, TRIES times at most
+    # 8 a board that refuses: tried again on every later pass, never given up; the log says so once, at TELL_AT
     fresh(); open(f"{d}/refuse", "w").close(); t = Fake(); t.add("box", ODD)
+    if os.path.exists(LOG):
+        os.remove(LOG)
     with q:
         for i in range(8):
             run(t, True, 1000 + i * STAND_S)
     st = load()
-    k(st.get("box\tdialog", {}).get("tries") == TRIES, f"a refused row is retried {TRIES} times, then left: {st}")
+    k(st.get("box\tdialog", {}).get("tries") == 7, f"a refused row is tried on every pass after it stands (7 of 8): {st}")
+    said = [l for l in open(LOG) if "still trying it every pass" in l] if os.path.exists(LOG) else []
+    k(len(said) == 1 and f"refused ctl/" in said[0] and f" {TELL_AT} times" in said[0],
+      f"…and the log says once that the board keeps refusing it: {said}")
     # 8b a board that writes the row and then exits non-zero (a timeout after the save): one row, never three
     fresh(); open(f"{d}/refuse", "w").close(); open(f"{d}/writes", "w").close(); t = Fake(); t.add("box", ODD)
     with q:

@@ -4012,6 +4012,35 @@ def run_selfcheck():
           "fits (perms' read of #1504, 10-20) — L13",
           res13.get("a") == "ok" and "not enough disk" in res13.get("b", "") and not os.path.exists(f"{tdD}/b")
           and held13 == 0 and res13.get("c") == "ok")
+    # A BODY THAT RUNS PAST ITS DECLARED SIZE (perms' read of #1654, 10-20): only the declared size was reserved
+    # against the floor, so the bytes past it re-check the floor chunk by chunk. Here the file says 1000 bytes and the
+    # body never ends; the floor leaves room for 4 MB, so the download is refused after a few chunks and leaves no file.
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_over_") as tdO:
+        readO, resO = [0], {}
+        class EndlessResp:
+            def read(self, n=None):
+                if readO[0] >= 64:            # a cap so the control (no re-check) ends: 64 MB written, all past 1000 bytes
+                    return b""
+                readO[0] += 1
+                return b"o" * (1 << 20)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        real_floorO, real_openO = DISK_FLOOR, slack_open
+        try:
+            globals()["DISK_FLOOR"] = shutil.disk_usage(tdO).free - 4 * (1 << 20)
+            globals()["slack_open"] = lambda req, timeout=None: EndlessResp()
+            try:
+                dmL13.save_file({"id": "FO", "size": 1000}, "https://files.slack.com/o", f"{tdO}/o"); resO["o"] = "ok"
+            except DiskFull as e:
+                resO["o"] = str(e)
+        finally:
+            globals()["DISK_FLOOR"], globals()["slack_open"] = real_floorO, real_openO
+        heldO = DISK_HELD[os.stat(tdO).st_dev]
+    check("save_file: a body that runs past its declared size re-checks the 2 GB floor on each chunk past it, so it is "
+          "refused near the floor and leaves no file, not written to the end (perms' read of #1654, 10-20) — L13",
+          "not enough disk" in resO.get("o", "") and readO[0] <= 8 and not os.path.exists(f"{tdO}/o") and heldO == 0)
     # A MEMBER'S FILES DIR SWAPPED FOR A LINK (perms' read of #1630, 10-20): member_dir(h)/files is writable in the
     # member's sandbox, so it can be a link to anywhere the owner can write. fetch_files (through save_file) and both
     # mail copies are refused there and write nothing at the link's target; a link planted at a mail copy's own name
@@ -4148,7 +4177,8 @@ def run_selfcheck():
         globals()["slack_open"] = lambda req, timeout=None: FakeAudioVM()
         with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
             dmVM.on_event(evVM([memoVM], "9.1")); landedVM()
-        audioVM = ranVM[0][2]
+        audioVM = next(f"{tdVM}/files/{n}" for n in os.listdir(f"{tdVM}/files") if not n.endswith(".txt"))   # the one memo
+        handedVM = ranVM[0][2] if ranVM else ""
         check("a voice memo becomes the MESSAGE: the session is handed the condensed text, tagged voice=memo with the "
               "recording's own path — and no '[attached: …]' line, because a memo is not an attachment",
               len(delivVM) == 1 and delivVM[0]["content"] == CONDENSED and "[attached:" not in delivVM[0]["content"]
@@ -4158,9 +4188,10 @@ def run_selfcheck():
               "the words as spoken, the condensed text in italics beneath",
               len(saidVM) == 1 and saidVM[0][0] == "CV" and saidVM[0][2] == "9.1"
               and saidVM[0][1] == f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{CONDENSED}_")
-        check("…transcribed from the file on the BOX (the path cc-voice was handed) and kept beside the audio, so the "
-              "words as spoken outlive the Slack post",
-              ranVM == [[f"{BIN}/cc-voice", "text", audioVM]] and os.path.dirname(audioVM) == f"{tdVM}/files"
+        check("…transcribed from a private copy of the file on the BOX (cc-voice is never handed a name a member can "
+              "swap, and the copy is gone after) and kept beside the audio, so the words as spoken outlive the Slack post",
+              ranVM == [[f"{BIN}/cc-voice", "text", handedVM]] and os.path.basename(handedVM) == os.path.basename(audioVM)
+              and not handedVM.startswith(tdVM) and not os.path.exists(handedVM)
               and open(audioVM + ".txt").read().strip() == SPOKEN
               and open(audioVM, "rb").read().startswith(b"\x00\x00\x00\x1cftyp"))
         # A PLANTED LINK. A member can drop <memo>.txt as a link to an owner file while the memo transcribes; the
@@ -4173,6 +4204,16 @@ def run_selfcheck():
         check("a transcript whose name a member planted as a link replaces the link and leaves its target alone",
               open(victimVM).read() == "owner's own\n" and not os.path.islink(plantVM + ".txt")
               and open(plantVM + ".txt").read().strip() == SPOKEN)
+        # …and the memo's own name planted as a link (perms' read of #1676, 10-20): cc-voice would read an owner file
+        # and send it to transcription, so nothing is transcribed and the memo stays an ordinary attachment.
+        ranVM.clear(); saidVM.clear()
+        linkVM = f"{tdVM}/files/linked.m4a"
+        os.symlink(victimVM, linkVM)
+        with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
+            outVM = dmVM.voice_pass(linkVM, "CV", "9.3", "myrepo")
+        check("a memo whose name a member planted as a link to an owner file is not read: cc-voice never runs, nothing "
+              "is posted, and the memo falls back to an attachment (perms 10-20)",
+              outVM == (None, None) and not ranVM and not saidVM and not os.path.exists(linkVM + ".txt"))
         # THE CHANNEL MUST NOT GO DEAF. on_event runs on this chat's own single-thread executor, so a transcription
         # taken inline would queue everything behind it for a minute — `!stop` and a `yes <id>` included. Held here
         # inside the transcriber, the memo is still in flight while the next typed message goes straight through.
@@ -4305,11 +4346,14 @@ def run_selfcheck():
         """What voice_text makes of one cc-voice answer, with the effect put back afterwards."""
         back = Effects("voice-answer", run=lambda cmd, **k: subprocess.CompletedProcess(cmd, rc, stdout=out,
                                                                                         stderr="refused")).install()
+        td = tempfile.mkdtemp(prefix="cc-slack-selfcheck-voice-")
+        open(f"{td}/x.m4a", "wb").write(b"memo")
         try:
             with contextlib.redirect_stderr(io.StringIO()):
-                return voice_text("/x.m4a")
+                return voice_text(f"{td}/x.m4a")
         finally:
             back.install()
+            shutil.rmtree(td, ignore_errors=True)
     check("voice_text: a cc-voice that refused (no transcriber installed yet, a recording it would not read), said "
           "nothing usable, or heard nothing at all is NOT a memo — the caller falls back to the attachment it always "
           "was, so the message still lands; only real words are a memo",
@@ -11760,6 +11804,45 @@ def run_selfcheck():
               os.listdir(lcanary) == [] and len(thanded) == 1 and "1 more (NOT saved)" in ltext
               and "could not save" in ltext and "file_paths" not in lmeta and "text_path" not in lmeta)
         shutil.rmtree(lcanary, ignore_errors=True)
+        # …and the same while a racer flips `files` between a real dir and a link to an owner canary as mail is
+        # handed (perms' read of #1676, 10-20): whichever it finds, nothing ever lands in the canary.
+        rcanary, raside, rstop, rflips = (tempfile.mkdtemp(prefix="cc-slack-selfcheck-canary-"), lfiles + ".aside",
+                                          threading.Event(), [])
+
+        def rflip():
+            while not rstop.is_set():
+                os.rename(lfiles, raside)                  # the real dir steps aside…
+                with contextlib.suppress(FileExistsError):
+                    os.symlink(rcanary, lfiles)            # …a link takes its name (unless the daemon just made a dir)…
+                time.sleep(0.0005)
+                while True:                                # …and the real dir comes back over whatever is there
+                    with contextlib.suppress(OSError):
+                        os.unlink(lfiles)
+                    shutil.rmtree(lfiles, ignore_errors=True)
+                    try:
+                        os.rename(raside, lfiles); break
+                    except OSError:
+                        pass
+                rflips.append(1)
+        rthread = threading.Thread(target=rflip, daemon=True)
+        dmT.cfg["MAIL_NO_TEXT"] = "@allowed.example"
+        rthread.start()
+        try:
+            for i in range(200):
+                rmsg = mail_write(f"R{i}", to=["mem@box.example"], subject="s", text="t",
+                                  attachments=[{"name": "x.pdf", "path": "x.pdf"}])
+                with open(f"{mdir}/inbox/R{i}/x.pdf", "wb") as fh:
+                    fh.write(b"%PDF-1.4 bytes")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    dmT.mail_hand(rmsg, MailPlaces(dmT).place("mem"), "1.0", "1.0",
+                                  R.Decision(to=[], workspace="mem", rule="named"))
+        finally:
+            rstop.set(); rthread.join(20)
+            dmT.cfg["MAIL_NO_TEXT"] = ""
+        check("mail: a racer flipping the member's files dir between a real dir and a link to an owner dir while 200 "
+              "mails are handed never gets an attachment or mail text into the owner dir (perms 10-20)",
+              os.listdir(rcanary) == [] and rflips and os.path.isdir(lfiles) and not os.path.islink(lfiles))
+        shutil.rmtree(rcanary, ignore_errors=True)
 
         # (f) THE DAEMON'S OWN DOOR, through on_event — the half mail_move cannot prove about itself. A move is
         # answered in its thread and the message STOPS there; anything else in that thread carries on to the

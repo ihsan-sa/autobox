@@ -32,8 +32,8 @@ boundary reads one file, its own workspace's, and can reach no other.
         and makes the outcome partial: no journal line stands in for the tier. (2026-09-18: the tier was answered
         from a two-day-old checkpoint while the log said otherwise — one owner turn, one wrong handoff fact.)
   cc-lib get <rid> [--ticket <T>] [--cap <bytes>]
-        One record page (≤ 8 KiB) by the id a hit printed, with its prev/next span. --ticket charges it to the
-        question's budget (24 KiB cumulative across ask, get and any subagent return); a spent ticket refuses.
+        One record page (≤ 8 KiB) by the id a hit printed, with its prev/next span. --ticket logs it as a turn of
+        that question; a question has no cumulative byte budget, so a ticket never refuses.
   cc-lib index [--rebuild] [--json]
         Reconcile every registered source with the index (no deadline) and print the measurements: sources,
         records, source bytes, text bytes, index bytes and ratios, seconds, peak RSS. `ask` reconciles stale
@@ -198,7 +198,7 @@ import time
 H = os.path.expanduser("~")
 PAGE = 8192            # one returned record page, at most
 SPAN = 6144            # a long entry is split at paragraphs into spans of at most this
-TICKET_CAP = 24576     # cumulative bytes one question may return, across ask/get/subagent
+ASK_CAP = 24576        # one ask's answer, at most (a per-read bound, like PAGE; a question's turns are not summed)
 HITS = 8               # search hits shown per page
 FTS_DEADLINE = 2.0     # seconds, one index operation
 RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
@@ -1825,7 +1825,7 @@ def ask(argv):
     if not obj and not q:
         print("cc-lib ask: give --object <id>, a query, or both", file=sys.stderr)
         return 2
-    cap = max(512, min(cap, TICKET_CAP))
+    cap = max(512, min(cap, ASK_CAP))
     query = " ".join(q)
     T = ticket_new()
     t0 = time.monotonic()
@@ -1951,7 +1951,7 @@ def ask(argv):
                + (f" · search {phase}-phase" + (" + any-word fill" if leads else "") if phase else (" · search: skipped (need current)" if skipped else " · search: no hit" if query else ""))
                + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
     tail = ([probe_line(o)] if need == "current" else []) + [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
-    last_tpl = f"OUTCOME not-recorded · {cap} bytes · 99999 ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP}"
+    last_tpl = f"OUTCOME not-recorded · {cap} bytes · 99999 ms · ticket {T} turn 1"
     reserve = sum(len(l.encode()) + 1 for l in tail) + len(header.encode()) + 1 + len(last_tpl.encode()) + 1
     budget = cap - reserve
     if budget < 200:
@@ -2037,7 +2037,7 @@ def ask(argv):
         body.append(CAPLINE)
     out = [header] + body + tail
     nbytes = sum(len(l.encode()) + 1 for l in out) + len(last_tpl.encode()) + 1   # the OUTCOME line, sized on its template
-    last = f"OUTCOME {outcome} · {nbytes} bytes · {ms:.0f} ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP - nbytes}"
+    last = f"OUTCOME {outcome} · {nbytes} bytes · {ms:.0f} ms · ticket {T} turn 1"
     out.append(last)
     text = "\n".join(out)
     ticket_write(T, 1, "ask", repo, need, obj or ("q:" + hashlib.sha1(query.encode()).hexdigest()[:8]), len(text.encode()) + 1, ms, outcome)
@@ -2066,13 +2066,7 @@ def get(argv):
     t0 = time.monotonic()
     cap = min(cap, PAGE)
     if T:
-        used, turns = ticket_used(T)
-        if used >= TICKET_CAP:
-            ticket_write(T, turns + 1, "get", None, None, rid, 0, 0, "refused")
-            print(f"cc-lib get: ticket {T} is spent ({used} of {TICKET_CAP} bytes over {turns} turns) — answer with what "
-                  f"you have, or open a new question with cc-lib ask", file=sys.stderr)
-            return 3
-        cap = min(cap, TICKET_CAP - used)
+        _, turns = ticket_used(T)
     else:
         T, turns = "-", 0
     c = db()
@@ -2784,8 +2778,9 @@ def selfcheck():
         for _ in range(3):
             ticket_write(T, 9, "get", "r1", None, rid, 8192, 1, "answered")
         rc, g = run("get", rid, "--ticket", T)
-        ok("a spent ticket refuses further output (rc 3) and logs the refusal", rc == 3 and ticket_used(T)[1] == 6
-           and lines_with(T, "refused"))
+        ok("a ticket has no cumulative budget: past 24 KiB returned it still gets its page, logged as the next turn",
+           rc == 0 and "cc-lib get " + rid in g and ticket_used(T)[1] == 6 and ticket_used(T)[0] > 24576
+           and not lines_with(T, "refused"))
         rc, g = run("get", "nope:0")
         ok("a record id the index does not hold is rc 1 and says so", rc == 1)
 

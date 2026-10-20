@@ -97,7 +97,8 @@ run_probe(){   # run_probe <case-file> <tree> -> rc from the probe; sets PROBE_O
 # than a flag because which model answered is a property of the RUN, not of one question — a case that could pick
 # its own would grade a model nobody asked for. That one variable is also the whole of an A/B:
 # `CC_EVALS_MODEL=claude-sonnet-5 cc-evals run --set capability` puts the same questions to the other model.
-# Env: CC_EVALS_MODEL · CC_EVALS_BUDGET (dollars per question, default 0.50) · CC_EVALS_THINK (MAX_THINKING_TOKENS;
+# Env: CC_EVALS_MODEL · CC_EVALS_BUDGET (dollars per question, default 0.50: a notice, not a cap — a question that
+# cost more answers anyway and says so once on stderr) · CC_EVALS_THINK (MAX_THINKING_TOKENS;
 # unset = the CLI's own default) · CC_EVALS_CLAUDE (which binary — the selfcheck points it at a fake and spends 0).
 #
 # THE WALL. `--tools ""` is what actually leaves this call with nothing, and until 2026-09-06 it was the whole of
@@ -114,19 +115,22 @@ DENY="Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSe
 # to the member directories that exist at that instant — and the rule then names the directory, leaving the
 # credentials.json inside it undenied. Glob off, the words reach --disallowedTools as written.
 set -f; for _s in $SECRET_PATHS; do DENY="$DENY,Read(/$HOME/$_s),Grep(/$HOME/$_s)"; done; set +f; unset _s
-cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdout; rc 2 = no answer
-  local model=${CC_EVALS_MODEL:-claude-opus-5-5} budget=${CC_EVALS_BUDGET:-0.50} schema="" prompt j rc out cl wd
+spent_note(){   # spent_note <spent> <budget> — the backstop, once per question: past the figure is one stderr line, never a stop
+  awk -v s="$1" -v b="$2" 'BEGIN{exit !(s+0 > b+0)}' || return 0
+  printf 'cc-evals ask: this question cost $%.2f, past CC_EVALS_BUDGET $%s (a notice, not a cap)\n' "$1" "$2" >&2
+}
+cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdout; rc 2 = no answer. --budget is a notice figure
+  local model=${CC_EVALS_MODEL:-claude-opus-5-5} budget=${CC_EVALS_BUDGET:-0.50} schema="" prompt j rc out cl wd spent=0
   while [ $# -gt 0 ]; do case $1 in
     --budget) budget=${2:?}; shift 2 ;; --schema) schema=${2:?}; shift 2 ;;
     *) die "ask: unknown option $1" ;; esac; done
   prompt=$(cat); [ -n "$prompt" ] || { printf 'cc-evals ask: no prompt on stdin\n' >&2; return 2; }
   cl=${CC_EVALS_CLAUDE:-claude}; command -v "$cl" >/dev/null 2>&1 || { printf 'cc-evals ask: no %s on PATH\n' "$cl" >&2; return 2; }
-  # --max-turns 3, not 1: the structured-output round trip is not always one turn — Opus with thinking on came back
-  # error_max_turns at 1 on questions Sonnet answered first time. There are no tools here, so a further turn can only
-  # finish the answer, and what actually bounds a question is the budget cap.
+  # No --max-turns and no --max-budget-usd: a turn cap of 1 came back error_max_turns on Opus with thinking on, and
+  # there are no tools here, so a further turn can only finish the answer. The budget is a notice figure (spent_note).
   # $DENY as well as `--tools ""`: the .ask shim puts the REAL home back for this process (run_probe:68), so
   # the credentials and the keys are on the other side of one flag otherwise.
-  local args=(-p --model "$model" --max-budget-usd "$budget" --max-turns 3 --output-format json
+  local args=(-p --model "$model" --output-format json
               --tools "" --setting-sources "" --strict-mcp-config --disable-slash-commands --no-session-persistence
               --disallowedTools "$DENY")
   [ -z "$schema" ] || args+=(--json-schema "$schema")
@@ -136,21 +140,23 @@ cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdo
   wd=$(mktemp -d) || return 2
   # Two tries, and the second only for a blip: a case asks its questions one after another, so one API error late in
   # a nine-question run throws away the eight already paid for. A usage limit is NOT retried — it is answered by
-  # waiting, not by asking again — and the budget cap is per question, so a retry cannot spend more than one more.
+  # waiting, not by asking again. Both tries count toward the question's notice figure.
   local lim err=""
   for _ in 1 2; do
     ( cd "$wd" && printf '%s' "$prompt" | CC_ROLE=worker ${CC_EVALS_THINK:+MAX_THINKING_TOKENS=$CC_EVALS_THINK} \
         timeout 600 "$cl" "${args[@]}" > "$j" 2>"$e" ); rc=$?
     [ -z "${CC_EVALS_METRICS:-}" ] || printf 'cost=%s\n' "$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)" >> "$CC_EVALS_METRICS"
+    spent=$(awk -v a="$spent" -v b="$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)" 'BEGIN{printf "%.4f", a+b}')
     if lim=$("$(dirname "$(readlink -f "$0")")/cc-limit" check "$j" "$e" 2>/dev/null); then
       printf 'cc-evals ask: a Claude usage limit (%s) — no answer, not a wrong one\n' "$lim" >&2
-      rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; return 2; fi
+      spent_note "$spent" "$budget"; rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; return 2; fi
     out=$(jq -r 'if (.structured_output|type) == "object" then (.structured_output|tojson) else (.result // "") end' "$j" 2>/dev/null)
     if [ -n "$out" ] && [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" != true ]; then
-      rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; printf '%s\n' "$out"; return 0; fi
+      spent_note "$spent" "$budget"; rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; printf '%s\n' "$out"; return 0; fi
     err=$(printf 'rc=%s %s %s %s' "$rc" "$(jq -r '.subtype // "no json"' "$j" 2>/dev/null)" \
           "$(jq -r '(.result // "")[0:120]' "$j" 2>/dev/null)" "$(tail -1 "$e" 2>/dev/null)")
   done
+  spent_note "$spent" "$budget"
   printf 'cc-evals ask: no answer from %s after two tries (%s)\n' "$model" "$err" >&2
   rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; return 2
 }

@@ -69,9 +69,9 @@ SCRIPT_RE = re.compile(r"^(?!/|~|-)(?!.*(^|/)\.\.?(/|$))[A-Za-z0-9_./-]+\.sh$")
 FILE_ROOTS = (f"{HOME}/dev/", f"{HOME}/.cc/worktrees/")
 # ALLOWLIST for config keys: knobs that change how the box's own sessions pace and read, and nothing that routes,
 # reaches, spends, lands, pages or names a program. A key joins this list by a reviewed PR, never by an ask.
-# key -> None (any plain value) or (lo, hi): a whole number in that range. cc-ask's turns and thinking tokens are
-# what one ask spends, and its packet and timeout go through int(), so each is held near its default (12 turns, no
-# thinking, 4096 bytes, 120 s). CC_WAKE is not here: it is the
+# key -> None (any plain value) or (lo, hi): a whole number in that range. cc-ask's thinking tokens are what one ask
+# spends, CC_ASK_TURNS is its opt-in turn cap (unset by default: no cap), and its packet and timeout go through int(),
+# so each is held in a range near its default (no thinking, 4096 bytes, 120 s). CC_WAKE is not here: it is the
 # owner's switch for the tick's wake (cc-reconcile), not a pacing knob (review at 3fca3cba).
 KEY_OK = {"MAIL_QUIET": None, "CC_HANDOFF_OVERLAP": None, "CC_SENSE": None, "CC_JANITOR_HOLDS": None,
           "CC_ASK_TURNS": (1, 24), "CC_ASK_TIMEOUT": (30, 300), "CC_ASK_THINK": (0, 10000), "CC_ASK_PACKET": (1024, 16384)}
@@ -252,15 +252,29 @@ def model(text):
     try:
         p = subprocess.run([os.environ.get("CC_CLAUDE") or f"{HOME}/.local/bin/claude", "-p", "--model", conf("APPROVER_MODEL", "opus"), "--tools", "",
                             "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
-                            "--max-turns", "1", "--no-session-persistence", "--output-format", "json",
-                            "--max-budget-usd", conf("APPROVER_BUDGET", "0.50")],
+                            "--max-turns", "1", "--no-session-persistence", "--output-format", "json"],
                            input=text, capture_output=True, text=True, timeout=int(conf("APPROVER_TIMEOUT", "150")),
                            env=env, cwd=RUNS)
         d = json.loads(p.stdout)
     except Exception:
         return None
+    over_budget(d.get("total_cost_usd"))
     r = d.get("result")
     return None if d.get("is_error") or not isinstance(r, str) else r
+
+
+def over_budget(cost):
+    """The backstop: APPROVER_BUDGET (0.50 USD) is a figure to notice, never a cap on the judge. A call whose reported
+    cost passed it says so once, on stderr; the verdict stands. Returns whether it did."""
+    try:
+        budget = float(conf("APPROVER_BUDGET", "0.50"))
+        if float(cost or 0) <= budget:
+            return False
+    except (TypeError, ValueError):
+        return False
+    print(f"cc-approve: the judge cost ${float(cost):.2f}, past APPROVER_BUDGET ${budget:.2f} (a notice, not a cap)",
+          file=sys.stderr)
+    return True
 
 
 def squash(s):
@@ -532,6 +546,23 @@ def selfcheck():
                        "reaches": "box", "reversible": "minutes"}), capture_output=True, text=True)
     check("...and an in-box, minutes-reversible ask with no evidence is ASK-OWNER, exit 1: no evidence, no grant",
           p.returncode == 1 and json.loads(p.stdout)["verdict"] == "ASK-OWNER")
+    # the judge call itself, through a stub claude that reports $0.90: one turn, no dollar cap, and the cost past
+    # APPROVER_BUDGET is said once on stderr while the reply still comes back
+    import io, contextlib
+    stub, argv_f = f"{d}/claude-over", f"{d}/claude-over.argv"
+    with open(stub, "w") as f:
+        f.write(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > {argv_f}\ncat >/dev/null\n'
+                'echo \'{"result":"{}","is_error":false,"total_cost_usd":0.90}\'\n')
+    os.chmod(stub, 0o755)
+    os.environ.pop("CC_APPROVE_FAKE", None); os.environ["CC_CLAUDE"] = stub; os.environ["APPROVER_BUDGET"] = "0.50"
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        r = model("judge this")
+    av = open(argv_f).read().split("\n") if os.path.exists(argv_f) else []
+    check("the judge is one turn with no --max-budget-usd; a call past APPROVER_BUDGET still answers and says so once",
+          r == "{}" and av[av.index("--max-turns") + 1] == "1" and "--max-budget-usd" not in av
+          and err.getvalue().count("past APPROVER_BUDGET $0.50") == 1 and "not a cap" in err.getvalue())
+    del os.environ["APPROVER_BUDGET"]
     print(f"cc-approve selfcheck: {passed} passed, {len(failed)} failed")
     return 1 if failed else 0
 

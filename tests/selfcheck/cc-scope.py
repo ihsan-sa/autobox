@@ -84,6 +84,10 @@ def selfcheck():
           and led[0]["links"]["source"].startswith("scope-deliver:%s:%s:" % (R, a1)) and "rc 3" in led[0]["observed"])
         quiet(["deliver", R, a1]); quiet(["deliver", R, a1])
         t("…once, not once per check tick: two more ticks on the same red leave one record", len(ledger(R)) == 1)
+        RL = R + "-long"   # its own ledger: an ask is kept whole, however long
+        essay = "make the digest say " + " ".join(f"point {i}" for i in range(300))
+        al, _ = add(RL, essay)
+        t("a long ask is kept whole, never cut to a length", len(essay) > 2000 and get(RL, al)["text"] == essay)
         R3 = R + "-ctl"   # its own ledger: an unsettled row left here would be work the cases below count
         a3, _ = add(R3, "a claimed ask whose check is red")
         quiet(["claim", R3, a3, "--track", "t3"]); quiet(["check-cmd", R3, a3, "exit 1"])

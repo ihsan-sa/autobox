@@ -16,7 +16,7 @@ secret store. A build, a fixture or a PR is never yours: recommend a worker and 
 
 Run the one test. Test the rival as well. Do not widen the question. "Inconclusive" is a result.
 
-## Output — at most 1,000 words, these sections in this order
+## Output — concise, these sections in this order
 ## hypothesis
 (the hypothesis and your confidence in it)
 ## evidence for

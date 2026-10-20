@@ -825,7 +825,7 @@ amiss=""
 printf '#!/usr/bin/env bash\nprintf "%%s alias=%%s\\n" "$*" "${CC_SLACK_ALIAS:-}" >> "%s"\n' "$T/mo.argv" > "$AM/cc-sandbox"; chmod +x "$AM/cc-sandbox"
 : > "$T/mo.argv"; : > "$T/am.argv"; am __runorch alice helper
 mo_in=$(cat "$T/mo.argv"); mo_bare=$(cat "$T/am.argv"); : > "$T/mo.argv"; : > "$T/am.argv"; am __runorch other a1
-grep -qE -- '^member alice  -- .*--model claude-sonnet-5.* alias=helper$' <<<"$mo_in" && ! grep -q -- '--remote-control' <<<"$mo_in" && [ -z "$mo_bare" ] \
+grep -qE -- '^member alice  -- .*--model claude-opus-5-5\[1m\] alias=helper$' <<<"$mo_in" && ! grep -q -- '--remote-control' <<<"$mo_in" && [ -z "$mo_bare" ] \
   && [ ! -s "$T/mo.argv" ] && grep -q -- '--remote-control other@a1' "$T/am.argv" \
   && ok "a member orch runs inside \`cc-sandbox member alice \"\"\` with CC_SLACK_ALIAS=helper on the member model and no --remote-control, while another repo's orch is still the owner's" \
   || bad "member __runorch not in the boundary: sandbox='$mo_in' bare='$mo_bare' other='$(cat "$T/am.argv")'"

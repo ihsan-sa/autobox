@@ -1,45 +1,40 @@
 #!/usr/bin/env python3
-"""cc-subagent-bound — a subagent's context has a bound, the way a seat's hand-off line bounds a seat.
+"""cc-subagent-bound — a subagent is told once, early, to save its work as it goes; the model's window is its bound.
 
-  cc-subagent-bound hook < payload.json     PreToolUse, every tool: a subagent's first call past the save line is
-                                            refused once with an order to write its deliverable now; its call past
-                                            the bound is refused with an order to save its work and return a report
+  cc-subagent-bound hook < payload.json     PreToolUse, every tool: a subagent's first call at or past the save line
+                                            is refused once with an order to write its work now; every other call runs
   cc-subagent-bound measure [--since YYYY-MM-DD] [--over TOKENS]
-                                            the spend figure the bound is judged by, over ~/.claude/projects/*/*/
+                                            the spend figure long subagents are judged by, over ~/.claude/projects/*/*/
                                             subagents/agent-*.jsonl touched since that day (UTC, default 7 days ago)
   cc-subagent-bound selfcheck               fixture transcripts and payloads in a HOME of their own
 
 WHY. A seat hands off near 150k (cc-context) and a worker starts fresh every cc-loop iteration, but a subagent had
 no bound at all, and every call re-reads its whole context as cache, so its cost grows with the square of its
 length. Since 2026-09-24, 18 of 615 subagent transcripts grew past 300k and carried 3.9B of the 6.6B cache-read
-tokens all subagents read; one Sonnet builder made 2070 calls and reached 966k.
+tokens all subagents read; one Sonnet builder made 2070 calls and reached 966k. This hook then refused a subagent's
+calls past a 150k bound, with a wrap-up room after it. That refusal was cut on 2026-10-20 (owner: the box's core
+keeps no count caps; the model's window is the bound). Only the one-time save nudge remains, so a long subagent
+has its work on disk before anything can cut it short.
 
 THE RULE. The hook acts only on a payload carrying agent_id, which the harness sets on a subagent's own tool calls
 and never on a session's. It reads that subagent's transcript (agent_transcript_path when the payload has one,
 else <transcript_path minus .jsonl>/subagents/agent-<agent_id>.jsonl) and takes USED as cc-context does: the last
 assistant entry's input + cache_creation + cache_read, or a later compact_boundary's postTokens.
   used < SAVE                    nothing: no output, the call runs
-  SAVE <= used < BOUND, first    the call is REFUSED once with the save order (if the brief names a file, write
-                                 what you have to it now and keep writing as you go; the next calls run normally);
-                                 the save is claimed by an atomic create of <session>-<agent>.json.saved beside
-                                 the per-agent file below, so it never fires twice, even for parallel calls
-  SAVE <= used < BOUND, saved    nothing: the call runs
-  used >= BOUND, first time      the call is REFUSED with the wrap-up order (save the work in the worktree and a
-                                 progress file there, then end the turn with a report the parent can re-spawn from);
-                                 the crossing is recorded in ~/.cc/state/subagent-bound/<session>-<agent>.json
-  crossed, used < crossed+GRACE  the call runs: this is the room to commit and write the report
-  crossed, used >= crossed+GRACE every call is refused: end the turn now. Ending a turn needs no tool, so the report
-                                 still reaches the parent and nothing the subagent wrote is lost.
-BOUND is CC_SUBAGENT_CONTEXT_TOKENS (env, else ~/.cc/config; default 150000, the seat's hand-off figure; 0 = off),
-GRACE is CC_SUBAGENT_WRAPUP_TOKENS (default 30000). SAVE is CC_SUBAGENT_SAVE_TOKENS (default 60% of BOUND, so 90000;
-0 = off): a long reader that has written nothing by the bound has only GRACE left to write a large deliverable, and
-at 60% it still has 60k of room to write it. At the bound counts as past it. No model call is made, and any error
-decides nothing: a hook that cannot read its input or transcript, or cannot record the save, leaves the call alone.
-The three figures cost one cc-config call at most per hook, and only for those the environment does not set.
+  used >= SAVE, first            the call is REFUSED once with the save order (run this call again; if the brief
+                                 names a file or you are editing a worktree, write what you have there now and keep
+                                 writing as you go; the next calls run normally). The save is claimed by an atomic
+                                 O_EXCL create of ~/.cc/state/subagent-bound/<session>-<agent>.json.saved, so it
+                                 never fires twice, even for parallel calls
+  used >= SAVE, saved            nothing: the call runs, however large the context grows
+SAVE is CC_SUBAGENT_SAVE_TOKENS (env, else ~/.cc/config; default 90000; 0 = off). At the line counts as past it. No
+model call is made, and any error decides nothing: a hook that cannot read its input or transcript, or cannot
+record the save, leaves the call alone. The figure costs one cc-config call at most per hook, and only when the
+environment does not set it.
 
-PRUNING. Each subagent leaves <session>-<agent>.json.lock in the state dir, and one past SAVE or BOUND also leaves
-.json and .json.saved. A hook that creates a new lock first deletes the files there older than PRUNE_DAYS (7): no
-subagent runs that long, and a missing record only means a fresh save order.
+PRUNING. Each subagent leaves <session>-<agent>.json.lock in the state dir, and one that got the save order also
+leaves .json.saved and .json (the save's record). A hook that creates a new lock first deletes the files there
+older than PRUNE_DAYS (7): no subagent runs that long, and a missing record only means a fresh save order.
 
 MEASURE prints, per the method the brief used: the files, the sum of cache_read_input_tokens over every assistant
 line, the count of files whose largest context passed --over (default 300000) and their share of that sum. The
@@ -55,24 +50,13 @@ AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TAIL = 256 * 1024
 MAX_TAIL = 32 * 1024 * 1024
 PRUNE_DAYS = 7
-CFG_KEYS = ("CC_SUBAGENT_CONTEXT_TOKENS", "CC_SUBAGENT_WRAPUP_TOKENS", "CC_SUBAGENT_SAVE_TOKENS")
+CFG_KEYS = ("CC_SUBAGENT_SAVE_TOKENS",)
 PAUSE = 0.0                                   # selfcheck only: widens the read-to-write gap; nothing else sets it
 
-WRAP = ("CONTEXT BOUND: this subagent's context is {used:,} tokens, at or past the box's bound of {bound:,} "
-        "(CC_SUBAGENT_CONTEXT_TOKENS), and every further call re-reads all of it. This call was NOT run. Wrap up now, "
-        "and do not start new work: (1) save what you have, so leave or commit your edits in your worktree and write "
-        "a short progress file there (what is done, what is left, the next step); (2) then end your turn with a final "
-        "report the parent can re-spawn you from, saying you stopped at the context bound, what is done and where it "
-        "is, what is left, and the exact next step. You have about {grace:,} more tokens for that; after them every "
-        "tool call is refused.")
-SAVE = ("SAVE NOW: this subagent's context is {used:,} tokens, {left:,} short of the box's bound of {bound:,} "
-        "(CC_SUBAGENT_CONTEXT_TOKENS), where its calls start being refused. This one call was NOT run; run it again "
-        "after this. If your brief names a file to write, or you are editing a worktree, write what you have there now "
-        "(your edits, findings or draft so far) and keep writing as you go, so the work survives if you reach the "
-        "bound. If your brief says to write no files, write none. Your next calls run normally.")
-STOP = ("CONTEXT BOUND: this subagent is {used:,} tokens in, past the bound of {bound:,} plus its {grace:,}-token "
-        "wrap-up. Every tool call is refused from here. End your turn now with your final report: that you stopped "
-        "at the context bound, what is done and where it is, what is left, and the exact next step.")
+SAVE = ("SAVE NOW: this subagent's context is {used:,} tokens. This one call was NOT run; run it again after this. "
+        "If your brief names a file to write, or you are editing a worktree, write what you have there now (your edits, "
+        "findings or draft so far) and keep writing as you go, so the work survives if the run is cut short. If your "
+        "brief says to write no files, write none. Your next calls run normally.")
 
 
 _file_cfg = None
@@ -187,11 +171,9 @@ def hook(raw):
     agent = p.get("agent_id")
     if not (isinstance(agent, str) and AGENT_RE.match(agent)):
         return 0                              # a session's own call: seats have cc-context, workers cc-loop
-    bound = cfg("CC_SUBAGENT_CONTEXT_TOKENS", 150000)
-    if bound <= 0:
+    save = cfg("CC_SUBAGENT_SAVE_TOKENS", 90000)
+    if save <= 0:
         return 0
-    grace = max(0, cfg("CC_SUBAGENT_WRAPUP_TOKENS", 30000))
-    save = cfg("CC_SUBAGENT_SAVE_TOKENS", bound * 3 // 5)
     try:
         path = transcript_of(p)
         used = used_of(path) if path and os.path.isfile(path) else None
@@ -216,49 +198,24 @@ def hook(raw):
         pass
 
     def decide():
-        try:
-            with open(mark) as f:
-                rec = json.load(f)
-            rec = rec if isinstance(rec, dict) else {}
-        except Exception:
-            rec = {}
-        try:
-            crossed = int(rec["used"])
-        except Exception:
-            crossed = None
-        if crossed is None:
-            # "a subagent past a configurable context bound ... is made to wrap up and return" (the brief): at counts as past
-            if used < bound:
-                if save <= 0 or used < save or "saved" in rec:
-                    return 0
-                # the early save: once, and only when it is recorded, or a subagent that cannot record it never runs again.
-                # The claim is an O_EXCL create of <mark>.saved, atomic on its own, so only one hook can issue it even when
-                # the lock above could not be taken (review of #1319: the check and the record are one step).
-                if PAUSE:
-                    time.sleep(PAUSE)
-                try:
-                    os.makedirs(STATE, exist_ok=True)
-                    os.close(os.open(mark + ".saved", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-                except OSError:
-                    return 0                      # already claimed by another hook, or unrecordable: the call runs
-                try:
-                    with open(mark, "w") as f:
-                        json.dump({"saved": used, "save": save, "bound": bound, "ts": int(time.time()), "transcript": path}, f)
-                except OSError:
-                    pass                          # the claim above already records it
-                deny(SAVE.format(used=used, left=bound - used, bound=bound))
-                return 0
-            try:
-                os.makedirs(STATE, exist_ok=True)
-                with open(mark, "w") as f:
-                    json.dump(dict(rec, used=used, bound=bound, ts=int(time.time()), transcript=path), f)
-            except OSError:
-                pass                              # unrecorded, the next call is refused the same way: never lets it run on
-            deny(WRAP.format(used=used, bound=bound, grace=grace))
+        if used < save:
             return 0
-        if used < crossed + grace:
-            return 0
-        deny(STOP.format(used=used, bound=bound, grace=grace))
+        # the save: once, and only when it is recorded, or a subagent that cannot record it would be refused forever.
+        # The claim is an O_EXCL create of <mark>.saved, atomic on its own, so only one hook can issue it even when
+        # the lock above could not be taken (review of #1319: the check and the record are one step).
+        if PAUSE:
+            time.sleep(PAUSE)
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            os.close(os.open(mark + ".saved", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        except OSError:
+            return 0                              # already claimed by another hook, or unrecordable: the call runs
+        try:
+            with open(mark, "w") as f:
+                json.dump({"saved": used, "save": save, "ts": int(time.time()), "transcript": path}, f)
+        except OSError:
+            pass                                  # the claim above already records it
+        deny(SAVE.format(used=used))
         return 0
 
     try:

@@ -33,8 +33,9 @@ core/tests/reach.tsv, open board rows and cc-failures records naming it, the doc
 calls that no tool, unit or directory carries any more. Every list is sorted and every age is counted from the run's
 date, so the same box on the same day gives the same pack.
 
-THE READ: one headless `claude -p` with no tools, the pack plus the part's code in the prompt, capped at
-ROTATION_READ_CAP dollars (default 3) on ROTATION_MODEL (default claude-opus-5-5). It answers keep, refresh, merge or
+THE READ: one headless `claude -p` with no tools, the pack plus the part's code in the prompt, on ROTATION_MODEL
+(default claude-opus-5-5), with no dollar or turn cap. ROTATION_READ_CAP dollars (default 3) is a notice figure: a read
+that cost more says so once on stderr and still counts; the batch also plans its next read at that figure. It answers keep, refresh, merge or
 retire with findings, each with evidence. The reviewer never edits or deletes anything. Each actionable finding
 becomes one board row raised-stale-<part>-<short> on ROTATION_REPO with its evidence in the brief (no repo set: no
 rows, and the report says so). A retire is a row for the planning seat too; for a LIVE part it is also an ARCHIVE
@@ -566,6 +567,24 @@ actionable false for an observation nobody needs to act on.
 """
 
 
+def read_argv():
+    """The read's claude argv: no tools, no settings, and no --max-budget-usd or --max-turns (ROTATION_READ_CAP is a
+    notice figure, see over_read)."""
+    return [os.environ.get("CLAUDE", "claude"), "-p", "--model", cfg("ROTATION_MODEL", "claude-opus-5-5"),
+            "--output-format", "json", "--tools", "", "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"]
+
+
+def over_read(pid, cost):
+    """The backstop, once per read: a read past ROTATION_READ_CAP is one line naming it, never a stop. "" under it."""
+    try:
+        cap = float(cfg("ROTATION_READ_CAP", "3"))
+    except ValueError:
+        return ""
+    if cost <= cap:
+        return ""
+    return "cc-rotation: the read of %s cost $%.2f, past ROTATION_READ_CAP $%g (a notice, not a cap)" % (pid, cost, cap)
+
+
 def read_part(pid, pk, p, ctx):
     """One model read. Returns (verdict dict or None, cost, why-not)."""
     code, total, cap = [], 0, 90_000
@@ -581,16 +600,12 @@ def read_part(pid, pk, p, ctx):
         total += len(txt)
         code.append("== %s\n%s" % (f.replace(HOME, "~"), txt))
     prompt = PROMPT + pack_md(pk) + "\n# Code\n" + ("\n".join(code) or "(no files: a live part, judged from the pack)")
-    cap_usd = cfg("ROTATION_READ_CAP", "3")
     if os.environ.get("ROTATION_FAKE_LLM"):
         raw = open(os.environ["ROTATION_FAKE_LLM"]).read()
     else:
         env = dict(os.environ, CC_ROLE="worker")
         try:
-            raw = subprocess.run([os.environ.get("CLAUDE", "claude"), "-p", "--model", cfg("ROTATION_MODEL", "claude-opus-5-5"),
-                                  "--max-budget-usd", cap_usd, "--max-turns", "2", "--output-format", "json", "--tools", "",
-                                  "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"],
-                                 input=prompt, capture_output=True, text=True, timeout=1200, env=env, cwd=tempfile.gettempdir()).stdout
+            raw = subprocess.run(read_argv(), input=prompt, capture_output=True, text=True, timeout=1200, env=env, cwd=tempfile.gettempdir()).stdout
         except (OSError, subprocess.TimeoutExpired) as e:
             return None, 0.0, "the read did not finish: %s" % e
     try:
@@ -598,6 +613,9 @@ def read_part(pid, pk, p, ctx):
     except ValueError:
         return None, 0.0, "claude printed no JSON"
     cost = float(j.get("total_cost_usd") or 0)
+    note = over_read(pid, cost)
+    if note:
+        print(note, file=sys.stderr)
     res = j.get("result") or ""
     if j.get("is_error") or not res:
         return None, cost, "the read failed: subtype %s" % j.get("subtype")
@@ -797,7 +815,7 @@ def post(line):
 
 def run_batch(ids, parts, packs, ctx, st, no_llm, cap, spent):
     """Review ids in order while the next read still fits under the cap. Returns (results, spent, stopped-at-cap)."""
-    read_cap = float(cfg("ROTATION_READ_CAP", "3"))
+    read_cap = float(cfg("ROTATION_READ_CAP", "3"))   # what one read is planned at: its notice figure, not a cap on it
     res, props = [], []
     for pid in ids:
         p = parts[pid]
@@ -1081,6 +1099,20 @@ def selfcheck():
            "pack: rows, docs, last run from the unit: %s" % z)
         ok(any(x.startswith("old-row") for x in idle["idle_rows"]) and not any(x.startswith("fresh-row") for x in idle["idle_rows"]),
            "idle rows: 14+ days kept, a fresh one not")
+
+        # 2b. the read carries no dollar or turn cap; ROTATION_READ_CAP is a notice once past, nothing under it
+        saved_cap = os.environ.get("ROTATION_READ_CAP")
+        os.environ["ROTATION_READ_CAP"] = "3"
+        av = read_argv()
+        ok("--max-budget-usd" not in av and "--max-turns" not in av and av[av.index("--tools") + 1] == "",
+           "the read: no tools, no --max-budget-usd and no --max-turns: %s" % av)
+        ok(over_read("dashboard", 2.5) == "" and over_read("dashboard", 4.2)
+           == "cc-rotation: the read of dashboard cost $4.20, past ROTATION_READ_CAP $3 (a notice, not a cap)",
+           "a read past ROTATION_READ_CAP is one notice line naming the part and the figure; under it, none")
+        if saved_cap is None:
+            os.environ.pop("ROTATION_READ_CAP")
+        else:
+            os.environ["ROTATION_READ_CAP"] = saved_cap
 
         # 3. stalest first
         ok(stalest(["b", "a", "c"], {"parts": {"a": {"last_reviewed": "2026-09-01"}, "c": {"last_reviewed": "2026-08-01"}}}) == ["b", "c", "a"],

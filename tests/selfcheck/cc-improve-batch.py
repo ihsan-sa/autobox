@@ -11,7 +11,7 @@ def selfcheck():
         print(f"  {'ok' if ok else 'FAIL'}  {label}")
 
     real_home = os.environ.get("HOME")
-    keep = {k: os.environ.get(k) for k in ("HOME", "CC_CLAUDE", "CC_CONFIG", "STUB_LOG", "STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS", "CC_JOB_NOTIFY")}
+    keep = {k: os.environ.get(k) for k in ("HOME", "CC_CLAUDE", "CC_CONFIG", "STUB_LOG", "STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS", "CC_JOB_NOTIFY", "STUB_COST")}
 
     def fixture():
         h = tempfile.mkdtemp(prefix="cc-improve-batch-sc.")
@@ -20,7 +20,7 @@ def selfcheck():
         with open(os.environ["CC_JOB_NOTIFY"], "w") as f:   # never the live cc-notify: a crossed budget lands in a file
             f.write(f"#!/bin/sh\necho \"$*\" >> '{h}/notified'\n")
         os.chmod(os.environ["CC_JOB_NOTIFY"], 0o755)
-        for k in ("STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS"):
+        for k in ("STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS", "STUB_COST"):
             os.environ.pop(k, None)
         open(os.environ["CC_CONFIG"], "w").close()
         with open(os.environ["CC_CLAUDE"], "w") as f:
@@ -137,28 +137,30 @@ def selfcheck():
         case("--out writes there, and not to the default reports folder",
              not os.path.exists(os.path.join(h, ".cc", "state", "improve", "reports")))
 
-        # 4. the budget: once spent, no more calls
+        # 4. THE BUDGET ALERTS, IT NEVER STOPS WORK (owner 10-16/20): $0.06 is crossed by the second call, every pass
+        #    still runs, and one ambient line says so
         h, snap = fixture()
         homes.append(h)
         os.environ["IMPROVE_BATCH_BUDGET"] = "0.06"
         rc, out = main_(snap)
-        case("a budget of $0.06 buys the first call and stops the rest", rc == 0 and len(calls()) == 1 and "budget" in out + open(
-            os.path.join(h, ".cc", "state", "improve", "reports", "2026-01-10.md")).read())
-
-        # 4b. THE BUDGET ALERTS, IT DOES NOT CUT A PASS (owner 10-16): pass 3's pick call crosses $0.10, its judge call
-        #     still runs under the over-budget ceiling, one ambient line says so, and pass 4 is where the day stops
-        h, snap = fixture()
-        homes.append(h)
-        os.environ["IMPROVE_BATCH_BUDGET"] = "0.10"
-        rc, out = main_(snap)
         cs = calls()
         said = open(os.path.join(h, "notified")).read() if os.path.exists(os.path.join(h, "notified")) else ""
-        case("a budget crossed inside pass 3 lets its judge call run, under the over-budget ceiling",
-             rc == 0 and [c["head"].split(": ", 1)[-1] for c in cs] == ["nudges", "failures", "fixes-pick", "fixes-judge"]
-             and cs[-1]["argv"][cs[-1]["argv"].index("--max-budget-usd") + 1] == f"{OVER_CALL:.2f}")
-        case("…its first crossing posts one ambient cc-notify line, and the day stops before pass 4, saying why",
-             said.count("\n") == 1 and "--id budget:cc-improve-batch:" in said and "failed: ideas" in out
-             and "budget of $0.10 is spent" in open(os.path.join(h, ".cc", "state", "improve", "reports", "2026-01-10.md")).read())
+        case("a budget of $0.06 is crossed and every pass still runs, with no dollar cap on any call",
+             rc == 0 and [c["head"].split(": ", 1)[-1] for c in cs] == ["nudges", "failures", "fixes-pick", "fixes-judge", "ideas"]
+             and not any("--max-budget-usd" in c["argv"] for c in cs) and "failed" not in out)
+        case("…its first crossing posts one ambient cc-notify line, and only one",
+             said.count("\n") == 1 and "--id budget:cc-improve-batch:" in said)
+
+        # 4b. one call over OVER_CALL says so once and is not cut off; the day goes on
+        h, snap = fixture()
+        homes.append(h)
+        os.environ.update(IMPROVE_BATCH_BUDGET="100", STUB_COST=f"{OVER_CALL + 0.10:.2f}")
+        rc, out = main_(snap)
+        os.environ.pop("STUB_COST")
+        said = open(os.path.join(h, "notified")).read() if os.path.exists(os.path.join(h, "notified")) else ""
+        case("every call over OVER_CALL still returns and every pass runs, and one line says so, once",
+             rc == 0 and len(calls()) == 5 and "failed" not in out
+             and said.count("\n") == 1 and "--id call:cc-improve-batch:" in said)
 
         # 5. the spend tier: a tier that holds `goals` spends nothing; one that allows it runs
         h, snap = fixture()
@@ -233,6 +235,12 @@ def selfcheck():
         notes = {}
         got = pass_ideas(Fake({"ideas": six[:2]}), found, [], notes, {})
         case("ideas: two returned, both kept", len(got) == 2 and notes["ideas"] == "2 ideas kept of 2 returned")
+        many = [{"id": f"m:{i}", "pass": "nudges", "title": f"t{i}", "cost": 1, "freq": 1} for i in range(15)]
+        fk = Fake({"ideas": []})
+        prompts = []
+        fk.ask = lambda pass_name, prompt: prompts.append(prompt) or []
+        pass_ideas(fk, many, [], {}, {})
+        case("ideas: the pass is shown every finding, not the first ten", prompts and all(f'"m:{i}"' in prompts[0] for i in range(15)))
 
         # 8. the service's start timeout covers the worst case the code can make
         unit = os.path.join(os.path.dirname(BIN), "config", "systemd-user", "cc-improve-batch.service")

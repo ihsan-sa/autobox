@@ -105,8 +105,10 @@
 # of this account could move itself into one of those cgroups while the unit runs (the user owns its delegated tree),
 # which is the same hostile session sudo already lets through; cc-guard also refuses `cc-perms revive` from a worker or
 # member shell as text. Revive takes no argument and brings back only the box's own repo's seat (ctl_repo), with the
-# same fixed launch as relaunch. A seat brought back 3 times in 30 minutes is left down, so a seat that dies at once is
-# not restarted every minute. A pins difference, or nothing pinned yet, does not hold it: it starts and logs the
+# same fixed launch as relaunch. A seat that keeps dying is never left down: past REVIVE_EASY revivals in a row (a run
+# of them each less than REVIVE_CALM apart) each further one waits twice as long as the last, from REVIVE_BASE up to
+# REVIVE_CEIL, so it is not restarted every minute, and the owner is told once per run, with the line that starts it
+# by hand (owner, 2026-10-16/20: no give-up after N; a time-based give-up backs off and posts once). A pins difference, or nothing pinned yet, does not hold it: it starts and logs the
 # difference in revive.log, and the seat's own stop line (cc-checkpoint, through pins-diff) tells it to check and pin.
 # Every other refusal tells the owner once (one cc-notify per reason, stamped in revive-alerted) with one line to paste.
 # THE PLANNING SEAT IS TRUSTED. It can edit cc-perms and cc-slack in ~/dev and start a claude that skips permissions
@@ -501,9 +503,18 @@ revive_refused(){
 revive_log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$2" >> "$1/revive.log" 2>/dev/null; return 0; }
 
 # revive — `cc-perms revive`, the box's own recover units bringing the seat back with no person (see REVIVE above)
-REVIVE_MAX=3; REVIVE_WINDOW=1800
+REVIVE_EASY=3; REVIVE_BASE=120; REVIVE_CEIL=3600; REVIVE_CALM=7200
+
+# revive_run DIR NOW — the run of revivals that ends DIR/revived: from the last line back, while each is less than
+# REVIVE_CALM before the next (the last, before NOW). Prints "<count> <first> <last>", or "0 0 0" when there is none.
+revive_run(){
+  [ -f "$1/revived" ] || { echo "0 0 0"; return 0; }
+  awk -v now="$2" -v calm="$REVIVE_CALM" '$1 ~ /^[0-9]+$/ {t[++n] = $1}
+    END { c = 0; nx = now; for (i = n; i >= 1 && nx - t[i] < calm; i--) { c++; nx = t[i] }
+          if (c) print c, t[n - c + 1], t[n]; else print "0 0 0" }' "$1/revived"; }
+
 revive(){
-  local r why pd cl pid n t f
+  local r why pd cl pid n t f first last gap next
   why=$(unit_caller) || die "refused — $why. Only the box's recover units revive the permission seat; a planning seat runs cc-perms relaunch."
   lock "a relaunch, hand-off or revive is already running; nothing started"
   r=$(ctl_repo); pd="$H/.cc/state/$r/perms"
@@ -514,9 +525,21 @@ revive(){
     && revive_refused "$r" "$pd" "window $SESSION:$WIN is open with no seat in it" \
       "Close it with this, and the box brings the seat back within a minute: tmux kill-window -t $SESSION:$WIN"
   t=$(date +%s)
-  n=0; [ -f "$pd/revived" ] && n=$(awk -v c=$(( t - REVIVE_WINDOW )) '$1 ~ /^[0-9]+$/ && $1 >= c {n++} END {print n + 0}' "$pd/revived")
-  [ "$n" -ge "$REVIVE_MAX" ] && revive_refused "$r" "$pd" "it was brought back $n times in the last $(( REVIVE_WINDOW / 60 )) minutes and went down again each time" \
-    "It tries again by itself once the oldest of those is $(( REVIVE_WINDOW / 60 )) minutes old. To look now, start it by hand with: $(hand_cmd "$pd" "You went down several times in a row: say what you see.")"
+  read -r n first last < <(revive_run "$pd" "$t")
+  if [ "$n" -ge "$REVIVE_EASY" ]; then
+    gap=$REVIVE_CEIL; [ $(( n - REVIVE_EASY )) -lt 6 ] && gap=$(( REVIVE_BASE << (n - REVIVE_EASY) ))
+    [ "$gap" -gt "$REVIVE_CEIL" ] && gap=$REVIVE_CEIL
+    # the owner hears once per run (its first revival's time, stamped in revive-backoff) that it keeps going down and
+    # that the box keeps bringing it back, waiting longer each time
+    if [ "$(cat "$pd/revive-backoff" 2>/dev/null)" != "$first" ]; then
+      revive_log "$pd" "brought back $n times in a row and down again each time; backing off, up to $(( REVIVE_CEIL / 60 )) minutes between tries"
+      "${NOTIFY[@]}" --owner -t "$r perms" --heading "The $r permission seat keeps going down" \
+        --id "perms-revive:$r:backoff:$first" "The $r permission seat was brought back $n times in a row and went down again each time. The box keeps bringing it back, waiting longer each time, up to $(( REVIVE_CEIL / 60 )) minutes between tries. To look now, start it by hand with: $(hand_cmd "$pd" "You went down several times in a row: say what you see.")" >/dev/null 2>&1 \
+        && printf '%s\n' "$first" > "$pd/revive-backoff"
+    fi
+    next=$(date -u -d "@$(( last + gap ))" +%H:%MZ)
+    [ $(( t - last )) -lt "$gap" ] && die "backing off — brought back $n times in a row; the next try is after $next. Nothing started."
+  fi
   if ! why=$(above_clean "$pd" "$r"); then f=${why%% sits above*}
     revive_refused "$r" "$pd" "$why" "Move it away with this, and the box brings the seat back within a minute: mv -- $f $f.off"; fi
   cl=$(launch_target) || revive_refused "$r" "$pd" "$cl" "Check it, then start the seat by hand with: $(hand_cmd "$pd" "")"
@@ -524,8 +547,8 @@ revive(){
   # the pins advise: a difference, or nothing pinned yet, is logged, and the seat's stop line has it check and pin
   why=$(pins_diff "$pd" "$cl") || revive_log "$pd" "started with startup files that differ from its pins: $(paste -sd , <<<"$why")"
   printf '%s\n' "$t" >> "$pd/revived"
-  # keep the record to what the window can count
-  f=$(awk -v c=$(( t - REVIVE_WINDOW )) '$1 ~ /^[0-9]+$/ && $1 >= c' "$pd/revived") && printf '%s\n' "$f" > "$pd/revived"
+  # keep the record to the current run, the only part revive_run reads
+  f=$(tail -n "$(( n + 1 ))" "$pd/revived") && printf '%s\n' "$f" > "$pd/revived"
   rm -f -- "$pd/revive-alerted"
   why=$(open_seat "$r" "$pd" "$cl" 0) || { revive_log "$pd" "the launch failed"; exit 1; }
   revive_log "$pd" "started"; echo "$why"; }
@@ -1112,11 +1135,23 @@ EOF
   rfx rbin; ln -s /bin/true "$H/bin/odd"; out=$(rv); r1=$?
   ok "$( [ $r1 = 1 ] && ! started && grep -q 'tmux new-window -t main -n perms' "$F/notify.log"; echo $?)" \
     "revive: a ~/bin entry outside the box's repo is refused, and the owner gets the line that starts the seat by hand"
-  rfx rloop; t=$(date +%s); printf '%s\n' $((t-600)) $((t-300)) $((t-60)) > "$(rd)/revived"; out=$(rv); r1=$?
-  printf '%s\n' $((t-4000)) $((t-300)) $((t-60)) > "$(rd)/revived"; out2=$(rv); r2=$?; rargs >/dev/null
-  ok "$( [ "$r1$r2" = 10 ] && [[ $out == *"brought back 3 times"* ]] && [[ $out2 != *"brought back"* ]] && [ "$(grep -c '^---$' "$F/notify.log")" = 1 ] && started \
+  rfx rloop; t=$(date +%s); printf '%s\n' $((t-600)) $((t-300)) $((t-60)) > "$(rd)/revived"; out=$(rv); r1=$?; out2=$(rv); r2=$?
+  ok "$( [ "$r1$r2" = 11 ] && ! started && [[ $out == *"backing off"*"3 times in a row"* ]] && [[ $out2 == *"backing off"* ]] \
+      && [ "$(grep -c '^---$' "$F/notify.log")" = 1 ] && grep -q -- '--owner' "$F/notify.log" && grep -q 'keeps bringing it back' "$F/notify.log" \
       && [ "$(grep -c . "$(rd)/revived")" = 3 ]; echo $?)" \
-    "revive: a seat brought back 3 times in 30 minutes is left down and the owner told once; with one of those older, it starts ($r1$r2)"
+    "revive: a seat brought back 3 times in a row waits $REVIVE_BASE s before the next, and the owner is told once, not once per tick ($r1$r2)"
+  rfx rloopgo; t=$(date +%s); printf '%s\n' $((t-900)) $((t-600)) $((t-300)) > "$(rd)/revived"; out=$(rv); r1=$?; rargs >/dev/null
+  ok "$( [ $r1 = 0 ] && started && [ "$(grep -c . "$(rd)/revived")" = 4 ] && [ "$(grep -c '^---$' "$F/notify.log")" = 1 ]; echo $?)" \
+    "revive: …past the wait it brings the seat back: three in a row never leaves it down"
+  rfx rloopcalm; t=$(date +%s); printf '%s\n' $((t-9000)) $((t-300)) $((t-60)) > "$(rd)/revived"; out=$(rv); r1=$?; rargs >/dev/null
+  ok "$( [ $r1 = 0 ] && started && [ ! -e "$F/notify.log" ] && [ "$(grep -c . "$(rd)/revived")" = 3 ] \
+      && ! grep -qx "$((t-9000))" "$(rd)/revived"; echo $?)" \
+    "revive: a revival more than $REVIVE_CALM s before the next ends the run, so two in a row start at once and the record keeps only the run"
+  rfx rloopceil; t=$(date +%s); : > "$(rd)/revived"; for i in 9 8 7 6 5 4 3 2 1; do echo $((t-3000-i*4000)) >> "$(rd)/revived"; done
+  echo $((t-3000)) >> "$(rd)/revived"; out=$(rv); r1=$?
+  sed -i '$d' "$(rd)/revived"; echo $((t-3700)) >> "$(rd)/revived"; out2=$(rv); r2=$?; rargs >/dev/null
+  ok "$( [ "$r1$r2" = 10 ] && [[ $out == *"10 times in a row"* ]] && started && [ "$(grep -c . "$(rd)/revived")" = 11 ]; echo $?)" \
+    "revive: the wait doubles up to $REVIVE_CEIL s and stops there: ten in a row 50 minutes after the last waits, one hour after it starts ($r1$r2)"
   # outside the selfcheck (no CC_PERMS_FIXTURE) CC_PERMS_CGROUP is ignored: the call reads its own cgroup, which for
   # this selfcheck is never a recover unit's, so it is refused before the lock (and nothing real is ever reached)
   rfx rreal; own=$(sed -n 's/^0:://p' /proc/self/cgroup)
