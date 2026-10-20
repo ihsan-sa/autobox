@@ -15,7 +15,14 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
    repo does not land its own PRs (`lander tick`'s strays sweep). The sweep skips `track/*` branches (`cc-loop`
    queues those) and PRs older than 48 hours. Because it lists `--author @me`, it also sweeps a non-draft PR the
    owner opens by hand on a self-landing repo. That is intended: the landing checks and the protected-path door
-   still apply.
+   still apply. A draft held back until another PR merges is queued as usual (the lane holds it as a draft)
+   and says so in its body with a line like `Waits on #1017` or `Waits on: #1001 and #1017`. Once every PR it
+   names has merged, the same sweep marks it ready and the held job reads it again at its wake, so the un-draft
+   never waits on a seat's journal. Only a draft the lander holds a live held job for is touched: the body alone is
+   never enough, because someone else's edits can arrive as the box's own drafts for a person to land, and an
+   ended job (a handback or query) is a decision a person still owes. If one of the
+   named PRs was closed unmerged, the draft stays a draft and the sweep says so. The drafts' gh calls are capped
+   per sweep (`LANDER_UNDRAFT_GH`, 20); the rest wait for the next sweep.
 2. **Plan.** The repo's manifest, `tests/LANDING.toml` read from the *base*, says which check owns which paths.
    The plan is the static checks, every check whose paths the change touches, and a changed tool's direct
    callers. A path no check owns widens to the manifest's `default` set, and the card names it. The path policy

@@ -18,7 +18,11 @@
             path door still decides). Left alone: a draft, a head on track/* (cc-loop queues a track's PR), one
             opened under 10 min ago (its seat may queue it itself) or over 48 h ago, and any PR with a job, a rest
             file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
-            a refusal is not undone by a sweep.
+            a refusal is not undone by a sweep. A draft the lander holds a queue job for, whose body has a "Waits on
+            #N" line (#N, #M on one or more such lines), is marked ready (`gh pr ready`) once every PR it names has
+            merged; the held job reads it again at its wake. A draft with no job is never touched, whatever its
+            body says, and a parent closed unmerged is said each sweep and the draft kept. The drafts' gh calls
+            are capped per sweep at $LANDER_UNDRAFT_GH (20); the rest wait for the next sweep.
             Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
             `dispatch/`) whose base is the repo's default branch and whose files touch no path on that branch's
             security list, read from a fresh fetch; any doubt queues it as before.
@@ -242,7 +246,7 @@ def sweep_strays(repos) -> list:
     cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back.
     A head on a self_merge_heads prefix whose base is the default branch and that merges_itself (no security path)
     is left to its repo; a PR to another base, and any doubt, queues."""
-    lines = []
+    lines, budget = [], [undraft_cap()]
     for repo in repos:
         root = J.repo_root(repo)
         if "--" in repo or not os.path.exists(os.path.join(root, ".git")):
@@ -254,9 +258,12 @@ def sweep_strays(repos) -> list:
         if prs is None:
             lines.append(f"[{repo}] strays: gh could not list the open PRs — {why}")
             continue
-        now, seen, heads, base = time.time(), None, None, None
+        now, seen, heads, base, parents = time.time(), None, None, None, {}
         for p in prs:
-            if not isinstance(p, dict) or not isinstance(p.get("number"), int) or p.get("isDraft"):
+            if not isinstance(p, dict) or not isinstance(p.get("number"), int):
+                continue
+            if p.get("isDraft"):
+                lines += undraft(repo, root, s, p, parents, budget)
                 continue
             n, head = p["number"], str(p.get("headRefName") or "")
             if head.startswith("track/"):
@@ -278,6 +285,67 @@ def sweep_strays(repos) -> list:
             lines.append(f"[{repo}] PR #{n} was open with no landing record — " +
                          (f"queued it ({said})" if qrc == 0 else f"queueing it failed: {said}"))
     return lines
+
+
+# a line of a draft's body naming the PRs it waits on: "Waits on #1017", "Waits on: #1001 and #1017". Only the list
+# straight after the words counts, so "Waits on #5; supersedes #7" names #5 alone.
+WAITS_ON = re.compile(r"^[ \t]*(?:[-*][ \t]*)?waits on\b:?((?:[ \t]*(?:,|and\b|&)?[ \t]*#[0-9]+\b)+)", re.I | re.M)
+
+
+def waits_on(p) -> list:
+    """The PR numbers a draft's body names on its "Waits on" lines, its own number left out. #N only: o/r#N is
+    another repo's PR, which this sweep does not read."""
+    got = []
+    for m in WAITS_ON.finditer(str(p.get("body") or "")):
+        for n in re.findall(r"#([0-9]+)", m.group(1)):
+            if int(n) != p.get("number") and int(n) not in got:
+                got.append(int(n))
+    return got
+
+
+def undraft_cap() -> int:
+    """How many gh calls one sweep may spend on drafts: $LANDER_UNDRAFT_GH, 20 when unset or not a number."""
+    try:
+        return max(0, int(os.environ.get("LANDER_UNDRAFT_GH") or 20))
+    except ValueError:
+        return 20
+
+
+def undraft(repo, root, s, p, parents, budget) -> list:
+    """raised-lander-half-draft-outlives-its-parent, 2026-10-14: three drafts sat ~12 h after their parents merged,
+    the un-draft being a line in a seat's journal that nothing acted on. A draft the lander holds a live HELD job for,
+    whose body says "Waits on #N", is marked ready once every PR it names has merged; the held job reads it again at
+    its wake. The body alone is never enough: a tool may open someone else's edits as @me drafts for a person to land,
+    with text they wrote in the body, so a planted line must not un-draft one. An ended job in rest/ (a handback, a
+    query) is a person's decision still owed, so it does not count either; holds re-arm and never move there. A parent
+    closed unmerged is said and the draft kept. parents: {n: state} read this sweep; budget: [gh calls left]."""
+    n = p["number"]
+    job = J.load_path(J.job_path(repo, n))
+    want = waits_on(p) if job is not None and job.state == T.HELD else []
+    if not want:
+        return []
+    for w in want:
+        if w not in parents:
+            if budget[0] <= 0:
+                return []
+            budget[0] -= 1
+            facts, why = GH.pr_facts(root, w, "state", None, 60)
+            if facts is None:
+                return [f"[{repo}] draft PR #{n}: gh could not say whether #{w} merged — {why}"]
+            parents[w] = facts.get("state") or ""
+    shut = [w for w in want if parents[w] == "CLOSED"]
+    if shut:
+        return [f"[{repo}] draft PR #{n} waits on " + ", ".join(f"#{w}" for w in shut) +
+                ", closed unmerged — it stays a draft for a person"]
+    if any(parents[w] != "MERGED" for w in want) or budget[0] <= 0:
+        return []
+    budget[0] -= 1
+    named = ", ".join(f"#{w}" for w in want)
+    rc, out, err = GH.gh(["pr", "ready", str(n), "-R", s], root, None, 60)
+    if rc:
+        why = GH.last(err or out) or f"exit {rc}"
+        return [f"[{repo}] draft PR #{n}: {named} merged, but marking it ready failed — {why}"]
+    return [f"[{repo}] PR #{n}: {named} merged — marked ready; its held job reads it again at its wake"]
 
 
 # what the `ended` step looks at: a job stopped for a person, or held, whose PR may have been merged around the lane

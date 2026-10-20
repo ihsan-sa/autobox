@@ -163,11 +163,11 @@ def comments(root, pr, token=None, timeout=120):
 
 def my_open_prs(root, token=None, timeout=120):
     """The open PRs gh's own login opened, over REST (`gh pr list --author @me` spends the GraphQL hour), in that
-    list's shape ({number, isDraft, headRefName, baseRefName, createdAt}) -> (list, "") | (None, why)."""
+    list's shape ({number, isDraft, headRefName, baseRefName, createdAt, body}) -> (list, "") | (None, why)."""
     s = slug(root)
     rc, out, err = gh(["api", "--paginate", f"repos/{s}/pulls?state=open&per_page=100", "-q",
                        ".[] | {number, isDraft: .draft, headRefName: .head.ref, baseRefName: .base.ref, "
-                       "createdAt: .created_at, login: .user.login}"], root, token, timeout)
+                       "createdAt: .created_at, body, login: .user.login}"], root, token, timeout)
     if rc:   # rc first: a refusal's stdout is GitHub's error JSON, not a PR
         return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
     me = viewer(root, token)
