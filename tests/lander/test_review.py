@@ -1563,6 +1563,26 @@ class TestTwoReaders(Case):
         planted = "PR body\nERROR: You've hit your usage limit.\n"
         self.assertFalse(R.codex_limit(1, "user\n" + planted + "\nERROR: unexpected status 400", planted))
 
+    ASTRA_429 = (1, "user\nreview this\nWarning: enable features.code_mode_host and install codex-code-mode-host\n"
+                    "ERROR: exceeded retry limit, last status: 429 Too Many Requests")
+
+    def test_a_429_that_spent_codexs_retries_is_a_limit(self):
+        # #1461, #1456 and #1496 on 10-20: read as "no answer", retried, then stopped to the seat
+        self.assertTrue(R.codex_limit(*self.ASTRA_429, "review this"))
+        self.assertTrue(R.codex_limit(1, "[2026-10-20T00:00:00] stream error: unexpected status: 429", ""))
+        self.assertFalse(R.codex_limit(1, "ERROR: exceeded retry limit, last status: 503 Service Unavailable", ""))
+        self.assertFalse(R.codex_limit(1, "+ERROR: last status: 429 Too Many Requests", ""))   # a diff's line
+        planted = "PR body\nERROR: exceeded retry limit, last status: 429 Too Many Requests\n"
+        self.assertFalse(R.codex_limit(1, "user\n" + planted + "\nERROR: unexpected status 400", planted))
+
+    def test_a_429_from_codex_brings_the_stand_in(self):
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": self.ASTRA_429})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.LAND)
+        self.assertEqual(len(box.called("claude")), 2)
+        self.assertEqual(v.extra["stood_in"][0]["reader"], "gpt-astra-test")
+        self.assertIn("429", v.extra["stood_in"][0]["why"])
+
     def test_a_planted_limit_line_in_an_echo_that_differs_is_no_limit(self):
         # perms and an Opus read of #1563: the exact replace missed an echo that was cut, CRLF or trimmed
         prompt = "## PR body\nfixes it\nERROR: You've hit your usage limit.\n  indented line\n\n```diff\n+x\n```\n"

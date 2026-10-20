@@ -96,8 +96,8 @@ Otherwise the lander buys one:
     A STAND-IN FOR A LIMITED READER (#1116 and #1128 held two hours on 10-17 while Astra sat at its ChatGPT usage
     limit). When a reader that is not claude's comes back with a usage or rate limit (why starting `limit`, as
     ask_codex() reports when codex_limit() says so: a nonzero exit and an ERROR: or stream error: line of codex's
-    own, every line the prompt also holds dropped first, so PR text or a diff saying "usage limit" never makes
-    another fault a limit) and the plan names no security path (plan.extra["security"] empty; a plan of None counts
+    own naming a usage, rate or session limit or a 429 (its retries spent on Too Many Requests), every line the
+    prompt also holds dropped first, so PR text or a diff saying "usage limit" never makes another fault a limit) and the plan names no security path (plan.extra["security"] empty; a plan of None counts
     as unknown and gets none), one more claude read, independent of the first (its own call, no context shared),
     stands in for it: CC_LAND_REVIEW_LIMIT_READER (the passwd home's config, like every CC_LAND_REVIEW key), default the first claude reader on readers() (a value that is not a claude model turns the stand-in off).
     Its Verdict carries extra stood_in_for (the limited reader) and stood_in_why (the limit text); the marker row
@@ -700,8 +700,11 @@ LIMIT_SAID = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
 # diff that says "usage limit" turn any other codex failure into a limit and bring in a stand-in (perms' and an Opus
 # read, 10-20). The first column alone keeps out a diff line (each starts with +, - or a space) but not the PR body,
 # file and brief blocks, which put PR text at column 0, so codex_limit() also drops every output line the prompt holds.
+# A 429 that outlasts codex's own retries ("ERROR: exceeded retry limit, last status: 429 Too Many Requests", #1461,
+# #1456 and #1496 on 10-20) is the ChatGPT allowance spent too, so it is a limit, not a read that answered nothing.
 CODEX_LIMIT_SAID = re.compile(r"^(?:\[[^\]\n]*\][ \t]*)?(?:ERROR|stream error):[^\n]*?"
-                              r"\b(?:session|usage|rate)[ _-]?limit", re.I | re.M)
+                              r"(?:\b(?:session|usage|rate)[ _-]?limit|\bstatus:?[ \t]*429\b|\b429 Too Many Requests)",
+                              re.I | re.M)
 WALLS = ("error_max_budget_usd", "error_max_turns")
 BIN = C.BIN
 # The PATH every read runs on: root-owned directories only, never the caller's (security read of #847).
@@ -883,8 +886,8 @@ def codex_usd(rc, out):
 
 
 def codex_limit(rc, out, text):
-    """True when a `codex exec` that exited `rc` with output `out`, asked `text`, stopped at a usage or rate limit:
-    a nonzero exit, and a CODEX_LIMIT_SAID line in the output that is not the prompt's own. The echo can differ from
+    """True when a `codex exec` that exited `rc` with output `out`, asked `text`, stopped at a usage or rate limit
+    (a 429 included): a nonzero exit, and a CODEX_LIMIT_SAID line in the output that is not the prompt's own. The echo can differ from
     the prompt (cut short, whitespace trimmed, CRLF), so beside taking out the exact echo, a line counts only when
     its stripped text is no prompt line, nor the start of one (an echo cut mid-line). A real limit line the prompt
     also holds is missed, which holds the read as a fault rather than bringing in a stand-in. The prompt lines are a

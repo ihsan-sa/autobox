@@ -40,6 +40,9 @@ Rules for both gated roles:
   ~, for any verb but echo/printf; or one of those path names (ccbox/env, .credentials.json, credentials.json,
   .cc/secrets, .codex/auth.json, cursor/auth.json; member also .cc/config .ssh .claude/settings.json .cc/sandbox) as text inside
   a python/perl/ruby/node/php -c/-e body or awk/sed program (so a commit message or grep pattern still passes) -> never
+  (the one exception, role pf only: `cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json` alone
+  on the line, ~ or $HOME, names the workers' login without reading it, and so does a cc-notify --approval --run of
+  exactly that text; namesonly)
 - git push whose refspec destination is main/master (+main, :main, -d main, HEAD:main) or a glob ('+refs/heads/*:
   refs/heads/*'); `HEAD` alone, or no refspec, is the branch checked out at the cwd / git -C / --git-dir (read
   from its HEAD; outside a checkout git refuses the push itself); --mirror, --all, --branches; -c remote.*.push|
@@ -182,6 +185,7 @@ ROOTOPT = {'-u', '-g', '-h', '-p', '-C', '-D', '-r', '-t', '-U', '-T', '--user',
            '--role', '--type', '--other-user', '--command-timeout'}   # sudo's options that take a value
 SSHOPT = {'-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w', '-B'}
 SECBASE = re.compile(r'\.?credentials\.json|[^/]*\.token')
+WLOGIN = ('WORKER_CLAUDE_CREDENTIALS', '/.claude-workers/.credentials.json')   # the workers' login, by key and by path under ~
 # gh's own commands. An alias or an extension runs whatever it was set to (`gh alias set x 'api -X POST …'`), so a
 # subcommand off this list is refused, and so are alias set and import (perms' read of 9bf1d03b)
 GHCMD = {'agent-task', 'alias', 'api', 'attestation', 'auth', 'browse', 'cache', 'co', 'codespace', 'completion', 'config',
@@ -921,10 +925,36 @@ class Guard:
                                         ': the live tree and the gates are written by the lander alone')
         return None
 
+    # NAMING THE WORKERS' LOGIN IS NOT READING IT (perms, 2026-10-14). `cc-config set WORKER_CLAUDE_CREDENTIALS
+    # ~/.claude-workers/.credentials.json` stores the path and never opens the file, so that one word, in that one
+    # command, is not a read: the key and the path exactly (~, $HOME or ${HOME}), cc-config by its bare name, no
+    # substitution, glob or brace anywhere, and nothing else on the line (no second command, function, VAR= or
+    # wrapper). A cc-notify --approval --run text is that command when it parses to it and nothing else (no second
+    # command, no redirection). Every other word, the `<` sources and any chained cat/jq of the file are judged as
+    # before. The ungated tier only (the planning seat holds the cc-config grant); a worker or a member is refused as
+    # before.
+    def namesonly(g, R):   # the argv words of R that name the workers' login without reading it
+        ws, v = R['argw'], R['verb']
+        if g.role != 'pf' or len(g.out) != 1 or R['assigns'] or R['via']: return []   # the line's one command, as typed
+        if v == 'cc-config' and 'cc-config' in R['raw'] and len(ws) == 3 and [w.v for w in ws[:2]] == ['set', WLOGIN[0]] \
+                and not any(w.dyn or w.glob or w.brace or w.subs for w in ws) and ws[2].v == g.home + WLOGIN[1]:
+            return [ws[2]]
+        if v == 'cc-notify' and '--approval' in R['args']:
+            return [w for k, w in enumerate(ws) if k and ws[k - 1].v == '--run' and not w.dyn and g.namesonlytext(w.v)]
+        return []
+
+    def namesonlytext(g, t):   # a --run text that is exactly the one cc-config set above
+        s2 = Guard(dict(g.env, GUARD_ROLE=g.role))
+        try: s2.script(t, g.base, 'run', 1)
+        except ParseError: return False
+        return bool(s2.out) and s2.out[0]['verb'] == 'cc-config' and not s2.out[0]['redirs'] and bool(s2.namesonly(s2.out[0]))
+
     def secread(g, R, mem=False):   # a read of the box's credentials: an argv word, a `<` source, or an interpreter's program text
         v = R['verb']
         if v not in ('echo', 'printf'):
+            named = g.namesonly(R)
             for w in R['argw'] + [r['w'] for r in R['redirs'] if r['op'] in ('<', '<>')]:
+                if any(w is x for x in named): continue
                 if w.dyn and not w.v.startswith(g.home): continue
                 cands = {w.v} | ({w.v.split('=', 1)[1]} if '=' in w.v else set()) | ({w.v.split('@', 1)[1]} if '@' in w.v else set())
                 if any(c and '\n' not in c and g.is_secret(c, w.glob, R['cwd']) for c in cands):
@@ -1470,7 +1500,21 @@ def selfcheck():
                 # hive's seat door: a seat writes #dispatch's door as dispatch-seat-door (dispatch's sudoers rule
                 # allows that one copy), and a worker or member is refused it like every other sudo
                 ('pf', None, SEATDOOR, False), ('worker', 'track/x', SEATDOOR, True), ('member', None, SEATDOOR, True),
-                ('pf', None, "ssh h 'rm -f ~/.cc/members/x/credentials.json'", True), ('pf', None, 'ssh h uptime', False)]:
+                ('pf', None, "ssh h 'rm -f ~/.cc/members/x/credentials.json'", True), ('pf', None, 'ssh h uptime', False),
+                # naming the workers' login is not reading it (namesonly): that one set, and a card that runs it, pass
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json', False),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS "$HOME"/.claude-workers/.credentials.json', False),
+                ('pf', None, "cc-notify --approval --run 'cc-config set WORKER_CLAUDE_CREDENTIALS ${HOME}/.claude-workers/.credentials.json' t", False),
+                ('pf', None, 'cc-config set OTHER ~/.claude-workers/.credentials.json', True),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/x/.credentials.json', True),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/../.claude/.credentials.json', True),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude*/.credentials.json', True),
+                ('pf', None, './cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json', True),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json < ~/ccbox/env', True),
+                ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json; cat ~/.claude-workers/.credentials.json', True),
+                ('pf', None, "cc-notify --run 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json' t", True),
+                ('pf', None, "cc-notify --approval --run 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json; jq . ~/.claude-workers/.credentials.json' t", True),
+                ('worker', 'track/x', 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json', True)]:
             cwd = repo(branch, branch != 'main') if branch else H + '/dev/alice'
             env = dict(base, GUARD_ROLE=role, GUARD_CWD=cwd, GUARD_ROOT=cwd, GUARD_MWS='alice' if role == 'member' else '')
             got = judge(cmd, env)
