@@ -726,17 +726,19 @@ def run_selfcheck():
         check("channel tools: a --go worker (CC_ROLE=worker) is refused, nothing is posted (M7)",
               werr and "interactive sessions" in wtext)
         os.environ.pop("CC_ROLE", None)                    # the rest of the tool checks act as an interactive session
-        # SHORT BY CONSTRUCTION: the reply tool measures and refuses, nothing posted; within shape it posts as before.
+        # WRITING ADVICE, NOT A REFUSAL (owner 2026-10-20): a long reply is posted, and the result says by how much.
         n_posts0 = sum(1 for m, kw in acalls2 if m == "chat.postMessage")
         longbold, errLB = ch.call("reply", {"chat_id": "C1", "text": "*" + "a bold paragraph that runs on " * 5 + "*\nthen a line"})
         longbody, errLY = ch.call("reply", {"chat_id": "C1", "text": "*Done.*\n" + "• a bullet of history the reader will skip\n" * 22})
-        check("reply: an opening bold past 120 chars is handed back unsent with its length; so is a text past 800 chars",
-              errLB and "opening bold is 150 chars" in longbold and errLY and "say fewer things and link the rest" in longbody
+        check("reply: an opening bold past 120 chars is posted, its result naming the length; so is a text past 800 chars",
+              not errLB and "SHAPE (sent anyway)" in longbold and "opening bold is 150 chars" in longbold
+              and not errLY and "say fewer things and link the rest" in longbody
               and "Do not squeeze the same things into fewer characters" in longbody
-              and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0)
+              and sum(1 for m, kw in acalls2 if m == "chat.postMessage") >= n_posts0 + 2)
+        n_posts0 = sum(1 for m, kw in acalls2 if m == "chat.postMessage")
         okshort, errOK = ch.call("reply", {"chat_id": "C1", "text": "❓ *Decision:* two workers or one? <https://x.example/a-very-long-url-" + "z" * 700 + "|the plan>"})
         check("…while a short reply — an emoji before the bold, a long URL behind a short label — posts as before",
-              not errOK and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1
+              not errOK and "SHAPE" not in okshort and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1
               and reply_shape("*Left: #430 landing now, one small row next, two guard rows behind #404, the email orch's two fixes, and the four you parked.*") is not None
               and reply_shape("*Landed (#453).* One thing is yours: the mail allow-list.") is None)
         text, err = ch.call("history", {"chat_id": "C1", "n": 500})
@@ -4277,7 +4279,13 @@ def run_selfcheck():
               "call ran on: a second chunk would carry no prefix, and every door above would read it as our answer",
               len(chunks(capVM)) == 1 and len(capVM) <= CHUNK and capVM.startswith(VOICE_PREFIX)
               and capVM.count(VOICE_CUT) == 1 and capVM.endswith("_")
-              and voice_post(SPOKEN, CONDENSED) == f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{CONDENSED}_")
+              and voice_post(SPOKEN, CONDENSED) == f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{CONDENSED}_"
+              and voice_post(SPOKEN, "c" * 2000) == f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{'c' * 2000}_")
+        capVM2 = voice_post("a" * 100, "b" * (CHUNK * 2))
+        check("…and no figure of ours cuts the condensed text: it keeps whole when it fits, and when it does not it "
+              "takes what the transcript leaves, the transcript kept whole beside it",
+              len(chunks(capVM2)) == 1 and len(capVM2) <= CHUNK and "a" * 100 + "\n" in capVM2
+              and VOICE_CUT not in capVM2 and capVM2.endswith(" …_"))
     finally:
         globals()["slack_open"] = real_slack_open
         globals()["paused"], globals()["needs_dir"] = _pausedVM, _needsVM
@@ -5310,7 +5318,7 @@ def run_selfcheck():
           "in COMMS.md",
           all(w in _desc["reply"] for w in ("no # headings", "One message per turn", "one-line acknowledgement first",
                                             "a first name only one person there answers to", "@everyone are never sent",
-                                            "A cc-guard refusal", "chat_id=\"local\"", "REFUSED UNSENT", "over 800 chars"))
+                                            "A cc-guard refusal", "chat_id=\"local\"", "under 800 chars", "a longer one is sent"))
           and all(w in _desc["file"] for w in ("never say 'here it is' unless a file went", "only reached the outbox"))
           and all(w in _desc["react"] for w in ("thinking_face unclear (then ask)", "Nothing answers for you",
                                                 "meta kind=reaction", "never as approval for what the box gates on the owner"))
@@ -5634,9 +5642,10 @@ def run_selfcheck():
               "answer from before a later ask does not settle it; kept answers expire after OWNER_ASK_RACE",
               racedE == [] and raced and oa_open() == [f"DOWN:{later}"] and len(settled) == 4
               and [k for k in load_table(OWNER_ASKS) if k.startswith("_")] == ["_DOWN::1.000000::0"])
-        check("owner asks: a week-old ask leaves the list, a fresh one stays",
+        check("owner asks: an unanswered ask stays on the list however old, newest first (owner 2026-10-20: nothing "
+              "drops an ask on a timer)",
               [r["text"] for r in owner_ask_rows({"a": {"text": "old", "at": 0}, "b": {"text": "new", "at": 9e5}},
-                                                 now=9e5 + 60)] == ["new"])
+                                                 now=9e5 + 60)] == ["new", "old"])
     finally:
         globals()["api"] = real_apiOA
         oa_reset()
@@ -8666,6 +8675,19 @@ def run_selfcheck():
         dmw.member_retry_cycle()                                   # the window passed: the daemon finishes the join
         henry_done = (not load_retries() and {"henry", "henry-updates"} <= set(fkm.created)
                       and os.path.isfile(f"{DEV}/henry/{MEMBER_MARKER}"))
+        # A JOIN STILL DEFERRED A DAY ON IS DROPPED, AND SAYS SO ONCE (owner 2026-10-20: never drop silently).
+        save_provisioned(full)
+        ensure_member(cfgw, "UJUNO", now0)
+        save_retries({k: dict(v, first=now0 - MEMBER_RETRY_TTL - 1) for k, v in load_retries().items()})
+        notesJ, _runJ = [], EFFECTS.run_impl
+        EFFECTS.run_impl = lambda cmd, **kw: notesJ.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        try:
+            dmw.member_retry_cycle()
+        finally:
+            EFFECTS.run_impl = _runJ
+        notesJ = [c for c in notesJ if c[0].endswith("/cc-notify")]
+        juno_said = (not load_retries() and len(notesJ) == 1 and "member-retry-dropped:UJUNO" in notesJ[0]
+                     and "member add <@UJUNO>" in notesJ[0][-1])
         # THE OWNER'S OWN HAND IS EXEMPT — `member add` is not a channel-creation spree — and what it makes does not
         # fill the window for the next join either.
         full = {f"cap{i}": {"chan": f"cap{i}", "at": time.time()} for i in range(PROVISION_MAX)}
@@ -8792,6 +8814,8 @@ def run_selfcheck():
           "and the daemon gives it the workspace by itself once the window passes — a team_join fires ONCE, so a "
           "refusal is that person dropped",
           st_h == "deferred" and henry_parked and henry_waits and henry_done)
+    check("…and a join still parked a day on is dropped with one post naming the hand command, never silently",
+          juno_said)
     check("the owner's own `member add` is exempt from the cap — his hand is not a channel-creation spree — and the "
           "workspace it makes does not fill the window for the next join either",
           rc_ivy == 0 and ivy_made and ivy_uncounted)

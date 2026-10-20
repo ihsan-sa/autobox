@@ -50,7 +50,8 @@ conversation, refuses a record it cannot trust, skips what is live, and takes a 
 second trigger does nothing. Archiving a crash marks the lost list `recover: due`, and the watcher, finding it so,
 starts cc-recover-restore.service (CC_TMUX_LEDGER_RECOVER names another command, for the selfcheck) and marks it
 `sent`, under the ledger's lock, so one crash starts it once. A second crash within 15 minutes of the last start
-does not start it again (the box may be crashing on what it restored): it is logged and announced, and is `held`.
+(the box may be crashing on what it restored) backs off: it stays `due` with an `after` time, announced once, and
+the watcher starts cc-recover when the wait is over, a wait that doubles with each such crash in a row.
 
 Every name, session and cwd handed back to tmux has its # doubled: tmux expands #(…) and #{…} in -n, -s and -c,
 so a window named `#(cmd)` would otherwise run cmd. The command itself and the -t targets are not expanded.
@@ -79,7 +80,8 @@ import time
 
 INTERVAL = float(os.environ.get("CC_TMUX_LEDGER_INTERVAL", "30"))
 GAP = float(os.environ.get("CC_TMUX_LEDGER_GAP", "2"))   # seconds between relaunches, so thirty seats do not start at once
-GUARD = 15 * 60                                           # a crash inside this of the last cc-recover start does not start it again
+GUARD = 15 * 60                                           # a crash inside this of the last cc-recover start waits before starting it again
+BACKOFF_MAX = 4 * 60 * 60                                 # …a wait that doubles with each such crash in a row, up to this
 EXPIRE = 24 * 60 * 60                                     # an entry older than this leaves the lost list
 SHELLS = {"bash", "sh", "dash", "zsh", "fish", "-bash", "-sh", "-zsh"}
 SEP = "\x1f"
@@ -454,22 +456,37 @@ def recover_cmd():
 
 
 def recover():
-    """The watcher's one step after a crash: start cc-recover, once per crash, and never relaunch anything here."""
+    """The watcher's one step after a crash: start cc-recover, once per crash, and never relaunch anything here.
+    A crash inside GUARD of the last start may be the box crashing on what it restored, so it backs off: cc-recover
+    starts after a wait that doubles with each such crash in a row (GUARD, 2x, 4x … up to BACKOFF_MAX), and the
+    first crash of the run posts one line (owner 2026-10-20: back off and keep trying, never leave the box down).
+    The stamp's mtime is the last start and its text how many quick crashes in a row led to it."""
     if not allowed():
         return 0
     with Lock():
         lost = read_json(path("lost.json"))
         if not lost or lost.get("recover") != "due":
             return 0
-        stamp = path("recovered")
-        if os.path.exists(stamp) and time.time() - os.path.getmtime(stamp) < GUARD:
-            write_json(path("lost.json"), dict(lost, recover="held"))
-            msg = ("The tmux server died again within 15 minutes, so I did not start cc-recover again. "
-                   "`cc-tmux-ledger list` shows what it lost, and `cc-recover restore` brings the sessions back.")
-            log(msg); notify(msg); print(msg)
+        stamp, now = path("recovered"), time.time()
+        if "after" not in lost and os.path.exists(stamp) and now - os.path.getmtime(stamp) < GUARD:
+            try:
+                quick = int(open(stamp).read().strip() or 0) + 1
+            except (OSError, ValueError):
+                quick = 1
+            wait = min(GUARD * 2 ** (quick - 1), BACKOFF_MAX)
+            write_json(path("lost.json"), dict(lost, after=now + wait, quick=quick))
+            if quick == 1:
+                msg = (f"The tmux server died again within {GUARD // 60} minutes of the last cc-recover start, so "
+                       f"cc-recover waits {wait // 60} minutes before it brings the sessions back, and longer if it "
+                       "keeps crashing. `cc-recover restore` brings them back now.")
+                log(msg); notify(msg); print(msg)
+            else:
+                log(f"the tmux server died again soon after a recover: cc-recover waits {wait // 60} minutes")
             return 0
-        with open(stamp, "w"):
-            pass
+        if now < float(lost.get("after") or 0):
+            return 0
+        with open(stamp, "w") as f:
+            f.write(str(int(lost.get("quick") or 0)))
         write_json(path("lost.json"), dict(lost, recover="sent"))
     try:
         r = subprocess.run(recover_cmd(), capture_output=True, text=True, timeout=60)
@@ -578,6 +595,7 @@ def watch():
         guarded(recover)   # a crash just found: cc-recover brings the sessions back, this relaunches nothing
         while server_pid() == cur:
             guarded(save)
+            guarded(recover)   # a crash that is backing off starts cc-recover once its wait is over
             time.sleep(INTERVAL)
     try:
         os.remove(path(f"watch-{cur}"))
@@ -650,11 +668,11 @@ upto '[ "$(wc -l < $T/hash.out)" = 2 ]'
 k "$([ "$(sort -u "$T/hash.out")" = "$HD" ] && echo 0 || echo 1)" "…in its own cwd, the #(…) in the path left alone: $(tail -1 "$T/hash.out")"
 k "$([ "$(X list-windows -t main -F '#W' | grep -cx box)" = 1 ] && echo 0 || echo 1)" "the window the new server made itself is not doubled"
 k "$([ ! -e "$T/state/$SOCK.lost.json" ] && echo 0 || echo 1)" "the lost list is cleared once everything on it is back"
-# A second crash inside 15 minutes: the box may be crashing on what it restored, so cc-recover is not started again.
+# A second crash inside 15 minutes: the box may be crashing on what it restored, so cc-recover waits before starting again.
 upto 'python3 -c "import json,sys; sys.exit(0 if \"work\" in [x[\"name\"] for x in json.load(open(\"$T/state/$SOCK.json\"))[\"windows\"]] else 1)" 2>/dev/null'
 spid=$(X list-sessions -F '#{pid}' | head -1); kill -SEGV "$spid"; upto '! kill -0 $spid 2>/dev/null'
 boot; upto '[ -s $T/state/$SOCK.log ] && grep -q "died again" $T/state/$SOCK.log'
-k "$([ $? = 0 ] && [ "$(calls)" = 1 ] && echo 0 || echo 1)" "a second crash within 15 minutes is logged and does not start cc-recover again"
+k "$([ $? = 0 ] && [ "$(calls)" = 1 ] && echo 0 || echo 1)" "a second crash within 15 minutes is logged and does not start cc-recover yet"
 k "$(has work; [ $? = 1 ] && echo 0 || echo 1)" "…work is not running"
 mkdir -p "$HOME/.cc/recover"
 out=$( { flock -n 9 && "$B" restore; } 9>"$HOME/.cc/recover/.lock" 2>&1 ); rc=$?
@@ -867,6 +885,34 @@ P
 )
 read -r da db <<<"$d"
 k "${da:-1}" "with no override the watcher starts cc-recover-restore.service through systemctl --user, without waiting"
+# A crash soon after a start backs off, then starts cc-recover: it is never held for good.
+d=$(python3 - "$B" "$T/back" <<'P'
+import importlib.machinery, importlib.util, json, os, sys, time
+os.makedirs(sys.argv[2])
+os.environ.update(CC_TMUX_LEDGER_DIR=sys.argv[2], CC_TMUX_LEDGER_SOCKET="back",
+                  CC_TMUX_LEDGER_RECOVER=f"sh -c 'echo x >> {sys.argv[2]}/calls'")
+ld = importlib.machinery.SourceFileLoader("l", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("l", ld)); ld.exec_module(m)
+calls = lambda: open(f"{sys.argv[2]}/calls").read().count("x") if os.path.exists(f"{sys.argv[2]}/calls") else 0
+lost = lambda: json.load(open(m.path("lost.json")))
+def crash():
+    with open(m.path("lost.json"), "w") as f:
+        json.dump({"server_pid": 1, "boot": "", "saved": 1, "windows": [], "recover": "due"}, f)
+out, sys.stdout = sys.stdout, open(os.devnull, "w")       # recover() prints its one line too
+open(m.path("recovered"), "w").close()                      # a start a moment ago
+crash(); m.recover(); m.recover()
+a = calls() == 0 and lost()["recover"] == "due" and lost()["quick"] == 1 and open(m.path("log")).read().count("waits 15 minutes") == 1
+d = dict(lost(), after=time.time() - 1); json.dump(d, open(m.path("lost.json"), "w")); m.recover()
+b = calls() == 1 and lost()["recover"] == "sent" and open(m.path("recovered")).read() == "1"
+crash(); m.recover()                                       # …and it crashes again at once: the wait doubles
+c = calls() == 1 and lost()["quick"] == 2 and 29 * 60 < lost()["after"] - time.time() <= 30 * 60
+sys.stdout = out
+print(int(not a), int(not b), int(not c))
+P
+)
+read -r ba bb bc <<<"$d"
+k "${ba:-1}" "a crash inside 15 minutes of a start waits, says so once, and keeps the crash due"
+k "${bb:-1}" "…once the wait is over the watcher starts cc-recover"
+k "${bc:-1}" "…and a crash straight after that waits twice as long"
 k "${db:-1}" "a cc-recover that cannot be started is logged, and the crash is not started again"
 # decode never guesses: tmux's quoting is reversed exactly or the command is listed instead.
 d=$(python3 - "$B" <<'P'

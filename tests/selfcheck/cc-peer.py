@@ -144,6 +144,32 @@ def selfcheck():
         t("land: the peer's pr-body.md is beside the hub's task", open(f"{hub}/.cc/state/r/w/pr-body.md").read(),
           "What changed.\n")
         t("land: …and the peer's spool is empty", os.listdir(f"{peer}/.cc/peer/spool/taken"), [])
+        # A DONE STILL NOT ON ORIGIN A DAY ON IS KEPT (owner 2026-10-20: back off and post once, never drop)
+        sha2 = "b" * 40
+        ran.clear()
+        put(peer, {"tool": "land", "argv": ["r", "w"], "sha": sha2, "t": int(time.time()) - 2 * RETRY_FOR})
+        drain()
+        notes = [a for a, _ in ran if a[0].endswith("cc-notify")]
+        t("late: a day-old DONE whose tip is not on origin stays with the peer",
+          len(os.listdir(f"{peer}/.cc/peer/spool/taken")), 1)
+        t("late: …and posts one line saying so", (len(notes), any("peer-late:" in x for x in (notes or [[]])[0])),
+          (1, True))
+        ran.clear()
+        drain()
+        t("late: the next drain inside the hour neither asks origin again nor posts again", ran, [])
+        late = f"{hub}/.cc/peer/late/" + os.listdir(f"{hub}/.cc/peer/late")[0]
+        os.utime(late, (time.time() - RETRY_EVERY - 1,) * 2)
+        drain()
+        t("late: an hour on it asks origin again, and still says nothing more",
+          (any("fetch" in a for a, _ in ran), [a for a, _ in ran if a[0].endswith("cc-notify")]), (True, []))
+        tip[0] = sha2
+        ran.clear()
+        os.utime(late, (time.time() - RETRY_EVERY - 1,) * 2)
+        drain()
+        t("late: once its tip reaches origin it lands, and the mark goes",
+          ([a[1:] for a, _ in ran if "queue" in a], os.listdir(f"{hub}/.cc/peer/late")),
+          ([["queue", "--task", "r", "w"]], []))
+        tip[0] = sha                               # the cases below land the first tip
         # A LINK THE WORKER PLANTED IN ITS STATE DIR IS NEVER WRITTEN THROUGH (security read of #1159): the old fixed
         # temp name pointed at a hub tool, and a state dir that is itself a link, are both left alone
         victim = f"{base}/victim"

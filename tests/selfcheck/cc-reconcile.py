@@ -2373,8 +2373,8 @@ def selfcheck():
         json.dump({"C1:1": {"text": "asks about row-a-b", "at": T - 3600},
                    "C1:2": {"text": "asks about row-c-d", "at": T - 8 * 86400},
                    "_C1:3": {"text": "row-e-f", "at": T}}, open(f"{tq}/owner-asks.json", "w"))
-        ok("OWNER-HELD: open_asks reads the unanswered asks inside a week — not one older, not an answer's \"_\" key",
-           open_asks(f"{tq}/owner-asks.json", T) == [("", "asks about row-a-b")])
+        ok("OWNER-HELD: open_asks reads every unanswered ask, one eight days old too — never an answer's \"_\" key",
+           sorted(open_asks(f"{tq}/owner-asks.json", T)) == [("", "asks about row-a-b"), ("", "asks about row-c-d")])
         ok("…and an unreadable table is no asks, not an error", open_asks(f"{tq}/none.json", T) == [])
     finally:
         shutil.rmtree(tq, ignore_errors=True)

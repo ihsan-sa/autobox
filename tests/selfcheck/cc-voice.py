@@ -104,12 +104,30 @@ def selfcheck():
     check("a recording that is not there is refused by name, before the venv is touched",
           rc4 == 2 and "no such recording" in err4)
 
-    long_py = f'#!/bin/sh\necho \'{{"text": "on and on", "seconds": {MAX_SECONDS + 1}, "language": "en"}}\'\n'
+    # NO CAP OF OURS ON A MEMO (owner 2026-10-20): a two-hour recording is transcribed and condensed like any other,
+    # and a condensing call that costs more than CONDENSE_USD is not cut off: it posts one line, through cc-notify.
+    long_py = f'#!/bin/sh\necho \'{{"text": "on and on", "seconds": 7200, "language": "en"}}\'\n'
     with open(f"{box}/venv/bin/python", "w") as fh:
         fh.write(long_py)
     os.chmod(f"{box}/venv/bin/python", 0o755)
-    rc5, _, err5 = err_of(["text", audio])
-    check(f"a recording longer than {MAX_SECONDS}s is not a memo: refused, not sat on", rc5 == 2 and "longer than a memo" in err5)
+    open(f"{box}/claude.out", "w").write(json.dumps({"result": "Keep going.", "is_error": False,
+                                                     "total_cost_usd": CONDENSE_USD * 3}))
+    with open(f"{box}/notify", "w") as fh:
+        fh.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {box}/notify.log\n')
+    os.chmod(f"{box}/notify", 0o755)
+    env = dict(env, CC_JOB_NOTIFY=f"{box}/notify")
+    rc5, out5, _ = err_of(["text", audio])
+    d5 = json.loads(out5) if rc5 == 0 else {}
+    said5 = open(f"{box}/notify.log").read() if os.path.exists(f"{box}/notify.log") else ""
+    check("a two-hour recording is transcribed, not refused; a condensing call over its dollars is kept and posts "
+          "one line, and the call carries no --max-budget-usd to cut it",
+          rc5 == 0 and d5.get("transcript") == "on and on" and d5.get("condensed") == "Keep going."
+          and "cc-voice budget crossed" in said5 and "budget:cc-voice:" in said5
+          and "--max-budget-usd" not in open(f"{box}/claude.argv").read())
+    open(f"{box}/claude.out", "w").write(json.dumps({"result": "Keep going.", "is_error": False, "total_cost_usd": 0.01}))
+    os.unlink(f"{box}/notify.log")
+    rc6, _, _ = err_of(["text", audio])
+    check("…and a call under its dollars posts nothing", rc6 == 0 and not os.path.exists(f"{box}/notify.log"))
 
     # THE CALLS THAT DO NOT RETURN. Every case above answers with an exit code; these two RAISE out of
     # subprocess.run, which is the shape a wedged transcriber and an unrunnable one really have. Both must come
