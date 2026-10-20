@@ -46,7 +46,7 @@ def selfcheck():
         """a room and a statusline dir of this case's own, nothing held, nothing queued"""
         d = f"{base}/{name}"
         os.makedirs(f"{d}/sl")
-        os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_USAGE_DIR=f"{d}/usage", CC_WORKER_CAP=str(cap),
+        os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_USAGE_DIR=f"{d}/usage", CC_WORKER_CAP=str(cap or ""),
                           CC_WORKER_PACE_MARGIN=str(margin), CC_ROOM_POLL="0.2", CC_CONFIG=f"{d}/config",
                           CC_ROOM_NOTICE_AFTER="3600", CC_HEAVY_CAP="1", CC_HEAVY_SCOPE="0", CC_ROOM_BIN=f"{d}/bin",
                           CC_ROOM_TMUX=f"{d}/bin/tmux", CC_ROOM_GRACE="1", CC_ROOM_NOTICE_RETRY="300",
@@ -186,6 +186,12 @@ esac''')):
           True)
         t("cap: check exits 1 with the reason",
           subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True).returncode, 1)
+        # no cap set, the default since 2026-10-20: no count of loops holds a launch, only pace and load do
+        d = fixture("nocap", cap=None)
+        for w in ("r/a", "r/b", "r/c"):
+            holder(w)
+        t("cap: unset, three slots held is still room (no count of worker loops holds a launch)",
+          (len(live("slots")), why_not()), (3, ""))
 
         # pace ahead means queued; at the margin exactly is room
         d = fixture("pace", margin=10)
@@ -763,14 +769,17 @@ esac''')):
           ("told r@comms" in "".join(lines(f"{d}/loop.log")), len(lines(f"{d}/told")) - n1,
            bool(e) and read_entry(e).get("noticed")), (True, 0, True))
 
-        # NOTICE_TRIES refused: said once in the dispatcher's channel (a plain --major notice), not only logged
+        t("retry: the wait doubles to six hours and stays there, even past try 1024",
+          (notice_wait(300, 1), notice_wait(300, 2), notice_wait(300, 2000)), (300, 600, 6 * 3600))
+
+        # UNHEARD_AFTER refused: said once in the dispatcher's channel (a plain --major notice), not only logged
         d = fixture("unheard")
         open(f"{d}/bin/cc-notify", "w").write(f'#!/bin/sh\necho "notify $*" >> "{d}/told"\n'
                                              f'case " $* " in *" --ask "*) exit 1 ;; esac\n')
-        rec = {"queued": time.time() - 7200, "target": "r@comms", "notice_tries": NOTICE_TRIES}
+        rec = {"queued": time.time() - 7200, "target": "r@comms", "notice_tries": UNHEARD_AFTER}
         said = unheard("r/deaf", rec, "the host is busy", f"{d}/loop.log")
         told = lines(f"{d}/told")
-        t("unheard: after the last refused try it says so once in the repo's channel, naming how to cancel",
+        t("unheard: after UNHEARD_AFTER refused tries it says so once in the repo's channel, naming how to cancel",
           (said, len(told), bool(told) and "--major --id room-unheard:r/deaf:" in told[0]
            and "cc-room cancel r/deaf" in told[0]), (True, 1, True))
         os.chmod(f"{d}/bin/cc-notify", 0o644)

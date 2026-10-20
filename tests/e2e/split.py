@@ -33,7 +33,7 @@ SLUGS = {
     "--go is a covering note, never a replacement for the brief (#71)": "go-covering-note",
     "--go waits for room, and a room check that crashes fails open": "go-waits-for-room",  # recurring-defect-ok: pause-hold-missing — a slug table entry; split.py launches nothing and writes no board
     "a finished track leaves the default board view (a13)": "finished-track-board",
-    "the step limit carries on, and a runaway does not (cc-loop)": "step-limit",
+    "the step limit carries on, and so does a runaway, told on a doubling stride (cc-loop)": "step-limit",
     "usage limits (cc-limit + cc-loop)": "usage-limits",
     "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model and cc-reconcile read them)": "limit-episode",
     "resume/digest/rm": "resume-digest-rm",

@@ -335,14 +335,11 @@ def send_verdicts(cases):
 class Box:
     """One case's whole world. Enter it, post to it, read its log and its store, leave it with nothing behind."""
 
-    KEYS = ("MAIL_SECRET", "MAIL_ALLOW", "LESSONS_EMAILS", "MAIL_MAX_BYTES", "MAIL_MAX_PARTS",
-            "MAIL_MAX_ATTACH_BYTES", "MAIL_MAX_CONN", "MAIL_RATE", "MAIL_RATE_WINDOW", "MAIL_DOMAIN",
-            "MAIL_PORT", "PATH")
+    KEYS = ("MAIL_SECRET", "MAIL_ALLOW", "LESSONS_EMAILS", "MAIL_DOMAIN", "MAIL_PORT", "PATH")
 
     def __init__(self, secret=SECRET, allow=ALLOWED + "," + OTHER, use_env=True, **cfg):
         self.cfg = dict(MAIL_SECRET=secret, MAIL_ALLOW=allow, LESSONS_EMAILS="",
-                        MAIL_MAX_BYTES="", MAIL_MAX_PARTS="", MAIL_MAX_ATTACH_BYTES="", MAIL_MAX_CONN="",
-                        MAIL_RATE="", MAIL_RATE_WINDOW="", MAIL_DOMAIN="box.example", MAIL_PORT="")
+                        MAIL_DOMAIN="box.example", MAIL_PORT="")
         self.cfg.update({k: str(v) for k, v in cfg.items()})
         # use_env=False puts the same values behind a STUB cc-config on PATH instead, which is the only way to
         # count how many times the server asks for one. See the "read once" case.
@@ -353,10 +350,9 @@ class Box:
         self.saved_env = {k: os.environ.get(k) for k in self.KEYS}
         self.saved_conf = r.CONF
         r.CONF = {}
-        self.saved = (r.MAILDIR, r.INBOX, r.RATEFILE, r.STATE, r.SLACKSOCK)
+        self.saved = (r.MAILDIR, r.INBOX, r.STATE, r.SLACKSOCK)
         r.MAILDIR = self.tmp
         r.INBOX = os.path.join(self.tmp, "inbox")
-        r.RATEFILE = os.path.join(self.tmp, "rate.json")
         r.STATE = os.path.join(self.tmp, "state")
         # THE DAEMON'S SOCKET IS REDIRECTED TOO, and this is not decoration: every stored mail now hands its id
         # over that socket, so a case left on the default would put its fixtures into the running box's daemon
@@ -422,7 +418,7 @@ class Box:
         self.srv.shutdown()
         self.srv.server_close()
         sys.stderr = self.saved_err
-        r.MAILDIR, r.INBOX, r.RATEFILE, r.STATE, r.SLACKSOCK = self.saved
+        r.MAILDIR, r.INBOX, r.STATE, r.SLACKSOCK = self.saved
         r.NOTIFY = self.saved_notify
         r.CONF = self.saved_conf
         router.MAILDIR, router.CONVDIR, router.INDEX = self.saved_conv
@@ -708,15 +704,13 @@ def run():
         k(len(b.lines()) == 1 and b.lines()[0].count("store id=") == 1,
           "…and that too is one line, not two: the http.server default line is off")
 
-    # an oversize mail from a stranger must still be a silent drop and never a reason — the check order is
-    # "the sender, then the size", and swapping the two would tell a stranger the address exists.
-    with Box(MAIL_MAX_BYTES=200) as b:
-        code, ans = b.post(eml(frm=STRANGER, body="x" * 4000), sender=STRANGER)
-        k(code == 403 and ans.get("reply") is None,
-          "an oversize mail from a stranger is dropped, not refused with a reason (drops come first)")
-        code, ans = b.post(eml(body="x" * 4000), sender=ALLOWED)
-        k(code == 413 and isinstance(ans.get("reply"), str),
-          "…the same mail from an allow-listed address gets the reason")
+    # there is no size cap any more (the allow-list is the gate): a large mail from a stranger is still a silent
+    # drop, and the same mail from an allow-listed address is stored whole.
+    with Box() as b:
+        code, ans = b.post(eml(frm=STRANGER, body="x" * 400000), sender=STRANGER)
+        k(code == 403 and ans.get("reply") is None, "a large mail from a stranger is dropped, never answered")
+        code, ans = b.post(eml(body="x" * 400000), sender=ALLOWED)
+        k(code == 200 and len(b.ids()) == 1, "…the same mail from an allow-listed address is stored, no size cap")
 
     # ---------------------------------------------------------------- 3. the call itself
     with Box() as b:
@@ -735,39 +729,6 @@ def run():
         k(code == 503 and ans.get("status") == "unavailable" and ans.get("reply") is None,
           "while MAIL_SECRET is unset on the box every call is refused 503 — never allowed through")
         k(b.ids() == [], "…and nothing is stored")
-
-    # ---------------------------------------------------------------- 4. size
-    with Box(MAIL_MAX_BYTES=3000) as b:
-        code, ans = b.post(eml(body="x" * 8000))
-        k(code == 413 and ans.get("status") == "refused", "a mail over MAIL_MAX_BYTES is refused (413)")
-        k(isinstance(ans.get("reply"), str) and "3000" in ans["reply"],
-          "…with a one-line reason naming the limit, for the worker to relay: %r" % (ans.get("reply") or "")[:50])
-        k(b.ids() == [], "…and nothing is stored")
-        code, _ = b.post(eml(body="x" * 100))
-        k(code == 200 and len(b.ids()) == 1, "a mail under the cap from the same sender is stored")
-
-    # ---------------------------------------------------------------- 5. the per-sender rate limit
-    with Box(MAIL_RATE=3, MAIL_RATE_WINDOW=3600) as b:
-        codes = [b.post(eml(body="m%d" % i))[0] for i in range(3)]
-        k(codes == [200, 200, 200] and len(b.ids()) == 3, "the first MAIL_RATE mails from a sender are stored")
-        code, ans = b.post(eml(body="one too many"))
-        k(code == 429 and ans.get("status") == "refused", "…and the next one is refused (429)")
-        k(isinstance(ans.get("reply"), str) and "3" in ans["reply"],
-          "…with a reason naming the limit: %r" % (ans.get("reply") or "")[:50])
-        k(len(b.ids()) == 3, "…and it is not stored")
-        code, _ = b.post(eml(frm=OTHER, body="from someone else"), sender=OTHER)
-        k(code == 200 and len(b.ids()) == 4,
-          "the limit is PER SENDER: one person's burst does not shut the door on anybody else")
-    with Box(MAIL_RATE=2, MAIL_RATE_WINDOW=60) as b:
-        r.RATEFILE = os.path.join(b.tmp, "rate.json")
-        now = time.time()
-        with open(r.RATEFILE, "w") as f:                     # two mails, but from 10 minutes ago
-            json.dump({ALLOWED: [now - 600, now - 601]}, f)
-        k(b.post(eml())[0] == 200, "a count older than MAIL_RATE_WINDOW does not hold a mail back")
-        with open(r.RATEFILE, "w") as f:
-            json.dump({ALLOWED: [now, now]}, f)
-        k(b.post(eml())[0] == 429,
-          "…and a count inside the window does, read off the file — so a restart is not a fresh allowance")
 
     # ---------------------------------------------------------------- 6. the verdict in the mail's own headers
     with Box() as b:
@@ -966,44 +927,14 @@ def run():
         open(os.path.join(r.INBOX, ".20260101T000000Z-deadbeef"), "w").close()
         k(r.ids() == b.ids(), "a directory store() is still writing (leading dot) is not listed as a mail")
 
-    # ---------------------------------------------------------------- 9. what one mail may cost
-    # A cap on FILES, not on bytes: the parts are what turn into creat()s. The mail is well formed and the
-    # sender is on the list, so this is a refusal with a reason and never a silent drop.
-    with Box(MAIL_MAX_PARTS=4) as b:
-        code, ans = b.post(many_parts(5))
-        k(code == 413 and "too many parts" in (ans.get("reason") or ""),
-          "a mail with more parts than MAIL_MAX_PARTS is refused (413): %r" % (ans.get("reason") or "")[:50])
-        k(isinstance(ans.get("reply"), str), "…with the reason as `reply`, for the worker to relay")
-        k(os.listdir(r.INBOX) == [], "…and nothing on disk, not even a directory half written")
-        k(b.post(many_parts(4))[0] == 200 and len(b.ids()) == 1, "a mail at the cap is stored")
-    # And a cap on the bytes those parts decode to, counted as they are written rather than found afterwards.
-    with Box(MAIL_MAX_ATTACH_BYTES=100) as b:
-        code, ans = b.post(many_parts(5, "x" * 40))
-        k(code == 413 and "attachments too large" in (ans.get("reason") or ""),
-          "attachments over MAIL_MAX_ATTACH_BYTES are refused (413): %r" % (ans.get("reason") or "")[:50])
-        k(os.listdir(r.INBOX) == [],
-          "…and the directory that was half written when the cap was hit is gone, tmp name and all")
-        k(b.post(many_parts(2, "x" * 40))[0] == 200 and len(b.ids()) == 1,
-          "…while a mail inside the cap is stored")
-
-    # ---------------------------------------------------------------- 10. the ceiling on connections
-    # One thread per connection with no ceiling is the tunnel's to spend: a caller that connects and then sends
-    # nothing holds a thread for Handler.timeout seconds and can do it as often as it likes. Over the ceiling a
-    # connection waits BUSY_WAIT for a slot and is then answered 503 busy, which the worker turns into a retry.
-    with Box(MAIL_MAX_CONN=1) as b:
-        held = socket.create_connection((b.host, b.port), timeout=10)
-        held.sendall(b"POST /inbound HTTP/1.1\r\nHost: x\r\n")     # no blank line: the handler waits for one
-        time.sleep(0.3)
-        s = socket.create_connection((b.host, b.port), timeout=10)
-        s.sendall(b"POST /inbound HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
-        first = s.recv(300)
-        s.close()
-        k(b"503" in first and b'"busy"' in first,
-          "with the only slot held, the next connection is answered 503 busy: %r" % first.split(b"\r\n")[0][:40])
-        k(b.ids() == [], "…and stores nothing")
-        held.close()
-        time.sleep(0.3)
-        k(b.post(eml())[0] == 200, "…and the slot comes back when that connection ends")
+    # ---------------------------------------------------------------- 9. no part or attachment cap
+    # The part, attachment-byte and connection caps are gone (guard inventory, 2026-10-20): an allow-listed
+    # sender's mail with many parts is stored whole, every part written.
+    with Box() as b:
+        code, ans = b.post(many_parts(80, "x" * 40))
+        k(code == 200 and len(b.ids()) == 1, "a mail with 80 parts from an allow-listed sender is stored: %r" % code)
+        k(bool(b.ids()) and len(b.mail(b.ids()[0]).get("attachments") or []) == 80,
+          "…with every one of its parts written as an attachment")
 
     # ---------------------------------------------------------------- 11. serve.log is bounded
     # Every line in it is built out of a stranger's mail and nothing else rotates it.
@@ -1105,7 +1036,7 @@ def run():
     # answer it gave, and "" is a classifier that answered nothing — which is `unsure`, the safe default, and
     # also exactly what a box with no `claude` on its PATH does. Unset it would SHELL OUT to a real model.
     allow = ",".join([ALLOWED, OTHER, OWNER, STRANGER])
-    with Box(allow=allow, MAIL_RATE=500) as b:
+    with Box(allow=allow) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""            # unsure, for every case that does not say otherwise
         try:
             d = Dir()
@@ -1443,7 +1374,7 @@ def run():
     # ---------------------------------------------------------------- 15. the wire to the daemon
     # The router's answer is what the SENDER hears, so the socket round trip is checked end to end: a real
     # store, a fake daemon on this case's own socket path, and the reply that comes back out of the 200.
-    with Box(allow=allow, MAIL_RATE=500) as b:
+    with Box(allow=allow) as b:
         k(b.post(eml())[1]["reply"].startswith("Received. It is in the queue as "),
           "with no daemon listening the mail is still stored, and the sender is told exactly that")
         asked = []
@@ -1496,7 +1427,7 @@ def run():
     k(28 < r.ROUTE_WAIT and vetting.TIMEOUT <= r.ROUTE_WAIT < 100,
       "the routing wait (%ss) outlasts a 28 s vetting and the vetting read's %ss, and stays under Cloudflare's "
       "100 s" % (r.ROUTE_WAIT, vetting.TIMEOUT))
-    with Box(allow=allow, MAIL_RATE=500) as b:
+    with Box(allow=allow) as b:
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(r.SLACKSOCK)
         srv.listen(4)
@@ -1535,7 +1466,7 @@ def run():
     # in for cc-sandbox that records the argv it was handed and then runs the rest of it. CC_MAIL_VET_FAKE is
     # the model's stand-in, "<the text read>|<the security read>", and an empty half is a model that is not
     # installed. Nothing here calls a model, and nothing here is left behind.
-    with Box(allow=allow, MAIL_RATE=500) as b:
+    with Box(allow=allow) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = "mem--site"      # the classifier is settled: these cases are the vetting's
         d = Dir()
 
@@ -1840,24 +1771,16 @@ def run():
           "an attachment's name is ONE capped line inside the <files> tags — a filename carrying newlines and "
           "an instruction cannot forge a line of the report the sandbox is quoted as writing")
 
-        # (e) THE DAY'S BUDGET IS A HOLD, NEVER A QUIET DROP. Its own day file: the cases above have been
-        # charging this sender since (a), and a budget case standing on that count would be a case about them.
+        # (e) NO DAY'S BUDGET (guard inventory, 2026-10-20): a sender's third read in a day is read like the first.
         os.remove(seen)
         shutil.rmtree(vetting.STATE, ignore_errors=True)
-        cfg = {"MAIL_VET_DAY_MAX": "2"}
         os.environ["CC_MAIL_VET_FAKE"] = "fits"
-        for _ in range(2):
+        verdicts = []
+        for _ in range(3):
             msg = arrived(b, ALLOWED)
-            vetting.vet(msg, router.route(msg, d, "box.example"), cfg)
-        k(vetting.spent(ALLOWED) == 2 and vetting.spent(OTHER) == 0,
-          "each read is counted against the sender who sent it, and against nobody else")
-        msg = arrived(b, ALLOWED)
-        v = vetting.vet(msg, router.route(msg, d, "box.example"), cfg)
-        k(v.verdict == "suspicious" and v.reason == "budget" and vetting.spent(ALLOWED) == 2,
-          "a sender over the day's budget is held for a person, and costs no further read")
-        msg = arrived(b, OTHER)
-        k(vetting.vet(msg, router.route(msg, d, "box.example"), cfg).clean,
-          "…while the next sender is unaffected: the budget is per sender, not per box")
+            verdicts.append(vetting.vet(msg, router.route(msg, d, "box.example"), {"MAIL_VET_DAY_MAX": "2"}))
+        k(all(v.clean for v in verdicts) and not hasattr(vetting, "spent"),
+          "a sender's mails past the old day count are read and passed, with no per-sender count kept")
 
         # (f) THE REPLY THAT FINISHES A HELD MAIL — one grammar, and a sentence that mentions it is not one.
         k([vetting.decided(t) for t in ("deliver it", "Drop it.", "deliver", "drop it!")]
@@ -1874,7 +1797,7 @@ def run():
     # hands vet() — section 16 passes {} and so stays the stranger's path. Every case here builds its own mail,
     # its own sandbox and its own answer; the fake's SECOND half is set to a word that would hold a stranger,
     # so a clean verdict proves the security read never ran rather than that it happened to agree.
-    with Box(allow=allow, MAIL_RATE=500) as b:
+    with Box(allow=allow) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = "mem--site"
         d = Dir()
         known = {"MAIL_ALLOW": " %s,\n%s " % (ALLOWED.upper(), OWNER)}    # the receiver's parse: any case, any separator
@@ -2033,12 +1956,6 @@ def run():
             k(not v.clean and v.reason == "unread" and v.known and v.why.startswith(vetting.KNOWN + ", but ")
               and "nobody has read this" in v.why,
               "…and a read that did not run still fails closed for a known sender, with both halves in the note")
-            shutil.rmtree(vetting.STATE, ignore_errors=True)
-            over = dict(known, MAIL_VET_DAY_MAX="1")
-            vetted("fits", OWNER, cfg=over)
-            _, v = vetted("fits", OWNER, cfg=over)
-            k(not v.clean and v.reason == "budget" and v.known and v.why.startswith(vetting.KNOWN + ", but "),
-              "…and the day's budget still holds a known sender, saying so")
 
             # (e) A COURSE DIGEST THE OWNER FORWARDS IS NOT READ (owner, 2026-09-30: "always allow these kinds of
             # email"). The body is the shape his university account sends — Outlook's rule, then the forwarded
@@ -2050,9 +1967,9 @@ def run():
                    "Sent: Tuesday, September 29, 2026 12:00:37 p.m.\nSubject: Daily Digest for ECE 231 on Piazza\n\n"
                    "When to use mass-action law? Please post your answer below.\n")
             _, v = vetted("against-rules", OWNER, cfg=dcfg, body=fwd)
-            k(v.clean and v.reason == "digest" and v.known and not asked_with and vetting.spent(OWNER) == 0
+            k(v.clean and v.reason == "digest" and v.known and not asked_with
               and v.why == vetting.KNOWN + ", and the mail is a course digest forwarded from the owner's own address",
-              "a Piazza digest the owner forwards is clean without a read, costs nothing of his day, and the note "
+              "a Piazza digest the owner forwards is clean without a read, and the note "
               "says why")
             _, v = vetted("against-rules", OWNER, cfg=dcfg,
                           body="fyi\n---------- Forwarded message ---------\n*From:* Crowdmark Mailer "
@@ -2175,7 +2092,7 @@ def run():
     # the secret offered, the From, the recipient list, and the raw message parsed back into a real mail. No
     # case here has a Slack token, a daemon or a channel — the tap that CALLS this lives in cc-slack and is
     # tested there; what is settled here is what one post in a mirror thread turns into.
-    with Box(allow=",".join([ALLOWED, OTHER, OWNER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OTHER, OWNER])) as b:
         MID = "<orig-1@allowed.example>"
 
         def conv(role="to", chat="C-mem", ts="1700.1", **kw):
@@ -2714,18 +2631,15 @@ def run():
         finally:
             outbound.SENTDIR = saved_sent
 
-        # (a2) A SUBJECT WITH A LINE BREAK is refused before the caps are charged — build() raised on it after
-        # caps() had taken a slot (2026-09-27). One slot an hour: the refusal must not use it up.
+        # (a2) A SUBJECT WITH A LINE BREAK goes out on one line (guard inventory, 2026-10-20): the break becomes a
+        # space, so nothing after it becomes a header, and the mail is sent rather than refused.
         cold_fresh()
         with FakeWorker() as w:
-            ok, line = outbound.send_to(cold_conf(w, MAIL_OUT_PER_HOUR=1), ALLOWED, "one\r\nBcc: x@evil.example",
-                                        "text")
-            k(not ok and "line break" in line and not w.calls
-              and [ln for ln in cold_log() if "cold: not sent" in ln and "line break" in ln],
-              "a subject with CR/LF in it is refused in one line, raising nothing and sending nothing: %r" % line)
-            ok, line = outbound.send_to(cold_conf(w, MAIL_OUT_PER_HOUR=1), ALLOWED, "one line", "text")
-            k(ok and len(w.calls) == 1,
-              "…and it charged no rate: the next mail still has the hour's one slot: %r" % line)
+            ok, line = outbound.send_to(cold_conf(w), ALLOWED, "one\r\nBcc: x@evil.example", "text")
+            m = w.one()["msg"] if len(w.calls) == 1 else None
+            k(ok and m is not None and m["Subject"] == "one Bcc: x@evil.example" and m["Bcc"] is None
+              and w.calls[0].get("to") == [ALLOWED],
+              "a subject with CR/LF in it is sent on one line, the break a space and no Bcc header made: %r" % line)
 
         # (b) THE REFUSAL. The list is the whole of what keeps this from being a relay, so the address is
         # checked BEFORE the wire and a mail nobody meant is a line rather than a POST somebody has to notice.
@@ -2810,7 +2724,7 @@ def run():
     # there; a mail to a name no channel has from an unknown sender does not reach any channel." Each case is
     # its own mail through the real door and its own fixture directory, with the classifier settled first —
     # "" is unsure. The vetting verdict riding with the delivery is cc-slack's half (its selfcheck, take_mail).
-    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER])) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""
         try:
             def to(rcpt, sender=ALLOWED, **kw):
@@ -2975,7 +2889,7 @@ def run():
       and router.quiet_names("home archive") == {"archive"},
       "MAIL_QUIET splits on commas or spaces, lower-cases, takes the local part of a full address, and never "
       "makes home@ quiet")
-    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER])) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""
         try:
             def to(rcpt, sender=ALLOWED, **kw):
@@ -3119,7 +3033,7 @@ def run():
     k(router.explain_names(TEACH) == {"explain", "why"} and router.explain_names("") == set()
       and router.explain_names("home explain") == {"explain"},
       "MAIL_EXPLAIN splits and folds as MAIL_QUIET does, and never makes home@ an explanation address")
-    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER])) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""
         try:
             def to(rcpt, sender=ALLOWED, **kw):
@@ -3195,7 +3109,7 @@ def run():
       {"site": "mem--site", "sam": "other"} and router.alias_map("") == {},
       "MAIL_ALIASES reads alias=target pairs, folds each side to a lower-case local part, and skips a pair "
       "missing a side, a self-alias and any alias of home@")
-    with Box(allow=",".join([ALLOWED, OWNER, "second@allowed.example"]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OWNER, "second@allowed.example"])) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""
         try:
             def to(rcpt, sender=ALLOWED, **kw):
@@ -3313,7 +3227,6 @@ def run():
         fresh20d()
         with FakeWorker() as w:
             refusals = [
-                outbound.send_to(cold20d(w), ALLOWED, "s", "", html=html20d),
                 outbound.send_to(cold20d(w), ALLOWED, "s", "text", images=[fig20d]),
                 outbound.send_to(cold20d(w), ALLOWED, "s", "text", html=html20d, images=[pdf20d]),
                 outbound.send_to(cold20d(w), ALLOWED, "s", "text", html=html20d,
@@ -3322,11 +3235,20 @@ def run():
             ]
             n20d = len(w.calls)
         k(n20d == 0 and not any(ok for ok, _ in refusals)
-          and "plain-text body" in refusals[0][1] and "inside an HTML body" in refusals[1][1]
-          and "cannot be an inline image" in refusals[2][1] and "cannot go inline" in refusals[3][1]
-          and "over 200 KiB" in refusals[4][1],
-          "an HTML body with no text, an image with no HTML, an image that is not one, one outside the trees and "
-          "an oversized HTML body are each refused by name, and nothing reaches the worker")
+          and "inside an HTML body" in refusals[0][1]
+          and "cannot be an inline image" in refusals[1][1] and "cannot go inline" in refusals[2][1]
+          and "over 200 KiB" in refusals[3][1],
+          "an image with no HTML, an image that is not one, one outside the trees and an oversized HTML body are "
+          "each refused by name, and nothing reaches the worker")
+        # (d2) an HTML body with no text is sent, its text part the HTML's own words with the tags stripped
+        fresh20d()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold20d(w), ALLOWED, "s", "", html="<p>Hello <b>there</b></p>")
+            msg = w.one()["msg"] if len(w.calls) == 1 else None
+        parts = [p for p in msg.walk() if not p.is_multipart()] if msg is not None else []
+        k(ok and [p.get_content_type() for p in parts] == ["text/plain", "text/html"]
+          and parts[0].get_content().strip() == "Hello there",
+          "an HTML body with no text is sent, the text part made from the HTML's words: %r" % ok)
         # (e) the command's JSON carries both keys, and a wrong type is exit 2's line
         ask20d = os.path.join(b.tmp, "ask20d.json")
         with open(ask20d, "w") as f:
@@ -3364,7 +3286,7 @@ def run():
       "sender, or the key unset")
     k(router.UNMAPPED in router.NOT_OWNERS and router.PINNED in router.NOT_OWNERS,
       "a pinned mail, like an unplaced one, is in the owner's workspace without being the owner's own word")
-    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER])) as b:
         os.environ["CC_MAIL_ROUTE_FAKE"] = ""
         try:
             def to(rcpt, sender=ALLOWED, **kw):
@@ -3406,7 +3328,7 @@ def run():
     # message that arrived by mail gets a mail reply; a post that answers nothing in a mail thread stays in
     # Slack; an explicit way to mail when asked remains (answering the mail-origin root)". Every case is its own
     # conversation on disk, and every one asserts BOTH the post that travels and the post that does not.
-    with Box(allow=",".join([ALLOWED, OTHER, OWNER]), MAIL_RATE=500) as b:
+    with Box(allow=",".join([ALLOWED, OTHER, OWNER])) as b:
         ROOT, LATER, OWNER_TS, NOBODY = "1800.1", "1800.4", "1800.7", ""
         made = [0]
 
@@ -4077,7 +3999,7 @@ def run():
     # here is the record it writes — saved, with the mirror line as its `to` root and the hold on it — and
     # what that record lets the mail door do: the mail's ack is on record from the door, a post answering
     # the held line goes out to the sender, and the sender's next mail lands on the same held conversation.
-    with Box(allow=ALLOWED + "," + OWNER, MAIL_RATE=500) as b:
+    with Box(allow=ALLOWED + "," + OWNER) as b:
         HROOT = "1900.1"
 
         def held_conf(worker):

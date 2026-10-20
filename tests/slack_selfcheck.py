@@ -81,9 +81,6 @@ def run_selfcheck():
     # case that asserts one would read differently on every box. Asia/Tokyo is nobody's zone here, has no DST, and
     # is far enough east that the DAY moves with the hour — a renderer that only stripped the Z fails these.
     os.environ["CC_TZ"] = "Asia/Tokyo"
-    # …and the ENGAGEMENT GATE is off for the run (CC_ENGAGE_DAYS=0): a fixture DIR has no archive, so every project
-    # would score idle and every routine post below would be held. Its own case turns it on, on its own fixture.
-    os.environ["CC_ENGAGE_DAYS"] = "0"
     # …and the same for the WORK those cases set off. Every :+1: case runs the real on_approval, and every tick case
     # runs the real loop_tick — so queue_land() shelled to the REAL cc-land and publish_soon() to the real cc-publish.
     # Against a fixture that is only noise; but `nameMM` below is deliberately the first REAL repo in ~/dev
@@ -1064,8 +1061,8 @@ def run_selfcheck():
     # A BOX POST IN A PROJECT'S CHANNEL WAKES THAT PROJECT'S SEAT AND NOT THE POSTER (raised-box-post-in-project-channel-
     # does-not-wake-seat, owner 2026-09-24: "It NEEDS to reach the session actively as if I sent a slack message"). The
     # planning seat posts into #lessons: lessons is handed the text itself as a message in #lessons' thread, never a relay;
-    # the same seat posting into its own channel is "own" and wakes nobody; and two seats waking each other are held
-    # after PINGPONG_MAX wakes in the window, while a third seat's wake of the same target still goes through.
+    # the same seat posting into its own channel is "own" and wakes nobody; and two seats waking each other turn about
+    # are never held by a count (the ping-pong cap is gone: COMMS.md tells seats to stop replying instead).
     dmBW = Daemon(use_slack=False); dmBW.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmBW.bot_user = "UBOT"
     dmBW.names.update({"CLES": "lessons", "CCTLX": "ctl"}); wokeBW = []
     dmBW.route = lambda chat, ctype: {"CLES": "lessons", "CCTLX": "ctl"}.get(chat)
@@ -1083,20 +1080,18 @@ def run_selfcheck():
           and firstBW[0][2]["content"] == "please add the Go Abroad event"
           and firstBW[0][2]["meta"]["chat_id"] == "CLES" and firstBW[0][2]["meta"]["thread_ts"] == "9.1"
           and firstBW[0][2]["meta"]["channel"] == "#lessons")
-    del wokeBW[:]; dmBW.pair_wakes.clear(); resBW = []
-    for i in range(Daemon.PINGPONG_MAX + 2):     # ctl -> lessons, lessons -> ctl, turn about
+    del wokeBW[:]; resBW = []
+    for i in range(10):     # ctl -> lessons, lessons -> ctl, turn about
         seatBW["s"] = ("ctl", None) if i % 2 == 0 else ("lessons", None)
         resBW.append(dmBW.wake_channel("CLES" if i % 2 == 0 else "CCTLX", f"10.{i}", None, "and back", ("peer",)).get("result"))
     seatBW["s"] = ("website", None)
     rBWthird = dmBW.wake_channel("CLES", "11.1", None, "a third seat", ("peer",))
     oneBW = [dmBW.wake_channel("CLES", f"13.{i}", None, "one more request", ("peer",)).get("result")
-             for i in range(Daemon.PINGPONG_MAX + 2)]    # website -> lessons only: a run of requests, not a loop
-    check("two seats waking each other by post are held after PINGPONG_MAX wakes between them (recorded, not delivered); "
-          "a third seat's post into the same channel still wakes it, and so does every post of a one-way run",
-          resBW[:Daemon.PINGPONG_MAX] == ["delivered"] * Daemon.PINGPONG_MAX
-          and resBW[Daemon.PINGPONG_MAX:] == ["held: ping-pong"] * 2
-          and rBWthird.get("result") == "delivered" and wokeBW[Daemon.PINGPONG_MAX][2]["content"] == "a third seat"
-          and oneBW == ["delivered"] * (Daemon.PINGPONG_MAX + 2) and len(wokeBW) == 2 * Daemon.PINGPONG_MAX + 3)
+             for i in range(10)]    # website -> lessons only: a run of requests
+    check("two seats waking each other by post ten times turn about are all delivered (no ping-pong hold); a third "
+          "seat's post into the same channel wakes it, and so does every post of a one-way run",
+          resBW == ["delivered"] * 10 and rBWthird.get("result") == "delivered"
+          and wokeBW[10][2]["content"] == "a third seat" and oneBW == ["delivered"] * 10 and len(wokeBW) == 21)
     # ANY POST IN A SEAT'S CHANNEL REACHES THAT SEAT, WHOEVER WROTE IT, AND NEVER ITS OWN (raised-a-box-post-in-a-seat-
     # channel-never-reaches-the-seat, 2026-09-27: the library editor's post of an owner's edit package into the orch's
     # channel woke nobody). A box process no session owns (a service, a shell) and another app's bot are handed over as
@@ -1314,7 +1309,7 @@ def run_selfcheck():
             check("route: a box post naming @alias or @project, in prose or leading, never bounces and is never delivered",
                   not said5 and not delivered5)
             mdel = []; dm5.deliver = lambda *a, **k: mdel.append((a[0], k.get("alias"))) or "delivered"
-            dm5.pingpong = lambda *a: None; dm5.permalink = lambda *a: None
+            dm5.permalink = lambda *a: None
             with offline_slack():
                 ms = dm5.route_mentions("C3", "6.8", "6.8", "ask @chip and @ai-dev", ("r", None))
             check("route_mentions: a stale orch alias naming a project reaches that project; a live-less orch alias still its orch",
@@ -2418,15 +2413,15 @@ def run_selfcheck():
                   open(f"{devG}/confirm-answers/{rid_d}").read() == "no\tThe Owner\n" and ("CTHREADS", r_d["card"], "x") in rxM)
             for w in ("seat-2", "seat-3", "seat-4"):
                 dmG.relay_grant(w, "confirm", "git push")
-            check("confirm cards share ONE hourly cap for the box: the window is the caller's word, so a new name buys no room",
-                  not dmG.relay_grant("seat-5", "confirm", "git push")["ok"] and dmG.relay_grant("seat-9", "allow", "Bash(w *)")["ok"])
+            check("confirm cards have no hourly cap: a fifth in the hour still posts, and so does an allow card",
+                  dmG.relay_grant("seat-5", "confirm", "git push")["ok"] and dmG.relay_grant("seat-9", "allow", "Bash(w *)")["ok"])
             wild_g = [dmG.relay_grant(CTL, "allow", w) for w in ("Bash(:*)", "Bash(**)", "Bash(* *)", "Bash(?*)", "Read(/**)")]
             check("every wildcard dressed up — Bash(:*), Bash(**), Bash(* *), Bash(?*), Read(/**) — is refused as the whole tool",
                   all(not r["ok"] for r in wild_g))
-            for _ in range(GRANT_CAP):
+            for _ in range(6):
                 dmG.relay_grant(CTL, "allow", "Bash(y *)")
-            check("a seat raising grant cards faster than anyone answers is capped (GRANT_CAP an hour)",
-                  not dmG.relay_grant(CTL, "allow", "Bash(z *)")["ok"])
+            check("a seat raising grant cards faster than anyone answers is not capped: the seventh in the hour still posts",
+                  dmG.relay_grant(CTL, "allow", "Bash(z *)")["ok"])
 
             # -- THE APPROVER (row permissions-agent-applies-owner-grants): an allow or config ask goes to cc-approve first.
             # What the owner's recorded grants cover, THIS DAEMON writes with no card and says so; the rest is his card.
@@ -2489,7 +2484,6 @@ def run_selfcheck():
                 check("an apply the writer refuses becomes the owner's card, saying so", r4["id"] in dmA.grant_asks
                       and "the write was refused: cc-config: refused" in saidA[n_said][1] and saidA[n_said][1].startswith("🤖 "))
                 rcA.clear()
-                dmA.grant_posts.clear()               # a fresh hour for the cases below: the cap has its own case above
                 # 5. refused before any judging: a credential's key, a value the card could not show exactly
                 runA.clear(); n_said = len(saidA)
                 bad = [dmA.relay_grant(CTL, "config", k, value=v) for k, v in (("SLACK_BOT_TOKEN", "x"), ("GH_PAT", "x"), ("MY_API_KEY", "x"),
@@ -3408,8 +3402,8 @@ def run_selfcheck():
           and outR[6] == ([("C-approvals", "🔒 <@UOWNER> approve the deploy?", None)], "")
           and outR[7][0] == [("C-myrepo-threads", "🤖 which snapshot, seat?", "6.0")] and "decision →" not in outR[7][1])
     # AN AGENT'S POST FOR ANOTHER AGENT (owner, 2026-10-01): through the real post(), a post addressed to another session
-    # opens with 🤖 once, and top level in #<repo> it lands in #<repo>-updates with one stderr line; threaded, in a
-    # -threads lane, or the caller's own plain post, it stays where it was aimed. Own fixture: no daemon, so no wake.
+    # opens with 🤖 once and stays where it was aimed (the move into #<repo>-updates is gone): top level, threaded, in a
+    # -threads lane, or the caller's own plain post. Own fixture: no daemon, so no wake.
     real_snA, real_sockA = globals()["sender_name"], globals()["sock_request"]
     usersA, outA, ownA = dict(_users), [], [False]
     def postA(*a):
@@ -3447,18 +3441,18 @@ def run_selfcheck():
         globals()["sock_request"], globals()["api"] = real_sockA, real_api
         _users.update(usersA); globals()["load_members"] = REAL_LOAD_MEMBERS
     check("agent post: a seat's top-level post into another session's #<repo> arrives first char 🤖, `🤖 <#C-myrepo> …`, "
-          "in #<repo>-updates, one stderr line saying so",
-          outA[0][0] == [("C-myrepo-updates", "🤖 <#C-myrepo> can you rebuild the index?", None)]
-          and outA[0][1].count("agent post → #myrepo-updates") == 1)
+          "top level in #<repo> as asked, no stderr line moving it",
+          outA[0][0] == [("C-myrepo", "🤖 <#C-myrepo> can you rebuild the index?", None)]
+          and "agent post" not in outA[0][1])
     check("agent post: threaded in #<repo> it stays in #<repo>'s thread, first char 🤖, no stderr line",
           outA[1][0] == [("C-myrepo", "🤖 <#C-myrepo> rebuilt?", "7.0")] and "agent post" not in outA[1][1])
-    check("agent post: a text the caller already opened with 🤖 carries ONE 🤖, ahead of the <#…> address, in -updates",
-          outA[2][0] == [("C-myrepo-updates", "🤖 <#C-myrepo> already marked, rebuild?", None)])
+    check("agent post: a text the caller already opened with 🤖 carries ONE 🤖, ahead of the <#…> address, in #<repo>",
+          outA[2][0] == [("C-myrepo", "🤖 <#C-myrepo> already marked, rebuild?", None)])
     check("agent post: a post into a -threads lane opens with 🤖 and stays in its thread there",
           outA[3][0] == [("C-myrepo-threads", "🤖 <#C-myrepo-threads> which branch?", "8.0")] and "agent post" not in outA[3][1])
-    check("agent post: the caller's own lane with a text opening <#…> is addressed — 🤖, moved to -updates; its own plain "
+    check("agent post: the caller's own lane with a text opening <#…> is addressed — 🤖, still in #<repo>; its own plain "
           "question is left alone: no 🤖, #<repo>, no stderr line",
-          outA[4][0] == [("C-myrepo-updates", "🤖 <#C-lessons> look at chapter 3", None)]
+          outA[4][0] == [("C-myrepo", "🤖 <#C-lessons> look at chapter 3", None)]
           and outA[5] == ([("C-myrepo", "which volume goes?", None)], ""))
     check("agent post: a --major post from a process no session owns (the daemon says no seat, or there is no daemon) "
           "is not addressed: no 🤖, top level in #<repo> " + repr(outA[6:]),
@@ -3493,7 +3487,7 @@ def run_selfcheck():
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []   # the fake token cannot ask users.list; the warning path has its own cases
         globals()["load_members"] = kept_twins("C-myrepo-updates")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errG):
-            rcG = cmd_post(["-c", "#myrepo", "bug report from lesson-builder: the skill drops step 3"])   # routine → the twin
+            rcG = cmd_post(["-c", "#myrepo", "bug report from lesson-builder: the skill drops step 3"])   # routine: stays in #myrepo
             cmd_post(["-c", "#myrepo", "restore which database?"])                                       # a question → main
             cmd_post(["-c", "#myrepo", "❓ blocked on the token"]); cmd_post(["-c", "#myrepo", "<@UOWNER> needs you"])   # decision markers → main
             cmd_post(["-c", "#myrepo", "@ada.byron pick the rollback target"])                            # a bare @handle is one too: linkified only after the gate
@@ -3507,139 +3501,34 @@ def run_selfcheck():
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
         globals()["unresolved_mentions"] = real_um; globals()["load_members"] = REAL_LOAD_MEMBERS
-    check("the main lane is the owner's: a routine -c '#<repo>' post is redirected to #<repo>-updates and one stderr line says so "
-          "(exit 0); a question ('?'), a decision (❓ / 🔐 / an @-mention / --mention), a --thread reply and --major (alias --main) "
-          "stay in #<repo>; #alerts, a track channel, a lane and a raw id are untouched",
-          rcG == 0 and postedG == [f"C-myrepo-{UPDATES}"] + ["C-myrepo"] * 9 + [f"C-myrepo-{UPDATES}", "C-alerts", "C-myrepo--w1", f"C-myrepo-{UPDATES}", "C123"]
-          and errG.getvalue().count(f"routine → #myrepo-{UPDATES}") == 2 and len(errG.getvalue().strip().splitlines()) == 2)
-    # ENGAGEMENT (owner, 2026-10-03: "if i havent been involved at all, why tell me everything"). The same posts go
-    # into three projects on one fresh fixture: BUSY (2 owner messages + 1 owner reaction → ACTIVE), SOME (1 message →
-    # LIGHT) and QUIET (a member's message and one of his older than the window, so nothing → IDLE).
-    # Brief: "a selfcheck case shows the same routine post is delivered in a project where he posted or reacted
-    # recently and folded away in one where he did not, while a decision card, a failure his to move and a reply in
-    # his own thread are delivered in both".
-    was_dir, was_days = DIR, os.environ.get("CC_ENGAGE_DAYS")
-    real_tt = track_thread
-    # DIR here is the tool's global, not a local: run_selfcheck opens with `global DIR, SOCK`, so engagement() and
-    # fold() read this fixture, and the finally below puts the box's DIR back
-    DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-engage-")
-    postedE, errE, outE, heldE, byE, scores = [], io.StringIO(), io.StringIO(), io.StringIO(), {}, {}
-    keepE, fortyE, gateE, logE = None, None, [], {}
+    check("no routine redirect: a routine -c '#<repo>' post goes to #<repo> as asked even with a twin on record (exit 0), "
+          "like a question, a decision, a --thread reply and --major; #alerts, a track channel, a lane and a raw id are "
+          "untouched, and no stderr line says anything was moved " + repr((postedG, errG.getvalue())),
+          rcG == 0 and postedG == ["C-myrepo"] * 11 + ["C-alerts", "C-myrepo--w1", f"C-myrepo-{UPDATES}", "C123"]
+          and "routine" not in errG.getvalue())
+    # NO ENGAGEMENT HOLD: the gate that folded routine posts away in a project he had not touched is gone. On its own
+    # fixture (a fresh DIR with no archive, so the owner has never spoken in #quiet), a routine main-lane post, a routine
+    # status line and a --major --keep digest line are all posted to #quiet and nothing says "held".
+    was_dir = DIR
+    DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-idle-")
+    postedE, errE = [], io.StringIO()
+    rcE = []
     try:
-        os.environ["CC_ENGAGE_DAYS"] = "3"; os.environ.pop("CC_ENGAGE_ACTIVE", None)
-        nowE = time.time()
-        for proj, chat, role, age in (("busy", "C-busy", "owner", 3600), ("busy", "C-busy-updates", "owner", 7200),
-                                      ("some", "C-some", "owner", 3600),
-                                      ("quiet", "C-quiet", "member", 3600), ("quiet", "C-quiet", "owner", 5 * 86400)):
-            d = f"{DIR}/archive/{proj}/{chat}"; os.makedirs(d, exist_ok=True)
-            ts = nowE - age
-            with open(f"{d}/{time.strftime('%Y-%m', time.gmtime(ts))}.jsonl", "a") as fh:
-                fh.write(json.dumps({"ts": f"{ts:.6f}", "chat": chat, "channel": "#" + chat[2:], "role": role, "target": proj}) + "\n")
-        dmE = Daemon(use_slack=False); dmE.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-        dmE.bot_user = "UBOT"; dmE.chan_name = lambda c: {"CB": "busy--w1", "CQ": "quiet"}[c]
-        dmE.owner_card_thumb = lambda *a, **k: False; dmE.deliver_reaction = lambda *a, **k: None
-        def reactE(chat, who, removed=False):
-            dmE.on_reaction({"type": "reaction_removed" if removed else "reaction_added", "reaction": "eyes", "user": who,
-                             "event_ts": "1.0", "item": {"type": "message", "channel": chat, "ts": "1.0"}})
-        reactE("CB", "UOWNER")                                           # kept: his reaction in a busy sub-lane counts for busy
-        reactE("CQ", "UMEMBER"); reactE("CQ", "UOWNER", removed=True)    # suppressed: a member's, and a removal
-        scores = {p: engagement(p, 3) for p in ("busy", "some", "quiet")}
-        # a window wider than a month reads the months in between: 40 d on 10-10 starts 08-31, and his 3 messages on
-        # 09-30 sit in a September file that neither end of the window names
-        nowF = calendar.timegm((2026, 10, 10, 12, 0, 0))
-        os.makedirs(f"{DIR}/archive/forty/C-forty", exist_ok=True)
-        with open(f"{DIR}/archive/forty/C-forty/2026-09.jsonl", "w") as fh:
-            for k in range(3):
-                fh.write(json.dumps({"ts": f"{calendar.timegm((2026, 9, 30, 9 + k, 0, 0)):.6f}", "chat": "C-forty",
-                                     "channel": "#forty", "role": "owner", "target": "forty"}) + "\n")
-        fortyE = engagement("forty", 40, now=nowF)
-        # the environment wins over ~/.cc/config (a config CC_ENGAGE_DAYS must not overrule the caller's), and the
-        # alerts channel a box names in SLACK_ALERTS is exempt like #alerts itself: "pager" has no record, so idle
-        routineE = "landed: PR #3 tidies the docs"
-        gateE = [engage_gate({"CC_ENGAGE_DAYS": "0"}, "quiet", routineE)[0],               # env 3 over cfg 0: weighed
-                 engage_gate({}, "pager", routineE)[0],                                    # an unnamed project: weighed
-                 engage_gate({"SLACK_ALERTS": "pager"}, "pager", routineE)]               # the box's alerts channel
-        os.environ["CC_ENGAGE_DAYS"] = "0"
-        gateE.append(engage_gate({"CC_ENGAGE_DAYS": "3"}, "quiet", routineE))             # env 0 over cfg 3: off
-        os.environ["CC_ENGAGE_DAYS"] = "3"
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, **kw: postedE.append((chat, thread)) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []
-        globals()["track_thread"] = lambda target: None
-        globals()["load_members"] = kept_twins(*(f"C-{p}-{UPDATES}" for p in ("busy", "some", "quiet")))
-        with contextlib.redirect_stdout(outE), contextlib.redirect_stderr(errE):
-            for p in ("busy", "some", "quiet"):
-                n0 = len(postedE)
-                rc = [cmd_post(["-c", f"#{p}", "--major", "landed: PR #3 tidies the docs"]),               # routine, main lane
-                      cmd_post(["-c", f"#{p}", "step 3 green, moving on"]),                              # routine → the -updates twin
-                      cmd_post(["-c", f"#{p}", "--mention", "approve the spend"]),                       # a decision card
-                      cmd_post(["--route", f"{p} deploy", "--keep", "deploy stopped: the token expired"]),  # a failure his to move
-                      cmd_post(["-c", f"#{p}", "STATUS: BLOCKED: which port?"]),                         # a worker blocked on him
-                      cmd_post(["-c", f"#{p}", "--thread", "1700.1", "done, see above"]),                # a reply in his own thread
-                      cmd_post(["-c", f"#{p}", "--ask", "the disk is filling up"])]                       # an ask he owes an answer
-                byE[p] = (rc, postedE[n0:])
-            # the daily digest (cc-reconcile digest_post: --major --keep) in an idle project goes out, and folds nothing
-            foldedE0 = open(f"{DIR}/{FOLDED}").read()
-            n0 = len(postedE)
-            keepE = (cmd_post(["-c", "#quiet", "--major", "--keep", "*box* today: nothing moved. $0 spent."]), postedE[n0:],
-                     open(f"{DIR}/{FOLDED}").read() == foldedE0)
-        with contextlib.redirect_stdout(heldE):
-            cmd_folded([])
-        # NO -updates TWINS (comms-only-read-channels-remain): a routine line for <p>, by --route or by a -c into its
-        # gone twin, lands in the box's one log lane. The gate weighs it as <p>'s updates, not as the log lane's own
-        # project: busy's is posted there, some's held for the digest, quiet's journal-only, each filed under <p>.
-        globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") and name != f"hub-{UPDATES}" else f"C-{name}"
-        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "SLACK_LOG_LANE": f"hub-{UPDATES}"}
-        foldN0 = len(open(f"{DIR}/{FOLDED}").read().splitlines())
-        with contextlib.redirect_stdout(outE), contextlib.redirect_stderr(io.StringIO()):
-            for p in ("busy", "some", "quiet"):
-                n0 = len(postedE)
-                rc = [cmd_post(["--route", f"{p} step", "step 4 green, moving on"]),
-                      cmd_post(["-c", f"#{p}-{UPDATES}", "step 5 green, moving on"])]
-                logE[p] = (rc, postedE[n0:])
-        logE["folded"] = [(r["project"], r["tier"]) for r in map(json.loads, open(f"{DIR}/{FOLDED}").read().splitlines()[foldN0:])]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errE):
+            rcE = [cmd_post(["-c", "#quiet", "--major", "landed: PR #3 tidies the docs"]),
+                   cmd_post(["-c", "#quiet", "step 3 green, moving on"]),
+                   cmd_post(["-c", "#quiet", "--major", "--keep", "*box* today: nothing moved. $0 spent."])]
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-        globals()["unresolved_mentions"] = real_um; globals()["track_thread"] = real_tt
-        globals()["load_members"] = REAL_LOAD_MEMBERS
+        globals()["unresolved_mentions"] = real_um
         DIR = was_dir
-        os.environ["CC_ENGAGE_DAYS"] = was_days if was_days is not None else "0"
-    alwaysE = lambda p: [(f"C-{p}", None), (f"C-{p}-{UPDATES}", None), (f"C-{p}", None), (f"C-{p}", "1700.1"),
-                         (f"C-{p}-{UPDATES}", None)]
-    check("engagement: his messages and reactions score a project (busy 3, some 1, quiet 0 — a member's message, a "
-          "removed reaction and his message older than the window do not count) " + repr(scores),
-          scores == {"busy": 3, "some": 1, "quiet": 0})
-    check("engagement: in BUSY (active) the routine main-lane post and the routine -updates post are both delivered, "
-          "with the decision, the failure, the blocked line, the reply in his thread and the --ask post " + repr(byE.get("busy")),
-          byE.get("busy") == ([0] * 7, [("C-busy", None), (f"C-busy-{UPDATES}", None)] + alwaysE("busy")))
-    check("engagement: in SOME (light) the main-lane post is delivered and the -updates one is held for the digest "
-          + repr(byE.get("some")),
-          byE.get("some") == ([0] * 7, [("C-some", None)] + alwaysE("some")))
-    check("engagement: in QUIET (idle) the SAME two routine posts are folded away (main lane to the digest, -updates to "
-          "the journal) while the decision card, the failure his to move, the blocked line and the reply in his own "
-          "thread are delivered exactly as in BUSY, and so is an --ask post he owes an answer (owner-asks, never held) "
-          + repr(byE.get("quiet")),
-          byE.get("quiet") == ([0] * 7, alwaysE("quiet")) and errE.getvalue().count("held for the ") == 3)
-    check("engagement: `cc-slack folded` names what was held (quiet's main-lane line for the digest and one "
-          "journal-only, some's -updates line) and nothing from busy: " + repr(heldE.getvalue()),
-          "quiet: 1 held for you, 1 journal-only — latest: landed: PR #3 tidies the docs" in heldE.getvalue()
-          and "some: 1 held for you — latest: step 3 green, moving on" in heldE.getvalue() and "busy" not in heldE.getvalue())
-    check("engagement: the digest's own --major --keep post in an idle project is delivered to its main lane and leaves "
-          "folded.jsonl untouched (the digest is never folded into itself) " + repr(keepE),
-          keepE == (0, [("C-quiet", None)], True))
-    logC = f"C-hub-{UPDATES}"
-    check("engagement with no -updates twins: a routine line for a project (--route, or -c into its gone twin) lands in "
-          "the box's log lane and is weighed by HIS engagement in that project — busy's both posted there, some's held "
-          "for the digest, quiet's journal-only, each folded under its own project, never the log lane's " + repr(logE),
-          logE.get("busy") == ([0, 0], [(logC, None), (logC, None)]) and logE.get("some") == ([0, 0], [])
-          and logE.get("quiet") == ([0, 0], [])
-          and logE.get("folded") == [("some", "digest")] * 2 + [("quiet", "journal")] * 2)
-    check(f"engagement: a 40-day window on 10-10 counts his 3 messages of 09-30 (a month neither end names), so the "
-          f"project is active ({fortyE} >= {ENGAGE_ACTIVE})", fortyE == 3 and fortyE >= ENGAGE_ACTIVE)
-    check("engagement: CC_ENGAGE_DAYS in the environment wins over ~/.cc/config both ways, and the channel SLACK_ALERTS "
-          "names is exempt like #alerts while an unnamed idle project is weighed " + repr(gateE),
-          gateE == ["digest", "digest", ("post", ""), ("post", "")])
+    check("no engagement hold: in a project the owner never spoke in, a routine post, a status line and a --major --keep "
+          "line are all posted to #quiet as asked, none held " + repr((rcE, postedE, errE.getvalue())),
+          rcE == [0, 0, 0] and postedE == [("C-quiet", None)] * 3 and "held" not in errE.getvalue())
     # EVERY `-c` POST ASKS THE DAEMON TO WAKE, however the channel is named (raised-box-post-in-project-channel-does-not-
     # wake-seat): a planning seat's `-c lessons` request on 2026-09-24 and a `-c C0…` post into an orch's channel on
     # 2026-09-21 never asked, because only '#name' did. A --route post is machinery and still never asks.
@@ -3778,11 +3667,8 @@ def run_selfcheck():
           "differently; on a box with no Slack at all there is no daemon to have a word and it stays a plain 1",
           rc_down == 2 and rc_noslack == 1 and "did not answer" in errS.getvalue())
 
-    check("a question mark glued to a trailing link is still a question (review-159), while a ?q= inside a link is not",
-          not routine_text("can I merge https://github.com/o/r/pull/159?") and routine_text("see https://x.y/a?q=1 done")
-          and not routine_text("<https://x.y/p|the PR>?"))
     postedH = []
-    try:                                                     # …and a repo with no twin yet keeps its routine post: the gate redirects, it never drops
+    try:                                                     # …and a repo with no twin keeps its routine post in #<repo>
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else f"C-{name}"
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedH.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
@@ -3790,7 +3676,7 @@ def run_selfcheck():
             cmd_post(["-c", "#myrepo", "routine, no twin yet"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-    check("no -updates twin on this box → the routine post stays in #<repo>, exactly as before the gate", postedH == ["C-myrepo"])
+    check("no -updates twin on this box → the routine post stays in #<repo>, as asked", postedH == ["C-myrepo"])
     # ── `!` IS FOUR COMMANDS: pause, resume, restart, reboot. Everything else that starts with `!` is refused by
     #    name, because a word the box swallows silently reads to the owner as a box that is not listening.
     dmS = Daemon(use_slack=False); saidS = []
@@ -7604,19 +7490,6 @@ def run_selfcheck():
               "that names the old lane and says it was a thread reply",
               postedR5m[3][:2] == ("CLOG", None)
               and postedR5m[3][2] == "(for #lessons-updates, archived, was a thread reply) done, see above")
-        # R5tg — the same reply with the engagement gate ON and the owner idle in lessons: moved top level, it is still a
-        # reply in a thread, and a reply is never held (engage_gate) — so it is posted, not sent to the journal
-        postedR5m.clear(); was_daysR = os.environ.get("CC_ENGAGE_DAYS")
-        os.environ["CC_ENGAGE_DAYS"] = "3"
-        try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                cmd_post(["-c", "#lessons-updates", "--thread", "4.4", "done, see above"])
-        finally:
-            os.environ["CC_ENGAGE_DAYS"] = was_daysR if was_daysR is not None else "0"
-        check("R5tg with the engagement gate on and the owner idle, a --thread reply aimed at a gone twin is still posted "
-              "to the log lane (a reply is never held), not folded into the journal",
-              [x[:2] for x in postedR5m] == [("CLOG", None)]
-              and postedR5m[0][2] == "(for #lessons-updates, archived, was a thread reply) done, see above")
         globals()["post"] = _postR
         # R6 — retire: ids only, dry run archives nothing, the kept channels are refused, a real run records first
         callsR6 = []

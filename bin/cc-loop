@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # cc-loop — autonomous "ralph loop": run headless Claude on a task, fresh context each iteration, rehydrating
-# from a durable progress journal + git, until the task reports DONE / BLOCKED / stalls / caps are hit.
+# from a durable progress journal + git, until the task reports DONE / BLOCKED / errors / is stopped by a person.
 # A BLOCKED line that only asks for a push ("cannot be pushed", "push from the host") of commits the track branch's
 # remote already holds, and asks nothing else, is not a stop: the loop takes it out of the journal, says why there,
 # and runs on (already_pushed).
-#   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M=CC_WORKER_MODEL] [--effort E] [--quiet]
+#   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N] [--model M=CC_WORKER_MODEL] [--effort E] [--quiet]
+#                          --max-iter N     a checkpoint every N iterations (a log line and a board note), never a stop,
+#                                           unless --no-extend makes it the caller's bound. --once is --max-iter 1 --no-extend.
+#                          --budget USD     each iteration's own dollar checkpoint (claude --max-budget-usd): the iteration
+#                                           ends there and the loop goes on, as after any other iteration
+#                          --turns N        only when a caller asks: no tool-call limit is passed by default
 #                          [--resume-last]  iteration 1 continues this track's last claude session instead of a cold
 #                                           one — for a repair round, where the context that found the bug is the
 #                                           expensive part; later iterations are fresh as always
-#                          [--no-extend]    the step limit is FINAL: no carry-on batches at --max-iter, so a caller
+#                          [--no-extend]    the step limit is FINAL: the loop ends at --max-iter, so a caller
 #                                           that promised "one round" gets exactly that.
 #                                           A bound reached with the last iteration COMMITTING is the round ending:
 #                                           exit 0 and no page, board `review` where the track has a PR to review
@@ -20,22 +25,25 @@
 #                                            failures-ledger record the loop inside could not write (member_stop below)
 #   cc-loop context-report <session.jsonl>…  what a turn of a past iteration actually carried, and what the context
 #                                            trim below would have left of it — the shadow week's one command
-# THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
-# another N iterations, as often as it keeps committing. There is no spend cap (owner, 2026-08-31: "no spend cap
-# as some just are expensive") — what stops a loop is not being expensive, it is not producing:
-# RUNAWAY — three iterations in a row that show nothing for their money, judged against THIS track's own history:
+# NO COUNT STOPS A LOOP (owner, 2026-10-16 and 2026-10-20: no count caps on calls, runs or rounds, no give-up after
+# N). The step limit is a checkpoint: at --max-iter the loop notes it and carries on, whether or not that iteration
+# committed. No tool-call limit is passed, and --budget ends an iteration, not the loop. There is no spend cap (owner,
+# 2026-08-31: "no spend cap as some just are expensive"). What ends a loop is DONE, a question, two failed iterations
+# in a row, every model refusing, a person's stop file, a pause or the tier, or --no-extend's bound.
+# RUNAWAY IS A NOTICE — three iterations in a row that show nothing for their money, judged against THIS track's own history:
 #   · committed nothing and left the journal untouched · repeated the previous outcome verbatim without committing
 #   · spent 5x what a committed iteration has cost this track, with no commit for two iterations.
-# One of those is normal. Three consecutively is a loop going nowhere, so it is stopped, the board says `blocked`,
-# and the owner is told once with the numbers.
-# ERRORS — two failed iterations in a row stop the track as `errored`. One killed at the 1 h iteration limit (rc=124)
-#   says so in its error line, and is not a failure at all if it committed.
-# WHAT A LEGITIMATE EXPENSIVE JOB LOOKS LIKE HERE, and why it survives: a $25-an-iteration opus worker on a
-# 40-step refactor commits something most iterations and journals every one. Signal 1 needs BOTH to fail;
-# signal 2 needs the model's own summary to repeat verbatim; signal 3 measures it against ITS OWN mean cost
-# per committed iteration, so $25 is the yardstick, not the alarm — it would have to spend $125 without one
-# commit. And all three are consecutive counters that a single good iteration resets. That job runs, past
-# its step limit, for as long as it keeps producing; what it may never do is spend without producing.
+# One of those is normal. Three consecutively tells the dispatching session, with the numbers, through the broker and
+# the board note, and the loop carries on: whoever reads it decides, and a stop file ends it. The streak is told again
+# on a doubling stride (its 1st, 2nd, 4th, 8th… barren iteration from the third), and a good iteration resets it.
+# Until 2026-10-20 it stopped the track (exit 9).
+# ERRORS — two failed iterations in a row stop the track as `errored`. One killed as hung (rc=124, below) says so in
+#   its error line, and is not a failure at all if it committed. A capped iteration (--budget, or a caller's --turns)
+#   is no error: it ends there and the loop goes on (until 2026-10-20 two with nothing to show stopped it, exit 7).
+# HUNG, NOT LONG: an iteration is killed only when its transcript has stopped growing for CC_LOOP_HUNG_SECS (1800 s)
+#   (hung_watch). Every tool call, model reply and subagent step writes the transcript, and Claude Code ends a
+#   foreground Bash call by 10 minutes, so a half hour of silence is a stuck process, never a long gate. Until
+#   2026-10-20 every iteration was killed at one hour of wall clock, live or not: 67 of 513 died there.
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
 # Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it)
 # PR body:    ~/.cc/state/<repo>/<track>/pr-body.md   (worker writes it before DONE: what changed, why, how it was tested. cc done makes it the PR's description and links the brief under it,
@@ -78,7 +86,8 @@
 # answered in the journal — a `- cc-loop:` line and `STATUS: RESUMED` — and the loop carries on, once per run; the worker
 # prompt says the same up front (sandbox_block). Any other BLOCKED, or that one again, stops as below.
 # Exit: 0 done, or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
-#     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
+#     | 5 errors | 6 a --no-extend bound reached with nothing committed | 10 every model on the chain refused
+#     (7 and 9 are retired: a capped iteration and a runaway no longer stop a loop)
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
 #     | 12 completion has no usable receipt, board `blocked` (notified); delivery is unconfirmed
 #     | 13 the spend tier (`cc-tier`) holds it at the next iteration — stop, or essential with no `critical` on the row — board `queued`, nobody notified;
@@ -100,9 +109,7 @@
 # still going is waited out HERE, with no model call, for up to 6 h (one still queued then is journaled and handed on
 # as progress, not dropped), its result is one journal line for the next fresh context, the
 # iteration is not the journal-untouched or repeated-outcome runaway signal (the run explains both; the spend rule
-# still counts it), and at the step limit it buys ONE more iteration to read that result — once per round (gext:
-# the grant is not repeated until a commit starts a new round, or a worker re-running a red suite every iteration
-# would never be stopped by anything), not a batch, and not under --no-extend, whose bound is the caller's promise.
+# still counts it). The next iteration reads that result; under --no-extend the bound is the caller's promise.
 # A SANDBOXED WORKER'S RUN GOES ON THE HOST (green_kick). Inside cc-sandbox the run lived on the fence's private
 # tmpfs and died with it at the iteration's end, so green_wait found nothing and all 12 workers stalled at their last
 # step on 2026-10-16. Each iteration is told where to ask (CC_GREEN_ASK=$ST/green.ask, not inside a member boundary,
@@ -115,10 +122,10 @@
 # still going at the 40-wait bound, or left by a loop that died, is journaled with its log copy later, and once.
 # One that ends with ANY OTHER RUN OF ITS OWN STILL GOING in its worktree (own_run_live: a detached EDA run, a heavy
 # slot) is not waited for, so it gets neither of those (a stray shell or dev server there must not switch the barren
-# stops off), but neither kind is COUNTED: the hour limit, a capped turn or an error that ended an iteration whose gate
-# was still running is not one of the two failures or two caps that stop a track (owner 10-16: no caps that stop work
+# stops off), but neither kind is COUNTED: a hung kill, a capped turn or an error that ended an iteration whose gate
+# was still running is not one of the two failures that stop a track (owner 10-16: no caps that stop work
 # that is still going; raised-loop-hour-cap-kills-long-gates, raised-gate-wait-counts-as-loop-failure). The waits are
-# checked BEFORE the counting for that reason. The barren-run and spend-multiple stops and --budget stand.
+# checked BEFORE the counting for that reason. The barren-run and spend-multiple notices and --budget stand.
 # A STOP IS ADDRESSED TO THE SESSION THAT DISPATCHED THE TRACK — an orch when one did (`<repo>@<alias>`, the broker's
 # own key for it), the repo seat only when none is recorded. The record is $ST/orch, written by this loop at start from
 # CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window, else from CC_DISPATCH_WIN,
@@ -129,11 +136,12 @@
 # anyone heard it). cc-broker's rc 0 means SENT, not heard: a stop or DONE sent to a key with no open seat window is
 # logged as unheard (and a stop is filed as a request), never passed off as delivered.
 # A STOP THAT IS A FAILURE IS WRITTEN TO THE FAILURES LEDGER BY THE LOOP, at the moment it stops (stop_record; design-failure-noticing
-# phase 2, "signals kept at their producers"): exits 5 6 9 10 as worker-loop/barren-stop, 4 12 as worker-loop/done-undelivered, 8 as
+# phase 2, "signals kept at their producers"): exits 5 6 10 as worker-loop/barren-stop, 4 12 as worker-loop/done-undelivered, 8 as
 # worker-loop/limit-outlasted-wait — one record per stop, through `cc-green red`, with a bounded excerpt of loop.log that outlives the
 # state dir. Not 3 (the worker ASKED, which is the work), 11 or 13 (the owner parked it, or the tier holds it): those are not failures.
 # The record never changes the exit code or the board word; a ledger that cannot be written is one log line.
-# Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
+# Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple ·
+#   CC_LOOP_HUNG_SECS how long a silent transcript means hung · CC_LOOP_HUNG_POLL how often it is looked at (60 s).
 # Env: CC_LOOP_TRIM=1 (cc-config key or the environment) drops OLD TOOL RESULTS from a worker's context — off by
 #      default, and off is byte-for-byte the run this loop always did. What it is and what it measured: trim_body.
 # Env: every worker runs inside bwrap (cc-sandbox) — secrets, sockets, other tracks absent, network through an allow-list;
@@ -705,7 +713,7 @@ stop_route(){   # $1 heard (sent|yes: a live seat has it · dead: the broker too
   printf "the stop went to %s's session: no%s — filed as a request for the planning seat%s: %s\n" "$(stop_target)" \
     "$([ "$1" = dead ] && printf " (the broker took it, but no session is live there, so nobody has heard it)")" \
     "$([ "${CC_MEMBER_SANDBOX:-}" = 1 ] && printf ", whose relay hands %s's own seat the line" "$repo")" "$r"; }
-stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
+stop_kind(){ case "$1" in 5|6|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
                  # Prints what the ledger said; exit 0 always — "a writer that fails must never fail" the stop it is in.
   local k r; k=$(stop_kind "$1"); [ -n "$k" ] || { echo "not a failure (exit $1)"; return 0; }
@@ -1425,8 +1433,8 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t "…carrying the worker's own question, not a pointer to a file the session would have to open" "$?" 0
   decides "$bl"
   t 'a worker that stopped to ASK carries a word cc-broker calls a decision, so that session is woken now' "$?" 0
-  decides "$(planner_line 'hit its cap' 'Two capped iterations with no commits or journal change ($4.10). Raise --budget/--turns or split the task; log: /x/loop.log')"
-  t '…and a stop with no question in it carries none of them, so it rides the next digest instead of buying a wake' "$?" 1
+  decides "$(planner_line 'is running without producing' '3 iterations in a row with nothing to show for the money: committed nothing and left the journal untouched. That is 7 iterations, $4.10, last commit 3 iteration(s) ago. The loop carries on; read /x/loop.log, and to end it: touch /x/stop')"
+  t '…and a notice with no question in it carries none of them, so it rides the next digest instead of buying a wake' "$?" 1
   BIN="$bd"
   tell_planner "$bl"; t 'the broker takes the stop' "$?" 0
   t "…addressed to the session that dispatched this track, and named as the loop" \
@@ -1677,8 +1685,8 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
     ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" ${lgreen:+CC_GREEN=$lgreen} \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
-  lrun it '- did one step, more to do' 0 --max-iter 1
-  t "the worker's own print run gets the background-wait ceiling removed, so a subagent still running at turn end does not kill the iteration at 600s (the 1h iteration timeout still bounds it)" \
+  lrun it '- did one step, more to do' 0 --max-iter 1 --no-extend
+  t "the worker's own print run gets the background-wait ceiling removed, so a subagent still running at turn end does not kill the iteration at 600s (hung_watch still ends one that goes silent)" \
     "$(cat "$lh/.cc/state/lp/it/bgceil" 2>/dev/null)" 0
   t 'an iteration that ends a loop with nothing committed posts nothing to Slack: its totals and spend stay in loop.log' "$(slackn)" 0
   t '…the stop goes to the planner intake instead' "$(grep -c '^--ask|' "$d/lb.n")" 1
@@ -1691,13 +1699,13 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   : > "$d/lb.n"
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/ceil" FK_LINE="" FK_COMMIT=0 CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=9999 \
-      CLAUDE_CODE_SHELL_PREFIX=/caller/prefix "$lb/cc-loop" lp ceil --max-iter 1 ) >/dev/null 2>&1
+      CLAUDE_CODE_SHELL_PREFIX=/caller/prefix "$lb/cc-loop" lp ceil --max-iter 1 --no-extend ) >/dev/null 2>&1
   t 'a dispatcher that already set the ceiling is not overridden' "$(cat "$lh/.cc/state/lp/ceil/bgceil" 2>/dev/null)" 9999
   t '…nor is a shell prefix the caller set: its claude still runs under cc-nosignal' "$(cat "$d/lb.ns" 2>/dev/null)" /caller/prefix
   mkdir -p "$lh/.cc/state/lp/sbx" "$lh/.cc/worktrees/lp/sbx"; echo "the task" > "$lh/.cc/state/lp/sbx/task.md"
   git -C "$lh/.cc/worktrees/lp/sbx" init -q; git -C "$lh/.cc/worktrees/lp/sbx" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
-      FK_ST="$lh/.cc/state/lp/sbx" FK_LINE="" FK_COMMIT=0 CC_WORKER_SANDBOX=0 "$lb/cc-loop" lp sbx --max-iter 1 ) >/dev/null 2>&1
+      FK_ST="$lh/.cc/state/lp/sbx" FK_LINE="" FK_COMMIT=0 CC_WORKER_SANDBOX=0 "$lb/cc-loop" lp sbx --max-iter 1 --no-extend ) >/dev/null 2>&1
   t '…and with the sandbox off (CC_WORKER_SANDBOX=0), each of its Bash calls is handed a scope of its own' "$(cat "$d/lb.ns" 2>/dev/null)" "$lb/cc-nosignal-shell"
   # ── WHOSE LIMIT ── with WORKER_CLAUDE_CREDENTIALS set, the limit stamp and model record follow the login cc-sandbox
   # says the launch will use (its stub answers worker-cred from FK_CRED), not the key: the workers' file, then the
@@ -1706,7 +1714,7 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   wacct(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" \
-        FK_LINE="" FK_COMMIT=0 FK_KEY="$lh/.claude-workers/.credentials.json" FK_CRED="$2" "$lb/cc-loop" lp "$1" --max-iter 1 ) >/dev/null 2>&1
+        FK_LINE="" FK_COMMIT=0 FK_KEY="$lh/.claude-workers/.credentials.json" FK_CRED="$2" "$lb/cc-loop" lp "$1" --max-iter 1 --no-extend ) >/dev/null 2>&1
     cat "$lh/.cc/state/lp/$1/acct" 2>/dev/null; }
   t "the workers' login in use → its own limit stamp and model record" "$(wacct wa "$lh/.claude-workers/.credentials.json")" "$lh/.cc/state/claude-limit.workers/workers"
   t "…and the key set but cc-sandbox falling back to the box's login → the box's stamp and record, as with no key" \
@@ -1719,13 +1727,13 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   mkdir -p "$lh/.cc/state/lp/nf" "$lh/.cc/worktrees/lp/nf"; echo "the task" > "$lh/.cc/state/lp/nf/task.md"
   git -C "$lh/.cc/worktrees/lp/nf" init -q; git -C "$lh/.cc/worktrees/lp/nf" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
-      FK_ST="$lh/.cc/state/lp/nf" FK_LINE="" FK_COMMIT=0 "$lb/cc-loop" lp nf --max-iter 1 ) >/dev/null 2>&1; c=$?
+      FK_ST="$lh/.cc/state/lp/nf" FK_LINE="" FK_COMMIT=0 "$lb/cc-loop" lp nf --max-iter 1 --no-extend ) >/dev/null 2>&1; c=$?
   t 'a box where the fence cannot start runs no worker: exit 2 before iteration 1, the reason in loop.log, claude never ran' \
     "$c/$(grep -c 'exit 2: the worker sandbox cannot start.*bwrap is not installed (fixture)' "$lh/.cc/state/lp/nf/loop.log" 2>/dev/null)/$(grep -c 'iter 1/' "$lh/.cc/state/lp/nf/loop.log" 2>/dev/null)/$([ -e "$lh/.cc/state/lp/nf/bgceil" ] && echo ran || echo none)" \
     2/1/0/none
   mv -f "$lb/cc-sandbox.ok" "$lb/cc-sandbox"
   # ── A KILLED ITERATION STILL LOGS WHAT IT SPENT ── its own fixture: a claude that writes a transcript (250k input
-  # tokens of opus-5-5 = $1.0000) and dies at the hour limit (rc=124) with no result json. The file is a RESUMED
+  # tokens of opus-5-5 = $1.0000) and is killed as hung (rc=124) with no result json. The file is a RESUMED
   # session's, so it already holds an earlier run's $12 record, which must not be priced again. Beside it, a finished
   # iteration whose json carries its own cost, which must never be re-priced from a transcript.
   cp "$BIN/cc-spend" "$lb/cc-spend"
@@ -1740,11 +1748,11 @@ KILL
   mkdir -p "$lh/.cc/state/lp/kl" "$lh/.cc/worktrees/lp/kl"; echo "the task" > "$lh/.cc/state/lp/kl/task.md"
   git -C "$lh/.cc/worktrees/lp/kl" init -q; git -C "$lh/.cc/worktrees/lp/kl" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudekill" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
-      "$lb/cc-loop" lp kl --max-iter 1 ) >/dev/null 2>&1
-  t 'an iteration killed at the hour limit logs the spend its transcript shows since it started (not a resumed session'"'"'s older records), marked as priced from it' \
+      "$lb/cc-loop" lp kl --max-iter 1 --no-extend ) >/dev/null 2>&1
+  t 'an iteration killed as hung logs the spend its transcript shows since it started (not a resumed session'"'"'s older records), marked as priced from it' \
     "$(grep -c 'iter 1 end rc=124 .*cost=\$1.0000~transcript total=\$1.0000' "$lh/.cc/state/lp/kl/loop.log")" 1
   # ── A TIMED-OUT ITERATION IS NAMED, AND ONE THAT COMMITTED IS NO FAILURE ── each run its own track and fixture: a
-  # claude that dies at the hour limit (rc=124), committing (FK_COMMIT=1) or not. 67 of 513 iterations died this way
+  # claude killed as hung (rc=124), committing (FK_COMMIT=1) or not. 67 of 513 iterations died this way
   # with an empty "error (N): " line, and two in a row stopped the track even when both had committed.
   cat > "$lb/claudeto" <<'TO'
 #!/bin/sh
@@ -1759,9 +1767,9 @@ TO
         FK_COMMIT="$([ "$tk" = toc ] && echo 1 || echo 0)" "$lb/cc-loop" lp "$tk" --max-iter 2 --no-extend ) >/dev/null 2>&1
   done
   t 'two timed-out iterations that each committed are not failures: no error line, no errored stop' \
-    "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/toc/loop.log")/$(grep -c 'timed out at the 1 h iteration limit (rc=124), but it committed' "$lh/.cc/state/lp/toc/loop.log")" 0/2
+    "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/toc/loop.log")/$(grep -c 'killed as hung (rc=124, transcript silent [0-9?]* s), but it committed' "$lh/.cc/state/lp/toc/loop.log")" 0/2
   t '…while two that committed nothing count, each error line naming the timeout, and stop the track as errored' \
-    "$(grep -c 'error ([12]): timed out at the 1 h iteration limit (rc=124) with nothing committed' "$lh/.cc/state/lp/ton/loop.log")/$(grep -c '2 consecutive failures' "$lh/.cc/state/lp/ton/loop.log")" 2/1
+    "$(grep -c 'error ([12]): killed as hung (rc=124, transcript silent [0-9?]* s) with nothing committed' "$lh/.cc/state/lp/ton/loop.log")/$(grep -c '2 consecutive failures' "$lh/.cc/state/lp/ton/loop.log")" 2/1
   # ── AN ITERATION STILL RUNNING ITS OWN GATE IS NEVER COUNTED (owner 10-16) ── the same timed-out claude, nothing
   # committed: tog with a cc-green run live as it ends (CC_GREEN answers 3 to `wait 0`), toe with a detached run of its
   # own (an EDA run) left in the worktree. Neither is a failure, so neither track is stopped as errored.
@@ -1790,12 +1798,59 @@ EDA
     "$(grep -c 'runaway signal [0-9]*/[0-9]*: committed nothing and left the journal untouched' "$lh/.cc/state/lp/toe/loop.log")" 2
   t '…and a finished iteration keeps the cost its own json reports, unmarked' \
     "$(grep -c 'iter 1 end .*cost=\$1.25 total=' "$lh/.cc/state/lp/it/loop.log")" 1
+  # ── HUNG, NOT LONG (owner 10-20) ── three fixtures, each its own track, with a 2 s silence meaning hung and a 1 s
+  # look: hg writes its transcript once and goes silent, so it is killed and counted; lv keeps writing for longer than
+  # the silence allowed, so it runs to its own end; bl writes no transcript at all, so the loop cannot see one and
+  # kills nothing; sl is lv with its project dir a symlink, which
+  # the look follows; lk is hg with a link it planted in that dir to a tree elsewhere that keeps growing, which the look
+  # never walks, so it is killed all the same. The wall clock alone ends none of them.
+  cat > "$lb/claudehung" <<'HG'
+#!/bin/sh
+p="$HOME/.claude/projects/$(realpath "$PWD" | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$p"
+[ -n "$FK_LINK" ] && { ln -s "$FK_LINK" "$p/out"; ( while :; do echo x >> "$FK_LINK/d/o.jsonl"; sleep 1; done ) & }
+n=0; while [ "$n" -lt "${FK_LIVE:-0}" ]; do echo '{"type":"user"}' >> "$p/s.jsonl"; sleep 1; n=$((n+1)); done
+[ "${FK_LIVE:-0}" = 0 ] && { [ "$FK_BLIND" = 1 ] && rmdir "$p"; [ "$FK_BLIND" = 1 ] || echo '{"type":"user"}' >> "$p/s.jsonl"; sleep "$FK_SLEEP"; }
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":1.25,"result":"did a step"}'
+HG
+  chmod +x "$lb/claudehung"
+  hrun(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
+    git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudehung" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" CC_LOOP_HUNG_SECS=2 CC_LOOP_HUNG_POLL=1 \
+        FK_LIVE="$2" FK_SLEEP="$3" FK_BLIND="$4" FK_LINK="${5:-}" "$lb/cc-loop" lp "$1" --once ) >/dev/null 2>&1; }
+  hrun hg 0 30 0; hrun lv 5 0 0; hrun bl 0 4 1
+  mkdir -p "$lh/elsewhere" "$lh/.claude/projects"   # sl: lv again, its project dir a symlink to a dir elsewhere
+  ln -s "$lh/elsewhere" "$lh/.claude/projects/$(realpath -m "$lh/.cc/worktrees/lp/sl" | sed 's/[^A-Za-z0-9]/-/g')"; hrun sl 5 0 0
+  mkdir -p "$lh/big/d"; hrun lk 0 30 0 "$lh/big"
+  t 'an iteration whose transcript stopped growing is killed as hung, and with nothing committed it is an error that names it' \
+    "$(grep -c 'iter 1 end rc=124 ' "$lh/.cc/state/lp/hg/loop.log")/$(grep -c 'error (1): killed as hung (rc=124, transcript silent [0-9]* s) with nothing committed' "$lh/.cc/state/lp/hg/loop.log")" 1/1
+  t '…one still writing it past that silence runs to its own end' "$(grep -c 'iter 1 end rc=0 ' "$lh/.cc/state/lp/lv/loop.log")/$(grep -c 'killed as hung' "$lh/.cc/state/lp/lv/loop.log")" 1/0
+  t '…and so does one whose project dir is a symlink' "$(grep -c 'iter 1 end rc=0 ' "$lh/.cc/state/lp/sl/loop.log")/$(grep -c 'killed as hung\|cannot see' "$lh/.cc/state/lp/sl/loop.log")/$(ls "$lh/elsewhere")" 1/0/s.jsonl
+  t '…and one whose transcript the loop cannot see is not killed: it is said once instead' \
+    "$(grep -c 'iter 1 end rc=0 ' "$lh/.cc/state/lp/bl/loop.log")/$(grep -c 'the hung check cannot see a transcript' "$lh/.cc/state/lp/bl/loop.log")" 1/1
+  t '…and a link planted under the project dir to a growing tree elsewhere is never walked: that iteration is killed as hung' \
+    "$(grep -c 'iter 1 end rc=124 ' "$lh/.cc/state/lp/lk/loop.log")/$(grep -c 'killed as hung' "$lh/.cc/state/lp/lk/loop.log")/$([ -s "$lh/big/d/o.jsonl" ] && echo grew)" 1/1/grew
+  # ── NO COUNT STOPS IT ── a worker that does nothing, with a checkpoint every 2 iterations and a runaway notice at 2
+  # barren in a row: it passes both, is told at its 2nd, 3rd and 5th barren iteration (the doubling stride), and runs until its own fifth call writes the stop file.
+  cat > "$lb/claudeidle" <<'ID'
+#!/bin/sh
+printf "%s\n" "$@" > "$FK_ST/argv"; echo x >> "$FK_ST/calls"; [ "$(wc -l < "$FK_ST/calls")" -ge 5 ] && echo "enough" > "$FK_ST/stop"
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":1.25,"result":"did a step"}'
+ID
+  chmod +x "$lb/claudeidle"; mkdir -p "$lh/.cc/state/lp/ra" "$lh/.cc/worktrees/lp/ra"; echo "the task" > "$lh/.cc/state/lp/ra/task.md"
+  git -C "$lh/.cc/worktrees/lp/ra" init -q; git -C "$lh/.cc/worktrees/lp/ra" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeidle" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" CC_LOOP_RUNAWAY_N=2 \
+      FK_ST="$lh/.cc/state/lp/ra" "$lb/cc-loop" lp ra --max-iter 2 ) >/dev/null 2>&1; c=$?
+  t 'a loop that commits nothing passes its checkpoints and its runaway notice, told again on a doubling stride, and ends on the stop file a person wrote' \
+    "$c/$(wc -l < "$lh/.cc/state/lp/ra/calls")/$(grep -c 'checkpoint at [0-9]* iterations' "$lh/.cc/state/lp/ra/loop.log")/$(grep -o 'runaway notice at [0-9]* barren' "$lh/.cc/state/lp/ra/loop.log" | grep -o '[0-9]*' | tr '\n' ' ')" '14/5/2/2 3 5 '
+  t '…and no iteration was told it was the last of a count' "$(grep -c 'Iteration [0-9]* of' "$lh/.cc/state/lp/ra/argv")" 0
+  t 'no tool-call limit is handed to a worker by default; --budget still is' \
+    "$(grep -cx -- '--max-turns' "$lh/.cc/state/lp/it/argv")/$(grep -cx -- '--max-budget-usd' "$lh/.cc/state/lp/it/argv")" 0/1
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
   t 'a round that is over posts nothing at all' "$(grep -c . "$d/lb.n")" 0
   t '…and the board note and loop.log carry it' "$(grep -c 'round over at its step limit' "$lh/.cc/state/lp/ro/loop.log")" 1
   # ── A WORKER'S QUESTION GOES TO THE SEAT FIRST ── two fixtures: no broker on this copy (no session hears it) and a
   # broker that takes the line (a cc-broker stub that records its argv and exits 0, removed again after its run).
-  lrun bk 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
+  lrun bk 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3 --no-extend
   t 'a BLOCKED question no seat took is posted once, and not also filed as a request' "$(slackn)/$(grep -c '^--ask|' "$d/lb.n")" 1/0
   t '…and loop.log says where it went: no session, a decision card' \
     "$(grep -c "the stop went to lp's session: no — its question went out as a decision card: yes" "$lh/.cc/state/lp/bk/loop.log")" 1
@@ -1874,16 +1929,16 @@ EDA
   mkdir -p "$d/lbt"; printf '#!/bin/sh\necho lp\n' > "$d/lbt/tmux"; chmod +x "$d/lbt/tmux"
   local sb="$d/lbs"; mkdir -p "$sb"; cp -p "$lb"/* "$sb/"
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$d/lbs.br" > "$sb/cc-broker"; chmod +x "$sb/cc-broker"; : > "$d/lbs.br"
-  lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun bks 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
+  lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun bks 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3 --no-extend
   t 'a BLOCKED question the seat took posts nothing and files no request' "$(grep -c . "$d/lb.n")" 0
   t '…the seat got it once, with the escalation it may run: cc-notify --decision under the blocked: id' \
     "$(grep -c '^inject --no-start --source loop lp loop: lp/bks needs you — STATUS: BLOCKED: which port do I use?.* — only the owner can settle it? cc-notify --decision --id blocked:lp/bks:[0-9a-f]*:[0-9]* -t "lp/bks needs you" "<the question>"$' "$d/lbs.br")" 1
-  : > "$d/lbs.br"; lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun its '- did one step, more to do' 0 --max-iter 1
+  : > "$d/lbs.br"; lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun its '- did one step, more to do' 0 --max-iter 1 --no-extend
   t 'a stop with no question the seat took: nothing posted, nothing filed, and its line offers no decision card' \
     "$(grep -c . "$d/lb.n")/$(grep -c 'cc-notify --decision' "$d/lbs.br")" 0/0
   lb="$d/lb"
   printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s"; echo >> "%s"\n' "$d/lb.b" "$d/lb.b" > "$lb/cc-broker"; chmod +x "$lb/cc-broker"; : > "$d/lb.b"
-  lpath="$d/lbt:/usr/bin:/bin" lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3
+  lpath="$d/lbt:/usr/bin:/bin" lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3 --no-extend
   rm -f "$lb/cc-broker"
   t 'a BLOCKED question the seat heard posts nothing to Slack and files no request — it is the seat'"'"'s to settle' "$(grep -c . "$d/lb.n")" 0
   t '…the seat gets the question, told to settle it or ask the owner itself' \
@@ -1976,7 +2031,7 @@ EDA
     "$(sy $ab hi)|$(test -e "$sst/say.spool" && echo spooled)" "rc=1|"
   kill "$sayp" "$x" 2>/dev/null; wait "$sayp" "$x" 2>/dev/null
   mkdir -p "$lh/.cc/state/lp/sy"; printf '%s\n' '{"at":"2026-09-24T03:00:00Z","from":"planning","text":"use the metadata file"}' > "$lh/.cc/state/lp/sy/say.spool"
-  lrun sy '- did one step' 0 --max-iter 1
+  lrun sy '- did one step' 0 --max-iter 1 --no-extend
   sp=$(awk 'p{print; exit} $0=="-p"{p=1}' "$lh/.cc/state/lp/sy/argv")
   t 'a message the last iteration never took opens the next iteration prompt, first' \
     "$sp|$(grep -c 'from planning\] use the metadata file' "$lh/.cc/state/lp/sy/argv")" \
@@ -1987,11 +2042,11 @@ EDA
   # was told where to ask.
   mkdir -p "$d/dg" "$lh/.cc/state/lp/dg"; : > "$lh/.cc/state/lp/dg/green.ask"
   printf '#!/bin/sh\necho "$1" >> "%s/dg/calls"\ncase "$1" in start) echo "cc-green: started (pid 1)"; exit 0;;\n  wait) echo "cc-green: the run (pid 1, started 00:00) has ended (exit 0) — log %s/dg/run.log"; exit 0;;\nesac\nexit 1\n' "$d" "$d" > "$d/dg/cc-green"
-  chmod +x "$d/dg/cc-green"; lgreen="$d/dg/cc-green" lrun dg 'STATUS: DONE' 0 --max-iter 1; unset lgreen
+  chmod +x "$d/dg/cc-green"; lgreen="$d/dg/cc-green" lrun dg 'STATUS: DONE' 0 --max-iter 1 --no-extend; unset lgreen
   t 'an iteration that writes STATUS: DONE and asked for its green gets the run started and waited on before the loop finishes' \
     "$(grep -c '^start$' "$d/dg/calls" 2>/dev/null)|$(grep -c '^wait$' "$d/dg/calls" 2>/dev/null)|$(test -e "$lh/.cc/state/lp/dg/green.ask" && echo left)" "1|1|"
   t '…and the worker ran told where a fenced cc-green start asks' "$(cat "$lh/.cc/state/lp/dg/gask" 2>/dev/null)" "$lh/.cc/state/lp/dg/green.ask"
-  lrun dn 'STATUS: DONE' 0 --max-iter 3
+  lrun dn 'STATUS: DONE' 0 --max-iter 3 --no-extend
   t 'a DONE posts exactly one card' "$(slackn)" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
 limit wait, a model fallback or restore, or a reminder has no post of its own' \
@@ -2007,7 +2062,7 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   drun(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init; : > "$d/lb.n"
     ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lr/claude" CC_LAND="$lr/cc-land" CC_FAILURES="$d/lr.fl" FK_DRC="$2" FK_DOUT="${3:-}" \
-        FK_ST="$lh/.cc/state/lp/$1" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lr/cc-loop" lp "$1" --max-iter 3 ) >/dev/null 2>&1; echo "rc=$?"; }
+        FK_ST="$lh/.cc/state/lp/$1" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lr/cc-loop" lp "$1" --max-iter 3 --no-extend ) >/dev/null 2>&1; echo "rc=$?"; }
   t 'a cc done that exits 7 (session row, note filed as a request) is a delivered DONE — loop rc 0, no stop, no second request' \
     "$(drun ds 7)|$(grep -c 'opened no PR' "$lh/.cc/state/lp/ds/loop.log")|$(grep -c '^--ask|' "$d/lb.n")|$(grep -c 'the ready-to-land note was filed as a request' "$lh/.cc/state/lp/ds/loop.log")" "rc=0|0|0|1"
   t '…while a cc done that fails any other way still stops 4, "opened no PR"' \
@@ -2031,7 +2086,7 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     : > "$d/lb.n"; : > "$d/mi.land"; : > "$d/mi.done"
     ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landnone" CC_DONE="$lb/ccdone" CC_FAILURES="$d/lb.fl" \
-        FK_ST="$lh/.cc/state/lp/$c" FK_LINE='STATUS: DONE' FK_COMMIT=0 ${2:+CC_MEMBER_SANDBOX=1} "$lb/cc-loop" lp "$c" --max-iter 1 ) >/dev/null 2>&1; echo $?; }
+        FK_ST="$lh/.cc/state/lp/$c" FK_LINE='STATUS: DONE' FK_COMMIT=0 ${2:+CC_MEMBER_SANDBOX=1} "$lb/cc-loop" lp "$c" --max-iter 1 --no-extend ) >/dev/null 2>&1; echo $?; }
   t "inside a member's boundary a DONE completes through cc done --json and exits 0, never asking the lander it cannot see" \
     "$(mrun mi in)|$(cat "$d/mi.done")|$(grep -c . "$d/mi.land")" "0|done|lp|mi|--json||0"
   t '…its one card names the PR cc done opened' "$(cut -d'|' -f1-2 "$d/lb.n")" "--id|done:lp/mi:pr5"
@@ -2047,7 +2102,7 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   git -C "$lh/.cc/worktrees/lp/pd" init -q; git -C "$lh/.cc/worktrees/lp/pd" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   : > "$d/lb.n"; : > "$d/pd.peer"; : > "$d/pd.land"
   c=$( ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landpd" CC_FAILURES="$d/lb.fl" CC_PEER_SPOOL="$d/pd.spool" \
-        FK_ST="$lh/.cc/state/lp/pd" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lb/cc-loop" lp pd --max-iter 1 ) >/dev/null 2>&1; echo $?)
+        FK_ST="$lh/.cc/state/lp/pd" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lb/cc-loop" lp pd --max-iter 1 --no-extend ) >/dev/null 2>&1; echo $?)
   t 'peer: a DONE on a host the hub placed it on goes to cc-peer spool land and exits 0, the lander never asked and no DONE card' \
     "$c|$(cat "$d/pd.peer")|$(grep -c . "$d/pd.land")|$(grep -c '^--id|done:' "$d/lb.n")|$(grep -c 'the hub queues the landing' "$lh/.cc/state/lp/pd/loop.log")" \
     "0|spool|land|lp|pd||0|0|1"
@@ -2073,7 +2128,7 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     : > "$d/lb.n"
     [ -z "${3:-}" ] || { ( cd "$w" && env -i PATH=/usr/bin:/bin HOME="$lh" CC_MEMBER_SANDBOX=1 "$rb/cc" done mw "$c" ) > "$d/rd.out" 2>&1; echo $?; return; }
     ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landnone" CC_DONE="$rb/cc" CC_FAILURES="$d/lb.fl" \
-        FK_ST="$s" FK_LINE='STATUS: DONE' FK_COMMIT=0 CC_MEMBER_SANDBOX=1 "$lb/cc-loop" mw "$c" --max-iter 1 ) >/dev/null 2>&1; echo $?; }
+        FK_ST="$s" FK_LINE='STATUS: DONE' FK_COMMIT=0 CC_MEMBER_SANDBOX=1 "$lb/cc-loop" mw "$c" --max-iter 1 --no-extend ) >/dev/null 2>&1; echo $?; }
   rcheck(){ local s="$lh/.cc/state/mw/$1"
     printf '%s|%s|%s|%s|%s|%s' "$(grep '^{' "$s/loop.log" | jq -c 'select(type == "object" and has("errors")) | [.pr_url, ([.errors[].stage] | index("push") != null), (.landing == null)]' 2>/dev/null | tail -1)" \
       "$(HOME="$lh" "$rb/cc-board" get mw "$1" status 2>/dev/null)" "$(grep -c 'pr create' "$d/rd.gh")" \
@@ -2249,10 +2304,10 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   # scratch ledger (CC_FAILURES), with the loop's globals set the way stop() sees them.
   mkdir -p "$d/fl"; printf 'loop line 1\nerror (2): boom\n' > "$d/fl/loop.log"
   sr(){ ( export CC_FAILURES="$d/fl/$1"; repo=lp track=t1 LOG="$d/fl/loop.log" i=3 spent=1.5; stop_record "$2" "$3" "$4" ); }
-  t 'exit 9 (runaway) is recorded as worker-loop/barren-stop'   "$(sr a 9 'is running away' '3 barren' | cut -c1-8)" recorded
+  t 'exit 6 (a --no-extend bound with nothing committed) is recorded as worker-loop/barren-stop'   "$(sr a 6 'paused' 'nothing committed' | cut -c1-8)" recorded
   t '…one record, of that kind, written by cc-loop, keyed to this stop' \
     "$(CC_FAILURES="$d/fl/a" "$BIN/cc-failures" show --json --scope lp | jq -r '[.[] | select(.writer=="cc-loop")] | "\(length) \(.[0].kind) \(.[0].links.exit) \(.[0].links.source | sub(":[0-9]+$";""))"')" \
-    "1 worker-loop/barren-stop 9 loop:lp/t1:9"
+    "1 worker-loop/barren-stop 6 loop:lp/t1:6"
   t '…with a bounded excerpt of loop.log that outlives the state dir' \
     "$(grep -c 'error (2): boom' "$(CC_FAILURES="$d/fl/a" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].evidence[] | select(startswith("excerpt:")) | sub("^excerpt:";"")')")" 1
   t 'exit 4 (cc done failed) is worker-loop/done-undelivered'   "$(sr b 4 'finished, but opened no PR' 'x' >/dev/null; CC_FAILURES="$d/fl/b" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].kind')" worker-loop/done-undelivered
@@ -2321,7 +2376,7 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
     "$(ms i mem t2 3 | sed 's/.*: //')|$(ms i '../x' t2 12 2>&1 | cut -c1-26)|$(ms i mem t2 x 2>&1 | cut -c1-26)|$(CC_MEMBER_SANDBOX=1 member_stop mem t2 12 2>&1 | cut -c1-27)|$(ls "$d/fl/i" 2>/dev/null | wc -l)" \
     "not a failure (exit 3)|cc-loop member-stop: usage|cc-loop member-stop: usage|cc-loop member-stop: the ho|0"
   mkdir -p "$d/fl/ro"; chmod 500 "$d/fl/ro"
-  t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 9 runaway x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
+  t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 6 paused x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
   chmod 700 "$d/fl/ro"
   # push_host: a head the host could not push is owed to the sweep; a push that lands, or a refused lease, owes nothing.
   # Its own fixture: a one-commit repo for $WT and a stub cc-checkpoint answering the rc in $d/ph/rc.
@@ -2373,14 +2428,16 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
 [ "${1:-}" = inbox-hook ] && inbox_hook "${2:?state dir}"   # the worker's PostToolUse hook: exits 0 always
 [ "${1:-}" = member-stop ] && { member_stop "${@:2}"; exit 0; }   # cc runs it on the host after a member's boundary exits
 repo="${1:?repo}"; track="${2:?track}"; shift 2
-MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT="${CC_WORKER_EFFORT:-medium}"; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
+MAXI=10; BUDGET=8; TURNS=""; MODEL=""; EFFORT="${CC_WORKER_EFFORT:-medium}"; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
 while [ $# -gt 0 ]; do case "$1" in
-  --once) MAXI=1;; --max-iter) MAXI="$2"; shift;; --budget) BUDGET="$2"; shift;; --turns) TURNS="$2"; shift;;
+  --once) MAXI=1; NOEXT=1;; --max-iter) MAXI="$2"; shift;; --budget) BUDGET="$2"; shift;; --turns) TURNS="$2"; shift;;
   --model) MODEL="$2"; shift;; --effort) EFFORT="$2"; shift;; --quiet) QUIET=1;; --resume-last) RESUME=1;; --no-extend) NOEXT=1;;
   *) echo "cc-loop: unknown arg $1" >&2; exit 2;; esac; shift; done
 [[ "$MAXI" =~ ^[0-9]+$ ]] && [ "$MAXI" -ge 1 ] || { echo "cc-loop: --max-iter must be a positive integer (got '$MAXI')" >&2; exit 2; }
 [[ "$BUDGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "cc-loop: --budget must be a plain number in USD (got '$BUDGET')" >&2; exit 2; }   # `1e9` is not $8
-BATCH="$MAXI"; RUNN="${CC_LOOP_RUNAWAY_N:-3}"; RUNX="${CC_LOOP_RUNAWAY_X:-5}"   # one batch of steps; the runaway rule's two dials
+[ -z "$TURNS" ] || [[ "$TURNS" =~ ^[1-9][0-9]*$ ]] || { echo "cc-loop: --turns must be a positive integer (got '$TURNS')" >&2; exit 2; }
+BATCH="$MAXI"; RUNN="${CC_LOOP_RUNAWAY_N:-3}"; RUNX="${CC_LOOP_RUNAWAY_X:-5}"   # the checkpoint's stride; the runaway notice's two dials
+HUNG="${CC_LOOP_HUNG_SECS:-1800}"; HPOLL="${CC_LOOP_HUNG_POLL:-60}"   # silence that means hung, and how often it is looked at (hung_watch)
 if [ -f "$HOME/dev/$repo/.cc/member-workspace" ] && [ "${CC_MEMBER_SANDBOX:-}" != 1 ]; then   # depth behind the boundary: cc puts a member worker inside cc-sandbox member, so a bare cc-loop here is a loop that escaped it
   echo "cc-loop: $repo is a member workspace — its workers run inside the boundary (member-sandbox) or not at all" >&2; exit 2
 fi
@@ -2430,6 +2487,24 @@ signalled(){ local s="$1" had="$child"; redispatching && { kill_child; log "sign
   stopped || :; trap '' HUP INT TERM   # one ending: a second signal does not start a second stop()
   stop 130 "was stopped" "The loop was signalled ($s) during iteration ${i:-0} and has ended; its claude was killed. To start it again: $(again)"; }
 trap 'signalled HUP' HUP; trap 'signalled INT' INT; trap 'signalled TERM' TERM
+# HUNG, NOT LONG (the header): beside each iteration, look at its transcript every HPOLL seconds, and kill the
+# iteration (kill_child, the same group kill a signal uses) only once nothing under its project dir has grown for
+# HUNG seconds (find -H follows the dir when it is a symlink, and no link a worker plants under it). The dir
+# is claude's own for the worktree (every non-alphanumeric a dash, as cc-spend reads it), which
+# cc-sandbox binds from the host's, so the loop sees what the fenced claude writes. A dir that never appeared is not
+# read as silence: the loop cannot see this claude's transcript, so it says so once and kills nothing.
+hung_watch(){   # $1 the file that says it was killed as hung (the seconds of silence) · $2 where "cannot see" is said once
+  local m="$1.mark" n="$1.new" last now pd
+  pd="$HOME/.claude/projects/$(realpath "$WT" | sed 's/[^A-Za-z0-9]/-/g')"
+  touch "$m"; last=$(date +%s)
+  while sleep "$HPOLL"; do
+    kill -0 "$child" 2>/dev/null || break
+    touch "$n"; now=$(date +%s)
+    if [ -n "$(find -H "$pd" -name '*.jsonl' -newer "$m" -print -quit 2>/dev/null)" ]; then mv -f "$n" "$m"; last=$now
+    elif [ $((now - last)) -lt "$HUNG" ]; then :
+    elif [ ! -d "$pd" ]; then [ -e "$2" ] || { : > "$2"; log "iter ${i:-?}: the hung check cannot see a transcript at $pd, so it kills nothing"; }
+    else echo "$((now - last))" > "$1"; kill_child; break; fi
+  done; rm -f "$m" "$n"; }
 stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid="" tg=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
@@ -2514,9 +2589,8 @@ SP=$(sp_worker "$base") || stop 2 "no worker prompt" "cc-loop cannot read the wo
 # iterations. `probe` also passes where the fence is off by the owner's switch or behind a member boundary.
 fw=$("$BIN/cc-sandbox" probe 2>&1) || stop 2 "cannot get the fence" "the worker sandbox cannot start on this box, so no worker does: ${fw:-cc-sandbox probe gave no reason}"
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
-i=0; errs=0; caps=0; spent=0
-barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
-gext=0   # the gate-wait's one extra iteration has been granted this round (cleared by a commit)
+i=0; errs=0; spent=0
+barren=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway notice's memory: this track measured against itself
 lastm=""; lastwhy=""; lastasked=""   # what the previous iteration ran on, the outage that had moved it there
                        # ("" = none), and the model it was DISPATCHED on. ALL THREE are the memory this needs: a model
                        # change alone does not say which way it went, and an outage remembered alone does not say the
@@ -2535,11 +2609,12 @@ while [ $i -lt "$MAXI" ]; do
     "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: $(again)"
     parked; stopped; fi   # that wait can be hours: a pause or a stop file written during it is read before anything is charged (review of #541)
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
-  cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
-  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$MAXI" "$cont")
+  of=""; [ "${NOEXT:-0}" = 1 ] && of=" of $MAXI"   # only a caller's bound is a last iteration; a checkpoint is not
+  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s%s.\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$of")
   if said=$(say_take "$ST"); then prompt=$(printf '# MESSAGES FROM YOUR DISPATCHER (arrived after the last iteration stopped reading — they come first)\n%s\n\n%s' "$said" "$prompt"); log "iter $i opens with the message(s) sent while the last one ran"; fi
   hook=$(jq -cn --arg c "$BIN/cc-loop inbox-hook $ST" '{hooks: {PostToolUse: [{hooks: [{type: "command", command: $c}]}]}}')   # a message sent mid-iteration reaches the turn (SAY_WAIT)
-  args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP" --settings "$hook")
+  args=(-p "$prompt" --permission-mode auto --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP" --settings "$hook")
+  [ -n "$TURNS" ] && args+=(--max-turns "$TURNS")   # a caller's own limit only: none by default (owner 10-20, no count caps on calls)
   m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an outage mid-loop moves this worker down, and its lift moves it back
   asked=$(worker_model "$MODEL" asked); why=$(model_outage_why "$m" "$asked")   # both read every iteration (see there)
   note=$(model_change_note "$i" "$m" "$asked" "$lastm" "$lastwhy" "$why" "$lastasked")   # $() ate its newline; printf puts it back
@@ -2555,8 +2630,8 @@ while [ $i -lt "$MAXI" ]; do
     else log "iter 1 was asked to resume, but no run of this track recorded a session id — starting fresh"; fi
   fi
   TRIMENV=(); tb=$(trim_body); [ -n "$tb" ] && TRIMENV=("CLAUDE_CODE_EXTRA_BODY=$tb")   # empty unless CC_LOOP_TRIM is on: the child's environment is otherwise exactly what it always was
-  BGENV=(); [ -z "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS+x}" ] && BGENV=("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")   # print mode's own 600s wait for background subagents killed a $10 run mid-turn; `timeout 3600` below still bounds the iteration, so this only removes a SHORTER, silent one — never overridden when the caller already set it
-  log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default}${TRIMENV:+, context trim on})"   # the trim is named in the log so a shadow week can tell trimmed runs from the rest; the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
+  BGENV=(); [ -z "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS+x}" ] && BGENV=("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")   # print mode's own 600s wait for background subagents killed a $10 run mid-turn; hung_watch below still ends an iteration that has gone silent, so this only removes a wall-clock one — never overridden when the caller already set it
+  log "iter $i/$MAXI start (budget \$$BUDGET, turns ${TURNS:-unlimited}, model ${m:-box default}${TRIMENV:+, context trim on})"   # the trim is named in the log so a shadow week can tell trimmed runs from the rest; the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"; t0=$(date +%s)
   # With the sandbox off, each Bash call, hook and MCP server gets a signal scope of its own inside the session's, so a
   # test cannot signal this worker's own claude either (cc-nosignal-shell). Not under bwrap, whose view may not hold
@@ -2564,8 +2639,10 @@ while [ $i -lt "$MAXI" ]; do
   # a caller's prefix.
   SPENV=(); [ "${CC_WORKER_SANDBOX:-}" = 0 ] && [ -z "${CLAUDE_CODE_SHELL_PREFIX:-}" ] && SPENV=("CLAUDE_CODE_SHELL_PREFIX=$BIN/cc-nosignal-shell")
   GAENV=(); inside_boundary || GAENV=("CC_GREEN_ASK=$ST/green.ask" "CC_DOCS_ASK=$ST/docs.ask")   # where a fenced `cc-green start` (green_kick) and `cc-docs file` (docs_kick) ask
-  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
-  child=$!; wait "$child"; rc=$?; child=""
+  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # no wall clock: hung_watch kills it only when its transcript stops growing; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
+  child=$!; rm -f "$out.hung"; hung_watch "$out.hung" "$out.blind" & hw=$!
+  wait "$child"; rc=$?; kill "$hw" 2>/dev/null; wait "$hw" 2>/dev/null; child=""
+  hungs=""; [ -s "$out.hung" ] && { hungs=$(cat "$out.hung"); rc=124; }   # killed as hung: the code `timeout` gave, so every reader of rc=124 still holds
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
     log "usage limit — waiting until ${resets}Z, then rerunning iteration $i"
@@ -2573,7 +2650,7 @@ while [ $i -lt "$MAXI" ]; do
     i=$((i-1)); continue; fi
   "$BIN/cc-limit" clear   # the API answered: whatever else went wrong, it was not a limit
   cost=$(jq -r '.total_cost_usd // empty' "$out" 2>/dev/null); costsrc=""
-  # A KILLED ITERATION (rc=124 at the hour limit, or any kill) leaves no result json, so no total_cost_usd — and its
+  # A KILLED ITERATION (rc=124 killed as hung, or any kill) leaves no result json, so no total_cost_usd — and its
   # spend used to vanish from total=. The session's transcript is still on disk: cc-spend prices it (its one rates
   # table, no second pricer), and the line marks the figure as priced from the transcript.
   if [ -z "$cost" ]; then cost=$("$BIN/cc-spend" transcript "$WT" "$t0" 2>/dev/null); costsrc="~transcript"; fi
@@ -2710,20 +2787,19 @@ while [ $i -lt "$MAXI" ]; do
   ownrun=no; if [ "$gated" = no ] && orl=$(own_run_live); then ownrun=yes; log "iter $i ended with a run of its own still going in its worktree (${orl}) — not idle"; fi
   if { [ "$gated" = yes ] || [ "$ownrun" = yes ]; } && { [[ "$subtype" == error_max_* ]] || [ "$rc" != 0 ] || [ "$iserr" = true ]; }; then
        log "ended (rc=$rc${subtype:+, $subtype}) while its own gate run was still going — not counted as a failure or a cap"
-  elif [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
-  elif [[ "$subtype" == error_max_* ]]; then caps=$((caps+1)); log "capped ($subtype) with nothing to show ($caps)"
-       [ $caps -ge 2 ] && stop 7 "hit its cap" "Two capped iterations with no commits or journal change (\$$spent). Raise --budget/--turns or split the task; log: $LOG"
-  elif [ "$rc" = 124 ] && [ "$before_head" != "$after_head" ]; then errs=0; log "timed out at the 1 h iteration limit (rc=124), but it committed — not counted as a failure"
+  elif [[ "$subtype" == error_max_* ]]; then errs=0; log "capped ($subtype) — the iteration ends at its checkpoint and the loop goes on$([ "$moved" = yes ] || echo ', nothing to show for it')"
+       # a cap is a checkpoint, never a failure: one with nothing to show is a runaway signal below, which tells, not stops
+  elif [ "$rc" = 124 ] && [ "$before_head" != "$after_head" ]; then errs=0; log "killed as hung (rc=124, transcript silent ${hungs:-?} s), but it committed — not counted as a failure"
        # brief: "don't count a timed-out iteration that committed as a failure"; one that did not is counted below
-  elif [ "$rc" = 124 ]; then errs=$((errs+1)); log "error ($errs): timed out at the 1 h iteration limit (rc=124) with nothing committed"
+  elif [ "$rc" = 124 ]; then errs=$((errs+1)); log "error ($errs): killed as hung (rc=124, transcript silent ${hungs:-?} s) with nothing committed"
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   elif [ "$rc" != 0 ] || [ "$iserr" = true ]; then errs=$((errs+1)); log "error ($errs): $( { head -c 300 "$out.err" 2>/dev/null; [ -s "$out.err" ] || jq -r '"\(.subtype // "")\ \(.result // "" | tostring)"' "$out" 2>/dev/null | head -c 300; } | tr '\n' ' ')"   # a run that errored in-band leaves .err empty: say why from the json
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
-  else errs=0; caps=0; fi
+  else errs=0; fi
   # ── the runaway rule: progress-free SPEND, and every number it uses comes from this track's own history ──
   committed=no; [ "$before_head" != "$after_head" ] && committed=yes
   sig=$(jq -r '"\(.subtype // "")|\(.is_error // false)|\((.result // "")|tostring)"' "$out" 2>/dev/null | tr -d '\n' | head -c 160)
-  if [ "$committed" = yes ]; then cn=$((cn+1)); ccost=$(awk -v a="$ccost" -v b="$sincecost" -v c="${cost:-0}" 'BEGIN{printf "%.4f", a+b+c}'); sincecost=0; nocommit=0; gext=0
+  if [ "$committed" = yes ]; then cn=$((cn+1)); ccost=$(awk -v a="$ccost" -v b="$sincecost" -v c="${cost:-0}" 'BEGIN{printf "%.4f", a+b+c}'); sincecost=0; nocommit=0
   else sincecost=$(awk -v a="$sincecost" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}'); nocommit=$((nocommit+1)); fi
   yard=$(awk -v c="$ccost" -v n="$cn" -v b="$BUDGET" 'BEGIN{printf "%.4f", (n>0 ? c/n : b)}')   # what an iteration that DID commit costs this track; before the first one, its own budget
   why=""
@@ -2736,17 +2812,19 @@ while [ $i -lt "$MAXI" ]; do
     why="spent \$$sincecost since its last commit — ${RUNX}x what a committed iteration costs this track (\$$yard)"; fi
   prevsig="$sig"
   if [ -n "$why" ]; then barren=$((barren+1)); log "runaway signal $barren/$RUNN: $why"
-    [ "$barren" -ge "$RUNN" ] && stop 9 "is running away" "$RUNN iterations in a row with nothing to show for the money: $why. That is $i iterations, \$$spent, last commit $nocommit iteration(s) ago. Nothing capped it — the work itself stopped moving. Read $LOG, then re-scope the task or stop the track."
+    k=$((barren - RUNN + 1))   # told at the streak's 1st, 2nd, 4th, 8th… barren iteration from RUNN, and the loop carries on (owner 10-20)
+    if [ "$k" -ge 1 ] && [ $((k & (k - 1))) = 0 ]; then
+      rmsg="$barren iterations in a row with nothing to show for the money: $why. That is $i iterations, \$$spent, last commit $nocommit iteration(s) ago. The loop carries on; read $LOG, and to end it: touch $ST/stop"
+      log "runaway notice at $barren barren (still running): $rmsg"
+      "$BOARD" note "$repo" "$track" "running without producing: $barren barren iterations in a row, \$$spent; still running" >/dev/null 2>&1
+      tell_planner "$(planner_line 'is running without producing' "$rmsg")" || log "the runaway notice reached no session: it is in loop.log and the board note"; fi
   else barren=0; fi
-  # The step limit is a checkpoint, not a verdict: still committing means still working, and nothing caps the spend.
-  # Under --no-extend it IS the verdict: a caller that bounded the round gets its bound.
-  if [ $i -ge "$MAXI" ] && [ "$committed" = yes ] && [ "${NOEXT:-0}" != 1 ]; then
-    rounds=$((rounds+1)); MAXI=$((MAXI + BATCH))
-    log "step limit reached with work committed — carrying on for $BATCH more (round $rounds, \$$spent)"
-    "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1
-  elif [ $i -ge "$MAXI" ] && [ "$gated" = yes ] && [ "$gext" = 0 ] && [ "${NOEXT:-0}" != 1 ]; then   # "…ends non-stop and re-enters" (the brief): ONE more, to read the run it waited for
-    MAXI=$((MAXI + 1)); gext=1   # …and once per round: the next grant needs a commit first
-    log "step limit reached with its own cc-green run just ended — one more iteration to read the result (\$$spent)"; fi
+  # The step limit is a checkpoint: a line and a board note, and the loop goes on, committing or not (owner 10-20: no
+  # count caps on runs). Under --no-extend it IS the verdict: a caller that bounded the round gets its bound.
+  if [ $i -ge "$MAXI" ] && [ "${NOEXT:-0}" != 1 ]; then
+    MAXI=$((MAXI + BATCH))
+    log "checkpoint at $i iterations (\$$spent, last commit $nocommit iteration(s) ago) — carrying on"
+    "$BOARD" note "$repo" "$track" "checkpoint: $i iterations, \$$spent, still running" >/dev/null 2>&1; fi
 done
 IFS='|' read -r ended bst <<<"$(round_end "${committed:-no}" "$("$BOARD" get "$repo" "$track" pr 2>/dev/null)")"
 if [ "$ended" = over ]; then   # bounded and still committing: the round did its job, so nobody is paged and the board says review
@@ -2757,4 +2835,4 @@ if [ "$ended" = over ]; then   # bounded and still committing: the round did its
   # broker (a digest, not a page). Nothing is posted to Slack for it: the board note and loop.log carry it.
   tell_planner "$(planner_line 'round over' "Ran its $MAXI iteration(s) (\$$spent) and committed on the last one — the round is over, not stalled. More with: $(again) --loop N")" || true
   exit 0; fi
-stop 6 "$ended" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: $(again) --loop N" "$bst"
+stop 6 "$ended" "Hit its --no-extend bound of $MAXI iterations (\$$spent) and the last one committed nothing. Continue with: $(again)" "$bst"

@@ -1084,8 +1084,9 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     AN HTML BODY IS THE CALLER'S TO ASK FOR, AND THE TEXT STAYS (owner, 2026-09-24: a short explanation "nicely
     formatted" in the mail itself). `html` given, the mail is multipart/alternative — the text as the fallback,
     then the HTML — and `images` are files the HTML shows inline as `cid:<basename>`, each read through
-    attach_bytes() under the same rules and cap as an attachment and refused the same way. An HTML body needs
-    its text (a client that shows no HTML shows that) and an image needs an HTML body to sit in. With no `html`
+    attach_bytes() under the same rules and cap as an attachment and refused the same way. An HTML body with no
+    text gets the HTML's own words as its text (a client that shows no HTML shows that), and an image needs an
+    HTML body to sit in. With no `html`
     nothing here changes: the mail is the one part of text it always was.
 
     A BLIND COPY IS AN ENVELOPE RECIPIENT AND NOTHING ELSE (owner, 2026-09-27: "cc-mail send takes bcc").
@@ -1131,17 +1132,15 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
     html = str(html or "")
     pics = [str(p).strip() for p in (images or []) if str(p or "").strip()]
-    if html and not body:
-        return refuse("an HTML body needs its plain-text body too, for the clients that show no HTML")
+    if html and not body:     # a client that shows no HTML shows this: the HTML's own words, tags stripped
+        body = plain(_router().html_text(html))
     if not body and not paths:
         return refuse("nothing to send: the mail has no text and no file")
     if pics and not html:
         return refuse("images go inside an HTML body, and there is none")
-    # A header cannot carry a line break, and build() raises on one — after caps() below has charged the rate,
-    # so a bad subject cost a slot and a traceback (the brief, 2026-09-27: "validate before charging, and
-    # refuse in one line like the other refusals").
-    if len(subject.splitlines()) > 1:     # CR, LF and every other break str.splitlines knows; build() refuses them all
-        return refuse("the subject has a line break in it, which a mail header cannot carry — nothing sent")
+    # A header cannot carry a line break (build() raises on one), so a subject written over several lines goes
+    # out as one: every break str.splitlines knows becomes a space. Nothing after the break becomes a header.
+    subject = " ".join(subject.splitlines())
     if len(html) > HTMLMAX:
         return refuse("the HTML body is over %d KiB — nothing sent" % (HTMLMAX // 1024))
     odd = [p for p in pics if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.(png|jpe?g|gif)", os.path.basename(p), re.I)]

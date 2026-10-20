@@ -47,11 +47,11 @@ re-reads and records. Three things then decide, in this order:
                 vouched for as somebody else. The identity is what milestone 2 routes on, so it is the
                 authenticated one and the envelope is kept beside it under `auth.envelope_from`.
 
-DROPS COME BEFORE REFUSALS, AND THAT ORDERING IS THE PRIVACY RULE. A drop answers 403 with `reply: null` and
+DROPS COME BEFORE ANY ANSWER, AND THAT ORDERING IS THE PRIVACY RULE. A drop answers 403 with `reply: null` and
 the worker sends nothing, so an unknown sender learns nothing at all — not that the address exists, not that
-there is an allow-list, not that anything happened. A refusal (too large, too many) does send a one-line reason,
-which is only ever seen by someone already on the allow-list. So the allow-list is checked before the size and
-the verdict before the rate limit: no path can answer a stranger with a reason.
+there is an allow-list, not that anything happened. A line with words in it (the router's answer, the ACK) is
+only ever sent once the verdict and the allow-list have passed: no path can answer a stranger with a reason.
+There is no size, part, attachment, connection or per-sender rate cap on the door: the allow-list is the gate.
 The stored mail's answer (`reply` in the 200, which the worker sends back to the sender) is the box's ACK — for a
 held mail the only word its sender gets until a person decides — and it is written to ~/.cc/mail/out.log as an
 `ack` line beside every mail that goes out, so one file shows all of what a sender was sent (acked()).
@@ -68,11 +68,13 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             "attachments": ["/abs/path", ...], "thread": "<chat_id>/<thread_ts>",
                                             "html": "<html>…", "images": ["/abs/fig.png", ...]}
                                             — those eight keys and no others; all but to, subject and body may
-                                            be left out. `bcc` is a blind copy: each address is checked against
+                                            be left out. Keep the subject on one line (a break in it
+                                            goes out as a space). `bcc` is a blind copy: each address is checked against
                                             the verified list like `to` (one that is not refuses the whole
                                             mail), it is delivered to, and no header of the mail names it; the
                                             sent copy keeps it (SENT MAIL, below). `html` makes the mail multipart/alternative with the
-                                            body as its plain-text fallback, and each of `images` is shown in
+                                            body as its plain-text fallback (write both; an empty body
+                                            gets the HTML's words, tags stripped), and each of `images` is shown in
                                             the HTML as cid:<its file name> (.png/.jpg/.gif), under the same
                                             rules and cap as an attachment. Without html the mail is text. A .pdf is never attached: it goes
                                             as a line at the end of the body (and the html) linking to its
@@ -157,16 +159,11 @@ sender with message.reply(), or null meaning the worker says nothing:
                                                   sender per UTC day, stamped in CC_MAIL_STATE/auth-drops.json.
                                                   The drop line then carries `owner=told`. The sender still
                                                   hears nothing: the address is claimed, not proven
-  413 {"status":"refused","reason":…,"reply":…}   over MAIL_MAX_BYTES, MAIL_MAX_PARTS or MAIL_MAX_ATTACH_BYTES
-  429 {"status":"refused","reason":…,"reply":…}   over MAIL_RATE in MAIL_RATE_WINDOW, for this sender
   400 {"status":"refused","reason":…,"reply":null} the call itself was malformed: no X-Mail-From, a
                                                   Content-Length that is not a number, an empty body, or a
                                                   body that would not parse as a mail. `reply` is null on all
                                                   four — none of them is a person's mistake to explain
   503 {"status":"unavailable","reply":null}       MAIL_SECRET is unset on this box: every call is refused
-  503 {"status":"busy","reply":null}              MAIL_MAX_CONN connections are already in flight. The worker
-                                                  throws on any 503, so the sending server retries later —
-                                                  which is what a queue full for a moment should do
 
 THE STORE IS THE CONTRACT MILESTONE 2 READS. One directory per mail:
 
@@ -261,16 +258,6 @@ it is written on the reload step of the runbook.
       MAIL_ALLOW         the allow-list, comma- or space-separated. Falls back to LESSONS_EMAILS, which is the
                          list the box already keeps of the people it will talk to. An address added here
                          reaches the door on the next HUP or restart, not on the next mail
-      MAIL_MAX_BYTES     10485760 (10 MiB), off Content-Length and again on the read
-      MAIL_MAX_PARTS     64 MIME parts. A cap on FILES, not bytes: 1 MB of nested multipart parsed to 12,787
-                         parts, and one file per part is 12,787 creat()s with the worker's event held open
-      MAIL_MAX_ATTACH_BYTES  10485760 (10 MiB) of decoded attachment bytes across the whole mail, counted as
-                         they are written. MAIL_MAX_BYTES bounds the wire, this bounds the disk
-      MAIL_MAX_CONN      8 connections in flight. Over it, a call waits BUSY_WAIT seconds for a slot and is
-                         then answered 503 busy — a bound on threads, memory and open files that a tunnel
-                         cannot talk the box out of
-      MAIL_RATE          10 mails per sender per window
-      MAIL_RATE_WINDOW   3600 seconds
 CC_MAIL_DIR moves the whole store, and CC_MAIL_STATE the pid/port/log, which is how the selfcheck runs against
 a tree of its own and never this box's inbox.
 """
@@ -297,22 +284,13 @@ H = os.path.expanduser("~")
 MAILDIR = os.environ.get("CC_MAIL_DIR") or os.path.join(H, ".cc", "mail")
 STATE = os.environ.get("CC_MAIL_STATE") or os.path.join(H, ".cc", "state", "mail")
 INBOX = os.path.join(MAILDIR, "inbox")
-RATEFILE = os.path.join(MAILDIR, "rate.json")
 
 BIND = "127.0.0.1"      # NOT configurable, and half the security model: the tunnel is the only way in
 PORT = 5220             # 5200 is the dashboard's, 5190 cc-graphs', 5173/5174 vite's, 5201 and 5211 taken
 START_WAIT = 5.0        # seconds `serve` waits for the background process before calling it failed
 LOGMAX = 300            # a log line is built out of attacker-supplied strings, so it is escaped and cut
 LOG_CAP = 4 * 1024 * 1024   # ...and serve.log is rolled at this size, one generation kept. See roll_log()
-MAX_BYTES = 10 * 1024 * 1024
-MAX_PARTS = 64
-MAX_ATTACH_BYTES = 10 * 1024 * 1024
 MAX_HTML = 256 * 1024   # how much of an inline text/html body is kept in message.json. raw.eml has all of it
-MAX_CONN = 8
-BUSY_WAIT = 1.0         # seconds a connection waits for one of those slots before it is answered 503 busy
-HEADER_BYTES = 65536    # how much of an OVER-cap mail is still read, so its headers can say who sent it
-RATE = 10
-RATE_WINDOW = 3600
 NOTIFY = os.path.join(H, "bin", "cc-notify")   # the owner line for an allow-listed sender's auth drop
 
 # The daemon's own socket (cc-slack). It is how a stored mail reaches the session it is for without a second
@@ -333,8 +311,7 @@ FAIL = ("fail", "permerror")
 
 # ---------------------------------------------------------------- config
 
-CONF_KEYS = ("MAIL_SECRET", "MAIL_PORT", "MAIL_DOMAIN", "MAIL_ALLOW", "LESSONS_EMAILS", "MAIL_MAX_BYTES",
-             "MAIL_MAX_PARTS", "MAIL_MAX_ATTACH_BYTES", "MAIL_MAX_CONN", "MAIL_RATE", "MAIL_RATE_WINDOW")
+CONF_KEYS = ("MAIL_SECRET", "MAIL_PORT", "MAIL_DOMAIN", "MAIL_ALLOW", "LESSONS_EMAILS")
 CONF = {}       # what load_config() read. EMPTY means "not loaded": the terminal subcommands ask cc-config
 
 
@@ -377,13 +354,6 @@ def cfg(key, default=""):
         return default if CONF[key] is None else CONF[key]
     v = _from_cc_config(key)
     return default if v is None else v
-
-
-def cfg_int(key, default):
-    try:
-        return int(cfg(key, "").strip() or default)
-    except ValueError:
-        return default
 
 
 def allow_list():
@@ -621,22 +591,13 @@ def roll_log(stream=None):
     return True
 
 
-class Refuse(Exception):
-    """A mail that is well formed and from an allow-listed person but over one of the caps, discovered while it
-    was being written. It carries the one-line reason the sender gets, and store() has already cleaned up."""
-
-    def __init__(self, reason):
-        super().__init__(reason)
-        self.reason = reason
-
-
 def safe_decode(body, charset):
     """Bytes decoded as `charset`, the way a sender's own mail declared it — or as utf-8 with errors=replace
     when that label is one Python's codecs module has never heard of. `charset` is attacker-supplied text:
     `iso-8859-8-i`, `unknown-8bit`, `x-unknown` and plenty of real mail carry a charset label with no codec
     behind it at all, and `.decode()` raises LookupError for every one of them — uncaught, that took the whole
     mail down with a 500 (store()'s rmtree undoes the write, do_POST answers 500, and the sending server just
-    retries the same mail until it burns this sender's MAIL_RATE allowance). So the label is proven with
+    retries the same mail). So the label is proven with
     codecs.lookup() before it is trusted; the bytes are never lost, only the label is downgraded."""
     charset = charset or "utf-8"
     try:
@@ -664,17 +625,12 @@ def parse(msg, who, auth, envelope_to, mail_id, received_at, attach_dir):
     The message arrives already parsed (do_POST needs the headers to decide anything at all, and parsing a
     hostile mail twice is a cost paid for nothing). `who` is the authenticated identity from identity(), which
     is what `from` becomes, and `auth` is the verdict dict that decided it.
-
-    Raises Refuse when the attachment bytes pass MAIL_MAX_ATTACH_BYTES: the total is counted as each part is
-    decoded, before it is written, so the cap bounds what reaches the disk rather than what is found there
-    afterwards.
     """
-    cap = cfg_int("MAIL_MAX_ATTACH_BYTES", MAX_ATTACH_BYTES)
     to = [envelope_to] if envelope_to else []
     for a in addrs(msg, "To"):
         if a not in to:
             to.append(a)
-    text, html, attachments, n, total = [], [], [], 0, 0
+    text, html, attachments, n = [], [], [], 0
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
@@ -698,9 +654,6 @@ def parse(msg, who, auth, envelope_to, mail_id, received_at, attach_dir):
             html.append(safe_decode(body, part.get_content_charset()))
             continue
         n += 1
-        total += len(body)
-        if total > cap:
-            raise Refuse("attachments too large: over %d bytes in total" % cap)
         rel = os.path.join("attachments", safe_name(part.get_filename(), n))
         path = os.path.join(attach_dir, os.path.basename(rel))
         with open(path, "wb") as f:            # bytes, written. Never opened, unpacked, rendered or run
@@ -738,59 +691,12 @@ def store(raw, msg, who, auth, envelope_to):
             json.dump(rec, f, indent=1)
         os.rename(tmp, final)
     except BaseException:
-        # A mail that breaks the parser, or trips the attachment cap half way through, must not leave its half
+        # A mail that breaks the parser half way through must not leave its half
         # of itself on the disk for ever. The `.` name is already invisible to every reader, so this is about
         # the bytes, not about what anyone can see.
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return rec
-
-
-RATE_LOCK = threading.Lock()
-
-
-def rate_ok(sender, now=None):
-    """Has this sender sent fewer than MAIL_RATE mails in the last MAIL_RATE_WINDOW seconds? Counts this one.
-
-    The counter is per SENDER, not per box: one person's burst must not shut the door on everybody else. It is
-    kept in one small JSON file rather than in memory so a restart does not hand a sender a fresh allowance —
-    the door is restarted by hand and by the unit's Restart=on-failure, and either would otherwise be a reset.
-    The lock is this process's: the server is threaded, and two mails from the same sender arriving together
-    would otherwise both read the same count and both be allowed.
-    """
-    now = time.time() if now is None else now
-    limit, window = cfg_int("MAIL_RATE", RATE), cfg_int("MAIL_RATE_WINDOW", RATE_WINDOW)
-    with RATE_LOCK:
-        try:
-            with open(RATEFILE) as f:
-                seen = json.load(f)
-        except (OSError, ValueError):
-            seen = {}
-        if not isinstance(seen, dict):
-            seen = {}
-        # Prune every sender, not just this one, or the file grows for as long as the box runs.
-        seen = {k: [t for t in v if isinstance(t, (int, float)) and now - t < window]
-                for k, v in seen.items() if isinstance(v, list)}
-        mine = seen.get(sender, [])
-        if len(mine) >= limit:
-            seen = {k: v for k, v in seen.items() if v}
-            _write_rate(seen)
-            return False, limit, window
-        mine.append(now)
-        seen[sender] = mine
-        _write_rate({k: v for k, v in seen.items() if v})
-        return True, limit, window
-
-
-def _write_rate(seen):
-    os.makedirs(MAILDIR, exist_ok=True)
-    tmp = RATEFILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(seen, f)
-        os.rename(tmp, RATEFILE)
-    except OSError:
-        pass        # a counter that cannot be written must not refuse a real mail; the caps above still hold
 
 
 def acked(mail_id, who, reply):
@@ -931,12 +837,6 @@ class Handler(BaseHTTPRequestHandler):
             auth["spf"] or "none", auth["dmarc"] or "none", sigs))
         self.dropped("%s dkim_sigs=%s%s" % (why, clip(sigs), " owner=told" if told else ""), sender)
 
-    def refused(self, code, reason, sender):
-        """A refusal is only ever sent to somebody already on the allow-list, which is why it may carry a
-        reason at all: the checks that answer a stranger have all run before any of these."""
-        self.say("refuse %s from=%s" % (clip(reason), clip(sender)))
-        self._json(code, {"status": "refused", "reason": reason, "reply": reason})
-
     def do_GET(self):
         # There is nothing to read here. Not a health endpoint either: `cc-mail status` is on the box, and an
         # endpoint that answers before the secret is checked is one more thing the tunnel exposes.
@@ -972,11 +872,8 @@ class Handler(BaseHTTPRequestHandler):
             self.say("refuse no-envelope-sender")
             return self._json(400, {"status": "refused", "reason": "no envelope sender", "reply": None})
 
-        # 2. THE BODY, bounded. Content-Length decides how much is read and MAIL_MAX_BYTES bounds that, so a
-        # 500 MB body costs 10 MiB and not a byte more. The mail has to be read before the sender can be
-        # decided at all, because the identity is in the mail and not in the envelope the caller wrote — and it
-        # is not answered with the 413 until the identity IS decided, or the reason would reach a stranger.
-        cap = cfg_int("MAIL_MAX_BYTES", MAX_BYTES)
+        # 2. THE BODY, Content-Length of it. The mail has to be read before the sender can be decided at all,
+        # because the identity is in the mail and not in the envelope the caller wrote.
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -984,18 +881,13 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             self.say("refuse bad-content-length from=%s" % clip(sender))
             return self._json(400, {"status": "refused", "reason": "bad Content-Length", "reply": None})
-        # An over-cap mail is still read as far as its headers, and only that far: the 413 below carries a
-        # reason, so it may only be sent to somebody the headers identify as allow-listed. Truncating at `cap`
-        # alone would cut the Authentication-Results off a mail whose cap is small, leaving a real person's
-        # oversize mail dropped in silence instead of answered.
-        raw = self.rfile.read(min(length, max(cap, HEADER_BYTES)))
+        raw = self.rfile.read(length)
         if not raw:
             self.say("refuse empty-body from=%s" % clip(sender))
             return self._json(400, {"status": "refused", "reason": "empty message", "reply": None})
         try:
-            # Parsed ONCE, here, and handed to store() later: the verdict, the identity and the part count are
-            # all read off this one object. The headers a truncated over-cap body still carries are enough for
-            # all three, and it is refused below anyway.
+            # Parsed ONCE, here, and handed to store() later: the verdict and the identity are both read off
+            # this one object.
             msg = email.message_from_bytes(raw, policy=email.policy.default)
             auth = verdict(msg)
         except Exception:
@@ -1018,29 +910,11 @@ class Handler(BaseHTTPRequestHandler):
         if who not in allow_list():
             return self.dropped("unknown-sender", who)
 
-        # 5. THE CAPS, which are refusals with a reason and so all come after the allow-list. Size first, off
-        # the length the caller declared; then the number of MIME parts, because one file per part is what a
-        # 1 MB mail turns into 12,787 of.
-        if length > cap:
-            return self.refused(413, "message too large: %d bytes, the limit is %d" % (length, cap), who)
-        maxparts = cfg_int("MAIL_MAX_PARTS", MAX_PARTS)
-        parts = sum(1 for p in msg.walk() if p.get_content_maintype() != "multipart")
-        if parts > maxparts:
-            return self.refused(413, "too many parts: %d, the limit is %d" % (parts, maxparts), who)
-
-        # 6. THE RATE, per authenticated sender.
-        ok, limit, window = rate_ok(who)
-        if not ok:
-            return self.refused(429, "too many messages: the limit is %d in %d seconds" % (limit, window),
-                                who)
-
-        # 7. STORE, ROUTE, and answer in the same event so the worker can still reply. Store first and always:
+        # 5. STORE, ROUTE, and answer in the same event so the worker can still reply. Store first and always:
         # a mail on disk is the promise this door makes, and routing is what happens to a mail that is already
         # kept. So a daemon that is down costs the delivery and not the mail — `cc-mail list` still has it.
         try:
             rec = store(raw, msg, who, auth, rcpt)
-        except Refuse as e:         # over MAIL_MAX_ATTACH_BYTES, found while writing; store() cleaned up
-            return self.refused(413, e.reason, who)
         except Exception as e:      # one broken mail must not take the door down for the next one
             self.say("error store from=%s %s: %s" % (clip(who), type(e).__name__, clip(str(e))))
             return self._json(500, {"status": "error", "reason": "could not store", "reply": None})
@@ -1056,48 +930,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
-    """ThreadingHTTPServer with a ceiling on how many connections are in flight at once.
-
-    One thread per connection with no bound is a public tunnel hostname's worth of threads, sockets and memory
-    for whoever can reach it, and every one of them can hold its slot for `Handler.timeout` seconds by simply
-    not sending anything. MAIL_MAX_CONN slots; a connection over the ceiling waits BUSY_WAIT seconds for one
-    (a burst is a normal thing and should queue, not fail) and is then answered 503 busy and closed. The
-    worker throws on a 503, so the sending server retries the mail later.
-
-    The slot is taken BEFORE the thread is made and given back when that thread ends, which is why it is
-    released in process_request_thread and not in shutdown_request — shutdown_request also runs on the path
-    that never took one.
-    """
+    """ThreadingHTTPServer whose handler threads do not hold the process open on shutdown."""
 
     daemon_threads = True
-    BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\n"
-            b"Content-Length: 31\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-            b'{"status":"busy","reply":null}\n')
-
-    def __init__(self, *a, **kw):
-        self.slots = threading.BoundedSemaphore(max(1, cfg_int("MAIL_MAX_CONN", MAX_CONN)))
-        super().__init__(*a, **kw)
-
-    def process_request(self, request, client_address):
-        if not self.slots.acquire(timeout=BUSY_WAIT):
-            sys.stderr.write("%s refuse busy\n" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-            sys.stderr.flush()
-            try:
-                request.sendall(self.BUSY)
-            except OSError:
-                pass
-            return self.shutdown_request(request)
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self.slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.slots.release()
 
 
 # ---------------------------------------------------------------- lifecycle

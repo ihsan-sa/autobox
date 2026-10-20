@@ -2561,13 +2561,14 @@ o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND
   && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' — and asks cc-land to queue it, whose refusal raises that card (P8f)" \
   || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
-# M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
+# M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going. Capped
+# work commits on runs 1-3 and nothing after; the --no-extend bound of 6 is what ends it (no count of caps does, owner 10-20).
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 echo "do capped work" > ~/.cc/state/$REPO/w2/task.md
-CC_CLAUDE="$T/cappedclaude" "$B/cc-loop" $REPO w2 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
+CC_CLAUDE="$T/cappedclaude" "$B/cc-loop" $REPO w2 --max-iter 6 --no-extend --quiet >/dev/null 2>&1; rc=$?
 runs=$(ls ~/.cc/state/$REPO/w2/runs/*.json 2>/dev/null | wc -l)
-{ [ "$rc" != 5 ] && [ "$runs" -gt 3 ]; } && ok "productive but capped iterations are not failures — the loop ran past its 3-step limit ($runs runs, not exit 5)" || bad "capped loop: rc=$rc runs=$runs"
+{ [ "$rc" = 6 ] && [ "$runs" = 6 ]; } && ok "capped iterations are neither failures nor a stop — three productive and three barren caps all ran to the caller's bound (6 runs, exit 6, not 5 or 7)" || bad "capped loop: rc=$rc runs=$runs"
 grep -q 'capped' ~/.cc/state/$REPO/w2/loop.log && [ "$("$B/cc-board" get $REPO w2 status)" = blocked ] && ok "cap logged + board left blocked, not running" || bad "capped log/board status"
 # H4: a killed loop must not leave claude re-parented to systemd, still editing the worktree
 "$B/cc" $REPO w3 >/dev/null 2>&1; sleep 1
@@ -2575,7 +2576,7 @@ for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " 
 echo "hang for a while" > ~/.cc/state/$REPO/w3/task.md
 # The kill proves something only if the fake claude was running when it came: no claude seen within the bound is a red
 # of its own, so a loop that never starts one cannot pass this as "no orphan".
-CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet >/dev/null 2>&1 & lp=$!
+CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --no-extend --quiet >/dev/null 2>&1 & lp=$!
 up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
@@ -2586,7 +2587,7 @@ wait $lp 2>/dev/null
 # H4b: …and from a launcher that IGNORES HUP — a `setsid nohup cc-loop` typed out of a session shell, the shape of the
 # relaunch-orphans incident. exec keeps SIG_IGN and bash cannot trap a signal ignored at entry, so the loop's HUP trap was a
 # no-op and its claude lived on. cc-loop puts its signals back to default at launch, before that trap is set.
-( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet ) >/dev/null 2>&1 & lp=$!
+( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --no-extend --quiet ) >/dev/null 2>&1 & lp=$!
 up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
@@ -2595,7 +2596,7 @@ elif [ "$gone" = yes ]; then ok "…and from a launcher that ignores HUP (setsid
 else bad "HUP-ignoring launcher: the loop kept SIG_IGN and its claude survived (relaunch orphans)"; pkill -f "$T/sleepclaude"; kill -TERM $lp 2>/dev/null; fi
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
 fi
-if stanza "the step limit carries on, and a runaway does not (cc-loop)"; then
+if stanza "the step limit carries on, and so does a runaway, told on a doubling stride (cc-loop)"; then
 # Every stub here is the same shape: it decides per iteration whether to COMMIT (a file in the worktree),
 # whether to JOURNAL, and what it cost. That pair is the whole runaway rule, and the money is never the reason.
 mkclaude(){ cat > "$T/$1" <<F
@@ -2609,18 +2610,17 @@ mktrack(){ "$B/cc" $REPO "$1" >/dev/null 2>&1; sleep 1; for id in $(wins "$REPO/
 lg(){ cat ~/.cc/state/$REPO/$1/loop.log; }
 nruns(){ ls ~/.cc/state/$REPO/$1/runs/*.json 2>/dev/null | wc -l; }
 
-# 1+2: three iterations in a row with nothing to show stop the loop, and the owner hears once, not three times
-mktrack w8 "spin forever"; mkclaude spinclaude w8 ':'   # commits nothing, journals nothing, ever
+# 1+2: three iterations in a row with nothing to show tell the dispatching session, again at the 2nd, 4th, 8th… barren one, and the loop carries on
+# (owner 10-20: no give-up after N). Here a person ends it: the stub writes the stop file on its fifth call.
+mktrack w8 "spin forever"; mkclaude spinclaude w8 '[ "$n" -ge 5 ] && echo "enough" > "$st/stop"'   # commits nothing, journals nothing, ever
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 CC_CLAUDE="$T/spinclaude" "$B/cc-loop" $REPO w8 --max-iter 20 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 9 ] && [ "$(nruns w8)" = 3 ]; } && ok "three progress-free iterations stop the loop (exit 9 after 3, not 20)" || bad "runaway: rc=$rc runs=$(nruns w8)"
-lg w8 | grep -q 'runaway signal 3/3' && [ "$("$B/cc-board" get $REPO w8 status)" = blocked ] && ok "…the reason is in the log and the board says blocked — a state a person must settle" || bad "runaway log/board: $(lg w8 | tail -2)"
-n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -vc "rung=P")
-[ "$n" = 0 ] && ok "…and nothing goes to the owner: the stop is the planning seat's request, below, and the numbers stay in the log" || bad "runaway notify count: $n"
-# …and a stop NO seat took is also a planner request (cc-notify --ask: kept on file and retried, never dropped and never
-# his alone to catch) — one, under the stop's own id; this fixture's repo is synthetic, so it is logged and not asked.
-nq=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -c "rung=P kind=request")
-[ "$nq" = 1 ] && ok "…and the stop nobody heard is filed once as a planner request beside that line, not dumped on the owner alone" || bad "stop request count: $nq"
+{ [ "$rc" = 14 ] && [ "$(nruns w8)" = 5 ]; } && ok "three progress-free iterations no longer stop the loop: it ran on until the stop file (exit 14 after 5)" || bad "runaway: rc=$rc runs=$(nruns w8)"
+{ lg w8 | grep -q 'runaway signal 3/3' && [ "$(lg w8 | grep -o 'runaway notice at [0-9]* barren' | grep -o '[0-9]*' | tr '\n' ' ')" = "3 4 " ] \
+  && "$B/cc-board" get $REPO w8 notes | grep -q 'running without producing'; } \
+  && ok "…the notice is in the log and the board note, told at signals 3 and 4 and not at 5, the doubling stride" || bad "runaway notice: $(lg w8 | grep runaway | tail -3)"
+n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "w8 is running")
+[ "$n" = 0 ] && ok "…and nothing goes to the owner: the notice is the dispatching session's, and the numbers stay in the log" || bad "runaway notify count: $n"
 
 # 3: an expensive job that keeps producing is never touched. $50 an iteration, and no cap anywhere.
 mktrack w9 "expensive but productive"
@@ -2628,25 +2628,25 @@ mkclaude richclaude w9 'cost=50; echo "work $n" > "rich-$n.txt"; echo "- did ste
 CC_CLAUDE="$T/richclaude" "$B/cc-loop" $REPO w9 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 0 ] && ! lg w9 | grep -q 'runaway signal'; } && ok "an expensive job that keeps committing runs untouched (\$100, no cap, no signal)" || bad "expensive job flagged: rc=$rc $(lg w9 | grep runaway | head -1)"
 
-# 4+5: the step limit carries on when that iteration COMMITTED, and stops when it did not
-mktrack w10 "carry on once"
-mkclaude carryclaude w10 'if [ "$n" -lt 2 ]; then echo "work $n" > "carry-$n.txt"; fi; echo "- step $n" >> "$st/progress.md"'
+# 4+5: the step limit is a checkpoint, committing or not: a log line and a board note, and the loop goes on
+mktrack w10 "carry on"
+mkclaude carryclaude w10 'if [ "$n" -lt 2 ]; then echo "work $n" > "carry-$n.txt"; fi; echo "- step $n" >> "$st/progress.md"; [ "$n" -ge 3 ] && echo "enough" > "$st/stop"'
 CC_CLAUDE="$T/carryclaude" "$B/cc-loop" $REPO w10 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$(nruns w10)" = 2 ] && [ "$(lg w10 | grep -c 'carrying on')" = 1 ]; } && ok "the step limit is a checkpoint: an iteration that committed buys another batch" || bad "carry-on: runs=$(nruns w10) carried=$(lg w10 | grep -c 'carrying on')"
-{ [ "$rc" = 6 ] && lg w10 | grep -q 'committed nothing, so it did not carry itself on'; } && ok "…and an iteration that committed nothing does not — the loop stops at exit 6" || bad "step limit without commits: rc=$rc"
+{ [ "$(nruns w10)" = 3 ] && [ "$(lg w10 | grep -c 'checkpoint at [0-9]* iterations')" -ge 2 ]; } && ok "the step limit is a checkpoint: the loop passes it after an iteration that committed and after one that did not" || bad "checkpoint: runs=$(nruns w10) checkpoints=$(lg w10 | grep -c 'checkpoint at')"
+{ [ "$rc" = 14 ] && "$B/cc-board" get $REPO w10 notes | grep -q 'checkpoint: [0-9]* iterations'; } && ok "…the board note carries it, and only the stop file a person wrote ended the loop (exit 14)" || bad "checkpoint stop: rc=$rc"
 
 # 6: neither a question for a person nor a run of errors is ever carried on
 mktrack w11 "ask something"
 mkclaude askclaude w11 'echo "work $n" > "ask-$n.txt"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: BLOCKED: which schema?" >> "$st/progress.md"'
 CC_CLAUDE="$T/askclaude" "$B/cc-loop" $REPO w11 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 3 ] && [ "$(nruns w11)" = 1 ] && ! lg w11 | grep -q 'carrying on'; } && ok "STATUS: BLOCKED is never carried on — it is a question, even with work committed" || bad "blocked carried on: rc=$rc runs=$(nruns w11)"
+{ [ "$rc" = 3 ] && [ "$(nruns w11)" = 1 ] && ! lg w11 | grep -q 'checkpoint at'; } && ok "STATUS: BLOCKED is never carried on — it is a question, even with work committed" || bad "blocked carried on: rc=$rc runs=$(nruns w11)"
 # …and the word it leaves is `waiting`, not `blocked`: the loop is the first to know a person is being asked, and it
 # must write what cc-reconcile and the Home tab already read out of that same journal line, or the tab prints drift.
 [ "$("$B/cc-board" get $REPO w11 status)" = waiting ] && ok "…and the board says \`waiting\`, the one word that reaches the owner's NEEDS YOU list — not \`blocked\`, which is every other way a loop stops" || bad "exit 3 board status: $("$B/cc-board" get $REPO w11 status)"
 mktrack w12 "fail every time"
 mkclaude failclaude w12 'err=true; res="fatal: it broke"'
 CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 5 ] && [ "$(nruns w12)" = 2 ] && ! lg w12 | grep -q 'carrying on'; } && ok "an error is never carried on either — two in a row and it stops (exit 5)" || bad "error carried on: rc=$rc runs=$(nruns w12)"
+{ [ "$rc" = 5 ] && [ "$(nruns w12)" = 2 ]; } && ok "an error is never carried on either — two in a row and it stops (exit 5)" || bad "error carried on: rc=$rc runs=$(nruns w12)"
 # 6b: --no-extend — the bound cc-land's fix round asks for, and a plain `cc` flag besides (core/bin/cc:407). A
 # round that ends AT its bound having COMMITTED is over, not stalled: exit 0, no page, and the owner never reads
 # "the last one committed nothing" about a round that just pushed. The board word claims a review only where a PR
@@ -2672,7 +2672,7 @@ CC_CLAUDE="$T/bound15claude" "$B/cc-loop" $REPO w15 --max-iter 1 --no-extend --q
 # detached suite in ten days to 2026-09-19, each a relaunch and a planning wake). The stub cc-green answers as the real
 # one does on a root with a run going: `wait` says still running (exit 3) twice, then ended (exit 0); asked on the next
 # iteration, nothing is running. The stub claude journals NOTHING on iteration 1 — the run is all it did — so without
-# the fix that iteration is a runaway signal AND the step limit stops the loop (exit 6, one run). Own track, own
+# the fix that iteration is a runaway signal. The step limit of 1 is a checkpoint, so iteration 2 reads the result. Own track, own
 # stub, own counter; the stub also writes where it was asked from, which must be this track's worktree and no other.
 mktrack w20 "start the suite, then read it"
 mkclaude greenclaude w20 '[ "$n" -ge 2 ] && echo "STATUS: DONE" >> "$st/progress.md"'
@@ -2686,20 +2686,16 @@ F
 chmod +x "$T/greenstub"; rm -f "$T/green.n" "$T/green.cwd"
 CC_GREEN="$T/greenstub" CC_CLAUDE="$T/greenclaude" "$B/cc-loop" $REPO w20 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 0 ] && [ "$(nruns w20)" = 2 ] && lg w20 | grep -q 'still going — waiting on it, no model call' \
-  && lg w20 | grep -q 'one more iteration to read the result' && ! lg w20 | grep -q 'runaway signal' \
+  && ! lg w20 | grep -q 'runaway signal' \
   && grep -q "^- cc-loop: the cc-green run iteration 1 started ended while the loop waited on it (exit 0, log $T/green.log)" ~/.cc/state/$REPO/w20/progress.md \
   && [ "$(sort -u "$T/green.cwd")" = "$HOME/.cc/worktrees/$REPO/w20" ]; } \
-  && ok "an iteration that ends with its own cc-green run still going is not idle: the loop waits it out (no model call), journals the result for the next context, raises no runaway signal, and at the step limit buys ONE more iteration to read it — asked on this track's worktree, no other" \
+  && ok "an iteration that ends with its own cc-green run still going is not idle: the loop waits it out (no model call), journals the result for the next context, raises no runaway signal, and the next iteration reads it — asked on this track's worktree, no other" \
   || bad "gate-wait: rc=$rc runs=$(nruns w20) cwd='$(sort -u "$T/green.cwd" 2>/dev/null)' log: $(lg w20 | grep -E 'cc-green|runaway|exit' | tail -3)"
-# 6c': …AND THAT ONE ITERATION IS GRANTED ONCE PER ROUND, AND THE SPEND RULE STILL COUNTS A GATED ITERATION (review of
-# #541): a worker that ends EVERY iteration with a fresh suite run on a red gate, never committing, was extended at every
-# limit and excused from every runaway signal — no bound on the spend at all. Here every iteration is gated (the stub
-# cc-green says running, running, ended, for two iterations, then nothing running — BOUNDED, because against the
-# defective loop an unbounded stub never ends: the first draft of this case ran 490 extended iterations on the
-# pre-repair bins and was ended by its stop file), nothing commits, nothing journals, and the loop is given a $0.10
-# yardstick against $0.50 iterations: iteration 1 is gated and buys one more; iteration 2 is gated too, but the grant
-# is spent until a commit, so the loop ends there (exit 6, two runs, not three) — and its spend since the last commit,
-# 5x the yardstick, is a runaway signal in the log even though the iteration was gated.
+# 6c': THE SPEND RULE STILL COUNTS A GATED ITERATION (review of #541): a worker that ends every iteration with a fresh
+# suite run on a red gate, never committing, is excused from the journal and repeat signals but not from spend. Every
+# iteration here is gated (the stub cc-green says running, running, ended, for two iterations), nothing commits, and
+# the loop is given a $0.10 yardstick against $0.50 iterations and a --no-extend bound of 2: its spend since the last
+# commit, 5x the yardstick, is a runaway signal in the log even though the iteration was gated.
 mktrack w22 "re-run the red suite forever"
 mkclaude green22claude w22 ':'   # commits nothing, journals nothing, ever — the run is all it does
 cat > "$T/greenstub22" <<F
@@ -2710,11 +2706,11 @@ case "\$1:\$c" in wait:1|wait:2|wait:4|wait:5) echo "cc-green: still running (pi
   *) echo "cc-green: NOT green on abc"; exit 1;; esac
 F
 chmod +x "$T/greenstub22"; rm -f "$T/green22.n"
-CC_GREEN="$T/greenstub22" CC_CLAUDE="$T/green22claude" "$B/cc-loop" $REPO w22 --max-iter 1 --budget 0.1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 6 ] && [ "$(nruns w22)" = 2 ] && [ "$(lg w22 | grep -c 'one more iteration to read the result')" = 1 ] \
+CC_GREEN="$T/greenstub22" CC_CLAUDE="$T/green22claude" "$B/cc-loop" $REPO w22 --max-iter 2 --no-extend --budget 0.1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 6 ] && [ "$(nruns w22)" = 2 ] \
   && lg w22 | grep -q 'runaway signal 1/3: spent \$1.0* since its last commit' && ! lg w22 | grep -q 'runaway signal .*journal untouched'; } \
-  && ok "…and that extra iteration is granted ONCE per round: a worker re-running its suite every iteration without committing is extended once and then stopped at the limit (exit 6, two runs), and the spend-since-last-commit rule still counts a gated iteration — only the untouched journal and the repeated outcome are what the live run explains" \
-  || bad "gate-wait grant: rc=$rc runs=$(nruns w22) grants=$(lg w22 | grep -c 'one more iteration') log: $(lg w22 | grep -E 'runaway|exit' | tail -3)"
+  && ok "…and the spend-since-last-commit rule still counts a gated iteration — only the untouched journal and the repeated outcome are what the live run explains" \
+  || bad "gated spend: rc=$rc runs=$(nruns w22) log: $(lg w22 | grep -E 'runaway|exit' | tail -3)"
 # 6d: A LOOP IS STOPPED BY A FILE, NOT A KILL. Written while iteration 1 runs (here by the stub claude itself — the
 # shape of a session touching it while the worker is mid-turn), it ends the loop before iteration 2's model call:
 # one run, exit 14, the board `blocked` with the reason, one journal line, the file consumed, nobody paged. And a
@@ -2980,9 +2976,9 @@ read -r m3pass m3fail < "$T/delivery-fixture/counts"; pass=$((pass+m3pass)); fai
 mktrack w16 "trimmed or not"
 mkclaude trimclaude w16 'echo "${CLAUDE_CODE_EXTRA_BODY:-none}" > "$st/extra-body"; echo "- step $n" >> "$st/progress.md"'
 : > "$T/trimcfg"   # its own empty config, so "off by default" is the default and not whatever this box has set
-CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --quiet >/dev/null 2>&1
+CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --no-extend --quiet >/dev/null 2>&1
 off=$(cat ~/.cc/state/$REPO/w16/extra-body 2>/dev/null)
-CC_LOOP_TRIM=1 CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --quiet >/dev/null 2>&1
+CC_LOOP_TRIM=1 CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --no-extend --quiet >/dev/null 2>&1
 on=$(cat ~/.cc/state/$REPO/w16/extra-body 2>/dev/null)
 { [ "$off" = none ] && [ "$(jq -r '.context_management.edits[0].type' <<<"$on" 2>/dev/null)" = clear_tool_uses_20250919 ] \
   && [ "$(lg w16 | grep -c 'context trim on')" = 1 ]; } \

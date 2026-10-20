@@ -149,6 +149,9 @@ class Case(unittest.TestCase):
         p = mock.patch.object(GH, "gh", gh_via_sh)
         p.start()
         self.addCleanup(p.stop)
+        p = mock.patch.object(R, "box_owner", return_value="owner")   # never the box's real cc-config
+        p.start()
+        self.addCleanup(p.stop)
         # the reviewer keys come from the passwd home's config, never the box's real one in a test
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME, R.PERMS_STATE)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")
@@ -2288,6 +2291,37 @@ class TestSecurityPaths(Case):
         self.assertEqual(R.carried_from(j), self.OLD)
         self.reads([self.rec(j, repo="owner/other")])
         self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]))
+
+    def test_a_ledger_entry_for_the_same_name_under_another_owner_never_counts(self):
+        # perms' read of #1691: matching on the bare name let 'someone/demo' grant the box's own 'demo'
+        j = self.carry(["x.py"])
+        self.reads([self.rec(j, repo="someone/demo")])
+        self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]))
+        self.reads([self.rec(j, head=self.OLD, change="0" * 16, repo="someone/demo")])
+        self.assertEqual(R.carried_from(j), "")
+        j.repo = "someone/demo"   # nor the box's bare 'demo' for another owner's job
+        self.reads([self.rec(j, repo="demo")])
+        self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]))
+        self.reads([self.rec(j, repo="Someone/Demo")])   # GitHub's names ignore case
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]))
+
+    def test_a_ledger_entry_with_no_repo_counts_for_none(self):
+        # Opus read of #1696: str(None) made an entry with no repo count for a repo named 'none'
+        j = self.carry(["x.py"])
+        j.repo = "none"
+        for e in ({k: v for k, v in self.rec(j).items() if k != "repo"}, self.rec(j, repo=None)):
+            self.reads([e], repo="none")
+            self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]), e)
+            self.reads([dict(e, head=self.OLD, change="0" * 16)], repo="none")
+            self.assertEqual(R.carried_from(j), "", e)
+
+    def test_with_no_owner_read_a_bare_name_matches_only_itself(self):
+        # Opus read of #1696: the fallback when CC_GH_PERSONAL_OWNER will not read
+        j = self.carry(["x.py"])
+        with mock.patch.object(R, "box_owner", return_value=""):
+            for repo, counts in (("owner/demo", False), ("demo", True), ("/demo", False)):
+                self.reads([self.rec(j, repo=repo)])
+                self.assertEqual(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]), counts, repo)
 
     def test_delta_files_on_a_real_repo_names_the_authors_change_only(self):
         # read of #1317: every other case fakes delta_files; this one runs it on git

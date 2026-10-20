@@ -28,7 +28,9 @@
   cc-room selfcheck
 
 ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as it does for every key):
-  CC_WORKER_CAP (12)          fewer than this many worker loops hold a slot;
+  CC_WORKER_CAP (unset)       no count of worker loops holds a launch (owner 2026-10-20: no count caps on runs; the
+                              box's CPU and memory pressure below is the real bound). Until then it was 12. A person
+                              may still set it, and then fewer than that many worker loops must hold a slot;
   CC_WORKER_PACE_MARGIN (10)  the account's five-hour usage is not ahead of the window's elapsed time by more than
                               this many points: used% <= elapsed% + margin. It reads cc-usage-poll's live reading
                               (~/.cc/state/usage/now.json, CC_USAGE_DIR) while it is under 3 min old, else the
@@ -48,7 +50,7 @@ went on to run, or a person's command) means the window is left alone, and so is
 
 TWO HOSTS (owner, 2026-10-12: "ideally full ram and cpu usage on both boxes"). With a peer configured (cc-peer:
 ~/.cc/peer), a launch this host has no room for goes to the peer when the peer has room by its own count — its own
-cap, load and memory, asked over the launch key (`cc-peer room`) — and otherwise waits here as before. This host
+load and memory (and a cap, where a person set one), asked over the launch key (`cc-peer room`) — and otherwise waits here as before. This host
 first, then the peer, then the queue. The five-hour pace is the account's, the same on both, so a launch held by it
 waits and the peer is not asked. Only a cc-loop launch can move; a member workspace's stays on its host. A peer that
 said no, did not answer or did not take a launch is not asked again for PEER_REST seconds. The peer is asked with the
@@ -98,8 +100,9 @@ inject --source room` to `<repo>@<alias>` when an orch dispatched it (CC_SLACK_A
 the window), else `<repo>`; a broker that does not take it files a `cc-notify --ask` instead. The line says why it
 waits and how to cancel it. Delivered is kept in the entry apart from tried, so a restart does not repeat a notice
 that arrived and a failed one is not taken for one: both refused, it tries again CC_ROOM_NOTICE_RETRY seconds (300)
-later, doubling up to 6 h, NOTICE_TRIES times at most; after the last refused try it says so once in its repo's
-channel (a plain `cc-notify --major`), and the launch keeps waiting.
+later, doubling up to 6 h, for as long as it waits (owner 2026-10-16: keep going slower, never fall silent); after
+UNHEARD_AFTER refused tries it also says so once in its repo's channel (a plain `cc-notify --major`), and both the
+tries and the launch go on. Until 2026-10-20 the tries stopped at 8.
 
 PRIORITY (2026-10-03: the owner said "bump it up in priority" about a worker sixth in the queue behind five
 launches all waiting on load, and nothing could reorder it: the waiter's own path is its entry's name, so renaming
@@ -185,7 +188,9 @@ RELAUNCH_ENV = ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_LIMIT_STAMP", "CC_FAI
                 "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX", "CC_ROOM_TRICKLE",
                 # a worker the hub placed here: resumed after a restart, its board, notices and DONE still go home
                 "CC_PEER_SPOOL", "CC_PEER_REPO", "CC_PEER_TRACK")
-NOTICE_TRIES = 8
+UNHEARD_AFTER = 8   # refused notices before the channel is told once; the tries go on after it
+def notice_wait(retry, tries):   # doubles from retry up to six hours; the exponent stops at 30 so a try past 1024 never overflows a float
+    return min(retry * 2 ** min(tries - 1, 30), 6 * 3600)
 SHELLS = ("sh", "bash", "dash", "zsh")
 MARKS = ("bumped", "now")   # a person's priority stamps (PRIORITY): only `bump` and `now` write them
 
@@ -324,9 +329,9 @@ def why_not(now=None):
 
 def host_why():
     """"" when this host's own cap and load leave room, else why not."""
-    cap = cfg("CC_WORKER_CAP", 12)
+    cap = cfg("CC_WORKER_CAP", "")   # unset: no count (the header); a number only when a person set one
     held = len(live("slots"))
-    if held >= cap:
+    if cap != "" and held >= cap:
         return f"{held} worker loops are running and the cap is {cap} (CC_WORKER_CAP)"
     busy = admission.overloaded()
     if busy and not trickle_due():
@@ -561,9 +566,9 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
             # the brief: "tells the seat that dispatched it when it has waited past a bound" — once delivered, kept in
             # the entry; a try is stamped before it is made, so a restart mid-try waits out its backoff too
             if (kind == "worker" and not rec["noticed"] and time.time() - rec["queued"] >= bound
-                    and rec["notice_tries"] < NOTICE_TRIES and time.time() >= rec["notice_next"]):
+                    and time.time() >= rec["notice_next"]):
                 rec["notice_tries"] += 1
-                rec["notice_next"] = time.time() + min(retry * 2 ** (rec["notice_tries"] - 1), 6 * 3600)
+                rec["notice_next"] = time.time() + notice_wait(retry, rec["notice_tries"])
                 tell_now = True
                 write_entry(qsub, name, what, rec)
         if ask_peer:   # never under the lock: a peer slow to answer would hold up every admit, heavy run, cancel and resume
@@ -576,7 +581,7 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
         if tell_now:
             if notice(what, rec, why, log):
                 rec["noticed"] = True
-            elif rec["notice_tries"] >= NOTICE_TRIES and not rec.get("unheard_said"):
+            elif rec["notice_tries"] >= UNHEARD_AFTER and not rec.get("unheard_said"):
                 rec["unheard_said"] = unheard(what, rec, why, log)
             with Lock():
                 if os.path.exists(me):   # a cancel in between moved it away: never write it back
@@ -679,19 +684,19 @@ def notice(what, rec, why, log):
         logline(log, f"cc-room: told {how}: {line}")
         return True
     logline(log, f"cc-room: could not tell anyone that {what} waits (the broker and cc-notify both refused; "
-                 f"try {rec.get('notice_tries', 1)} of {NOTICE_TRIES})")
+                 f"try {rec.get('notice_tries', 1)}; it tries again later)")
     return False
 
 
 def unheard(what, rec, why, log):
-    """NOTICE_TRIES refused notices: say so once in the dispatcher's repo channel (a plain --major cc-notify, a door
+    """UNHEARD_AFTER refused notices: say so once in the dispatcher's repo channel (a plain --major cc-notify, a door
     apart from the broker and the request file) rather than only in the log. -> True once that post was taken; the
     --id keeps a restart from saying it twice. The launch keeps waiting either way: nothing is dropped."""
-    logline(log, f"cc-room: nobody took the notice that {what} waits, after {NOTICE_TRIES} tries; saying so in its channel")
+    logline(log, f"cc-room: nobody took the notice that {what} waits, after {rec.get('notice_tries', UNHEARD_AFTER)} tries; saying so in its channel and still trying")
     mins = int((time.time() - rec["queued"]) // 60)
     stamp = time.strftime("%Y%m%dT%H%MZ", time.gmtime(rec["queued"]))
     line = (f"{what} has waited {mins // 60} h {mins % 60:02d} min in the worker queue: {why}. Its seat "
-            f"({rec.get('target', '?')}) did not take the notice after {NOTICE_TRIES} tries. It starts on its own "
+            f"({rec.get('target', '?')}) did not take the notice after {rec.get('notice_tries', UNHEARD_AFTER)} tries. It starts on its own "
             f"when there is room; `cc-room cancel {what}` drops it.")
     b = os.environ.get("CC_ROOM_BIN") or BIN
     try:

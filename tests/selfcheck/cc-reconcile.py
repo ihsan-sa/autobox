@@ -2772,9 +2772,8 @@ def selfcheck():
             globals()["sh"] = _shD
             if _loD is not None:
                 os.environ["CC_NOTIFY_LOG_ONLY"] = _loD
-        ok("…and off the harness digest_post posts --major --keep, so cc-slack's engagement gate never folds the digest "
-           "into itself in a control repo he has been away from: " + repr(argvD),
-           [a[:3] for a in argvD if a[:1] == ("post",)] == [("post", "--major", "--keep")])
+        ok("…and off the harness digest_post posts it --major to the box's own channel: " + repr(argvD),
+           [a[:3] for a in argvD if a[:1] == ("post",)] == [("post", "--major", "-c")])
     finally:
         restore(); shutil.rmtree(td, ignore_errors=True)
     # (e) digest: a queued row inside a live bundle is being written, so it counts under the bundle and not as queued

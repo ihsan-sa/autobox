@@ -2913,7 +2913,7 @@ class AtOnce(Fixture):
             def run_plan(self, root, m, plan, files, head_tree, base_tree="", **kw):
                 def run(check, tree, where, alone=False, **k):
                     return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
-                                    extra={"loaded": False, "fails": [],
+                                    extra={"loaded": False, "fails": [], "ends": True,
                                            "failed": self.counts[tree == head_tree]})
                 return {n: RUN.judge(T.Check(name=n, run="true"), head_tree, base_tree, runner=run)
                         for n in plan.checks}

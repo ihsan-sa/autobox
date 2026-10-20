@@ -46,7 +46,7 @@ with an `@` is that address, one without is that domain and its subdomains. Unse
 shape is keyed on the forwarded header and not on the mail's own From, and the forwarded header is text the
 sender typed, so it is trusted only as far as the sender is: a stranger's forward, a member's, and a `From:`
 line with no forward marker above it all take the read as before. It changes the verdict and nothing else —
-the mail is still delivered as mail, never with the owner's authority, and costs no read of the budget.
+the mail is still delivered as mail, never with the owner's authority, and costs no read.
 
 A SHAPE THE OWNER HAS LET THROUGH IS NOT HELD AGAIN (owner, 2026-10-06: "too much stuff gets stopped by the
 email vetter… it should be flexible and learn"). A mail's shape is three things: its sender, the domain of the
@@ -95,9 +95,8 @@ A MAIL WHOSE BODY CAME AS HTML IS STILL READ. A client that sends no text/plain 
 both reads is router.body_text() — the tags stripped out and the characters kept — and the links are the ones
 written in that text plus the href of every link in the source. The HTML is never rendered, opened or fetched.
 
-THE BUDGET IS PER MAIL AND PER SENDER PER DAY. Each read carries --max-budget-usd (MAIL_VET_COST, default
-0.05) and each sender gets MAIL_VET_DAY_MAX reads a UTC day (default 20), counted in
-~/.cc/state/mail/vet.json. A sender over it is held for a person, never dropped quietly.
+THE BUDGET IS PER MAIL. Each read carries --max-budget-usd (MAIL_VET_COST, default 0.05). There is no
+per-sender daily count: the allow-list already decides who can make the box spend a read.
 
 FAIL CLOSED, AND SAY WHY. A model that is not installed, times out, errs or answers with a word off the table
 gives `unread` — suspicious — because a mail nothing has read is exactly the one a person should see. A read
@@ -171,7 +170,6 @@ REASONS = {
     "link":        ("suspicious", "a link in it does not fit this sender's world"),
     "attachment":  ("suspicious", "an attachment in it does not fit this sender's world"),
     "unreadable":  ("suspicious", "an attachment could not be inspected inside the sandbox"),
-    "budget":      ("suspicious", "this sender is over the day's vetting budget"),
     "unread":      ("suspicious", "the vetting read did not run, so nobody has read this yet"),
     "scam":        ("refused", "it asks for money, credentials or access"),
     "phish":       ("refused", "it is dressed up as somebody else's mail"),
@@ -400,49 +398,6 @@ def forget(text):
         if gone:
             _save_shapes({k: v for k, v in d.items() if k not in gone})
     return gone
-
-
-# ---------------------------------------------------------------- the day's budget
-
-def _day():
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
-def spent(sender):
-    """How many reads this sender has had today. The file is one day's counts and is replaced when the day
-    turns, so it does not grow and yesterday is not evidence about today."""
-    try:
-        with open(os.path.join(STATE, "vet.json")) as f:
-            d = json.load(f)
-    except (OSError, ValueError):
-        return 0
-    if not isinstance(d, dict) or d.get("day") != _day():
-        return 0
-    return int((d.get("senders") or {}).get((sender or "").lower()) or 0)
-
-
-def charge(sender):
-    """One more read against this sender's day. Read-modify-write on a file only the daemon writes, so no lock:
-    a lost count costs a read, not a boundary."""
-    path = os.path.join(STATE, "vet.json")
-    try:
-        with open(path) as f:
-            d = json.load(f)
-        if not isinstance(d, dict) or d.get("day") != _day():
-            raise ValueError
-    except (OSError, ValueError):
-        d = {"day": _day(), "senders": {}}
-    d.setdefault("senders", {})
-    key = (sender or "").lower()
-    d["senders"][key] = int(d["senders"].get(key) or 0) + 1
-    try:
-        os.makedirs(STATE, exist_ok=True)
-        tmp = path + ".%d.tmp" % os.getpid()
-        with open(tmp, "w") as f:
-            json.dump(d, f, sort_keys=True)
-        os.replace(tmp, path)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- what the mail is weighed against
@@ -749,7 +704,7 @@ def vet(msg, dec, cfg=None):
     what the mail is weighed against — and `cfg` is the daemon's configuration.
 
     The order is the cost. The owner's forwarded digest and a shape he has let through before (digest(),
-    learned()) pass with no read at all, and the day's budget is checked before any model runs. A KNOWN SENDER — trusted(), off the
+    learned()) pass with no read at all. A KNOWN SENDER — trusted(), off the
     box's one list — then gets one read and no other: the destination question, with the mail's links and the
     sandbox's report on its files in front of it, and `fits` unless the mail does not belong in that channel or
     asks the box to break its rules. A stranger gets the cheap read next; the security read only happens when
@@ -760,14 +715,11 @@ def vet(msg, dec, cfg=None):
     ws = dec.workspace or ""
     known = trusted(sender, cfg)
     if digest(msg, dec, cfg):
-        return Verdict("digest", known=True)   # no read, so nothing charged to the day's budget
+        return Verdict("digest", known=True)   # no read
     if learned(msg, dec, cfg):
         return Verdict("learned", known=True)  # nor here
-    if spent(sender) >= max(1, int(cfg.get("MAIL_VET_DAY_MAX") or 20)):
-        return Verdict("budget", known=known)
     cost = cfg.get("MAIL_VET_COST") or "0.05"
     ftext, fsec = _fakes()
-    charge(sender)
 
     target = (dec.to or dec.cc or [None])[0]
     body = _router().body_text(msg)[:VET_MAX]   # `text`, or an HTML-only mail's body with its tags stripped

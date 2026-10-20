@@ -507,13 +507,14 @@ o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND
   && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' — and asks cc-land to queue it, whose refusal raises that card (P8f)" \
   || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
-# M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
+# M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going. Capped
+# work commits on runs 1-3 and nothing after; the --no-extend bound of 6 is what ends it (no count of caps does, owner 10-20).
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 echo "do capped work" > ~/.cc/state/$REPO/w2/task.md
-CC_CLAUDE="$T/cappedclaude" "$B/cc-loop" $REPO w2 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
+CC_CLAUDE="$T/cappedclaude" "$B/cc-loop" $REPO w2 --max-iter 6 --no-extend --quiet >/dev/null 2>&1; rc=$?
 runs=$(ls ~/.cc/state/$REPO/w2/runs/*.json 2>/dev/null | wc -l)
-{ [ "$rc" != 5 ] && [ "$runs" -gt 3 ]; } && ok "productive but capped iterations are not failures — the loop ran past its 3-step limit ($runs runs, not exit 5)" || bad "capped loop: rc=$rc runs=$runs"
+{ [ "$rc" = 6 ] && [ "$runs" = 6 ]; } && ok "capped iterations are neither failures nor a stop — three productive and three barren caps all ran to the caller's bound (6 runs, exit 6, not 5 or 7)" || bad "capped loop: rc=$rc runs=$runs"
 grep -q 'capped' ~/.cc/state/$REPO/w2/loop.log && [ "$("$B/cc-board" get $REPO w2 status)" = blocked ] && ok "cap logged + board left blocked, not running" || bad "capped log/board status"
 # H4: a killed loop must not leave claude re-parented to systemd, still editing the worktree
 "$B/cc" $REPO w3 >/dev/null 2>&1; sleep 1
@@ -521,7 +522,7 @@ for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " 
 echo "hang for a while" > ~/.cc/state/$REPO/w3/task.md
 # The kill proves something only if the fake claude was running when it came: no claude seen within the bound is a red
 # of its own, so a loop that never starts one cannot pass this as "no orphan".
-CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet >/dev/null 2>&1 & lp=$!
+CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --no-extend --quiet >/dev/null 2>&1 & lp=$!
 up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
@@ -532,7 +533,7 @@ wait $lp 2>/dev/null
 # H4b: …and from a launcher that IGNORES HUP — a `setsid nohup cc-loop` typed out of a session shell, the shape of the
 # relaunch-orphans incident. exec keeps SIG_IGN and bash cannot trap a signal ignored at entry, so the loop's HUP trap was a
 # no-op and its claude lived on. cc-loop puts its signals back to default at launch, before that trap is set.
-( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet ) >/dev/null 2>&1 & lp=$!
+( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --no-extend --quiet ) >/dev/null 2>&1 & lp=$!
 up=no; for _ in $(seq 1 30); do pgrep -f "$T/sleepclaude" >/dev/null && { up=yes; break; }; sleep 1; done
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done

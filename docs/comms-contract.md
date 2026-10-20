@@ -96,15 +96,11 @@ card gets ✅, and that seat is told by `cc-msg` to go ahead; nothing runs on th
 With no record or no seat on file the 👍 is still stamped, and the card's thread says no seat was told. A member's 👍
 stamps nothing.
 
-**How much a project tells the owner follows how much he has been in it lately.** His own messages and
-reactions in a project's channels over the last `CC_ENGAGE_DAYS` (3) days are its score, and `cc-slack post` is the
-one place a post is weighed against it (`engage_gate`). At `CC_ENGAGE_ACTIVE` (3) or more he gets everything. Below
-that, the `-updates` lane goes to the digest. At none, the main lane goes to the digest too, and the `-updates` lane
-to the journal alone (`~/.cc/slack/folded.jsonl`, read by `cc-slack folded` and the digest). A held post is on
-record, never dropped. Nothing his to move is ever held: a decision or approval, a post marked `--keep` (a failure
-or stop only he can shift; `cc-notify` adds it for a stop in the title or a high prio), a 🔐 card or
-`STATUS: BLOCKED`, a question, any threaded reply, a post for another session, or a channel members read.
-`CC_ENGAGE_DAYS=0` turns the gate off.
+**The lane is the poster's call, written, not enforced.** `cc-slack post` sends a post where it was aimed: no
+engagement gate, no redirect of a routine line off `#<repo>` and no move of a 🤖 post off the top level. Sessions
+are told in COMMS.md: routine progress goes to the log lane, `#<repo>` takes a question, a decision or `--major`, a
+post for another session goes in a thread, a seat that only answers back gets two turns, and one 🔐 grant card per
+refusal. The 🔐 card still refuses a credential key; the grant cap and the ping-pong count are gone.
 
 **`#<repo>-updates` is the one box log lane; nobody has to read it.**
 

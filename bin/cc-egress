@@ -17,10 +17,11 @@
 # `*` is every name and every global IP literal on every port, which is what a planning seat reaches.
 # An IP literal is refused unless the list names that literal (or has `*` and the literal is global), and a NAME that
 # resolves to a loopback, private, link-local or otherwise non-global address is refused whatever the list says, and
-# so is any address on the host's own interfaces or on-link with them, the home's own public IPv4 (asked of an echo
-# service at start and every few minutes), and any IPv6 form carrying an IPv4 address — no listed name reaches the
-# host's own services or the LAN. With no --allow, DEFAULT below: `*`, because a worker holds
-# no login and the owner's rule (2026-10-20) is a seat's access with a net, not a wall; the host's own services stay
+# so is any address on the host's own interfaces or on-link with them, the rest of the home's IPv6 prefix (a /48
+# around each own global address), the home's own public IPv4 (asked of an echo service at start and every few
+# minutes, and every answer kept box-wide in ~/.cc/state/egress-public-v4), and any IPv6 form carrying an IPv4
+# address — no listed name reaches the host's own services or the LAN. With no --allow, DEFAULT below: `*`, because
+# a worker holds no login and the owner's rule (2026-10-20) is a seat's access with a net, not a wall; the host's own services stay
 # walled, since nothing undoes a worker driving them. A narrower list is `cc-config set CC_EGRESS_ALLOW "<list>"`
 # (cc-sandbox reads it and passes it here), e.g. the old default: the model APIs, GitHub, npm and PyPI.
 # ONLY CONNECT: a plain-HTTP request (`GET http://…`) is refused. What CONNECT opens is a TCP tunnel to the named
@@ -92,13 +93,21 @@ def allowed(rules, host, port):
 # address of the tower (its IPv6 above all) is still the tower: sshd and anything bound to [::] or published by Docker
 # answer on it, and its neighbours in the same prefix are the LAN. The selfcheck points these at fake tables.
 IF_INET6, FIB_TRIE, ROUTE = "/proc/net/if_inet6", "/proc/net/fib_trie", "/proc/net/route"
+# The router's WAN IPv6 is on no interface here and no echo service can name it (IPv6 has no NAT, so they answer with
+# the tower's own). A router numbers it from the prefix the ISP delegated to the home, /48 at the widest, so the /48
+# around each own global address is walled: the router, the home's other subnets and nothing a worker needs. A router
+# numbered from a separate ISP link prefix is out of reach of this.
+HOME_V6 = 48
 # IPv6 forms that carry an IPv4 address (v4-compatible, v4-mapped, NAT64): refused whole, so none reaches a walled one.
 EMBEDS_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
 # The home's own public IPv4 is on no interface (the router holds it), yet the router may hairpin a connection to it back
 # onto the LAN, so it is walled too. Only an outside service can say what it is, so it is asked at start and every
 # PUBLIC_EVERY seconds after (IPv4-only endpoints, so the answer is never the IPv6 one), and a new lease is walled
-# within that. Every address seen stays walled: a past home address is nobody's server a worker needs.
+# within that. Every address seen stays walled: a past home address is nobody's server a worker needs. Each answer is
+# kept in PUBLIC_FILE, shared by every worker's proxy and read at each lookup, so a proxy whose echo services all fail
+# still walls every address any proxy has seen.
 PUBLIC_V4 = ("https://api.ipify.org", "https://ipv4.icanhazip.com")
+PUBLIC_FILE = os.path.expanduser("~/.cc/state/egress-public-v4")
 PUBLIC_EVERY = 300
 public = frozenset()     # replaced whole, never changed in place, so a connection's thread never sees it half-built
 
@@ -116,12 +125,20 @@ def lookup_public():
 
 def refresh_public(log):
     global public
+    try:
+        with open(PUBLIC_FILE) as fh:
+            kept = {ipaddress.IPv4Address(ln.strip()) for ln in fh if ln.strip()}
+    except (OSError, ValueError):
+        kept = set()
     a = lookup_public()
+    if a is not None and a not in kept:
+        os.makedirs(os.path.dirname(PUBLIC_FILE), exist_ok=True)
+        with open(PUBLIC_FILE, "a") as fh:
+            fh.write(f"{a}\n")
+    public = public | kept | ({a} if a else set())
     if a is None:
-        log("public IPv4 unknown: no echo service answered" + ("; still walling " + " ".join(map(str, sorted(public)))
-                                                              if public else ""))
-    elif a not in public:
-        public = public | {a}
+        log("public IPv4 lookup failed: no echo service answered; walling the kept "
+            + " ".join(map(str, sorted(public))) if public else "public IPv4 unknown: no echo service answered and none is kept")
 
 
 def watch_public(log):
@@ -140,6 +157,8 @@ def host_nets():
                 if len(f) >= 3 and int(f[2], 16):
                     own = ipaddress.IPv6Address(int(f[0], 16))
                     nets.append(ipaddress.ip_network((own, int(f[2], 16)), strict=False))
+                    if own.is_global:
+                        nets.append(ipaddress.ip_network((own, HOME_V6), strict=False))
     except (OSError, ValueError):
         pass
     try:
@@ -408,9 +427,10 @@ def selfcheck():
             print(f"  FAIL {name}: got {got!r} want {want!r}")
         else:
             print(f"  ok   {name}")
-    global PUBLIC_V4, public
+    global PUBLIC_V4, PUBLIC_FILE, public
     PUBLIC_V4 = ()      # no echo service is asked from here; the public-address case below feeds answers in
     d = tempfile.mkdtemp(prefix="cc-egress.")
+    PUBLIC_FILE = os.path.join(d, "state", "egress-public-v4")
     # A waiter polls for the path, then connects; a path that exists before listen() is a refused connect under load.
     early, seen = os.path.join(d, "early"), []
 
@@ -530,6 +550,22 @@ def selfcheck():
         t("`*` refuses the home's public IPv4 by literal and by name, and its new one after it changes",
           (before, first, resolve("5.5.5.6", 443, w)[1] is None, resolve("5.5.5.5", 443, w)[1] is None,
            resolve("1.1.1.1", 443, w)[1]), (True, ["403", "403"], False, False, None))
+        with open(PUBLIC_FILE) as fh:
+            t("each address an echo service answers is kept box-wide", fh.read(), "5.5.5.5\n5.5.5.6\n")
+        # A new proxy whose echo services all fail: what earlier proxies kept is still walled, and it says so.
+        with open(PUBLIC_FILE, "w") as fh:
+            fh.write("5.5.5.7\n")
+        public, said = frozenset(), []
+        globals()["lookup_public"] = lambda: None
+        refresh_public(said.append)
+        t("both echo services failing: a new proxy walls the address kept box-wide, and logs no 'unknown'",
+          (ask("CONNECT 5.5.5.7:443 HTTP/1.1")[0], said),
+          ("403", ["public IPv4 lookup failed: no echo service answered; walling the kept 5.5.5.7"]))
+        os.remove(PUBLIC_FILE)
+        public, said = frozenset(), []
+        refresh_public(said.append)
+        t("both echo services failing and nothing kept: it logs the address unknown",
+          said, ["public IPv4 unknown: no echo service answered and none is kept"])
     finally:
         socket.getaddrinfo = gai
         globals()["lookup_public"], public = look, frozenset()
@@ -553,6 +589,8 @@ def selfcheck():
           [ask(f"CONNECT {h} HTTP/1.1")[0] for h in ("[2606:4700:abcd::5]:22", "[2606:4700:abcd::77]:443",
                                                      "tower.example:22", "8.8.4.4:22", "9.9.9.9:443")],
           ["403"] * 5)
+        t("`*` refuses the router's WAN IPv6 in the home's /48, outside the tower's own /64",
+          ask("CONNECT [2606:4700:abcd:ff00::1]:443 HTTP/1.1")[0], "403")
         t("`*` refuses IPv4 inside IPv6 (v4-compatible, v4-mapped, NAT64)",
           [resolve(h, 443, w)[1] is None for h in ("::a00:1", "::ffff:10.0.0.1", "64:ff9b::808:404", "64:ff9b::101:101")],
           [False] * 4)

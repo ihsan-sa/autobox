@@ -349,8 +349,30 @@ PERMS_READS_LOCK = ".security-reads.lock"   # grant()'s flock, beside the ledger
 
 
 def repo_name(repo):
-    """'owner/demo' and 'demo' are one repo: a ledger entry may name either (Opus read of #1268)."""
+    """'demo' for 'owner/demo' or 'demo': the folder a repo's state lives in."""
     return str(repo).rsplit("/", 1)[-1]
+
+
+_BOX_OWNER = []
+
+
+def box_owner():
+    """The box's own GitHub owner, CC_GH_PERSONAL_OWNER, read once; "" when unset or unread."""
+    if not _BOX_OWNER:
+        from lander import members as MB
+        _BOX_OWNER.append((MB.config_read("CC_GH_PERSONAL_OWNER") or "").lower())
+    return _BOX_OWNER[0]
+
+
+def repo_key(repo):
+    """'owner/demo', how a ledger entry and a job are matched: either may name the repo with its owner or without
+    (Opus read of #1268), and a bare name is the box's own owner's, so a 'demo' under another owner never stands for
+    it (perms' read of #1691). With no owner read, a bare name matches only a bare name. None when `repo` is not a
+    non-empty string, and None matches nothing."""
+    if not isinstance(repo, str) or not repo:
+        return None
+    s, owner = repo.lower(), box_owner()
+    return s if "/" in s or not owner else f"{owner}/{s}"
 
 
 def perms_reads_path(repo):
@@ -396,9 +418,9 @@ def newest_reads(entries, repo, pr):
     """{head: the newest of `entries` for exactly this repo and PR at that head}, in the order those newest entries
     were appended. perms appends under a flock, so the last entry for a head is its newest verdict: a FIX perms
     records after its LAND at one head takes the LAND back (perms' follow-up to its LAND on #1564)."""
-    out = {}
+    out, key = {}, repo_key(repo)
     for e in entries:
-        if repo_name(e.get("repo")) == repo_name(repo) and e.get("pr") == pr and isinstance(e.get("head"), str):
+        if key and repo_key(e.get("repo")) == key and e.get("pr") == pr and isinstance(e.get("head"), str):
             out.pop(e["head"], None)
             out[e["head"]] = e
     return out
@@ -467,14 +489,14 @@ def carried_from(job):
     perms read (perms' read of #1624: LAND at X, the branch moved to Y, a HANDBACK written at Y, and X's LAND still
     carried to a later head), and a fresh LAND of Y is a read of Y, not of X (Opus read of #1628: with only each
     head's newest entry read, a LAND recorded at Y over that DO-NOT-LAND brought X's LAND back)."""
-    entries = perms_reads(job.repo)[0]
+    entries, key = perms_reads(job.repo)[0], repo_key(job.repo)
     newest = newest_reads(entries, job.repo, job.pr)
     if job.head in newest and newest[job.head].get("verdict", T.LAND) != T.LAND:
         return ""
     olds = []
     for e in entries:   # every entry, in the order perms appended them, not only each head's newest
         h = e.get("head")
-        if repo_name(e.get("repo")) != repo_name(job.repo) or e.get("pr") != job.pr or not isinstance(h, str):
+        if not key or repo_key(e.get("repo")) != key or e.get("pr") != job.pr or not isinstance(h, str):
             continue
         if e.get("verdict", T.LAND) != T.LAND:
             olds = []
