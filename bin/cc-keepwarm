@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""cc-keepwarm — keep an idle seat's prompt cache warm when it is likely to wake again.
+
+  cc-keepwarm                 what a tick would do now, one line a seat; types nothing
+  cc-keepwarm --apply         …and type the keepalive line at each seat the rule picks (cc-keepwarm.timer, 5 min)
+  cc-keepwarm replay [--hours N] [--json]
+                              the rule against this host's transcripts over the last N hours (default 48): the cache
+                              re-writes it would have saved, what its keepalives would have cost, how many were
+                              wasted, and the same for a grid of other rules. Reads only; asks no model.
+  cc-keepwarm selfcheck       fake panes and fake transcripts; no tmux, no model
+
+WHY. The prompt cache lives 1 h, and a read refreshes it. A seat that sleeps past the hour and is then woken writes
+its whole context again: about $1.60 for a 200k Opus seat, against a few cents for a one-line turn that only reads
+it. Measured on 2026-10-13/14: 97 own-thread wakes a day after more than 1 h idle, about $75/day of re-writes.
+
+THE TICK (--apply). Off unless `cc-config get CC_KEEPWARM` says 1 (on, yes, true); the timer runs either way and an
+off tick does nothing. It never types while cc-limit's stamp binds (`cc-limit status` rc 0). It walks session main
+and takes only planning, plain and orch seats (the pane's `cc __runmain|__runplain|__runorch`) and the perms window.
+Never a member (`__runmember`, or anything under cc-sandbox), a track, a worker, `box`, `_*`, or a window whose name
+holds `~` (a handoff's ~next / ~old). For each, from its transcript (the sid the live claude holds open):
+  idle      the last model call is IDLE_LO..IDLE_HI old: the cache still holds, and one tick lands in the window
+  parked    the transcript ends on a usage-limit error, or the pane shows a limit wall or its dialog: never typed at
+  busy      a turn is open (the transcript ends on a prompt or a tool result), or the pane says "esc to interrupt",
+            shows a dialog, is in copy mode, or has text in its input box (a person typing): never typed at
+  once      ~/.cc/state/keepwarm.json keeps the last call each sid was kept warm for: two ticks in one window send one
+  rule      likely() below — the same function the replay scores
+Then it types KEEPALIVE and Enter. Best effort: a seat that fails is a line in ~/.cc/state/keepwarm.log and the
+walk moves on; the tick exits 0.
+
+THE RULE, likely(f, chain, p). A seat is kept warm when its context is at least p.min_ctx (a small one is cheap to
+re-write), the keepalives already sent since its last real turn are under p.max_chain (a seat that has slept through
+that many hours is done), and either it has work out — a background task or Monitor it launched whose notification
+has not come back — or it took at least p.min_turns real turns in the LOOKBACK before it went idle. The keepalive
+turns themselves never count as turns. Its defaults are DEFAULT below; the replay prints the grid they were picked
+from, and they stay what the last host replay found best (put its numbers in the PR that changes them).
+"""
+import calendar, glob, json, os, re, subprocess, sys, time
+from collections import namedtuple
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+PROJECTS = os.environ.get("CC_KEEPWARM_PROJECTS") or os.path.join(HOME, ".claude", "projects")
+STATE = os.environ.get("CC_KEEPWARM_STATE") or f"{HOME}/.cc/state/keepwarm.json"
+LOG = os.environ.get("CC_KEEPWARM_LOG") or f"{HOME}/.cc/state/keepwarm.log"
+SESSION = os.environ.get("CC_KEEPWARM_SESSION") or "main"
+PROC = os.environ.get("CC_KEEPWARM_PROC") or "/proc"
+KEY = "CC_KEEPWARM"
+
+TTL = 3600                      # the prompt cache's life; a read refreshes it
+IDLE_LO, IDLE_HI = 50 * 60, 57 * 60   # the tick fires in here: a 5 min timer lands once, with 3 min to spare
+LOOKBACK = 6 * 3600             # how far back "it has been taking turns" looks
+TAIL_BYTES = 8 << 20            # the transcript read for a live seat: its tail covers the lookback
+MARK = "[keepwarm]"
+KEEPALIVE = (f"{MARK} Cache keepalive from the box, not a task: use no tools, change nothing, "
+             "and reply with a single period.")
+WORKING = "esc to interrupt"
+DIALOG_MARKS = ("Enter to confirm", "Esc to cancel", "Do you want to", "Would you like to proceed?",
+                "No, and tell Claude what to do differently", "Held message from another session")
+LIMIT_MARKS = ("What do you want to do?", "hit your limit", "hit your weekly limit", "hit your session limit",
+               "hit your monthly spend limit", "usage limit")
+SEAT_MODES = ("__runmain", "__runplain", "__runorch")
+SID_RE = re.compile(r"/claude-\d+/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
+
+# $ per token: input, 1 h cache write, cache read, output. The seats run on a plan; these are the API rates the
+# usage counts against, which is what the plan's weekly limit tracks closely enough to rank rules by.
+PRICES = {"claude-fable": (10e-6, 20e-6, 0.25e-6, 50e-6), "claude-mythos": (10e-6, 20e-6, 0.25e-6, 50e-6),
+          "claude-opus-5-5": (4e-6, 8e-6, 0.20e-6, 20e-6), "claude-opus": (5e-6, 10e-6, 0.50e-6, 25e-6),
+          "claude-sonnet": (2e-6, 4e-6, 0.20e-6, 10e-6), "claude-haiku": (0.10e-6, 0.20e-6, 0.01e-6, 0.50e-6)}
+# What a keepalive turn writes and outputs beyond reading the cache. Measured 2026-10-14 on a scratch Opus 5.5 session
+# (one process, a real turn then KEEPALIVE): 104 written, 22,617 read, 3 out, and it replied ".". Rounded up for the
+# reminders a seat's hooks add to a turn.
+KA_WRITE = int(os.environ.get("CC_KEEPWARM_KA_WRITE") or 300)
+KA_OUT = int(os.environ.get("CC_KEEPWARM_KA_OUT") or 20)
+HANDOFF_COST = 0.60             # the add-on's alternative to a cold resume: a handoff, as measured by autobox2
+
+Rule = namedtuple("Rule", "min_ctx max_chain min_turns")
+DEFAULT = Rule(min_ctx=60_000, max_chain=3, min_turns=2)
+
+
+def price(model):
+    for k in sorted(PRICES, key=len, reverse=True):
+        if (model or "").startswith(k):
+            return PRICES[k]
+    return PRICES["claude-opus-5-5"]
+
+
+def ts(s):
+    try:
+        return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) + float("0" + s[19:].rstrip("Z")[:4])
+    except (ValueError, TypeError):
+        return None
+
+
+def log(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{line}\n")
+    except OSError:
+        pass
+
+
+# ── a transcript, read into what the rule and the replay need ─────────────────────────────────────────────────
+Call = namedtuple("Call", "t ctx write read out model ka end")   # one model request; ka = inside a keepalive turn,
+                                                                  # end = it closed its turn (asked for no tool)
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def read_session(lines):
+    """A transcript's lines → {calls, turns (t of each real turn start), kas (each keepalive's), limits (t), bg (t, +1/-1),
+    open (a turn is in flight at the end), parked (it ends on a limit error), interactive}."""
+    s = {"calls": [], "turns": [], "kas": [], "limits": [], "bg": [], "open": False, "parked": False, "interactive": False}
+    seen, in_ka, last_model = set(), False, None
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("isSidechain"):
+            continue
+        t = ts(d.get("timestamp") or "")
+        if t is None:
+            continue
+        if d.get("entrypoint") == "cli":
+            s["interactive"] = True
+        kind, m = d.get("type"), d.get("message") or {}
+        if kind == "user":
+            c = m.get("content")
+            results = isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+            text = text_of(c)
+            if "<task-notification>" in text:
+                s["bg"].append((t, -1))
+            if not results and not d.get("isMeta"):
+                in_ka = MARK in text
+                s["kas" if in_ka else "turns"].append(t)
+            s["open"] = True
+        elif kind == "assistant":
+            if d.get("isApiErrorMessage") or m.get("model") == "<synthetic>":
+                if d.get("error") == "rate_limit" or "limit" in text_of(m.get("content")).lower():
+                    s["limits"].append(t); s["parked"] = True
+                s["open"] = False
+                continue
+            for b in m.get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    inp = b.get("input") or {}
+                    if b.get("name") == "Monitor" or inp.get("run_in_background") is True or (
+                            b.get("name") == "Agent" and inp.get("run_in_background") is not False):
+                        s["bg"].append((t, +1))
+            s["open"] = (m.get("stop_reason") == "tool_use")
+            s["parked"] = False
+            mid = m.get("id") or d.get("requestId")
+            u = m.get("usage") or {}
+            if not mid or mid in seen or not u:
+                continue
+            seen.add(mid)
+            w, r, i = u.get("cache_creation_input_tokens") or 0, u.get("cache_read_input_tokens") or 0, u.get("input_tokens") or 0
+            s["calls"].append(Call(t, w + r + i, w, r, u.get("output_tokens") or 0, m.get("model"), in_ka,
+                                    m.get("stop_reason") != "tool_use"))
+    return s
+
+
+def features(s, upto):
+    """What likely() reads, from everything up to and including the call at `upto` (no look-ahead)."""
+    real = [c for c in s["calls"] if c.t <= upto and not c.ka]
+    last_real = real[-1].t if real else upto
+    chain = sum(1 for t in s["kas"] if last_real < t <= upto)
+    out = sum(v for t, v in s["bg"] if t <= upto)
+    turns = sum(1 for t in s["turns"] if last_real - LOOKBACK <= t <= last_real)
+    ctx = next((c.ctx for c in reversed(s["calls"]) if c.t <= upto), 0)
+    return {"ctx": ctx, "chain": chain, "bg_out": max(0, out), "turns": turns}
+
+
+def likely(f, p=DEFAULT):
+    if f["ctx"] < p.min_ctx or f["chain"] >= p.max_chain:
+        return False
+    return f["bg_out"] > 0 or f["turns"] >= p.min_turns
+
+
+# ── the live tick ──────────────────────────────────────────────────────────────────────────────────────────────
+class Host:
+    """Everything the tick reads or does to the box, so the selfcheck can stand a fake in its place."""
+
+    def run(self, *a, timeout=10):
+        try:
+            r = subprocess.run(list(a), capture_output=True, text=True, timeout=timeout)
+            return r.returncode, r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return 127, ""
+
+    def enabled(self):
+        if KEY in os.environ:
+            v = os.environ[KEY]
+        else:
+            v = self.run(os.path.join(BIN, "cc-config"), "get", KEY, "0")[1].strip()
+        return v.lower() in ("1", "on", "yes", "true")
+
+    def limit_binds(self):
+        return self.run(os.path.join(BIN, "cc-limit"), "status")[0] == 0
+
+    def windows(self):
+        rc, out = self.run("tmux", "list-windows", "-t", SESSION, "-F", "#{window_id}\t#W\t#{pane_pid}\t#{pane_in_mode}")
+        rows = []
+        for line in out.splitlines() if rc == 0 else []:
+            p = line.split("\t")
+            if len(p) == 4 and p[0] not in (r[0] for r in rows):
+                rows.append((p[0], p[1], p[2], p[3] == "1"))
+        return rows
+
+    def screen(self, wid):
+        rc, out = self.run("tmux", "capture-pane", "-p", "-t", wid)
+        return out if rc == 0 else None
+
+    def argv(self, pid):
+        try:
+            with open(f"{PROC}/{pid}/cmdline", "rb") as f:
+                return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            return []
+
+    def tree(self, pid):
+        todo, seen = [str(pid)], []
+        while todo:
+            p = todo.pop(0)
+            if p in seen:
+                continue
+            seen.append(p)
+            try:
+                with open(f"{PROC}/{p}/task/{p}/children") as f:
+                    todo += f.read().split()
+            except OSError:
+                pass
+        return seen
+
+    def kind(self, name, pane_pid):
+        """seat | perms | None (anything this tool never types at)."""
+        if name in ("box",) or name.startswith("_") or "~" in name:
+            return None
+        tree = [self.argv(p) for p in self.tree(pane_pid)]
+        words = [w for a in tree for w in a]
+        if any(os.path.basename(w) in ("cc-sandbox", "cc-loop") or w == "__runmember" for w in words):
+            return None
+        if name == "perms" and any("--dangerously-skip-permissions" in a for a in tree):
+            return "perms"
+        mode = next((w for w in self.argv(pane_pid) if w.startswith("__run")), None)
+        return "seat" if mode in SEAT_MODES else None
+
+    def transcript(self, pane_pid):
+        for p in self.tree(pane_pid):
+            a = self.argv(p)
+            if not a or os.path.basename(a[0]) != "claude" or "-p" in a or "--print" in a:
+                continue
+            try:
+                fds = os.listdir(f"{PROC}/{p}/fd")
+            except OSError:
+                return None
+            for fd in sorted(fds):
+                try:
+                    m = SID_RE.search(os.readlink(f"{PROC}/{p}/fd/{fd}"))
+                except OSError:
+                    continue
+                if m:
+                    hits = glob.glob(os.path.join(PROJECTS, "*", m.group(1) + ".jsonl"))
+                    return hits[0] if hits else None
+            return None
+        return None
+
+    def type(self, wid, text):
+        if self.run("tmux", "send-keys", "-t", wid, "-l", "--", text)[0] != 0:
+            return False
+        time.sleep(0.4)
+        return self.run("tmux", "send-keys", "-t", wid, "Enter")[0] == 0
+
+
+def tail_lines(path):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - TAIL_BYTES))
+        data = f.read()
+    lines = data.split(b"\n")
+    if size > TAIL_BYTES:
+        lines = lines[1:]
+    return [l.decode(errors="replace") for l in lines if l.strip()]
+
+
+def pane_says(scr):
+    """busy | dialog | parked | typing | None, from the visible pane."""
+    if WORKING in scr:
+        return "busy"
+    bottom = "\n".join(scr.rstrip("\n").splitlines()[-12:]).lower()   # a wall is drawn at the bottom; above it is transcript
+    if any(m.lower() in bottom for m in LIMIT_MARKS):
+        return "parked"
+    if any(m in scr for m in DIALOG_MARKS):
+        return "dialog"
+    box = [l for l in scr.splitlines() if re.match(r"^[\s│]*(❯|>)", l)]
+    if box and re.sub(r"^[\s│]*(❯|>)\s*", "", box[-1]).strip(" │"):
+        return "typing"
+    return None
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save(st):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE)
+    except OSError as e:
+        log(f"-\terror\tstate: {e}")
+
+
+def decide(host, wid, name, pane_pid, in_mode, st, now):
+    """(verdict, why, sid, last). verdict is send or skip."""
+    k = host.kind(name, pane_pid)
+    if not k:
+        return "skip", "not a seat", None, None
+    if in_mode:
+        return "skip", "copy mode", None, None
+    path = host.transcript(pane_pid)
+    if not path:
+        return "skip", "no transcript", None, None
+    sid = os.path.basename(path)[:-6]
+    s = read_session(tail_lines(path))
+    if s["parked"]:
+        return "skip", "parked at a limit", sid, None
+    if s["open"]:
+        return "skip", "mid-turn", sid, None
+    if not s["calls"]:
+        return "skip", "no calls", sid, None
+    last = s["calls"][-1].t
+    idle = now - last
+    # brief: "finds tmux seats … that have been idle about 50-55 minutes" — inside the hour the cache still holds
+    if not IDLE_LO <= idle <= IDLE_HI:
+        return "skip", f"idle {int(idle // 60)} min", sid, last
+    if st.get(sid) == last:
+        return "skip", "already kept warm for this call", sid, last
+    f = features(s, last)
+    # brief: "sends a keepalive turn only to those a rule says will likely wake again within a few hours"
+    if not likely(f):
+        return "skip", "rule: unlikely to wake ({ctx} ctx, {turns} turns, {bg_out} out, chain {chain})".format(**f), sid, last
+    scr = host.screen(wid)
+    if scr is None:
+        return "skip", "pane unreadable", sid, last
+    said = pane_says(scr)
+    if said:
+        return "skip", f"pane {said}", sid, last
+    return "send", "{ctx} ctx, {turns} turns, {bg_out} out, chain {chain}".format(**f), sid, last
+
+
+def tick(host, apply_, now=None):
+    now = time.time() if now is None else now
+    if not host.enabled():
+        if not apply_:
+            print(f"off: cc-config {KEY} is not 1")
+        return []
+    if host.limit_binds():
+        log("-\tskip\tcc-limit binds: nobody is typed at")
+        if not apply_:
+            print("cc-limit binds: nobody is typed at")
+        return []
+    st, sent = load(), []
+    for wid, name, pane_pid, in_mode in host.windows():
+        try:
+            verdict, why, sid, last = decide(host, wid, name, pane_pid, in_mode, st, now)
+            if verdict == "send" and apply_:
+                st[sid] = last; save(st)           # stamped first: a crash between the two never types twice
+                ok = host.type(wid, KEEPALIVE)
+                log(f"{name}\t{'sent' if ok else 'type-failed'}\t{why}")
+                if ok:
+                    sent.append(name)
+            elif verdict == "send":
+                print(f"{name}\twould send\t{why}")
+            elif not apply_:
+                print(f"{name}\tskip\t{why}")
+        except Exception as e:                    # best effort: one seat's failure is a line, never the walk's end
+            log(f"{name}\terror\t{e.__class__.__name__}: {e}")
+    if apply_:
+        cut = now - 2 * 86400
+        save({k: v for k, v in st.items() if isinstance(v, (int, float)) and v > cut})
+    return sent
+
+
+# ── the replay ────────────────────────────────────────────────────────────────────────────────────────────────
+def replay_session(s, p, start, end):
+    """Score rule p on one session over [start, end]. Ticks fire IDLE_LO + 2.5 min after the cache was last touched."""
+    r = {"saved": 0.0, "ka_cost": 0.0, "ka": 0, "wasted": 0, "cold": 0, "cold_cost": 0.0, "warmed": 0,
+         "resume_cold": 0, "resume_cost": 0.0}
+    calls = [c for c in s["calls"] if not c.ka]
+    fire = IDLE_LO + 150
+    for i, c in enumerate(calls):
+        nxt = calls[i + 1] if i + 1 < len(calls) else None
+        wake = nxt.t if nxt else end
+        if c.t < start - TTL or c.t > end:
+            continue
+        wp, rp, op = price(c.model)[1], price(c.model)[2], price(c.model)[3]
+        # the add-on: a cold resume after a limit or a model switch, on a seat over 100k
+        if nxt and nxt.t >= start and nxt.ctx >= 100_000 and nxt.write > 0.5 * nxt.ctx and nxt.t - c.t <= TTL and (
+                any(c.t <= t <= nxt.t for t in s["limits"]) or nxt.model != c.model):
+            r["resume_cold"] += 1; r["resume_cost"] += nxt.write * price(nxt.model)[1]
+        cold = nxt and nxt.t - c.t > TTL and nxt.t >= start
+        if cold:
+            r["cold"] += 1; r["cold_cost"] += nxt.write * price(nxt.model)[1]
+        touched, chain, sent = c.t, 0, 0
+        f = features(s, c.t)
+        while c.end:                              # a turn still open (a long tool) is never typed into
+            at = touched + fire
+            if at >= wake or at > end:
+                break
+            if any(c.t < t <= at for t in s["limits"]):
+                break
+            f["chain"] = chain
+            if not likely(f, p):
+                break
+            if at >= start:
+                r["ka"] += 1; sent += 1
+                r["ka_cost"] += f["ctx"] * rp + KA_WRITE * wp + KA_OUT * op
+            touched, chain = at, chain + 1
+            f["ctx"] += KA_WRITE
+        if not sent:
+            continue
+        if cold and wake - touched <= TTL:
+            r["warmed"] += 1
+            delta = max(0, nxt.ctx - c.ctx) + KA_WRITE * chain
+            r["saved"] += max(0, nxt.write - delta) * (price(nxt.model)[1] - price(nxt.model)[2])
+        else:
+            r["wasted"] += sent
+    return r
+
+
+def sessions(hours, now):
+    start = now - hours * 3600
+    out = []
+    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < start:
+                continue
+            with open(path, errors="replace") as f:
+                s = read_session(f)
+        except OSError:
+            continue
+        if s["interactive"] and s["calls"]:
+            out.append(s)
+    return out, start
+
+
+def score(ss, p, start, end):
+    tot = dict.fromkeys(("saved", "ka_cost", "ka", "wasted", "cold", "cold_cost", "warmed", "resume_cold", "resume_cost"), 0)
+    for s in ss:
+        for k, v in replay_session(s, p, start, end).items():
+            tot[k] += v
+    tot["net"] = tot["saved"] - tot["ka_cost"]
+    return tot
+
+
+GRID = [Rule(c, m, t) for c in (0, 30_000, 60_000, 100_000, 150_000) for m in (1, 2, 3, 4) for t in (0, 1, 2, 4, 8)]
+
+
+def replay(argv):
+    hours = float(argv[argv.index("--hours") + 1]) if "--hours" in argv else 48.0
+    now = time.time()
+    ss, start = sessions(hours, now)
+    base = score(ss, DEFAULT, start, now)
+    grid = sorted(((score(ss, p, start, now), p) for p in GRID), key=lambda x: -x[0]["net"])
+    days = hours / 24
+    if "--json" in argv:
+        print(json.dumps({"hours": hours, "sessions": len(ss), "default": [DEFAULT._asdict(), base],
+                          "grid": [[p._asdict(), t] for t, p in grid]}))
+        return 0
+    print(f"replay over {hours:g} h, {len(ss)} interactive sessions, keepalive = {KA_WRITE} written + {KA_OUT} out")
+    print(f"cold re-writes (a wake after more than {TTL // 60} min idle): {base['cold']}, ${base['cold_cost']:.2f} "
+          f"(${base['cold_cost'] / days:.2f}/day)")
+    def line(t, p):
+        return (f"min_ctx {p.min_ctx // 1000:>3}k max_chain {p.max_chain} min_turns {p.min_turns}: "
+                f"saved ${t['saved']:.2f} on {t['warmed']} wakes, keepalives {t['ka']} cost ${t['ka_cost']:.2f}, "
+                f"{t['wasted']} wasted, net ${t['net']:.2f} (${t['net'] / days:.2f}/day)")
+    print("DEFAULT  " + line(base, DEFAULT))
+    print("best of the grid:")
+    for t, p in grid[:8]:
+        print("  " + line(t, p))
+    rc, rcost = base["resume_cold"], base["resume_cost"]
+    print(f"add-on (a cold resume over 100k after a limit or a model switch): {rc} re-writes, ${rcost:.2f}; "
+          f"a handoff each instead ${rc * HANDOFF_COST:.2f}, net ${rcost - rc * HANDOFF_COST:.2f}")
+    return 0
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-keepwarm.py, run in THIS namespace (as cc-stall does)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tests", "selfcheck", "cc-keepwarm.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["replay"]:
+        return replay(argv[1:])
+    if argv and argv != ["--apply"]:
+        print(__doc__.split("\n\n")[0], file=sys.stderr)
+        return 2
+    try:
+        tick(Host(), argv == ["--apply"])
+    except Exception as e:                          # a timer job never goes red over one bad read
+        log(f"-\terror\t{e.__class__.__name__}: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
