@@ -386,8 +386,13 @@ def door_write(door, kind, sender, body):
 
     def run(argv, env=None):
         try:
-            return subprocess.run(argv, input=body, capture_output=True, text=True, timeout=30, env=env)
-        except (OSError, subprocess.SubprocessError):
+            return subprocess.run(argv, input=body, capture_output=True, text=True, env=env,
+                                  timeout=float(os.environ.get("CC_DESK_DOOR_TIMEOUT") or 30))
+        except subprocess.TimeoutExpired:
+            print(f"cc-desk: writing {door} timed out, so nothing was written and nothing else was tried",
+                  file=sys.stderr)
+            return None
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
     try:
         seat = pwd.getpwnam(user).pw_uid
@@ -407,7 +412,7 @@ def door_write(door, kind, sender, body):
             # the brief: "Give cc-desk.service a path that reaches the seat user: drop NoNewPrivileges for that unit
             # only if nothing else works" — the user manager runs the line outside this unit's flag
             argv = [os.environ.get("CC_DESK_SYSTEMD_RUN") or "systemd-run", "--user", "--quiet", "--collect",
-                    "--pipe", "--wait", "--", *argv]
+                    "--expand-environment=no", "--pipe", "--wait", "--", *argv]
             env = dict(os.environ)
             if not env.get("XDG_RUNTIME_DIR"):         # a system unit has none, and systemd-run needs the bus
                 env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
@@ -1209,11 +1214,27 @@ def selfcheck():
         dargs = (got("svc", "sdrun.args") or "").split("\n")
         ok("under no_new_privs (cc-desk.service) the seat line goes through the user manager and still writes "
            "as the seat user, not the helper",
-           rc == 0 and dargs[:dargs.index("--")] == ["--user", "--quiet", "--collect", "--pipe", "--wait"]
+           rc == 0 and dargs[:dargs.index("--")] == ["--user", "--quiet", "--collect", "--expand-environment=no",
+                                                  "--pipe", "--wait"]
            and dargs[dargs.index("--") + 1:dargs.index("--") + 5] == [os.path.join(T, "svc", "sudo"), "-n", "-u",
                                                                       me_name]
            and got("svc", "sdrun.xdg") == f"/run/user/{os.getuid()}"
            and got("svc", "in") == START_PREFIX + "Write the spec." and got("svc", "helper.in") is None)
+        rc, out, err = seat_case("warn", 'echo "sudo: warning: unable to resolve host" >&2; shift 3; exec "$@"\n',
+                                 copy_body='printf x >> "$HOME/{n}.count"; cat >> "$HOME/{n}.in"; exit 3\n')
+        ok("a warning from the root call then a failed copy: the ask is written exactly once, through the door, "
+           "never again by the helper",
+           rc == 1 and got("warn", "count") == "x" and got("warn", "in") == START_PREFIX + "Write the spec."
+           and got("warn", "helper.in") is None and "failed:" in err)
+        rc, out, err = seat_case("slow", 'sleep 5\n', CC_DESK_DOOR_TIMEOUT="0.5")
+        ok("a root call that times out is a failure, said, and never a write through the helper",
+           rc == 1 and got("slow", "helper.in") is None and got("slow", "in") is None and "timed out" in err)
+        rc, out, err = seat_case("lit", SUDO_RUNS, CC_DESK_NO_NEW_PRIVS="1", CC_DESK_DOOR_FROM="a${HOME}b")
+        dl = (got("lit", "sdrun.args") or "").split("\n")
+        ok("a sender holding a literal ${HOME} reaches the seat copy as typed, and systemd-run is told not to "
+           "expand it",
+           rc == 0 and "--expand-environment=no" in dl[:dl.index("--")] and "a${HOME}b" in dl
+           and (got("lit", "sudo.args") or "").split("\n")[6] == "a${HOME}b")
         rc, out, _ = run("start", "repo", "Add a page.")
         sent = open(os.path.join(T, "msg")).read()
         ok("start with no door goes to the repo's planning seat as a row",

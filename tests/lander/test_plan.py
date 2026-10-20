@@ -511,6 +511,30 @@ class DeadWeight(unittest.TestCase):
         files.base["core/bin/cc-ghost"] = files.head["core/bin/cc-ghost"] = "blob:ghost"
         self.assertEqual(M.widen_faults(base, head, files), ["check 'ghost' was removed"])
 
+    GUARD = textwrap.dedent('''
+        [[check]]
+        name = "guard-replay"
+        run = 'tests/guard-replay.sh'
+        paths = ["bin/cc-guard", "bin/cc-guard-argv", "tests/guard-replay.sh", "tests/guard-replay.jsonl"]
+        class = "hermetic"
+    ''')
+
+    def test_guard_replay_never_goes_as_dead(self):
+        """2026-10-19, perms' read of #1453: a head deleting guard-replay's run file and every path it lists dropped
+        the check, and landed with no guard replay at all."""
+        files = self.trees()
+        guard = ("bin/cc-guard", "bin/cc-guard-argv", "tests/guard-replay.sh", "tests/guard-replay.jsonl")
+        for f in guard:
+            files.base["core/" + f] = "blob:" + f
+        base, head = AddOnly.two(None, self.BASE, self.BASE + self.GUARD)
+        self.assertEqual(M.widen_faults(base, head, files), ["check 'guard-replay' was removed"])
+        self.assertIn("guard-replay", M.widen(base, head, files).checks)
+        # the same check under another name is dead weight and goes: only the name keeps it
+        other = (self.BASE + self.GUARD).replace('"guard-replay"', '"other"')
+        base, head = AddOnly.two(None, self.BASE, other)
+        self.assertEqual(M.widen_faults(base, head, files), [])
+        self.assertNotIn("other", M.widen(base, head, files).checks)
+
     def test_a_check_added_before_its_tool_is_refused(self):
         base, head = AddOnly.two(None, self.BASE + self.GHOST, self.BASE)
         self.assertEqual(M.widen_faults(base, head, self.trees()),

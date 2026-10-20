@@ -14,7 +14,7 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   box      by class — static, hermetic, timing and every host check the laptop may take in the bwrap profile
            (sandbox.py), as the laptop's cage runs them: a PR head is code a worker wrote, never run as the box's
            user (manifest.on_host; perms' reviewer, 10-19). Box checks and the host checks that need this host
-           (bare, or no laptop in `where`) on the host with the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
+           (bare, or no laptop in `where`; on a PR head, only after perms' LAND at it, lane.Lane.host_unread) on the host with the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
            under cc-nosignal, so a check signals only what it started (the user manager went down on 2026-10-02).
            A check that says bare = true runs without it: its cases read what cc-nosignal's Landlock domain hides
            (cc-member-v2 reading a live sandbox's /proc/<pid>/fd, cc-fence's no_new_privs case), and nothing leaves

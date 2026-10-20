@@ -6,6 +6,7 @@ HOME and its own fake wrappers, and both sides are asserted: with no working wra
 named, and a wrapper that works is never reported as unnested.
 """
 import contextlib
+import fcntl
 import importlib.util
 import io
 import os
@@ -94,28 +95,84 @@ class OwnPidns(unittest.TestCase):
     # stands in for them here.
     def selfcheck_with(self, own_rc, env=None):
         calls = []
-        self.mod.cases = lambda m, nested: calls.append(nested) or 5
+        self.mod.cases = lambda m, plant: calls.append(plant) or 5
         self.mod.own_pidns = lambda m: own_rc
-        saved = os.environ.pop(self.mod.HOSTNS, None)
-        if env is not None:
-            os.environ[self.mod.HOSTNS] = env
+        saved = {k: os.environ.pop(k, None) for k in (self.mod.HOSTNS, self.mod.PLANT)}
+        os.environ.update(env or {})
         try:
             return self.mod.selfcheck(Launcher), calls
+        except SystemExit as exc:
+            return str(exc), calls
         finally:
-            os.environ.pop(self.mod.HOSTNS, None)
-            if saved is not None:
-                os.environ[self.mod.HOSTNS] = saved
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
 
     def test_no_namespace_runs_the_cases_unnested(self):
-        self.assertEqual(self.selfcheck_with(None), (5, [False]))
+        self.assertEqual(self.selfcheck_with(None), (5, [None]))
 
     def test_a_nested_run_returns_its_own_code_and_runs_no_cases_out_here(self):
         self.assertEqual(self.selfcheck_with(0), (0, []))
         self.assertEqual(self.selfcheck_with(1), (1, []))
 
-    def test_inside_the_namespace_the_cases_run_nested(self):
-        self.assertEqual(self.selfcheck_with(None, env="pid:[1]"), (5, [True]))
+    # THE RUN INSIDE PROVES IT IS ONE. Each case opens its own descriptors: the host's pid namespace and the lock
+    # under this case's HOME, held as own_pidns holds it.
+    def fd(self, path, flags=os.O_RDONLY):
+        f = os.open(path, flags | os.O_CLOEXEC, 0o600)
+        self.addCleanup(os.close, f)
+        return f
 
+    def held_lock(self):
+        d = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
+        d.mkdir(parents=True)
+        f = self.fd(d / "lock", os.O_RDWR | os.O_CREAT)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+
+    def proof(self, host, lock):
+        return {self.mod.HOSTNS: f"{host} {lock}", self.mod.PLANT: "EACCES"}
+
+    def test_the_variables_alone_are_refused_and_run_no_case(self):
+        # The bypass perms' read found: any text and EACCES ran the cases on the host with no namespace or lock.
+        for text in ("x", "pid:[4026531836]", "3 4"):
+            rc, calls = self.selfcheck_with(None, {self.mod.HOSTNS: text, self.mod.PLANT: "EACCES"})
+            self.assertRegex(rc, r"^cc-member-v2 selfcheck: refused: CC_MEMBER_V2_HOST_PIDNS is set but ", text)
+            self.assertEqual(calls, [], text)
+
+    def test_this_runs_own_namespace_is_refused(self):
+        rc, calls = self.selfcheck_with(None, self.proof(self.fd("/proc/self/ns/pid"), self.held_lock()))
+        self.assertIn("this run is in that pid namespace, not one of its own", rc)
+        self.assertEqual(calls, [])
+
+    def test_a_namespace_that_is_not_a_pid_one_is_refused(self):
+        rc, calls = self.selfcheck_with(None, self.proof(self.fd("/proc/self/ns/net"), self.held_lock()))
+        self.assertIn("its first descriptor is no pid namespace", rc)
+        self.assertEqual(calls, [])
+
+    def test_a_proof_that_holds_runs_the_cases_nested(self):
+        # This process's pid namespace stands for the host's; the run's own is read off its net namespace, which is
+        # also on nsfs and is not that pid namespace. Only the inode comparison is stood in for.
+        self.mod.SELF_PIDNS = "/proc/self/ns/net"
+        self.assertEqual(self.selfcheck_with(None, self.proof(self.fd("/proc/self/ns/pid"), self.held_lock())),
+                         (5, ["EACCES"]))
+
+    def test_a_lock_another_run_holds_is_refused(self):
+        self.mod.SELF_PIDNS = "/proc/self/ns/net"
+        mine = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck/lock"
+        self.held_lock()   # another selfcheck's open of the same file
+        rc, calls = self.selfcheck_with(None, self.proof(self.fd("/proc/self/ns/pid"), self.fd(mine, os.O_RDWR)))
+        self.assertIn(f"another selfcheck holds {mine}", rc)
+        self.assertEqual(calls, [])
+
+    def test_a_descriptor_on_another_file_is_refused(self):
+        self.mod.SELF_PIDNS = "/proc/self/ns/net"
+        self.held_lock()
+        other = self.root / "other"
+        other.write_text("")
+        rc, calls = self.selfcheck_with(None, self.proof(self.fd("/proc/self/ns/pid"), self.fd(other)))
+        self.assertIn("its second descriptor is not ", rc)
+        self.assertEqual(calls, [])
 
 if __name__ == "__main__":
     unittest.main()

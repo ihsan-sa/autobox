@@ -22,7 +22,8 @@ fewer or later runs), a policy entry removed. The one exception is dead weight t
 an entry is gone when it names a file in the base tree and none in the head's (a glob by match, a plain path as
 itself or a directory above files), and no base file it names has its blob at any path in the head (a move or a
 rename keeps it). Given the two trees, a head may then remove a check whose run line names a file (run_files) and
-whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone. A run line names a file by
+whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone, except a check in KEPT
+(guard-replay), whose removal is always a fault. A run line names a file by
 a relative path or by a dotted module after `-m` or `-mX` (tests.test_x is tests/test_x.py; run_files); a file
 git's -M sees renamed, edited or not, is not gone. A check whose run line names files and none of them is in either tree never ran
 here, so a head may remove it too (never_ran; 2026-10-13 #1046 and #1154 left checks on main for tools only unmerged
@@ -78,6 +79,10 @@ CLASS_RANK = {T.STATIC: 0, T.HERMETIC: 1, T.TIMING: 1, T.BOX: 2, T.HOST: 3}
 UNSANDBOXED = (T.BOX, T.HOST)
 NEW_DEFAULT = T.HERMETIC
 BUILTIN = "manifest-widen"
+# Checks a head may never remove as dead (dead_check): the guard's refusal replay and its differential against main's
+# guard. 2026-10-19, perms' read of #1453: a head that deleted guard-replay's run file and every path it lists, cc-guard
+# included, dropped the check and landed with no replay at all.
+KEPT = ("guard-replay", "guard-replay-box")
 # A check's name goes into the queue log as `gate=<name>` and keys its recorded run times (events.lead_times): a name
 # with a space or `=` in it could write fields of its own there (2026-10-07, #969's security read)
 NAME_RE = re.compile(r"[\w.-]+")
@@ -92,8 +97,8 @@ def on_host(c: T.Check) -> bool:
     needs this host — bare, or a `where` that names no laptop. Every other host check runs in the bwrap profile on
     the box (run.py), as the laptop's cage already runs it: a PR head is code a worker wrote, and a worker reads the
     web, issue text and members' asks, so the head never runs as the box's user before a read (perms' reviewer,
-    10-19: selfcheck-cc-lib ran a head's cc-lib on the host). These still run on the host before the merge: a read
-    before that run is the open half (raised-lander-runs-pr-code-on-the-host's journal has the groups)."""
+    10-19: selfcheck-cc-lib ran a head's cc-lib on the host). These run on the host only after perms' security LAND
+    is recorded at that exact head: the lane holds them till then (lane.Lane.host_unread; perms' LAND on #1561)."""
     return c.klass == T.BOX or (c.klass == T.HOST and (c.bare or "laptop" not in c.where))
 
 
@@ -469,7 +474,9 @@ def gone(entry: str, files) -> bool:
 def dead_check(b: T.Check, cwd: str, files) -> bool:
     """The head may remove base check b: its run line names a file (run_files; `-m unittest tests.x` names
     tests/x.py), and every run file, path and fixture it names is gone in this head; or its run files name nothing
-    in either tree (never_ran), so it could not run on the base and cannot on the head."""
+    in either tree (never_ran), so it could not run on the base and cannot on the head. A check in KEPT never is."""
+    if b.name in KEPT:
+        return False
     run = [cwd + w for w in run_files(b.run)]
     return never_ran(run, files) or bool(run) and all(gone(x, files) for x in run + b.paths + b.fixtures)
 

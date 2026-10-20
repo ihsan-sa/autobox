@@ -44,8 +44,15 @@ def descendants(pid):
 # ('live namespace 2186232 cannot be inspected (fd/: EACCES)') held main red for 40 of 46 gate-hours in the week to
 # 2026-10-13. So the cases run again inside a pid namespace with a fresh /proc, and every refusal they assert is
 # planted inside it. cc-member-v2 itself is unchanged: a live provision still walks the whole box.
-HOSTNS = "CC_MEMBER_V2_HOST_PIDNS"   # set for the run inside: the host's pid namespace, which must not be its own
+HOSTNS = "CC_MEMBER_V2_HOST_PIDNS"   # set for the run inside: "<fd> <fd>", the host's pid namespace and the lock
 PLANT = "CC_MEMBER_V2_HOST_PLANT"    # …and what the host read of the uninspectable process it planted beside the run
+# THE RUN INSIDE TAKES NOTHING ON THE ENVIRONMENT'S WORD. When HOSTNS named the namespace as text, setting it to
+# anything and PLANT to EACCES ran the cases on the host's /proc with no namespace and no lock, and passed them (perms'
+# read of #1318, 2026-10-20). Now it names two descriptors own_pidns opened and handed down, which a variable alone
+# cannot carry, and `inside` refuses unless the first is a pid namespace that is not this process's and the second
+# is the selfcheck lock, held. PLANT is read only after both hold.
+NS_GET_NSTYPE, CLONE_NEWPID = 0xb703, 0x20000000
+SELF_PIDNS = "/proc/self/ns/pid"
 # A SANDBOX HAS TO NEST IN THERE, because most cases drive a real bwrap. With
 # kernel.apparmor_restrict_unprivileged_userns=1 every child of /usr/bin/bwrap runs under unpriv_bwrap, which denies
 # all capabilities, so a bwrap started inside one cannot mount anything. The box's claude-bwrap copy has a profile
@@ -109,22 +116,56 @@ def own_pidns(m):
             shape = "readable"
         except OSError as exc:
             shape = errno.errorcode.get(exc.errno, str(exc.errno))
-        env = dict(os.environ, **{HOSTNS: os.readlink("/proc/self/ns/pid"), PLANT: shape})
-        return sp.run([*outer, "--", str(m.BIN / "cc-member-v2"), "selfcheck"], stdin=sp.DEVNULL, env=env).returncode
+        host = os.open(SELF_PIDNS, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            env = dict(os.environ, **{HOSTNS: f"{host} {lock}", PLANT: shape})
+            return sp.run([*outer, "--", str(m.BIN / "cc-member-v2"), "selfcheck"], stdin=sp.DEVNULL, env=env,
+                          pass_fds=(host, lock)).returncode
+        finally:
+            os.close(host)
     finally:
         for p in procs:
             p.communicate(b"stop\n", timeout=GUARD)
 
 
+def inside():
+    """The run inside own_pidns proves it is one from the descriptors HOSTNS names, or refuses. Returns PLANT."""
+    def refuse(why):
+        raise SystemExit(f"cc-member-v2 selfcheck: refused: {HOSTNS} is set but {why}; it is own_pidns's to set")
+    try:
+        host, lock = (int(f) for f in os.environ[HOSTNS].split())
+        hst, mine = os.fstat(host), os.stat(SELF_PIDNS)
+        kind = fcntl.ioctl(host, NS_GET_NSTYPE)
+    except (ValueError, OSError) as exc:
+        refuse(f"names no host pid namespace handed down ({exc})")
+    if kind != CLONE_NEWPID or hst.st_dev != mine.st_dev:
+        refuse("its first descriptor is no pid namespace")
+    if hst.st_ino == mine.st_ino:
+        refuse("this run is in that pid namespace, not one of its own")
+    lockfile = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cc/member-v2-selfcheck/lock"
+    try:
+        held, want = os.fstat(lock), os.stat(lockfile)
+    except OSError as exc:
+        refuse(f"names no selfcheck lock handed down ({exc})")
+    if (held.st_dev, held.st_ino) != (want.st_dev, want.st_ino):
+        refuse(f"its second descriptor is not {lockfile}")
+    try:   # the same open file own_pidns locked, so this only confirms it; another run's lock refuses
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        refuse(f"another selfcheck holds {lockfile} ({exc})")
+    return os.environ.get(PLANT, "")
+
+
 def selfcheck(m):
     """The cases, inside a pid namespace of their own when own_pidns can make one, else unnested on the host."""
     if HOSTNS in os.environ:
-        return cases(m, nested=True)
+        return cases(m, plant=inside())
     rc = own_pidns(m)
-    return cases(m, nested=False) if rc is None else rc
+    return cases(m, plant=None) if rc is None else rc
 
 
-def cases(m, nested):
+def cases(m, plant):
+    """`plant` is None unnested, else what the host read of the process it planted beside the namespace."""
     passed = failed = 0
 
     def check(ok, name, detail=""):
@@ -133,10 +174,8 @@ def cases(m, nested):
         failed += not ok
         print(f"  {'ok' if ok else 'FAIL'} v2: {name}" + (f": {detail}" if not ok else ""), flush=True)
 
-    if nested:
-        check(os.readlink("/proc/self/ns/pid") != os.environ[HOSTNS],
-              "the cases run in a pid namespace of their own, so the walk sees only what they started",
-              os.environ[HOSTNS])
+    if plant is not None:   # `inside` refused unless it held; this line keeps the fact on the tally
+        check(True, "the cases run in a pid namespace of their own, so the walk sees only what they started")
 
     def call(command, **kwargs):
         return sp.run([str(a) for a in command], stdin=sp.DEVNULL, stdout=sp.PIPE,
@@ -455,10 +494,10 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 except ValueError as exc:
                     refused = str(exc)
                 check(not refused, "inventory control: provisioning allowed after exposed namespace exits", refused)
-                if nested:   # unnested, nothing is planted on the host: the walk would refuse it
-                    check(os.environ.get(PLANT) == "EACCES" and not refused,
+                if plant is not None:   # unnested, nothing is planted on the host: the walk would refuse it
+                    check(plant == "EACCES" and not refused,
                           "a live host namespace the walk cannot inspect lies outside this pid namespace and leaves"
-                          " it clear", f"from the host its fd/ read {os.environ.get(PLANT)}; here: {refused or 'allowed'}")
+                          " it clear", f"from the host its fd/ read {plant}; here: {refused or 'allowed'}")
                 # …AND UNDER V IS EXPOSURE TOO, not only V and above. The registry decides a task's
                 # authority and the broker re-reads it under the lock; the state directory is the lock
                 # and the status log. A namespace holding either is refused like one holding V. The

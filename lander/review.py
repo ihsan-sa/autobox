@@ -379,12 +379,14 @@ def perms_reads(repo):
 
 
 def perms_recorded(repo, pr, head, digests) -> bool:
-    """True when perms' file holds a record for exactly this repo, PR and head at one of `digests`: what a security
-    path merges on (_security_unread, lane.landed_at) and is released on (release.remote_rules)."""
+    """True when perms' file holds a LAND for exactly this repo, PR and head at one of `digests`: what a security
+    path merges on (_security_unread, lane.landed_at), a host check runs on (lane.Lane.host_unread) and is released
+    on (release.remote_rules). An entry with no `verdict` is a LAND, as in carried_from; a FIX or DO-NOT-LAND is
+    not one."""
     if not (head and digests):
         return False
     return any(e.get("repo") == repo and e.get("pr") == pr and e.get("head") == head and e.get("change") in digests
-               for e in perms_reads(repo)[0])
+               and e.get("verdict", T.LAND) == T.LAND for e in perms_reads(repo)[0])
 
 
 def security_globs(root, base, repo):

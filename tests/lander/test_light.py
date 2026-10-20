@@ -138,6 +138,10 @@ class LightLane(TL.Fixture):
 
     def setUp(self):
         super().setUp()
+        # these cases are about the lane's reads, not perms' hold on a host check (test_lane.HostHold)
+        p = mock.patch.object(TL.L.Lane, "host_unread", lambda self, job, m, todo: [])
+        p.start()
+        self.addCleanup(p.stop)
         fb = os.path.join(self.tmp, "release", "tests", "landing-repos")
         self.write(fb, {"demo.toml": self.FB})
         self.fb = fb

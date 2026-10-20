@@ -2931,7 +2931,8 @@ class HostFallback(Fixture):
         head = self.pr(1, {"b/y": "n\n"})
         J.submit("demo", 1)
         rv = Runner()
-        with mock.patch.object(MF, "FALLBACK_DIR", fb):
+        # its host check runs on the host, so it waits for perms' LAND at the head (HostHold): recorded here
+        with mock.patch.object(MF, "FALLBACK_DIR", fb), mock.patch.object(R, "perms_recorded", lambda *a: True):
             self.assertEqual(L.Lane("demo", self.units()).fallback, os.path.join(fb, "demo.toml"))
             self.land(planner=P, runner=rv)
             base = self.origin_rev("main")
@@ -2946,6 +2947,95 @@ class HostFallback(Fixture):
         with mock.patch.object(MF, "FALLBACK_DIR", os.path.join(self.tmp, "empty")):
             self.land(planner=P, runner=rv2)
         self.assertEqual(rv2.calls, [])
+
+
+class HostHold(Fixture):
+    """A check the box runs on the host itself (manifest.on_host) runs the head's code as the box's user, so it waits
+    for perms' security LAND recorded at exactly that head (perms' LAND on #1561, 10-20). The rest of the plan runs
+    first."""
+    FB = ('[[check]]\nname = "unit"\nrun = "true"\npaths = ["**"]\nclass = "static"\n\n'
+          '[[check]]\nname = "on-host"\nrun = "true"\npaths = ["**"]\nclass = "host"\nwhere = ["box"]\n')
+
+    def lane(self, recorded, reading=("", False), read_at=None, entries=None):
+        """`entries`, when given, is perms' file itself (review.perms_reads) and perms_recorded runs for real on it,
+        each entry at the PR's head and change; else perms_recorded answers `recorded`. `read_at` is perms' read file
+        at the head (review.load_read)."""
+        from lander import plan as P
+        fb = os.path.join(self.tmp, "release", "tests", "landing-repos")
+        self.write(fb, {"demo.toml": self.FB})
+        head = self.pr(1, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        rv, asked = Runner(), []
+        real = R.perms_recorded
+
+        def recorded_(*a):
+            asked.append(a)
+            return real(*a) if entries is not None else recorded
+
+        def reads(repo):
+            j = self.job()
+            return [dict(e, repo="demo", pr=1, head=head, change=j.digest) for e in entries or []], ""
+        with mock.patch.object(MF, "FALLBACK_DIR", fb), \
+                mock.patch.object(R, "perms_recorded", recorded_), mock.patch.object(R, "perms_reads", reads), \
+                mock.patch.object(R, "perms_reading", lambda *a: reading), \
+                mock.patch.object(R, "load_read", lambda *a: (read_at, "" if read_at else "absent")):
+            self.land(planner=P, runner=rv)
+        return head, rv, asked
+
+    def test_with_no_land_at_the_head_the_host_check_never_runs_and_planning_is_asked(self):
+        head, rv, asked = self.lane(False)
+        self.assertEqual([c[0] for c in rv.calls], ["unit"])
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn(f"on-host runs the head's code on the host, so it waits for perms' security LAND at {head[:12]}",
+                      j.extra["why"])
+        self.assertIn("lander perms-read demo 1", j.extra["why"])
+        self.assertEqual({(a[0], a[1], a[2]) for a in asked}, {("demo", 1, head)})
+        self.assertEqual(asked[0][3], {j.digest})   # the exact change digest, never a carried one
+
+    def test_with_perms_reading_the_head_the_job_is_held_not_queried(self):
+        _, rv, _ = self.lane(False, reading=("perms' security read of PR #1 at x is still running", True))
+        self.assertEqual([c[0] for c in rv.calls], ["unit"])
+        j = self.job()
+        self.assertEqual((j.state, j.extra["hold"]), (T.HELD, "box"))
+        self.assertTrue(j.extra["why"].endswith(": perms' security read of PR #1 at x is still running"), j.extra["why"])
+
+    def test_with_perms_land_at_the_head_the_host_check_runs_and_it_merges(self):
+        _, rv, _ = self.lane(True)
+        self.assertEqual(sorted(c[0] for c in rv.calls), ["on-host", "unit"])
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+
+    def unread(self, verdict):
+        """Perms' read of #1564: perms_recorded matched repo, PR, head and digest but not the verdict, so a FIX at the
+        head ran its host checks as the box's user."""
+        _, rv, asked = self.lane(None, entries=[{"verdict": verdict}])
+        self.assertTrue(asked)
+        self.assertEqual([c[0] for c in rv.calls], ["unit"])
+        self.assertEqual(self.job().state, T.QUERY)
+
+    def test_a_fix_in_perms_file_at_the_head_runs_no_host_check(self):
+        self.unread("FIX")
+
+    def test_a_do_not_land_in_perms_file_at_the_head_runs_no_host_check(self):
+        self.unread("DO-NOT-LAND")
+
+    def ran(self, entry):
+        _, rv, _ = self.lane(None, entries=[entry])
+        self.assertEqual(sorted(c[0] for c in rv.calls), ["on-host", "unit"])
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+
+    def test_a_land_in_perms_file_at_the_head_runs_the_host_check(self):
+        self.ran({"verdict": T.LAND})
+
+    def test_an_entry_with_no_verdict_word_is_a_land(self):
+        self.ran({})
+
+    def test_a_finished_land_read_not_in_perms_ledger_asks_for_perms_adopt(self):
+        self.lane(False, read_at={"state": "done", "verdict": T.LAND})
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn("lander perms-adopt demo 1", j.extra["why"])
+        self.assertNotIn("perms-read", j.extra["why"])
 
 
 class Review(Fixture):
@@ -3949,6 +4039,10 @@ class Parallel(Fixture):
         r = mock.patch.object(L.RUN, "spill", return_value="load 50.0 on 20 cores (at least 2x)")
         r.start()
         self.addCleanup(r.stop)
+        # and about where checks go, not perms' hold on a host check (HostHold)
+        h = mock.patch.object(L.Lane, "host_unread", lambda self, job, m, todo: [])
+        h.start()
+        self.addCleanup(h.stop)
 
     def merged_order(self):
         return [int(argv[2]) for argv in self.box()["merges"]]

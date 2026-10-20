@@ -79,6 +79,10 @@ def tearDownModule():
 class RealUnits(TL.Fixture):
     def setUp(self):
         super().setUp()
+        # these cases are about the lane's reads, not perms' hold on a host check (test_lane.HostHold)
+        p = mock.patch.object(TL.L.Lane, "host_unread", lambda self, job, m, todo: [])
+        p.start()
+        self.addCleanup(p.stop)
         # self.work is a checkout the host made by its board's path, outside $CC_DEV (git.host_tree): every sealed and
         # VERIFIED read below runs git there only on a root host_tree takes
         with open(os.path.join(os.environ["CC_BOARDS"], "work.json"), "w") as f:
