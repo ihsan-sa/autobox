@@ -462,6 +462,15 @@ def light_word(repo, root, pr, token=None, genv=None) -> str:
             else f"PR #{pr} goes the light way once a LAND is recorded at its head")
 
 
+def draft_why(pr) -> str:
+    """The why of the hold a draft gets at its queued read. tick's un-draft sweep acts on this hold alone: a PR held
+    for anything else that a person turned back into a draft is theirs to mark ready."""
+    return f"PR #{pr} is a draft — mark it ready for review"
+
+
+DRAFT = re.compile(r"PR #\d+ is a draft — ")
+
+
 # --- the board (used when lander.board is not installed) ------------------------------------------------------------
 
 CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)[A-Za-z0-9][A-Za-z0-9_-]*)*)")
@@ -931,8 +940,9 @@ class Lane:
         return str(job.extra.get("queued_at") or ""), job.head
 
     @staticmethod
-    def due(job):
-        return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))
+    def due(job, now=None):
+        """Not at rest, and no hold still running at `now` (the wall clock when None; the tick passes its own)."""
+        return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job, now))
 
     @staticmethod
     def heavy(job) -> bool:
@@ -1045,6 +1055,7 @@ class Lane:
                 target, why = T.QUEUED, f"retry after hold: the base moved from {was} to {base}"
         if job.extra.get("hold") == "box":   # tick.flag_waited counts the job's age from here (perms' read, 10-13)
             job.extra["unheld_at"] = E.stamp()
+        job.extra["last_hold"] = job.extra.get("hold")   # queued() reads whose hold a later draft followed
         for k in ("held_from", "hold", "not_before", "deferred"):
             job.extra.pop(k, None)
         J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why=why)
@@ -1118,7 +1129,12 @@ class Lane:
             J.move(job, T.DONE, why="the PR is closed")
             return E.log("done", job.repo, job.pr, rc=1)
         if facts.get("isDraft"):
-            return self.hold(job, f"PR #{job.pr} is a draft — mark it ready for review")
+            # held for something of the PR's own (not the box's), then drafted: a person did that, and the hold's
+            # why stays out of DRAFT so tick's un-draft sweep leaves it theirs
+            prev = job.extra.get("why") or ""
+            if prev and not DRAFT.match(prev) and job.extra.get("last_hold") == "pr":
+                return self.hold(job, f"PR #{job.pr} was turned back into a draft — mark it ready for review")
+            return self.hold(job, draft_why(job.pr))
         if facts.get("mergeable") == "CONFLICTING":
             # GitHub names no files: the merge-tree of what origin sends does, and an empty answer is GitHub's
             # word against git's — held as before, and read again at the next wake

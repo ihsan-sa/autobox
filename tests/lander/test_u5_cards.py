@@ -825,6 +825,16 @@ class QueuedCards(Stubbed):
         self.assertEqual(self.flag([held], 7200 + 3600 + 60), ["[demo] PR #7 has waited 181 min in the queue; "
                                                               "the planning seat is told"])
 
+    def test_an_older_job_held_past_the_ticks_now_does_not_hide_a_late_one(self):
+        # Opus read of #1278: the tick asked Lane.due with the wall clock, not its own now, so a job held past now
+        # read as due, was taken as the oldest, and its hold (not_before ahead of now) hid the late job behind it
+        held = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "held_from": T.QUEUED, "not_before": E.stamp(E.epoch_of(Q) + 7200)})
+        late = T.Job(repo="demo", pr=8, state=T.QUEUED, stage=T.QUEUED,
+                     extra={"queued_at": E.stamp(E.epoch_of(Q) + 60)})
+        self.assertEqual(self.flag([held, late], 3600 + 61), ["[demo] PR #8 has waited 60 min in the queue; "
+                                                              "the planning seat is told"])
+
     def test_a_job_a_box_hold_let_go_counts_its_age_from_unheld_at(self):
         lifted = E.stamp(E.epoch_of(Q) + 3000)
         jobs = [T.Job(repo="demo", pr=7, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q, "unheld_at": lifted})]

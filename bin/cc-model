@@ -201,8 +201,8 @@
 #   LISTED WINDOWS BELONG ON THE PRIMARY) · CC_MODEL_RETURN_GAP (7200) · CC_MODEL_RETURN_CHANNEL (the card's
 #   channel when the session's repo has none: `#<box>`) · CC_MODEL_IDLE_AFTER (900: a seat whose transcript has not
 #   moved for this many seconds, with nothing in its inbox, is idle and its return waits for its next wake) · CC_MODEL_PLANNING (~/.cc/config: windows or globs such as
-#   `lessons/*` that are planning on top of the default rule) · CC_ORCH_MODEL (~/.cc/config: alias=model pairs; a listed orch's band is
-#   its pin, as `cc` starts it) · CC_MODEL_FLOOR (the lowest a planning session runs;
+#   `lessons/*` that are planning on top of the default rule) · CC_ORCH_MODEL (~/.cc/config: <repo>@<alias>=model pairs; a listed orch's band is
+#   its pin, as `cc` starts it; a value that is not a model id pins nothing and is one `pin` row an hour) · CC_MODEL_FLOOR (the lowest a planning session runs;
 #   default Opus while it is on the chain, else the fallback) · CC_MODEL_CRED (whose login, see Unavailable) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS
 #   (a file of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of
 #   "<pane-id>\t<model>" standing in for what each pane's session is running), CC_MODEL_MEMBERS (~/.cc/members),
@@ -821,12 +821,23 @@ listed_primary(){   # $1 window → 0 = named on CC_MODEL_PRIMARY_WINDOWS. An em
   IFS=', ' read -ra gs <<<"$(primary_windows)"   # read, not $(…): no pathname expansion
   # shellcheck disable=SC2254   # $g unquoted on purpose: a glob
   for g in "${gs[@]}"; do case "$w" in $g) return 0;; esac; done; return 1; }
-pin_of(){   # $1 window → the model CC_ORCH_MODEL (~/.cc/config, alias=model pairs, as `cc` reads them) pins this orch
-            # `<repo>@<alias>` to, or nothing (exit 1). A person's pin (owner, 2026-10-13: "ensure your successors also go
+MODEL_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}(\[[0-9]{1,6}[A-Za-z]{0,3}\])?$'   # claude-fable-5-1[1m]; `cc` holds the same
+pin_of(){   # $1 window → the model CC_ORCH_MODEL (~/.cc/config, <repo>@<alias>=model pairs, as `cc` reads them) pins this
+            # orch `<repo>@<alias>` to, or nothing (exit 1). A person's pin (owner, 2026-10-13: "ensure your successors also go
             # on fable 5.1 max") is that window's band, so reconcile neither types it down to the floor nor hands it back.
+            # KEYED ON REPO AND ALIAS (review of #1320): on the alias alone, an orch of that alias in any repo took the
+            # pin. A bare alias=model pins nothing. THE VALUE IS A MODEL ID OR NOTHING: reconcile types it after
+            # `/model ` into a live pane, so a value outside the id charset is refused here, with one `pin` row an hour.
   local w="${1:-}" kv kvs; case "$w" in *~*|*/*) return 1;; *@*) ;; *) return 1;; esac
   cfg_v CC_ORCH_MODEL; read -ra kvs <<<"$REPLY"   # read, not $(…): no glob on [1m]
-  for kv in "${kvs[@]}"; do case "$kv" in "${w#*@}="?*) printf '%s\n' "${kv#*=}"; return 0;; esac; done; return 1; }   # a bare alias pins nothing
+  for kv in "${kvs[@]}"; do case "$kv" in "$w="?*) ;; *) continue;; esac
+    [[ "${kv#*=}" =~ $MODEL_ID_RE ]] && { printf '%s\n' "${kv#*=}"; return 0; }
+    pin_reported "$w" || printf '%s\t%s\tpin\t-\t%s:%s CC_ORCH_MODEL value is not a model id (%q); pins nothing, nothing typed\n' \
+      "$(date -u +%FT%TZ)" "$now" "$SESSION" "$w" "${kv#*=}" >> "$LOG"
+    return 1; done; return 1; }
+pin_reported(){ local t   # $1 window → 0 = a `pin` row for it inside CC_MODEL_MISMATCH_GAP (1 h): pin_of runs per pane per tick
+  t=$(awk -F'\t' -v w=":${1:-} " '$3=="pin" && index($5, w){t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)
+  [ "$((now - t))" -lt "${CC_MODEL_MISMATCH_GAP:-3600}" ]; }
 band_of(){   # $1 window (a planning or major one) → the model it belongs on before any outage: its CC_ORCH_MODEL pin, else
              # the primary, or the floor rung when the list is set and this window is not on it.
   pin_of "$1" && return 0
@@ -2883,12 +2894,34 @@ TXT
     "$(cat "$MOVED" 2>/dev/null):$(grep -c 'Planning parked' "$d/calls"):$(typed other@orch)" ":0:"
   # AN ORCH CC_ORCH_MODEL PINS HAS THE PIN AS ITS BAND (owner, 2026-10-13): left on it, moved down the chain when it
   # is out and banked, and handed back when it answers. Beside it an unpinned orch, which goes to the floor as above.
-  export CC_ORCH_MODEL="orch=$PRIMARY"
+  export CC_ORCH_MODEL="other@orch=$PRIMARY"
   pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
   printf '%s\n' '%2 other@orch' '%6 other@free' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" '%6' "$PRIMARY" > "$d/live"; reconcile
   t '(pin) a pinned orch on its pin is left there; an unpinned one beside it is typed to the floor' \
     "$(want_of '%2' other@orch):$(typed other@orch):$(typed other@free):$(paste -sd'|' "$d/handoffs")" "$PRIMARY::/model $fl:"
-  t '(pin) a bare alias with no =model pins nothing: that orch keeps the policy band' "$(CC_ORCH_MODEL='orch' want_of '%2' other@orch)" "$fl"
+  t '(pin) a bare alias with no =model pins nothing: that orch keeps the policy band' "$(CC_ORCH_MODEL='other@orch' want_of '%2' other@orch)" "$fl"
+  # (pin) KEYED ON REPO AND ALIAS (review of #1320): other@orch's pin is not third@orch's, though both are orchs named
+  #     orch; and the old alias-only key pins nothing at all. Fresh state, a pane each, so only the key differs.
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
+  printf '%s\n' '%2 other@orch' '%7 third@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" '%7' "$PRIMARY" > "$d/live"; reconcile
+  t '(pin) other@orch=… pins other@orch only: third@orch, the same alias in another repo, is typed to the floor' \
+    "$(want_of '%2' other@orch):$(want_of '%7' third@orch):$(typed other@orch):$(typed third@orch)" "$PRIMARY:$fl::/model $fl"
+  t '(pin) …and the alias-only key orch=… pins neither' \
+    "$(CC_ORCH_MODEL="orch=$PRIMARY" want_of '%2' other@orch):$(CC_ORCH_MODEL="orch=$PRIMARY" want_of '%7' third@orch)" "$fl:$fl"
+  # (pin) A VALUE THAT IS NOT A MODEL ID IS NEVER TYPED (review of #1320): reconcile types the pin after `/model ` into
+  #     a live pane. A pane on the primary, no window list, so unpinned it belongs where it is; the pin names the floor
+  #     rung with a shell tail. Taken, it would be typed down to it; refused, nothing is typed and the log has one `pin`
+  #     row across two passes. The control is the same pane under the bare id, typed down to it.
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS=''
+  printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"
+  CC_ORCH_MODEL="other@orch=$fl;clear" reconcile; : > "$d/typed"; CC_ORCH_MODEL="other@orch=$fl;clear" reconcile
+  t '(pin) a pin outside the model-id charset (<floor>;clear) is refused: nothing typed, one pin row over two passes' \
+    "$(typed other@orch):$(grep -c $'\tpin\t.*other@orch CC_ORCH_MODEL value is not a model id' "$LOG")" ":1"
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS=''
+  printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"
+  CC_ORCH_MODEL="other@orch=$fl" reconcile
+  t '(pin) control: the same pane under the bare floor id is typed down to it, and no pin row' \
+    "$(typed other@orch):$(grep -c $'\tpin\t' "$LOG")" "/model $fl:0"
   pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
   printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"
   note_unavailable "$(fam "$PRIMARY")" 'the cap'; reconcile
@@ -2921,7 +2954,7 @@ TXT
   # (pin) A PIN OFF THE CHAIN (review of #1320): Fable is no rung of the shipped chain, so a Fable-pinned orch whose
   #     Fable is out goes to the chain's first runnable rung, Opus 5.5, as `cc` launches it (cc-model resolve), and sits
   #     there quietly until Fable answers. chain_next alone parked it, told the owner Opus was out, and looped a handoff.
-  export CC_ORCH_MODEL='orch=claude-fable-5-1[1m]'
+  export CC_ORCH_MODEL='repo@orch=claude-fable-5-1[1m]'
   pl; rm -f "$OV"; printf '%s\n' '%2 repo@orch' > "$d/sess"; printf '%s\t%s\n' '%2' 'claude-fable-5-1[1m]' > "$d/live"
   note_unavailable fable 'Fable 5.1 requires usage credits'; reconcile
   t '(pin) shipped, its Fable pin out: the orch on Fable is typed to Opus 5.5, not parked, not handed off, the owner told nothing' \

@@ -18,11 +18,12 @@
             path door still decides). Left alone: a draft, a head on track/* (cc-loop queues a track's PR), one
             opened under 10 min ago (its seat may queue it itself) or over 48 h ago, and any PR with a job, a rest
             file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
-            a refusal is not undone by a sweep. A draft the lander holds a queue job for, whose body has a "Waits on
-            #N" line (#N, #M on one or more such lines), is marked ready (`gh pr ready`) once every PR it names has
-            merged; the held job reads it again at its wake. A draft with no job is never touched, whatever its
-            body says, and a parent closed unmerged is said each sweep and the draft kept. The drafts' gh calls
-            are capped per sweep at $LANDER_UNDRAFT_GH (20); the rest wait for the next sweep.
+            a refusal is not undone by a sweep. A draft the lander holds a queue job for as a draft, whose body has
+            a "Waits on #N" line (#N, #M on one or more such lines), is marked ready (`gh pr ready`) once every PR it
+            names has merged; the held job reads it again at its wake. A draft with no job, or held for anything
+            else, is never touched, whatever its body says, and a parent closed unmerged is said each sweep and the
+            draft kept. The drafts' gh calls are capped per sweep at $LANDER_UNDRAFT_GH (20); the rest wait for the
+            next sweep.
             Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
             `dispatch/`) whose base is the repo's default branch and whose files touch no path on that branch's
             security list, read from a fresh fetch; any doubt queues it as before.
@@ -314,14 +315,18 @@ def undraft_cap() -> int:
 def undraft(repo, root, s, p, parents, budget) -> list:
     """raised-lander-half-draft-outlives-its-parent, 2026-10-14: three drafts sat ~12 h after their parents merged,
     the un-draft being a line in a seat's journal that nothing acted on. A draft the lander holds a live HELD job for,
-    whose body says "Waits on #N", is marked ready once every PR it names has merged; the held job reads it again at
-    its wake. The body alone is never enough: a tool may open someone else's edits as @me drafts for a person to land,
-    with text they wrote in the body, so a planted line must not un-draft one. An ended job in rest/ (a handback, a
-    query) is a person's decision still owed, so it does not count either; holds re-arm and never move there. A parent
-    closed unmerged is said and the draft kept. parents: {n: state} read this sweep; budget: [gh calls left]."""
+    held because it is a draft (lane.DRAFT), whose body says "Waits on #N", is marked ready once every PR it names
+    has merged; the held job reads it again at its wake. The body alone is never enough: a tool may open someone
+    else's edits as @me drafts for a person to land, with text they wrote in the body, so a planted line must not
+    un-draft one. An ended job in rest/ (a handback, a query) is a person's decision still owed, so it does not count
+    either; holds re-arm and never move there. A parent closed unmerged is said and the draft kept. parents: {n: state}
+    read this sweep; budget: [gh calls left]."""
     n = p["number"]
     job = J.load_path(J.job_path(repo, n))
-    want = waits_on(p) if job is not None and job.state == T.HELD else []
+    # a hold for a conflict or a red check is not one the lander drafted: a person who turned that PR back into a
+    # draft meant it, whatever "Waits on" line its body still carries (Opus read of #1344)
+    held = job is not None and job.state == T.HELD and L.DRAFT.match(job.extra.get("why") or "")
+    want = waits_on(p) if held else []
     if not want:
         return []
     for w in want:
@@ -740,7 +745,7 @@ def flag_waited(repos, cards, now=None) -> list:
         return lines
     for r in (repos if cards else []):
         try:
-            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in J.lane_jobs(r) if L.Lane.due(j)]
+            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in J.lane_jobs(r) if L.Lane.due(j, t)]
             aged = [(at, j) for at, j in aged if at]
             if not aged:
                 continue

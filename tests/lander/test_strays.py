@@ -269,7 +269,8 @@ class Drafts(Fixture):
     merged; nothing else about a draft moves it."""
     def held(self, *prs):
         for n in prs:
-            J.save(T.Job(repo="demo", pr=n, state=T.HELD))   # the lane held it as a draft; it re-reads it itself
+            # the lane held it as a draft, in its own words; it re-reads it itself
+            J.save(T.Job(repo="demo", pr=n, state=T.HELD, extra={"hold": "pr", "why": L.draft_why(n)}))
 
     def test_a_held_draft_is_marked_ready_once_its_parents_merge(self):
         self.open["demo"] = [pr(20, branch="track/half", age=5 * 86400, draft=True,
@@ -301,6 +302,49 @@ class Drafts(Fixture):
         J.save(T.Job(repo="demo", pr=25, state=T.CHECKING))
         self.assertEqual(TK.sweep_strays(["demo"]), [])
         self.assertEqual((self.readied, self.queued), ([], []))
+
+    def test_a_job_held_for_anything_but_the_draft_stays_a_draft(self):
+        # held for a conflict, then turned back into a draft by a person, with an old "Waits on" line in its body:
+        # its parent merging does not undo their choice
+        self.open["demo"] = [pr(26, draft=True, body="Waits on #17")]
+        self.states = {17: "MERGED"}
+        J.save(T.Job(repo="demo", pr=26, state=T.HELD,
+                     extra={"hold": "pr", "why": "PR #26 conflicts with main in a.py — rebase it"}))
+        self.assertEqual(TK.sweep_strays(["demo"]), [])
+        self.assertEqual((self.readied, self.queued, self.views), ([], [], 0))
+        self.assertTrue(L.DRAFT.match(L.draft_why(26)))   # while the lane's own draft hold is the one it acts on
+
+    def requeued_draft(self, n, kind=None, why=""):
+        """A job held with `kind` and `why` (none: never held) that the lane's unhold() sends back, read again by
+        queued() once its PR is a draft; the job as it was saved."""
+        lane, extra = L.Lane("demo", {}), {"held_from": T.QUEUED, "hold": kind, "why": why} if kind else {}
+        job = T.Job(repo="demo", pr=n, state=T.HELD if kind else T.QUEUED, extra=extra)
+        J.save(job)
+        if kind:
+            lane.unhold(job)
+        with mock.patch.object(GH, "pr_facts", lambda *a, **k: ({"state": "OPEN", "isDraft": True}, "")):
+            lane.queued(job)
+        return J.load("demo", n)
+
+    def test_a_draft_after_another_hold_keeps_out_of_the_draft_hold(self):
+        job = self.requeued_draft(26, "pr", "PR #26 conflicts with main — rebase it")
+        self.assertEqual(job.state, T.HELD)
+        self.assertFalse(L.DRAFT.match(job.extra["why"]))
+        self.open["demo"] = [pr(26, draft=True, body="Waits on #17")]
+        self.states = {17: "MERGED"}
+        TK.sweep_strays(["demo"])
+        self.assertEqual(self.readied, [])
+
+    def test_a_draft_after_a_box_hold_or_none_gets_the_draft_hold(self):
+        for n, held in ((27, ()), (28, ("box", "gh could not read PR #28: boom"))):
+            self.assertEqual(self.requeued_draft(n, *held).extra["why"], L.draft_why(n))
+
+    def test_two_drafts_on_one_parent_read_it_once(self):
+        self.open["demo"] = [pr(33, draft=True, body="Waits on #17"), pr(34, draft=True, body="Waits on #17")]
+        self.states = {17: "MERGED"}
+        self.held(33, 34)
+        TK.sweep_strays(["demo"])
+        self.assertEqual((self.readied, self.views), ([("demo", 33), ("demo", 34)], 1))
 
     def test_a_draft_stays_while_a_parent_is_open(self):
         self.open["demo"] = [pr(21, draft=True, body="- Waits on: #17, #19")]
