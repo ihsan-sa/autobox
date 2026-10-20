@@ -28,6 +28,9 @@ if os.getppid() != int(sys.argv[1]): sys.exit(143)   # the holder died before th
 os.execv(sys.argv[2], sys.argv[2:])' "$$" "$BASH" "$E2E_FILE" "$@"; exit $?
 fi
 unset E2E_HELD   # children must not think they are already re-run
+# …nor that they already hold a slot. The lander's cage says CC_SELFTEST_HELD=1 for the run it starts, and selftest.sh
+# unsets it once read; kept here, every selftest.sh a stanza re-runs skipped its lock as "pid 1" (suite-slots, 10-20).
+unset CC_SELFTEST_HELD CC_SELFTEST_SPILL   # and the cage's SPILL=0, read by selftest.sh alone, likewise
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
 qbad(){ bad "$2"; }   # no quarantine here: a red case is red
 RED_CASES=5

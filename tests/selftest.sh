@@ -171,6 +171,7 @@ if os.getppid() != int(sys.argv[1]): sys.exit(143)   # the holder died before th
 os.execv(sys.argv[2], sys.argv[2:])' "$$" "$SELF" "$@" {LK}>&-; exit $?
 fi
 HOLDER=$CC_SELFTEST_HELD; unset CC_SELFTEST_HELD   # our children must not think they are already inside the lock
+unset CC_SELFTEST_SPILL   # nor that they may not spill: a cage says 0 for this run, and the stanza's stub runs need their own
 if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this file to here and no further —
   echo "== lock taken by pid $HOLDER =="                # it stops before a single fixture exists
   # ...and, asked to, leaves one child behind on purpose, so the case can prove the child did NOT inherit the lock.
