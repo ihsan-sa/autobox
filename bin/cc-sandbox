@@ -207,6 +207,9 @@
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX (and $CC_TMUX_PANE)
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
 #   groups become nobody).
+#   GITHUB, READ ONLY (a worker only): GH_TOKEN is the first line of the owner's read-only token file (`cc-config get
+#   WORKER_GH_READ_TOKEN`, empty → /var/lib/dispatch-login-workers/gh-read.token), read at launch, and GH_CONFIG_DIR is
+#   /nonexistent/gh; gh and git over https read his private repos with it. No file, or an unreadable one: neither is set.
 # OTHER HARNESSES' LOGINS ARE ABSENT, not stripped: $HOME inside is a tmpfs and only the binds above are in it, so
 #   ~/.codex (auth.json, config.toml), ~/.cursor and ~/.config/cursor do not exist in a worker's world at all. The
 #   selfcheck plants each one in a fixture HOME and reads for it from inside. A harness that needs its own credential
@@ -843,6 +846,14 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # Inside it is ~/.cc/egress, not its host path: a bind under ~/.cc/sandbox would make that directory exist in here,
   # and the namespace case holds that it does not.
   B+=(--ro-bind "$eg" "$H/.cc/egress" --ro-bind "$EGRESS" "$EGRESS")
+  # THE OWNER'S PRIVATE REPOS, READ ONLY (owner, 2026-10-20): the first line of the read-only token perms places, read
+  # at each launch and handed in as GH_TOKEN — gh reads it, and git's https lookup reaches it through ~/.gitconfig's
+  # `gh auth git-credential`. GH_CONFIG_DIR names a dir that does not exist, so no gh login is read beside it. Exported,
+  # never --setenv, because bwrap's argv is readable on the host. No file, or one this user cannot read: public only,
+  # as before. A member's launch never comes here (launch_member, --clearenv).
+  local gt; gt=$("$BIN/cc-config" get WORKER_GH_READ_TOKEN 2>/dev/null); gt="${gt/#\~/$H}"
+  gt=$(head -n1 -- "${gt:-/var/lib/dispatch-login-workers/gh-read.token}" 2>/dev/null | tr -d '\r\n')
+  [ -n "$gt" ] && export GH_TOKEN="$gt" GH_CONFIG_DIR=/nonexistent/gh
   pins_unlinked   # last, right before exec: a pinned file git renamed over during the launch goes in as data
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" "${ca[@]}" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
@@ -2852,6 +2863,15 @@ selfcheck_secretenv(){   # A SECRET GRANTED AS AN ENVIRONMENT VARIABLE (cc-sandb
     && git -C "$fh/dev/r" worktree add -q -b track/t "$fh/.cc/worktrees/r/t" >/dev/null 2>&1 || return 1
   out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
   t 'env: a BOX WORKER does not get it — no VAR, the file and the grant absent' "$(g name)/$(g match)/$(g file)/$(g grant)" /0/0/absent
+  # ── THE OWNER'S READ-ONLY GITHUB TOKEN (launch): a worker gets it as GH_TOKEN with no gh config dir; no file, none; a member, none
+  local gp='echo gt=${GH_TOKEN:-none}; echo gcd=${GH_CONFIG_DIR:-unset}; [ -e "${GH_CONFIG_DIR:-/nonexistent/gh}" ] && echo gce=there || echo gce=absent'
+  printf 'fixture-gh-%s\n' "$$" > "$fh/gh-read.token"
+  out=$(env -u GH_TOKEN -u GH_CONFIG_DIR HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_GH_READ_TOKEN="$fh/gh-read.token" "$SELF" r t -- sh -c "$gp" 2>&1)
+  t 'gh read token: a worker has GH_TOKEN from the file, and GH_CONFIG_DIR names a dir that does not exist' "$(g gt)/$(g gcd)/$(g gce)" "fixture-gh-$$//nonexistent/gh/absent"
+  out=$(env -u GH_TOKEN -u GH_CONFIG_DIR HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_GH_READ_TOKEN="$fh/no-such.token" "$SELF" r t -- sh -c "$gp" 2>&1)
+  t 'gh read token: no file → the worker still starts, with no GH_TOKEN and no GH_CONFIG_DIR' "$(g gt)/$(g gcd)" none/unset
+  out=$(env -u GH_TOKEN -u GH_CONFIG_DIR HOME="$fh" WORKER_GH_READ_TOKEN="$fh/gh-read.token" "$SELF" member "$h" -- sh -c "$gp" 2>&1)
+  t 'gh read token: a member launch, with the file there, carries no GH_TOKEN' "$(g gt)/$(g gcd)" none/unset
   # ── AN EXPERIMENT SUBJECT, launched for real through BOTH of cc-subject's launch paths, each from a side that HOLDS the
   #    value in its own environment, so what is proved is the subject's boundary and not a clean parent:
   #    (1) from INSIDE the granted workspace: `cc-subject run` there → the workspace's socket → the daemon's own
