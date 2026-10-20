@@ -141,7 +141,13 @@ ll0=$(wc -l < ~/.cc/state/$REPO/w1/loop.log 2>/dev/null || echo 0)
 # + `iteration count: 0` (#752, #788, 09-29: the box's load, which the e2e preamble did not isolate). Say it here.
 rw=$("$B/cc-room" check 2>&1) && ok "cc-room admits the fixture --go: the box's load, PSI, loops and pace never queue it" \
   || bad "cc-room would queue the fixture --go: $rw"
-CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
+# THE LOOP'S COMPLETION IS THIS TREE'S LANDER, NOT THE BOX'S PINNED ONE. cc-loop completes through `cc-land queue
+# --task`, and bin/lander runs only ~/.cc/lander/current: in the lander's cage HOME has none, so it refused ("no
+# pinned release"), printed no receipt and the loop stopped at exit 12, `delivery unconfirmed` (the two cases below,
+# red in the sandbox on main and #1588 alike); on the host it ran the pinned release's `cc done`, not this tree's.
+printf '#!/bin/sh\nexec python3 %q "$@"\n' "$(cd "$B/../lander" && pwd)/cli.py" > "$T/landtree"; chmod +x "$T/landtree"
+# recurring-defect-ok: pause-hold-missing — a fixture --go on the e2e's own throwaway repo under $T; cc refuses --go on a paused repo itself
+CC_LAND="$T/landtree" CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
 # WAIT ON THE LOOP'S OWN END, NOT THE CLOCK. A fixed 40 s here went red on a loaded box (#670, #699, #722, 09-25..27:
 # `loop DONE` + `loop iteration count: 1`, while the notify and board cases below passed — the loop DID finish, a
 # beat after the wait gave up). Every stop of cc-loop logs `exit <n>:`, and this fixture ends in one (exit 4, no PR);

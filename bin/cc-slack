@@ -125,6 +125,7 @@ except KeyError:
     _PW = None
 PW_HOME, PW_USER = (_PW.pw_dir or None, _PW.pw_name) if _PW else (None, "")   # no entry: run-approved refuses (run_cfg)
 RUN_CARDS = f"{PW_HOME or '/nonexistent'}/.cc/approvals/run"   # cc-notify --approval --run: <card ts>.json holds the command the owner's 👍 runs (/nonexistent: passwd's own word for no home)
+PLAIN_CARDS = f"{PW_HOME or '/nonexistent'}/.cc/approvals/cards"   # cc-notify --approval with no --run: <card ts>.json names the seat that asked, and the owner's 👍 is stamped in it (on_plain_card)
 RUN_TS_RE = re.compile(r"^[0-9]{6,12}\.[0-9]{1,9}$")           # a card ts, and the only thing a path under RUN_CARDS is built from
 RUN_TIMEOUT = 900                                              # seconds an approved command may run before it is killed and reported as exit 124
 RUN_TAIL = 1500                                                # characters of its output the owner's DM shows (never #approvals: members read it)
@@ -7902,13 +7903,12 @@ class Daemon:
         # is_ours, not user == bot_user: a card is a signed post, which carries bot_id and no user (every 👍 on 09-25's
         # cards, #601's protected-door card among them, was logged "not a bot PR post" and woke nobody)
         if not self.is_ours(msg) or not m or not os.path.isdir(f"{DEV}/{m.group(1)}/.git"):
-            log(f"approvals: ignored :+1: on {ts} (not a bot PR post)")
+            # Slack hands the card back with :closed_lock_with_key: for 🔐, so the test reads it through run_card_glyphs:
+            # on the raw text it never matched, and the owner's 👍 on a card with no command was dropped unheard.
             if approves and who and who == self.cfg.get("SLACK_OWNER_ID") and self.is_ours(msg) and not m \
-                    and "🔐 *Approval needed:*" in (msg.get("text") or ""):
-                # the owner's 👍 on our own 🔐 card that names no PR and carries no command (an ack on any other post stays quiet): nothing on the box can act
-                # on it, so he hears that rather than nothing
-                self.say(chat, "Nothing ran: this card carries no command and names no PR, so a 👍 here does nothing "
-                               "on the box. The seat that asked has to re-post it with `cc-notify --approval --run`.", ts)
+                    and "🔐 *Approval needed:*" in run_card_glyphs(msg.get("text") or ""):
+                return self.on_plain_card(chat, ts, who)   # an ack on any other post of ours stays quiet
+            log(f"approvals: ignored :+1: on {ts} (not a bot PR post)")
             return None
         repo, n = m.groups()
         name = self.user_name(who) if who else ""
@@ -7927,6 +7927,32 @@ class Daemon:
             return text
         react(self.cfg, chat, ts, "eyes")     # seen and queued; landing edits the card and sends the one reply itself
         return f"[{repo}] PR #{n}: queued for cc-land — gates, then the merge, then the deploy"
+
+    def on_plain_card(self, chat, ts, who):
+        """The owner's 👍 on our own 🔐 card that names no PR and carries no command (cc-notify --approval with no --run)
+        IS the approval it asked for: it is stamped in the card's record (plain_card_approve), the card gets ✅, and the
+        seat that asked hears it (plain_card_tell), since nothing on the box acts on it otherwise. On 10-13 such a 👍
+        was logged "not a bot PR post", nothing recorded it, and a plan waited 4 h for him to say "done" by hand. Once
+        per card: a 👍 taken off and put back tells nobody again. A card with no record on file (or no seat in it) is
+        still stamped, and his thread says nobody was told, so he knows to say it himself."""
+        rec, first = plain_card_approve(ts, who)
+        if rec is None:
+            log(f"approvals: the owner's 👍 on plain card {ts} could not be recorded")
+            react(self.cfg, chat, ts, "x")
+            self.say(chat, "❌ Your 👍 could not be recorded on the box, so nobody was told. Tell the seat that asked "
+                           "yourself.", ts)
+            return None
+        if not first:
+            log(f"approvals: plain card {ts} was approved already ({rec.get('approved_at')}) — nobody told twice")
+            return None
+        told = plain_card_tell(ts, rec)
+        log(f"approvals: plain card {ts} ({rec.get('id') or 'no id'}) approved by the owner — "
+            f"{'told ' + rec.get('from') if told else 'no seat told'}")
+        react(self.cfg, chat, ts, "white_check_mark")
+        if not told:
+            self.say(chat, "Your 👍 is recorded as the approval, but no seat could be told, so nothing on the box picks "
+                           "it up by itself. Tell the seat that asked.", ts)
+        return None
 
     def queue_land(self, repo, n, chat, ts, who="", run=None, uid=""):
         """cc-land owns the queue's format, its lock and its worker; this only asks, and reports what it said. Its exit
@@ -11238,6 +11264,52 @@ def run_tell_seat(ts, what):
         run_log(f"{ts}: told {seat} why (cc-msg exit {r.returncode})")
     except Exception as e:
         run_log(f"{ts}: could not tell {seat} why ({e!r})")
+
+def plain_card_approve(ts, who):
+    """Stamp the owner's 👍 (approved_at, approved_by) into PLAIN_CARDS/<ts>.json: (record, first), first False when it
+    was stamped already, and (None, False) when it cannot be written. A card with no record (posted before cc-notify
+    kept them, or by hand) gets one holding the stamp alone, so the approval is on file either way."""
+    if not (ts and RUN_TS_RE.match(ts)):
+        return None, False
+    path = f"{PLAIN_CARDS}/{ts}.json"
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+        if not isinstance(rec, dict):
+            rec = {}
+    except (OSError, ValueError):
+        rec = {}
+    if rec.get("approved_at"):
+        return rec, False
+    rec.update(ts=ts, approved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), approved_by=who)
+    try:
+        os.makedirs(PLAIN_CARDS, mode=0o700, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"approvals: plain card {ts}: {e!r}")
+        return None, False
+    return rec, True
+
+def plain_card_tell(ts, rec):
+    """Tell the seat named in a plain card's record (`from`, written by cc-notify) that the owner approved it, so it
+    carries the step on. True once cc-msg took the message; False with no seat on file or when cc-msg failed."""
+    seat = (rec.get("from") or "").strip() if isinstance(rec.get("from"), str) else ""
+    if not RUN_SEAT_RE.match(seat):
+        return False
+    what = rec.get("id") if isinstance(rec.get("id"), str) and rec.get("id") else ts
+    text = (f"The owner approved your #approvals card {what} (ts {ts}) with 👍. It carried no command, so nothing ran "
+            f"on the box: go ahead with the step it asked for. The record is {PLAIN_CARDS}/{ts}.json.")
+    try:
+        r = EFFECTS.run([f"{BIN}/cc-msg", window_for(seat), text], env=dict(os.environ, CC_MSG_FROM=f"approval-card:{ts}"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
+        return r.returncode == 0
+    except Exception as e:
+        log(f"approvals: could not tell {seat} about card {ts} ({e!r})")
+        return False
 
 def run_mask(text):
     """A run's output with every secret shape this box has met masked: SECRET_RE's, RUN_MASKS' and NAME=value pairs.

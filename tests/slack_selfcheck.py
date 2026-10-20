@@ -6781,22 +6781,59 @@ def run_selfcheck():
     check("a 👍 on the bot's SIGNED 🔐 card (bot_id, no user) hands that head to the landing queue; another app's "
           "bot's card hands nothing over",
           qMM == [(nameMM, "11")] and not saidMM)
-    qMM.clear()
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmMM.fetch_message = lambda chat, ts: {**signed, "text": "❓ <@UOWNER> 🔐 *Approval needed:* install texlive"}
-            dmMM.on_approval("CAPPR", "1.7", "+1", who="UMEMBER")
-            dmMM.on_approval("CAPPR", "1.7", "+1", who="UOWNER", approves=False)
-            nMM = len(saidMM)
-            dmMM.on_approval("CAPPR", "1.7", "+1", who="UOWNER")
-            dmMM.fetch_message = lambda chat, ts: {**signed, "text": "Not run: the card was edited."}
-            dmMM.on_approval("CAPPR", "1.8", "+1", who="UOWNER")
-    finally:
-        globals()["react"] = _reactMM
-    check("the owner's 👍 on the bot's 🔐 card that names no PR and carries no command queues nothing but tells him, in "
-          "its thread, that nothing on the box acts on it; a member's 👍, a log-lane 👍 and his 👍 on any other post of "
-          "ours say nothing",
-          not qMM and nMM == 0 and len(saidMM) == 1 and saidMM[0][0] == "1.7" and "cc-notify --approval --run" in saidMM[0][1])
+    # A CARD WITH NO COMMAND (raised-a-thumbs-up-on-a-credential-card-is-dropped, 10-13): cc-notify --approval with no
+    # --run keeps a record naming the seat that asked; the owner's 👍 is stamped in it, the card gets ✅ and that seat
+    # hears it. Slack hands the card back with :closed_lock_with_key: for 🔐, which is how the fixtures read. Each case
+    # has its own card ts and its own record dir.
+    def plain_case(text, rec=None, reactors=(("UOWNER", True),), card="1790000000.000700"):
+        d = tempfile.mkdtemp(prefix="plain-cards-", dir=DIR)
+        if rec is not None:
+            with open(f"{d}/{card}.json", "w") as fh:
+                json.dump(rec, fh)
+        out = {"said": [], "reacts": [], "msgs": [], "queued": []}
+        was = globals()["react"], globals()["PLAIN_CARDS"], EFFECTS.run_impl, dmMM.say
+        globals()["react"] = lambda cfg, chat, ts, name, **k: out["reacts"].append((ts, name))
+        globals()["PLAIN_CARDS"] = d
+        EFFECTS.run_impl = lambda cmd, **kw: out["msgs"].append((cmd, kw.get("env", {}).get("CC_MSG_FROM"))) or \
+            type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        dmMM.say = lambda chat, text, thread=None, **k: out["said"].append((thread, text))
+        dmMM.fetch_message = lambda chat, ts: {**signed, "text": text}
+        qMM.clear()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                for who, approves in reactors:
+                    dmMM.on_approval("CAPPR", card, "+1", who=who, approves=approves)
+        finally:
+            globals()["react"], globals()["PLAIN_CARDS"], EFFECTS.run_impl, dmMM.say = was
+        out["queued"] = list(qMM)
+        try:
+            with open(f"{d}/{card}.json") as fh:
+                out["rec"] = json.load(fh)
+        except OSError:
+            out["rec"] = None
+        return out
+    stored = "❓ <@UOWNER> :closed_lock_with_key: *Approval needed:* install texlive"
+    pc = plain_case(stored, {"ts": "1790000000.000700", "id": "credential:mem-pat", "from": "box@perms"})
+    check("the owner's 👍 on our 🔐 card that names no PR and carries no command, as Slack stores it, is stamped in the "
+          "card's record as his approval, gets ✅, and the seat that posted it is told by cc-msg; nothing is queued and "
+          "nothing is said in the thread",
+          (pc["rec"] or {}).get("approved_by") == "UOWNER" and (pc["rec"] or {}).get("approved_at")
+          and pc["reacts"] == [("1790000000.000700", "white_check_mark")] and len(pc["msgs"]) == 1
+          and pc["msgs"][0][0][1] == "box@perms" and "credential:mem-pat" in pc["msgs"][0][0][2]
+          and pc["msgs"][0][1] == "approval-card:1790000000.000700" and not pc["said"] and not pc["queued"])
+    pc = plain_case(stored, {"ts": "1790000000.000700", "id": "credential:mem-pat", "from": "box@perms"},
+                    reactors=(("UOWNER", True), ("UOWNER", True)))
+    check("…a second 👍 on the same card tells nobody again", len(pc["msgs"]) == 1 and len(pc["reacts"]) == 1)
+    pc = plain_case(stored, {"ts": "1790000000.000700", "from": "box@perms"}, reactors=(("UMEMBER", True), ("UOWNER", False)))
+    check("…a member's 👍 and the owner's log-lane 👍 stamp nothing and tell nobody",
+          "approved_at" not in (pc["rec"] or {}) and not pc["msgs"] and not pc["said"] and not pc["reacts"])
+    pc = plain_case(stored)
+    check("…a card with no record on file is still stamped, and his thread hears that no seat was told",
+          (pc["rec"] or {}).get("approved_by") == "UOWNER" and not pc["msgs"]
+          and len(pc["said"]) == 1 and pc["said"][0][0] == "1790000000.000700" and "no seat could be told" in pc["said"][0][1])
+    pc = plain_case("Not run: the card was edited.", {"ts": "1790000000.000700", "from": "box@perms"})
+    check("…and his 👍 on any other post of ours says nothing and stamps nothing",
+          "approved_at" not in (pc["rec"] or {}) and not pc["msgs"] and not pc["said"] and not pc["reacts"])
 
     # the channel server runs the code that is DEPLOYED, not the code it started with
     fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()

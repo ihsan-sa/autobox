@@ -89,6 +89,13 @@ card: from a worker, a member workspace or any kind but `--approval`, `--run` is
 So is a card with three backticks anywhere in it, or a command holding a control, bidi or zero-width
 character, because either can make the card show one command while another runs.
 
+**A card with no command is approved by the owner's 👍 too.** `cc-notify --approval` without `--run` keeps a record
+under the card's ts (`~/.cc/approvals/cards/<ts>.json`, 0600): its `--id`, title and the seat that posted it. The
+owner's own 👍 on our 🔐 card in `#approvals` that names no PR is stamped there (`approved_at`, `approved_by`), the
+card gets ✅, and that seat is told by `cc-msg` to go ahead; nothing runs on the box. A second 👍 tells nobody again.
+With no record or no seat on file the 👍 is still stamped, and the card's thread says no seat was told. A member's 👍
+stamps nothing.
+
 **How much a project tells the owner follows how much he has been in it lately.** His own messages and
 reactions in a project's channels over the last `CC_ENGAGE_DAYS` (3) days are its score, and `cc-slack post` is the
 one place a post is weighed against it (`engage_gate`). At `CC_ENGAGE_ACTIVE` (3) or more he gets everything. Below

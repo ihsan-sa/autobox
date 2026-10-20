@@ -370,6 +370,16 @@ PY
   k "$(yes_ test "$(jq -r .sha256 "$rrec" 2>/dev/null)" = "$runsha")" "…with its sha256"
   k "$(yes_ test "$(stat -c %a "$rrec" 2>/dev/null)/$(stat -c %a "${rrec%/*}" 2>/dev/null)" = 600/700)" "…in a file only this user reads (0600, dir 0700)"
   k "$(yes_ test "$(jq -r .from "$rrec" 2>/dev/null)" = "${CTL:-abox}")" "…naming the seat that posted it (the control seat: its repo, or the box's name where this copy is not under ~/dev), which run-approved tells when his 👍 does not do what the card asked"
+  # A CARD WITH NO COMMAND keeps a record too, in a dir of its own: its --id and the seat that posted it, so the owner's
+  # 👍 is stamped there and that seat is told (cc-slack on_plain_card). Starts with no approvals dir, so the record is this case's.
+  # Its own stub: the ledger has not sent this --id (`sent` exits 1), so the card goes out.
+  cp "$NH/bin/cc-slack" "$T/cc-slack.kept"; rm -rf "$NH/.cc/approvals"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n[ "$1" = sent ] && exit 1\n[ "$1" = post ] && echo 1790000000.000100\nexit 0\n' "$T/slack.args" > "$NH/bin/cc-slack"
+  N --approval --id credential:mem-pat -t "demorepo approval" "mint a PAT for mem"
+  cp "$T/cc-slack.kept" "$NH/bin/cc-slack"
+  crec="$NH/.cc/approvals/cards/1790000000.000100.json"
+  k "$(yes_ test "$(jq -r '.id + " " + .from' "$crec" 2>/dev/null)" = "credential:mem-pat ${CTL:-abox}")" "--approval with no --run: a record under the card's ts names its --id and the seat that posted it"
+  k "$(yes_ test "$(stat -c %a "$crec" 2>/dev/null)/$(no_ test -e "$NH/.cc/approvals/run")" = 600/0)" "…in a file only this user reads, and no run record: a 👍 on it runs nothing"
   # A FLAG THE TOOL DOES NOT TAKE: one of the box's own scripts (under HOME), read and never run. Each case below
   # starts with no record on file, so the record (or its absence) is this case's own.
   printf '#!/usr/bin/env bash\n# cc-zonetool set <name> --zone <zone> [--proxied]\ntouch "%s"\n' "$T/zonetool.ran" > "$NH/bin/cc-zonetool"
