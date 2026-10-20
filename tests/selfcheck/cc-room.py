@@ -57,7 +57,7 @@ def selfcheck():
         # {d}/vanish, tmux's list-panes and new-window remove every queue entry, as a cancel in between would; tmux
         # writes each -S socket it is given to {d}/sockets, is "up" once {d}/up exists, lists the window names in
         # {d}/windows (with -a, the ids in {d}/winids), the pane pid in {d}/panepid, and a new window runs its command
-        # in the background (unless {d}/nospawn), its pid in {d}/panepid, and prints its id and the server pid in {d}/srv
+        # in the background with its -e environment (unless {d}/nospawn), its pid in {d}/panepid, and prints its id and the server pid in {d}/srv
         os.makedirs(f"{d}/bin")
         for name, body in (("cc-broker", f'echo "$*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
                            ("cc-notify", f'echo "notify $*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
@@ -70,6 +70,7 @@ case "$1" in
               cat "{d}/panepid" 2>/dev/null; true ;;
   kill-window) echo "$*" >> "{d}/killed"; : > "{d}/windows"; : > "{d}/winids" ;;
   new-window) for a; do last=$a; done; echo "$*" >> "{d}/spawned"
+              prev=; for a; do [ "$prev" = -e ] && export "$a"; prev=$a; done   # as tmux does: -e is the window's env
               [ -e "{d}/vanish" ] && for f in "{d}"/room/queue/*; do rm -f "$f"; done
               if [ ! -e "{d}/nospawn" ]; then sh -c "$last" </dev/null >/dev/null 2>&1 & echo $! > "{d}/panepid"; fi
               echo "@7 $(cat "{d}/srv" 2>/dev/null || echo 0)" ;;
@@ -370,9 +371,12 @@ esac''')):
         srv = subprocess.Popen(["sleep", "60"])
         procs.append(srv)
         mark = f"{d}/ran"
+        # the launch writes down the lander it would complete through: the tree's override (CC_LAND, #1611), which
+        # `cc … --go` put in the waiter's environment and the relaunch must carry, or it falls back to the pin
         w = subprocess.Popen([sys.executable, __file__, "admit", "r/lost", "--log", f"{d}/loop.log", "--",
-                              "touch", mark], env=dict(os.environ, TMUX=f"{d}/sock,{srv.pid},0", TMUX_PANE="%1"),
-                             stderr=subprocess.DEVNULL)
+                              "sh", "-c", 'printf %s "$CC_LAND" > "$1.t" && mv "$1.t" "$1"', "sh", mark],
+                             env=dict(os.environ, TMUX=f"{d}/sock,{srv.pid},0", TMUX_PANE="%1",
+                                      CC_LAND=f"{d}/landtree"), stderr=subprocess.DEVNULL)
         procs.append(w)
         e = queued("r/lost")
         t("restart: the waiter records the tmux server it waits in, and its socket",
@@ -392,7 +396,10 @@ esac''')):
         r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
         t("restart: resume waits while tmux is not back", ("resumed" in r.stdout, os.path.exists(e)), (False, True))
         open(f"{d}/up", "w").close()
-        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
+        # resume itself runs where CC_LAND names the pin (a timer's environment, or the box's own): only the entry
+        # can give the relaunched worker the override
+        r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True,
+                           env=dict(os.environ, CC_LAND=f"{d}/pinned"))
         t("restart: once tmux is back, resume relaunches it in a window of its old name",
           "resumed r/lost in main:r/lost" in r.stdout, True)
         socks = lines(f"{d}/sockets")
@@ -413,6 +420,8 @@ esac''')):
                 break
             time.sleep(0.2)
         t("restart: it runs by itself once the slot is freed", os.path.exists(mark), True)
+        t("restart: …and completes through the lander override it was dispatched with, not the pin",
+          open(mark).read() if os.path.exists(mark) else None, f"{d}/landtree")
 
         # PLACING (landing's security read of #1159): the waiter is killed with its tmux server after the peer took
         # the launch and before the hub recorded it. resume must not start it a second time here.

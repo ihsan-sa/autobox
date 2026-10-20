@@ -3,8 +3,12 @@
 WHAT IS INSIDE: the distribution read-only (/usr and the merged-usr links, the real /etc — vet's tmpfs /etc loses
 /usr/bin/awk through /etc/alternatives), /opt when there is one, a fresh /proc, /dev and tmpfs /tmp; the check's tree
 read-write at /work/tree — never at its host path, whose parent directories would name this user's HOME — as a git
-repo with one commit (the identity check greps it, B1); a tmpfs HOME at /tmp/home holding only a stub
-`~/.local/bin/claude` that sleeps (the suite stubs every model call; a window that starts one must stay up); and a
+repo with one commit (the identity check greps it, B1); a tmpfs HOME at /work/home holding only a stub
+`~/.local/bin/claude` that sleeps (the suite stubs every model call; a window that starts one must stay up) — off
+/tmp, since the guard and cc-slack's upload check let anything under /tmp through, so a HOME there passed writes and
+uploads their checks expect refused; an empty directory at this user's passwd home, so a command that runs from there
+(cc-slack's approved runs, cwd=PW_HOME) finds its directory and nothing of the host's in it; XDG_RUNTIME_DIR at
+/run/user/<uid>, an empty 0700 directory on the tmpfs /run (systemd-analyze --user cannot start without one); and a
 private tmux server (TMUX_TMPDIR=/tmp/tmux) with a session `main`. Each of the check's `mounts` is bound read-only
 at its own path (a leading ~ is this user's HOME) — a mount that is not there makes the run unrunnable, never a skip
 that passes (MissingMount).
@@ -24,12 +28,14 @@ runs, so the check never holds it. The lander reads the pipe's other end: no STA
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import sys
 
 from lander import types as T
 
-HOME_IN = "/tmp/home"
+HOME_IN = "/work/home"
+RUNTIME_IN = f"/run/user/{os.getuid()}"
 TREE_IN = "/work/tree"
 TMUX_IN = "/tmp/tmux"
 PATH_IN = f"{HOME_IN}/.local/bin:/usr/local/bin:/usr/bin:/bin"
@@ -43,7 +49,7 @@ STUB = ("#!/bin/sh\n# the lander's sandbox stub: the suite stubs every model cal
         "exec sleep 3600\n")
 # a setup step that fails stops the run with this as its first line, which run.SETUP_RE reads as unrunnable
 SETUP_FAILED = "lander-sandbox: setup failed, nothing ran"
-SETUP = (f'err=$({{ mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" && chmod 700 "{TMUX_IN}" && '
+SETUP = (f'err=$({{ mkdir -p "{TMUX_IN}" "{HOME_IN}/.local/bin" "{RUNTIME_IN}" && chmod 700 "{TMUX_IN}" "{RUNTIME_IN}" && '
          f'cp "$LANDER_STUB" "{HOME_IN}/.local/bin/claude" && chmod +x "{HOME_IN}/.local/bin/claude"; }} 2>&1) || '
          f'{{ printf "%s: %s\\n" "{SETUP_FAILED}" "$err" >&2; exit 125; }}; ')
 CHECK = ('command -v tmux >/dev/null 2>&1 && tmux new-session -d -s main -x 200 -y 50 >/dev/null 2>&1; '
@@ -61,10 +67,19 @@ def available() -> bool:
 def env(extra: dict | None = None) -> dict:
     user = os.environ.get("USER") or "lander"
     e = {"PATH": PATH_IN, "HOME": HOME_IN, "USER": user, "LOGNAME": user, "LANG": "C.UTF-8", "TERM": "dumb",
-         "SHELL": "/bin/bash", "TMPDIR": "/tmp", "TMUX_TMPDIR": TMUX_IN, "CC_SELFTEST_HELD": "1",
+         "SHELL": "/bin/bash", "TMPDIR": "/tmp", "TMUX_TMPDIR": TMUX_IN, "XDG_RUNTIME_DIR": RUNTIME_IN,
+         "CC_SELFTEST_HELD": "1",
          "CC_SELFTEST_SPILL": "0", "LANDER_STUB": "/tmp/.lander-stub"}
     e.update(extra or {})
     return e
+
+
+def pw_home() -> str:
+    """This user's home in the password database, which the cage's real /etc names anyway; "" when it has none."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir.rstrip("/") or "/"
+    except KeyError:
+        return ""
 
 
 def mounts(check: T.Check, home: str | None = None) -> list:
@@ -127,7 +142,10 @@ def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | 
         a += ["--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve"]
     for p in mounts(check, home):
         a += ["--ro-bind", p, p]
-    a += ["--bind", tree, TREE_IN, "--dir", HOME_IN]
+    a += ["--bind", tree, TREE_IN, "--tmpfs", HOME_IN]
+    pw = pw_home()
+    if pw not in ("", "/", HOME_IN):
+        a += ["--dir", pw]
     for k, v in env(extra_env).items():
         a += ["--setenv", k, v]
     a += ["--ro-bind", stub, "/tmp/.lander-stub", "--chdir", os.path.join(TREE_IN, cwd.rstrip("/")) if cwd else TREE_IN,

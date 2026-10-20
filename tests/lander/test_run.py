@@ -1172,16 +1172,17 @@ class GuardReplayEvilGuard(unittest.TestCase):
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
 class Sandbox(Env):
     def test_inside_there_is_the_tree_and_none_of_the_box(self):
-        home = os.path.expanduser("~")
+        home = S.pw_home()   # an empty directory inside (cc-slack's approved runs start there), never the host's
         probe = textwrap.dedent(f'''
             set -e
             test -x core/bin/tool
             test "$(git rev-parse HEAD^{{tree}})" = {self.tree}
-            test "$HOME" = /tmp/home
-            test ! -e "{home}" && test "$PWD" = /work/tree
+            test "$HOME" = /work/home
+            test -d "{home}" && test -z "$(ls -A "{home}")" && test "$PWD" = /work/tree
+            test -d "$XDG_RUNTIME_DIR" && test "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 && test -z "$(ls -A "$XDG_RUNTIME_DIR")"
             test -z "${{SECRET_TOKEN:-}}" && test -z "${{CLAUDECODE:-}}"
             tmux has-session -t main
-            command -v claude | grep -q /tmp/home/.local/bin/claude
+            command -v claude | grep -q /work/home/.local/bin/claude
             test "$(grep -c : /proc/net/dev)" = 1
             test "$CC_SELFTEST_SPILL" = 0
             echo "0 failed"
@@ -2728,6 +2729,20 @@ class Judge(unittest.TestCase):
                          T.FAILED)
         self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, quarantine=rows, touched=True).status,
                          T.FAILED)
+
+    def test_a_coloured_red_matches_its_quarantine_row_and_is_named_plain(self):
+        # #1655's follow-up: a colour code inside the red split the row's text, so it missed, and the why carried it
+        red = "\x1b[31m✗ flaky\x1b[0m text\r\n"
+        self.assertTrue(REC.quarantined(chk(), RUN.red_lines(red), [("c", "flaky text")]))
+        self.assertEqual(RUN.cause_of("ok\n" + red, 1), "✗ flaky text")
+
+    def test_a_red_that_stripping_eats_stays_red_beside_a_quarantined_one(self):
+        # Opus read of #1662: an open OSC took the whole red, a CSI took FAIL's F, and the quarantined red let it land
+        rows, flaky = [("c", "flaky text")], "✗ flaky text\n"
+        for red in ("\x1b]0;t ✗ test_real broke\n", "\x1b[FAIL: test_real\n", "\x1b[31m✗ real\x1b[0m broke\n"):
+            with self.subTest(red=red):
+                self.assertEqual(len(RUN.red_lines(flaky + red)), 2)
+                self.assertFalse(REC.quarantined(chk(), RUN.red_lines(flaky + red), rows))
 
     def test_run_plan_derives_security_and_touched_from_the_manifest(self):
         m = M.Manifest(checks={"guard": chk(name="guard", paths=["core/bin/guard"]),

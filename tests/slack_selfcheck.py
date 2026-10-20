@@ -6787,8 +6787,11 @@ def run_selfcheck():
     # --run keeps a record naming the seat that asked; the owner's 👍 is stamped in it, the card gets ✅ and that seat
     # hears it. Slack hands the card back with :closed_lock_with_key: for 🔐, which is how the fixtures read. Each case
     # has its own card ts and its own record dir.
-    def plain_case(text, rec=None, reactors=(("UOWNER", True),), card="1790000000.000700"):
+    def plain_case(text, rec=None, reactors=(("UOWNER", True),), card="1790000000.000700", unwritable=False, msg_rc=0):
         d = tempfile.mkdtemp(prefix="plain-cards-", dir=DIR)
+        if unwritable:   # the record's dir sits under a plain file, so makedirs fails as a full or read-only disk would
+            open(f"{d}/file", "w").close()
+            d = f"{d}/file/cards"
         if rec is not None:
             with open(f"{d}/{card}.json", "w") as fh:
                 json.dump(rec, fh)
@@ -6797,7 +6800,7 @@ def run_selfcheck():
         globals()["react"] = lambda cfg, chat, ts, name, **k: out["reacts"].append((ts, name))
         globals()["PLAIN_CARDS"] = d
         EFFECTS.run_impl = lambda cmd, **kw: out["msgs"].append((cmd, kw.get("env", {}).get("CC_MSG_FROM"))) or \
-            type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            type("R", (), {"returncode": msg_rc, "stdout": "", "stderr": ""})()
         dmMM.say = lambda chat, text, thread=None, **k: out["said"].append((thread, text))
         dmMM.fetch_message = lambda chat, ts: {**signed, "text": text}
         qMM.clear()
@@ -6836,6 +6839,18 @@ def run_selfcheck():
     pc = plain_case("Not run: the card was edited.", {"ts": "1790000000.000700", "from": "box@perms"})
     check("…and his 👍 on any other post of ours says nothing and stamps nothing",
           "approved_at" not in (pc["rec"] or {}) and not pc["msgs"] and not pc["said"] and not pc["reacts"])
+    # THE TWO WAYS IT FAILS (perms' read of #1350) must fail closed. A record that cannot be written is no approval:
+    # the card gets ❌, no seat is told to go ahead, and his thread says so.
+    pc = plain_case(stored, unwritable=True)
+    check("…a 👍 whose record cannot be written gets ❌ and tells no seat to go ahead, and his thread says nobody was told",
+          pc["reacts"] == [("1790000000.000700", "x")] and not pc["msgs"] and not pc["queued"]
+          and len(pc["said"]) == 1 and "could not be recorded" in pc["said"][0][1])
+    # A cc-msg that fails has told nobody: the 👍 stays on file as his approval, but his thread hears no seat was told,
+    # so he knows to say it himself instead of waiting on a seat that never heard.
+    pc = plain_case(stored, {"ts": "1790000000.000700", "id": "credential:mem-pat", "from": "box@perms"}, msg_rc=1)
+    check("…a cc-msg that fails does not count as telling the seat: his thread hears that no seat could be told",
+          (pc["rec"] or {}).get("approved_by") == "UOWNER" and len(pc["msgs"]) == 1
+          and len(pc["said"]) == 1 and pc["said"][0][0] == "1790000000.000700" and "no seat could be told" in pc["said"][0][1])
 
     # the channel server runs the code that is DEPLOYED, not the code it started with
     fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()

@@ -477,7 +477,12 @@ def resolves(host: str, wait: float = RESOLVE_WAIT) -> bool:
 
 
 def red_lines(text: str) -> list:
-    return [ln.strip() for ln in text.splitlines() if RED_RE.search(ln) and not PASS_RE.search(ln)]
+    """-> each line red in its raw or its plain() form, named plain, so a coloured red matches a quarantine row and
+    names a red without escapes. Read raw too, because stripping can eat a red: an open OSC takes its line to the end
+    and a CSI the F of '\x1b[FAIL' (Opus read of #1662, 10-20)."""
+    def red(ln):
+        return RED_RE.search(ln) and not PASS_RE.search(ln)
+    return [plain(ln).strip() for ln in text.splitlines() if red(ln) or red(plain(ln))]
 
 
 # THE RATCHET'S IDS: the line a suite prints for one failing case — its own ✗/✘ line, a FAIL line, pytest's FAILED or
@@ -591,7 +596,9 @@ PROGRESS_RE = re.compile(r"^(\S+\.py) [.sxX]*[FE][.sxXFE]*(?:\s+\[\s*\d+%\])?$",
 
 def cause_of(text: str, rc: int) -> str:
     """One line naming why a run is red, read from its WHOLE output, not the tail (2026-09/10: an INTERNALERROR, a
-    failing check.sh line above the tail and an all-pass tail each left a red nobody could name)."""
+    failing check.sh line above the tail and an all-pass tail each left a red nobody could name). Read from
+    plain(text), so the line carries no escape codes; the kept log stays raw."""
+    text = plain(text)
     def more(got, what="more"):
         return f" (+{len(got) - 1} {what})" if len(got) > 1 else ""
     summary, internal, progress = SUMMARY_RE.findall(text), INTERNAL_RE.findall(text), PROGRESS_RE.findall(text)

@@ -380,6 +380,16 @@ PY
   crec="$NH/.cc/approvals/cards/1790000000.000100.json"
   k "$(yes_ test "$(jq -r '.id + " " + .from' "$crec" 2>/dev/null)" = "credential:mem-pat ${CTL:-abox}")" "--approval with no --run: a record under the card's ts names its --id and the seat that posted it"
   k "$(yes_ test "$(stat -c %a "$crec" 2>/dev/null)/$(no_ test -e "$NH/.cc/approvals/run")" = 600/0)" "…in a file only this user reads, and no run record: a 👍 on it runs nothing"
+  # …AND WHEN THAT RECORD CANNOT BE WRITTEN (perms' read of #1350) the card has gone out, so the caller hears it, and
+  # nothing is left on file to name a seat: the owner's 👍 then tells nobody (cc-slack on_plain_card says so in his
+  # thread). A plain file where the cards dir goes makes the write fail as a full or read-only disk would.
+  rm -rf "$NH/.cc/approvals"; mkdir -p "$NH/.cc/approvals"; : > "$NH/.cc/approvals/cards"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n[ "$1" = sent ] && exit 1\n[ "$1" = post ] && echo 1790000000.000200\nexit 0\n' "$T/slack.args" > "$NH/bin/cc-slack"
+  N --approval --id credential:mem-key -t "demorepo approval" "mint a deploy key for mem"
+  cp "$T/cc-slack.kept" "$NH/bin/cc-slack"
+  k "$(yes_ test "$(grep -c 'its record could not be written' "$T/err")$(yes_ test -f "$NH/.cc/approvals/cards")$(no_ test -e "$NH/.cc/approvals/run")" = 100)" \
+    "…a record that cannot be written says so on stderr and leaves no record (the cards path still a plain file) and no run record, so a 👍 on the card names no seat and runs nothing"
+  rm -rf "$NH/.cc/approvals"
   # A FLAG THE TOOL DOES NOT TAKE: one of the box's own scripts (under HOME), read and never run. Each case below
   # starts with no record on file, so the record (or its absence) is this case's own.
   printf '#!/usr/bin/env bash\n# cc-zonetool set <name> --zone <zone> [--proxied]\ntouch "%s"\n' "$T/zonetool.ran" > "$NH/bin/cc-zonetool"

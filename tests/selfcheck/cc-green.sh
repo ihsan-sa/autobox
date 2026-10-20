@@ -592,6 +592,14 @@ EOS
   git -C "$cwt" add -A >/dev/null 2>&1
   k "$([ -e "$D/cw.fsm" ] && [ -e "$D/cw.hook" ] && echo 0 || echo 1)" "…control: plain git add -A there runs both"
   git -C "$cw" worktree remove --force "$cwt" >/dev/null 2>&1
+  # A SANDBOX VIEW WITHOUT tests/green.sh (a worker's: core/bin bound, the rest of the checkout hidden): the tool says the
+  # sandbox hides it by design and exits 2, and never dies on a bare "No such file" — while beside green.sh it gets past that line.
+  mkdir -p "$D/view/bin" && cp "$SELF" "$D/view/bin/cc-green"
+  out=$( cd "$D" && "$D/view/bin/cc-green" 2>&1 ); rc=$?
+  k "$(t test "$rc" = 2 -a -n "$(grep 'hides the host checkout by design' <<<"$out")" -a -z "$(grep 'No such file' <<<"$out")")" "with tests/green.sh hidden, cc-green says the sandbox hides it by design and exits 2"
+  mkdir -p "$D/view/tests" && cp "$(dirname "$(dirname "$SELF")")/tests/green.sh" "$D/view/tests/green.sh"
+  out=$( cd "$D" && "$D/view/bin/cc-green" 2>&1 )
+  k "$(nt grep -q 'hides the host checkout by design' <<<"$out")" "…and with green.sh beside it, it does not"
 
   echo "cc-green selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]

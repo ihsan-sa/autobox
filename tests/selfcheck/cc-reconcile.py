@@ -268,6 +268,17 @@ def selfcheck():
        decide(F(status="merged", journal=("BLOCKED", "old"), pr="u", pr_state="MERGED")) == [])
     ok("STATUS: BLOCKED with no question is still a declaration — it stopped, and only a person restarts it",
        decide(F(journal=("BLOCKED", "")))[0][:2] == ("ask", "waiting"))
+    with tempfile.TemporaryDirectory() as jd:   # journal() itself: a cc-loop RESUMED line after a BLOCKED one ends the wait
+        _st = STATE; globals().update(STATE=jd); os.makedirs(f"{jd}/r/t")
+        try:
+            open(f"{jd}/r/t/progress.md", "w").write("- x\nSTATUS: BLOCKED: git push failed\n- cc-loop: pushed\nSTATUS: RESUMED: head abc is on origin\n")
+            a = journal("r", "t")
+            open(f"{jd}/r/t/progress.md", "a").write("STATUS: BLOCKED: which port?\n")
+            b = journal("r", "t")
+        finally:
+            globals().update(STATE=_st)
+    ok("a cc-loop STATUS: RESUMED line after a BLOCKED one ends the wait, and a BLOCKED after it starts a new one",
+       a == (None, "") and b == ("BLOCKED", "which port?"))
     ok("nothing is ever inferred from prose: a journal that merely TALKS about waiting declares nothing",
        waits_for(F(journal=(None, "waiting on the owner for the syllabus"))) == ("", ""))
     ok("the snapshot's word is what decide() would set, not what the board says",
