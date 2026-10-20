@@ -295,5 +295,38 @@ def selfcheck():
     k(len(sent()) == 1, f"…and is said on the first pass after it lifts: {sent()}")
     os.environ.pop("CC_STALL_TIER")
 
+    # 15 a permission dialog standing DECLINE_S gets one Esc (No) and one cc-msg quoting it; never before, never under
+    # tier stop, never without --apply, and an unknown dialog with no "No, and tell Claude" never
+    os.environ["CC_STALL_TIER"] = tsub
+    passes = (1000, 1000 + DECLINE_S - 1, 1000 + DECLINE_S, 1000 + DECLINE_S + 120, 1000 + DECLINE_S + 240)
+    dead_fresh(); t = Fake(); w = t.add("perms", ASKED)
+    with q:
+        run(t, True, passes[0]); run(t, True, passes[1])
+        k(t.keys == [], "a permission dialog younger than DECLINE_S gets no key")
+        for s in passes[2:]:
+            run(t, True, s)
+    k(t.keys == [(w, "\x1b")], f"…and one Esc once it has stood DECLINE_S, across several passes: {t.keys}")
+    got = sent()
+    k(len(got) == 1 and got[0].startswith("perms|cc-stall pressed Esc") and "cc fund --repair ideas-2" in got[0],
+      f"…and one cc-msg to its own window quoting the command: {got}")
+    open(f"{d}/stop", "w").close()
+    dead_fresh(); t = Fake(); t.add("perms", ASKED)
+    with q:
+        for s in passes:
+            run(t, True, s)
+    os.remove(f"{d}/stop")
+    k(t.keys == [] and sent() == [], "tier stop: no Esc, no message")
+    dead_fresh(); t = Fake(); t.add("perms", ASKED)
+    with q:
+        for s in passes:
+            run(t, False, s)
+    k(t.keys == [] and sent() == [], "without --apply: no Esc, no message")
+    dead_fresh(); t = Fake(); t.add("box", ODD)
+    with q:
+        for s in passes:
+            run(t, True, s)
+    k(t.keys == [] and sent() == [], "an unknown dialog that is no permission dialog gets no Esc")
+    os.environ.pop("CC_STALL_TIER")
+
     print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0
