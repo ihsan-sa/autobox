@@ -2710,10 +2710,12 @@ pass=0; fail=0
 export HOME="$T/delivery-home" D="$T/delivery-fixture" REALBIN="$B"
 mkdir -p "$HOME/dev/r" "$D/bin"
 export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
-export CC_CONFIG="$D/config" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
+export CC_CONFIG="$D/cfg" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
-printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
+printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/cfg"
 cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/lander" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
+# cc-loop reads the worker prompt from the config/ beside its bin, so the copy here needs the real one there.
+mkdir -p "$D/config"; cp "$B/../config/worker-prompt.md" "$D/config/"
 # cc-land is a shim over `lander`, which runs only a pinned release under releases/<sha>: `current` is a symlink
 # to it, never the tree itself (#771) — a `current` that resolves outside releases/ is refused.
 rel="$HOME/.cc/lander/releases/fixture"; mkdir -p "$rel/core"; cp -r "$B/../lander" "$rel/core/"

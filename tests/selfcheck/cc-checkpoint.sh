@@ -12,6 +12,10 @@ selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspace
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   HOME="$T/home"; export HOME GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
   bin="$T/bin"; mkdir -p "$bin" "$HOME/.cc/worktrees" "$HOME/dev"
+  # Every case runs as if fenced (loopback only), so a push at a fixture's example.test url fails its lookup at once
+  # wherever this runs, rather than waiting out RESOLVE_WAITS on a host; the resolve cases below give themselves an uplink.
+  printf 'Inter-|\n face |\n    lo: 0\n' > "$T/net-lo"; printf 'Inter-|\n face |\n    lo: 0\n  eth0: 0\n' > "$T/net-up"
+  NET_DEV="$T/net-lo"; CC_NET_DEV="$T/net-lo"; export CC_NET_DEV
   cp "$(readlink -f "$0")" "$bin/cc-checkpoint"   # a COPY: a symlink resolves back to core/bin, and the stubs beside it would never be reached
   CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; RACE="$T/race"; ROWS="$T/rows"; UPACK="$T/upack"
   export CALLS NOTES DEFS RACE ROWS UPACK; : > "$UPACK"
@@ -553,6 +557,35 @@ SH
   git -C "$d" remote set-url origin "$owW"; runp "$d"; rc=$?
   k "$([ "$rc" = 0 ] && has "$owW" track/tW && [ ! -e "$d/.cc/push.err" ] && echo 0 || echo 1)" \
     "…while a remote that answers is pushed to as before, and push.err is cleared" "rc=$rc"
+  # ── a name that did not resolve is asked again ────────────────────────────────────────────────────
+  # 2026-10-14: two tracks' pushes failed 17 s apart on 'Could not resolve host: github.com'. A git on PATH that fails
+  # its lookup for the first $FLAPS calls stands in for that resolver; each case counts the calls it made.
+  mkdir -p "$T/flapbin"; RCOUNT="$T/rcount"; export RCOUNT
+  printf '#!/usr/bin/env bash\nn=$(( $(cat "$RCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RCOUNT"\n[ "$n" -le "${FLAPS:-0}" ] || { [ -z "${DENY:-}" ] || { echo "fatal: Authentication failed" >&2; exit 128; }; echo pushed; exit 0; }\necho "fatal: unable to access '"'"'https://github.com/o/r.git/'"'"': Could not resolve host: github.com" >&2; exit 128\n' > "$T/flapbin/git"
+  chmod +x "$T/flapbin/git"
+  flap(){   # $1 the interfaces file · $2 how many lookups fail · $3 non-empty: then refuse, as a failed login does
+    : > "$RCOUNT"; ( PATH="$T/flapbin:$PATH"; NET_DEV="$1"; RESOLVE_WAITS="0 0 0"; FLAPS="$2" DENY="${3:-}"; export FLAPS DENY
+    git_unattended push origin x ) 2>"$T/flap.err"; }
+  out=$(flap "$T/net-up" 2); rc=$?
+  eq "a lookup that fails twice and then answers is pushed on the third try" "rc=$rc out=$out calls=$(cat "$RCOUNT")" "rc=0 out=pushed calls=3"
+  k "$(grep -q 'Could not resolve host: github.com — asking again in 0s' "$T/flap.err" && echo 0 || echo 1)" \
+    "…and each retry is said on stderr, where push.err keeps it" "$(cat "$T/flap.err")"
+  out=$(flap "$T/net-up" 9); rc=$?
+  eq "a resolver that stays down is given up on after the last wait, with git's own exit" "rc=$rc calls=$(cat "$RCOUNT")" "rc=128 calls=4"
+  k "$(tail -1 "$T/flap.err" | grep -q '^fatal: unable to access' && echo 0 || echo 1)" \
+    "…and git's own line is the last on stderr, so push.err names the real reason" "$(cat "$T/flap.err")"
+  out=$(flap "$T/net-up" 0 deny); rc=$?
+  eq "a failure that is not the lookup is returned at once, never asked again" "rc=$rc calls=$(cat "$RCOUNT")" "rc=128 calls=1"
+  out=$(flap "$T/net-lo" 9); rc=$?
+  eq "inside a fence (loopback only) a failed lookup is final at once: there is no network to come back" "rc=$rc calls=$(cat "$RCOUNT")" "rc=128 calls=1"
+  # …AND END TO END through --push, on a real remote behind an ssh whose lookup fails the first time it is called.
+  owF=$(bare ownF)
+  printf '#!/usr/bin/env bash\nn=$(( $(cat "$RCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RCOUNT"\n[ "$n" -gt 1 ] || { echo "ssh: Could not resolve hostname example.test: Temporary failure in name resolution" >&2; exit 255; }\ncd "%s" && eval "${@: -1}"\n' "$T" > "$bin/flap-ssh"
+  chmod +x "$bin/flap-ssh"
+  d=$(mkproj myrepoF/tF origin "user@example.test:ownF.git"); : > "$RCOUNT"
+  ( cd "$d" && env CC_NET_DEV="$T/net-up" CC_RESOLVE_WAITS="0 0" GIT_SSH_COMMAND="$bin/flap-ssh" "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); rc=$?
+  k "$([ "$rc" = 0 ] && has "$owF" track/tF && [ "$(cat "$RCOUNT")" = 2 ] && [ ! -e "$d/.cc/push.err" ] && echo 0 || echo 1)" \
+    "--push through a lookup that fails once: pushed on the retry, with no push.err left behind" "rc=$rc calls=$(cat "$RCOUNT") $(cat "$d/.cc/push.err" 2>/dev/null)"
   # ── a push the remote rejects is said, once per reason ─────────────────────────────────────────────
   # 2026-09-08: GitHub rejected every checkpoint of a track (a workflow file, no `workflow` scope), and all anyone
   # saw was `push!`. A bare repository whose hook declines is the same answer from a real git remote: the line

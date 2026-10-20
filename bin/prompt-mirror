@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""prompt-mirror — an editable copy of every prompt the box gives an agent, in one folder, synced both ways.
+
+  prompt-mirror sync        one pass each way (what the path unit runs, on a save in the mirror or a change in git)
+  prompt-mirror list        each draft and the file it feeds, as the README says it
+  prompt-mirror selfcheck   the sync both ways, on throwaway repositories
+
+THE MIRROR is ~/prompts (PROMPT_MIRROR moves it): one flat folder, one draft per prompt, named
+<repo>.<path with / as .>, and a README saying which file feeds which agent. Flat because a systemd path unit
+watches one directory and not a tree, so a save anywhere in it is seen. The prompts are found, not listed: in each
+git checkout under ~/dev (PROMPT_MIRROR_DEV), the tracked files named like a prompt (PATTERNS below), outside
+docs/ and tests/. A repo the box adds, and a prompt a PR adds, show up on the next pass. A member's workspace
+(~/dev/<handle> with ~/.cc/members/<handle>, or its own .cc/member-workspace marker) is left out entirely, git
+included. Only a regular file reached through no link and at most MAX_BYTES (256 KiB) is read, so a link, a FIFO
+or a device at a prompt's path is skipped, and a PR never writes through a link the default branch carries.
+
+THE STATE is ~/prompts/.state/map.json: per draft, its source (repo, path), `base` (the source text the draft was
+last made from) and `sent` (the draft text last opened as a PR). Three rules, and nothing else decides:
+  · git → mirror: a draft still equal to its base is unedited, so a source that moved replaces it (and the base).
+    A draft that differs from its base is being edited and is NEVER written over by a change in git.
+  · mirror → git: an edited draft that is not what was last sent opens (or updates) a PR: a branch
+    prompt-mirror/<draft> cut from the repo's default branch, the draft copied over its source, pushed, `gh pr
+    create`, `cc-land queue <repo> <pr>`, and the PR link to Slack (cc-notify). A second save while that PR is
+    open force-pushes the same branch, so one draft is one PR. If the source moved since the draft was made, the
+    edit is carried onto it with `git merge-file` in the PR, so the PR reverts nothing git did meanwhile; on a
+    clash nothing is pushed and he is told how to start over. Either way the draft itself is never written.
+  · landed: a sent draft whose edit git now carries (merging it onto the source changes nothing) becomes the
+    source's text, others' changes included, and follows git again. Until then it is left exactly as he saved it.
+A draft deleted by hand comes back from git, which is also how an edit is dropped. A source that left git takes
+its draft with it unless the draft is edited, which is then left alone and never pushed. Passes repeat until one
+finds nothing to do, so a save made while a PR was being opened is not lost to the path unit's single trigger.
+"""
+import fcntl, json, os, shutil, signal, stat, subprocess, sys, tempfile
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+PATTERNS = ["*CLAUDE.md", "*-prompt.md", "prompts/*.md", "*/prompts/*.md", "*/agents/*.md", "*/self-review.md"]
+SKIP = ("docs/", "tests/", "fixtures/")
+MAX_BYTES = 256 * 1024   # the largest real prompt is ~/CLAUDE.md's source at under 7 KB; anything near this is not a prompt
+
+
+def env_path(var, default):
+    return os.path.expanduser(os.environ.get(var) or default)
+
+
+def mirror_dir():
+    return env_path("PROMPT_MIRROR", "~/prompts")
+
+
+def dev_dir():
+    return env_path("PROMPT_MIRROR_DEV", "~/dev")
+
+
+def tool(var, name):   # CC_GH / CC_LAND / CC_NOTIFY: test hooks; the box's own copies otherwise
+    return os.environ.get(var) or (name if name == "gh" else os.path.join(BIN, name))
+
+
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r
+
+
+def log(msg):
+    print(f"prompt-mirror: {msg}", file=sys.stderr)
+
+
+def read(p):   # a regular file's text, or None: never through a link, never a FIFO or device, never past MAX_BYTES
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:   # missing, or a link (ELOOP); O_NONBLOCK keeps a FIFO from waiting for a writer
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+            return None
+        data = b""
+        while len(data) <= MAX_BYTES and (chunk := os.read(fd, MAX_BYTES + 1 - len(data))):
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > MAX_BYTES:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def member_workspace(dev, repo):   # ~/dev/<handle> is a member's, written from inside a sandbox: never read, never run git in
+    return (os.path.lexists(os.path.join(env_path("PROMPT_MIRROR_MEMBERS", "~/.cc/members"), repo))
+            or os.path.lexists(os.path.join(dev, repo, ".cc", "member-workspace")))
+
+
+def plain_file(rd, path):   # a regular file reached through no link at any depth, and small enough to be a prompt
+    full = os.path.join(rd, path)
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and st.st_size <= MAX_BYTES
+            and os.path.realpath(full) == os.path.join(os.path.realpath(rd), path))
+
+
+def write(p, text):   # whole or not at all: an editor watching the file never sees half of it
+    d = os.path.dirname(p)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".pm-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, p)
+
+
+def sources():   # → {draft name: (repo name, repo dir, path)}
+    out, dev = {}, dev_dir()
+    for repo in sorted(os.listdir(dev)) if os.path.isdir(dev) else []:
+        rd = os.path.join(dev, repo)
+        if os.path.islink(rd) or not os.path.exists(os.path.join(rd, ".git")) or member_workspace(dev, repo):
+            continue
+        r = git(rd, "ls-files", "--", *PATTERNS, check=False)
+        for path in r.stdout.splitlines():
+            if any(path.startswith(s) or f"/{s}" in path for s in SKIP) or not plain_file(rd, path):
+                continue
+            out[f"{repo}.{path.replace('/', '.')}"] = (repo, rd, path)
+    return out
+
+
+FEEDS = {   # what a source feeds, by its path's tail; the README's second column
+    "config/worker-prompt.md": "every headless worker (cc-loop): its system prompt. {track} {repo} {state} {base} are filled in; line breaks become spaces",
+    "config/dispatch-prompt.md": "every session kind, appended: when to use a subagent, a worker or an orch, and the model bands",
+    "config/writing-prompt.md": "every session kind and the Slack tool: the writing rules",
+    "config/writing-ref-prompt.md": "a worker on the host: the one-line pointer to the writing rules",
+    "config/review-prompt.md": "the lander's review gate: the one read every PR gets before it merges",
+    "config/raise-prompt.md": "workers and seats: how to raise a problem with the box",
+    "config/spend-prompt.md": "workers and seats: how to curb spend",
+    "config/mail-prompt.md": "workers and seats: when the box sends mail",
+    "config/library-prompt.md": "workers and seats: filing a PDF in the library",
+    "config/ask-prompt.md": "workers and seats: where to look first, and whom to ask",
+    "config/propose-prompt.md": "cc-improve: proposes the next change to try on a replay of real landings",
+    "config/audit-failure-broad-prompt.md": "cc-audit's session that looks into a failure (broad pass)",
+    "config/audit-failure-narrow-prompt.md": "cc-audit's session that looks into a failure (narrow pass)",
+    "config/mail-route-prompt.md": "the mail router: which session an incoming mail goes to",
+    "config/mail-vet-prompt.md": "the mail vetter, for an unknown sender",
+    "config/mail-vet-known-prompt.md": "the mail vetter, for a known sender",
+    "config/mail-vet-security-prompt.md": "the mail vetter's security pass",
+    "templates/channel-CLAUDE.md": "a Slack channel's own session: its CLAUDE.md, written when the channel's directory is made",
+    "templates/self-review.md": "the worker prompt's self-review: its six headings are copied into every worker's prompt",
+    "templates/home/CLAUDE.md": "~/CLAUDE.md on a box with no overlay of its own (a seed, copied once)",
+    "templates/home/agents/builder.md": "the builder subagent type (~/.claude/agents, copied in by install.sh)",
+    "templates/home/agents/reviewer.md": "the reviewer subagent type (~/.claude/agents, copied in by install.sh)",
+    "templates/home/agents/security-reviewer.md": "the security-reviewer subagent type (~/.claude/agents, copied in by install.sh)",
+    "home/CLAUDE.md": "~/CLAUDE.md: every session on the box",
+    "home/claude/CLAUDE.md": "~/.claude/CLAUDE.md: every session the owner runs (it imports BOX.md and OWNER.md)",
+}
+
+
+def feeds(path):
+    for tail, what in FEEDS.items():
+        if path == tail or path.endswith("/" + tail):
+            return what
+    if path == "CLAUDE.md":
+        return "every session working in this repo (its project CLAUDE.md)"
+    if path.endswith("CLAUDE.md"):
+        return "sessions working under " + (os.path.dirname(path) or ".") + "/"
+    return "read by this repo's own code (grep the file name to see where)"
+
+
+README_HEAD = """# Prompts
+
+Every prompt the box gives an agent, one draft each. Edit and save: within seconds a PR opens with your change,
+queues to land, and its link comes to you in Slack. Saving again while it is open updates the same PR.
+You never touch git here.
+
+- A draft you have edited is never overwritten. One you have not follows git: when a PR changes the prompt,
+  the draft changes with it.
+- To drop an edit, delete the draft. It comes back from git.
+- If git changed the prompt while you were editing, the PR carries your edit onto the new text. If the two clash,
+  no PR opens and Slack tells you so; your draft is left as you saved it. Delete it to get the current text back,
+  then redo the edit.
+- This file is rewritten on every pass, so edits to it are lost.
+
+| draft | feeds | source |
+|---|---|---|
+"""
+
+
+def readme(srcs):
+    rows = "".join(f"| {n} | {feeds(p)} | {r}: {p} |\n" for n, (r, _, p) in sorted(srcs.items()))
+    return README_HEAD + rows
+
+
+def default_branch(rd):
+    r = git(rd, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+    b = r.stdout.strip().removeprefix("origin/")
+    return b if b and not b.startswith("track/") else "main"
+
+
+def open_pr(name, repo, rd, path, text):   # → the PR url; raises on any step before the PR exists
+    base = default_branch(rd)
+    branch = f"prompt-mirror/{name.removesuffix('.md')}"
+    git(rd, "fetch", "-q", "origin", base)
+    # a scratch checkout of its own, outside ~/.cc/worktrees where every name is a track's
+    wt = os.path.join(env_path("PROMPT_MIRROR_WORKTREES", "~/.cache/prompt-mirror"), repo)
+    git(rd, "worktree", "remove", "--force", wt, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    os.makedirs(os.path.dirname(wt), exist_ok=True)
+    git(rd, "worktree", "add", "-q", "-f", "-B", branch, wt, f"origin/{base}")
+    try:
+        target = os.path.join(wt, path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # the default branch may carry the path as a link (or a link above it): writing through it would land outside
+        if os.path.realpath(os.path.dirname(target)) != os.path.dirname(os.path.join(os.path.realpath(wt), path)):
+            raise RuntimeError(f"{path}: a directory above it is a link on {base}; not written")
+        if os.path.lexists(target) and not stat.S_ISREG(os.lstat(target).st_mode):
+            raise RuntimeError(f"{path} is not a regular file on {base}; not written")
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        git(wt, "add", "--", path)
+        if not git(wt, "diff", "--cached", "--quiet", check=False).returncode:
+            return None   # already what the default branch says: nothing to propose
+        git(wt, "commit", "-q", "-m", f"Prompt edit: {path}\n\nEdited in the prompt mirror as {name}.")
+        git(wt, "push", "-q", "-f", "origin", f"{branch}:{branch}")
+        gh = tool("CC_GH", "gh")
+        r = subprocess.run([gh, "pr", "view", branch, "--json", "url,state", "-q", 'select(.state=="OPEN").url'],
+                           cwd=wt, capture_output=True, text=True)
+        url = r.stdout.strip() if r.returncode == 0 else ""
+        if not url:
+            body = (f"The owner edited `{path}` in the prompt mirror (`{name}`); `prompt-mirror` opened this PR "
+                    "from his saved draft. The diff is the whole change.")
+            r = subprocess.run([gh, "pr", "create", "--base", base, "--head", branch,
+                                "--title", f"Prompt edit: {path}", "--body", body],
+                               cwd=wt, capture_output=True, text=True)
+            if r.returncode:
+                raise RuntimeError(f"gh pr create: {r.stderr.strip()}")
+            url = r.stdout.strip().splitlines()[-1]
+    finally:
+        git(rd, "worktree", "remove", "--force", wt, check=False)
+    num = url.rstrip("/").rsplit("/", 1)[-1]
+    q = subprocess.run([tool("CC_LAND", "cc-land"), "queue", repo, num], capture_output=True, text=True)
+    queued = "queued to land" if q.returncode == 0 else f"NOT queued (cc-land queue said: {(q.stderr or q.stdout).strip()[:200]})"
+    notify(repo, f"Your prompt edit to {path} is {url} — {queued}.")
+    return url
+
+
+def notify(repo, text):
+    r = subprocess.run([tool("CC_NOTIFY", "cc-notify"), "-t", f"{repo} prompt-mirror", "--keep", text],
+                       capture_output=True, text=True)
+    if r.returncode:
+        log(f"cc-notify failed ({r.returncode}): {text}")
+
+
+def merge3(ours, base, theirs):   # → (merged text, 0 or the number of clashes), as git merge-file says it
+    with tempfile.TemporaryDirectory() as td:
+        f = [os.path.join(td, x) for x in ("ours", "base", "theirs")]
+        for p, text in zip(f, (ours, base, theirs)):
+            with open(p, "w", encoding="utf-8") as h:
+                h.write(text)
+        m = subprocess.run(["git", "merge-file", "-p", "-L", "your draft", "-L", "before", "-L", "git now", *f],
+                           capture_output=True, text=True)
+    return m.stdout, m.returncode
+
+
+def one_pass(state, srcs):   # → True when it did anything (wrote a draft or opened a PR)
+    md, did = mirror_dir(), False
+    for name in sorted(set(state) | set(srcs)):
+        dp, st = os.path.join(md, name), state.get(name)
+        src = None
+        if name in srcs:
+            repo, rd, path = srcs[name]
+            src = read(os.path.join(rd, path))
+        draft = read(dp)
+        if src is None:   # the source left git: its draft goes with it, unless it is being edited
+            if st is not None and draft is not None and draft != st["base"]:
+                continue
+            if draft is not None and st is not None:
+                os.remove(dp); did = True
+            state.pop(name, None)
+            continue
+        if st is None or draft is None:   # new, or deleted by hand: made from git
+            write(dp, src); state[name] = {"repo": repo, "path": path, "base": src, "sent": src}; did = True
+            continue
+        if draft == st["base"]:   # unedited: follows git
+            if src != draft:
+                write(dp, src); st.update(base=src, sent=src); did = True
+            continue
+        if draft == src:   # the edit landed
+            st.update(base=src, sent=src)
+            continue
+        if draft == st["sent"]:   # edited and sent: its PR is open, and git merges it when it lands
+            if src != st["base"] and merge3(draft, st["base"], src) == (src, 0):   # landed, with others' changes
+                write(dp, src); st.update(base=src, sent=src); did = True
+            continue
+        # "a draft he's editing is never overwritten" (the brief): from here on the draft is only read. If git moved
+        # under it, the PR gets his edit carried onto git's text, never his whole file over it; the draft stays as saved.
+        text, clash = merge3(draft, st["base"], src) if src != st["base"] else (draft, 0)
+        if clash:   # nothing to propose that would not undo git's change: tell him, once per save
+            st["sent"] = draft; did = True
+            notify(repo, f"Your edit to {path} clashes with a change made in git since you opened it, so no PR was "
+                         f"opened. Delete {name} in the prompt mirror to get the current text back, then redo the edit.")
+            continue
+        try:
+            url = open_pr(name, repo, rd, path, text)
+        except (RuntimeError, OSError) as e:
+            log(f"{name}: no PR — {e}")
+            continue
+        st["sent"] = draft; did = True
+        log(f"{name}: {url or 'already on the default branch'}")
+    return did
+
+
+def sync():
+    md = mirror_dir()
+    os.makedirs(os.path.join(md, ".state"), exist_ok=True)
+    with open(os.path.join(md, ".state", "lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sp = os.path.join(md, ".state", "map.json")
+        state = json.loads(read(sp) or "{}")
+        for _ in range(10):
+            srcs = sources()
+            busy = one_pass(state, srcs)
+            write(sp, json.dumps(state, indent=1))
+            if not busy:
+                break
+        rd = readme(srcs)
+        if read(os.path.join(md, "README.md")) != rd:
+            write(os.path.join(md, "README.md"), rd)
+    return 0
+
+
+W0 = "You are worker {track}.\nLine two.\nmiddle\nLine four.\n"
+WP, BP, CP = "core/config/worker-prompt.md", "core/templates/home/agents/builder.md", "CLAUDE.md"
+W, B, C = "box.core.config.worker-prompt.md", "box.core.templates.home.agents.builder.md", "box.CLAUDE.md"
+BR = "prompt-mirror/box.core.config.worker-prompt"
+FAKES = {   # each logs its argv to $PM_CALLS; gh keeps one PR per branch under $PM_PRS
+    "gh": 'echo "gh $*" >> "$PM_CALLS"\ncase "$1 $2" in "pr view") cat "$PM_PRS/$(echo "$3" | tr / _)" 2>/dev/null || exit 1;;\n'
+          '"pr create") n=$(ls "$PM_PRS" | wc -l); u="https://example.invalid/pull/$((n+7))"; echo "$u" > "$PM_PRS/$(echo "$6" | tr / _)"; echo "$u";; esac',
+    "cc-land": 'echo "land $*" >> "$PM_CALLS"',
+    "cc-notify": 'echo "notify $*" >> "$PM_CALLS"',
+}
+
+
+class Fixture:   # one case's own world: a remote, the live checkout under dev/, the mirror, and its own call log
+    def __init__(self, root, k):
+        d = self.d = os.path.join(root, f"case{k}")
+        self.rd, self.md, self.calls_f = f"{d}/dev/box", f"{d}/prompts", f"{d}/calls"
+        os.makedirs(f"{d}/prs")
+        os.environ.update(PROMPT_MIRROR=self.md, PROMPT_MIRROR_DEV=f"{d}/dev", PROMPT_MIRROR_WORKTREES=f"{d}/wt",
+                          PROMPT_MIRROR_MEMBERS=f"{d}/members",
+                          PM_CALLS=self.calls_f, PM_PRS=f"{d}/prs")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", f"{d}/up.git"], check=True)
+        subprocess.run(["git", "clone", "-q", f"{d}/up.git", self.rd], check=True, capture_output=True)
+        for p, text in {WP: W0, BP: "builder\n", CP: "project rules\n", "docs/old-prompt.md": "not a prompt\n",
+                        "core/bin/tool": "code\n"}.items():
+            self.put(p, text)
+        self.commit("init")
+        git(self.rd, "remote", "set-head", "origin", "main")
+        sync()
+        self.clear()
+
+    def upstream(self, p, link):   # main gains p as a link to `link`, and the live checkout does not move
+        d = f"{self.d}/other"
+        if not os.path.isdir(d):
+            subprocess.run(["git", "clone", "-q", f"{self.d}/up.git", d], check=True, capture_output=True)
+        git(d, "pull", "-q", "origin", "main")
+        os.remove(os.path.join(d, p)); os.symlink(link, os.path.join(d, p))
+        git(d, "add", "-A"); git(d, "commit", "-qm", "link"); git(d, "push", "-q", "origin", "main")
+
+    def put(self, p, text):
+        os.makedirs(os.path.dirname(os.path.join(self.rd, p)) or self.rd, exist_ok=True)
+        with open(os.path.join(self.rd, p), "w") as f:
+            f.write(text)
+
+    def commit(self, msg):
+        git(self.rd, "add", "-A"); git(self.rd, "commit", "-qm", msg); git(self.rd, "push", "-q", "origin", "main")
+
+    def land(self, p, text, msg="land"):   # a change merged in git: the live checkout moves with it
+        self.put(p, text); self.commit(msg)
+
+    def draft(self, name):
+        return read(f"{self.md}/{name}")
+
+    def save(self, name, text):
+        write(f"{self.md}/{name}", text)
+
+    def calls(self):
+        return read(self.calls_f) or ""
+
+    def clear(self):
+        open(self.calls_f, "w").close()
+
+    def pushed(self, branch, p):
+        git(self.rd, "fetch", "-q", "origin")
+        return git(self.rd, "show", f"origin/{branch}:{p}", check=False).stdout
+
+
+def selfcheck():
+    n = bad = 0
+
+    def t(label, got, want):
+        nonlocal n, bad
+        n += 1
+        if got != want:
+            bad += 1
+            print(f"FAIL {label}: got {got!r}, want {want!r}")
+
+    root = tempfile.mkdtemp(prefix="pm-sc-")
+    try:
+        os.environ.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                          GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        os.makedirs(f"{root}/fake")
+        for name, body in FAKES.items():
+            with open(f"{root}/fake/{name}", "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(f"{root}/fake/{name}", 0o755)
+        os.environ.update(CC_GH=f"{root}/fake/gh", CC_LAND=f"{root}/fake/cc-land", CC_NOTIFY=f"{root}/fake/cc-notify")
+        k = iter(range(100))
+
+        f = Fixture(root, next(k))
+        t("the first pass mirrors each prompt, and no doc, no code",
+          sorted(x for x in os.listdir(f.md) if not x.startswith(".")), sorted([W, B, C, "README.md"]))
+        t("a draft is its source's text", f.draft(W), W0)
+        rm = f.draft("README.md")
+        t("the README says what each draft feeds, and from where",
+          ("every headless worker (cc-loop)" in rm, f"| box: {BP} |" in rm), (True, True))
+        f.save("README.md", "mine\n"); sync()
+        t("the README is the tool's: an edit to it is rewritten and proposes nothing",
+          (f.draft("README.md") == rm, f.calls()), (True, ""))
+
+        f = Fixture(root, next(k))
+        f.land(BP, "builder v2\n"); sync()
+        t("git → mirror: an unedited draft follows git, and proposes nothing", (f.draft(B), f.calls()), ("builder v2\n", ""))
+
+        f = Fixture(root, next(k))
+        mine = W0.replace("Line two.", "Line two, edited.")
+        f.save(W, mine); sync()
+        c = f.calls()
+        t("mirror → git: a saved draft is pushed on its own branch, cut from main", f.pushed(BR, WP), mine)
+        t("…changing only its file", git(f.rd, "diff", "--name-only", "origin/main", f"origin/{BR}").stdout.split(), [WP])
+        t("…a PR opened against main, queued with cc-land, its link sent to Slack",
+          (f"gh pr create --base main --head {BR}" in c, "land queue box 7" in c,
+           f"notify -t box prompt-mirror --keep Your prompt edit to {WP} is https://example.invalid/pull/7" in c),
+          (True, True, True))
+        t("…the live checkout and the draft left as they were", (read(f"{f.rd}/{WP}"), f.draft(W)), (W0, mine))
+        f.clear(); sync()
+        t("a pass with nothing new proposes nothing", f.calls(), "")
+
+        f = Fixture(root, next(k))
+        f.save(W, W0.replace("Line two.", "Line two, edited.")); sync(); f.clear()
+        again = W0.replace("Line two.", "Line two, edited again.")
+        f.save(W, again); sync()
+        c = f.calls()
+        t("a second save updates the same PR: no second PR, queued again", ("pr create" in c, "land queue box 7" in c), (False, True))
+        t("…with the new text", f.pushed(BR, WP), again)
+
+        f = Fixture(root, next(k))
+        mine = W0.replace("Line two.", "Line two, edited.")
+        f.save(W, mine); sync(); f.clear()
+        f.land(WP, W0.replace("Line four.", "Line four, from git.")); sync()
+        t("a draft whose PR is open is never overwritten by another change landing, and proposes nothing",
+          (f.draft(W), f.calls()), (mine, ""))
+        both = mine.replace("Line four.", "Line four, from git.")
+        f.land(WP, both, "the PR lands, merged with that change"); sync()
+        t("once git carries the edit, the draft is git's merged text", f.draft(W), both)
+        later = both.replace("Line two, edited.", "Line two, later.")
+        f.land(WP, later); sync()
+        t("…and follows git again, proposing nothing", (f.draft(W), f.calls()), (later, ""))
+
+        f = Fixture(root, next(k))
+        mine = W0.replace("Line two.", "Line two, stale edit.")
+        f.save(W, mine)
+        f.land(WP, W0.replace("Line four.", "Line four, newer."))   # git moves before the save is seen
+        sync()
+        t("an edit saved over a draft git has since moved: the PR carries the edit onto git's text, reverting nothing",
+          f.pushed(BR, WP), mine.replace("Line four.", "Line four, newer."))
+        t("…and the draft is left exactly as he saved it", f.draft(W), mine)
+
+        f = Fixture(root, next(k))
+        f.save(C, "my rules\n"); f.land(CP, "their rules\n"); sync()
+        c = f.calls()
+        t("a clash opens no PR, tells him how to start over, and leaves the draft as saved",
+          ("gh pr create" in c, "clashes" in c and f"Delete {C}" in c, f.draft(C)), (False, True, "my rules\n"))
+        f.clear(); sync()
+        t("…once: the next pass says nothing", f.calls(), "")
+        os.remove(f"{f.md}/{C}"); sync()
+        t("a draft deleted by hand comes back as git's text, proposing nothing", (f.draft(C), f.calls()), ("their rules\n", ""))
+
+        f = Fixture(root, next(k))
+        f.save(C, "kept edit\n")
+        f.put("core/templates/home/agents/new.md", "new agent\n"); f.commit("new")
+        git(f.rd, "rm", "-q", BP, CP); f.commit("rm")
+        sync()
+        t("a prompt added in git appears", f.draft("box.core.templates.home.agents.new.md"), "new agent\n")
+        t("a prompt removed from git takes its unedited draft with it", os.path.exists(f"{f.md}/{B}"), False)
+        t("…but an edited one stays, and is never pushed", (f.draft(C), "pr create" in f.calls()), ("kept edit\n", False))
+
+        f = Fixture(root, next(k))
+        secret = f"{f.d}/config-secret"
+        with open(secret, "w") as h:
+            h.write("TOKEN=s3cret\n")
+        os.remove(f"{f.rd}/{CP}"); os.symlink(secret, f"{f.rd}/{CP}")   # a tracked prompt turned into a link
+        sync()
+        t("a prompt whose file is a link is not followed: its draft goes, and the linked file's text is nowhere",
+          (os.path.exists(f"{f.md}/{C}"), any("s3cret" in (read(f"{f.md}/{x}") or "") for x in os.listdir(f.md))),
+          (False, False))
+
+        f = Fixture(root, next(k))
+        os.remove(f"{f.rd}/{BP}"); os.mkfifo(f"{f.rd}/{BP}")   # a FIFO with no writer at a prompt's path
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+        signal.alarm(20)
+        try:
+            sync(); hung = False
+        except TimeoutError:
+            hung = True
+        finally:
+            signal.alarm(0)
+        t("a FIFO at a prompt's path never hangs the pass, and is not mirrored", (hung, os.path.exists(f"{f.md}/{B}")), (False, False))
+
+        f = Fixture(root, next(k))
+        f.land(CP, "x" * (MAX_BYTES + 1)); sync()
+        t("a file over the size limit is not a prompt: no draft", os.path.exists(f"{f.md}/{C}"), False)
+
+        f = Fixture(root, next(k))
+        os.makedirs(f"{f.d}/members/alice")
+        subprocess.run(["git", "clone", "-q", f"{f.d}/up.git", f"{f.d}/dev/alice"], check=True, capture_output=True)
+        os.makedirs(f"{f.d}/dev/bob/.cc"); open(f"{f.d}/dev/bob/.cc/member-workspace", "w").close()
+        subprocess.run(["git", "init", "-q", f"{f.d}/dev/bob"], check=True)
+        with open(f"{f.d}/dev/bob/CLAUDE.md", "w") as h:
+            h.write("bob\n")
+        git(f"{f.d}/dev/bob", "add", "-A"); git(f"{f.d}/dev/bob", "commit", "-qm", "b")
+        sync()
+        t("a member's workspace is left out entirely (by its record, or by its own marker)",
+          sorted(x for x in os.listdir(f.md) if x.startswith(("alice.", "bob."))), [])
+
+        f = Fixture(root, next(k))
+        target = f"{f.d}/outside"
+        with open(target, "w") as h:
+            h.write("untouched\n")
+        f.save(C, "my rules\n")
+        f.upstream(CP, target)   # main now carries CLAUDE.md as a link out of the repo; the live checkout has not moved
+        sync()
+        c = f.calls()
+        t("a PR never writes through a link the default branch carries: the link's target is untouched, nothing pushed",
+          (read(target), "pr create" in c, f.pushed(BR.replace("box.core.config.worker-prompt", "box.CLAUDE"), CP)),
+          ("untouched\n", False, ""))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"prompt-mirror selfcheck: {n - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "sync":
+        return sync()
+    if cmd == "list":
+        for n, (r, _, p) in sorted(sources().items()):
+            print(f"{n}\t{feeds(p)}\t{r}: {p}")
+        return 0
+    if cmd == "selfcheck":
+        return selfcheck()
+    print(__doc__.split("\n\n")[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

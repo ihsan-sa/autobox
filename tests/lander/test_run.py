@@ -118,6 +118,19 @@ class Status(unittest.TestCase):
         self.assertEqual(RUN.status_of(1, "cp: No space left on device"),
                          (T.UNRUNNABLE, "the box, not the tree: No space left on device"))
 
+    def test_a_failed_lookup_is_the_network_only_on_a_net_check(self):
+        dns = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n1 failed"
+        self.assertEqual(RUN.status_of(1, dns, net=True),
+                         (T.UNRUNNABLE, "the network, not the tree: Could not resolve host: github.com"))
+        self.assertEqual(RUN.status_of(1, "socket.gaierror: [Errno -3] Temporary failure in name resolution",
+                                       net=True)[0], T.UNRUNNABLE)
+        # a check with no network has no lookup to fail: the line is its own, and its red stands
+        self.assertEqual(RUN.status_of(1, dns)[0], T.FAILED)
+        # a net check that passed while quoting the line (a case that fakes the failure) still passes
+        self.assertEqual(RUN.status_of(0, "Could not resolve host: x\nok 4 passed, 0 failed", net=True)[0], T.PASSED)
+        # …and a net check's red with no lookup in it is the tree's
+        self.assertEqual(RUN.status_of(1, "AssertionError: 2 != 3\n1 failed", net=True)[0], T.FAILED)
+
     def test_setup_said_out_of_band_decides_whether_the_sandbox_started(self):
         # perms on #1452: a check that prints setup's words first is the check's red, never unrunnable
         for text in ("bwrap: Can't mount proc on /newroot/proc\n1 failed",
@@ -856,6 +869,14 @@ class Sandbox(Env):
     def test_net_true_shares_the_network(self):
         r = self.run_(chk(run='test "$(grep -c : /proc/net/dev)" -gt 1', net=True))
         self.assertEqual(r.status, T.PASSED, r.extra)
+
+    def test_a_net_check_that_fails_its_lookup_is_held_not_red(self):
+        # a fake resolver failure, printed the way git prints it when the box's resolver drops out (10-14)
+        flap = "echo \"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\" >&2; exit 1"
+        r = self.run_(chk(run=flap, net=True))
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("the network, not the tree", r.extra.get("why", ""))
+        self.assertEqual(self.run_(chk(run=flap)).status, T.FAILED)   # no network to lose: the tree's own red
 
     def test_a_mount_is_read_only_and_a_missing_mount_is_unrunnable(self):
         m = os.path.join(self.tmp, "venv")

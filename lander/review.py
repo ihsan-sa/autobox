@@ -93,6 +93,18 @@ Otherwise the lander buys one:
     The verdict is HANDBACK when any reader's is; the findings are all readers', each row naming its reader; the
     marker lists every reader's own verdict. Together they count as ONE read against the cap.
     CC_LAND_REVIEW_MODEL, when set, is the only reader (the old single-read setting).
+    A STAND-IN FOR A LIMITED READER (#1116 and #1128 held two hours on 10-17 while Astra sat at its ChatGPT usage
+    limit). When a reader that is not claude's comes back with a usage or rate limit (why starting `limit`, as
+    ask_codex() reports codex_limit(): a nonzero exit and codex's own ERROR: or stream error: line, the echoed
+    prompt taken out first, so a diff saying "usage limit" never makes another fault a limit) and the plan names no
+    security path (plan.extra["security"] empty; a plan of None counts as unknown and gets none), one more claude
+    read, independent of the first (its own call, no context shared), stands in for it: CC_LAND_REVIEW_LIMIT_READER (the passwd home's config, like every CC_LAND_REVIEW
+    key), default the first claude reader on readers() (a value that is not a claude model turns the stand-in off).
+    Its Verdict carries extra stood_in_for (the limited reader) and stood_in_why (the limit text); the marker row
+    says `<claude>`: VERDICT (stood in for `<reader>`, at its usage limit), its findings say "read by <claude> for
+    <reader>", and the combined Verdict's extra stood_in lists each one, so the record shows the fallback. A stand-in that fails too is handled as that
+    failure (_silent), and a limit on a security path, or any other failure (a fault, a timeout, a wall), is held as
+    before: perms' read gates a security path.
 The read runs with its cwd in `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.review.<repo>.<pr>.<rand>`: that name is
 how cc-spend puts its cost on `<repo>/review`, and every read's cost is also added to the PR's spend file
 (root/<repo>-<pr>.json, `review_usd`, `reads`) that the old lander kept.
@@ -242,7 +254,9 @@ def marker(v: T.Verdict, base, head, by):
     rows += [f"{i}. [other] {a}" for i, a in enumerate(v.advisory, len(rows) + 1)]
     by = re.sub(r"[^A-Za-z0-9._@-]+", "-", by or "lander")
     head_ = f"<!-- {MARK} v2 change={v.digest} base={base[:12]} head={head[:12]} verdict={v.verdict} by={by} -->"
-    said = [f"- `{r['model']}`: {r['verdict']}" for r in (v.extra or {}).get("readers") or []]
+    said = [f"- `{r['model']}`: {r['verdict']}" + (f" (stood in for `{r['stood_in_for']}`, at its usage limit)"
+                                                   if r.get("stood_in_for") else "")
+            for r in (v.extra or {}).get("readers") or []]
     return "\n".join([head_, f"**lander review** — `{head[:12]}`, read by `{v.model or by}`", "",
                       f"**VERDICT: {v.verdict}**", ""] + (said + [""] if said else []) + (rows or ["No findings."]))
 
@@ -640,6 +654,12 @@ def over_ceiling(repo, pr):
 # --- the box around a read -----------------------------------------------------------------------------------------
 
 LIMIT_SAID = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
+# A limit codex itself reports: a line it starts with `ERROR:` or `stream error:` at its first column (after an optional
+# [timestamp]), which no diff line can (each starts with +, - or a space).
+# codex echoes the prompt, PR text and diff included, so a bare LIMIT_SAID over its output would let a diff that says
+# "usage limit" turn any other codex failure into a limit and bring in a stand-in (perms' and an Opus read, 10-20).
+CODEX_LIMIT_SAID = re.compile(r"^(?:\[[^\]\n]*\][ \t]*)?(?:ERROR|stream error):[^\n]*?"
+                              r"\b(?:session|usage|rate)[ _-]?limit", re.I | re.M)
 WALLS = ("error_max_budget_usd", "error_max_turns")
 BIN = C.BIN
 # The PATH every read runs on: root-owned directories only, never the caller's (security read of #847).
@@ -820,6 +840,14 @@ def codex_usd(rc, out):
         return CODEX_READ_USD
 
 
+def codex_limit(rc, out, text):
+    """True when a `codex exec` that exited `rc` with output `out`, asked `text`, stopped at a usage or rate limit:
+    a nonzero exit, and a CODEX_LIMIT_SAID line in the output once the echoed prompt is taken out of it."""
+    if rc == 0 or not out:
+        return False
+    return bool(CODEX_LIMIT_SAID.search(out.replace(text, "") if text else out))
+
+
 def ask_codex(text, repo, pr, digest, model):
     """One tool-less `codex exec` read. -> (Verdict | None, usd, why), as ask(); codex reports no dollar cost, so
     `usd` is codex_usd()'s estimate, and 0.0 when the exec never ran."""
@@ -848,7 +876,7 @@ def ask_codex(text, repo, pr, digest, model):
     if v:
         return v, usd, ""
     tail = " ".join((out or "").split())[-200:]
-    if LIMIT_SAID.search(out or ""):
+    if codex_limit(rc, out, text):
         return None, 0.0, f"limit: rc={rc} {tail}"
     bad = fault(rc, out)
     return None, usd, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {tail}"
@@ -1657,20 +1685,37 @@ def limit_until(text, now=None):
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def stand_in(job, model, why):
+    """The claude model that reads in place of `model` after its read came back `why`, or "": only for a usage or
+    rate limit on a reader that is not claude's, on a plan that names no security path (the module doc)."""
+    if not why.startswith("limit") or is_claude(model) or not job.plan or job.plan.extra.get("security"):
+        return ""
+    sub = C.conf("CC_LAND_REVIEW_LIMIT_READER", "").strip() or next((m for m in readers() if is_claude(m)), "")
+    return sub if sub and is_claude(sub) else ""
+
+
 def combined(reads):
     """[(model, Verdict)], every reader's -> the one Verdict the landing acts on: HANDBACK when any reader's is, every
-    reader's findings tagged with its model, and extra `readers` naming each reader's own verdict. A single reader's
-    Verdict is returned as it is."""
-    if len(reads) == 1:
+    reader's findings tagged with its model (and the reader it stood in for), and extra `readers` naming each
+    reader's own verdict, and `stood_in` each stand-in. A single reader's Verdict is returned as it is, unless it is
+    a stand-in's."""
+    subs = [{"reader": x.extra["stood_in_for"], "by": m, "why": x.extra.get("stood_in_why", "")}
+            for m, x in reads if x.extra.get("stood_in_for")]
+    if len(reads) == 1 and not subs:
         return reads[0][1]
-    tag = lambda attr: [f"{r} (read by {m})" for m, x in reads for r in getattr(x, attr)]  # noqa: E731
+    by = lambda m, x: f"{m} for {x.extra['stood_in_for']}" if x.extra.get("stood_in_for") else m  # noqa: E731
+    tag = lambda attr: [f"{r} (read by {by(m, x)})" for m, x in reads for r in getattr(x, attr)]  # noqa: E731
     unresolved = sorted({u for _, x in reads for u in x.unresolved})
     first = reads[0][1]
     v = T.Verdict(verdict=T.HANDBACK_VERDICT if any(x.verdict == T.HANDBACK_VERDICT for _, x in reads) else T.LAND,
                   digest=first.digest, blocking=tag("blocking"), advisory=tag("advisory"),
                   model="+".join(m for m, _ in reads), tokens=sum(x.tokens for _, x in reads),
                   resolved=[r for r in first.resolved if r not in unresolved], unresolved=unresolved)
-    v.extra["readers"] = [{"model": m, "verdict": x.verdict} for m, x in reads]
+    v.extra["readers"] = [dict({"model": m, "verdict": x.verdict},
+                               **({"stood_in_for": x.extra["stood_in_for"]} if x.extra.get("stood_in_for") else {}))
+                          for m, x in reads]
+    if subs:
+        v.extra["stood_in"] = subs
     return v
 
 
@@ -1753,17 +1798,29 @@ def _buy(job, template, diff, more, prior=None):
     reads, usd = [], 0.0
     for model in readers():
         if isinstance(kept.get(model), dict):
-            reads.append((model, T.Verdict.from_dict(kept[model])))
+            was = T.Verdict.from_dict(kept[model])
+            reads.append((was.model if was.extra.get("stood_in_for") else model, was))
             continue
         v, cost, why = ask(text, repo, pr, job.digest, model)
         if cost:
             charge(repo, pr, review_usd=cost)
             usd += cost
             over_ceiling(repo, pr)
+        sub = stand_in(job, model, why) if v is None else ""
+        if sub:
+            C.log("stand-in", repo, pr, reader=model, by=sub, why=why[:120])
+            v, cost, sub_why = ask(text, repo, pr, job.digest, sub)
+            if cost:
+                charge(repo, pr, review_usd=cost)
+                usd += cost
+                over_ceiling(repo, pr)
+            if v is None:
+                return _silent(job, j, sub, sub_why)
+            v.extra.update(stood_in_for=model, stood_in_why=why[:300])
         if v is None:
             return _silent(job, j, model, why)
         v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` holds it too
-        reads.append((model, v))
+        reads.append((sub or model, v))
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)
     v = combined(reads)

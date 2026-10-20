@@ -127,7 +127,7 @@ done
 # the overlay's own user units, for what only that box runs: linked like core's, never enabled here — which of
 # them should start is the box owner's call (`systemctl --user enable --now <unit>` once, after this installer).
 if [ -n "$O" ]; then
-  for f in "$O"/config/systemd-user/*.service "$O"/config/systemd-user/*.timer; do
+  for f in "$O"/config/systemd-user/*.service "$O"/config/systemd-user/*.timer "$O"/config/systemd-user/*.path; do
     [ -f "$f" ] || continue
     link "$f" ~/.config/systemd/user/"$(basename "$f")"
   done

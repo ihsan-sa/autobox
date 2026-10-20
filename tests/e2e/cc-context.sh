@@ -92,13 +92,9 @@ sid=$("$B/cc-board" get $REPO w1 session_id)
 printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
 # ── the stanza
 if stanza "cc-context (the real number, and what refuses to run without it)"; then
-chk cc-context
-chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
-chk cc-tmux-ledger   # a real scratch tmux server killed with SIGSEGV: the next server starts cc-recover once, and a hand restore brings back what was running
-chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
-chk cc-bench-grade   # the container filter, on a fake daemon: nothing reaches the real one
-chk cc-egress   # the worker's only way out: listed hosts tunnel, the rest 403, and the in-sandbox forwarder
-chk cc-harness-codex   # Codex's tools through cc-guard: the patch parser, the session-log reads, guard check
+# NO `chk` HERE. This stanza ran seven tools' selfchecks, and cc-sandbox's read the live box, so a sandbox of another
+# session's turned main red under this suite's name (2026-10-13). Each of the seven runs once as its own selfcheck-<tool>
+# check in tests/LANDING.toml (and in tests/selftest.sh's copy of this stanza); what is left here is cc-context end to end.
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1) (fixture sid $sid, board sid $("$B/cc-board" get $REPO w1 session_id))"
 "$B/cc-context" $REPO w1 --over 90 >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "--over N at 10% says under, exit 1" || bad "--over 90 at 10%: rc=$rc"
 "$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "a bare --over reads the hand-off line: 20k is under it" || bad "bare --over: rc=$rc"

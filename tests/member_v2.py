@@ -1,4 +1,6 @@
-"""Called by cc-sandbox selfcheck through cc-member-v2; all effects use fixtures."""
+"""Called by cc-sandbox selfcheck through cc-member-v2; all effects use fixtures, and the cases run in a pid
+namespace of their own (own_pidns), so the inventory walks only what they started. Where no sandbox can nest in one,
+they run unnested over the host's /proc as before, and say so."""
 import errno
 import fcntl
 import grp
@@ -15,9 +17,114 @@ import time
 # load 70-110 a fixed 30 s ran out and killed the whole selfcheck with TimeoutExpired. Every wait below is for a
 # process to answer or exit; this bound only stops a hang, and no case passes or fails on how long one took.
 GUARD = 600
+# The smallest sandbox this file drives: a user and pid namespace of its own over /usr, as an unprivileged user gets.
+MINIMAL = ["/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--ro-bind", "/usr", "/usr",
+           "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64"]
+# A process that says ready and holds until a line arrives. Given a pid it first joins that process's user and mount
+# namespaces (nsenter -U -m); `nodump` makes it non-dumpable, and `leaderless` leaves only its other thread holding.
+HOLD = ("import ctypes,os,sys,threading\nlibc=ctypes.CDLL(None)\n"
+        "for ns in ('user','mnt') if len(sys.argv)>2 else ():\n"
+        " libc.setns(os.open('/proc/%s/ns/%s'%(sys.argv[2],ns),os.O_RDONLY),0) == 0 or sys.exit(ns)\n"
+        "if sys.argv[1]=='nodump': libc.prctl(4,0,0,0,0)\n"
+        "def hold():\n sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.readline()\n"
+        "if sys.argv[1]=='leaderless':\n threading.Thread(target=hold).start(); libc.pthread_exit(None)\n"
+        "hold()\n")
+
+
+def descendants(pid):
+    kids = []
+    for t in Path(f"/proc/{pid}/task").iterdir():
+        for kid in (t / "children").read_text().split():
+            kids += [int(kid), *descendants(kid)]
+    return kids
+
+
+# THE WALK SEES ONLY WHAT THIS SELFCHECK STARTED. The inventory reads every live namespace in /proc and refuses one it
+# cannot inspect. That is right on a live box and wrong for a test: an unrelated session's sandbox on the same host
+# ('live namespace 2186232 cannot be inspected (fd/: EACCES)') held main red for 40 of 46 gate-hours in the week to
+# 2026-10-13. So the cases run again inside a pid namespace with a fresh /proc, and every refusal they assert is
+# planted inside it. cc-member-v2 itself is unchanged: a live provision still walks the whole box.
+HOSTNS = "CC_MEMBER_V2_HOST_PIDNS"   # set for the run inside: the host's pid namespace, which must not be its own
+PLANT = "CC_MEMBER_V2_HOST_PLANT"    # …and what the host read of the uninspectable process it planted beside the run
+# A SANDBOX HAS TO NEST IN THERE, because most cases drive a real bwrap. With
+# kernel.apparmor_restrict_unprivileged_userns=1 every child of /usr/bin/bwrap runs under unpriv_bwrap, which denies
+# all capabilities, so a bwrap started inside one cannot mount anything. The box's claude-bwrap copy has a profile
+# of its own that leaves its children unconfined (config/etc/claude-bwrap), so it is tried first.
+WRAPPERS = ("/usr/local/libexec/claude-bwrap", "/usr/bin/bwrap")
+
+
+def own_pidns(m):
+    """Run `cc-member-v2 selfcheck` again in a pid namespace of its own, beside a host process the walk cannot
+    inspect. Returns that run's exit code, or None once it has printed why no wrapper here can hold the cases."""
+    # The account's home and not $HOME, so a run under a fixture HOME shares this lock (see `scratch` in cases).
+    scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cc/member-v2-selfcheck"
+    scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # ONE SELFCHECK AT A TIME ON THE BOX, held out here and not inside, where a second open of the lock would wait on
+    # this one for ever. The process planted below is one an older selfcheck's walk cannot read, and those still walk
+    # the host's /proc (two landings ran this suite together and refused on each other, 2026-10-02). The lock is
+    # released when this process exits.
+    # A BOUNDED WAIT, so a run that holds the lock for good is a red that names it and not a hang: a worker's gate
+    # sat behind one until e2e-cc-context hit its 30 min cap (2026-10-13). One whole run fits well inside it.
+    lock, since = os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), time.monotonic()
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() - since > 900:
+                raise SystemExit(f"cc-member-v2 selfcheck: refused: another selfcheck has held {scratch / 'lock'} for 15 min")
+            time.sleep(1)
+    why = []
+    for w in WRAPPERS:
+        if not os.access(w, os.X_OK):
+            why.append(f"{w}: not installed")
+            continue
+        outer = [w, "--unshare-user", "--unshare-pid", "--die-with-parent", "--dev-bind", "/", "/", "--proc", "/proc"]
+        probe = sp.run(outer + ["--", *MINIMAL, "--unshare-net", "--proc", "/proc", "--", "/usr/bin/true"],
+                       stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.PIPE, timeout=GUARD)
+        if probe.returncode == 0:
+            break
+        why.append(f"{w}: {probe.stderr.decode(errors='replace').strip() or f'exit {probe.returncode}'}")
+    else:
+        # NO WRAPPER NESTS HERE, so the cases run as they did before own_pidns: over the host's /proc, where another
+        # session's sandbox can still refuse them. A skip here passed selfcheck-cc-sandbox with no member-boundary case
+        # run on a host without claude-bwrap and with AppArmor's userns restriction (review, 2026-10-13). This line
+        # names why, and cc-sandbox carries it onto its tally.
+        print("cc-member-v2 selfcheck: UNNESTED: no pid namespace here that a sandbox can nest in, so the cases walk"
+              " the host's /proc — " + "; ".join(why), flush=True)
+        return None
+    # THE UNRELATED UNINSPECTABLE PROCESS, on the host: it joins a sandbox's namespaces and goes non-dumpable, then
+    # the sandbox stops, so that namespace's only member cannot be read. That is the shape that held main red.
+    procs = []
+    try:
+        procs.append(sp.Popen(MINIMAL + ["--", "/usr/bin/python3", "-c", HOLD, "hold"],
+                              stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE))
+        m.require(procs[0].stdout.readline() == b"ready\n", "the host's planted sandbox did not start")
+        procs.append(sp.Popen(["/usr/bin/python3", "-c", HOLD, "nodump", str(descendants(procs[0].pid)[-1])],
+                              stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE))
+        m.require(procs[1].stdout.readline() == b"ready\n", "the host's planted process did not start")
+        procs.pop(0).communicate(b"stop\n", timeout=GUARD)
+        try:
+            os.listdir(f"/proc/{procs[0].pid}/fd")
+            shape = "readable"
+        except OSError as exc:
+            shape = errno.errorcode.get(exc.errno, str(exc.errno))
+        env = dict(os.environ, **{HOSTNS: os.readlink("/proc/self/ns/pid"), PLANT: shape})
+        return sp.run([*outer, "--", str(m.BIN / "cc-member-v2"), "selfcheck"], stdin=sp.DEVNULL, env=env).returncode
+    finally:
+        for p in procs:
+            p.communicate(b"stop\n", timeout=GUARD)
 
 
 def selfcheck(m):
+    """The cases, inside a pid namespace of their own when own_pidns can make one, else unnested on the host."""
+    if HOSTNS in os.environ:
+        return cases(m, nested=True)
+    rc = own_pidns(m)
+    return cases(m, nested=False) if rc is None else rc
+
+
+def cases(m, nested):
     passed = failed = 0
 
     def check(ok, name, detail=""):
@@ -25,6 +132,11 @@ def selfcheck(m):
         passed += bool(ok)
         failed += not ok
         print(f"  {'ok' if ok else 'FAIL'} v2: {name}" + (f": {detail}" if not ok else ""), flush=True)
+
+    if nested:
+        check(os.readlink("/proc/self/ns/pid") != os.environ[HOSTNS],
+              "the cases run in a pid namespace of their own, so the walk sees only what they started",
+              os.environ[HOSTNS])
 
     def call(command, **kwargs):
         return sp.run([str(a) for a in command], stdin=sp.DEVNULL, stdout=sp.PIPE,
@@ -58,20 +170,6 @@ def selfcheck(m):
     # The passwd entry names one directory whatever HOME says; each run still gets its own vault inside it.
     scratch = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cc/member-v2-selfcheck"
     scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # ONE SELFCHECK AT A TIME ON THE BOX. Its non-dumpable cases plant a live task the walk cannot read, which must
-    # not be called clear, so a second selfcheck's inventory refused on it whenever two landings ran this suite
-    # together (2026-10-02). The lock is released when the process exits.
-    # A BOUNDED WAIT, so a run that holds the lock for good is a red that names it and not a hang: a worker's gate
-    # sat behind one until e2e-cc-context hit its 30 min cap (2026-10-13). One whole run fits well inside it.
-    lock, since = os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), time.monotonic()
-    while True:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.monotonic() - since > 900:
-                raise SystemExit(f"cc-member-v2 selfcheck: refused: another selfcheck has held {scratch / 'lock'} for 15 min")
-            time.sleep(1)
     with tempfile.TemporaryDirectory(prefix="cc-member-v2-", dir=scratch) as temp:
         root = Path(temp).resolve()
         h, v = root / "home", root / "vault"
@@ -126,8 +224,7 @@ def selfcheck(m):
             check(control.returncode == result.returncode == 0 and control.stdout == result.stdout,
                   f"flag {flag!r}: argv, fd 3 and environment equal legacy control", result.stderr.decode())
 
-        minimal = ["/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--ro-bind", "/usr", "/usr",
-                   "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64"]
+        minimal = list(MINIMAL)
         probe = call(minimal + ["--", "/usr/bin/true"])
         check(probe.returncode == 0, "real bwrap available", probe.stderr.decode().strip())
         if probe.returncode != 0:
@@ -358,6 +455,10 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 except ValueError as exc:
                     refused = str(exc)
                 check(not refused, "inventory control: provisioning allowed after exposed namespace exits", refused)
+                if nested:   # unnested, nothing is planted on the host: the walk would refuse it
+                    check(os.environ.get(PLANT) == "EACCES" and not refused,
+                          "a live host namespace the walk cannot inspect lies outside this pid namespace and leaves"
+                          " it clear", f"from the host its fd/ read {os.environ.get(PLANT)}; here: {refused or 'allowed'}")
                 # …AND UNDER V IS EXPOSURE TOO, not only V and above. The registry decides a task's
                 # authority and the broker re-reads it under the lock; the state directory is the lock
                 # and the status log. A namespace holding either is refused like one holding V. The
@@ -449,20 +550,7 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 # mountinfo still reads, and the walk used to take that for a gone pid. A thread-group leader that
                 # exits leaves its other threads live, holding the descriptors, behind a zombie /proc/<pid>. Each
                 # case builds its own sandbox and holds an inherited descriptor on V unless it says otherwise.
-                hold = ("import ctypes,os,sys,threading\nlibc=ctypes.CDLL(None)\n"
-                        "for ns in ('user','mnt') if len(sys.argv)>2 else ():\n"
-                        " libc.setns(os.open('/proc/%s/ns/%s'%(sys.argv[2],ns),os.O_RDONLY),0) == 0 or sys.exit(ns)\n"
-                        "if sys.argv[1]=='nodump': libc.prctl(4,0,0,0,0)\n"
-                        "def hold():\n sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.readline()\n"
-                        "if sys.argv[1]=='leaderless':\n threading.Thread(target=hold).start(); libc.pthread_exit(None)\n"
-                        "hold()\n")
-
-                def descendants(pid):
-                    kids = []
-                    for t in Path(f"/proc/{pid}/task").iterdir():
-                        for kid in (t / "children").read_text().split():
-                            kids += [int(kid), *descendants(kid)]
-                    return kids
+                hold = HOLD
 
                 def hidden(mode, bind=(), fd_on_v=True):
                     # Returns (shape seen from outside, refusal naming this case's process or ""); the shape

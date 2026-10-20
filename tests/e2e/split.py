@@ -58,6 +58,17 @@ BASE = ["cc main + track creation", "checkpoint hook"]
 DEPS = {
 }
 
+# A stanza whose file drops its `chk cc-foo` lines: each of those tools runs once as its own selfcheck-<tool> check in
+# tests/LANDING.toml, because a file that runs other tools' selfchecks goes red on all of them under its own name. The
+# comment below stands where the first dropped line was. selftest.sh keeps the lines.
+NO_CHK = {
+    "cc-context": [
+        "# NO `chk` HERE. This stanza ran seven tools' selfchecks, and cc-sandbox's read the live box, so a sandbox of another",
+        "# session's turned main red under this suite's name (2026-10-13). Each of the seven runs once as its own selfcheck-<tool>",
+        "# check in tests/LANDING.toml (and in tests/selftest.sh's copy of this stanza); what is left here is cc-context end to end.",
+    ],
+}
+
 # A stanza that tests selftest.sh's own machinery gets that machinery, extracted from selftest.sh's preamble
 # (start and end line patterns, both inclusive) and run after lib.sh, where it replaces lib.sh's reduced copy.
 EXTRAS = {
@@ -169,6 +180,10 @@ def build():
             errs.append("stanza with a body of its own and no slug: %r" % title)
             continue
         slug = SLUGS[title]
+        if slug in NO_CHK:
+            kept = [l for l in body if not CHK_ONLY.match(l)]
+            at = next((i for i, l in enumerate(body) if CHK_ONLY.match(l)), 0)
+            body = kept[:at] + NO_CHK[slug] + kept[at:]
         fixtures = set(BASE) | set(DEPS.get(slug, []))
         parts, used = [], list(body)
         for k2, t2, b2 in segs[:idx]:
@@ -195,6 +210,9 @@ def build():
         for s, e in EXTRAS.get(slug, []):
             head += ["# ── from selftest.sh's preamble: the machinery this stanza tests"] + extract(pre, s, e, slug)
         out[slug] = "\n".join(head + parts + ["# ── the stanza"] + body + ["e2e_end"] + TRAILER + [""])
+    for s in NO_CHK:
+        if s not in out:
+            errs.append("NO_CHK names %r, which is no generated file" % s)
     for s in EXTRAS:
         if s not in out:
             errs.append("EXTRAS names %r, which is no generated file" % s)

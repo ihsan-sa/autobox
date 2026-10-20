@@ -404,9 +404,15 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
   [ -r "$CHECKLIST" ] || return 0
   printf " Before you append 'STATUS: DONE', read \`git diff origin/%s\` against the LANDING SELF-REVIEW (templates/self-review.md; an entry that is wrong is fixed THERE) and fix what it finds:%s Then hand over a tree a suite has passed on: \`cc-green start\`, then end the iteration: the loop waits on the run with no model call and journals its exit and log for the next iteration (\`cc-green stop\` ends your own run; never setsid, nohup or &). It also names lines of the defect classes the review keeps stopping PRs for. Edit nothing after a green run.\n" \
     "$1" "$(sed -n 's/^\([0-9]\)\. \*\*\([^*]*\)\*\*.*/ \1. \2/p' "$CHECKLIST" | tr -d '\n')"; }
+WORKER_PROMPT="$(dirname "$BIN")/config/worker-prompt.md"   # the worker prompt's own words, a file a person edits (the prompt mirror)
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', headless in a loop: each iteration is a FRESH context, and state lives in files. Task: $ST/task.md. Journal: $ST/progress.md — read it first and append a dated entry EARLY (what you did, what is next, gotchas), because an iteration cut short with nothing written leaves the next one blind. Do the next unfinished step only. A hook commits and pushes to track/$track after you finish, so never git commit or push yourself (a push you cannot make is never a reason to stop), and never touch '$1' or files outside this worktree. Board: 'cc board show $repo', 'cc board note $repo $track \"...\"'. Before you call it complete, re-read $ST/task.md in full, because scope may have been appended. When the WHOLE task is done, append the exact line 'STATUS: DONE' to progress.md; for an owner decision append 'STATUS: BLOCKED: <one-line question>' and stop. Write the PR description in $ST/pr-body.md: what changed, why, how it was tested, and anything the lander must do after the merge; a 'Closes <row>' line closes those board rows, and cc done links the brief, so do not paste it. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line 'thread' (the row's own) or a #channel the brief named, an optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
+               # Its words are WORKER_PROMPT, wrapped for editing and joined back into one line here: {track},
+               # {repo}, {state} and {base} are filled in, the blocks below are appended. The replacements are quoted
+               # because bash 5.2 reads a bare & in one as the matched text. No file, no prompt: the caller stops.
+  local p; p=$(sed 's/[[:space:]]*$//' "$WORKER_PROMPT" 2>/dev/null | tr '\n' ' ') && [ -n "${p// /}" ] || return 1
+  p=${p% }; p=${p//\{track\}/"$track"}; p=${p//\{repo\}/"$repo"}; p=${p//\{state\}/"$ST"}; p=${p//\{base\}/"$1"}
+  printf %s "$p$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -1005,7 +1011,7 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   # The config is a scratch file, not the box's: CC_WORKER_MODEL is a documented knob, and reading the real
   # ~/.cc/config would turn these cases red the moment the owner sets it — a supported setting must not fail the suite.
   mkdir -p "$d/nov" "$d/ov"; ln -sf "$BIN/cc-config" "$d/nov/cc-config"; ln -sf "$BIN/cc-config" "$d/ov/cc-config"
-  : > "$d/config"
+  : > "$d/cfg"
   # Both stubs answer the way the real cc-model does in that state, subcommand by subcommand: on its primary
   # `current` names that primary and `forced` names nothing, and a box a limit has moved names the fallback to
   # both. A stub that answered every subcommand alike could not tell the two questions apart, and this pair of
@@ -1014,27 +1020,27 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   printf '#!/bin/sh\ncase "$1" in current) echo claude-fable-5-1;; esac\nexit 0\n' > "$d/nov/cc-model"
   printf '#!/bin/sh\ncase "$1" in resolve) case "$2" in *fable*) echo claude-sonnet-5;; *) echo "$2";; esac;; *) echo claude-sonnet-5;; esac\n' > "$d/ov/cc-model"   # moved to sonnet: `resolve` moves the model it was moved off, passes the rest through
   chmod +x "$d/nov/cc-model" "$d/ov/cc-model"
-  wm=$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/nov" worker_model "")
+  wm=$(unset CC_WORKER_MODEL; CC_CONFIG="$d/cfg" BIN="$d/nov" worker_model "")
   t 'no --model and the box on its primary: a worker runs on Opus, not on that primary' "$wm" claude-opus-5-5
-  t 'CC_WORKER_MODEL moves that default'   "$(CC_CONFIG="$d/config" BIN="$d/nov" CC_WORKER_MODEL=claude-haiku-4-5-20251001 worker_model '')" claude-haiku-4-5-20251001
-  t 'a box override outranks it'           "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/ov" worker_model '')" claude-sonnet-5
-  t "--model is the dispatcher's call: passed through untouched when it is not the model the box was moved off" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'claude-opus-5-5')" 'claude-opus-5-5'
-  t "…and the one the box WAS moved off runs where the box is this iteration (resolve), not pinned there" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'fable[1m]')" 'claude-sonnet-5'
+  t 'CC_WORKER_MODEL moves that default'   "$(CC_CONFIG="$d/cfg" BIN="$d/nov" CC_WORKER_MODEL=claude-haiku-4-5-20251001 worker_model '')" claude-haiku-4-5-20251001
+  t 'a box override outranks it'           "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/cfg" BIN="$d/ov" worker_model '')" claude-sonnet-5
+  t "--model is the dispatcher's call: passed through untouched when it is not the model the box was moved off" "$(CC_CONFIG="$d/cfg" BIN="$d/ov" worker_model 'claude-opus-5-5')" 'claude-opus-5-5'
+  t "…and the one the box WAS moved off runs where the box is this iteration (resolve), not pinned there" "$(CC_CONFIG="$d/cfg" BIN="$d/ov" worker_model 'fable[1m]')" 'claude-sonnet-5'
   t 'and a two-rung chain carries on from it to its last rung' "$(hermetic "$BIN/cc-model" next "$wm")" "$last"
   # (c) AN OUTAGE MOVES THE LOOP DOWN, AND ITS LIFT MOVES IT BACK: a stub cc-model whose `out`/`resolve` read one flag
   # file, the way the real one reads its unavailable record and its override. Own fixture per state.
   mkdir -p "$d/out"
   printf '#!/bin/sh\ncase "$1" in current) echo claude-fable-5-1;; forced) [ -e "%s/fable-out" ] && echo "claude-opus-5-5[1m]";; out) if [ -e "%s/fable-out" ]; then case "$2" in *fable*) echo "fable is not available to this account: test"; exit 0;; esac; fi; exit 1;; resolve) if [ -e "%s/fable-out" ]; then case "$2" in *fable*) echo "claude-opus-5-5[1m]"; exit 0;; esac; fi; echo "$2";; esac\nexit 0\n' "$d" "$d" "$d" > "$d/out/cc-model"
   chmod +x "$d/out/cc-model"
-  t '(c) on its primary, a loop dispatched on Fable runs on Fable' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
+  t '(c) on its primary, a loop dispatched on Fable runs on Fable' "$(CC_CONFIG="$d/cfg" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
   touch "$d/fable-out"
   t '(c) while the box has Fable recorded as out, the same dispatch runs on the next rung — the record, not a pin' \
-    "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-opus-5-5[1m]'
-  t '(c) …and the model AS DISPATCHED is still known, for the journal line that says why' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]' asked)" 'claude-fable-5-1[1m]'
-  t '(c) …a worker with no --model runs on what the box was moved to, as before' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/out" worker_model '')" 'claude-opus-5-5[1m]'
+    "$(CC_CONFIG="$d/cfg" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-opus-5-5[1m]'
+  t '(c) …and the model AS DISPATCHED is still known, for the journal line that says why' "$(CC_CONFIG="$d/cfg" BIN="$d/out" worker_model 'claude-fable-5-1[1m]' asked)" 'claude-fable-5-1[1m]'
+  t '(c) …a worker with no --model runs on what the box was moved to, as before' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/cfg" BIN="$d/out" worker_model '')" 'claude-opus-5-5[1m]'
   rm -f "$d/fable-out"
-  t '(c) the lift: the next iteration is back on Fable, with no handoff and nothing pinned' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
-  t '(c) a cc-model that does not answer `resolve` (an older copy) leaves the model as it was' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/nov" worker_model 'fable[1m]')" 'fable[1m]'
+  t '(c) the lift: the next iteration is back on Fable, with no handoff and nothing pinned' "$(CC_CONFIG="$d/cfg" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
+  t '(c) a cc-model that does not answer `resolve` (an older copy) leaves the model as it was' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/cfg" BIN="$d/nov" worker_model 'fable[1m]')" 'fable[1m]'
 
   # (c) THE LINE THE NEXT FRESH CONTEXT READS ABOUT ITS OWN MODEL, and the cases it must NOT read. Its own fixture:
   # seven arguments in, one line or nothing out, no state between cases. Before the review of #503 a model change alone
@@ -1123,6 +1129,13 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   grep -q 'do not sit in `cc-green wait`' "$CHECKLIST";  t 'the checklist tells the worker to end its iteration after cc-green start' "$?" 0
   grep -q "end the iteration: never wait on it in your turn" <<<"$(repo=r track=t ST="$d/st"; sp_worker trunk)"; t 'and so does the prompt cc-loop builds' "$?" 0
   t 'the worker prompt never tells the worker to run cc-green wait' "$(repo=r track=t ST="$d/st"; sp_worker trunk | grep -o '[^.]*cc-green wait[^.]*' | grep -vc 'not sit in\|[Nn]ever wait\|no model call')" 0
+  # the prompt's words come from WORKER_PROMPT: every placeholder filled, a wrapped file read back as one line, and
+  # a missing file is no prompt at all (the caller stops) rather than a worker started on the blocks alone
+  t 'the worker prompt fills every placeholder of its file' "$(repo=r track=t ST="$d/st"; sp_worker trunk | grep -c '{track}\|{repo}\|{state}\|{base}')" 0
+  t 'and reads the wrapped file back as one line' "$(repo=r track=t ST="$d/st"; sp_worker trunk | wc -l | tr -d ' ')" 0
+  printf 'Track {track} of {repo}  \nkeeps {state}, never {base}.\n' > "$d/wp.md"
+  t 'its four placeholders, an & taken literally' "$(repo='r&' track=t ST=/s WORKER_PROMPT="$d/wp.md"; CHECKLIST="$d/absent/x" DISPATCH="$d/absent/x"; sp_worker trunk | cut -c1-36)" 'Track t of r& keeps /s, never trunk.'
+  t 'no prompt file, no prompt' "$(WORKER_PROMPT="$d/absent/worker-prompt.md"; sp_worker trunk >/dev/null; echo $?)" 1
   # The fake models the run: $3 = live as the iteration ended (1/0); `wait 0` answers from that alone, and each long
   # wait is one more 540 s, still going for the first $2 of them, ended on the next. `calls` counts every ask.
   gw(){ ( mkdir -p "$d/gw/$1/wt" "$d/gw/$1/st"; : > "$d/gw/$1/st/progress.md"; : > "$d/gw/$1/calls"; : > "$d/gw/$1/longs"
@@ -1572,8 +1585,8 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   # ── WHAT A RUN POSTS ── the loop itself, run end to end: a COPY of this script (never a link) beside stubs, on a
   # scratch HOME and worktree, with a fake claude. Every post leaves by cc-notify, so its stub's argv is the whole
   # of what reached Slack; a call with --ask is the planner intake, never Slack.
-  local lb="$d/lb" lh="$d/lh" c
-  mkdir -p "$lb" "$lh"; cp "$0" "$lb/cc-loop"
+  local lb="$d/lb" lh="$d/lh" c   # each copy's config/ is $d/config, as core/bin's is core/config: the worker prompt is there
+  mkdir -p "$lb" "$lh" "$d/config"; cp "$0" "$lb/cc-loop"; cp "$WORKER_PROMPT" "$d/config/"
   printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"; echo >> "%s"\n' "$d/lb.n" "$d/lb.n" > "$lb/cc-notify"
   printf '#!/bin/sh\ncase "$1" in reconcile|probe) exit 0;; worker-cred) echo "$FK_CRED"; exit 0;; esac\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' > "$lb/cc-sandbox"
   printf '#!/bin/sh\nexit 0\n' > "$lb/cc-tier"
@@ -2355,7 +2368,7 @@ worker_account(){
   if [ -n "$LS0" ]; then export CC_LIMIT_STAMP="$LS0"; else unset CC_LIMIT_STAMP; fi
   if [ -n "$MC0" ]; then export CC_MODEL_CRED="$MC0"; else unset CC_MODEL_CRED; fi; }
 base=$(worker_base "$repo")
-SP=$(sp_worker "$base")
+SP=$(sp_worker "$base") || stop 2 "no worker prompt" "cc-loop cannot read the worker prompt at $WORKER_PROMPT, so no worker starts"
 # NO FENCE, NO WORKER. The fence (cc-sandbox) is on for every worker and has no host fallback, so a box where it cannot
 # start stops here, before iteration 1, with its reason on the board and to the dispatcher — not as an hour of failed
 # iterations. `probe` also passes where the fence is off by the owner's switch or behind a member boundary.

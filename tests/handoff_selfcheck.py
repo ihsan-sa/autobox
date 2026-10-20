@@ -1088,6 +1088,25 @@ def run_selfcheck():
         globals()["dispatched"] = _dispatched
         os.environ["CC_HANDOFF_TASKS"] = troot
 
+        # THE PERMS SEAT'S RUNNING READS (cc-perms handoff carries them to its successor). Its own fixture: one read
+        # mid-turn whose prompt names its PR and head, one whose prompt names neither, one that has reported.
+        tr = os.path.join(troot, "project", "sid-reads", "tasks")
+        os.makedirs(tr)
+        for name, prompt, last in (("a-read", "Security read of PR #1546 at head 0123abcd for the planner seat\n"
+                                    "(asked by planner).", rec_tool), ("a-plain", [{"type": "text", "text": "look"}],
+                                    rec_tool), ("a-over", "PR #9 head 89abcdef", rec_end)):
+            t = os.path.join(d, name + ".jsonl")
+            with open(t, "w") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n" + last + "\n")
+            os.utime(t, (clk[0], clk[0]))
+            os.symlink(t, os.path.join(tr, name + ".output"))
+        rr = sorted(running_reads("sid-reads"))
+        ok("running_reads names each subagent still out with the PR, head and asker its prompt names, on one line, '-' "
+           "where it names none, and leaves out one that has reported",
+           rr == ["a-plain\t-\t-\t-\tlook",
+                  "a-read\tPR #1546\thead 0123abcd\tasker planner\tSecurity read of PR #1546 at head 0123abcd for the planner seat "
+                  "(asked by planner)."] and running_reads("sid-none") == [])
+
         def cutover_sub(t):
             """cutover(), for a predecessor whose session id is the one the fixture's subagents belong to"""
             wins[t] = "@" + t

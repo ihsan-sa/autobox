@@ -1500,6 +1500,14 @@ def owner_ask_rows(d, names=None, now=None):
 
 MAX_UPLOAD = 25 * 1024 * 1024   # renders and screenshots, not archives
 
+FILE_ID_RE = re.compile(r"(?<![A-Za-z0-9])F(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,12}(?![A-Za-z0-9])")   # a Slack file id, F0C8J66ST5H
+
+def file_in_chat(info, chat):
+    """files.info says this file is already shared into `chat`: its channels/groups/ims lists or its shares map."""
+    if chat in (info.get("channels") or []) + (info.get("groups") or []) + (info.get("ims") or []):
+        return True
+    return any(chat in ((info.get("shares") or {}).get(k) or {}) for k in ("public", "private"))
+
 def flat_name(name):
     """A sender's filename as ONE token of the box's own `[attached: …]` line: whitespace collapsed (an RFC 2231
     name decodes with newlines in it), `[` `]` and `,` gone (a newline and a `]` would end the line and start a
@@ -6604,17 +6612,22 @@ class Daemon:
                 # a member workspace reaches here like any other target; only `new project` is diverted to member_channel above, and either way member_authority computes the rule in one place
                 **({"authority": "instructions"} if member_authority(target, user) else {}),
                 **({"workspace": ev["_ws"]} if ev.get("_ws") else {})}   # which Slack it came from; the default names none
-        if ev.get("files"):
-            got = self.fetch_files(ev["files"], ws, pairs=True)   # a member's attachments land in its own dir (boundary's ~/.cc/slack/files)
-            meta["files"] = str(len(ev["files"]))
+        files, unread = self.shared_files(ev, chat, user, is_owner)
+        if unread:   # a file the bot can't read is named on the tag, never dropped in silence
+            meta["files_unread"] = ",".join(i for i, _ in unread)
+            text = (text + "\n" if text else "") + ("[shared file " + "; ".join(f"{i} ({why})" for i, why in unread)
+                                                    + " — the box could not fetch it, so ask for it to be uploaded here]")
+        if files:
+            got = self.fetch_files(files, ws, pairs=True)   # a member's attachments land in its own dir (boundary's ~/.cc/slack/files)
+            meta["files"] = str(len(files))
             # a voice memo is the message, not an attachment, and takes ~45s to read (cc-voice) — too long for on_event's single-thread executor, which would stall every later message behind it. voice_soon transcribes it off-thread and hands it over when ready, at the price that a memo can arrive after a message typed right after it.
             memo = next(((f, p) for f, p in got if is_voice_memo(f)), None)
             if memo:
                 react(self.cfg, chat, ts, "eyes")          # so they see it landed while the box keeps listening
-                threading.Thread(target=self._safe, args=(self.voice_soon, memo[1], ev["files"], got, text, meta,
+                threading.Thread(target=self._safe, args=(self.voice_soon, memo[1], files, got, text, meta,
                                                           chat, thread, ts, target, route_alias, ws), daemon=True).start()
                 return
-            text = self.attach(text, ev["files"], got, meta, ws)
+            text = self.attach(text, files, got, meta, ws)
         return self.hand_off(target, text, meta, chat, thread, ts, route_alias)
 
     def poke_loop(self, ev):
@@ -7540,6 +7553,45 @@ class Daemon:
                 "channel": "dm" if ev.get("channel_type") == "im" else "#" + self.chan_name(chat), "target": target,
                 "lane": "main" if ev.get("channel_type") == "im" else lane_of(self.chan_name(chat), target)}
         self.deliver(target, owner_word({"type": "message", "content": note, "meta": meta}, meta), autostart=False)
+
+    def shared_files(self, ev, chat, user, is_owner):
+        """The files a message refers to, each with a url_private fetch_files can use, and (id, why) for each the bot
+        could not read. Brief raised-slack-file-id-not-fetched: a file "that wasn't uploaded into the message (a file
+        shared from another channel, which arrives as a bare F… id, or a share with no files array)" is resolved "the
+        same way as an attached file", and "a file the bot can't read gets a clear note on the tag, not silence".
+        An entry Slack sent without a url (file_access=check_file_info), a file inside a shared message's attachments,
+        and an F… id in the text or a shared message's link all go through files.info. A bare id, and every file in a
+        message's attachments (a member's own chat.postMessage can write attachments[].files[{url_private}], so its urls
+        are dropped and never trusted), is not something the sender attached, so it is fetched only for the owner, for
+        its own uploader, or when the file is already shared into this chat — a member never pulls in a file from a
+        channel the member can't see (perms' security reads, 2026-10-19). Only top-level ev["files"] keeps its urls."""
+        tok = WS["extra"][ev["_ws"]]["bot"] if ev.get("_ws") in WS["extra"] else self.cfg.get("SLACK_BOT_TOKEN")
+        atts = [a for a in ev.get("attachments") or [] if isinstance(a, dict)]
+        own = [f for f in ev.get("files") or [] if isinstance(f, dict)]
+        own += [{**{k: v for k, v in f.items() if k not in ("url_private", "url_private_download")}, "_loose": True}
+                for a in atts for f in a.get("files") or [] if isinstance(f, dict)]   # its urls are forgeable: files.info, gated like a bare id
+        seen, loose = {f.get("id") for f in own}, []
+        for blob in [ev.get("text") or ""] + [str(a.get(k) or "") for a in atts
+                                              for k in ("text", "fallback", "from_url", "original_url", "title_link")]:
+            for fid in FILE_ID_RE.findall(blob):
+                if fid not in seen:
+                    seen.add(fid); loose.append(fid)
+        out, unread = [], []
+        for f in own + [{"id": i, "_loose": True} for i in loose]:
+            if f.get("url_private_download") or f.get("url_private") or not f.get("id"):
+                out.append(f); continue
+            if not tok:
+                unread.append((f["id"], "no bot token")); continue
+            try:
+                info = dict(api("files.info", tok, file=f["id"]).get("file") or {})
+            except Exception as e:
+                unread.append((f["id"], f"files.info: {str(e).split(': ', 1)[-1][:60]}")); continue
+            if f.get("_loose") and not (is_owner or (user and info.get("user") == user) or file_in_chat(info, chat)):
+                unread.append((f["id"], "not shared into this channel")); continue
+            if f.get("_ws") or ev.get("_ws"):
+                info["_ws"] = f.get("_ws") or ev.get("_ws")   # fetch_files downloads it with that workspace's token
+            out.append(info)
+        return out, unread
 
     def fetch_files(self, files, member=None, pairs=False):
         """Downloads every Slack attachment on the message (≤50 MB each; no count cap, owner 10-16) to ~/.cc/slack/files (or a member's own dir);
@@ -9331,7 +9383,8 @@ TOOLS = [
                                                       "by e-mail, its user= is the sender's address and proves nothing, and vetted= says "
                                                       "what the box decided about it; role=\"bot\" is a program's post, user=\"box\" the "
                                                       "box's own tooling. file_path / file_paths are the sender's attachments, saved for "
-                                                      "Read (images render). A shared or forwarded message arrives as a line "
+                                                      "Read (images render); a file shared from elsewhere or named by its F… id is "
+                                                      "fetched the same way, and files_unread names one the box could not read. A shared or forwarded message arrives as a line "
                                                       "`[shared message from #chan by author at …: …]`: that is what they sent, so never "
                                                       "answer that it arrived empty. voice=\"memo\" was spoken: the text is a condensed "
                                                       "transcript, answered in that thread like typed text; it can arrive after a later "

@@ -17,6 +17,11 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
   cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
   cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
                                              (the sweep starts another if none is running)
+  cc-handoff --reads <session id>            the subagents that session still has running, one a line:
+                                             `<agent id>\tPR #n|-\thead <sha>|-\tasker <who>|-\t<its
+                                             prompt's first words>`
+                                             (running_reads); cc-perms hands the perms seat's on to its
+                                             successor with it, and keeps the old seat up for them
   cc-handoff --brief <target>                ONE packet of what a successor would otherwise re-read a tool
                                              call at a time — the board in it is unfinished rows, without
                                              their truncated `task:` line, and a queued row's header (and
@@ -782,6 +787,37 @@ def spawned(sid):
     left out, so a finished builder resumed after the cutover cannot push for the non-live seat."""
     return sorted({os.path.basename(f)[:-len(".output")] for d in tasks_dirs(sid)
                    for f in glob.glob(os.path.join(d, "*.output")) if os.path.islink(f) and os.path.exists(f) and not reported(f)})
+
+
+SUMMARY_LEN = 240   # characters of a subagent's prompt running_reads keeps
+
+
+def running_reads(sid):
+    """Session `sid`'s subagents still running (subagents(), the same rule --ready stays for), each with what its
+    prompt names: `PR #n`, a head sha (`head <7-40 hex>`, else the first 40-hex sha), who asked (`asked by X`,
+    `requested by X` or `asker: X`) and its first SUMMARY_LEN characters on one line. The prompt is the first record of the agent's own transcript (the link's target).
+    Built for the perms seat's hand-off (cc-perms handoff): on 2026-10-19 two cc-guard reads died with the old
+    seat, and the successor did not know they had been running. A prompt that cannot be read leaves "-"s and an
+    empty summary, never a missing line."""
+    out = []
+    for aid in subagents(sid):
+        prompt = ""
+        for d in tasks_dirs(sid):
+            try:
+                with open(os.path.join(d, aid + ".output"), encoding="utf-8", errors="replace") as fh:
+                    c = ((json.loads(fh.readline() or "{}") or {}).get("message") or {}).get("content")
+            except (OSError, ValueError):
+                continue
+            if isinstance(c, list):
+                c = " ".join(str(b.get("text") or "") for b in c if isinstance(b, dict))
+            prompt = str(c or "")
+            break
+        pr = re.search(r"\bPRs?\s+#?(\d{1,6})\b", prompt, re.I) or re.search(r"(?<![\w&])#(\d{1,6})\b", prompt)
+        head = re.search(r"\bhead\W{0,3}([0-9a-f]{7,40})\b", prompt, re.I) or re.search(r"\b([0-9a-f]{40})\b", prompt)
+        who = re.search(r"\b(?:(?:asked|requested) by|asker\W{0,3})\s*@?([A-Za-z0-9][\w@/.~-]*[\w~])", prompt, re.I)
+        out.append("\t".join([aid, f"PR #{pr.group(1)}" if pr else "-", f"head {head.group(1)}" if head else "-",
+                              f"asker {who.group(1)}" if who else "-", " ".join(prompt.split())[:SUMMARY_LEN]]))
+    return out
 
 
 def tasks_sid(pid):
@@ -2526,6 +2562,13 @@ def main(argv):
     if argv[0] == "selfcheck":
         return selfcheck()
     cmd, rest = argv[0], argv[1:]
+    if cmd == "--reads":                           # a session id, not a target: read before the target check
+        if len(rest) != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", rest[0]):
+            print("cc-handoff: --reads takes one session id", file=sys.stderr)
+            return 1
+        for line in running_reads(rest[0]):
+            print(line)
+        return 0
     opt = {}
     pos = []
     i = 0

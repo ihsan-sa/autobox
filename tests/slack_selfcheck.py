@@ -9843,6 +9843,91 @@ def run_selfcheck():
           # and the pair round-trips: the `file` verb translates that same in-boundary path back to the host one
           and member_files_inside(hF, f"{member_dir(hF)}/files/{fnames[0]}") == inb + fnames[0]
           and member_files_inside(hF, f"{DEV}/{hF}/x.png") == f"{DEV}/{hF}/x.png")
+    # -- A FILE SHARED FROM ELSEWHERE IS FETCHED LIKE AN ATTACHMENT (brief raised-slack-file-id-not-fetched) ----------
+    #    The owner's message held only 'F0C8J66ST5H' and nothing was saved. Each case below builds its own daemon, its
+    #    own fake files.info and its own fake download, and asserts what was fetched AND what was not.
+    def share_case(ev_extra, user="UOWNER", infos=None):
+        dmS = Daemon(use_slack=False); dmS.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+        dmS.bot_user = "UBOT"; dmS.names.update({"CS": rF}); dmS.users.update({"UMEM": ("Ada", "ada")})
+        handed, fetched, asked = [], [], []
+        dmS.deliver = lambda target, payload, **k: handed.append(payload) or "delivered"
+        dmS.say = lambda chat, text, thread=None, mail=True, **_k: None
+        dmS.arm = lambda *a, **k: None; dmS.owner_spoke = lambda *a, **k: None
+        dmS.route = lambda chat, ctype=None: rF
+        def fetchS(files, member=None, pairs=False):
+            fetched.extend(f.get("id") for f in files)
+            got = [(f, f"{DIR}/files/{f['id']}-{f.get('name')}") for f in files]
+            return got if pairs else [p for _, p in got]
+        dmS.fetch_files = fetchS
+        def info(method, token, **kw):
+            if method != "files.info":
+                return {"ok": True, "user": {"name": "x", "real_name": "X"}}
+            asked.append((method, kw.get("file")))
+            if (infos or {}).get(kw.get("file")) is None:
+                raise RuntimeError("files.info: file_not_found")
+            return {"ok": True, "file": infos[kw["file"]]}
+        _api, _rx, _sl = globals()["api"], globals()["react"], globals()["save_last"]
+        globals()["api"], globals()["react"], globals()["save_last"] = info, (lambda *a, **k: None), (lambda last: None)
+        try:
+            dmS.on_event({"type": "message", "channel": "CS", "ts": "s.1", "user": user, "channel_type": "channel", **ev_extra})
+        finally:
+            globals()["api"], globals()["react"], globals()["save_last"] = _api, _rx, _sl
+        meta = handed[0]["meta"] if handed else {}
+        return meta, (handed[0]["content"] if handed else ""), fetched, asked
+    render = lambda fid, **k: {"id": fid, "name": "render.png", "url_private": f"https://files.slack.com/{fid}", "user": "UOTHER", **k}
+    mB, tB, fB, aB = share_case({"text": "F0C8J66ST5H"}, infos={"F0C8J66ST5H": render("F0C8J66ST5H")})
+    check("SHARED FILE: a bare F… id in the owner's message is looked up with files.info and saved like an attachment — "
+          "file_paths names it, and no files_unread; the same text with no id fetches nothing",
+          aB == [("files.info", "F0C8J66ST5H")] and fB == ["F0C8J66ST5H"]
+          and mB.get("file_paths") == f"{DIR}/files/F0C8J66ST5H-render.png" and "files_unread" not in mB
+          and share_case({"text": "FAILED twice, see FOO"}, infos={})[2:] == ([], []))
+    mS, tS, fS, aS = share_case({"text": "", "attachments": [{"is_share": True, "text": "the render",
+                                 "files": [{"id": "F0SHARED01", "file_access": "check_file_info"}]}]},
+                                infos={"F0SHARED01": render("F0SHARED01", name="cad.png")})
+    mU, tU, fU, aU = share_case({"text": "", "files": [{"id": "F0SHARED02", "file_access": "check_file_info"}]},
+                                infos={"F0SHARED02": render("F0SHARED02")})
+    check("SHARED FILE: a shared message with no files array, whose file rides in its attachments, and a files entry "
+          "Slack sent without a url (check_file_info) are both resolved through files.info and saved; a file that "
+          "already carries its url is fetched without a lookup",
+          fS == ["F0SHARED01"] and mS.get("file_paths") == f"{DIR}/files/F0SHARED01-cad.png"
+          and fU == ["F0SHARED02"] and mU.get("file_paths") == f"{DIR}/files/F0SHARED02-render.png"
+          and share_case({"text": "", "files": [render("F0PLAIN0001")]}, infos={})[2:] == (["F0PLAIN0001"], []))
+    mN, tN, fN, aN = share_case({"text": "F0NOACCESS1"}, infos={})
+    check("SHARED FILE: an id the bot cannot read is named on the tag (files_unread) and in the text with Slack's "
+          "reason, never dropped in silence, and nothing is fetched",
+          fN == [] and mN.get("files_unread") == "F0NOACCESS1" and "file_not_found" in tN and "F0NOACCESS1" in tN
+          and "file_paths" not in mN)
+    elsewhere = {"F0ELSEWHERE": render("F0ELSEWHERE", channels=["COTHER"])}
+    mM, tM, fM, _ = share_case({"text": "F0ELSEWHERE"}, user="UMEM", infos=elsewhere)
+    mM2, _t, fM2, _a = share_case({"text": "F0ELSEWHERE"}, user="UMEM",
+                                  infos={"F0ELSEWHERE": render("F0ELSEWHERE", shares={"private": {"CS": []}})})
+    check("SHARED FILE: a member's bare id for a file shared only into another channel is not fetched and is named as "
+          "not shared into this channel; the same id once the file is shared into this channel is fetched",
+          fM == [] and mM.get("files_unread") == "F0ELSEWHERE" and "not shared into this channel" in tM
+          and fM2 == ["F0ELSEWHERE"] and "files_unread" not in mM2)
+    # another app's bot post, shared into this channel by a member: its attachment is the bot's own JSON
+    bot = lambda *fs: {"text": "", "attachments": [{"is_share": True, "bot_id": "BFOREIGN", "text": "see", "files": list(fs)}]}
+    mF, tF, fF, _ = share_case(bot({"id": "F0PRIVATE01"}), user="UMEM",
+                               infos={"F0PRIVATE01": render("F0PRIVATE01", channels=["CPRIV"])})
+    mF2, _t, fF2, aF2 = share_case(bot(render("F0SLACKURL1")), user="UMEM",
+                                   infos={"F0SLACKURL1": render("F0SLACKURL1", shares={"public": {"CS": []}})})
+    check("SHARED FILE: another app's bot post, shared in by a member, naming a private-channel file by id alone in "
+          "attachments[].files[] is refused like a bare id (not shared into this channel, nothing fetched); one that "
+          "carries a url_private still goes through files.info, and is fetched once that says the file is in this "
+          "channel (perms' security reads, 2026-10-19)",
+          fF == [] and mF.get("files_unread") == "F0PRIVATE01" and "not shared into this channel" in tF
+          and fF2 == ["F0SLACKURL1"] and aF2 == [("files.info", "F0SLACKURL1")] and "files_unread" not in mF2)
+    # a member's own chat.postMessage can write attachments[].files[] with any url it likes: no bot, no share needed
+    priv = {"F0FORGED001": render("F0FORGED001", channels=["CPRIV"])}
+    forged = lambda key: {"text": "", "attachments": [{"text": "see", "files": [
+        {"id": "F0FORGED001", "name": "x.png", key: "https://files.slack.com/files-pri/T1-F0FORGED001/x.png"}]}]}
+    for key in ("url_private", "url_private_download"):
+        mG, tG, fG, aG = share_case(forged(key), user="UMEM", infos=priv)
+        check(f"SHARED FILE: a member's own post forging {key} for a private-channel file in attachments[].files[] is "
+              "looked up with files.info and refused as not shared into this channel; nothing is downloaded "
+              "(perms' security read, 2026-10-19)",
+              aG == [("files.info", "F0FORGED001")] and fG == [] and mG.get("files_unread") == "F0FORGED001"
+              and "not shared into this channel" in tG)
 
     # ── THE OWNER'S 👍 RUNS A CARD'S COMMAND (cc-notify --approval --run; the brief an-owner-thumbs-up-runs-the-
     # approved-command). Each case below builds its own card: a record on disk, the card and its reactions in a fake

@@ -7,7 +7,7 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
   local fh n=0 bad=0 up up2 out rc a
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccskills-XXXXXX") || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
-  run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" CC_SKILLS_TREE="$fh/tree" \
+  run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" CC_SKILLS_TREE="$fh/tree" CC_SKILLS_OVERLAY="$fh/overlay" \
     GIT_CONFIG_GLOBAL="$fh/gitconfig" GIT_CONFIG_NOSYSTEM=1 "$SELF" "$@"; }
   gi(){ git -c user.name=t -c user.email=t@t "$@"; }
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/notified"\n' "$fh" > "$fh/notify"; chmod +x "$fh/notify"; : > "$fh/gitconfig"
@@ -63,6 +63,13 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
   t 'tree: a changed source is copied again whole, in one sync, and no dot dir is left behind' \
     "$rc/$(tail -1 "$fh/.claude/skills/tx/SKILL.md")/$(cat "$fh/.claude/skills/tx/new.md")/$(grep -c 'copied again' <<<"$out")/$(find "$fh/.claude/skills" -maxdepth 1 -name '.*cc-skills*' | wc -l)" 0/t2/extra/1/0
   t 'list: a tree skill reads as a tree copy' "$(run list | cut -f4)" 'at tree copy'
+  # AN OVERLAY SKILL: the same copy, read from the overlay's root; one that climbs out is refused like a tree one
+  mkdir -p "$fh/overlay/tool/skill"; printf -- '---\nname: ox\n---\no1\n' > "$fh/overlay/tool/skill/SKILL.md"
+  printf 'ox overlay:tool/skill\noup overlay:../tool\n' > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
+  t 'overlay: a listed overlay skill is copied from the overlay root, one that climbs out is refused' \
+    "$(tail -1 "$fh/.claude/skills/ox/SKILL.md" 2>/dev/null)/$(cat "$fh/.claude/skills/ox/.cc-skills-tree" 2>/dev/null)/$(grep -c 'absolute or climbs out' <<<"$out")/$rc" \
+    "o1/$fh/overlay/tool/skill/1/0"
   t '--help exits 0' "$("$SELF" --help >/dev/null 2>&1; echo $?)" 0
   # ALIAS lines: a second clone holding a sub-skill, a symlink inside it that escapes, a directory sitting at an
   # unlisted name, and every name/target failure names is supposed to catch

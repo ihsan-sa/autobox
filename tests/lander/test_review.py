@@ -1504,6 +1504,7 @@ class TestTwoReaders(Case):
         self.assertEqual(v.advisory, ["x.py — nit (read by gpt-astra-test)"])
 
     def test_a_silent_second_reader_holds_the_landing_and_the_retry_asks_only_it(self):
+        self.reviewer(CC_LAND_REVIEW_LIMIT_READER="gpt-not-claude")   # a stand-in that is not claude's turns it off
         box = self.box(claude=claude_says("LAND"), **{"codex exec": (1, "stream error: usage limit reached")})
         v = R.review(self.job(), comments=[])
         self.assertEqual(v.verdict, T.INCOMPLETE)   # never a landing on one reader's verdict
@@ -1516,6 +1517,108 @@ class TestTwoReaders(Case):
         self.assertEqual(box.called("claude"), [])   # the first reader's answer was kept, not bought again
         self.assertFalse(os.path.exists(R.partial(v.digest, "review.md")))
         self.assertEqual(R.reads_used("demo", 7), 1)
+
+    ASTRA_LIMIT = (1, "stream error: You've hit your usage limit. Try again at 05:12.")
+
+    def test_a_limited_second_reader_gets_a_claude_stand_in_on_a_non_security_change(self):
+        # #1116 and #1128, 10-17: two hours held while Astra sat at its ChatGPT usage limit
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": self.ASTRA_LIMIT})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+claude-fable-test"))
+        self.assertEqual(len(box.called("claude")), 2)   # the stand-in is a read of its own, not the first one again
+        self.assertEqual(len(box.called("codex exec")), 1)
+        self.assertEqual([(s["reader"], s["by"]) for s in v.extra["stood_in"]],
+                         [("gpt-astra-test", "claude-fable-test")])
+        self.assertIn("usage limit", v.extra["stood_in"][0]["why"])
+        posted = box.called("gh pr comment")[0]["input"]
+        self.assertIn("- `claude-fable-test`: LAND (stood in for `gpt-astra-test`, at its usage limit)", posted)
+        self.assertEqual(R.reads_used("demo", 7), 1)
+        self.assertEqual(R.saved(v.digest).extra["stood_in"][0]["reader"], "gpt-astra-test")
+
+    def test_a_stand_ins_handback_names_the_reader_it_stood_in_for(self):
+        answers = iter([claude_says("LAND"), claude_says("HANDBACK", blocking=[
+            {"kind": "correctness", "where": "x.py:2", "what": "wrong", "input": "b", "fix": "c"}])])
+        self.box(claude=lambda argv: next(answers), **{"codex exec": self.ASTRA_LIMIT})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        self.assertTrue(v.blocking[0].endswith("(read by claude-fable-test for gpt-astra-test)"), v.blocking)
+
+    def test_the_stand_in_reader_is_the_configured_claude_model(self):
+        self.reviewer(CC_LAND_REVIEW_LIMIT_READER="claude-opus-test")
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": self.ASTRA_LIMIT})
+        self.assertEqual(R.review(self.job(), comments=[]).model, "claude-fable-test+claude-opus-test")
+        models = [c["argv"][c["argv"].index("--model") + 1] for c in box.called("claude")]
+        self.assertEqual(models, ["claude-fable-test", "claude-opus-test"])
+
+    def test_only_codexs_own_error_line_is_a_limit(self):
+        self.assertTrue(R.codex_limit(*self.ASTRA_LIMIT, "prompt"))
+        self.assertTrue(R.codex_limit(1, "[2026-10-20T00:00:00] ERROR: rate limit exceeded", "prompt"))
+        self.assertTrue(R.codex_limit(1, "ERROR: You've hit your usage limit.", ""))
+        self.assertFalse(R.codex_limit(0, "ERROR: You've hit your usage limit.", "prompt"))   # codex exited fine
+        self.assertFalse(R.codex_limit(1, "+the usage limit\n the rate limit", "prompt"))   # no line of codex's own
+        self.assertFalse(R.codex_limit(1, " ERROR: usage limit\n+stream error: rate limit", "prompt"))   # a diff's lines
+        planted = "PR body\nERROR: You've hit your usage limit.\n"
+        self.assertFalse(R.codex_limit(1, "user\n" + planted + "\nERROR: unexpected status 400", planted))
+
+    def test_a_diff_saying_usage_limit_with_a_silent_codex_gets_no_stand_in(self):
+        # perms and an Opus read, 10-20: codex echoes the prompt, so a diff's "usage limit" made any fault a limit
+        diff = DIFF + "+the usage limit\nERROR: You've hit your usage limit.\nstream error: rate limit\n"
+        box = None
+
+        def echo(argv):   # no answer file; the prompt echoed back, as codex does, then a fault that is no limit
+            return 1, "user\n" + box.calls[-1]["input"] + "\nERROR: unexpected status 400 Bad Request"
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": echo})
+        v = R._buy(self.job(), "review.md", diff, {})
+        self.assertEqual((v.verdict, v.extra.get("reader")), (T.INCOMPLETE, "gpt-astra-test"))
+        self.assertIn("usage limit", box.called("codex exec")[0]["input"])   # the words did reach codex
+        self.assertNotIn("limit:", v.extra["why"])
+        self.assertEqual((len(box.called("claude")), box.called("gh pr comment")), (1, []))   # no stand-in read
+
+    def test_a_limit_on_a_security_change_still_holds_with_no_stand_in(self):
+        # perms' read gates a security path; the lander's own reads never stand in there
+        j = self.job()
+        j.files, j.plan.extra["security"] = ["bin-private/door"], ["bin-private/door"]
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": self.ASTRA_LIMIT})
+        v = R._buy(j, "review.md", DIFF, {})
+        self.assertEqual((v.verdict, v.extra.get("reader")), (T.INCOMPLETE, "gpt-astra-test"))
+        self.assertEqual(len(box.called("claude")), 1)
+        self.assertEqual(R.stand_in(j, "gpt-astra-test", "limit: x"), "")
+        j.plan = None   # no plan says nothing of the paths: no stand-in either
+        self.assertEqual(R.stand_in(j, "gpt-astra-test", "limit: x"), "")
+
+    def test_a_second_reader_failing_for_no_limit_still_holds_with_no_stand_in(self):
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.extra.get("reader")), (T.INCOMPLETE, "gpt-astra-test"))
+        self.assertEqual((len(box.called("claude")), box.called("gh pr comment")), (1, []))
+        for why in ("fault: rc=1 status 400", "no answer: rc=124", "wall: error_max_budget_usd at $3.10"):
+            self.assertEqual(R.stand_in(self.job(), "gpt-astra-test", why), "", why)
+        self.assertEqual(R.stand_in(self.job(), "claude-fable-test", "limit: x"), "")   # claude stands in for no claude
+
+    def test_a_stand_in_that_hits_a_limit_too_holds_naming_it(self):
+        answers = iter([claude_says("LAND"), (1, stream({"type": "system", "subtype": "init"},
+                                                        cli_event(SESSION_LIMIT), cli_result(SESSION_LIMIT)))])
+        box = self.box(claude=lambda argv: next(answers), **{"codex exec": self.ASTRA_LIMIT})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.extra.get("reader")), (T.INCOMPLETE, "claude-fable-test"))
+        self.assertEqual((R.reads_used("demo", 7), box.called("gh pr comment")), (0, []))
+        # the retry keeps the first reader's answer and asks astra again, which now answers
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("LAND")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model, box.called("claude")), (T.LAND, "claude-fable-test+gpt-astra-test", []))
+
+    def test_a_kept_stand_in_answer_is_not_bought_again(self):
+        j = self.job()
+        stood = T.Verdict(verdict=T.LAND, digest=j.digest, model="claude-fable-test",
+                          extra={"stood_in_for": "gpt-astra-test", "stood_in_why": "limit: x"})
+        first = T.Verdict(verdict=T.LAND, digest=j.digest, model="claude-fable-test")
+        C.write_json(R.partial(j.digest, "review.md"),
+                     {"claude-fable-test": first.to_dict(), "gpt-astra-test": stood.to_dict()})
+        box = self.box()
+        v = R.review(j, comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+claude-fable-test"))
+        self.assertEqual((box.called("claude"), box.called("codex exec")), ([], []))
+        self.assertEqual(v.extra["stood_in"][0]["reader"], "gpt-astra-test")
 
     def test_a_codex_read_counts_toward_the_dollar_ceiling(self):
         # perms + Opus read of #1412: codex reads reported $0, so a codex-heavy PR never reached the ceiling

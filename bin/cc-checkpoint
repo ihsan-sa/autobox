@@ -159,7 +159,27 @@ gg(){ local i=0 k; GG=(-c core.fsmonitor=false -c "core.hooksPath=$HP")
 git(){ gg; command git "${GG[@]}" "$@"; }
 # ── no push waits for a person ───────────────────────────────────────────────────────────────────
 PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds. A track's push is seconds of work, so this is a wall, not a budget.
-git_unattended(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
+# A NAME THAT DID NOT RESOLVE IS ASKED AGAIN. The box's resolver drops out for seconds at a time: on 2026-10-14 two
+# tracks' pushes failed 17 s apart on 'Could not resolve host: github.com' and each needed a hand retry. A lookup that
+# failed sent nothing, so asking again is safe; anything else that failed (a refusal, a rejection, the bound) is
+# returned at once. CC_RESOLVE_WAITS: the seconds slept before each retry.
+# …BUT NOT INSIDE A FENCE. A sandbox with no network of its own (loopback only, CC_NET_DEV) fails every lookup for
+# good, and the hook pushes there after every turn: waiting a minute each time would buy nothing.
+RESOLVE_WAITS=${CC_RESOLVE_WAITS:-5 15 40}
+RESOLVE_RE='Could not resolve host|Could not resolve hostname|Temporary failure in name resolution|Name or service not known|No address associated with hostname'
+NET_DEV=${CC_NET_DEV:-/proc/net/dev}   # this network namespace's interfaces; the selfcheck points it at a fixture
+has_uplink(){ awk -F: 'NR > 2 && $1 !~ /^ *lo$/ { up = 1 } END { exit !up }' "$NET_DEV" 2>/dev/null; }
+git_unattended(){   # _git_bounded, asked again after each RESOLVE_WAITS pause while the only failure is the name lookup
+  local e rc w waits=""; has_uplink && waits=$RESOLVE_WAITS
+  e=$(mktemp) || { _git_bounded "$@"; return; }
+  for w in $waits ""; do
+    _git_bounded "$@" 2>"$e"; rc=$?
+    [ "$rc" != 0 ] && [ -n "$w" ] && grep -qE "$RESOLVE_RE" "$e" || break
+    printf '%s %s — asking again in %ss\n' "$(date -u +%FT%TZ)" "$(grep -m1 -oE "($RESOLVE_RE).*" "$e")" "$w" >&2
+    sleep "$w"
+  done
+  cat "$e" >&2; rm -f "$e"; return "$rc"; }
+_git_bounded(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
   # 124/137 from `timeout`. Both locks are needed and neither is enough: the prompt locks turn "ask for a
   # username" into an error the caller can read, and the bound catches everything they do not — a credential
   # helper that blocks on its own, a connection accepted and then never answered. `timeout` runs the command in
@@ -1254,7 +1274,7 @@ journal_nudge(){   # $1 the Stop payload.  One reason line on stdout (relay wrap
       printf '%s\n' "CONTEXT $m. You are the permission seat, past the hand-off line. Before this turn ends, append a dated entry to handoff.md in your own directory, ~/.cc/state/$r/perms/handoff.md (what is done, what is next in order, the gotchas), then carry on. $PERMS_SHUT"
       return 0
     elif [[ $r != */* ]] && [ -f "$cwd/brief.md" ]; then
-      printf '%s\n' "CONTEXT $m. You are the permission seat, past the hand-off line. Before this turn ends, append an entry headed '## HAND-OFF ENTRY <UTC time to the minute>Z ... START HERE' to handoff.md in your own directory, ~/.cc/state/$r/perms/handoff.md, which only you can write and the only journal your successor reads (what is done, what is next in order, the gotchas), then run cc-perms handoff in the foreground, never in the background, with a Bash timeout of at least 120000 ms, so a timeout cannot stop it halfway. A fresh seat starts from brief.md and that entry, takes window perms, and this window ends."
+      printf '%s\n' "CONTEXT $m. You are the permission seat, past the hand-off line. Before this turn ends, append an entry headed '## HAND-OFF ENTRY <UTC time to the minute>Z ... START HERE' to handoff.md in your own directory, ~/.cc/state/$r/perms/handoff.md, which only you can write and the only journal your successor reads (what is done, what is next in order, the gotchas), then run cc-perms handoff in the foreground, never in the background, with a Bash timeout of at least 120000 ms, so a timeout cannot stop it halfway. A fresh seat starts from brief.md and that entry, takes window perms, and this window ends, unless reads are still running in your subagents: then it stays as perms~old for them, and the hand-off's output says what to do."
       return 0; fi;; esac
   printf '%s\n' "CONTEXT $m. Append a dated entry to this session's journal now, before this turn ends: what is done, what is next in order, the gotchas. A track journals to ~/.cc/state/<repo>/<track>/progress.md, any other session to ~/.cc/state/<repo>/<alias-or-planning>-handoff.md. Write it from what you already know, then carry on. A fresh session starts from that file and from nothing else."
 }

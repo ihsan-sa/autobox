@@ -106,6 +106,11 @@ BOX_STATE_RE = re.compile(r"Disk quota exceeded|No space left on device|Cannot a
 SETUP_RE = re.compile(r"^(bwrap:|systemd-run:|Failed to start transient scope"
                       r"|Failed to connect to (user )?(scope )?bus"
                       r"|cc-nosignal: .*refused, nothing ran|" + re.escape(S.SETUP_FAILED) + r").*", re.M)
+# A live-network check that failed a name lookup met the box's resolver, not the tree: it drops out for seconds at a time
+# (10-14: two pushes 17 s apart on 'Could not resolve host: github.com'), and a red for it stopped an ai-ee landing.
+# Only a net check is read this way: a check with no network has no lookup to fail, so its line is the tree's own.
+RESOLVE_RE = re.compile(r"Could not resolve host(?:name)?\b.*|Temporary failure in name resolution|"
+                        r"Name or service not known|No address associated with hostname|\bEAI_AGAIN\b")
 RED_RE = re.compile(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback")
 PASS_RE = re.compile(r"^\W*[✓✔]|^\s*(?:ok|pass(?:ed)?)\b", re.I)
 KILLED = (124, 137, 143)
@@ -277,11 +282,13 @@ def read_log(log: str, limit: int = 400_000) -> str:
         return ""
 
 
-def status_of(rc: int, text: str, capped: bool = False, started: bool | None = None) -> tuple:
+def status_of(rc: int, text: str, capped: bool = False, started: bool | None = None, net: bool = False) -> tuple:
     """-> (status, why). A clean exit with no 'N failed' above zero passes whatever it prints: a check that quotes
     a box-state error (a case that fills a disk on purpose) is not the box failing, so that text counts on rc != 0.
     started: what setup said out of band (read_started) — False is unrunnable whatever the exit, True never reads
-    the output for setup's words; None (no pipe: a member, a runner) reads its first line for them."""
+    the output for setup's words; None (no pipe: a member, a runner) reads its first line for them.
+    net: the check is a live-network one, so a failed name lookup in a failed run is unrunnable (RESOLVE_RE), which
+    the lane holds and runs again rather than handing back."""
     if capped:
         return T.UNRUNNABLE, "stopped at its cap"
     if rc < 0 or rc in KILLED:
@@ -300,6 +307,9 @@ def status_of(rc: int, text: str, capped: bool = False, started: bool | None = N
     n = [int(x) for x in FAILED_RE.findall(text)]
     if rc == 0 and not (n and n[-1] > 0):
         return T.PASSED, ""
+    r = RESOLVE_RE.search(text) if net else None
+    if r:
+        return T.UNRUNNABLE, f"the network, not the tree: {r.group(0)[:200]}"
     return T.FAILED, f"exit {rc}" + (f", {n[-1]} failed" if n and n[-1] else "")
 
 
@@ -676,7 +686,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         if kind == "laptop":
             started = {"never_started": never_started(text, capped)} if dest else {}
             text, rc = _laptop_verdict(text, rc)
-        st, why = status_of(rc, text, capped, started=said)
+        st, why = status_of(rc, text, capped, started=said, net=check.net)
         if kind == "laptop" and rc == -1 and not capped:   # capped: it ran there, and "stopped at its cap" says so
             why = text.splitlines()[0] if text else "the laptop did not answer"
         kept = {}
