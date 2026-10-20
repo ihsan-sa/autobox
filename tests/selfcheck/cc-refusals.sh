@@ -4,7 +4,7 @@
 # globals, as they did when the body sat there. SC2154/SC2034 are off because those globals live in bin/cc-refusals.
 
 selfcheck(){
-  local d n=0 f=0 out lg id
+  local d n=0 f=0 out lg id sid n0
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-refusals-sc.XXXXXX") || return 1
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
@@ -257,6 +257,17 @@ STUB
   fresh; rc=$(sc ask repo --from repo --kind permission -- 'a seat ask' >/dev/null 2>&1; echo $?); k "$(t test "$rc" = 2 -a ! -s "$lg")" "--kind without --member is a usage error"
   fresh; printf '%s\n' '{"kind":"ask","id":"qold00001","at":"2026-10-19T00:00:00Z","repo":"repo","window":"aya","member":true,"where":"#aya","text":"OLD INJECTED TEXT","key":"k"}' > "$lg"
   k "$(t test -z "$( { sc open repo; sc show repo qold00001; } | grep 'OLD INJECTED')")" "a member ask filed before this with text in it prints no text in open or show"
+  # 12b. the planning seat's summary names a member ask from that same workspace, or it is refused with nothing written
+  #      (perms' read of #1585: a member's words could steer the seat to file under another workspace's id)
+  fresh; id=$(sc ask repo --from aya --member); sid=$(sc ask repo --from repo -- 'may aya read the calendar API? (member aya, '"$id"')')
+  k "$(t jq -e --arg s "$sid" 'select(.id == $s and .member == false)' "$lg")" "a seat's summary naming a member ask from that workspace is filed"
+  n0=$(wc -l < "$lg")
+  rc=$(sc ask repo --from repo -- 'may bob read it? (member bob, '"$id"')' >/dev/null 2>&1; echo $?)
+  k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…one naming that id under another workspace is refused (exit 2), nothing written"
+  rc=$(sc ask repo --from repo -- 'may aya read it? (member aya, q00000000)' >/dev/null 2>&1; echo $?)
+  k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…and so is one naming an id the ledger never gave"
+  rc=$(sc ask repo --from repo -- 'may aya read it? (member aya, '"$id"') and the seat (member aya, '"$sid"')' >/dev/null 2>&1; echo $?)
+  k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…and one whose second tag names a seat's ask, not a member's"
   # 13. perms down: the ask still waits, and the owner gets one line that it is down, never the ask's text
   fresh; rm -f "$d/notified"; id=$(CC_REFUSALS_PERMS_LIVE=0 sc ask repo --from repo -- 'secret-ish ask text' 2>/dev/null)
   k "$(t jq -e --arg id "$id" 'select(.id == $id)' "$lg")" "with the permission session down the ask still waits in the ledger"
