@@ -337,14 +337,14 @@ dispatch_block(){   # → that shared text with a leading space, or NOTHING if t
   local d; d=$(cat "$DISPATCH" 2>/dev/null); [ -n "$d" ] || return 0; printf ' %s' "$d"; }
 WRITING="$(dirname "$BIN")/config/writing-prompt.md"   # the box's one writing block — written ONCE, in core/, for every session kind and the Slack tool
 WRITING_REF="$(dirname "$BIN")/config/writing-ref-prompt.md"   # the pointer to that block, for a worker that already loads ~/CLAUDE.md
-worker_writing_block(){   # → the writing rule as THIS worker needs it. On the host it loads ~/CLAUDE.md, which carries the
-                          # block, so it gets the pointer. Inside a sandbox (CC_WORKER_SANDBOX, or a member workspace's
-                          # boundary) no ~/CLAUDE.md exists, so it gets the block's first paragraph and its last line, the
-                          # guide cc-sandbox binds as ~/WRITING.md: paragraphs of the same file, never a copy.
+worker_writing_block(){   # → the writing rule as THIS worker needs it. A worker that loads ~/CLAUDE.md, which carries the
+                          # block, gets the pointer, as a seat does: on the host, in a worker sandbox and in the owner's own
+                          # workspace, where cc-sandbox binds it (SHARED_DOCS). A member's boundary binds no ~/CLAUDE.md, so
+                          # there it gets the block's first paragraph and its last line, the guide cc-sandbox binds as
+                          # ~/WRITING.md: paragraphs of the same file, never a copy.
   local w
-  if [ "${CC_WORKER_SANDBOX:-}" = 1 ] || [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
-    w=$(awk 'BEGIN{RS=""} NR==1{print; print ""} {l=$0} END{if(NR>1)print l}' "$WRITING" 2>/dev/null)
-  else w=$(cat "$WRITING_REF" 2>/dev/null); fi
+  if [ -f "$HOME/CLAUDE.md" ]; then w=$(cat "$WRITING_REF" 2>/dev/null)
+  else w=$(awk 'BEGIN{RS=""} NR==1{print; print ""} {l=$0} END{if(NR>1)print l}' "$WRITING" 2>/dev/null); fi
   [ -n "$w" ] || return 0; printf ' %s' "$w"; }
 RAISE="$(dirname "$BIN")/config/raise-prompt.md"   # how a session raises a problem with the box itself — written ONCE, in core/, for every session kind
 raise_block(){   # → that shared rule with a leading space, or NOTHING if the file is missing, like the two above.
@@ -1130,11 +1130,14 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   grep -q "end the iteration: never wait on it in your turn" <<<"$(repo=r track=t ST="$d/st"; sp_worker trunk)"; t 'and so does the prompt cc-loop builds' "$?" 0
   t 'the worker prompt never tells the worker to run cc-green wait' "$(repo=r track=t ST="$d/st"; sp_worker trunk | grep -o '[^.]*cc-green wait[^.]*' | grep -vc 'not sit in\|[Nn]ever wait\|no model call')" 0
   # the prompt's words come from WORKER_PROMPT: every placeholder filled, a wrapped file read back as one line, and
-  # a missing file is no prompt at all (the caller stops) rather than a worker started on the blocks alone
+  # a missing file is no prompt at all (the caller stops) rather than a worker started on the blocks alone. HOME is a
+  # fixture holding a ~/CLAUDE.md, as the box's does, so the writing rule is the one-line pointer whoever runs this
+  # (worker_writing_block: without one it is the block's paragraphs, which are lines of their own)
+  mkdir -p "$d/wh" && : > "$d/wh/CLAUDE.md"
   t 'the worker prompt fills every placeholder of its file' "$(repo=r track=t ST="$d/st"; sp_worker trunk | grep -c '{track}\|{repo}\|{state}\|{base}')" 0
-  t 'and reads the wrapped file back as one line' "$(repo=r track=t ST="$d/st"; sp_worker trunk | wc -l | tr -d ' ')" 0
+  t 'and reads the wrapped file back as one line' "$(repo=r track=t ST="$d/st" HOME="$d/wh"; sp_worker trunk | wc -l | tr -d ' ')" 0
   printf 'Track {track} of {repo}  \nkeeps {state}, never {base}.\n' > "$d/wp.md"
-  t 'its four placeholders, an & taken literally' "$(repo='r&' track=t ST=/s WORKER_PROMPT="$d/wp.md"; CHECKLIST="$d/absent/x" DISPATCH="$d/absent/x"; sp_worker trunk | cut -c1-36)" 'Track t of r& keeps /s, never trunk.'
+  t 'its four placeholders, an & taken literally' "$(repo='r&' track=t ST=/s WORKER_PROMPT="$d/wp.md" HOME="$d/wh"; CHECKLIST="$d/absent/x" DISPATCH="$d/absent/x"; sp_worker trunk | cut -c1-36)" 'Track t of r& keeps /s, never trunk.'
   t 'no prompt file, no prompt' "$(WORKER_PROMPT="$d/absent/worker-prompt.md"; sp_worker trunk >/dev/null; echo $?)" 1
   # The fake models the run: $3 = live as the iteration ended (1/0); `wait 0` answers from that alone, and each long
   # wait is one more 540 s, still going for the first $2 of them, ended on the next. `calls` counts every ask.
@@ -2023,23 +2026,27 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   t '…and it is said once: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$dtext"; echo "$dup")" no
   # ── AND THE OWNER'S WRITING RULE REACHES THE WORKER ── a worker writes the BLOCKED line he reads, the board note and
-  # the journal a handoff is taken from, and `cc selfcheck` cannot see this prompt. ON THE HOST it loads ~/CLAUDE.md,
-  # which carries the block, so it gets the pointer and never a second copy; IN A SANDBOX it loads none, so it gets the
-  # block's first paragraph and guide line. Each half on its own env, each with its control.
+  # the journal a handoff is taken from, and `cc selfcheck` cannot see this prompt. A worker that loads ~/CLAUDE.md —
+  # on the host, in a worker sandbox and in the owner's own workspace, where cc-sandbox binds it — gets the pointer and
+  # never a second copy; a member's boundary binds none, so there it gets the block's first paragraph and guide line.
+  # Decided by the file, never by the env: each half on a HOME of its own, a sandbox's env on both, each with its control.
   wtext=$(cat "$WRITING"); wref=$(cat "$WRITING_REF"); wp1=$(awk 'BEGIN{RS=""} NR==1' "$WRITING")
   writes(){ [ -n "$2" ] || { echo no; return; }; case "$1" in *"$2"*) echo yes;; *) echo no;; esac; }
-  wsp=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st"; sp_worker main)
+  mkdir -p "$d/wnh"   # no ~/CLAUDE.md in it, as in a member's boundary; $d/wh above has one
+  wsp=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st" HOME="$d/wh"; sp_worker main)
   t 'a host worker prompt carries the pointer to the writing rule' "$(writes "$wsp" "$wref")" yes
   t '…and not a second copy of the block ~/CLAUDE.md gives it' "$(writes "$wsp" "$wtext")" no
-  wgone=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st" WRITING_REF="$d/absent/writing-ref-prompt.md"; sp_worker main)
+  wgone=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; repo=r track=t ST="$d/st" HOME="$d/wh" WRITING_REF="$d/absent/writing-ref-prompt.md"; sp_worker main)
   t 'control: with the pointer gone, the host worker prompt fails that same test' "$(writes "$wgone" "$wref")" no
   for e in CC_MEMBER_SANDBOX CC_WORKER_SANDBOX; do
-    wbx=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; export "$e=1"; repo=r track=t ST="$d/st"; sp_worker main)
+    wbs=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; export "$e=1"; repo=r track=t ST="$d/st" HOME="$d/wh"; sp_worker main)
+    t "a sandboxed worker ($e) that has ~/CLAUDE.md bound gets the same pointer a seat gets, and not a second copy" "$(writes "$wbs" "$wref"):$(writes "$wbs" "$wtext")" yes:no
+    wbx=$(unset CC_WORKER_SANDBOX CC_MEMBER_SANDBOX; export "$e=1"; repo=r track=t ST="$d/st" HOME="$d/wnh"; sp_worker main)
     # shellcheck disable=SC2088  # the literal text the prompt carries, not a path
-    t "a sandboxed worker ($e) carries the block's first paragraph and its guide line" "$(writes "$wbx" "$wp1"):$(writes "$wbx" '~/WRITING.md')" yes:yes
+    t "a worker with no ~/CLAUDE.md ($e) carries the block's first paragraph and its guide line" "$(writes "$wbx" "$wp1"):$(writes "$wbx" '~/WRITING.md')" yes:yes
     t "…and not the pointer to a ~/CLAUDE.md it cannot see ($e)" "$(writes "$wbx" "$wref")" no
   done
-  wbg=$(export CC_MEMBER_SANDBOX=1; repo=r track=t ST="$d/st" WRITING="$d/absent/writing-prompt.md"; sp_worker main)
+  wbg=$(export CC_MEMBER_SANDBOX=1; repo=r track=t ST="$d/st" HOME="$d/wnh" WRITING="$d/absent/writing-prompt.md"; sp_worker main)
   t 'control: with the writing rule gone, the sandboxed worker prompt fails that same test' "$(writes "$wbg" "$wp1")" no
   t '…and the writing rule is said once too: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$wtext"; echo "$dup")" no
