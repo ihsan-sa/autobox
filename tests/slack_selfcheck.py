@@ -1589,6 +1589,15 @@ def run_selfcheck():
                 refused = True
             check("…and a door dir that is a link refuses the door bind, nothing made through it",
                   refused and os.listdir(f"{dS}/elsewhere") == [])
+            # `enabled` sits in member/<h> too (perms' read of #1630, 10-20): a link planted there, to an owner's file
+            # or to a name not made yet, is replaced by a plain flag; the file is untouched and the name never made.
+            open(f"{dS}/victim2", "w").write("KEEP\n")
+            for hE, toE in (("memw", f"{dS}/victim2"), ("memv", f"{dS}/notyet")):
+                os.makedirs(f"{dS}/member/{hE}"); os.symlink(toE, f"{dS}/member/{hE}/enabled")
+                dmS.bind_member_sock(hE)
+            check("…and a link planted at member/<h>/enabled is replaced by a plain file, never written through",
+                  all(stat.S_ISREG(os.lstat(f"{dS}/member/{h}/enabled").st_mode) for h in ("memw", "memv"))
+                  and open(f"{dS}/victim2").read() == "KEEP\n" and not os.path.lexists(f"{dS}/notyet"))
         finally:
             globals()["DIR"] = real_dirS
 
@@ -3880,7 +3889,7 @@ def run_selfcheck():
           and split_orch("myrepo/track@2") == ("myrepo/track@2", None) and split_orch("box") == ("box", None)
           and split_orch("myrepo@") == ("myrepo@", None))
     dmL13 = Daemon(use_slack=False); dmL13.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
-    opened13, real_urlopen = [], urllib.request.urlopen
+    opened13, real_urlopen, real_slack_open = [], urllib.request.urlopen, slack_open
     class FakeResp:                     # one body, then EOF: fetch_files streams until read() comes back empty
         sent = False
         def read(self, n=None):
@@ -3899,7 +3908,7 @@ def run_selfcheck():
             os.makedirs(f"{td13}/files")
             old13 = f"{td13}/files/20250101T000000Z-FOLD-old.png"
             open(old13, "w").write("x"); os.utime(old13, (nowA - 40 * 86400, nowA - 40 * 86400))
-            urllib.request.urlopen = lambda req, timeout=None: opened13.append(req.full_url) or FakeResp()
+            globals()["slack_open"] = lambda req, timeout=None: opened13.append(req.full_url) or FakeResp()
             with contextlib.redirect_stderr(io.StringIO()):
                 out13 = dmL13.fetch_files([
                     {"id": "F1", "name": "evil.png", "url_private": "https://files.slack.example.com/x", "size": 10},
@@ -3907,7 +3916,7 @@ def run_selfcheck():
                     {"id": "F3/../../../etc/passwd", "name": "ok.png", "url_private": "https://files.slack.com/z", "size": 10}])
             pruned13 = os.path.exists(old13)
         finally:
-            urllib.request.urlopen = real_urlopen
+            globals()["slack_open"] = real_slack_open
             globals()["DIR"] = real_dir13
     check("fetch_files: a non-Slack host and an external-mode file are skipped; the file id can't escape the directory — L13",
           opened13 == ["https://files.slack.com/z"] and len(out13) == 1
@@ -3923,7 +3932,7 @@ def run_selfcheck():
         try:
             globals()["DIR"] = td13b
             opened13.clear()
-            urllib.request.urlopen = lambda req, timeout=None: opened13.append(req.full_url) or FakeResp()
+            globals()["slack_open"] = lambda req, timeout=None: opened13.append(req.full_url) or FakeResp()
             with contextlib.redirect_stderr(io.StringIO()):
                 got13 = dmL13.fetch_files(ten, pairs=True)
                 meta13 = {}
@@ -3933,7 +3942,7 @@ def run_selfcheck():
                 meta13c = {}
                 text13c = dmL13.attach("the set", ten[:2], [], meta13c, None)
         finally:
-            urllib.request.urlopen = real_urlopen
+            globals()["slack_open"] = real_slack_open
             globals()["DIR"] = real_dir13
     check("fetch_files: NO COUNT CAP: eleven attachments on one message are all fetched (owner 10-16) — L13",
           len(got13) == 11 and [f["id"] for f, _ in got13] == ["F%d" % i for i in range(1, 12)]
@@ -3967,7 +3976,7 @@ def run_selfcheck():
         fakes13, said13 = [], []
         try:
             globals()["DIR"] = td13c
-            urllib.request.urlopen = lambda req, timeout=None: fakes13.append(FakeBig()) or fakes13[-1]
+            globals()["slack_open"] = lambda req, timeout=None: fakes13.append(FakeBig()) or fakes13[-1]
             dmL13.deliver = lambda target, payload, autostart=True, alias=None: said13.append((target, payload, autostart, alias))
             with contextlib.redirect_stderr(io.StringIO()):
                 whole13 = dmL13.fetch_files([dict(bigF)], pairs=True)                 # no `later`: inline, whole
@@ -3982,7 +3991,7 @@ def run_selfcheck():
                 gotfull13 = dmL13.fetch_files([fF13], pairs=True, later=full13)
                 textfull13 = dmL13.attach("look", [fF13], gotfull13, {}, None, full13)
         finally:
-            urllib.request.urlopen = real_urlopen
+            globals()["slack_open"] = real_slack_open
             globals()["DIR"], globals()["DISK_FLOOR"] = real_dir13, real_floor13
             dmL13.deliver = real_deliver13
             path13 = whole13[0][1] if whole13 else ""
@@ -4012,20 +4021,166 @@ def run_selfcheck():
         os.symlink(f"{td13l}/real", f"{td13l}/linkdir")
         refused13 = []
         try:
-            urllib.request.urlopen = lambda req, timeout=None: FakeBig()
+            globals()["slack_open"] = lambda req, timeout=None: FakeBig()
             for p13 in (f"{td13l}/files/x-FBIG-rec.mov", f"{td13l}/linkdir/x-FBIG-rec.mov"):
                 try:
                     dmL13.save_file(dict(bigF, size=1), bigF["url_private"], p13); refused13.append(False)
                 except OSError:
                     refused13.append(True)
         finally:
-            urllib.request.urlopen = real_urlopen
+            globals()["slack_open"] = real_slack_open
         with open(victim13) as fh:
             kept13 = fh.read()
         linked13 = os.path.islink(f"{td13l}/files/x-FBIG-rec.mov") and os.listdir(f"{td13l}/real") == []
     check("save_file: a symlink planted at the announced path (or the files dir) is refused, and its target is left "
           "untouched (perms 10-20) — L13",
           refused13 == [True, True] and kept13 == "ssh-ed25519 KEEP\n" and linked13)
+    # THE TOKEN STAYS ON SLACK (perms' read of #1504, 10-20): urllib copies Authorization onto wherever a redirect
+    # points. A fake network answers files.slack.com with a 302 to another host (and one more inside Slack): through
+    # save_file the token reaches Slack's hops only, and the same redirect without SlackAuthRedirect is the control.
+    from email.message import Message as MsgR
+    from urllib.response import addinfourl as RespR
+    def fake_net(seen):
+        class FakeNet(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                host = urllib.parse.urlparse(req.full_url).hostname
+                seen.append((host, req.get_header("Authorization")))
+                hops = {"files.slack.com": "https://edge.slack.com/a", "edge.slack.com": "https://cdn.example.net/a",
+                        "cdn.example.net": "https://files.slack.com/back", "plain.slack.com": "http://files.slack.com/clear"}
+                hdrs = MsgR()
+                if host in hops and not req.full_url.endswith(("/back", "/clear")):
+                    hdrs["Location"] = hops[host]
+                    r = RespR(io.BytesIO(b""), hdrs, req.full_url, 302); r.msg = "Found"
+                    return r
+                r = RespR(io.BytesIO(b"the bytes"), hdrs, req.full_url, 200); r.msg = "OK"
+                return r
+        class FakeNetP(urllib.request.HTTPHandler):   # the http hop too: nothing here reaches a real network
+            http_open = FakeNet.https_open
+        return FakeNet(), FakeNetP()
+    seenR, seenC, seenH, real_opener13 = [], [], [], SLACK_OPENER
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_redirect_") as tdR:
+        try:
+            globals()["SLACK_OPENER"] = urllib.request.build_opener(urllib.request.ProxyHandler({}), SlackAuthRedirect, *fake_net(seenR))
+            dmL13.save_file({"id": "FR", "size": 9}, "https://files.slack.com/r", f"{tdR}/r")
+            gotR = open(f"{tdR}/r", "rb").read()
+            globals()["SLACK_OPENER"] = urllib.request.build_opener(urllib.request.ProxyHandler({}), SlackAuthRedirect, *fake_net(seenH))
+            dmL13.save_file({"id": "FH", "size": 9}, "https://plain.slack.com/r", f"{tdR}/h")
+            globals()["SLACK_OPENER"] = urllib.request.build_opener(urllib.request.ProxyHandler({}), *fake_net(seenC))   # urllib's own redirects
+            dmL13.save_file({"id": "FC", "size": 9}, "https://files.slack.com/r", f"{tdR}/c")
+        finally:
+            globals()["SLACK_OPENER"] = real_opener13
+    tok13 = "Bearer xoxb-test"
+    check("save_file: a download redirected off Slack loses its Authorization header there and on every hop after "
+          "it, back on Slack included; Slack's own hops keep it, an http hop on slack.com gets none, and the file "
+          "still lands (perms' read of #1504, 10-20) — L13",
+          seenR == [("files.slack.com", tok13), ("edge.slack.com", tok13), ("cdn.example.net", None), ("files.slack.com", None)]
+          and gotR == b"the bytes" and seenH == [("plain.slack.com", tok13), ("files.slack.com", None)])
+    check("…and the control: the same redirects through urllib's own handler carry the token to the foreign host — L13",
+          ("cdn.example.net", tok13) in seenC)
+    # TWO BIG DOWNLOADS AT ONCE (perms' read of #1504, 10-20): each one alone fits above DISK_FLOOR, both together
+    # don't. The first is held mid-download; the second, checked while it runs, is refused because the first's size
+    # is still promised; once the first lands (or fails) its promise is gone and the next one fits again.
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_room_") as tdD:
+        S13 = 64 * 1024 * 1024
+        go13, in13, res13 = threading.Event(), threading.Event(), {}
+        class SlowResp:
+            def __init__(self):
+                self.done = False
+            def read(self, n=None):
+                in13.set(); go13.wait(20)
+                if self.done:
+                    return b""
+                self.done = True
+                return b"z" * 1000
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        real_floor13, real_open13 = DISK_FLOOR, slack_open
+        try:
+            globals()["DISK_FLOOR"] = shutil.disk_usage(tdD).free - S13 - S13 // 2   # room for one, not two
+            globals()["slack_open"] = lambda req, timeout=None: SlowResp()
+            def first13():
+                try:
+                    dmL13.save_file({"id": "FA", "size": S13}, "https://files.slack.com/a", f"{tdD}/a"); res13["a"] = "ok"
+                except Exception as e:
+                    res13["a"] = repr(e)
+            t13 = threading.Thread(target=first13, daemon=True); t13.start(); in13.wait(20)
+            try:
+                dmL13.save_file({"id": "FB", "size": S13}, "https://files.slack.com/b", f"{tdD}/b"); res13["b"] = "ok"
+            except DiskFull as e:
+                res13["b"] = str(e)
+            go13.set(); t13.join(20)
+            held13 = DISK_HELD[os.stat(tdD).st_dev]
+            try:
+                dmL13.save_file({"id": "FC", "size": S13}, "https://files.slack.com/c", f"{tdD}/c"); res13["c"] = "ok"
+            except DiskFull as e:
+                res13["c"] = str(e)
+        finally:
+            go13.set()
+            globals()["DISK_FLOOR"], globals()["slack_open"] = real_floor13, real_open13
+    check("save_file: a big download still running holds its size against the 2 GB floor, so a second one that would "
+          "only fit without it is refused and leaves no file; the promise is gone once the first lands, and the next "
+          "fits (perms' read of #1504, 10-20) — L13",
+          res13.get("a") == "ok" and "not enough disk" in res13.get("b", "") and not os.path.exists(f"{tdD}/b")
+          and held13 == 0 and res13.get("c") == "ok")
+    # A MEMBER'S FILES DIR SWAPPED FOR A LINK (perms' read of #1630, 10-20): member_dir(h)/files is writable in the
+    # member's sandbox, so it can be a link to anywhere the owner can write. fetch_files (through save_file) and both
+    # mail copies are refused there and write nothing at the link's target; a link planted at a mail copy's own name
+    # is refused the same way, its target untouched.
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_swap_") as tdW:
+        real_dirW, real_mailW, real_openW = DIR, MAIL_DIR, slack_open
+        try:
+            globals()["DIR"], globals()["MAIL_DIR"] = f"{tdW}/slack", f"{tdW}/mail"
+            globals()["slack_open"] = lambda req, timeout=None: FakeResp()
+            outW, filesW = f"{tdW}/owner-only", f"{tdW}/slack/member/memq/files"
+            os.makedirs(outW); os.makedirs(f"{tdW}/slack/member/memq"); os.symlink(outW, filesW)
+            os.makedirs(f"{tdW}/mail/inbox/m1"); open(f"{tdW}/mail/inbox/m1/a.pdf", "w").write("pdf")
+            msgW = {"id": "m1", "subject": "s", "attachments": [{"path": "a.pdf"}]}
+            with contextlib.redirect_stderr(io.StringIO()):
+                gotW = dmL13.fetch_files([{"id": "FW", "name": "w.png", "url_private": "https://files.slack.com/w", "size": 1}],
+                                         member="memq")
+                mailW, textW = dmL13.mail_files(msgW, "memq"), dmL13.mail_text_file(msgW, "memq")
+                swappedW = os.listdir(outW)
+                os.unlink(filesW); os.makedirs(filesW)
+                victimW = f"{tdW}/owner-file"; open(victimW, "w").write("KEEP\n")
+                os.symlink(victimW, f"{filesW}/m1-a.pdf"); os.symlink(f"{tdW}/notyet", f"{filesW}/m1.text.txt")
+                mailW2, textW2 = dmL13.mail_files(msgW, "memq"), dmL13.mail_text_file(msgW, "memq")
+                os.unlink(f"{filesW}/m1-a.pdf"); os.unlink(f"{filesW}/m1.text.txt")
+                mailW3, textW3 = dmL13.mail_files(msgW, "memq"), dmL13.mail_text_file(msgW, "memq")
+        finally:
+            globals()["DIR"], globals()["MAIL_DIR"], globals()["slack_open"] = real_dirW, real_mailW, real_openW
+        check("a member's files dir swapped for a link: fetch_files, the mail attachment copy and the mail text are all "
+              "refused and nothing lands at the link's target (perms' read of #1630, 10-20) — L13",
+              gotW == [] and mailW == [] and textW == "" and swappedW == [])
+        check("…a link planted at a mail copy's name is refused and its target untouched, and with the links gone both "
+              "copies land inside as before — L13",
+              mailW2 == [] and textW2 == "" and open(victimW).read() == "KEEP\n" and not os.path.exists(f"{tdW}/notyet")
+              and len(mailW3) == 1 and open(f"{filesW}/m1-a.pdf").read() == "pdf"
+              and textW3.endswith("/m1.text.txt") and os.path.isfile(f"{filesW}/m1.text.txt"))
+    # FILES SHARED FROM ANOTHER WORKSPACE (perms' read of #1579, 10-20): shared_files drops every "_" key a sender
+    # wrote, so it must put the box's own _ws back from the event, on top-level files, on files.info lookups and on a
+    # bare id alike, or the download would go out with the default workspace's token. A forged _ws never wins.
+    real_wsx, real_apiX = dict(WS["extra"]), api
+    try:
+        WS["extra"].update({"wsb": {"bot": "xoxb-wsb"}, "evil": {"bot": "xoxb-evil"}})
+        infoX = lambda fid: {"id": fid, "name": "x.png", "url_private": f"https://files.slack.com/{fid}", "_ws": "evil"}
+        globals()["api"] = lambda method, token, **kw: {"ok": True, "file": infoX(kw.get("file"))}
+        evX = {"_ws": "wsb", "text": "F0WSBBARE01",
+               "files": [{**infoX("F0WSBTOP001"), "_ws": "evil"}, {"id": "F0WSBCHK001", "_ws": "evil"}],
+               "attachments": [{"text": "see", "files": [{"id": "F0WSBATT001", "_ws": "evil"}]}]}
+        gotX, unreadX = dmL13.shared_files(evX, "CS", "UOWNER", True)
+        authX = []
+        globals()["slack_open"] = lambda req, timeout=None: authX.append(req.get_header("Authorization")) or FakeResp()
+        with tempfile.TemporaryDirectory(prefix="_selfcheck_ws_") as tdX:
+            dmL13.save_file(gotX[0], gotX[0]["url_private"], f"{tdX}/x")
+    finally:
+        WS["extra"].clear(); WS["extra"].update(real_wsx)
+        globals()["api"], globals()["slack_open"] = real_apiX, real_slack_open
+    check("shared_files: on another workspace's event every file it returns carries that workspace as _ws, the forged "
+          "_ws=evil dropped, and the download goes out with that workspace's own token (perms' read of #1579, 10-20)",
+          sorted(f["id"] for f in gotX) == ["F0WSBATT001", "F0WSBBARE01", "F0WSBCHK001", "F0WSBTOP001"]
+          and all(f.get("_ws") == "wsb" for f in gotX) and not unreadX and authX == ["Bearer xoxb-wsb"])
     # -- A VOICE MEMO IS A MESSAGE (owner, 2026-09-05) --------------------------------------------------------------
     #    Fixtures only: a fake recording (bytes off a stubbed download) and a stubbed cc-voice. Nothing here loads a
     #    model, transcribes anything or spends: what is under test is the ROUTING — which file becomes text, what the
@@ -4087,7 +4242,7 @@ def run_selfcheck():
                                "text": "", "channel_type": "channel", "files": files})
     _pausedVM, _needsVM, _reactVM, _lastVM = (globals()["paused"], globals()["needs_dir"], globals()["react"],
                                               globals()["save_last"])
-    wasVM, _openVM, _dirVM = Effects("voice", run=runVM).install(), urllib.request.urlopen, DIR
+    wasVM, _dirVM = Effects("voice", run=runVM).install(), DIR
     # A DIRECTORY OF ITS OWN, like the fetch_files case above: these cases download the SAME fixture memo nine times,
     # all named `…-F9-audio_message.m4a`, and Slack names a real voice memo `audio_message.m4a` too — so picking the
     # fixture out of a shared directory by name is picking whichever one sorted first. The path under test is the one
@@ -4102,7 +4257,7 @@ def run_selfcheck():
         globals()["needs_dir"] = lambda t: False         # ~/dev is not this case's subject; provisioning is the P case's
         globals()["react"] = lambda *a, **k: None
         globals()["save_last"] = lambda last: None       # …and #CV is not a chat the nudge cases should then find
-        urllib.request.urlopen = lambda req, timeout=None: FakeAudioVM()
+        globals()["slack_open"] = lambda req, timeout=None: FakeAudioVM()
         with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
             dmVM.on_event(evVM([memoVM], "9.1")); landedVM()
         audioVM = ranVM[0][2]
@@ -4238,7 +4393,7 @@ def run_selfcheck():
               and capVM.count(VOICE_CUT) == 1 and capVM.endswith("_")
               and voice_post(SPOKEN, CONDENSED) == f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{CONDENSED}_")
     finally:
-        urllib.request.urlopen = _openVM
+        globals()["slack_open"] = real_slack_open
         globals()["paused"], globals()["needs_dir"] = _pausedVM, _needsVM
         globals()["react"], globals()["save_last"] = _reactVM, _lastVM
         globals()["DIR"] = _dirVM
@@ -7102,16 +7257,20 @@ def run_selfcheck():
             mk9 = f"{DEV}/{r8}/.cc/member-workspace"; os.makedirs(os.path.dirname(mk9), exist_ok=True); open(mk9, "w").close()
             find9 = globals()["find_channel"]
             globals()["find_channel"] = lambda cfg, name: ("CRUG", False) if name == f"{r8}--rugs" else find9(cfg, name)
+            was9 = load_orchs()
             try:
                 del api9[:]
                 resM = dm9.ensure_orch_channel(r8, "rugs", brief="the rug site", at=1.0)
                 madeM = [m for m, _ in api9]
+                del api9[:]
+                resU = dm9.ensure_orch_channel(r8, "rugs-updates", brief="x", at=1.0)
+                madeU = [m for m, _ in api9]; regU = orch_lookup(load_orchs(), r8, "rugs-updates")
                 o9 = load_orchs(); o9["COLDX"] = {"target": "myrepo", "alias": "old", "name": "myrepo-old-aaaa", "created": 1.0, "seen": 1.0, "archived": False}
                 save_orchs(o9); del api9[:]; dm9.orch_sweep(); aftM = load_orchs()
                 archM = [kw.get("channel") for m, kw in api9 if m == "conversations.archive"]
             finally:
                 os.remove(mk9); globals()["find_channel"] = find9
-                o9 = load_orchs(); o9.pop("CRUG", None); o9.pop("COLDX", None); save_orchs(o9)
+                save_orchs(was9)   # the table as the cases above left it, whatever a regression here wrote over it
             check("orch channel: a member workspace's orch gets #<h>--<alias> (one of its own channels, so the member socket "
                   "serves it) and an existing one is joined, never created; the janitor leaves it while it archives an "
                   "ordinary orch idle as long",
@@ -7119,6 +7278,10 @@ def run_selfcheck():
                   and member_chat_ok(r8, resM.get("name")) and "conversations.create" not in madeM and "conversations.join" in madeM
                   and "conversations.setPurpose" not in madeM
                   and not aftM["CRUG"]["archived"] and "COLDX" in archM and "CRUG" not in archM)
+            check("orch channel: a member orch's alias ending in -updates is refused, since #<h>--<x>-updates reads as the "
+                  "updates lane of #<h>--<x>: no channel is made or joined and orchs.json records nothing",
+                  resU.get("ok") is False and "updates lane" in resU.get("error", "")
+                  and not {"conversations.create", "conversations.join"} & set(madeU) and not regU)
             calls9 = []
             def api_ec(m, tok, **kw):
                 calls9.append((m, kw))
@@ -13466,6 +13629,74 @@ def run_selfcheck():
             os.environ["CC_DISPATCH_DOOR_ROOT"] = envWasK
         _door.update(root=None, t=None, map={}, last={}, logged=set())
         shutil.rmtree(rootK, ignore_errors=True)
+
+    # ---- THE OWNER SOCKET'S history AND thread: dispatch's phone secretary reads them aloud, and a caller's speech
+    # picks the channel, so only a public C channel answers (perms, 2026-10-20). Each refused kind is asked for by id
+    # and by the #name that resolves to it; resolve_channel lists private channels too, so the info is what refuses.
+    dmPR = Daemon(use_slack=False); dmPR.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "MAIL_CHANNEL": "#inbox"}
+    infoPR = {"CPUB": {"is_channel": True, "is_private": False, "name": "general"},
+              "CPRIV": {"is_channel": True, "is_private": True, "name": "secret"},
+              "CGRP": {"is_channel": False, "is_group": True, "is_private": True, "name": "oldsecret"},
+              "CIM": {"is_im": True, "is_private": True},
+              "CMPIM": {"is_mpim": True, "is_channel": False, "is_private": True, "name": "mpdm-a--b-1"},
+              "CMAIL": {"is_channel": True, "is_private": False, "name": "inbox"},
+              "CBARE": {"is_channel": True, "name": "unsaid"}}            # says neither way: not public
+    namesPR = {"general": "CPUB", "secret": "CPRIV", "oldsecret": "CGRP", "dm": "CIM", "mpdm-a--b-1": "CMPIM", "inbox": "CMAIL", "unsaid": "CBARE"}
+    callsPR = []
+    def api_pr(method, token, **kw):
+        callsPR.append((method, kw.get("channel")))
+        if method == "conversations.info":
+            if kw["channel"] not in infoPR:
+                raise RuntimeError("channel_not_found")
+            return {"channel": dict(infoPR[kw["channel"]], id=kw["channel"])}
+        if method == "conversations.history":
+            return {"messages": [{"ts": "2.0", "text": "second", "bot_id": "B1", "username": "bot"},
+                                 {"ts": "1.0", "text": "first", "bot_id": "B1", "username": "bot"}]}
+        if method == "conversations.replies":
+            return {"messages": [{"ts": "1.0", "text": "root", "bot_id": "B1", "username": "bot"},
+                                 {"ts": "1.1", "text": "answer", "bot_id": "B1", "username": "bot"}]}
+        raise RuntimeError(f"unexpected {method}")
+    def pr_req(obj, member=None):
+        a, b = socket.socketpair(); a.sendall((json.dumps(obj) + "\n").encode()); a.shutdown(socket.SHUT_WR)
+        was = dmPR.peer_of; dmPR.peer_of = lambda c: (os.getpid(), os.getuid(), f"{DEV}/{CTL}")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                dmPR.handle_conn(b, member)
+        finally:
+            dmPR.peer_of = was
+        out = b""; a.settimeout(2)
+        with contextlib.suppress(Exception):
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                out += d
+        a.close()
+        return json.loads(out.splitlines()[0]) if out.strip() else {}
+    real_pr = {k: globals()[k] for k in ("api", "resolve_channel")}
+    try:
+        globals().update(api=api_pr, resolve_channel=lambda cfg, name: namesPR.get(name))
+        r_pr_id = pr_req({"history": "CPUB", "n": 5}); r_pr_name = pr_req({"history": "#general"})
+        r_pr_thr = pr_req({"thread": "#general", "ts": "1.0"}); r_pr_thr_bad = pr_req({"thread": "CPUB", "ts": "x"})
+        reads_ok = [m for m, c in callsPR if m in ("conversations.history", "conversations.replies")]
+        callsPR.clear()
+        refused = {(v, q): pr_req({v: q, "ts": "1.0"}) for v in ("history", "thread")
+                   for q in ("CPRIV", "#secret", "CGRP", "#oldsecret", "CIM", "#dm", "CMPIM", "#mpdm-a--b-1",
+                             "CMAIL", "#inbox", "CBARE", "#unsaid", "CGONE", "#nobody",
+                             "D0ABC", "U0ABC", "G0ABC", "general", "", "C1; x")}
+        reads_refused = [m for m, c in callsPR if m in ("conversations.history", "conversations.replies")]
+        r_pr_member = pr_req({"history": "CPUB"}, member="alice")   # a member socket still has only its own channels
+    finally:
+        globals().update(real_pr)
+    check("OWNER socket: history and thread read a public C channel, by id or by #name, oldest first",
+          r_pr_id.get("ok") and r_pr_id.get("text", "").index("first") < r_pr_id["text"].index("second")
+          and r_pr_name.get("ok") and r_pr_thr.get("ok") and "answer" in r_pr_thr.get("text", "")
+          and r_pr_thr_bad.get("ok") is False and reads_ok == ["conversations.history", "conversations.history", "conversations.replies"])
+    check("OWNER socket: a private channel, a legacy group, an IM, an MPIM, the mail channel, one Slack does not call public, "
+          "one Slack cannot find, and a D/U/G id or bare name are each refused by id and by #name, and nothing is read",
+          all(r.get("ok") is False and r.get("error") for r in refused.values()) and reads_refused == []
+          and "mail channel" in refused[("history", "#inbox")]["error"] and "not a public channel" in refused[("thread", "#secret")]["error"]
+          and r_pr_member.get("ok") is False)
 
     shutil.rmtree(scratch_dev, ignore_errors=True); globals()["DEV"] = real_dev
     leaked = sorted(n for n in (set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()) - dev_before

@@ -3163,6 +3163,29 @@ class Review(Fixture):
             self.assertEqual(f.read(), "untouched\n")               # nothing appended through the link
         self.assertTrue(os.path.islink(J.attic_path("demo", 1)))
 
+    def test_a_fifo_at_the_attic_path_never_hangs_the_removal_and_a_loose_mode_is_tightened(self):
+        # read of #1315: O_NONBLOCK and a plain-file check, so a FIFO is refused at once and the refusal is logged
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        os.makedirs(os.path.dirname(J.attic_path("demo", 1)), exist_ok=True)
+        os.mkfifo(J.attic_path("demo", 1))
+        J.remove(self.job())
+        self.assertIsNone(self.job())
+        with open(E.log_path()) as f:
+            self.assertIn(f"attic demo#1 {J.attic_path('demo', 1)}: not written: errno", f.read())
+        os.unlink(J.attic_path("demo", 1))
+        with open(J.attic_path("demo", 1), "w"):
+            pass
+        os.chmod(J.attic_path("demo", 1), 0o644)
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        J.remove(self.job())
+        self.assertEqual(stat.S_IMODE(os.stat(J.attic_path("demo", 1)).st_mode), 0o600)
+
     def test_no_read_count_turns_a_handback_into_a_query(self):
         # owner 10-16: the second handback went to planning as a query and stalled; every one goes back to the seat
         self.pr(1, {"a/x": "n\n"})

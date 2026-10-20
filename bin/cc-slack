@@ -1482,14 +1482,55 @@ MAX_UPLOAD = 25 * 1024 * 1024   # renders and screenshots, not archives
 FILE_INLINE = 50 * 1024 * 1024  # an inbound attachment bigger than this downloads off the event path (fetch_later)
 DISK_FLOOR = 2 * 1024 ** 3       # a download that would leave less free than this on its filesystem is refused
 
+DISK_LOCK = threading.Lock()
+DISK_HELD = collections.Counter()   # st_dev -> bytes promised to downloads still running there and not yet written
+
 class DiskFull(OSError):
     pass
 
-def disk_room(d, size):
-    """Raises DiskFull when `size` more bytes in directory d would leave under DISK_FLOOR free there."""
-    left = shutil.disk_usage(d).free - size
-    if left < DISK_FLOOR:
-        raise DiskFull(f"not enough disk: {size / 1e6:.0f} MB would leave {max(left, 0) / 1e9:.1f} GB free, under the 2 GB floor")
+def disk_room(d, size, hold=False):
+    """Raises DiskFull when `size` more bytes in directory d (a path or a dir fd) would leave under DISK_FLOOR free
+    there. What other downloads on that filesystem were promised and have not written yet counts as used, because two
+    big files each checked alone could both pass and together fill the disk (perms' read of #1504, 10-20). With
+    hold=True the size is promised to the caller under the same lock, and it gives the bytes back with disk_release
+    as they land; returns the filesystem's st_dev for that."""
+    dev = os.stat(d).st_dev
+    with DISK_LOCK:
+        left = shutil.disk_usage(d).free - DISK_HELD[dev] - size
+        if left < DISK_FLOOR:
+            raise DiskFull(f"not enough disk: {size / 1e6:.0f} MB would leave {max(left, 0) / 1e9:.1f} GB free, under the 2 GB floor")
+        if hold:
+            DISK_HELD[dev] += size
+    return dev
+
+def disk_release(dev, n):
+    with DISK_LOCK:
+        DISK_HELD[dev] -= n
+
+class SlackAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies every header, Authorization too, onto wherever a redirect points, so a file download that Slack
+    (or anything between) redirected off Slack would hand that host the bot token (perms' read of #1504, 10-20). The
+    header is dropped on any hop that is not https on slack.com, and a later hop back to Slack doesn't get it back."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        u = urllib.parse.urlparse(newurl)
+        host = u.hostname or ""
+        if new is not None and not (u.scheme == "https" and (host == "slack.com" or host.endswith(".slack.com"))):
+            new.remove_header("Authorization")
+        return new
+
+SLACK_OPENER = urllib.request.build_opener(SlackAuthRedirect)
+
+def slack_open(req, timeout):
+    """urlopen for a request that carries the bot token, through SlackAuthRedirect."""
+    return SLACK_OPENER.open(req, timeout=timeout)
+
+def open_dir_nofollow(d):
+    """d, made if missing, as a directory fd; a link at d itself is refused (ELOOP). A member's sandbox can swap its
+    files dir, or a name in it, for a link, so the daemon writes there by name under this fd and never through a path
+    a link could send somewhere else the owner can write (perms' read of #1630, 10-20)."""
+    os.makedirs(d, exist_ok=True)
+    return os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
 FILE_ID_RE = re.compile(r"(?<![A-Za-z0-9])F(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,12}(?![A-Za-z0-9])")   # a Slack file id, F0C8J66ST5H
 
@@ -4715,7 +4756,21 @@ class Daemon:
             time.sleep(30)
 
     def bind_member_sock(self, h):
-        d = member_dir(h); os.makedirs(f"{d}/files", exist_ok=True); open(f"{d}/enabled", "a").close()
+        d = member_dir(h); os.makedirs(f"{d}/files", exist_ok=True)
+        # `enabled` sits in the member's sandbox, so a link or FIFO planted there is replaced, never written through
+        dfd = open_dir_nofollow(d)
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+            try:
+                fd = os.open("enabled", flags, 0o644, dir_fd=dfd)
+            except OSError:
+                if stat.S_ISREG(os.lstat("enabled", dir_fd=dfd).st_mode):
+                    raise
+                os.unlink("enabled", dir_fd=dfd)
+                fd = os.open("enabled", flags | os.O_EXCL, 0o644, dir_fd=dfd)
+            os.close(fd)
+        finally:
+            os.close(dfd)
         path = f"{d}/sock"
         if os.path.exists(path):
             os.unlink(path)
@@ -5011,6 +5066,8 @@ class Daemon:
     MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject", "channels")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover")
 
+    PUBLIC_READS = ("history", "thread")   # the member verbs the owner socket serves too, on a public channel only (public_read)
+
     def verbs_of(self, first):
         """Every recognised verb key in a request. Exactly one is allowed, because exactly one is authorised: else
         `{"hello": "alice", "reply": "D0…"}` could pass the hello check and post the reply."""
@@ -5071,9 +5128,58 @@ class Daemon:
                 ws = member_tree(cwd)                        # …and the `.cc/track` it was read from is the member's own file
                 if ws and workspace_of(str(first["hello"])) != ws:
                     return f"hello {first['hello']} from inside {ws}'s tree, which names no session but {ws}'s"
-            if verb in self.MEMBER_VERBS:
+            if verb in self.MEMBER_VERBS and verb not in self.PUBLIC_READS:
                 return f"{verb} is a member-socket verb"
         return ""
+
+    def public_channel(self, s):
+        """(id, "") when `s` names a public C channel of this workspace, else (None, why). Dispatch's phone secretary
+        reads what the owner socket's history and thread return aloud, and a caller's speech picks the channel, so
+        this is judged by the id Slack describes, never by the name sent. A #name goes through resolve_channel, which
+        lists private channels too, and the conversations.info below is what refuses those: Slack names are unique
+        across public and private, so a refused name has no public channel to fall back on. Anything Slack will not
+        describe, or describes without saying it is public, is refused too."""
+        tok = self.cfg.get("SLACK_BOT_TOKEN")
+        if not tok:
+            return None, "no SLACK_BOT_TOKEN"
+        s = str(s or "").strip()
+        if s.startswith("#"):
+            if ws_of_name(s[1:]):   # another workspace's name would resolve with its own token: not a channel this reads
+                return None, f"{s} is not a channel of this workspace"
+            cid = resolve_channel(self.cfg, s[1:])
+            if not cid:
+                return None, f"{s} is not a channel the bot is in"
+        elif re.fullmatch(r"C[A-Z0-9]{2,}", s):
+            cid = s
+        else:
+            return None, f"{s[:40] or 'that'} is not a #name or a C… channel id"
+        try:
+            ch = api("conversations.info", tok, channel=cid)["channel"]
+        except Exception as e:
+            return None, f"{s}: cannot read it ({str(e)[:80]})"
+        if (not cid.startswith("C") or ch.get("id") != cid or ch.get("is_private") is not False or not ch.get("is_channel")
+                or ch.get("is_im") or ch.get("is_mpim") or ch.get("is_group")):
+            return None, f"{s} is not a public channel"
+        mail = (self.cfg.get("MAIL_CHANNEL") or "").strip().lstrip("#").lower()
+        if mail and mail in (cid.lower(), (ch.get("name") or "").lower()):
+            return None, f"{s} is the mail channel"
+        return cid, ""
+
+    def public_read(self, first, verb):
+        """`{"history": chat, "n":…}` or `{"thread": chat, "ts":…, "n":…}` on the owner socket: the member verbs' reads,
+        with the same caps, of a public channel only (public_channel)."""
+        cid, why = self.public_channel(first[verb])
+        if not cid:
+            log(f"owner {verb}: refused {str(first[verb])[:40]} — {why}")
+            return {"ok": False, "error": why}
+        n = str(first.get("n") or "")
+        if verb == "history":
+            msgs = api("conversations.history", self.cfg["SLACK_BOT_TOKEN"], channel=cid, limit=str(clamp_n(n, 20, 100)))["messages"]
+            return {"ok": True, "text": fmt_history(self.cfg, list(reversed(msgs)))}
+        ts = str(first.get("ts") or "")
+        if not re.fullmatch(r"[0-9]+\.[0-9]+", ts):
+            return {"ok": False, "error": "thread needs the ts of its first message"}
+        return {"ok": True, "text": fmt_history(self.cfg, replies_tail(self.cfg, cid, ts, clamp_n(n, 50, 50)))}
 
     def member_mirrors(self, h):
         """{name: id} of the mirror channels routed to workspace `h` (member_chat by id: a channel of a Slack workspace
@@ -5509,6 +5615,12 @@ class Daemon:
                     res = self.member_verb(member, first, verb)
                 except Exception as e:
                     log(f"member {member} {verb}: {e!r}"); res = {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:200]}"}
+                c.sendall((json.dumps(res) + "\n").encode()); return
+            if verb in self.PUBLIC_READS:     # the owner socket's reads (refuse_reason sent a member's to member_verb above)
+                try:
+                    res = self.public_read(first, verb)
+                except Exception as e:
+                    log(f"owner {verb}: {e!r}"); res = {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:200]}"}
                 c.sendall((json.dumps(res) + "\n").encode()); return
             if verb == "hello":
                 target, alias = first["hello"], first.get("alias") or None
@@ -6046,6 +6158,10 @@ class Daemon:
         pchat, pname = self.orch_parent(target, parent_alias)
         if workspace_of(target) == target:   # a MEMBER orch: #<h>--<alias>, the name ws_of_name puts in the member's own Slack
             name = f"{target}--{alias}"       # workspace (its token, never the owner's); one that exists is adopted, not remade
+            # An alias ending in -updates names the updates lane of #<h>--<rest>, a channel the box reads as another
+            # project's second lane, so adopting it would seat the orch in that view (perms' read of #1331, 10-20).
+            if main_lane(name):
+                return {"ok": False, "error": f"`{name}` reads as the updates lane of #{main_lane(name)}"}
         else:
             name = orch_chan_name(pname or target.replace("/", "--"), alias, at, bool(pchat and pchat in orchs))
         try:
@@ -7216,19 +7332,23 @@ class Daemon:
                 continue
             try:
                 d = f"{member_dir(ws)}/files"
-                os.makedirs(d, exist_ok=True)
-                dst = os.path.join(d, f"{msg['id']}-{os.path.basename(src)}")
+                name = f"{msg['id']}-{os.path.basename(src)}"
+                dst = os.path.join(d, name)
+                dfd = open_dir_nofollow(d)   # the files dir itself can be swapped for a link, not just the name
                 try:
-                    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                except FileExistsError:
-                    if os.path.islink(dst) or not os.path.isfile(dst):
-                        log(f"mail {msg['id']}: {os.path.basename(dst)} in {ws}'s files is not a file we wrote — "
-                            f"not copied, and nothing written through it")
+                    try:
+                        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+                    except FileExistsError:
+                        if not stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
+                            log(f"mail {msg['id']}: {name} in {ws}'s files is not a file we wrote — "
+                                f"not copied, and nothing written through it")
+                            continue
+                        out.append((a, member_files_inside(ws, dst)))   # the same bytes are already there
                         continue
-                    out.append((a, member_files_inside(ws, dst)))   # the same bytes are already there
-                    continue
-                with os.fdopen(fd, "wb") as w, open(src, "rb") as r:   # fdopen first: it owns fd from here on
-                    shutil.copyfileobj(r, w)       # bytes, copied. Not opened, not decoded, not run
+                    with os.fdopen(fd, "wb") as w, open(src, "rb") as r:   # fdopen first: it owns fd from here on
+                        shutil.copyfileobj(r, w)       # bytes, copied. Not opened, not decoded, not run
+                finally:
+                    os.close(dfd)
                 out.append((a, member_files_inside(ws, dst)))
             except OSError as e:
                 log(f"mail {msg['id']}: could not copy an attachment into {ws}: {e!r}")
@@ -7243,20 +7363,24 @@ class Daemon:
         if not ws:
             return f"{MAIL_DIR}/inbox/{msg['id']}/message.json"
         d = f"{member_dir(ws)}/files"
-        dst = os.path.join(d, f"{msg['id']}.text.txt")
+        name = f"{msg['id']}.text.txt"
+        dst = os.path.join(d, name)
         text = "Subject: %s\n\n%s\n" % (msg.get("subject") or "(no subject)", mail_router().body_text(msg).strip())
         try:
-            os.makedirs(d, exist_ok=True)
+            dfd = open_dir_nofollow(d)   # the files dir itself can be swapped for a link, not just the name
             try:
-                fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            except FileExistsError:
-                if os.path.islink(dst) or not os.path.isfile(dst):
-                    log(f"mail {msg['id']}: {os.path.basename(dst)} in {ws}'s files is not a file we wrote — "
-                        f"the text was not saved")
-                    return ""
-                return member_files_inside(ws, dst)
-            with os.fdopen(fd, "w", encoding="utf-8") as w:
-                w.write(text)
+                try:
+                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+                except FileExistsError:
+                    if not stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
+                        log(f"mail {msg['id']}: {name} in {ws}'s files is not a file we wrote — "
+                            f"the text was not saved")
+                        return ""
+                    return member_files_inside(ws, dst)
+                with os.fdopen(fd, "w", encoding="utf-8") as w:
+                    w.write(text)
+            finally:
+                os.close(dfd)
             return member_files_inside(ws, dst)
         except OSError as e:
             log(f"mail {msg['id']}: could not save the text into {ws}: {e!r}")
@@ -7559,8 +7683,7 @@ class Daemon:
     def save_file(self, f, url, path):
         """Streams one attachment to `path` in 1 MB chunks, with no size cap: refused (DiskFull) when it would leave
         under DISK_FLOOR free on that filesystem. A symlink at the dir or the name is refused (OSError), never followed.
-        A failed download leaves no partial file behind."""
-        disk_room(os.path.dirname(path), int(f.get("size") or 0))
+        A failed download leaves no partial file behind. Its size stays reserved (disk_room) until it has landed."""
         tok = self.cfg.get("SLACK_BOT_TOKEN")
         ftok = WS["extra"][f["_ws"]]["bot"] if f.get("_ws") in WS["extra"] else tok   # ws_ingress marks another workspace's files
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ftok}"})
@@ -7569,22 +7692,28 @@ class Daemon:
         dfd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         name = os.path.basename(path)
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            owed = int(f.get("size") or 0)
+            dev = disk_room(dfd, owed, hold=True)
             try:
-                fd = os.open(name, flags, 0o600, dir_fd=dfd)
-            except FileExistsError:   # the same file fetched twice in one second: replace a plain file, refuse a link
-                if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
-                    raise
-                os.unlink(name, dir_fd=dfd)
-                fd = os.open(name, flags, 0o600, dir_fd=dfd)
-            try:
-                with os.fdopen(fd, "wb") as w, urllib.request.urlopen(req, timeout=60) as r:
-                    while chunk := r.read(1 << 20):
-                        w.write(chunk)
-            except BaseException:
-                with contextlib.suppress(OSError):
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                try:
+                    fd = os.open(name, flags, 0o600, dir_fd=dfd)
+                except FileExistsError:   # the same file fetched twice in one second: replace a plain file, refuse a link
+                    if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+                        raise
                     os.unlink(name, dir_fd=dfd)
-                raise
+                    fd = os.open(name, flags, 0o600, dir_fd=dfd)
+                try:
+                    with os.fdopen(fd, "wb") as w, slack_open(req, 60) as r:
+                        while chunk := r.read(1 << 20):
+                            w.write(chunk)
+                            n = min(len(chunk), owed); owed -= n; disk_release(dev, n)   # on disk now: free space counts it
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name, dir_fd=dfd)
+                    raise
+            finally:
+                disk_release(dev, owed)
         finally:
             os.close(dfd)
 

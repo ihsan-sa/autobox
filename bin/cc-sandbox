@@ -626,7 +626,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   shared_docs_bind   # the docs a planning seat reads, ro, each at its own name (SHARED_DOCS): ~/CLAUDE.md and the guides, his user memory and its imports
-  shared_lib_bind   # …and the knowledge base and the document register, whole and ro, as a seat reads them (shared_lib_bind)
+  shared_lib_bind "$1"   # …and the knowledge base and the document register, whole and ro, as a seat reads them (shared_lib_bind)
   # NO RESOLVER: /etc/resolv.conf points at /run/systemd/resolve, which is not bound. The network namespace has no route
   # off the box anyway, and a resolver socket reached from in here would be a DNS channel out of it; names are resolved
   # by cc-egress, on the host, against its list (NETWORK in the header).
@@ -980,8 +980,15 @@ shared_lib_bind(){   # THE KNOWLEDGE BASE AND THE DOCUMENT REGISTER AS A PLANNIN
   # whole at its own name, so `cc-docs find` reads it with its default root; filing stays the loop's, on the host, after
   # the iteration. Both are written by the host alone: a symlink at either name binds nothing, with a line, and the
   # launch goes on rather than every worker stopping over it. Pinned like every source (pinq).
-  local l="$H/.cc/library" d="$H/.cc/documents"
-  if [ -L "$l" ] || [ -L "$l/owner" ]; then echo "cc-sandbox: a symlink sits under ~/.cc/library, where only the host writes — the knowledge base is not bound" >&2
+  # [$1 the repo, for a worker] A WORKER ON A MEMBER-FACING REPO writes where a member reads, so it gets the owner's
+  # records alone (~/.cc/library/shared, cc-lib build_shared) at ~/.cc/library/workspace, and the aggregate is absent:
+  # no other member's record is in reach to be quoted, which a prompt line alone cannot promise. Member-facing is the
+  # repo's marker or the host's ~/.cc/members/<repo>, either one, so removing the marker in the checkout does not widen it.
+  local l="$H/.cc/library" d="$H/.cc/documents" src=owner
+  [ -n "${1:-}" ] && { [ -e "$H/dev/$1/.cc/member-facing" ] || [ -e "$H/.cc/members/$1" ]; } && src=shared
+  if [ -L "$l" ] || [ -L "$l/$src" ]; then echo "cc-sandbox: a symlink sits under ~/.cc/library, where only the host writes — the knowledge base is not bound" >&2
+  elif [ "$src" = shared ]; then   # not built yet: an empty workspace dir, so cc-lib reads an empty scope and builds nothing of its own in here
+    if [ -d "$l/shared" ]; then pinq --ro-bind "$l/shared" "$l/workspace"; else B+=(--dir "$l/workspace"); fi
   elif [ -d "$l/owner" ]; then pinq --ro-bind "$l/owner"; pinq --ro-bind "$l/owner" "$l/workspace"; fi
   if [ -L "$d" ]; then echo "cc-sandbox: ~/.cc/documents is a symlink, where only the host writes — the document register is not bound" >&2
   elif [ -d "$d" ]; then pinq --ro-bind "$d"; fi; :; }
@@ -3791,6 +3798,24 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     "1/0000000000000000000000000000000000000001/$(git -C "$dev" rev-parse refs/heads/track/t)"
   grep -q STARTED <<<"$out2" || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out2:-nothing at all}"   # why a launch never started; FAIL in the line so a gate log, which keeps only FAIL and ✗ lines, keeps it
   rm -rf "$rsd".unfolded.*
+  # A WORKER ON A MEMBER-FACING REPO asks the owner's records alone (shared_lib_bind, cc-lib build_shared): a member
+  # workspace's board note, planted and indexed here, answers a worker on an owner repo and not one on a repo a member
+  # talks to, which still gets the owner's own record. The fixture member is removed and the index rebuilt after.
+  # It sits after the fold cases because each launch folds the last run onto track/t (build), which they read.
+  # The listing leaves out tickets.log: the asks' own tickets, written in the worker's tmpfs, not the library's.
+  local wb="sbxwsb$$" mq mfa mfb   # its own names: $out still holds the probe the cases below read through `g`
+  mkdir -p "$H/dev/$wb/.cc" "$dev/.cc" && : > "$H/dev/$wb/.cc/member-workspace"
+  printf '{"repo":"%s","path":"%s","tracks":{"t1":{"title":"row","kind":"track","status":"running","notes":[{"ts":"2026-10-20T00:00:00Z","msg":"sbxmemberbnote"}]}},"log":[]}\n' \
+    "$wb" "$H/dev/$wb" > "$H/.cc/boards/$wb.json"
+  python3 "$(dirname "$SELF")/cc-lib" index >/dev/null 2>&1
+  mq='echo memask=$(~/bin/cc-lib ask sbxmemberbnote 2>&1 | grep -q "ws='"$wb"'" && echo 1 || echo 0)/$(~/bin/cc-lib ask sbxsharedclaudemd 2>&1 | grep -c "^OUTCOME answered")/$(ls -A ~/.cc/library | grep -vx tickets.log | tr "\n" " ")'
+  mfa=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c "$mq" 2>&1 | sed -n 's/^memask=//p')
+  : > "$dev/.cc/member-facing"
+  mfb=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c "$mq" 2>&1 | sed -n 's/^memask=//p')
+  rm -f "$dev/.cc/member-facing" "$H/.cc/boards/$wb.json"; rmdir "$dev/.cc" 2>/dev/null; rm -rf "${H:?}/dev/$wb" "${H:?}/.cc/members/$wb"
+  python3 "$(dirname "$SELF")/cc-lib" index >/dev/null 2>&1
+  t 'a worker on an owner repo finds a member workspace'"'"'s record in the aggregate, as a seat does' "$mfa" '1/1/owner workspace'
+  t '…a worker on a member-facing repo gets no member'"'"'s record, the owner'"'"'s own still answers, and the aggregate is absent' "$mfb" '0/1/workspace'
   # THE OBJECT STORE: WHAT IS CLOSED AND WHAT IS ACCEPTED, each read against the other rather than one of them claimed.
   # objects/ is rw because every commit a worker makes writes one, so a LOOSE object it can delete and this says so.
   # objects/pack is ro on top, so the packed history cannot be deleted and the directory cannot be walked away from —

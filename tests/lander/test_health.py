@@ -314,6 +314,18 @@ class At(Case):
         C.write_json(HL.path("demo"), rec)
         self.assertEqual(HL.at("demo", tree), {})
 
+    def test_red_holds_a_check_only_while_its_record_is_fresh(self):
+        # read of #1309: a stale red must not put a PR first, as a stale green skips no base run
+        self.go(TIP1, ["app/x.py"], red={"app"})
+        stamp = HL.load("demo")["checks"]["app"]["at"]
+        t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        self.assertEqual(set(HL.red("demo", now=t + datetime.timedelta(seconds=HL.FRESH - 60))), {"app"})
+        self.assertEqual(HL.red("demo", now=t + datetime.timedelta(seconds=HL.FRESH)), {})
+        rec = HL.load("demo")
+        rec["checks"]["app"]["at"] = "not a stamp"
+        C.write_json(HL.path("demo"), rec)
+        self.assertEqual(HL.red("demo"), {})
+
 
 class Judge(unittest.TestCase):
     def setUp(self):

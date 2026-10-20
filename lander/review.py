@@ -88,7 +88,7 @@ Otherwise the lander buys one:
     carries no structured_output, though the turn already called StructuredOutput. The stream carries that call,
     so a wall with an answer in it is that answer (streamed()); only a wall without one (a refusal, a text-only
     turn) counts as a wall. A call counts as an answer only when it is whole (its turn stopped on tool_use, or the
-    CLI accepted it; never max_tokens), the CLI did not reject it, and it fits SCHEMA.
+    CLI accepted it; never a CUT stop), the CLI did not reject it, and it fits SCHEMA.
     A claude read runs with DISABLE_PROMPT_CACHING=1: the read is one API call, and the CLI otherwise writes the
     whole prompt to a one-hour cache at twice the input price for a read nothing makes again (#960 at 3447d443,
     10-07: $3.02 of a $3.49 wall was that write).
@@ -116,11 +116,12 @@ blockers numbered; it answers resolved/unresolved/moot and new blockers on added
 A prior blocker the read lists as moot (the change makes it no longer apply, or it lies outside the diff and is
 already true) holds nothing and counts as resolved; one it lists as both moot and unresolved stays unresolved, and an
 unresolved one is a HANDBACK whatever the verdict word says. A prior [security] blocker is never moot (pinned()): it
-stays unresolved, and the HANDBACK stands, until a read resolves it. "Already true" needs evidence in the read's
-inputs, not the author's word (delta.md says so; no code can check it). Each prior blocker left unresolved is
-carried into the verdict as a blocking row with the prior row's own text and its kind tag in front,
-"[security] still open from the earlier read: …" (carried()), whatever the reader's verdict word and whether or
-not it named new blockers, so pinned() finds the [security] row again in the round after, and every round.
+stays unresolved, named or left out of every list, and the HANDBACK stands, until a read resolves it. "Already
+true" needs evidence in the read's inputs, not the author's word (delta.md says so; no code can check it). Each
+prior blocker left unresolved is carried into the verdict as a blocking row with the prior row's own text and its
+kind tag in front, "[security] still open from the earlier read: …" (carried()), whatever the reader's verdict
+word and whether or not it named new blockers, so pinned() finds the [security] row again in the round after, and
+every round.
 
 A SECURITY PATH needs perms' security read (perms, after #1265: a tunnel unit and the Cloudflare door merged with
 no security read, and the read after found a HIGH). When the plan names a changed file on the base's
@@ -347,8 +348,13 @@ PERMS_READS = "security-reads.json"
 PERMS_READS_LOCK = ".security-reads.lock"   # grant()'s flock, beside the ledger
 
 
+def repo_name(repo):
+    """'owner/demo' and 'demo' are one repo: a ledger entry may name either (Opus read of #1268)."""
+    return str(repo).rsplit("/", 1)[-1]
+
+
 def perms_reads_path(repo):
-    return os.path.join(PERMS_STATE, str(repo).rsplit("/", 1)[-1], "perms", PERMS_READS)
+    return os.path.join(PERMS_STATE, repo_name(repo), "perms", PERMS_READS)
 
 
 def own_json(path):
@@ -392,7 +398,7 @@ def newest_reads(entries, repo, pr):
     records after its LAND at one head takes the LAND back (perms' follow-up to its LAND on #1564)."""
     out = {}
     for e in entries:
-        if e.get("repo") == repo and e.get("pr") == pr and isinstance(e.get("head"), str):
+        if repo_name(e.get("repo")) == repo_name(repo) and e.get("pr") == pr and isinstance(e.get("head"), str):
             out.pop(e["head"], None)
             out[e["head"]] = e
     return out
@@ -468,7 +474,7 @@ def carried_from(job):
     olds = []
     for e in entries:   # every entry, in the order perms appended them, not only each head's newest
         h = e.get("head")
-        if e.get("repo") != job.repo or e.get("pr") != job.pr or not isinstance(h, str):
+        if repo_name(e.get("repo")) != repo_name(job.repo) or e.get("pr") != job.pr or not isinstance(h, str):
             continue
         if e.get("verdict", T.LAND) != T.LAND:
             olds = []
@@ -591,16 +597,27 @@ def pinned(v, prior):
     """A delta read's Verdict, with every prior blocker it called moot that was a [security] finding put back as
     unresolved. The brief: "keep a security reader's HANDBACK standing until a security LAND" — so a read must
     resolve it; a reader's word that it no longer applies does not. `prior` is the prior verdict's blocking rows,
-    numbered from 1 as the read saw them."""
+    numbered from 1 as the read saw them. One the read leaves out of every list is pinned too (Opus read of #1227:
+    else a LAND passes it by)."""
     sec = {str(i) for i, b in enumerate(prior, 1) if "[security]" in b}
-    back = [m for m in (v.extra or {}).get("moot") or [] if m in sec]
+    moot = (v.extra or {}).get("moot") or []
+    done = {row_number(r) for r in v.resolved if r not in moot}
+    back = sorted(sec - done - {row_number(u) for u in v.unresolved}, key=int)
     if not back:
         return v
-    v.extra["moot"] = [m for m in v.extra["moot"] if m not in back]
-    v.resolved = [r for r in v.resolved if r not in back]
+    if moot:
+        v.extra["moot"] = [m for m in moot if row_number(m) not in back]
+    v.resolved = [r for r in v.resolved if row_number(r) not in back]
     v.unresolved = v.unresolved + back
     v.verdict = T.HANDBACK_VERDICT   # carried() writes each one's row, its [security] tag in front
     return v
+
+
+def row_number(name):
+    """A prior row's number as a read names it ('2', '#2', 'blocker 2'), or None (Opus read of #1227: a bare match
+    lost '#2' its [security] tag)."""
+    m = re.search(r"\d+", str(name))
+    return m.group(0) if m else None
 
 
 STILL_OPEN = "still open from the earlier read: "
@@ -612,20 +629,20 @@ def carried(v, prior):
     the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
     still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
     as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
-    prior row's number is carried as the reader wrote it. `prior` is the prior verdict's blocking rows, as pinned()
-    takes them. Running it twice on one verdict adds nothing."""
+    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. `prior` is the
+    prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
     rows = list(prior or [])
     out = []
     for x in v.unresolved:
-        n = x.strip().rstrip(".")
-        row = rows[int(n) - 1] if n.isdigit() and 1 <= int(n) <= len(rows) else x
+        n = row_number(x)
+        row = rows[int(n) - 1] if n and 1 <= int(n) <= len(rows) else x
         m = KIND_TAG.match(row)
         tag, row = (m.group(0), row[m.end():]) if m else ("", row)
         row = row[len(STILL_OPEN):] if row.startswith(STILL_OPEN) else row
         out.append(f"{tag}{STILL_OPEN}{row}")
     if out:
         v.verdict = T.HANDBACK_VERDICT
-        v.blocking = (out + [b for b in v.blocking if b not in out])[:10]
+        v.blocking = out + [b for b in v.blocking if b not in out]   # no cap: a cut would drop a [security] pin
     return v
 
 
@@ -1032,6 +1049,9 @@ def cli_spoke(e):
                 or e.get("error"))
 
 
+CUT = ("max_tokens", "model_context_window_exceeded")   # stop reasons that end a turn before the model did
+
+
 def streamed(out):
     """claude -p --output-format stream-json --verbose: one JSON event a line, the result last, stderr after it ->
     (the result event, or {}, its `result` the CLI's own words or none | the input of the StructuredOutput call that
@@ -1047,12 +1067,11 @@ def streamed(out):
     model's last event (a limit hit mid-read, after turns that cost money); otherwise it is dropped.
     A call is an answer only when its turn ended to make it (stop_reason tool_use, or null with a tool_result from
     the CLI accepting it, since stream-json leaves every assistant event's stop_reason null: a max_tokens stop may
-    have cut the input short), no stop for its turn said max_tokens (the result event's stop_reason is the last
-    turn's, and the CLI may accept a cut object that still fits), the CLI did not reject it (a tool_result with
-    is_error), and it is SCHEMA's object (#824, #772: on a wall the CLI may never have checked it, and parse() reads
-    a missing `blocking` as none). Any
-    accepted call that says HANDBACK outweighs a LAND in the same stream: the answer is the last whole HANDBACK, or
-    none."""
+    have cut the input short), no stop for its turn was a cut (CUT: the result event's stop_reason is the last
+    turn's, and the CLI may accept a cut object that still fits, so a cut result's own structured_output is dropped
+    too), the CLI did not reject it (a tool_result with is_error), and it is SCHEMA's object (#824, #772: on a wall
+    the CLI may never have checked it, and parse() reads a missing `blocking` as none). Any accepted call
+    that says HANDBACK outweighs a LAND in the same stream: the answer is the last whole HANDBACK, or none."""
     result, calls, rejected, accepted, said, spoke, last = {}, [], set(), set(), [], False, None
     # a turn is the model's assistant events between two user events, one message id: each content block is its
     # own event, and a stop that comes later for the turn (the result event's, for the last) speaks for all of it
@@ -1072,10 +1091,12 @@ def streamed(out):
             continue
         kind, msg = e.get("type"), e.get("message") or {}
         if kind == "result":
-            if e.get("stop_reason") == "max_tokens" and turn:
+            if e.get("stop_reason") in CUT and turn:
                 cut.add(turn)
             keep = e.get("is_error") is True and not spoke
-            result = {k: v for k, v in e.items() if keep or k != "result"}
+            # a cut turn's structured_output can still fit SCHEMA with `unresolved` lost off its end: never an answer
+            result = {k: v for k, v in e.items() if (keep or k != "result")
+                      and not (k == "structured_output" and e.get("stop_reason") in CUT)}
             if not keep and last is not None:
                 result["result"] = last
             said.append(json.dumps(cli_own(result)))
@@ -1094,7 +1115,7 @@ def streamed(out):
             if prev is False or prev != mid:
                 turn += 1
             prev = mid
-            if isinstance(msg, dict) and msg.get("stop_reason") == "max_tokens":
+            if isinstance(msg, dict) and msg.get("stop_reason") in CUT:
                 cut.add(turn)
         else:
             prev = False

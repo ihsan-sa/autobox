@@ -20,7 +20,7 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
     pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way, or a tick
                                    found the lock taken and asked for one more (want(repo)), since the running pass
                                    may be on an older tip.
-    red(repo)                      {name: entry} of every check the record holds red on main, whatever tree
+    red(repo)                      {name: entry} of every check the record holds red on main, whatever tree, if fresh
     at(repo, tree)                 {name: status} measured on exactly `tree` within the last FRESH seconds: a fresh
                                    record of a PR's base, which run.judge() takes instead of running the check on that
                                    base again. An older one is left out, so the base runs as before: main sitting
@@ -64,8 +64,10 @@ def load(repo):
             "gave_up": rec.get("gave_up") or "", "checks": dict(rec.get("checks") or {})}
 
 
-def red(repo):
-    return {n: e for n, e in load(repo)["checks"].items() if e.get("status") == T.FAILED}
+def red(repo, now=None):
+    # read of #1309: as at(), only a record younger than FRESH, so a stale red puts no PR first
+    return {n: e for n, e in load(repo)["checks"].items()
+            if e.get("status") == T.FAILED and fresh(e, now)}
 
 
 def age(stamp, now=None):
@@ -77,14 +79,18 @@ def age(stamp, now=None):
     return ((now or datetime.datetime.now(datetime.timezone.utc)) - t).total_seconds()
 
 
+def fresh(e, now=None):
+    a = age(e.get("at"), now)
+    return a is not None and a < FRESH
+
+
 def at(repo, tree, now=None):
     # architect read, 10-13: "Only trust a record younger than a set limit, and otherwise run the base as before"
     if not tree:
         return {}
     out = {}
     for n, e in load(repo)["checks"].items():
-        a = age(e.get("at"), now)
-        if e.get("tree") == tree and a is not None and a < FRESH:
+        if e.get("tree") == tree and fresh(e, now):
             out[n] = e["status"]
     return out
 

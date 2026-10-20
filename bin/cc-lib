@@ -261,9 +261,10 @@ WS = {}   # handle -> immutable workspace id, set by registry(); '' everywhere e
 
 def libroot():
     """~/.cc/library — the PROTECTED PARENT: the host alone writes under it, and no bind of a member's boundary reaches
-    it. Under it: owner/ (the aggregate, every record, bound read-only into --go workers and the owner's own workspace,
-    never into another member's), ws/<id>/ (one workspace's records and only those — the one directory cc-sandbox binds
-    into that workspace's boundary) and registry.json (id → handle)."""
+    it. Under it: owner/ (the aggregate, every record, bound read-only into --go workers on owner-only repos and the
+    owner's own workspace, never into a member's), ws/<id>/ (one workspace's records and only those — the one directory
+    cc-sandbox binds into that workspace's boundary), shared/ (the owner's records alone, for a worker on a member-facing
+    repo: build_shared) and registry.json (id → handle)."""
     return os.path.join(H, ".cc", "library")
 
 
@@ -1333,6 +1334,47 @@ def build_all_ws(reg, only=None):
     return out
 
 
+def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the index only; launches nothing, writes no board
+    """THE OWNER'S RECORDS AND NO MEMBER'S, ~/.cc/library/shared/index.sqlite: what cc-sandbox binds into a worker on a
+    member-facing repo in place of the aggregate. Since #1600 a worker reads the aggregate, and a worker on a repo a
+    member talks to writes where that member reads, so another member's records must not be in reach there at all, not
+    just asked to stay out of its output. Copied from the aggregate (c, current after the full pass) into a FRESH file
+    rather than pruned from a copy of it: deleted text lingers in free pages and FTS segments, and a worker can read the
+    raw bytes. Built only when the owner's sources moved since the last copy, so between full passes (five minutes) it
+    may lag a hook's --touch; renamed in like a workspace's file, so a reader holds a whole one."""
+    d = os.path.join(libroot(), "shared")
+    final = os.path.join(d, "index.sqlite")
+    stamp = "|".join(str(v) for v in c.execute(
+        "SELECT COUNT(*), COALESCE(MAX(indexed_at), ''), TOTAL(mtime) FROM sources WHERE ws=''").fetchone())
+    try:
+        real_dirs(d)
+        if os.path.islink(final) or (os.path.lexists(final) and not os.path.isfile(final)):
+            raise OSError(f"{tilde(final)} is a link, not written through")
+        if os.path.isfile(final):
+            rc = sqlite3.connect(f"file:{final}?mode=ro&immutable=1", uri=True)
+            same = dict(rc.execute("SELECT k, v FROM meta")).get("aggregate") == stamp
+            rc.close()
+            if same:
+                return dict(file=final, changed=False, refused="")
+        tmp = os.path.join(d, f".index.{os.getpid()}.tmp")
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        s = db(tmp, wal=False)
+        s.execute("ATTACH DATABASE ? AS a", (dbpath(),))
+        s.execute("INSERT INTO sources SELECT * FROM a.sources WHERE ws=''")
+        s.execute("INSERT INTO records SELECT * FROM a.records WHERE source_id IN (SELECT id FROM sources)")   # the trigger fills fts
+        s.execute("INSERT INTO rids SELECT * FROM a.rids WHERE record_id IN (SELECT id FROM records)")
+        s.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('workspace', 'owner'), ('aggregate', ?)", (stamp,))
+        s.commit()
+        s.execute("DETACH DATABASE a")
+        s.close()
+        os.chmod(tmp, 0o600)
+        os.rename(tmp, final)
+        return dict(file=final, changed=True, refused="")
+    except (OSError, sqlite3.Error) as e:
+        return dict(file=final, changed=False, refused=str(e))
+
+
 def rec_ids(r, rrepo, rows):
     """The exact ids one record carries: those in its title and text, any the parser attached, and its track."""
     ids = ids_in(r["title"] + "\n" + r["text"], rrepo, rows) | set(r.get("extra_ids") or ())
@@ -2127,6 +2169,9 @@ def index(argv):
     reg = registry()
     cov = reconcile(c, reg=reg)
     wss = build_all_ws(reg)   # then each member workspace's own file, from the same registry, its scope only
+    sh = build_shared(c)   # …and the owner's records alone, for a worker on a member-facing repo
+    if sh["refused"]:
+        print(f"cc-lib index: the owner-only copy for member-facing workers was not built: {sh['refused']}", file=sys.stderr)
     hm = misses()
     if hm and not cov["pending"]:   # every source is current now, so the hooks' misses are repaired
         try:
@@ -3225,6 +3270,8 @@ def selfcheck_workspaces(th, ok, run, w):
     import shutil
     import subprocess
     import stat
+    import tempfile
+    global H
     binroot = os.environ.get("CC_LIB_SELFCHECK_BIN") or os.path.dirname(os.path.realpath(__file__))
     K = "K" + os.urandom(4).hex()   # the secret's shape, minted per run: this file is bound as ~/bin inside, so no literal of it may match
     sandbox = os.path.join(binroot, "cc-sandbox")
@@ -3293,6 +3340,42 @@ def selfcheck_workspaces(th, ok, run, w):
        "and names the workspace it is", n_mine == 3 and n_leak == 0 and meta.get("workspace") == "wsa" and meta.get("workspace_id") == ida)
     ok("…and it is left in rollback-journal mode with nothing beside it (the read-only side needs no -wal or -shm)",
        not glob.glob(wsa_file + "-*") and not glob.glob(os.path.join(os.path.dirname(wsa_file), ".index.*")))
+    # ── the owner-only copy, what a worker on a member-facing repo is bound in place of the aggregate (build_shared) ──
+    sh_file = os.path.join(th, ".cc", "library", "shared", "index.sqlite")
+    def count(sql, *a):   # -1 when the copy is not there, so its absence is a FAIL line and not a crash of the run
+        if not os.path.isfile(sh_file):
+            return -1
+        cs = sqlite3.connect(f"file:{sh_file}?mode=ro&immutable=1", uri=True)
+        v = cs.execute(sql, a).fetchone()[0]
+        cs.close()
+        return v
+    n_mem = count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-ws%'")
+    n_own = count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-own%'")
+    n_fts = count("SELECT COUNT(*) FROM fts WHERE fts MATCH ?", f'"{K}"')
+    ok("the owner-only copy holds the owner's doc and not one record of either member workspace, in its rows or its search index",
+       n_own == 1 and n_mem == 0 and n_fts == 1)
+    wh = tempfile.mkdtemp(prefix="cclib-wk-")   # a worker's HOME as cc-sandbox builds it: the copy bound at ~/.cc/library/workspace
+    os.makedirs(os.path.join(wh, ".cc", "library", "workspace"))
+    if os.path.isfile(sh_file):
+        shutil.copyfile(sh_file, os.path.join(wh, ".cc", "library", "workspace", "index.sqlite"))
+    H, h0 = wh, H
+    try:
+        rc, o = run("ask", "--need", "history", K)
+    finally:
+        H = h0
+        shutil.rmtree(wh, ignore_errors=True)
+    ok("a worker on a repo shared with member wsa asks the knowledge base and gets the owner's doc but no record of wsb (nor of wsa), "
+       "scoped `workspace owner`", rc == 0 and f"{K}-own-doc" in o and f"{K}-wsb" not in o and f"{K}-wsa" not in o
+       and "scope workspace owner" in o)
+    ino = lambda: os.stat(sh_file).st_ino if os.path.isfile(sh_file) else -1
+    i1 = ino()
+    run("index")
+    i2 = ino()
+    w("dev/r1/docs/owner-only.md", f"# owner\n\n## sec\n{K}-own-doc, edited.\n")
+    run("index")
+    n_ed = count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-own-doc, edited%'")
+    ok("…rebuilt only when the owner's sources moved: a pass with nothing new keeps the file, an edited owner doc renames a new one in",
+       i1 != -1 and i2 == i1 and ino() != i1 and n_ed == 1)
     # ── inside a member's boundary, the production launch: shell, SQL and grep reach one file, its own ──
     r = member("wsa", probe)
     g = lambda k: re.search(rf"^{k}=(.*)$", r.stdout, re.M).group(1).strip() if re.search(rf"^{k}=(.*)$", r.stdout, re.M) else "?"

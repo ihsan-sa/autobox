@@ -63,12 +63,14 @@ verdict comes only from the lane's own review or from PR markers the box's login
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import glob
 import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 import time
 
@@ -281,14 +283,21 @@ def save(job: T.Job) -> None:
 
 def remove(job: T.Job) -> None:
     """The job leaves the queue and rest/; its record goes on the end of its attic file first. The attic file is
-    opened O_NOFOLLOW and created 0600 like a job file: a link planted at that path is refused (ELOOP), the line
-    is dropped, and the job is removed all the same."""
-    with contextlib.suppress(OSError):
-        os.makedirs(os.path.dirname(attic_path(job.repo, job.pr)), exist_ok=True)
-        fd = os.open(attic_path(job.repo, job.pr),
-                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    opened O_NOFOLLOW and O_NONBLOCK and kept 0600 like a job file: a link planted at that path is refused (ELOOP),
+    and so is anything not a plain file (a FIFO would hang the tick); the line is dropped, the events log says
+    where and why, and the job is removed all the same."""
+    path = attic_path(job.repo, job.pr)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     0o600)
         with os.fdopen(fd, "a") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, "not a plain file")
+            os.fchmod(fd, 0o600)
             f.write(json.dumps(job.to_dict()) + "\n")
+    except OSError as e:
+        E.log("attic", job.repo, job.pr, f"{path}: not written: errno {e.errno} {e.strerror}")
     for p in (job_path(job.repo, job.pr), rest_path(job.repo, job.pr)):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(p)
