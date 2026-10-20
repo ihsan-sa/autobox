@@ -202,3 +202,7 @@ cc-model and nowhere else — when models change, change cc-model.
 ## testing bar
 Done means: the new branches have selfcheck cases, the whole suite is green, and anything a daemon
 or timer runs was seen doing it once for real after deploy.
+
+A member's code only ever runs inside its sandbox. To rerun a member workspace's checks by hand, use
+`cc-sandbox member <handle> [<track>] -- <cmd>`; cc-guard refuses a host session running a file under `~/dev/<handle>`
+or `~/.cc/worktrees/<handle>`, or make/npm/pytest and the like pointed there, because there it runs as the owner.

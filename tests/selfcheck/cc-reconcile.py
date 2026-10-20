@@ -268,6 +268,26 @@ def selfcheck():
        decide(F(status="merged", journal=("BLOCKED", "old"), pr="u", pr_state="MERGED")) == [])
     ok("STATUS: BLOCKED with no question is still a declaration — it stopped, and only a person restarts it",
        decide(F(journal=("BLOCKED", "")))[0][:2] == ("ask", "waiting"))
+    with tempfile.TemporaryDirectory() as jd:
+        _keep_state = STATE
+        globals()["STATE"] = jd
+        try:
+            for t, body in (("bd", "STATUS: BLOCKED: which?\n- round 2\n2026-10-19T22:25Z STATUS: DONE\n"),
+                            ("db", "STATUS: DONE\n- round 2\nSTATUS: BLOCKED: which now?\n"),
+                            ("bd2", "STATUS: BLOCKED: old\n" + "- noise\n" * 500 + "**STATUS: DONE**\n"),
+                            ("bu", "STATUS: BLOCKED: old question\n__STATUS: DONE__\n"),
+                            ("bs", "STATUS: BLOCKED: old\n2026-10-19 22:25Z STATUS: DONE\n")):
+                os.makedirs(f"{jd}/r/{t}")
+                open(f"{jd}/r/{t}/progress.md", "w").write(body)
+            ok("a journal with BLOCKED then a later DONE reads as done — the settled question raises nothing",
+               journal("r", "bd") == ("DONE", "") and journal("r", "bd2") == ("DONE", ""))
+            ok("an underscore-bold final __STATUS: DONE__ settles an earlier BLOCKED", journal("r", "bu") == ("DONE", ""))
+            ok("a timestamp with a space between date and time still prefixes a final DONE",
+               journal("r", "bs") == ("DONE", ""))
+            ok("…and DONE then a later BLOCKED reads as blocked, with its question",
+               journal("r", "db") == ("BLOCKED", "which now?"))
+        finally:
+            globals()["STATE"] = _keep_state
     with tempfile.TemporaryDirectory() as jd:   # journal() itself: a cc-loop RESUMED line after a BLOCKED one ends the wait
         _st = STATE; globals().update(STATE=jd); os.makedirs(f"{jd}/r/t")
         try:

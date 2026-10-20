@@ -13,9 +13,9 @@ recurring-defect-ok: pause-hold-missing — a judge that refuses `--go`; it neve
 recurring-defect-ok: held-files-unchecked — a judge that refuses `--go`; it never dispatches or groups rows
 
 Only what bash would exec is judged. Words are read after VAR= and wrappers (env timeout nice nohup setsid stdbuf
-ionice time command builtin exec chrt taskset xargs parallel busybox flock watch systemd-run unshare nsenter); the parser
+ionice time command builtin exec chrt taskset xargs parallel busybox flock watch systemd-run unshare nsenter chroot); the parser
 recurses into sh -c, eval, $( ), backticks, <( ), find -exec, xargs fed by a pipe, env -S/--split-string, and a
-heredoc, here-string, pipe or `< <( )` fed to a shell, `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
+heredoc, here-string, pipe or `< <( )` fed to a shell or to at/batch, `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
 literals of an interpreter's -c/-e code (python perl ruby node php…: each literal, and all of them joined by blanks,
 so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
 does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
@@ -24,7 +24,8 @@ reads an interpreter's -c/-e (or stdin heredoc) body and awk/sed program text.
 Rules for both gated roles:
 - root: sudo doas su runuser pkexec sudoedit                                                        -> never
 - power: reboot shutdown poweroff halt kexec; systemctl|loginctl reboot|poweroff|halt|kexec|suspend|hibernate|
-  rescue|emergency|isolate|default                                                                   -> never
+  rescue|emergency|isolate|default; dbus-send|busctl|gdbus|qdbus naming login1 or systemd1 with a Reboot, PowerOff,
+  Halt, KExec, Suspend, Hibernate… method or a power target                                          -> never
 - network units: systemctl|service stop|disable|mask|kill|restart.. on NetworkManager hostapd wpa_supplicant
   systemd-networkd iwd dnsmasq                                                                        -> never
 - firewall: iptables ip6tables nft ufw firewall-cmd ebtables, unless a read (-L/-S, list, status, --list-*) -> never
@@ -101,6 +102,11 @@ Every role, pf included:
   firewall, disk, container, systemctl, ip, nmcli or netplan verb in it. -o ProxyCommand/LocalCommand/
   KnownHostsCommand run here and are parsed as local commands                                         -> never
 - cc-slack member add / cc slack member add (widening who reaches the box)                           -> never
+pf and worker (a host session; one whose cwd is in a member workspace is read as role member, and not judged here):
+- a member's code run outside its sandbox: a verb path, a shell/interpreter/`source` file argument or `<` source
+  under a member workspace (~/dev/<h> holding .cc/member-workspace) or its worktrees (~/.cc/worktrees/<h>), python -m
+  there, or make npm npx yarn pnpm pytest tox nox cargo just with the cwd there or a path argument there; only
+  `cc-sandbox member <h> -- …` runs it (an -c/-e literal is judged as its own commands)                -> never
 - member code on the host: a command that runs a file under a member's tree (~/dev/<h> or ~/.cc/worktrees/<h>,
   where the host-side ~/.cc/members/<h> exists) as its command word or as the script of a shell, `source` or an
   interpreter; make whose -C, -f or -I (attached, detached, clustered or a long prefix, as make reads them),
@@ -130,11 +136,24 @@ POWERSUB = {'reboot', 'poweroff', 'halt', 'kexec', 'suspend', 'hibernate', 'hybr
 POWERTGT = re.compile(r'(reboot|poweroff|halt|kexec|shutdown|suspend|hibernate|hybrid-sleep|suspend-then-hibernate|sleep|'
                       r'rescue|emergency|ctrl-alt-del|exit|soft-reboot)\.target')
 
+# …and the same call made over D-Bus: logind's or systemd's Reboot, PowerOff, Halt, KExec, Suspend… method, or a
+# StartUnit of one of those targets, sent with dbus-send, busctl, gdbus or qdbus (perms' read of #1221). A target
+# counts only beside a method that starts a unit (StartUnit, a unit object's Start, EnqueueUnitJob…), so CanReboot,
+# GetUnit reboot.target and the like are reads, and pass.
+DBUSV = {'dbus-send', 'busctl', 'gdbus', 'qdbus', 'qdbus6'}
+DBUSPOW = re.compile(r'(?<![A-Za-z])(Reboot|PowerOff|Halt|KExec|Suspend|Hibernate|HybridSleep|SuspendThenHibernate|Sleep|'
+                     r'SoftReboot|ScheduleShutdown)(WithFlags)?$')
+DBUSSTART = re.compile(r'(?<![A-Za-z])(Start|Restart|TryRestart|ReloadOrRestart|ReloadOrTryRestart|Enqueue)'
+                       r'(Unit|UnitReplace|UnitWithFlags|TransientUnit|UnitJob|Job)?$')
+
 def power(v, a):   # a reboot, halt, suspend or target switch, by its verb, its systemctl subcommand or its unit
     first = next((x for x in a if not x.startswith('-')), '')
     tgt = first not in ('status', 'show', 'cat', 'list-dependencies', 'list-units', 'is-active', 'is-enabled', 'help') \
         and any(POWERTGT.fullmatch(x) for x in a)   # a read of the unit passes
-    return v in POWERV or (v in ('systemctl', 'loginctl') and (bool(POWERSUB & set(a)) or tgt)) \
+    bus = v in DBUSV and any('login1' in x or 'systemd1' in x for x in a) \
+        and (any(DBUSPOW.search(x) for x in a) or any(DBUSSTART.search(x) for x in a)
+             and any(POWERTGT.search(x.replace('_2e', '.')) for x in a))   # a unit's object path escapes its dot
+    return v in POWERV or (v in ('systemctl', 'loginctl') and (bool(POWERSUB & set(a)) or tgt)) or bus \
         or (v in ('init', 'telinit') and first in ('0', '1', '6', 's', 'S'))
 NETUNIT = re.compile(r'(NetworkManager|hostapd|wpa_supplicant|systemd-networkd|iwd|dnsmasq)(@[^.]*)?(\.service|\.socket)?')
 UNITSTOP = {'stop', 'disable', 'mask', 'kill', 'restart', 'try-restart', 'reload-or-restart', 'try-reload-or-restart', 'force-reload'}
@@ -206,6 +225,17 @@ CMDCFG = re.compile(r'core\.(pager|editor|sshcommand|askpass|fsmonitor)|pager\..
                     r'(gpg|credential)\.(program|helper)|.*\.(textconv|clean|smudge|process)', re.I)
 READERS = {'cat', 'tac', 'nl', 'head', 'tail', 'sed', 'cut', 'grep', 'tee', 'sort', 'uniq'} | AWKS   # print a file's lines
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash'}
+# run what sits in the directory they are pointed at (the cwd, -C/--prefix/--cwd or a path argument): a member's build
+# files and tests are its code
+# per interpreter family: (the options whose value is code, so nothing on disk runs; the options that take the next word)
+MEMOPTS = {'sh': ({'-c'}, {'-o', '+o', '-O', '+O', '--rcfile', '--init-file'}),
+           'python': ({'-c'}, {'-W', '-X'}),
+           'perl': ({'-e', '-E'}, set()),
+           'ruby': ({'-e'}, {'-r', '-I', '-C', '-E'}),
+           'node': ({'-e', '--eval', '-p', '--print'}, {'-r', '--require', '--import', '--loader', '--experimental-loader',
+                                                       '-C', '--conditions', '--input-type'}),
+           'php': ({'-r', '-B', '-R', '-E'}, {'-d', '-c', '-z'})}
+RUNNERS = {'make', 'gmake', 'npm', 'npx', 'yarn', 'pnpm', 'pytest', 'py.test', 'tox', 'nox', 'cargo', 'just'}
 WRAP = {'env': set(), 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'nice': {'-n', '--adjustment'},
         'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
         'nohup': set(), 'setsid': set(), 'time': {'-f', '--format', '-o', '--output'}, 'command': set(),
@@ -215,7 +245,11 @@ WRAP = {'env': set(), 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'nice
         'flock': {'-w', '-E', '--timeout', '--conflict-exit-code'}, 'watch': {'-n', '--interval'},
         'systemd-run': {'-u', '--unit', '-p', '--property', '-E', '--setenv', '-M', '--machine', '-H', '--host',
                         '--description', '--slice', '--uid', '--gid', '--nice', '--working-directory'},
-        'unshare': {'-S', '-G', '-R', '-w'}, 'nsenter': {'-t', '--target', '-S', '-G', '-r', '-w'},
+        'unshare': {'-S', '-G', '-R', '-w', '--setuid', '--setgid', '--root', '--wd'},
+        # nsenter's -r and -w take a directory only when it is attached (-r/x, --root=/x): `nsenter -t 1 -r reboot`
+        # runs the reboot, so neither eats the next word (perms' read of #1221)
+        'nsenter': {'-t', '--target', '-S', '-G', '--setuid', '--setgid'},
+        'chroot': {'--userspec', '--groups'},   # …and chroot runs what follows its new root (perms' read of #1221)
         'unbuffer': set(), 'torify': set(), 'torsocks': set()}
 RUNOPT = {'man': ('-P', '--pager'), 'sort': ('--compress-program',), 'rg': ('--pre',), 'ag': ('--pager',), 'ack': ('--pager',),
           'wget': ('--use-askpass',), 'split': ('--filter',), 'less': ('--lesskey-src',)}   # an option whose value a tool runs
@@ -469,6 +503,7 @@ class Guard:
         g.env = env
         g.out, g.dirs, g._names, g.vars, g.vout = [], [], None, {}, {}
         g.headmove = g.cddyn = g.bypass = False
+        g._mp = None
         g.written, g.alias = {}, {}   # files this command writes (path -> text), and its aliases
         g.vsrc = {}   # a variable set from a substitution: its source text, read as a computed verb's words
         nt = env.get('GUARD_NEVER_TOUCH') or os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'config', 'never-touch.txt')
@@ -658,6 +693,8 @@ class Guard:
         out = []
         for b in (g.deglob(b0) if w0.glob else [b0]):
             if b in WRAP and len(via) < 8 and not mine:
+                if '/' in w0.v and g.mplaces() and g.inmem(w0, cwd):   # ~/dev/<member>/env runs the member's file, not env:
+                    R = g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw); R['vw'] = w0; out.append(R)   # memexec
                 j, info = g.unwrap(b, ws)
                 for t in info.get('script', []): out += g.script(t, cwd, b, depth + 1)
                 c2 = g.absp(info['cd'].v, cwd) if 'cd' in info and not info['cd'].dyn else cwd
@@ -671,7 +708,7 @@ class Guard:
                 if j is None or j >= len(ws): out.append(g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw))
                 else: out += g.expand(ws[j:], redirs, c2, assigns + info.get('assigns', []), via + [b], nested, depth, ctx)
                 continue
-            R = g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw); out.append(R)
+            R = g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw); R['vw'] = w0; out.append(R)
             R['w0'] = w0.v   # the command word as a path (memcode)
             out += g.inner(R, ws, depth, ctx)
         return out
@@ -697,7 +734,7 @@ class Guard:
             if a[j] == '--': j += 1; break
             j += 2 if a[j] in WRAP[b] else 1
         if b in ('taskset', 'chrt') and '-p' in a[1:j]: return None, info
-        if b in ('timeout', 'chrt', 'taskset'): j += 1   # its duration, priority or mask
+        if b in ('timeout', 'chrt', 'taskset', 'chroot'): j += 1   # its duration, priority, mask or new root
         return j, info
 
     def produced(g, ctx):   # what the commands piped into this one print, read as words
@@ -1125,6 +1162,59 @@ class Guard:
                     return h, rest
         return None
 
+    def mplaces(g):   # every member's workspace (~/dev/<h> holding .cc/member-workspace, cc-sandbox's own test) and worktrees
+        if g._mp is None:
+            g._mp = []
+            for m in glob.glob(g.home + '/dev/*/.cc/member-workspace'):
+                d = m[:-len('/.cc/member-workspace')]
+                for p in (d, g.home + '/.cc/worktrees/' + os.path.basename(d)):
+                    g._mp += [p, os.path.realpath(p)]
+        return g._mp
+
+    def inmem(g, w, cwd):
+        if w.dyn or '\n' in w.v: return False
+        p = re.split(r'[*?[]', w.v)[0] if w.glob else w.v
+        if not p: return False
+        q = g.absp(p, cwd)
+        return any(x == d or x.startswith(d + '/') for x in {q, os.path.realpath(q)} for d in g.mplaces())
+
+    def memexec(g, R):   # A HOST SESSION RUNNING A MEMBER'S CODE runs it as the owner, beside ~/.ssh and the box's tokens: a
+        # file under a member workspace or worktree, an interpreter or shell given one, or a build/test runner pointed
+        # there. Only `cc-sandbox member <h> -- …` runs it (raised-member-gate-reruns-ran-unsandboxed)
+        if g.role not in ('pf', 'worker') or not g.mplaces(): return None
+        v, aw, cwd, w0 = R['verb'] or '', R['argw'], R['cwd'], R.get('vw')
+        why = "running a member's code outside its sandbox ({}): run it as `cc-sandbox member <handle> [<track>] -- …`"
+        if w0 is not None and '/' in w0.v and g.inmem(w0, cwd): return 'never', why.format(w0.v)
+        here = g.inmem(Word(cwd), cwd)
+        def pointed(ws, what):   # a runner's path arguments (and NAME=path values) naming a member's files
+            for x in ws:
+                for c in [x] + ([x.like(x.v.split('=', 1)[1])] if '=' in x.v else []):
+                    if '/' in c.v and g.inmem(c, cwd): return 'never', why.format(f'{what} {x.v}')
+        if v in SHELLS or v in ('source', '.') or INTERP.fullmatch(v):
+            # each interpreter's options by its own semantics (bash -E and python3 -O take no value, perl -E is code)
+            fam = 'sh' if v in SHELLS or v in ('source', '.') else re.match(r'[a-z]+', v).group(0)
+            fam = {'pypy': 'python', 'nodejs': 'node'}.get(fam, fam)
+            code, val = MEMOPTS.get(fam, MEMOPTS['node'])
+            k, stdin = 0, False
+            while k < len(aw) and aw[k].v.startswith(('-', '+')) and aw[k].v not in ('-', '+'):
+                x = aw[k].v
+                if x == '--': k += 1; break
+                if fam == 'python' and (x == '-m' or (re.fullmatch(r'-[A-Za-z]+', x) and x.endswith('m'))):
+                    if here: return 'never', why.format(f'{v} -m in {cwd}')   # the module is found from the cwd
+                    return pointed(aw[k + 1:], f'{v} -m')
+                if x in code or (fam in ('sh', 'python') and re.fullmatch(r'-[A-Za-z]+', x) and x.endswith('c')):
+                    return None   # its code is a literal (judged as a script on its own)
+                if fam == 'sh' and re.fullmatch(r'-[A-Za-z]*s[A-Za-z]*', x): stdin = True
+                k += 2 if x in val else 1
+            if fam in ('deno', 'bun') and k < len(aw) and aw[k].v in ('run', 'test', 'x'): k += 1
+            if k < len(aw) and aw[k].v != '-' and g.inmem(aw[k], cwd): return 'never', why.format(f'{v} {aw[k].v}')
+            if (stdin or k >= len(aw) or aw[k].v == '-') and v not in ('source', '.') \
+                    and any(r['op'] == '<' and g.inmem(r['w'], cwd) for r in R['redirs']):   # it runs what stdin holds
+                return 'never', why.format(f'{v} < a member file')
+        if v in RUNNERS:
+            if here: return 'never', why.format(f'{v} in {cwd}')
+            return pointed(aw, v)
+        return None
     def memcode(g, R):   # code from a member's tree, run on the host outside cc-sandbox member
         # Why (from the brief): member-written code ran on the host as the box's own user, with full host access, more than once, and no seat noticed.
         # So a hit refuses (never), at every tier; no tree recorded under ~/.cc/members means nothing to judge.
@@ -1163,7 +1253,7 @@ class Guard:
 
     def rules(g, R):
         v, a, mem = R['verb'], R['args'], g.role == 'member'
-        h = g.everyrole(R)
+        h = g.everyrole(R) or g.memexec(R)
         if h: return h
         if g.role == 'pf':   # THE UNGATED TIER: the seat's state, the hard limits above (ssh carrying them too), the credentials
             return g.fence(R) or g.secread(R)
@@ -1602,6 +1692,8 @@ def selfcheck():
     with tempfile.TemporaryDirectory(prefix='cc-guard-argv.') as H:
         H = os.path.realpath(H)
         os.makedirs(H + '/.cc/state/demo/perms')   # the seat's state exists, so a parent of it is found (rule D)
+        os.makedirs(H + '/dev/alice/.cc'); os.makedirs(H + '/.cc/worktrees/alice/t')   # alice is a member workspace (memexec)
+        open(H + '/dev/alice/.cc/member-workspace', 'w').close()
         os.makedirs(H + '/.cc/worktrees/demo/t/.cc')   # the worker's tree, of repo demo (its own Slack channels)
         with open(H + '/.cc/worktrees/demo/t/.cc/track', 'w') as f: f.write('other\nt\n')   # written by the worker: not read
         base = {'HOME': H, 'GUARD_ROLE': 'worker', 'GUARD_CWD': H + '/.cc/worktrees/demo/t', 'GUARD_ROOT': H + '/.cc/worktrees/demo/t'}

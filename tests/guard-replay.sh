@@ -64,6 +64,7 @@ H=$T/home; WT=$H/.cc/worktrees/demo/t; MWT=$H/.cc/worktrees/demo/onmain
 mkdir -p "$WT/.cc" "$MWT/.cc" "$H/bin" "$H/dev" "$T/x" "$H/.cc/state/demo/perms"
 echo demo > "$WT/.cc/track"; echo demo > "$MWT/.cc/track"
 git -C "$WT" init -q -b track/t; git -C "$MWT" init -q -b main
+mkdir -p "$H/dev/alice/.cc"; : > "$H/dev/alice/.cc/member-workspace"   # alice is a member workspace from the first row (cc-guard-argv memexec)
 for s in cc-notify cc-slack cc-failures; do printf '#!/bin/sh\nexit 0\n' > "$H/bin/$s"; chmod +x "$H/bin/$s"; done
 pass=0; fail=0; reg=0
 
