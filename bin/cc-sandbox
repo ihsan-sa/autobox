@@ -149,6 +149,18 @@
 #     file there yet, or `-` for the file, the owner pastes the token at a hidden prompt first; it is saved mode 600 and
 #     asked of GitHub. One that is not a fine-grained github_pat_ (a classic PAT), one GitHub refuses, or one whose
 #     repositories name any owner but the org is not saved (gh_read).
+#   cc-sandbox env <workspace> <VAR> [<secret file> | --revoke]   ~/dev/<workspace>, a member workspace, is GRANTED A SECRET AS
+#     AN ENVIRONMENT VARIABLE (an API key the owner holds, e.g. XAI_API_KEY): from its next launch the WORKSPACE SESSION — the
+#     one `cc-sandbox member <workspace>` starts with no track and no --tree — has VAR set to the first line of the file, and
+#     every process it starts inherits it. Nothing else gets it: not a track of the workspace (`member <workspace> <track>`),
+#     not a landing's tree, not a box worker (`cc-sandbox <repo> <track>`), not an experiment subject (cc-subject starts those
+#     from the host with --clearenv), and the file itself is absent from inside all of them. THE GRANT IS HOST-SIDE:
+#     ~/.cc/members/<workspace>/env/<VAR>, a link to the file, in a 700 dir no bind of any boundary reaches. The file must be
+#     a one-line regular file, mode 600, under ~/.cc/secrets (resolved, so a link out of it is refused); VAR must match
+#     [A-Z][A-Z0-9_]* and must not name a variable the box itself sets or reads (CLAUDE_*, ANTHROPIC_*, CC_*, GH_*, GIT_*,
+#     LD_*, PATH, HOME and the rest of env_reserved). The value goes into the boundary over a pipe and a /bin/sh that exports
+#     it, never on an argv, which every process on the host can read. With no file named, the command says what VAR is
+#     granted from; --revoke removes it. Rotate in the file. A CC_MEMBER_V2=1 launch carries no grant, and says so in one line on stderr.
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -1359,8 +1371,13 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # to be able to lose that race on demand instead of hoping to hit a microsecond — so it widens the window with this.
   # A NUMBER, never a command, and only ever set on the host: the environment inside is cleared, so no session sets it.
   case "${CC_SANDBOX_TEST_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$CC_SANDBOX_TEST_DELAY";; esac
+  # A SECRET GRANTED AS AN ENVIRONMENT VARIABLE (cc-sandbox env) reaches the WORKSPACE SESSION ONLY — "sets each granted VAR
+  # in the member WORKSPACE session's environment only" (the brief) — so no track, no landing tree. fd 4 carries the values
+  # to EW's shell, which exports them, closes it and execs the command; nothing is on an argv.
+  EW=(); [ -z "$tr" ] && [ -z "$TREE" ] && env_bind "$h"
+  [ ${#EW[@]} -gt 0 ] && exec 4< <(printf '%s' "$EV")
   pins_unlinked   # last, after the window above (pins_unlinked)
-  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" -- "$@" \
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" -- "${EW[@]}" "$@" \
     3< <({ jq -c '.projects // {}' "$H/.claude.json" 2>/dev/null || printf '{}'; } \
          | jq -n --arg d "$dev" --arg cwd "$cwd" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
            '{projects: (((input? // {}) | with_entries(select(.key == $d or (.key | startswith($w)))))
@@ -1683,6 +1700,62 @@ gh_read(){   # $1 org $2 the file — THE OWNER'S READ-IN of a fine-grained PAT 
   { [ -d "${f%/*}" ] || mkdir -m 700 "${f%/*}"; } && ( umask 077; printf '%s\n' "$tok" > "$f.new" && chmod 600 "$f.new" && mv -f "$f.new" "$f" ) \
     || { rm -f "$f.new"; echo "cc-sandbox: could not write $f — nothing was saved" >&2; return 1; }
   echo "cc-sandbox: saved the token for $org in $f (mode 600)" >&2; }
+env_reserved(){   # $1 VAR → 0 when the box sets or reads that name itself, so no grant may take it. Prefixes are whole families
+  # (claude's own knobs, the API key it would prefer to a login, the box's CC_* switches, gh and git, the loader, the
+  # interpreters' import and option hooks, libc's tunables and resolver, systemd's); the exact names are the shell's — the
+  # ones it maintains itself too, OPTIND above all: dash aborts on a non-numeric one before the wrapper execs (read of
+  # #1022) — the session's and the proxies'.
+  case "$1" in
+    CLAUDE*|ANTHROPIC*|CC_*|GH_*|GITHUB_*|GIT_*|LD_*|BASH*|PYTHON*|NODE*|NPM_*|XDG_*|SSH_*|LC_*|DBUS_*|TMUX*|BWRAP*|SSL_*|OPENSSL_*|CURL_*|REQUESTS_*|PERL*|RUBY*|JAVA_*|MALLOC_*|GCONV_*|GLIBC_*|SYSTEMD_*|HIST*|DISABLE_*|MCP_*|OTEL_*|MAX_THINKING_TOKENS|TERMINFO*|LESS*) return 0;;
+    PATH|HOME|USER|LOGNAME|SHELL|SHELLOPTS|TEMP|TMP|TERM|COLORTERM|LANG|LANGUAGE|TZ|TZDIR|TMPDIR|PWD|OLDPWD|IFS|ENV|SHLVL|MAIL|MAILPATH|MAILCHECK|HOSTNAME|CDPATH|GLOBIGNORE|PS1|PS2|PS3|PS4|PROMPT_COMMAND|EDITOR|VISUAL|PAGER|DISPLAY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|FTP_PROXY) return 0;;
+    OPTIND|OPTARG|OPTERR|PPID|LINENO|RANDOM|SECONDS|UID|EUID|GROUPS|FUNCNAME|POSIXLY_CORRECT|RES_OPTIONS|LOCALDOMAIN|HOSTALIASES|NLSPATH) return 0;;
+  esac; return 1; }
+env_secret(){   # $1 a secret file → its resolved path on stdout when it may be granted, or the reason on stderr and 1:
+  # a regular file under ~/.cc/secrets once every link is resolved, mode 600, one non-empty line
+  local f s l=""; f=$(readlink -f -- "$1" 2>/dev/null) || f=""; s=$(readlink -f -- "$H/.cc/secrets" 2>/dev/null) || s=""
+  [ -n "$f" ] && [ -n "$s" ] && [ "${f#"$s"/}" != "$f" ] || { echo "$1 is not under ~/.cc/secrets" >&2; return 1; }
+  [ -f "$f" ] && [ ! -L "$f" ] || { echo "$f is not a regular file" >&2; return 1; }
+  [ "$(stat -c %a "$f" 2>/dev/null)" = 600 ] || { echo "$f is not mode 600" >&2; return 1; }
+  IFS= read -r l < "$f" || [ -n "$l" ]
+  # the whole file is that line: no newline before its last byte, so 'a\nb' with no newline at the end is refused too
+  [ -n "$l" ] && [ "$(head -c -1 -- "$f" | wc -l)" = 0 ] || { echo "$f is not one non-empty line" >&2; return 1; }
+  printf '%s\n' "$f"; }
+env_grant(){   # $1 handle · $2 VAR · [$3 secret file | --revoke] — the `env` subcommand (header). No file: say what is granted.
+  local r="${1:-}" v="${2:-}" a="${3:-}" m f why
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  [[ "$v" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] || { echo "cc-sandbox: '$v' is not a variable name this grants — [A-Z][A-Z0-9_]*, at most 64 long" >&2; return 2; }
+  env_reserved "$v" && { echo "cc-sandbox: $v is a name the box sets or reads itself — grant the secret under another name" >&2; return 2; }
+  m="$H/.cc/members/$r"
+  [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then grant it" >&2; return 2; }
+  if [ "$a" = --revoke ]; then
+    [ -L "$m/env/$v" ] || { echo "cc-sandbox: ~/dev/$r was not granted $v — nothing to revoke"; return 0; }
+    rm -f "$m/env/$v" || { echo "cc-sandbox: could not remove $m/env/$v" >&2; return 2; }
+    echo "cc-sandbox: ~/dev/$r no longer gets $v, from its next launch. A session that is running keeps it until it is reopened."; return 0; fi
+  if [ -z "$a" ]; then
+    if [ -L "$m/env/$v" ]; then echo "cc-sandbox: ~/dev/$r gets $v from $(readlink "$m/env/$v")"; else echo "cc-sandbox: ~/dev/$r is not granted $v"; fi; return 0; fi
+  f=$(env_secret "$a" 2>&1) || { echo "cc-sandbox: $f — nothing was granted" >&2; return 2; }
+  # umask 077, so a ~/.cc/members/<h> that is not there yet is made 700 too, as the header says, not with the umask's mode
+  ( umask 077; mkdir -p -- "$m/env" ) && chmod 700 "$m/env" && ln -sfn "$f" "$m/env/$v" \
+    || { echo "cc-sandbox: could not write $m/env/$v — nothing was changed" >&2; return 2; }
+  why=$(env_secret "$m/env/$v" 2>&1) || { rm -f "$m/env/$v"; echo "cc-sandbox: $why — nothing was granted" >&2; return 2; }
+  echo "cc-sandbox: ~/dev/$r's workspace session has $v from $f from its next launch (~/.cc/members/$r/env/$v) — not its tracks, not its subjects. Reopen any session that is running. cc-sandbox env $r $v --revoke takes it back."; }
+env_names(){   # $1 handle → the names it is granted, space-separated, or 1 when none (the V2 launch's notice)
+  local g got=(); for g in "$H/.cc/members/$1/env"/*; do [ -L "$g" ] && got+=("$(basename "$g")"); done
+  [ ${#got[@]} -gt 0 ] && echo "${got[*]}"; }
+env_bind(){   # $1 handle → the globals EW (a wrapper command, or nothing) and EV (the values, one per line) for launch_member.
+  # Each grant is checked again here — name, reserved list, file — and one that fails is skipped with a line naming it,
+  # never its value. The values are read by the shell builtin, so they are on no argv on the host either.
+  local g v f line
+  EW=(); EV=""; local names=()
+  for g in "$H/.cc/members/$1/env"/*; do
+    [ -L "$g" ] || continue; v=$(basename "$g")
+    if ! [[ "$v" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] || env_reserved "$v" || ! f=$(env_secret "$g" 2>/dev/null); then
+      echo "cc-sandbox: ~/dev/$1 is granted $v, but the grant or its file is not one this launch honours — it is not set (cc-sandbox env $1 $v says where it points)" >&2; continue; fi
+    IFS= read -r line < "$f" || [ -n "$line" ] || continue
+    names+=("$v"); EV+="$line"$'\n'
+  done
+  [ ${#names[@]} -gt 0 ] || return 0
+  EW=(/bin/sh -c 'n=$1; shift; while [ "$n" -gt 0 ]; do IFS= read -r v <&4 || exit 125; export "$1=$v"; shift; n=$((n-1)); done; exec 4<&-; exec "$@"' cc-env "${#names[@]}" "${names[@]}"); }
 race_swap(){   # $1 a launch's pid · $2 the source it pins NEXT after the swapped name's last pin · $3 the swap → swapped | late | missed
   # THE SWAP CASES ARE ORDERED BY WHAT THE LAUNCH HAS DONE, NOT BY SLEEPS. A fixed 0.4 s head start guessed how fast the
   # box was, and at load ~50 the launch had not pinned yet when the racer moved the name, so it refused and every landing
@@ -2691,6 +2764,142 @@ selfcheck_ghtoken(){   # A WORKSPACE GRANTED A GITHUB TOKEN, in a HOME of its ow
   out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "${pat%-a}-b" 2>&1)
   t 'gh: the grant removed — the next launch holds none of the token, the copy is gone, and nothing is said' \
     "$(g tok)/$(g cfg)/$([ -e "$fh/.cc/sandbox/$h/gh" ] && echo copy || echo none)/$(grep -c 'GitHub token' <<<"$out")" '0/absent/none/0'
+  rm -rf "${fh:?}"; }
+selfcheck_secretenv(){   # A SECRET GRANTED AS AN ENVIRONMENT VARIABLE (cc-sandbox env), in a HOME of its own: one member workspace,
+  # one secret file under ~/.cc/secrets, and every place the value could leak to driven for real — the workspace session
+  # (has it), a track of the workspace, a box worker, and an experiment SUBJECT through each of its two launch paths
+  # (lack it, and none can read the file). The value never reaches this output: every check prints a count or a word.
+  local fh h dev out rc va vb val sec sbx subj gd i run d1 pid
+  # A HOME under /tmp with short names. The subject's proxy socket is not under it: cc-subject puts that at
+  # $XDG_RUNTIME_DIR/cc-subject/<hash> (else ~/.cc/s/<hash>), so its length no longer depends on the HOME's or the handle's.
+  fh=$(mktemp -d /tmp/cse-XXXXXX) || return 1; chmod 700 "$fh"
+  h="cse$$"; dev="$fh/dev/$h"; va="fixture-xai-"; vb="$$-$RANDOM"; val="$va$vb"; sec="$fh/.cc/secrets/xai.token"; sbx=$(dirname "$SELF"); subj="$sbx/cc-subject"; gd="$fh/.cc/members/$h/env"
+  mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/.cc/boards" "$fh/.cc/members/$h" "$fh/.cc/secrets" "$fh/elsewhere" || return 1
+  chmod 700 "$fh/.cc/secrets"; : > "$dev/.cc/member-workspace"
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1 && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init >/dev/null 2>&1 || return 1
+  jq -n '{claudeAiOauth: {accessToken: "env-access", expiresAt: 99999999999999}}' > "$fh/.cc/members/$h/credentials.json"; chmod 600 "$fh/.cc/members/$h/credentials.json"
+  ( umask 077; printf '%s\n' "$val" > "$sec"; printf '%s\n' "$val" > "$fh/elsewhere/xai.token"; printf 'a\nb\n' > "$fh/.cc/secrets/two.token"; printf 'a\nb' > "$fh/.cc/secrets/nonl.token"; printf '\n' > "$fh/.cc/secrets/empty.token" )
+  ln -s "$fh/elsewhere/xai.token" "$fh/.cc/secrets/out.token"
+  # what any of these sandboxes sees: is VAR set, how many lines of `env` carry the value, can the file be read at its host
+  # path, is the grant dir there, does any process argv inside carry it, and is fd 4 left open. The value is handed in as
+  # two halves ($1 $2) and matched by the shell itself, never by a grep whose own argv would hold it.
+  local probe='v="$1$2"; n(){ c=0; while IFS= read -r l; do case "$l" in *"$v"*) c=$((c+1));; esac; done; echo $c; }
+    echo name=${XAI_API_KEY:+set}; echo match=$(env | n); echo file=$(cat "$3" 2>/dev/null | n); echo grant=$([ -e "$4" ] && echo present || echo absent)
+    echo argv=$(for f in /proc/[0-9]*/cmdline; do tr "\0" " " 2>/dev/null < "$f"; echo; done | n); echo fd4=$([ -e /proc/self/fd/4 ] && echo open || echo closed)'
+  hostargv(){ local f c k=0; for f in /proc/[0-9]*/cmdline; do c=$(tr '\0' ' ' 2>/dev/null < "$f"); [[ "$c" == *"$val"* ]] && k=$((k+1)); done; echo "$k"; }
+  # ── "it refuses a VAR that isn't [A-Z][A-Z0-9_]* or that names a box variable … and a file outside ~/.cc/secrets"
+  rc=""; for v in xai_api_key 1XAI XAI-KEY '' CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CC_ROLE GH_TOKEN GIT_DIR PATH HOME LD_PRELOAD BASH_ENV PYTHONPATH HTTPS_PROXY; do
+    env HOME="$fh" "$SELF" env "$h" "$v" "$sec" >/dev/null 2>&1; rc+="$?"; done
+  t 'env: a bad name or a box variable is refused — lower case, a digit first, a dash, empty, CLAUDE_*, ANTHROPIC_*, CC_*, GH_*, GIT_*, PATH, HOME, LD_*, BASH_*, PYTHON*, a proxy' \
+    "$rc/$(ls -A "$fh/.cc/members/$h/env" 2>/dev/null | wc -l)" "$(printf '2%.0s' $(seq 15))/0"
+  # the names the shell maintains itself, libc's and systemd's: OPTIND granted a word made dash abort before the wrapper
+  # exec'd the workspace command (read of #1022)
+  rc=""; for v in OPTIND OPTARG PPID GLIBC_TUNABLES RES_OPTIONS LOCALDOMAIN HOSTALIASES SYSTEMD_LOG_LEVEL; do
+    env HOME="$fh" "$SELF" env "$h" "$v" "$sec" >/dev/null 2>&1; rc+="$?"; done
+  t 'env: a shell-maintained name (OPTIND, OPTARG, PPID), GLIBC_TUNABLES, a resolver one and SYSTEMD_* are refused too' \
+    "$rc/$(ls -A "$fh/.cc/members/$h/env" 2>/dev/null | wc -l)" 22222222/0
+  rc=""; for f in "$fh/elsewhere/xai.token" "$fh/.cc/secrets/out.token" "$fh/.cc/secrets/../elsewhere/xai.token" "$fh/.cc/secrets/two.token" "$fh/.cc/secrets/nonl.token" "$fh/.cc/secrets/empty.token" "$fh/.cc/secrets/none.token" "$fh/.cc/secrets"; do
+    env HOME="$fh" "$SELF" env "$h" XAI_API_KEY "$f" >/dev/null 2>&1; rc+="$?"; done
+  chmod 644 "$sec"; env HOME="$fh" "$SELF" env "$h" XAI_API_KEY "$sec" >/dev/null 2>&1; rc+="$?"; chmod 600 "$sec"
+  t 'env: a file outside ~/.cc/secrets (named, a link out, a ../ path), a two-line file (with or without a last newline), an empty line, a missing one, a directory and a mode-644 one are all refused, and no grant is written' \
+    "$rc/$(ls -A "$fh/.cc/members/$h/env" 2>/dev/null | wc -l)" 222222222/0
+  out=$(env HOME="$fh" "$SELF" env "$h" XAI_API_KEY "$sec" 2>&1); rc=$?
+  t 'env: the grant is one host-side link ~/.cc/members/<h>/env/<VAR> → the secret file, in a 700 dir, and the line names it without the value' \
+    "$rc/$(readlink "$fh/.cc/members/$h/env/XAI_API_KEY")/$(stat -c %a "$fh/.cc/members/$h/env")/$(grep -cF -- "$val" <<<"$out")" "0/$sec/700/0"
+  # a workspace whose ~/.cc/members/<h> is not there yet: the grant makes it 700, not the umask's 755
+  mkdir -p "$fh/dev/${h}n/.cc" && : > "$fh/dev/${h}n/.cc/member-workspace"
+  ( umask 022; env HOME="$fh" "$SELF" env "${h}n" XAI_API_KEY "$sec" >/dev/null 2>&1 ); rc=$?
+  t 'env: a grant to a workspace with no ~/.cc/members/<h> yet makes that dir 700 as well as env/' \
+    "$rc/$(stat -c %a "$fh/.cc/members/${h}n" 2>/dev/null)/$(stat -c %a "$fh/.cc/members/${h}n/env" 2>/dev/null)" 0/700/700
+  # ── A CC_MEMBER_V2=1 LAUNCH carries no grant, and says so on one stderr line (a copy of this file beside a stub cc-member-v2)
+  mkdir -p "$fh/v2" && cp "$SELF" "$fh/v2/cc-sandbox" && printf '#!/bin/sh\necho V2RAN\n' > "$fh/v2/cc-member-v2" && chmod 755 "$fh/v2/cc-member-v2" || return 1
+  out=$(env HOME="$fh" CC_MEMBER_V2=1 "$fh/v2/cc-sandbox" member "$h" -- true 2>&1 >/dev/null); rc=$?
+  t 'env: a CC_MEMBER_V2=1 launch of a granted workspace still starts, with one stderr line naming the grant it does not carry, not its value' \
+    "$rc/$(wc -l <<<"$out")/$(grep -c 'XAI_API_KEY.*does not carry' <<<"$out")/$(grep -cF -- "$val" <<<"$out")" 0/1/1/0
+  out=$(env HOME="$fh" CC_MEMBER_V2=1 "$fh/v2/cc-sandbox" member "${h}x" -- true 2>&1); rc=$?
+  t 'env: a CC_MEMBER_V2=1 launch of a workspace with no grant prints no such line' "$rc/$(grep -c 'does not carry' <<<"$out")/$(grep -c V2RAN <<<"$out")" 0/0/1
+  # ── THE WORKSPACE SESSION has it, and only as a variable: the file, the grant and every argv inside are clean
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
+  t 'env: the WORKSPACE session has VAR set to the file'"'"'s line — and the secret file, the grant and every argv inside hold none of it, fd 4 closed' \
+    "$(g name)/$(g match)/$(g file)/$(g grant)/$(g argv)/$(g fd4)" set/1/0/absent/0/closed
+  # …and on the HOST, while it runs, no process argv carries the value either (it crossed on a pipe)
+  env HOME="$fh" "$SELF" member "$h" -- sh -c 'sleep 3' >/dev/null 2>&1 & pid=$!; sleep 1.5
+  t 'env: while the workspace session runs, no argv on the host carries the value' \
+    "$(hostargv)" 0
+  wait "$pid" 2>/dev/null
+  # ── A TRACK OF THE WORKSPACE is a worker the grant does not name
+  git -C "$dev" worktree add -q -b track/t "$fh/.cc/worktrees/$h/t" >/dev/null 2>&1 || return 1
+  out=$(env HOME="$fh" "$SELF" member "$h" t -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
+  t 'env: a TRACK of the granted workspace does not get it — no VAR, the file and the grant absent' "$(g name)/$(g match)/$(g file)/$(g grant)" /0/0/absent
+  # ── A BOX WORKER (the other boundary), with the grant standing
+  mkdir -p "$fh/dev/r" "$fh/.cc/worktrees/r" "$fh/bin" || return 1
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$fh/.cc/worktrees/r/t" >/dev/null 2>&1 || return 1
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
+  t 'env: a BOX WORKER does not get it — no VAR, the file and the grant absent' "$(g name)/$(g match)/$(g file)/$(g grant)" /0/0/absent
+  # ── AN EXPERIMENT SUBJECT, launched for real through BOTH of cc-subject's launch paths, each from a side that HOLDS the
+  #    value in its own environment, so what is proved is the subject's boundary and not a clean parent:
+  #    (1) from INSIDE the granted workspace: `cc-subject run` there → the workspace's socket → the daemon's own
+  #        run_subject (cc-slack, loaded as it is) → `cc-subject launch <h>` → supervise → bwrap. The daemon here holds VAR too.
+  #    (2) on the HOST: `cc-subject launch <h>` with the ask on stdin, VAR in its environment.
+  # Each run's probe output is its out.log, read on the host once the run is over.
+  local sprobe="set -- $va $vb $sec $gd; $probe"
+  subj_wait(){   # $1 run → its out.log on stdout once status.json says it is over (180 s at most)
+    local i=0 rd="$fh/.cc/members/$h/subjects/$1"
+    while [ $i -lt 360 ]; do case "$(jq -r .state "$rd/status.json" 2>/dev/null)" in done|killed|stopped|failed) cat "$rd/out.log"; return 0;; esac
+      grep -q Traceback "$rd/supervise.log" 2>/dev/null && break; i=$((i+1)); sleep 0.5; done
+    echo "state=$(jq -r .state "$rd/status.json" 2>/dev/null)"; }
+  if [ -x "$subj" ]; then
+    rm -f "$fh/.cc/slack/member/$h/sock"; mkdir -p "$fh/.cc/slack/member/$h"
+    HOME="$fh" CC_SUBJECT_HOME="$fh" XAI_API_KEY="$val" python3 - "$fh/.cc/slack/member/$h/sock" "$sbx/cc-slack" "$h" >/dev/null 2>&1 <<'PY' &
+import json, os, runpy, socket, sys
+path, slack, h = sys.argv[1:4]
+run_subject = runpy.run_path(slack, run_name="cc_sandbox_selfcheck")["run_subject"]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(path); s.listen(1); s.settimeout(90)
+try:
+    c, _ = s.accept(); ask = json.loads(c.makefile("rb").readline())["subject"]
+    c.sendall((json.dumps(run_subject(h, ask)) + "\n").encode()); c.close()
+finally:
+    s.close(); os.unlink(path)
+PY
+    d1=$!; i=0; while [ $i -lt 100 ] && [ ! -S "$fh/.cc/slack/member/$h/sock" ]; do i=$((i+1)); sleep 0.1; done
+    out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo ws=${XAI_API_KEY:+set}; cc-subject run --hours 0.1 -- sh -c "$1"' _ "$sprobe" 2>&1)
+    wait "$d1" 2>/dev/null
+    run=$(grep -o '[0-9]\{8\}-[0-9]\{6\}-[0-9a-f]\{6\}' <<<"$out" | head -1); rc="$(g ws)"
+    out=$(subj_wait "$run")
+    t 'env: a SUBJECT started from INSIDE the granted workspace (cc-subject run → socket → cc-slack run_subject → launch → bwrap) does not get it — no VAR, no argv, the file and the grant absent' \
+      "$rc/${run:+run}/$(g name)/$(g match)/$(g argv)/$(g file)/$(g grant)" set/run//0/0/0/absent
+    out=$(printf '{"op": "run", "argv": ["sh", "-c", %s], "hours": 0.1}' "$(jq -Rn --arg p "$sprobe" '$p')" \
+          | HOME="$fh" CC_SUBJECT_HOME="$fh" XAI_API_KEY="$val" "$subj" launch "$h" 2>&1)
+    run=$(jq -r '.run // empty' <<<"$out" 2>/dev/null)
+    out=$(subj_wait "$run")
+    t 'env: a SUBJECT started on the HOST (cc-subject launch, VAR in the launcher'"'"'s own environment) does not get it — no VAR, no argv, the file and the grant absent' \
+      "${run:+run}/$(g name)/$(g match)/$(g argv)/$(g file)/$(g grant)" run//0/0/0/absent
+  else
+    t 'env: cc-subject is beside cc-sandbox, so the subject cases ran' missing present
+  fi
+  # ── NEVER WRITTEN TO A TRACKED FILE: nothing under the workspace (its .git included) holds the value, and git is clean
+  t 'env: nothing under ~/dev/<h>, .git included, holds the value, and the workspace has no change' \
+    "$(grep -rlF -- "$val" "$dev" 2>/dev/null | wc -l)/$(git -C "$dev" status --porcelain 2>/dev/null | grep -v '^?? \.cc/$' | wc -l)" 0/0
+  # ── REVOKE
+  out=$(env HOME="$fh" "$SELF" env "$h" XAI_API_KEY --revoke 2>&1); rc=$?
+  t 'env: --revoke removes the link' "$rc/$([ -e "$fh/.cc/members/$h/env/XAI_API_KEY" ] || [ -L "$fh/.cc/members/$h/env/XAI_API_KEY" ] && echo link || echo none)" 0/none
+  out=$(env HOME="$fh" "$SELF" env "$h" XAI_API_KEY --revoke 2>&1); rc=$?
+  t 'env: --revoke of a VAR that is not granted says so and exits 0' "$rc/$(grep -c 'was not granted XAI_API_KEY' <<<"$out")" 0/1
+  # a link planted by hand at a name env_reserved refuses (OPTIND, a word for its value) is skipped at launch, and the
+  # workspace command still starts: set, it made dash abort in the wrapper (read of #1022)
+  ln -s "$sec" "$gd/OPTIND"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
+  t 'env: …and the next workspace launch has no VAR' "$(g name)/$(g match)/$(g fd4)" /0/closed
+  t 'env: a hand-planted OPTIND grant is skipped with a line naming it, and the workspace command still runs' \
+    "$(grep -c 'granted OPTIND' <<<"$out")/$(g fd4)" 1/closed
+  rm -f "$gd/OPTIND"
+  # a grant whose file went bad after it was made (mode widened) is not honoured, and the launch names the VAR, not the value
+  env HOME="$fh" "$SELF" env "$h" XAI_API_KEY "$sec" >/dev/null 2>&1; chmod 644 "$sec"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
+  t 'env: a granted file that went mode 644 is not set at launch, and the line names XAI_API_KEY without the value' \
+    "$(g name)/$(g match)/$(grep -c 'granted XAI_API_KEY' <<<"$out")/$(grep -cF -- "$val" <<<"$out")" /0/1/0
   rm -rf "${fh:?}"; }
 selfcheck_docs(){   # THE DOCUMENT REGISTER (docs_bind), in a HOME of its own: the owner's register, this workspace's view and
   # another workspace's view, each carrying a mark of its own. Inside: the own view is ~/.cc/documents, readable and ro; the
@@ -3744,7 +3953,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out="$(env HOME="$out" CC_SANDBOX_SELFCHECK_HOME="$out" "$SELF" selfcheck 2>&1; echo "rc=$?")|$(env CC_SANDBOX_SELFCHECK_HOME="$H/x" "$SELF" selfcheck 2>&1; echo "rc=$?")"
   t 'selfcheck refuses the real HOME, and a marker that is not HOME, in one line each' \
     "$(grep -c '^cc-sandbox selfcheck: refused: ' <<<"${out//|/$'\n'}")/$(grep -o 'rc=[0-9]*' <<<"$out" | tr '\n' ' ')" '2/rc=1 rc=1 '
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_workercred; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip. Where no pid namespace of
   # its own here can hold the sandboxes its cases start, they run unnested over the host's /proc and print an
   # UNNESTED line saying why (tests/member_v2.py, own_pidns). That reason goes on this tally's last line.
@@ -3816,18 +4025,21 @@ case "${1:-}" in selfcheck) if [ -n "${CC_SANDBOX_SELFCHECK_HOME:-}" ]; then sel
   signout) shift; signout "${1:-}" "${2:-}"; exit $?;;
   web) shift; web "${1:-}"; exit $?;;
   github) shift; github "$@"; exit $?;;
+  env) shift; env_grant "${1:-}" "${2:-}" "${3:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
           if [ "${1:-}" = --tree ]; then TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; }; fi
           [ "${1:-}" = -- ] && shift
           [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
             [ -z "$TREE" ] || { echo "cc-sandbox: --tree is not a cc-member-v2 option" >&2; exit 2; }
+            ! handle_ok "$h" || ! ev=$(env_names "$h") \
+              || echo "cc-sandbox: ~/dev/$h is granted $ev (cc-sandbox env), but a CC_MEMBER_V2=1 launch does not carry grants — this session runs without them" >&2
             BIN=$(dirname "$SELF"); exec "$BIN/cc-member-v2" run "$h" "${tr:-$h}" -- "$@"
           fi
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox handle <handle>   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox handle <handle>   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox env <workspace> <VAR> [<secret file> | --revoke]   |   cc-sandbox selfcheck" >&2; exit 2; }
 # ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
 # for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
 fence_off && exec "$@"   # off means the command runs exactly as given, nothing added

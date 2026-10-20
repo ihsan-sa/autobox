@@ -204,10 +204,10 @@ class Case(unittest.TestCase):
         return T.Job(repo="demo", pr=7, head=HEAD, base_sha=BASE, digest=R.change_digest(DIFF),
                      plan=T.Plan(paid=paid), files=["x.py"], extra=dict(root=self.tmp, **extra))
 
-    def comment(self, verdict, digest, rows=(), mine=True, head=HEAD, by="x"):
+    def comment(self, verdict, digest, rows=(), mine=True, head=HEAD, by="x", at="2026-10-20T10:00:00Z"):
         body = (f"<!-- {R.MARK} v2 change={digest} base={BASE[:12]} head={head[:12]} verdict={verdict} by={by} -->\n"
                 + "\n".join(rows))
-        return {"body": body, "viewerDidAuthor": mine}
+        return {"body": body, "viewerDidAuthor": mine, "createdAt": at}
 
 
 class TestDigestAndMarkers(Case):
@@ -2262,12 +2262,29 @@ class TestSecurityPaths(Case):
         j = self.sec_job(self.PATHS[0])
         back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")
         comments = [back, self.comment("LAND", "0dd", head="b" * 40, by="perms-security-read")]
-        self.reads([self.rec(j)])
+        self.reads([self.rec(j, at="2026-10-20T11:00:00Z")])
         self.assertEqual(R.review(j, comments=comments).verdict, T.LAND)
         self.assertEqual(R.delta_review(j, R.imported(back["body"]), comments=comments).verdict, T.LAND)
         self.assertIsNone(R.standing(j, comments=comments))
         self.assertNotIn("a security HANDBACK", R.would_read(j, comments)[1])
         self.assertEqual(box.called("claude"), [])
+
+    def test_a_handback_newer_than_the_ledger_land_or_untimed_stands(self):
+        """Opus read of #1673: perms records few FIXes, so its HANDBACK marker posted at this head after its ledger
+        LAND (or in the same second, or with a time that does not parse) is its word, and the LAND clears nothing."""
+        self.box(claude=claude_says("LAND"))
+        j = self.sec_job(self.PATHS[0])
+        for back_at, land_at in (("2026-10-20T12:00:00Z", "2026-10-20T11:00:00Z"),
+                                 ("2026-10-20T11:00:00Z", "2026-10-20T11:00:00Z"),
+                                 ("not a time", "2026-10-20T11:00:00Z"), ("2026-10-20T10:00:00Z", None)):
+            back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head=j.head, by="perms-security-read",
+                                at=back_at)
+            self.reads([self.rec(j, at=land_at)])
+            self.assertEqual(R.review(j, comments=[back]).verdict, T.HANDBACK_VERDICT, back_at)
+            self.assertEqual(R.delta_review(j, R.imported(back["body"]), comments=[back]).verdict,
+                             T.HANDBACK_VERDICT, back_at)
+            self.assertIsNotNone(R.standing(j, comments=[back]), back_at)
+            self.assertIn("a security HANDBACK", R.would_read(j, [back])[1], back_at)
 
     def test_a_ledger_land_at_an_old_head_or_only_carried_leaves_the_handback(self):
         back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")

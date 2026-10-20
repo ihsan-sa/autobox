@@ -35,7 +35,8 @@ row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the 
 WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> INCOMPLETE, nothing read or landed:
 a handback recorded there cannot be ruled out. A HANDBACK by perms' security reader (security_reader(): exactly
 perms-security-read) stands, at any head, until a later LAND by that reader at its head or the PR's head now
-(open_security()), or perms' ledger holds its LAND of the PR's head now (_security_open()); while it stands the
+(open_security()), or perms' ledger holds its LAND of the PR's head now, recorded at a later second than the
+HANDBACK comment was posted (_security_open(); a time that does not parse clears nothing); while it stands the
 verdict is that HANDBACK and no read is bought, because no read the lander buys is a security reader's. A recorded
 verdict at the digest (or the legacy digest, which kept the hunk tail) is returned as it is: the newest, except
 that a LAND at the PR's exact head is not replaced by a later HANDBACK the lander's own readers wrote (recorded(),
@@ -520,6 +521,7 @@ def open_security(comments, head):
             continue
         if v.verdict == T.HANDBACK_VERDICT:
             found = v
+            found.extra["at"] = c.get("createdAt") or ""
         elif v.verdict == T.LAND and found:
             at = v.extra.get("head", "")[:12]
             if at and at in (found.extra.get("head", "")[:12], now):
@@ -1631,10 +1633,16 @@ def _unread(job):
 def _security_open(job, comments):
     """open_security(), unless perms' ledger holds its LAND of this exact head (perms_recorded at keys() of the
     job's diff): #1198's handback stood from an old head over perms' LAND at the head now, because no
-    LAND marker named that head. A LAND only carried from an earlier head (carried_from) clears nothing."""
+    LAND marker named that head. A LAND only carried from an earlier head (carried_from) clears nothing. Nor does a
+    LAND the HANDBACK was posted after or in the same second as (Opus read of #1673: perms records few FIXes, so a
+    later HANDBACK marker is its only word), and a time either side does not give (E.epoch_of 0) leaves it standing."""
+    from lander import events as E
     sec = open_security(comments, job.head)
     if sec and perms_recorded(job.repo, job.pr, job.head, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
-        return None
+        land = E.epoch_of(newest_reads(perms_reads(job.repo)[0], job.repo, job.pr)[job.head].get("at"))
+        back = E.epoch_of(sec.extra.get("at"))
+        if back and land and back < land:
+            return None
     return sec
 
 

@@ -66,9 +66,11 @@ import collections
 import contextlib
 import fcntl
 import glob
+import io
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -176,7 +178,18 @@ class Slack:
                                              or "redir=" in (r.geturl() if hasattr(r, "geturl") else "")):
                     return "Slack answered with a web page, not the file"
                 n = 0
-                with open(tmp, "wb", opener=in_dir(dfd)) as f:
+                # made fresh, never truncated in place: a hard link planted at the .part name would otherwise have
+                # the download written through it into whatever file it shares
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                with open(tmp, "xb", opener=in_dir(dfd)) as f:
+                    fs = os.fstat(f.fileno())
+                    if not stat.S_ISREG(fs.st_mode) or fs.st_nlink != 1:
+                        why = f"{tmp} is not a fresh file of its own, so nothing is written to it"
+                        print(f"cc-slack-history: {why}", file=sys.stderr)
+                        raise OSError(why)
                     os.fchmod(f.fileno(), 0o600)
                     while True:
                         b = r.read(1 << 20)
@@ -716,9 +729,16 @@ def users_of(sl):
 
 
 def locked():
-    """The pass lock, held for the life of the process, or None when another pass holds it."""
+    """The pass lock, held for the life of the process, or None when another pass holds it. OSError when .lock is
+    not a regular file: opened without blocking, so a FIFO planted there is refused rather than hanging the pass."""
     with at(hist()) as dfd:
-        fd = os.open(".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        try:
+            fd = os.open(".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+        except OSError as e:
+            raise OSError(f".lock in {hist()} is a link or not a regular file ({e.strerror})") from e
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f".lock in {hist()} is not a regular file")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
@@ -728,7 +748,11 @@ def locked():
 
 
 def run_pass(sl, budget, cap, owner):
-    fd = locked()
+    try:
+        fd = locked()
+    except OSError as e:
+        print(f"cc-slack-history: {e}; this pass did nothing", file=sys.stderr)
+        return 1
     if fd is None:
         print("cc-slack-history: another pass is running; this one did nothing")
         return 0
@@ -1023,11 +1047,40 @@ def selfcheck():
         lctx, lst = {"cap": FILE_CAP, "files": 0, "skips": 0}, {"skipped": []}
         part = keep_files(Slack("t"), {"files": [f("F2", 10)]}, "C0LNK", "proj", lctx, lst)[0]
         got = keep_files(Slack("t"), {"files": [f("F3", 10)]}, "C0LNK", "proj", lctx, lst)[0]
-        ok("a download's .part planted as a link is refused, and a file planted as a link is fetched again in its place",
-           "download failed" in part.get("skipped", "") and open(f"{out}/part").read() == "theirs"
+        ok("a download's .part planted as a link is replaced, not written through, and a file planted as a link is "
+           "fetched again in its place",
+           part.get("path") == "proj/C0LNK/files/F2-F2.png" and open(f"{out}/part").read() == "theirs"
            and got.get("path") == "proj/C0LNK/files/F3-F3.png" and open(f"{out}/file").read() == "theirs"
            and not os.path.islink(f"{hist()}/proj/C0LNK/files/F3-F3.png"))
-        if os.path.lexists(f"{hist()}/skipped.log"):       # the refused .part's own skip line, above
+        # perms on #1640: a .part planted as a hard link is made fresh, and a FIFO planted as .lock is refused unblocked
+        open(f"{out}/hard", "w").write("theirs")
+        os.link(f"{out}/hard", f"{hist()}/proj/C0LNK/files/F4-F4.png.part")
+        hard = keep_files(Slack("t"), {"files": [f("F4", 10)]}, "C0LNK", "proj", lctx, lst)[0]
+        ok("a download's .part planted as a hard link to another file leaves that file as it was",
+           hard.get("path") == "proj/C0LNK/files/F4-F4.png" and open(f"{out}/hard").read() == "theirs"
+           and os.stat(f"{out}/hard").st_nlink == 1)
+        os.mkfifo(f"{hist()}/.lock")
+        fsl, err = FakeSlack(convs, history, replies), io.StringIO()
+
+        class Hung(Exception):                    # not an OSError, which the open's own refusal would take it for
+            pass
+
+        def hung(*_):
+            raise Hung
+        old = signal.signal(signal.SIGALRM, hung)
+        signal.alarm(10)
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = run_pass(fsl, 10 ** 6, FILE_CAP, "UOWN")
+        except Hung:
+            rc = "hung"
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        ok("a FIFO planted as .lock ends the pass at once with a refusal on stderr, not a hang, and nothing is read",
+           rc == 1 and "not a regular file" in err.getvalue() and not fsl.log)
+        os.unlink(f"{hist()}/.lock")
+        if os.path.lexists(f"{hist()}/skipped.log"):
             os.unlink(f"{hist()}/skipped.log")
         os.symlink(f"{out}/log", f"{hist()}/skipped.log")
         try:
@@ -1365,8 +1418,6 @@ def selfcheck():
 
         # ── the report
         sl = FakeSlack(convs, history, replies, files_total={"C0PROJ": 4})
-        import contextlib
-        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             report(sl)
