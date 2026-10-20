@@ -1871,11 +1871,16 @@ def tick_path():
 
 def tick_env(env):
     """The environment a queued tick starts with: kept_env's allow-list of the caller's, HOME at the passwd home,
-    PATH at tick_path(), and XDG_RUNTIME_DIR / INVOCATION_ID as above."""
+    PATH at tick_path(), and XDG_RUNTIME_DIR / INVOCATION_ID as above. TMPDIR is the box's scratch on disk
+    (environment.d's 60-cc-tmp.conf), never the caller's: without it a lane's runs fell to /tmp, which dispatch's
+    fence masks, and main read red (2026-10-20)."""
     out = C.kept_env(env, PATH=tick_path())
     run = f"/run/user/{os.getuid()}"
     if os.path.isdir(run):
         out["XDG_RUNTIME_DIR"] = run
+    scratch = os.path.join(C.PASSWD_HOME, ".cc", "tmp")
+    if os.path.isdir(scratch):
+        out["TMPDIR"] = scratch
     if env.get("INVOCATION_ID"):
         out["INVOCATION_ID"] = env["INVOCATION_ID"]
     return out

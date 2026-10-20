@@ -3926,6 +3926,15 @@ class Branches(Fixture):
         self.assertEqual((env["LANG"], env["LC_CTYPE"], env["USER"], env["HOME"]),
                          ("C.UTF-8", "C.UTF-8", "owner", "/home/owner"))
 
+    def test_tick_env_tmpdir_is_the_box_scratch(self):
+        # a lane's runs must not fall to /tmp (dispatch's fence masks it), and a caller's TMPDIR never steers them
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        with mock.patch("lander.cards.PASSWD_HOME", home):
+            self.assertNotIn("TMPDIR", L.tick_env({"TMPDIR": "/tmp/own"}))
+            os.makedirs(os.path.join(home, ".cc", "tmp"))
+            self.assertEqual(L.tick_env({"TMPDIR": "/tmp/own"})["TMPDIR"], os.path.join(home, ".cc", "tmp"))
+
     def test_tick_path_puts_the_system_dirs_first(self):
         # a gh, git or claude a worker drops in ~/bin or ~/.local/bin must not shadow the system's (#862 review reads)
         with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
