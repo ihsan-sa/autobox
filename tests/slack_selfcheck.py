@@ -22,6 +22,8 @@ def run_selfcheck():
     # is what makes `cc-slack selfcheck` runnable on a bare clone with no ~/.cc and no network, which is what makes it
     # usable as a health probe and a ledger check-cmd.
     scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")
+    real_dev = f"{HOME}/dev"   # checked at the end: the run leaves no folder there (the `_` ones are parallel suites')
+    dev_before = set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()
     real_effects = Effects("selfcheck", dev=scratch_dev).install()
     # NOR DOES THE BOX'S OWN WORKSPACE TABLE (10-14: with SLACK_WORKSPACES in the host's config, a case that read it
     # through load_cfg asked Slack which workspace its fixture chat was in, and the run went red on the host alone).
@@ -11177,6 +11179,8 @@ def run_selfcheck():
           + ("; ".join(denied[:3]) if denied else "none"), not denied)
     check("selfcheck: it ran on a scratch ~/dev and put the real one back — this command has to work on a bare clone",
           DEV == f"{HOME}/dev" and EFFECTS.api_impl is slack_api and not os.path.exists(scratch_dev))
+    globals()["DEV"] = scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")   # the cases below still write ~/dev
+    real_effects.dev = scratch_dev   # …and every `was.install()` below hands this back, not the real one
     # A FIXTURE IS NOT A BOARD (owner, 2026-09-01): a `_cctest<pid>` board — a selftest suite's — beside a real one, each
     # with the waiting row and live question that put "w1 · push refused" on the NEEDS YOU list. Every tab input reads
     # boards through home_boards, so nothing the tab renders carries the fixture while the real board's row still shows.
@@ -13372,5 +13376,9 @@ def run_selfcheck():
         _door.update(root=None, t=None, map={}, last={}, logged=set())
         shutil.rmtree(rootK, ignore_errors=True)
 
+    shutil.rmtree(scratch_dev, ignore_errors=True); globals()["DEV"] = real_dev
+    leaked = sorted(n for n in (set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()) - dev_before
+                    if not n.startswith("_"))
+    check(f"selfcheck: the real ~/dev gained no folder (2026-10-20: ~/dev/r and repo0-2 were fixtures): {leaked}", not leaked)
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0

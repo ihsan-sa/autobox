@@ -3388,6 +3388,35 @@ class Ratchet(unittest.TestCase):
         self.assertTrue(RUN.no_new_reds(res("h", "setup ok\n" + t), base))
         self.assertTrue(RUN.no_new_reds(res("h", "== 4 passed in 0.1s ==\nnext suite\n" + t), base))
 
+    def test_a_coloured_or_crlf_tally_is_read_as_a_tally(self):
+        # Opus read of #1651: no form read a coloured tally, so main's tally in red, a new red, then main's tally
+        # plain read 3 against 3 and landed
+        res = lambda tree, text: T.Result(check="c", tree=tree, status=T.FAILED, secs=0.0, runner="box:x:y",
+                                          extra={"fails": RUN.fail_ids(text), **RUN.ran(text)})
+        t = "== 3 failed, 9 passed in 0.3s ==\n"
+        base = res("b", "setup ok\n" + t)
+        for red in ("\x1b[31m== 3 failed, 9 passed in 0.3s ==\x1b[0m\n", "\x1b[1m\x1b[31m== 3 failed\x1b[0m, "
+                    "\x1b[32m9 passed\x1b[0m\x1b[31m in 0.3s ==\x1b[0m\n", "\x1b]0;x\x07FAILED (failures=3)\n"):
+            head = res("h", red + "guard: broke y\n" + t)
+            self.assertFalse(RUN.no_new_reds(head, base), red)
+            self.assertFalse(head.extra["ends"], red)
+        # an open OSC eats nothing past its line, so the red after it is still there
+        self.assertFalse(RUN.ran("\x1b]0;x\nguard: broke y\n" + t + "guard: broke z\n")["ends"])
+        # nor past a bare \r: a red that holds on main still holds behind an open OSC and a carriage return
+        self.assertEqual(RUN.fail_ids("✗ a\n\x1b]0;x\r✗ new\n"), RUN.fail_ids("✗ a\n✗ new\n"))
+        self.assertFalse(RUN.no_new_reds(res("h", "✗ a\n\x1b]0;x\r✗ new\n"), res("b", "✗ a\n")))
+        self.assertFalse(RUN.ran(t + "\x1b]0;x\rguard: broke z\n")["ends"])
+        # a progress bar that redraws its tally with a bare \r is read where it ends, and a red after it holds
+        self.assertEqual(RUN.ran("== 1 failed in 0.1s ==\r== 3 failed in 0.3s ==\r")["failed"], 3)
+        self.assertFalse(RUN.ran("== 1 failed in 0.1s ==\r== 3 failed in 0.3s ==\rguard: broke z\n")["ends"])
+        # a CRLF tally is a tally: it ends the run and its count is read, so the honest repeat compares by count
+        crlf = res("h", "setup ok\r\n" + t.replace("\n", "\r\n"))
+        self.assertEqual((crlf.extra["failed"], crlf.extra["ends"]), (3, True))
+        self.assertTrue(RUN.no_new_reds(crlf, base))
+        self.assertFalse(RUN.no_new_reds(res("h", t.replace("\n", "\r\n") + "guard: broke y\r\n" + t), base))
+        # and a coloured ✗ names the same case as a plain one
+        self.assertEqual(RUN.fail_ids("\x1b[31m✗ a\x1b[0m\r\n"), RUN.fail_ids("✗ a\n"))
+
     def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
         store = self.store()
         run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})

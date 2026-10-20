@@ -508,11 +508,24 @@ TALLY_RES = (re.compile(rf"^=*\s*((?:{_PYTEST_WORD}, )*{_PYTEST_WORD}) in [\d.]+
 TALLY_PART_RE = re.compile(r"(\d+) (failed|errors?)\b|\b(failures|errors)=(\d+)")
 CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR>)|Segmentation fault|core dumped|"
                       r"^\s*(?:Killed|Aborted)\b|\bline \d+:\s+\d+ (?:Killed|Aborted)\b", re.M)
+# A terminal's escapes: CSI (colour, cursor), OSC (a title or link, ended by BEL or ST), and the two-byte rest. None
+# reaches past its line, and a \r ends one: an open OSC that ate to the next escape or across a \r could swallow a
+# red line
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b\r\n]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]")
+
+
+def plain(text: str) -> str:
+    """`text` with its terminal escapes gone and each \\r a line break. No form read a coloured tally, so a PR that
+    turned its suite's colour on printed main's tally in red, a new red, then main's tally plain, and read 3 against
+    3 (Opus read of #1651, 10-20). A \\r breaks the line as splitlines() already did for the ids, so a CRLF tally
+    is one and a tally a progress bar overwrote is read where it stands."""
+    return ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def ran(text: str) -> dict:
     """-> {"passes": its last `N passed`, else its count of pass lines; "failed": tally(text); "crash": a crash or
-    abort marker in it; "ends": ends(text)}."""
+    abort marker in it; "ends": ends(text)}, all read from plain(text)."""
+    text = plain(text)
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
     return {"passes": passes, "failed": tally(text), "crash": bool(CRASH_RE.search(text)), "ends": ends(text)}
@@ -553,9 +566,9 @@ def case_id(full: str) -> str:
 
 def fail_ids(text: str):
     """-> the sorted failing case ids `text` names ([] when it names none: the exit code is all there is), or None
-    past FAILS_CAP."""
+    past FAILS_CAP. Read from plain(text), so a red ✗ is the same id as a plain one."""
     got = set()
-    for ln in text.splitlines():
+    for ln in plain(text).splitlines():
         m = FAIL_ID_RE.match(ln)
         if not m or PASS_RE.search(ln):
             continue
