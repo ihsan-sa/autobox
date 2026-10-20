@@ -1188,6 +1188,10 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$m/board" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards" "$gw"; : >> "$sl/enabled"
   : > "$gw/config.worktree"
   [ -f "$H/.cc/boards/$h.json" ] || "$cb/cc-board" init "$h" "$dev" main >/dev/null 2>&1 || : > "$H/.cc/boards/$h.json"
+  # THE LOCK'S OTHER NAME IS THE MEMBER'S. $m/board is rw inside, so a link planted at $h.lock (../owner-workspace) would
+  # make this append, board_dir's open and every host cc-board create its target; whatever is not a plain file goes first
+  # (perms-38, 2026-10-20). A racer that re-plants it makes an empty file at most, which `granted` does not trust.
+  if [ -L "$m/board/$h.lock" ] || { [ -e "$m/board/$h.lock" ] && [ ! -f "$m/board/$h.lock" ]; }; then rm -rf "${m:?}/board/$h.lock"; fi
   : >> "$H/.cc/boards/$h.lock"
   board_dir "$h"
   B=(--die-with-parent --unshare-pid --clearenv
@@ -1290,7 +1294,8 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   # its subdirectories are bound, each at another path — so a session inside can neither plant it nor remove it: the
   # workspace's .cc/ is rw in here, which is why the marker is NOT beside .cc/member-workspace.
   # A WEB GRANT (cc-sandbox web) sits beside it in the same unreachable directory, for the same reason; owner wins.
-  own=""; if [ -f "$m/owner-workspace" ]; then own=owner; elif [ -f "$m/web-grant" ]; then own=web; fi
+  # Each counts only as the host wrote it (granted): a host open that followed a link the member planted makes no grant.
+  own=""; if granted "$m/owner-workspace"; then own=owner; elif granted "$m/web-grant"; then own=web; fi
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
   # THE OWNER'S OWN WORKSPACE reads what his worker reads: the shared docs and the whole knowledge base and register, ro
   # (shared_docs_bind, shared_lib_bind). Any other member keeps its own workspace's slice and none of the docs.
@@ -1642,6 +1647,11 @@ signout(){   # $1 workspace · $2 why — a deliberate sign-out, said as one: bl
     4) echo "cc-sandbox: could not blank $m/credentials.json — nothing was signed out" >&2; return 2;;
     *) echo "cc-sandbox: blanked $m/credentials.json but could not keep the reason beside it" >&2; return 2;; esac
   echo "cc-sandbox: signed $r out ($why). It does not revoke the login, and a running session can refresh itself back in, so stop the workspace's sessions too. #$r and the owner are told it was deliberate. Sign it back in with the login walk: cc-sandbox mint $r"; }
+granted(){   # $1 a host-side marker (owner-workspace, web-grant) → 0 when the HOST wrote it: a plain file, not a link, whose
+  # first line is the header own or web writes. A host open that followed a planted link makes an empty file, or a board,
+  # and neither is a grant (perms-38, 2026-10-20).
+  local l; [ ! -L "$1" ] && [ -f "$1" ] && IFS= read -r l < "$1" || return 1
+  case "${1##*/}:$l" in "owner-workspace:# the owner's own workspace:"*|"web-grant:# a web grant:"*) return 0;; esac; return 1; }
 own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked as his own, or the refusal says why. The mark
   # is one host-side file, ~/.cc/members/<repo>/owner-workspace: the host decides, and it is written where no session
   # inside can (build_member). It changes the ask baseline (settings_copy) and what is read, ro: the shared docs and the
@@ -1650,7 +1660,7 @@ own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked a
   handle_ok "$r" || return 2
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then mark it" >&2; return 2; }
-  [ -f "$m/owner-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already the owner's own workspace — nothing changed."; return 0; }
+  granted "$m/owner-workspace" && { echo "cc-sandbox: ~/dev/$r is already the owner's own workspace — nothing changed."; return 0; }
   mkdir -p "$m" && printf '%s\n%s\n' "# the owner's own workspace: its sealed sessions get no ask baseline (cc-sandbox own; docs/design-member-workspaces.md)" \
                                      "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/owner-workspace" \
     || { echo "cc-sandbox: could not write $m/owner-workspace — nothing was changed" >&2; return 2; }
@@ -1662,7 +1672,7 @@ web(){   # $1 workspace — a member workspace is granted WebFetch and WebSearch
   handle_ok "$r" || return 2
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — there is no sealed session there to grant the web to" >&2; return 2; }
-  [ -f "$m/web-grant" ] && { echo "cc-sandbox: ~/dev/$r already has the web — nothing changed."; return 0; }
+  granted "$m/web-grant" && { echo "cc-sandbox: ~/dev/$r already has the web — nothing changed."; return 0; }
   mkdir -p "$m" && printf '%s\n%s\n' "# a web grant: this workspace's sealed sessions do not ask about WebFetch or WebSearch; auto mode judges each call (cc-sandbox web)" \
                                      "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/web-grant" \
     || { echo "cc-sandbox: could not write $m/web-grant — nothing was changed" >&2; return 2; }
@@ -1887,7 +1897,7 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   # THE OWNER'S OWN WORKSPACE (cc-sandbox own) reads what his worker reads: the same docs and the whole knowledge base and
   # register, ro (shared_docs_bind, shared_lib_bind). The marker is host-side; it is removed after, so every case below
   # is the ordinary member it was.
-  : > "$H/.cc/members/$h/owner-workspace"
+  printf "# the owner's own workspace: selfcheck\n" > "$H/.cc/members/$h/owner-workspace"
   s1=$("$SELF" member "$h" t -- sh -c 'echo umem=$(for f in '"${SHARED_DOCS[*]}"'; do if [ -s ~/$f ]; then [ -w ~/$f ] && printf writable, || printf ro,; else printf none,; fi; done)
     ask=$(~/bin/cc-lib ask sbxsharedclaudemd 2>&1); echo libask=$(printf "%s\n" "$ask" | grep -c "^OUTCOME answered")/$(printf "%s\n" "$ask" | grep -c "↳ .* ~/CLAUDE.md\[")
     echo libro=$( (: > ~/.cc/library/owner/x || : > ~/.cc/library/workspace/x) 2>/dev/null && echo rw || echo ro)
@@ -2541,6 +2551,23 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   out=$(env HOME="$fh" "$SELF" member "$ho" -- sh -c 'rm -rf $HOME/.cc/members; echo gone=$([ -e $HOME/.cc/members/'"$ho"'/owner-workspace ] || echo yes)' 2>&1)
   t 'own: an owner session that removes the marker at its path removes nothing of the host'"'"'s — still marked, and its next launch still asks nothing' \
     "$(g gone)/$([ -f "$fh/.cc/members/$ho/owner-workspace" ] && echo marked || echo none)/$(env HOME="$fh" "$SELF" member "$ho" -- sh -c "$probe" 2>/dev/null | sed -n 's/^crosses=//p')" yes/marked/false,false,false,false
+  # ── NOR THROUGH ITS BOARD LOCK (perms-38). ~/.cc/boards is the member's own $m/board, rw inside, and the host's
+  #    ~/.cc/boards/<h>.lock links into it, so a relative link planted at <h>.lock would have the next launch's append
+  #    create $m/owner-workspace. The launch drops the link first, makes no marker, and the member still asks.
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'ln -sfn ../owner-workspace ~/.cc/boards/'"$h"'.lock && echo planted=$(readlink ~/.cc/boards/'"$h"'.lock)' 2>&1)
+  t 'own: a link a member plants at its board lock makes no marker on the next launch, which still asks, and the lock is a plain file again' \
+    "$(g planted)/$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>/dev/null | sed -n 's/^crosses=//p')/$([ -e "$fh/.cc/members/$h/owner-workspace" ] && echo marked || echo none)/$([ ! -L "$fh/.cc/members/$h/board/$h.lock" ] && [ -f "$fh/.cc/members/$h/board/$h.lock" ] && echo file)" \
+    ../owner-workspace/true,true,true,true/none/file
+  # …and a marker the host did not write is no marker: an empty file (what an open through a link makes) and a link to
+  #    a file that does carry the header both leave the member asking, for owner-workspace and web-grant alike.
+  printf "# the owner's own workspace: elsewhere\n# a web grant: elsewhere\n" > "$fh/elsewhere"
+  : > "$fh/.cc/members/$h/owner-workspace"; : > "$fh/.cc/members/$h/web-grant"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1); a1="$(g crosses)/$(g web)"
+  rm -f "$fh/.cc/members/$h/owner-workspace" "$fh/.cc/members/$h/web-grant"
+  ln -s "$fh/elsewhere" "$fh/.cc/members/$h/owner-workspace"; ln -s "$fh/elsewhere" "$fh/.cc/members/$h/web-grant"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1); a2="$(g crosses)/$(g web)"
+  rm -f "$fh/.cc/members/$h/owner-workspace" "$fh/.cc/members/$h/web-grant" "$fh/elsewhere"
+  t 'own: an empty marker and grant, then both as links to a file with the headers, are trusted by neither — the member asks every time'     "$a1 $a2" "true,true,true,true/true,true true,true,true,true/true,true"
   # ── A WORKSPACE GRANTED THE WEB, on a fixture of its own in the same HOME. `cc-sandbox web` is refused until the
   #    workspace marker exists, then makes one host-side file; that workspace's copy leaves WebFetch and WebSearch off
   #    the ask list and keeps every other entry of SBX_ASK — the member fixture above ('crosses', askn) is the same
@@ -2568,7 +2595,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     "$(g made)/$([ -e "$fh/.cc/members/$h/web-grant" ] && echo granted || echo none)/$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>/dev/null | sed -n 's/^web=//p')" yes/none/true,true
   # ── THE WORKER PATH GETS THE SAME COPY, on its own fixture in the same HOME — and a marker planted under
   #    ~/.cc/members/<repo> for a repo that is no member workspace changes nothing there: only build_member reads it.
-  mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" "$fh/.cc/members/$w" || return 1; : > "$fh/.cc/members/$w/owner-workspace"
+  mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" "$fh/.cc/members/$w" || return 1; printf "# the owner's own workspace: selfcheck\n" > "$fh/.cc/members/$w/owner-workspace"
   git -C "$fh/dev/$w" init -q -b main >/dev/null 2>&1 \
     && git -C "$fh/dev/$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init >/dev/null 2>&1 \
     && git -C "$fh/dev/$w" worktree add -q -b track/t "$fh/.cc/worktrees/$w/t" >/dev/null 2>&1 || return 1
