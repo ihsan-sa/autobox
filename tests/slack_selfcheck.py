@@ -252,6 +252,27 @@ def run_selfcheck():
         os.makedirs(f"{d}/wt/.cc"); open(f"{d}/wt/.cc/track", "w").write(f"{name}\nt1\n")
         check("detect: ~/dev/<repo> → repo", detect_target(d) == name and detect_target(f"{d}/wt/sub") == f"{name}/t1" if os.makedirs(f"{d}/wt/sub") is None else False)
         check("detect: ~/dev → box, ~ → box", detect_target(DEV) == "box" and detect_target(HOME) == "box")
+        # THE PERMISSION SEAT stands in ~/.cc/state/<repo>/perms under env -i (cc-perms), so no CC_SLACK_TARGET names it, and
+        # its Slack tools died at "no target for cwd". It is the repo's target (the daemon's hello check runs the same
+        # detect_target) under its own alias `perms`, so neither the repo's messages nor the box's DMs ever reach it.
+        realHomeP, cwdP, aliasP = HOME, os.getcwd(), os.environ.pop("CC_SLACK_ALIAS", None)
+        with tempfile.TemporaryDirectory(prefix="_selfcheck_home_") as thP:
+            try:
+                globals()["HOME"] = thP
+                seatP, otherP = f"{thP}/.cc/state/{name}/perms", f"{thP}/.cc/state/{name}/elsewhere"
+                os.makedirs(seatP); os.makedirs(otherP)
+                tgtP = (detect_target(seatP), detect_target(otherP), detect_target(f"{thP}/.cc/state/no-such-repo-zz/perms"))
+                os.chdir(seatP); chP = Channel(tgtP[0]).alias
+                os.chdir(otherP); chQ = Channel(name).alias
+            finally:
+                os.chdir(cwdP)
+                globals()["HOME"] = realHomeP
+                if aliasP is not None:
+                    os.environ["CC_SLACK_ALIAS"] = aliasP
+        check("detect: a permission seat's ~/.cc/state/<repo>/perms → that repo, with the alias `perms`; another state "
+              "dir and a repo with no ~/dev checkout name nothing",
+              tgtP[0] == name and valid_target(tgtP[0]) and chP == "perms" and chQ is None
+              and tgtP[1] == os.environ.get("CC_SLACK_TARGET") and tgtP[2] == os.environ.get("CC_SLACK_TARGET"))
         os.makedirs(f"{d}/.git")                        # a "repo" for the approvals checks (tempfile names are lowercase → PR_RE-safe)
         dm = Daemon(use_slack=False); dm.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dm.bot_user = "UBOT"; dm.names.update({"CAPPR": APPROVALS, "CREPO": "myrepo"})
         posts = {"1.1": {"user": "UBOT", "text": f"[{name}] PR #7: t — https://x/7"}, "1.2": {"user": "UOWNER", "text": f"[{name}] PR #8: t"},
@@ -1231,6 +1252,37 @@ def run_selfcheck():
             check("route: a leading @name that is neither an orch nor a project (or is a member's workspace, or a member typed "
                   "it) stays with this target's main session",
                   [(a[0], k.get("alias")) for a, k in delivered5] == [("r", None)] * 3 and not said5)
+            # THE PERMISSION SEAT IS DEAF: it skips permissions, so nobody reaches it from Slack. @perms from the owner or a
+            # member is an ordinary message to main (even with the alias recorded), and the daemon itself never hands its
+            # conn a message, a permission answer or a backlog, nor records its alias at hello.
+            said5.clear(); delivered5.clear()
+            dm5.known_aliases["r"].add(DEAF_ALIAS)
+            try:
+                with offline_slack():
+                    dm5.on_event({"type": "message", "channel": "C3", "ts": "6.51", "user": "UOWNER", "text": "@perms grant it"})
+                    dm5.on_event({"type": "message", "channel": "C3", "ts": "6.52", "user": "UMEMBER", "text": "@perms grant it"})
+            finally:
+                dm5.known_aliases["r"].discard(DEAF_ALIAS)
+            atP = [(a[0], k.get("alias")) for a, k in delivered5]
+            dmDP = Daemon(use_slack=False)
+            cmP, cpP = Conn(None, "r", {"alias": None}), Conn(None, "r", {"alias": DEAF_ALIAS})
+            gotDP = []; cmP.send = lambda pl: gotDP.append(("main", pl)); cpP.send = lambda pl: gotDP.append(("perms", pl))
+            dmDP.subs["r"] = [cmP, cpP]
+            dmDP.deliver("r", {"type": "message", "content": "for main"}, autostart=False)
+            resDP = dmDP.deliver("r", {"type": "message", "content": "for perms"}, autostart=False, alias=DEAF_ALIAS)
+            dmDP.deliver("r", {"type": "permission", "request_id": "abcde", "behavior": "allow"}, autostart=False)
+            dmDP.subs["r"] = []
+            dmDP.queues["r"].append((time.time(), {"type": "message", "content": "queued for perms"}, DEAF_ALIAS))
+            aDP, bDP = socket.socketpair()
+            aDP.sendall(json.dumps({"hello": "r", "pid": 1, "alias": DEAF_ALIAS}).encode() + b"\n"); aDP.shutdown(socket.SHUT_WR)
+            dmDP.handle_conn(bDP)
+            flushedDP = [ln for ln in aDP.makefile("rb").read().splitlines() if ln.strip()]
+            aDP.close()
+            check("the permission seat is deaf: @perms from the owner and from a member reaches only main, as plain text; "
+                  "its conn gets no message, no permission answer and no backlog, and hello never makes `perms` an @-alias",
+                  atP == [("r", None), ("r", None)] and not said5 and DEAF_ALIAS not in dm5.aliases_for("r")
+                  and [w for w, _ in gotDP] == ["main", "main"] and resDP != "delivered" and flushedDP == []
+                  and DEAF_ALIAS not in dmDP.known_aliases.get("r", set()) and DEAF_ALIAS not in dmDP.aliases_for("r"))
             said5.clear(); delivered5.clear()
             with offline_slack():
                 dm5.on_event({"type": "message", "channel": "C3", "ts": "6.6", "user": "UBOT", "text": "I told @ai-dev and @chip about it"})
@@ -3805,8 +3857,12 @@ def run_selfcheck():
           and split_orch("myrepo@") == ("myrepo@", None))
     dmL13 = Daemon(use_slack=False); dmL13.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     opened13, real_urlopen = [], urllib.request.urlopen
-    class FakeResp:
+    class FakeResp:                     # one body, then EOF: fetch_files streams until read() comes back empty
+        sent = False
         def read(self, n=None):
+            if self.sent:
+                return b""
+            self.sent = True
             return b"x"
         def __enter__(self):
             return self
@@ -3866,6 +3922,86 @@ def run_selfcheck():
           and len(meta13["file_paths"].split(",")) == 10
           and "files_missing" not in meta13b and "NOT saved" not in text13b and "img1.png, img2.png, img3.png — saved" in text13b
           and "files_missing" not in meta13c and "could not be downloaded" in text13c and "img1.png, img2.png" in text13c)
+    # ANY SIZE (owner 10-18: two ~700 MB screen recordings came back "could not be downloaded" at the old 50 MB cap).
+    # A file over FILE_INLINE streams to disk whole, in 1 MB reads; on_event leaves it for fetch_later, so the message
+    # is delivered at once naming the path and a follow-up says it landed; and a download that would leave under
+    # DISK_FLOOR free is refused with that reason in the line the session reads.
+    BIG13 = FILE_INLINE + 3 * 1024 * 1024 + 7
+    class FakeBig:
+        def __init__(self):
+            self.left, self.reads = BIG13, []
+        def read(self, n=None):
+            k = min(n or self.left, self.left); self.left -= k; self.reads.append(n)
+            return b"v" * k
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    bigF = {"id": "FBIG", "name": "screen recording.mov", "url_private": "https://files.slack.com/big", "size": BIG13}
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_files_") as td13c:
+        real_dir13, real_floor13, real_deliver13 = DIR, DISK_FLOOR, dmL13.deliver
+        fakes13, said13 = [], []
+        try:
+            globals()["DIR"] = td13c
+            urllib.request.urlopen = lambda req, timeout=None: fakes13.append(FakeBig()) or fakes13[-1]
+            dmL13.deliver = lambda target, payload, autostart=True, alias=None: said13.append((target, payload, autostart, alias))
+            with contextlib.redirect_stderr(io.StringIO()):
+                whole13 = dmL13.fetch_files([dict(bigF)], pairs=True)                 # no `later`: inline, whole
+                later13, f13 = [], dict(bigF)
+                inl13 = dmL13.fetch_files([f13], pairs=True, later=later13)          # the event path: left for later
+                opened_inline13 = len(fakes13)
+                meta13d = {"chat_id": "C1", "ts": "1.1"}
+                text13d = dmL13.attach("look", [f13], inl13, meta13d, None, later13)
+                dmL13.fetch_later(later13, "myrepo", "scout", dict(meta13d), None)
+                globals()["DISK_FLOOR"] = 1 << 62                                     # no filesystem has room for this
+                full13, fF13 = [], dict(bigF, id="FFULL")
+                gotfull13 = dmL13.fetch_files([fF13], pairs=True, later=full13)
+                textfull13 = dmL13.attach("look", [fF13], gotfull13, {}, None, full13)
+        finally:
+            urllib.request.urlopen = real_urlopen
+            globals()["DIR"], globals()["DISK_FLOOR"] = real_dir13, real_floor13
+            dmL13.deliver = real_deliver13
+            path13 = whole13[0][1] if whole13 else ""
+            size13 = os.path.getsize(path13) if path13 and os.path.exists(path13) else -1
+            size13b = os.path.getsize(later13[0][1]) if later13 and os.path.exists(later13[0][1]) else -1
+    check("fetch_files: NO SIZE CAP: a file over 50 MB is saved whole, streamed in 1 MB reads (owner 10-18) — L13",
+          len(whole13) == 1 and size13 == BIG13 and set(fakes13[0].reads) == {1 << 20})
+    check("fetch_files: on the event path a file over 50 MB is not downloaded inline; the message names the path it "
+          "will land at as still downloading, and fetch_later saves it whole and tells the same session it is on disk — L13",
+          inl13 == [] and opened_inline13 == 1 and len(later13) == 1 and later13[0][0] is f13
+          and meta13d.get("files_pending") == later13[0][1] and f"screen recording.mov → {later13[0][1]}" in text13d
+          and "still downloading" in text13d and "could not be downloaded" not in text13d and "file_paths" not in meta13d
+          and size13b == BIG13 and len(said13) == 1 and said13[0][0] == "myrepo" and said13[0][3] == "scout"
+          and said13[0][2] is False and "finished downloading" in said13[0][1]["content"]
+          and said13[0][1]["meta"].get("file_path") == later13[0][1] and "files_pending" not in said13[0][1]["meta"])
+    check("fetch_files: a download that would leave under 2 GB free is refused, and the session's line says why — L13",
+          gotfull13 == [] and full13 == [] and "not enough disk" in fF13.get("_why", "") and len(fakes13) == 2
+          and "could not be downloaded" in textfull13 and "not enough disk" in textfull13)
+    # A member's files dir is writable in its sandbox and a big file's path is announced before it opens (perms
+    # 10-20): a symlink planted at that name, or at the dir itself, is refused and its target stays untouched.
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_link_") as td13l:
+        os.makedirs(f"{td13l}/files"); os.makedirs(f"{td13l}/real")
+        victim13 = f"{td13l}/authorized_keys"
+        with open(victim13, "w") as fh:
+            fh.write("ssh-ed25519 KEEP\n")
+        os.symlink(victim13, f"{td13l}/files/x-FBIG-rec.mov")
+        os.symlink(f"{td13l}/real", f"{td13l}/linkdir")
+        refused13 = []
+        try:
+            urllib.request.urlopen = lambda req, timeout=None: FakeBig()
+            for p13 in (f"{td13l}/files/x-FBIG-rec.mov", f"{td13l}/linkdir/x-FBIG-rec.mov"):
+                try:
+                    dmL13.save_file(dict(bigF, size=1), bigF["url_private"], p13); refused13.append(False)
+                except OSError:
+                    refused13.append(True)
+        finally:
+            urllib.request.urlopen = real_urlopen
+        with open(victim13) as fh:
+            kept13 = fh.read()
+        linked13 = os.path.islink(f"{td13l}/files/x-FBIG-rec.mov") and os.listdir(f"{td13l}/real") == []
+    check("save_file: a symlink planted at the announced path (or the files dir) is refused, and its target is left "
+          "untouched (perms 10-20) — L13",
+          refused13 == [True, True] and kept13 == "ssh-ed25519 KEEP\n" and linked13)
     # -- A VOICE MEMO IS A MESSAGE (owner, 2026-09-05) --------------------------------------------------------------
     #    Fixtures only: a fake recording (bytes off a stubbed download) and a stubbed cc-voice. Nothing here loads a
     #    model, transcribes anything or spends: what is under test is the ROUTING — which file becomes text, what the
@@ -3888,7 +4024,12 @@ def run_selfcheck():
     CONDENSED = "Do the board change first, and tell me when the PR is up."
 
     class FakeAudioVM:
+        sent = False
+
         def read(self, n=None):
+            if self.sent:
+                return b""
+            self.sent = True
             return b"\x00\x00\x00\x1cftypM4A recording"
 
         def __enter__(self):
@@ -3955,6 +4096,16 @@ def run_selfcheck():
               ranVM == [[f"{BIN}/cc-voice", "text", audioVM]] and os.path.dirname(audioVM) == f"{tdVM}/files"
               and open(audioVM + ".txt").read().strip() == SPOKEN
               and open(audioVM, "rb").read().startswith(b"\x00\x00\x00\x1cftyp"))
+        # A PLANTED LINK. A member can drop <memo>.txt as a link to an owner file while the memo transcribes; the
+        # owner-run daemon must replace the link with the transcript, never write through it.
+        plantVM, victimVM = f"{tdVM}/files/planted.m4a", f"{tdVM}/victim"
+        open(plantVM, "wb").write(b"memo"); open(victimVM, "w").write("owner's own\n")
+        os.symlink(victimVM, plantVM + ".txt")
+        with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
+            dmVM.voice_pass(plantVM, "CV", "9.2", "myrepo")
+        check("a transcript whose name a member planted as a link replaces the link and leaves its target alone",
+              open(victimVM).read() == "owner's own\n" and not os.path.islink(plantVM + ".txt")
+              and open(plantVM + ".txt").read().strip() == SPOKEN)
         # THE CHANNEL MUST NOT GO DEAF. on_event runs on this chat's own single-thread executor, so a transcription
         # taken inline would queue everything behind it for a minute — `!stop` and a `yes <id>` included. Held here
         # inside the transcriber, the memo is still in flight while the next typed message goes straight through.
@@ -10060,7 +10211,7 @@ def run_selfcheck():
     dmF.deliver = lambda target, payload, **k: gotF.append((target, payload)) or "delivered"
     dmF.say = lambda chat, text, thread=None, mail=True, **_k: None
     dmF.arm = lambda *a, **k: None; dmF.owner_spoke = lambda *a, **k: None
-    def fetchF(files, member=None, pairs=False):   # what the daemon really wrote, out here
+    def fetchF(files, member=None, pairs=False, later=None):   # what the daemon really wrote, out here
         fseen.append(member)
         got = [(f, f"{member_dir(member)}/files/{n}" if member else f"{DIR}/files/{n}") for f, n in zip(files, fnames)]
         return got if pairs else [p for _, p in got]
@@ -10100,7 +10251,7 @@ def run_selfcheck():
         dmS.say = lambda chat, text, thread=None, mail=True, **_k: None
         dmS.arm = lambda *a, **k: None; dmS.owner_spoke = lambda *a, **k: None
         dmS.route = lambda chat, ctype=None: rF
-        def fetchS(files, member=None, pairs=False):
+        def fetchS(files, member=None, pairs=False, later=None):
             fetched.extend(f.get("id") for f in files)
             share_case.files = [dict(f) for f in files]   # what fetch_files was handed, keys and all
             got = [(f, f"{DIR}/files/{f['id']}-{f.get('name')}") for f in files]

@@ -1469,6 +1469,17 @@ def owner_ask_rows(d, names=None, now=None):
             for a in sorted(rows, key=lambda a: -_home_num(a.get("at")))]
 
 MAX_UPLOAD = 25 * 1024 * 1024   # renders and screenshots, not archives
+FILE_INLINE = 50 * 1024 * 1024  # an inbound attachment bigger than this downloads off the event path (fetch_later)
+DISK_FLOOR = 2 * 1024 ** 3       # a download that would leave less free than this on its filesystem is refused
+
+class DiskFull(OSError):
+    pass
+
+def disk_room(d, size):
+    """Raises DiskFull when `size` more bytes in directory d would leave under DISK_FLOOR free there."""
+    left = shutil.disk_usage(d).free - size
+    if left < DISK_FLOOR:
+        raise DiskFull(f"not enough disk: {size / 1e6:.0f} MB would leave {max(left, 0) / 1e9:.1f} GB free, under the 2 GB floor")
 
 FILE_ID_RE = re.compile(r"(?<![A-Za-z0-9])F(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,12}(?![A-Za-z0-9])")   # a Slack file id, F0C8J66ST5H
 
@@ -2839,9 +2850,20 @@ def ask_project(cfg, ws, leaf, at=None):
         save_asked(asked)
     return ok, msg
 
+DEAF_ALIAS = "perms"   # the permission seat's subscription: its tools work, but the daemon hands it nothing (deliver, backlog, @-routing)
+
+def perms_seat_repo(cwd):
+    """The repo whose permission seat stands in `cwd` (~/.cc/state/<repo>/perms, where cc-perms starts it), else None."""
+    m = re.fullmatch(re.escape(f"{HOME}/.cc/state/") + r"([A-Za-z0-9_][A-Za-z0-9_.\-]*)/perms", os.path.realpath(cwd or "/"))
+    return m.group(1) if m and os.path.isdir(f"{DEV}/{m.group(1)}") else None
+
 def detect_target(cwd=None):
-    """Target of the session whose cwd this is: track worktree marker → repo/track; ~/dev/<repo> → repo; ~/dev or ~ → box."""
+    """Target of the session whose cwd this is: track worktree marker → repo/track; ~/dev/<repo> → repo; ~/dev or ~ → box;
+    a permission seat's ~/.cc/state/<repo>/perms → repo (its Channel takes the alias `perms`, so the repo's own traffic
+    and the box's DMs never reach it; cc-perms starts it under env -i, so no CC_SLACK_TARGET could name it)."""
     d = os.path.realpath(cwd or os.getcwd())
+    if perms_seat_repo(d):
+        return perms_seat_repo(d)
     x = d
     while x and x != "/":
         if os.path.isfile(f"{x}/.cc/track"):
@@ -5489,14 +5511,14 @@ class Daemon:
                     peers = [x for x in self.subs[target] if (x.info.get("alias") or None) == alias]
                     # each entry waits for its own alias (main's backlog isn't an orch's); the muted half of a
                     # handoff gets none of it — that goes to the promoted conn once the live session is gone.
-                    backlog = [e for e in (q or []) if e[2] == alias] if conn in self.live_conns(target, peers) else []
+                    backlog = [e for e in (q or []) if e[2] == alias] if conn in self.live_conns(target, peers) and alias != DEAF_ALIAS else []
                     if stop:   # under tier stop a seat coming up hears the owner, and the rest waits
                         backlog = [e for e in backlog if e[1].get("steer")]
                     for e in backlog:
                         q.remove(e)
                     self.save_queues()
                 note_handover(target, alias)   # @target/@alias stay handover vocabulary, never linkified into a person
-                if alias:                       # a join/leave is the log's, never a post (owner's review, 2026-09-20: machine chatter)
+                if alias and alias != DEAF_ALIAS:   # a join/leave is the log's, never a post (owner's review, 2026-09-20: machine chatter); the deaf alias is never @-addressable
                     self.known_aliases[target].add(alias)
                 log(f"subscribe {target} alias={alias}{' handoff=' + hid if hid else ''} pid={first.get('pid')} backlog={len(backlog)}")
                 for t, payload, _a in backlog:
@@ -5766,7 +5788,9 @@ class Daemon:
             return "stopped"
         every = payload.get("type") == "permission"   # the prompt can come from any alias — answer them all, one of them is waiting
         with self.lock:
-            conns = [c for c in self.subs.get(target, []) if every or (c.info.get("alias") or None) == alias]
+            # the permission seat skips permissions, so nothing from Slack reaches it, not even a permission answer (DEAF_ALIAS)
+            conns = [c for c in self.subs.get(target, []) if c.info.get("alias") != DEAF_ALIAS
+                     and (every or (c.info.get("alias") or None) == alias)]
         conns = self.live_conns(target, conns)        # …but never the muted half of a handoff, whatever it asked
         sent = 0
         for conn in conns:
@@ -6168,8 +6192,8 @@ class Daemon:
 
     def aliases_for(self, target):
         """Aliases whose @token we honour: this daemon life's subscribers plus every live orch channel's, read from disk so routing survives a daemon restart."""
-        return set(self.known_aliases.get(target, ())) | {e["alias"] for e in load_orchs().values()
-                                                          if e.get("alias") and not e.get("archived") and e.get("target") == target}
+        return (set(self.known_aliases.get(target, ())) | {e["alias"] for e in load_orchs().values()
+                                                           if e.get("alias") and not e.get("archived") and e.get("target") == target}) - {DEAF_ALIAS}
 
     def project_seat(self, repo, tok):
         """The project an @token names when no live orch of <repo> wears it, else None. An orch channel can outlive its
@@ -6487,18 +6511,22 @@ class Daemon:
             meta["files_unread"] = ",".join(i for i, _ in unread)
             text = (text + "\n" if text else "") + ("[shared file " + "; ".join(f"{i} ({why})" for i, why in unread)
                                                     + " — the box could not fetch it, so ask for it to be uploaded here]")
+        big = []                                                  # files over FILE_INLINE: named now, fetched by fetch_later after hand_off
         if files:
-            got = self.fetch_files(files, ws, pairs=True)   # a member's attachments land in its own dir (boundary's ~/.cc/slack/files)
+            got = self.fetch_files(files, ws, pairs=True, later=big)   # a member's attachments land in its own dir (boundary's ~/.cc/slack/files)
             meta["files"] = str(len(files))
             # a voice memo is the message, not an attachment, and takes ~45s to read (cc-voice) — too long for on_event's single-thread executor, which would stall every later message behind it. voice_soon transcribes it off-thread and hands it over when ready, at the price that a memo can arrive after a message typed right after it.
             memo = next(((f, p) for f, p in got if is_voice_memo(f)), None)
             if memo:
                 react(self.cfg, chat, ts, "eyes")          # so they see it landed while the box keeps listening
                 threading.Thread(target=self._safe, args=(self.voice_soon, memo[1], files, got, text, meta,
-                                                          chat, thread, ts, target, route_alias, ws), daemon=True).start()
+                                                          chat, thread, ts, target, route_alias, ws, big), daemon=True).start()
                 return
-            text = self.attach(text, files, got, meta, ws)
-        return self.hand_off(target, text, meta, chat, thread, ts, route_alias)
+            text = self.attach(text, files, got, meta, ws, big)
+        res = self.hand_off(target, text, meta, chat, thread, ts, route_alias)
+        if big:
+            threading.Thread(target=self._safe, args=(self.fetch_later, big, target, route_alias, dict(meta), ws), daemon=True).start()
+        return res
 
     def poke_loop(self, ev):
         """A person's post (not a bot, not ours, not an edit or delete; a thread reply counts) pokes the hive loop
@@ -6590,17 +6618,26 @@ class Daemon:
             log(f"ask {repo}: {why}")
             self.say(chat, f"no answer this time ({why}) — ask again, or ask in #{repo}", thread)
 
-    def attach(self, text, files, got, meta, ws):
+    def attach(self, text, files, got, meta, ws, later=()):
         """The `[attached: …]` line and paths for a message's ordinary files (everything a voice memo isn't); `files` is
         what to name, `got` the (file, path) pairs that actually arrived. "an inbound message with ten files saves ten
         or reports the gap in the same object the session reads" (the brief): a file named but not saved is listed as
-        NOT saved in this line and in files_missing, so a partial set is never read as the whole."""
+        NOT saved in this line and in files_missing, so a partial set is never read as the whole. `later` are the
+        (file, path) pairs still downloading (fetch_later): named with the path each will land at, in files_pending."""
         if not files:
             return text
         paths = [p for _, p in got]
-        missing = [flat_name(f.get("name")) for f in files if not any(f is g for g, _ in got)]
+        missing = [flat_name(f.get("name")) + (f" ({f['_why']})" if f.get("_why") else "")
+                   for f in files if not any(f is g for g, _ in [*got, *later])]
+        if later:
+            soon = [member_files_inside(ws, p) if ws else p for _, p in later]
+            meta["files_pending"] = ",".join(soon)
+            text += ("\n[still downloading (over 50 MB): " + ", ".join(f"{flat_name(f.get('name'))} → {p}" for (f, _), p in zip(later, soon))
+                     + " — not on disk yet; a follow-up message says when each one is, or that it failed]")
+            if not paths and not missing:
+                return text
         if not paths:
-            return text + f"\n[attached: {', '.join(missing)} — could not be downloaded (files:read scope? size > 50 MB?)]"
+            return text + f"\n[attached: {', '.join(missing)} — could not be downloaded (files:read scope? not enough disk? download failed?)]"
         # a session is told to Read these paths, so it must see the one it can reach: a member gets the in-boundary path, never the host dir that doesn't exist inside
         inside = [member_files_inside(ws, p) for p in paths] if ws else paths
         meta["file_path"], meta["file_paths"] = inside[0], ",".join(inside)
@@ -6609,10 +6646,10 @@ class Daemon:
             return text + f"\n[attached: {names} — saved on the box, paths in file_paths]"
         meta["files_missing"] = ",".join(missing)
         return text + (f"\n[attached: {names} — {len(paths)} of {len(files)} saved on the box, paths in file_paths; the rest "
-                       f"are named in files_missing and are not on disk (download failed, over 50 MB, or an external link), "
+                       f"are named in files_missing and are not on disk (download failed, not enough disk, or an external link), "
                        f"so do not brief work on them — ask for them again]")
 
-    def voice_soon(self, path, files, got, text, meta, chat, thread, ts, target, alias, ws):
+    def voice_soon(self, path, files, got, text, meta, chat, thread, ts, target, alias, ws, later=()):
         """Transcribes off the executor (voice_pass), then hands the message to on_event's own path: same target, thread, alias and pause rules, so deliver() still decides and a parked project still queues. Transcribed, the memo becomes the text (its own `voice_path`, transcript at `+".txt"`) and `[attached: …]` names only the other files. Untranscribed, it's an ordinary attachment, and the line says what can open an .m4a."""
         said, _ = self.voice_pass(path, chat, thread, target)
         if said:
@@ -6623,13 +6660,15 @@ class Daemon:
             spoke = next((f for f, p in got if p == path), None)
             files = [f for f in files if f is not spoke]
             got = [(f, p) for f, p in got if p != path]
-        out = self.attach(text, files, got, meta, ws)
+        out = self.attach(text, files, got, meta, ws, later)
         # an unread recording — parked project, no transcriber, a failed call, or a second memo — is an .m4a no session can open, so the line says what opens it
         unread = [member_files_inside(ws, p) if ws else p for f, p in got if is_voice_memo(f)]
         if unread:
             how = " · ".join(f"`cc-voice text {p}`" for p in unread)
             out += f"\n[audio, not text — {how} reads it; `cc-voice install` first if that has not been done]"
         self.hand_off(target, out, meta, chat, thread, ts, alias)
+        if later:                                          # already off the executor, so the big files download right here
+            self.fetch_later(later, target, alias, dict(meta), ws)
 
     def hand_off(self, target, text, meta, chat, thread, ts, alias=None):
         """Hands the message to the session; the tail every inbound message ends in. Says something only when no answer
@@ -7471,17 +7510,19 @@ class Daemon:
             out.append(info)
         return out, unread
 
-    def fetch_files(self, files, member=None, pairs=False):
-        """Downloads every Slack attachment on the message (≤50 MB each; no count cap, owner 10-16) to ~/.cc/slack/files (or a member's own dir);
+    def fetch_files(self, files, member=None, pairs=False, later=None):
+        """Downloads every Slack attachment on the message (any size, owner 10-18; no count cap, owner 10-16) to ~/.cc/slack/files (or a member's own dir);
         returns saved paths, or with pairs=True, (file, path) pairs — needed since a skipped/failed download
-        leaves no path, and a plain zip of the two lists would misalign by one."""
+        leaves no path, and a plain zip of the two lists would misalign by one. With a `later` list, a file over
+        FILE_INLINE is not downloaded here but appended to it as (file, path) for fetch_later, so a 700 MB recording
+        never holds on_event's single-thread executor. A file refused for disk room carries its reason in f["_why"]."""
         tok = self.cfg.get("SLACK_BOT_TOKEN"); out = []
         fdir = f"{member_dir(member)}/files" if member else f"{DIR}/files"
         os.makedirs(fdir, exist_ok=True)
         self.prune_files()
         for f in files:
             url = f.get("url_private_download") or f.get("url_private")
-            if not (url and tok) or int(f.get("size") or 0) > 50 * 1024 * 1024:
+            if not (url and tok):
                 continue
             if f.get("mode") == "external":
                 log(f"file skipped ({f.get('name')}): external link, not a Slack upload"); continue
@@ -7492,14 +7533,65 @@ class Daemon:
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f.get("name") or "file")[:80]
             path = f"{fdir}/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{fid}-{safe}"
             try:
-                ftok = WS["extra"][f["_ws"]]["bot"] if f.get("_ws") in WS["extra"] else tok   # ws_ingress marks another workspace's files
-                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ftok}"})
-                with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as w:
-                    w.write(r.read(50 * 1024 * 1024 + 1))
+                if later is not None and int(f.get("size") or 0) > FILE_INLINE:
+                    disk_room(fdir, int(f.get("size") or 0))   # say it now, not after "still downloading"
+                    later.append((f, path)); continue
+                self.save_file(f, url, path)
                 out.append((f, path) if pairs else path)
+            except DiskFull as e:
+                f["_why"] = str(e); log(f"file refused ({f.get('name')}): {e}")
             except Exception as e:
                 log(f"file download failed ({f.get('name')}): {e}")
         return out
+
+    def save_file(self, f, url, path):
+        """Streams one attachment to `path` in 1 MB chunks, with no size cap: refused (DiskFull) when it would leave
+        under DISK_FLOOR free on that filesystem. A symlink at the dir or the name is refused (OSError), never followed.
+        A failed download leaves no partial file behind."""
+        disk_room(os.path.dirname(path), int(f.get("size") or 0))
+        tok = self.cfg.get("SLACK_BOT_TOKEN")
+        ftok = WS["extra"][f["_ws"]]["bot"] if f.get("_ws") in WS["extra"] else tok   # ws_ingress marks another workspace's files
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ftok}"})
+        # a member's files dir is writable in its sandbox and the path is announced before a big file opens, so a
+        # link planted at the dir or the name must be refused, never followed (perms 10-20)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        name = os.path.basename(path)
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(name, flags, 0o600, dir_fd=dfd)
+            except FileExistsError:   # the same file fetched twice in one second: replace a plain file, refuse a link
+                if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+                    raise
+                os.unlink(name, dir_fd=dfd)
+                fd = os.open(name, flags, 0o600, dir_fd=dfd)
+            try:
+                with os.fdopen(fd, "wb") as w, urllib.request.urlopen(req, timeout=60) as r:
+                    while chunk := r.read(1 << 20):
+                        w.write(chunk)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(name, dir_fd=dfd)
+                raise
+        finally:
+            os.close(dfd)
+
+    def fetch_later(self, later, target, alias, meta, ws):
+        """The files fetch_files left for later (over FILE_INLINE), downloaded off the event path one at a time. The
+        message itself was already delivered naming each path as still downloading; each file then gets a follow-up
+        message to the same session (deliver, as an edit note does), saying it is on disk or that it failed."""
+        for f, path in later:
+            name, shown = flat_name(f.get("name")), member_files_inside(ws, path) if ws else path
+            m = {k: v for k, v in meta.items() if k not in ("files_pending", "files_missing", "file_path", "file_paths")}
+            try:
+                self.save_file(f, f.get("url_private_download") or f.get("url_private"), path)
+                m["file_path"] = m["file_paths"] = shown
+                note = f"[attached: {name} finished downloading — saved on the box at {shown}]"
+            except Exception as e:
+                log(f"file download failed ({f.get('name')}): {e}")
+                m["files_missing"] = name
+                note = f"[attached: {name} did NOT download ({e}); nothing is at {shown}, so do not brief work on it — ask for it again]"
+            self.deliver(target, {"type": "message", "content": note, "meta": m}, autostart=False, alias=alias)
 
     def voice_pass(self, path, chat, thread, target):
         """A voice memo is a message: the reply under it carries the transcript + condensed text in italics.
@@ -7514,9 +7606,22 @@ class Daemon:
             return None, None
         raw = " ".join(d["transcript"].split())
         said = (d.get("condensed") or "").strip() or raw
-        try:                          # the transcript outlives the Slack post, beside the audio and pruned with it
-            with open(path + ".txt", "w") as fh:
-                fh.write(raw + "\n")
+        try:      # the transcript outlives the Slack post, beside the audio and pruned with it. A member can plant
+            # <memo>.txt as a link while the memo transcribes, so the name is made fresh: O_EXCL|O_NOFOLLOW under the
+            # dir's fd, and whatever already sits there (a re-transcription, or a link) is unlinked, never followed.
+            dfd, name = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC), \
+                os.path.basename(path) + ".txt"
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                try:
+                    fd = os.open(name, flags, 0o600, dir_fd=dfd)
+                except FileExistsError:
+                    os.unlink(name, dir_fd=dfd)
+                    fd = os.open(name, flags, 0o600, dir_fd=dfd)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(raw + "\n")
+            finally:
+                os.close(dfd)
         except OSError as e:
             log(f"voice: could not save the transcript beside {os.path.basename(path)} ({e})")
         echo = self.say(chat, voice_post(raw, said), thread)
@@ -9354,6 +9459,8 @@ class Channel:
     def __init__(self, target):
         self.target, self.cfg, self.link, self.daemon_ok = target, load_cfg(), None, None
         self.alias = os.environ.get("CC_SLACK_ALIAS") or None   # set by `cc <repo> --orch <alias>`: peer session, same target
+        if not self.alias and perms_seat_repo(os.getcwd()):
+            self.alias = DEAF_ALIAS   # the permission seat: the repo's target passes the hello check, and this alias is deaf in the daemon
         self.handoff = os.environ.get("CC_HANDOFF") or None     # set by `cc __runnext`: this is the successor session
         self.member = os.environ.get("CC_MEMBER_SANDBOX") == "1"   # in a workspace boundary: no token, socket is the member's scoped link
         self.link_started = False   # link starts only after notifications/initialized, else backlog is emitted pre-handshake and dropped
