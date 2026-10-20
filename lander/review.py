@@ -134,7 +134,9 @@ reads that file. Perms writes it in one of two ways, each run only from the perm
 each entry adds verdict LAND, read, model and at: `lander record <repo> <pr> LAND --by <who> --head <sha>` from the
 perms seat posts the marker and appends the entry for the PR's live head and change (read "perms" when <who> is
 perms or perms-*, else <who>), but only when <sha> is that live head in full 40-hex; without it the marker is
-posted and the ledger is not written. `perms-adopt` does the same for a finished `perms-read` (read naming its
+posted and the ledger is not written. A HANDBACK, LAND-AFTER-FIX or DO-NOT-LAND recorded the same way from the perms
+seat appends an entry with that word as its verdict (no full --head needed: it only holds), so a LAND perms later
+hands back at one head reads as handed back. `perms-adopt` does the same for a finished `perms-read` (read naming its
 file). Both append under a flock on .security-reads.lock beside the file. No other caller writes it.
 With no such record the answer is INCOMPLETE with extra host=True and security=True, which the lane sends to the planning seat as a query, and no read is bought, because none the lander
 buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_READER included, does not merge it.
@@ -2014,7 +2016,8 @@ def cmd_record(argv):
     """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]. A --by of `perms` or starting
     `perms-` (perms-security-read among them) is refused unless perms_seat_caller(): only the perms seat writes
     perms' name. No marker clears a security path; perms' ledger does (perms_recorded), and a LAND recorded from the
-    perms seat with --head at the PR's head in full goes there too (_perms_ledger)."""
+    perms seat with --head at the PR's head in full goes there too, as does any other verdict from that seat
+    (_perms_ledger)."""
     args, opts = [], {}
     it = iter(argv)
     for a in it:
@@ -2065,7 +2068,7 @@ def cmd_record(argv):
     # a second reader's LAND is posted too: lander-self needs an Opus read and a security read at one head
     if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
         print(f"lander record: {word} is already recorded for this change; nothing posted")
-        return _perms_ledger(job, seat, word, who, head)
+        return _perms_ledger(job, seat, args[2], who, head)
     if stands and stands.verdict == T.HANDBACK_VERDICT and word == T.LAND:
         print(f"lander record: HANDBACK stands for this change and LAND is looser; push the fix instead")
         return 1
@@ -2078,31 +2081,39 @@ def cmd_record(argv):
     C.log("recorded", repo, pr, verdict=word, by=re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]),
           head=job.head[:12], change=job.digest[:12] or "-")
     print(f"lander record: {word} recorded on PR #{pr} at {job.head[:12]}")
-    return _perms_ledger(job, seat, word, who, head)
+    return _perms_ledger(job, seat, args[2], who, head)
 
 
-def _perms_ledger(job, seat, word, who, head):
-    """The perms seat's LAND through `record` is its security read (perms_recorded), so it goes in perms' ledger in
-    the same step (#1523: a LAND marker by perms, and no ledger entry, was refused INCOMPLETE twice). Any other
-    caller, or any other verdict, writes nothing there. The entry is for job.head, the PR's head now, so it is
-    written only when --head names that head in full: with no --head, perms' read of an earlier head would stand in
-    the ledger for one it never read. The entry says `read: perms` only for perms' own name, but perms_recorded
-    ignores `read`, so a LAND recorded from the perms seat under any --by also counts as the security read: whoever
-    reads from that seat is within perms' trust. -> the exit code."""
-    if not (seat and word == T.LAND):
+def _perms_ledger(job, seat, said, who, head):
+    """The perms seat's verdict through `record` is its security read, so it goes in perms' ledger in the same step
+    (#1523: a LAND marker by perms, and no ledger entry, was refused INCOMPLETE twice). `said` is the word perms
+    passed (OLD_WORDS' key), and the entry keeps it. A HANDBACK, LAND-AFTER-FIX or DO-NOT-LAND is appended as a
+    non-LAND entry, so newest_reads sees a LAND that perms later handed back at the same head as handed back
+    (perms' follow-up to its LAND on #1584: with no entry, the older LAND stood). Any other caller writes nothing
+    there. The entry is for job.head, the PR's head now, so a LAND is written only when --head names that head in
+    full: with no --head, perms' read of an earlier head would stand in the ledger for one it never read. A non-LAND
+    needs no full --head: it only holds a head, and the marker it goes with is posted at job.head too. The entry
+    says `read: perms` only for perms' own name, but perms_recorded ignores `read`, so a LAND recorded from the
+    perms seat under any --by also counts as the security read: whoever reads from that seat is within perms'
+    trust. -> the exit code."""
+    if not seat:
         return 0
-    if not (SHA40.fullmatch(head) and head == job.head):
+    land = OLD_WORDS[said] == T.LAND
+    if land and not (SHA40.fullmatch(head) and head == job.head):
         print(f"lander record: perms' ledger was not written: pass --head with the full 40-hex sha of the head "
               f"you read (PR #{job.pr} is at {job.head}), and run this record again")
         return 1
     named = who.lower()
-    why = grant(job, "perms" if named == "perms" or named.startswith("perms-") else who, who)
+    why = grant(job, "perms" if named == "perms" or named.startswith("perms-") else who, who,
+                T.LAND if land else said)
     if why:
         print(f"lander record: the marker is on the PR, but perms' ledger {perms_reads_path(job.repo)} was not "
-              f"written ({why}), so a security path will not merge on it. Put that right and run this record again.")
+              f"written ({why}), so " + ("a security path will not merge on it" if land else
+                                         "an earlier LAND of this head may still stand there")
+              + ". Put that right and run this record again.")
         return 1
-    C.log("perms-recorded", job.repo, job.pr, head=job.head[:12], change=job.digest[:12])
-    print(f"lander record: perms' LAND of PR #{job.pr} at {job.head[:12]} is in its ledger")
+    C.log("perms-recorded", job.repo, job.pr, head=job.head[:12], change=job.digest[:12], verdict=said)
+    print(f"lander record: perms' {said} of PR #{job.pr} at {job.head[:12]} is in its ledger")
     return 0
 
 
@@ -2389,10 +2400,10 @@ def adoptable(job):
     return e, ""
 
 
-def grant(job, read, model):
-    """Append perms' ledger entry (perms_recorded's form) for perms' LAND of the job's head, `read` naming the read
-    it rests on, whole or not at all: a 0600 file swapped in by rename, in a seat dir reached through no symlink.
-    Callers check perms_seat_caller() first. -> why not, or ''."""
+def grant(job, read, model, verdict=T.LAND):
+    """Append perms' ledger entry (perms_recorded's form) for perms' `verdict` (LAND, or a word that holds) of the
+    job's head, `read` naming the read it rests on, whole or not at all: a 0600 file swapped in by rename, in a seat
+    dir reached through no symlink. Callers check perms_seat_caller() first. -> why not, or ''."""
     path = perms_reads_path(job.repo)
     seat = os.path.dirname(path)
     if not (SHA40.fullmatch(job.head or "") and job.digest):
@@ -2409,9 +2420,9 @@ def grant(job, read, model):
             if why and os.path.lexists(path):
                 return f"perms' ledger will not read ({why}); nothing written over it"
             last = newest_reads(have, job.repo, job.pr).get(job.head) or {}
-            if last.get("change") == job.digest and last.get("verdict", T.LAND) == T.LAND:
+            if last.get("change") == job.digest and last.get("verdict", T.LAND) == verdict:
                 return ""   # already the newest; a LAND after a FIX at this head is appended, so it stands
-            rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": T.LAND,
+            rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": verdict,
                    "read": read, "model": model, "at": C.now()}
             fd, tmp = tempfile.mkstemp(dir=seat, prefix=".", suffix=".tmp")   # 0600
             with os.fdopen(fd, "w") as f:

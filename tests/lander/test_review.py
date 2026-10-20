@@ -2638,7 +2638,7 @@ class TestPermsReads(Case):
         self.assertEqual(box.called("gh pr comment"), [])
         self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
 
-    def test_no_other_caller_and_no_handback_writes_perms_ledger(self):
+    def test_no_other_caller_writes_perms_ledger(self):
         for by in ("seat", "perms", "perms-security-read"):
             self.record_as(False, "LAND", "--by", by)
         self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
@@ -2647,9 +2647,43 @@ class TestPermsReads(Case):
         self.assertEqual(code, 0)
         self.assertEqual(len(box.called("gh pr comment")), 1)
         self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
-        self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--findings", "[security] x")[0], 0)
+        self.assertEqual(self.record_as(False, "HANDBACK", "--by", "seat", "--head", HEAD)[0], 0)
         self.assertFalse(os.path.lexists(R.perms_reads_path("demo")))
-        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+
+    # perms' follow-up to its LAND on #1584: a HANDBACK or DO-NOT-LAND from the seat is a non-LAND ledger entry
+    def test_a_perms_land_then_a_handback_at_one_head_reads_as_handed_back(self):
+        digest = R.change_digest(DIFF)
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
+        code, box = self.record_as(True, "HANDBACK", "--by", "perms", "--findings", "[security] x")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(box.called("gh pr comment")), 1)
+        self.assertEqual([(e["verdict"], e["head"], e["change"]) for e in self.ledger()],
+                         [("LAND", HEAD, digest), ("HANDBACK", HEAD, digest)])
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
+        self.assertEqual(R.newest_reads(self.ledger(), "demo", 7)[HEAD]["verdict"], "HANDBACK")
+        # run again (the marker already stands): one HANDBACK still
+        self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual(len(self.ledger()), 2)
+
+    def test_a_perms_handback_then_a_land_at_one_head_reads_as_landed(self):
+        digest = R.change_digest(DIFF)
+        self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["HANDBACK", "LAND"])
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
+
+    def test_a_perms_do_not_land_is_a_non_land_entry_that_holds(self):
+        digest = R.change_digest(DIFF)
+        code, box = self.record_as(True, "DO-NOT-LAND", "--by", "perms-security-read", "--head", HEAD)
+        self.assertEqual(code, 0)
+        self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
+        e, = self.ledger()
+        self.assertEqual({k: e[k] for k in ("repo", "pr", "head", "change", "verdict", "read")},
+                         {"repo": "demo", "pr": 7, "head": HEAD, "change": digest, "verdict": "DO-NOT-LAND",
+                          "read": "perms"})
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
 
     def test_a_perms_record_says_what_to_do_when_the_ledger_will_not_take_it(self):
         with open(R.perms_reads_path("demo"), "w") as f:
