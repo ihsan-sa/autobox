@@ -4,7 +4,9 @@ THE TREE. A run never touches a checkout. materialise() writes the tree's files 
 `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.gates.<repo>.<pr>.<rand>/head` (the shape cc-tmp-reap and `cc-sandbox member
 --tree` accept), makes it a git repo with one commit and proves `git write-tree` there equals the tree asked for
 (B1: the identity check greps a real work tree); given the base tree, the repo also holds it as refs/lander/base,
-for a check that compares against main (the guard's differential). The files are read out of the checkout's objects
+for a check that compares against main (the guard's differential), and a check PINNED names runs once more with
+main's copies of its pinned files laid over a fresh copy of the head, never the one its first pass ran in, when the
+head changed them (pins, pinned_head). The files are read out of the checkout's objects
 in a borrowed repo (git.borrowed) and every git there runs with git.blind_env(), so no config, attributes, filter or
 replace ref of the checkout's runs or shapes them. Everything under the run directory goes when the run ends.
 
@@ -83,6 +85,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -125,6 +128,13 @@ BLOCKED = "blocked-by-main"
 DEFERRED = "deferred"
 # materialise(base_tree=): the base (main at the PR's base_sha) as a commit in the check's repo
 BASE_REF = "refs/lander/base"
+# PINNED, perms' read of #1425: a check whose run file is one of these keys (under a manifest prefix) also runs with
+# these files as main has them at the PR's base, laid over the head tree, when the head changed any of them. The
+# guard's differential ran the PR's own guard-replay.sh and guard-probe.jsonl, so a PR could weaken the script or
+# drop probe rows and pass its own check; main's copies now judge the PR's guard too (pins, run).
+# A path may climb out of the prefix (the overlay's own box set, ../tests/...); one that leaves the tree pins nothing.
+PINNED = {"tests/guard-replay.sh": ("tests/guard-replay.sh", "tests/guard-probe.jsonl", "tests/guard-replay.jsonl",
+                                    "../tests/guard-replay-box.jsonl")}
 
 
 class Unrunnable(RuntimeError):
@@ -192,6 +202,111 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
     except (Unrunnable, OSError, subprocess.CalledProcessError, G.GitError) as e:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise e if isinstance(e, Unrunnable) else Unrunnable(f"could not write the tree out: {e}") from None
+
+
+def base_of(head: str) -> str:
+    """BASE_REF as the head repo holds it, read from its file (materialise writes it loose), never through git, whose
+    config the check ran with write access to; "" when there is none."""
+    try:
+        with open(os.path.join(head, ".git", *BASE_REF.split("/"))) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def base_kept(r: T.Result, head: str, want: str) -> T.Result:
+    """`r`, or FAILED when it passed and the check left BASE_REF (`want`, as materialise set it) moved or gone in its
+    head. Opus' read of #1453: a PR's cc-guard deleted the ref, guard-replay.sh skipped its differential and passed."""
+    if not want or r.status != T.PASSED or base_of(head) == want:
+        return r
+    r.status = T.FAILED
+    r.extra["why"] = (f"the check moved or deleted {BASE_REF} (main at the PR's base, {want[:12]}), which it may "
+                      "compare against, so its pass proves nothing")
+    return r
+
+
+def pins(repo_root: str, check: T.Check, cwd: str, base_tree: str, tree: str) -> dict:
+    """{path: (mode, bytes)} of the PINNED files of `check` that base_tree holds and `tree` holds otherwise (a
+    different blob or mode, or none), paths from the tree's root; {} when the check pins nothing, there is no other
+    side, or the base has no run file of its own to run (a base from before the script)."""
+    full = cwd + M.run_file(check.run)
+    key = next((k for k in PINNED if full == k or full.endswith("/" + k)), "")
+    if not key or not base_tree or base_tree == tree:
+        return {}
+    pre = full[:len(full) - len(key)]
+    out = {}
+    with G.Objects(repo_root) as o:
+        b, h = o.tree(base_tree), o.tree(tree)
+        for rel in PINNED[key]:
+            path = posixpath.normpath(pre + rel)
+            if path.startswith("../") or path == "..":
+                continue
+            e = o.entry(b, path)
+            if e is None or e[0] not in (b"100644", b"100755"):
+                if rel == key:
+                    return {}
+                continue
+            if o.entry(h, path) == e:
+                continue
+            kind, body = o.read(e[1])
+            if kind != b"blob":
+                raise G.GitError(f"{path} at {base_tree[:12]} is not a blob")
+            out[path] = (0o755 if e[0] == b"100755" else 0o644, body)
+    return out
+
+
+def lay_over(head: str, files: dict) -> None:
+    """Writes `files` ({path: (mode, bytes)}, pins) into the head work tree. A path whose directory resolves outside
+    head (a symlinked directory the head carries) is Unrunnable, and a file already there, a symlink too, is
+    replaced, never written through."""
+    root = os.path.realpath(head)
+    for path, (mode, body) in files.items():
+        dest = os.path.join(head, path)
+        d = os.path.dirname(dest)
+        os.makedirs(d, exist_ok=True)
+        if os.path.commonpath([root, os.path.realpath(d)]) != root:
+            raise Unrunnable(f"{path}: its directory resolves outside the tree, so main's copy cannot go there")
+        if os.path.lexists(dest):
+            if os.path.isdir(dest) and not os.path.islink(dest):
+                raise Unrunnable(f"{path} is a directory in the head, so main's copy cannot go there")
+            os.unlink(dest)
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.chmod(dest, mode)
+
+
+def pinned_head(repo_root: str, tree: str, label: str, base_tree: str, files: dict) -> tuple:
+    """-> (run_dir, head) for a PINNED check's second pass: `tree` written out afresh (materialise, with BASE_REF),
+    `files` (pins) laid over it, and write-tree of that work tree proved to be `tree` with exactly those files
+    replaced. Never the head the first pass ran in: the PR's own script ran there read-write and could have deleted
+    BASE_REF or planted files, so main's script would judge what the PR left behind. Raises Unrunnable."""
+    run_dir, head = materialise(repo_root, tree, label + ".pinned", base_tree)
+    try:
+        lay_over(head, files)
+        g, henv = ["git", "-C", head], G.blind_env()
+
+        def git(*argv, idx, inp=None):
+            return subprocess.run(g + list(argv), env=dict(henv, GIT_INDEX_FILE=os.path.join(run_dir, idx)),
+                                  input=inp, check=True, capture_output=True).stdout.decode().strip()
+
+        git("read-tree", tree, idx="pin.want")
+        for path, (mode, body) in sorted(files.items()):
+            blob = git("hash-object", "-w", "--stdin", idx="pin.want", inp=body)
+            git("update-index", "--add", "--cacheinfo", f"100{mode & 0o777:o},{blob},{path}", idx="pin.want")
+        want = git("write-tree", idx="pin.want")
+        git("add", "-A", "-f", idx="pin.got")
+        for ent in git("ls-tree", "-r", "-z", tree, idx="pin.got").split("\0"):
+            meta, _, path = ent.partition("\t")
+            if meta.startswith("160000 commit "):
+                git("update-index", "--add", "--cacheinfo", f"160000,{meta.split()[2]},{path}", idx="pin.got")
+        got = git("write-tree", idx="pin.got")
+        if got != want:
+            raise Unrunnable(f"the tree with main's pinned files laid over is {got}, not {want}")
+        return run_dir, head
+    except (Unrunnable, OSError, subprocess.CalledProcessError) as e:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise e if isinstance(e, Unrunnable) else Unrunnable(f"could not lay main's pinned files over: {e}") from None
 
 
 def tree_of(repo_root: str, rev: str) -> str:
@@ -582,8 +697,9 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
-    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen and as the check
-    repo's refs/lander/base (materialise). lane: a landing lane's run, whose slot ticket goes before a worker's
+    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen, as the check
+    repo's refs/lander/base (materialise), and where a PINNED check's files come from for its second pass, which runs
+    only when the head's own pass passed, in a head written out afresh (pinned_head), and whose red is the result. lane: a landing lane's run, whose slot ticket goes before a worker's
     (admission). first: main health's or a main-red fix's run,
     whose ticket goes ahead of every younger one (admission FIRST CLAIM)."""
     t0 = time.monotonic()
@@ -607,8 +723,15 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     except Unrunnable as e:
         return res(T.UNRUNNABLE, str(e))
     try:
+        pinned = pins(repo_root, check, cwd, base_tree, tree_sha)
+    except (OSError, G.GitError) as e:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return res(T.UNRUNNABLE, f"could not read main's pinned files: {e}")
+
+    def attempt(head: str, run_dir: str) -> T.Result:
         if kind != "laptop":
-            return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane, first)
+            return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane,
+                            first)
         # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
         # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
         # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
@@ -639,10 +762,41 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
             if not took:
                 r.extra["why"] = "; ".join(passed)
         return r
+
+    dirs = [run_dir]
+    try:
+        # a laptop run's head is a copy on the runner, so only a run here can be held to the base it was given
+        want = base_of(head) if kind != "laptop" else ""
+        r = base_kept(attempt(head, run_dir), head, want)
+        if not pinned or r.status != T.PASSED:
+            return r
+        # the head's own copies passed; main's (PINNED) now judge the same tree, written out afresh (pinned_head): the
+        # PR's script ran read-write in `head`. Off the box a runner proves the tree it gets by write-tree, which a
+        # laid-over tree is not, so that pass runs on the box
+        if kind == "laptop" and "box" not in {w.split(":")[0] for w in check.where}:
+            raise Unrunnable("main's pinned files run on the box only, and this check may not run there")
+        p_dir, p_head = pinned_head(repo_root, tree_sha, label, base_tree, pinned)
+        dirs.append(p_dir)
+        p_want = base_of(p_head)
+        if kind == "laptop":
+            p = _attempt(check, tree_sha, "box", "", p_head, p_dir, cwd, env_extra, alone, state, express, lane,
+                         first)
+        else:
+            p = attempt(p_head, p_dir)
+        p = base_kept(p, p_head, p_want)
+        names = sorted(pinned)
+        if p.status != T.PASSED:
+            p.extra["why"] = f"with main's {', '.join(names)}: {p.extra.get('why', '')}"
+            p.extra["pinned"] = names
+            return p
+        r.secs, r.cpu_secs = round(r.secs + p.secs, 2), round(r.cpu_secs + p.cpu_secs, 2)
+        r.extra["pinned"] = names
+        return r
     except Unrunnable as e:
         return res(T.UNRUNNABLE, str(e))
     finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,

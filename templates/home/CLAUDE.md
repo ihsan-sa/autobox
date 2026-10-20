@@ -1,7 +1,7 @@
 # <box> — headless home server, run by Claude Code sessions
 
 - **Look first:** `cc-lib ask`, Slack history and threads, the board, your journal.
-- **Ask:** permissions and refusals the `perms` session (`~/COMMS.md`); scope the planning seat; the owner only for the approval list, by Slack @-mention.
+- **Ask:** permissions, refusals and approval asks the `perms` session first (`~/COMMS.md`); scope the planning seat; the owner only for what perms rules "his", by Slack @-mention.
 - **Enough:** once the record answers, stop reading, answer, and say what you didn't check.
 - **Docs:** this file → `~/USAGE.md` · `~/COMMS.md` · `~/RUNBOOK.md` · `~/WORKING.md` (between tasks, spend) → `docs/`. Each level stands alone; never push detail up a level, so specs and versions don't go here.
 - **The box:** always on, no console, tmux as `<user>` (sudo), projects in `~/dev/`, `box-status`. Setup `~/dev/<control-repo>`: autobox, or a private repo with it as `core/` plus this box's overlay (`PRIVATE-OVERLAY.md`). The generic tree is public, so this box's identity never goes in it. Edit in the repo, commit, push.

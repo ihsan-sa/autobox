@@ -480,6 +480,14 @@ def run_selfcheck():
                           "owner asking for it by name (`!start`/`!restart`) still starts it",
                           st_ns == "no-session" and ran_ns == 0
                           and st_ask == "starting" and scalls[-1] == [f"{BIN}/cc", name, "t1"])
+                    # A TEST FIXTURE'S NAME NEVER STARTS A SESSION (09-26: three _cctest targets ran real Opus sessions
+                    # for 40 min to 2 h): queued and nothing run, an arriving message or the owner naming it alike.
+                    _popF, n_sf = EFFECTS.popen_impl, len(scalls)
+                    EFFECTS.popen_impl = lambda cmd, **k: scalls.append(cmd) or type("P", (), {"poll": lambda s: 0})()
+                    st_fx = Daemon.autostart(dm, "_cctest1"); st_fxa = Daemon.autostart(dm, "_cctest1/w1", asked=True)
+                    EFFECTS.popen_impl = _popF
+                    check("autostart: a suite fixture (_cctest<pid>, not this run's) target is 'queued' and runs nothing, asked or not",
+                          st_fx == "queued" and st_fxa == "queued" and len(scalls) == n_sf)
                 finally:
                     globals()["HOME"], globals()["DEV"] = _homeW, _devW
             dm.cmd_restart("slack", "C1", None)
@@ -4563,6 +4571,103 @@ def run_selfcheck():
     check("live-id: a card sent through the real submit() is found again under its own id (its ledger record carries "
           "`id`), so a crash retry of the same ask is that card, not a second one " + repr(li_sub[0]),
           li_sub[0] == idS and (li_sub[1] or {}).get("ts") == "6.6")
+    # A PERMISSION QUESTION REACHES THE PERMISSION SESSION FIRST (owner, 2026-10-05: "stuff often doesnt go to perms
+    # when it should"). reply(needs_owner, permission=true) from ANY seat — the control repo's own included — is one ask
+    # line in the permission session's ledger and mentions nobody; permission=false is today's route; left out on an
+    # ask that reads like a permission, nothing is posted until the session declares it. Its own fixture: a ledger root
+    # the real cc-refusals writes into, and seats of its own; cc-notify stays a stub.
+    role_pm = os.environ.pop("CC_ROLE", None); sent_pm, ran_pm, res_pm = [], [], {}
+    real_run_pm = EFFECTS.run_impl
+    root_pm = tempfile.mkdtemp(prefix="cc-slack-selfcheck-perms-"); os.makedirs(f"{root_pm}/ctlx/perms")
+    env_pm = dict(os.environ, CC_REFUSALS_ROOT=root_pm, CC_REFUSALS_CTL="ctlx", CC_REFUSALS_PERMS_LIVE="1",
+                  CC_REFUSALS_NOTIFY="/bin/false")
+    def run_pm(cmd, **kw):
+        ran_pm.append(list(cmd))
+        if cmd[0] == f"{BIN}/cc-refusals":
+            return subprocess.run(cmd, env=env_pm, **kw)
+        return types.SimpleNamespace(returncode=0, stdout="req-20261005T000000Z-1\n", stderr="")
+    ch_pc = Channel(CTL); ch_pt = Channel(f"{CTL}/some-track")       # the control seat, and a track of its repo
+    for c_pm in (ch_pc, ch_pt):
+        c_pm.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; c_pm.muted = lambda: False
+    lg_pm = []
+    try:
+        globals()["api"] = lambda method, token, **kw: (sent_pm.append(kw.get("text")) if method == "chat.postMessage" else None) or {"ts": "1"}
+        EFFECTS.run_impl = run_pm
+        res_pm["ctl"] = ch_pc.call("reply", {"chat_id": "C1", "text": "may I add Bash(npm test:*) to the allow rules?",
+                                             "thread_ts": "9.0", "needs_owner": True, "permission": True})
+        res_pm["track"] = ch_pt.call("reply", {"chat_id": "C1", "text": "the classifier refused git fetch, allow it?",
+                                               "needs_owner": True, "permission": True})
+        n_pm = len(ran_pm)
+        res_pm["dec"] = ch_pc.call("reply", {"chat_id": "C1", "text": "which token budget, A or B?", "needs_owner": True,
+                                             "permission": False})
+        res_pm["undecl"] = ch_pc.call("reply", {"chat_id": "C1", "text": "may I widen the settings.json allow list?",
+                                                "needs_owner": True})
+        res_pm["plain"] = ch_pc.call("reply", {"chat_id": "C1", "text": "prod or staging?", "needs_owner": True})
+        n_pm2 = len(ran_pm)
+        lg_pm = open(f"{root_pm}/ctlx/perms/refusals.jsonl").read().splitlines()
+        env_pm["CC_REFUSALS_CTL"] = "nobody"                              # no ledger in reach: the ask goes the usual way
+        res_pm["ctl_fb"] = ch_pc.call("reply", {"chat_id": "C1", "text": "may I add a curl rule?", "needs_owner": True, "permission": True})
+        res_pm["track_fb"] = ch_pt.call("reply", {"chat_id": "C1", "text": "may I read the token file?", "needs_owner": True, "permission": True})
+        # the permission session down, and a cc-notify that demoted the down-notice to a request (a track asked): the
+        # session is told the planning seat was told, never the owner
+        with open(f"{root_pm}/demoted", "w") as fh:
+            fh.write("#!/bin/sh\necho 'cc-notify: only the control seat asks the owner — this is a request to x' >&2\n")
+        os.chmod(f"{root_pm}/demoted", 0o755)
+        env_pm.update(CC_REFUSALS_CTL="ctlx", CC_REFUSALS_PERMS_LIVE="0", CC_REFUSALS_NOTIFY=f"{root_pm}/demoted")
+        res_pm["down"] = ch_pt.call("reply", {"chat_id": "C1", "text": "may I add a wget rule?", "needs_owner": True, "permission": True})
+    finally:
+        globals()["api"], EFFECTS.run_impl = real_api, real_run_pm
+        subprocess.run(["rm", "-rf", root_pm])
+        if role_pm is not None:
+            os.environ["CC_ROLE"] = role_pm
+    asks_pm = [json.loads(l) for l in lg_pm]
+    check("reply tool: a needs_owner declared permission:true — from the control repo's own seat and from a track — is an "
+          "ask line in the permission session's ledger (the control repo's, when the asker's repo has none), and the reply "
+          "goes out as written with no 🔒 and no mention; no cc-notify runs, and the session is told who answers it",
+          [(x.get("kind"), x.get("window"), x.get("member")) for x in asks_pm] == [("ask", CTL, False), ("ask", f"{CTL}/some-track", False)]
+          and asks_pm[0].get("text") == "may I add Bash(npm test:*) to the allow rules?" and asks_pm[0].get("where") == "C1 thread 9.0"
+          and sent_pm[:2] == ["may I add Bash(npm test:*) to the allow rules?", "the classifier refused git fetch, allow it?"]
+          and n_pm == 2 and all(c[0] == f"{BIN}/cc-refusals" for c in ran_pm[:2])
+          and all(res_pm[k][1] is False and "THE OWNER WAS NOT MENTIONED" in res_pm[k][0] and "permission session" in res_pm[k][0]
+                  for k in ("ctl", "track"))
+          and asks_pm[0].get("id", "?") in res_pm["ctl"][0])
+    check("reply tool: permission:false keeps today's route — the control seat's ask opens with 🔒 and his mention even when "
+          "its words read like a permission — and an UNDECLARED permission-shaped needs_owner posts nothing and comes back "
+          "asking for permission:true or false, while an undeclared ordinary one is untouched",
+          sent_pm[2:3] == ["🔒 <@UOWNER> which token budget, A or B?"]
+          and res_pm["undecl"][1] is True and "permission:true" in res_pm["undecl"][0] and "permission:false" in res_pm["undecl"][0]
+          and sent_pm[3:4] == ["🔒 <@UOWNER> prod or staging?"] and n_pm2 == n_pm)
+    # The perms-routing audit's replay cases (2026-10-04): 4 a skip-permissions launch path, 9 a classifier refusal,
+    # 23 a merge the lander's route "would refuse". Undeclared, each is held back and asked to declare; a plain
+    # decision is not.
+    check("reply tool: the audit's cases 4, 9 and 23, sent undeclared, are each held and asked to declare permission; "
+          "an ordinary decision is not",
+          all(undeclared_permission({}, t) for t in (
+              "may `cc` gain a launch path that starts a skip-permissions session?",
+              "The auto-mode classifier refused to let me start the film worker, so I haven't started it.",
+              "it changes a file that only the lander's own route may change, so the queue would refuse it"))
+          and not undeclared_permission({}, "prod or staging?")
+          and not undeclared_permission({"permission": False}, "the classifier refused it"))
+    check("reply tool: with the permission session down, a track's permission ask says who was told it is down — the "
+          "planning seat, when cc-notify made the notice a request — and never that the owner was",
+          "the planning seat was told it is down" in res_pm["down"][0] and "owner was told" not in res_pm["down"][0])
+    check("reply tool: a token or a credential is a permission word only beside key, secret, file or grant — a token "
+          "budget is a plain decision, a token file is not",
+          not undeclared_permission({}, "which token budget, A or B?")
+          and not undeclared_permission({}, "which credentials do you mean, the old or the new?")
+          and undeclared_permission({}, "may I read the token file?")
+          and undeclared_permission({}, "may I mint an API key credential?"))
+    check("reply tool: …and a permission ask the ledger does NOT take never pages the owner — the control seat's comes "
+          "back unsent as a failure it can retry, with nothing posted and no cc-notify run (review of #1028: it used to "
+          "fall through to ❓ and his mention), and a track's goes the usual way as the planner request `cc-notify --ask`",
+          res_pm["ctl_fb"][1] is True and "did not take it" in res_pm["ctl_fb"][0] and "not mentioned" in res_pm["ctl_fb"][0]
+          and "again" in res_pm["ctl_fb"][0]
+          and not any("may I add a curl rule?" in (t or "") for t in sent_pm)
+          and not any("UOWNER" in (t or "") for t in sent_pm[4:])
+          and sent_pm[4:5] == ["may I read the token file?"] and "DID NOT TAKE IT" in res_pm["track_fb"][0]
+          and "filed as a request" in res_pm["track_fb"][0]
+          and [c[0] for c in ran_pm[n_pm2:n_pm2 + 3]] == [f"{BIN}/cc-refusals", f"{BIN}/cc-refusals", f"{BIN}/cc-notify"]
+          and ran_pm[n_pm2 + 2][3] == "--ask")
     # A REPLY GOES WHERE THE QUESTION WAS ASKED, lanes or not: the tool posts to the chat_id off the tag and nothing
     # in the split touches it — the -updates routing lives in cmd_post's --route, which no reply ever goes through.
     sentL, roleL = [], os.environ.pop("CC_ROLE", None)
@@ -9285,6 +9390,22 @@ def run_selfcheck():
         EFFECTS.run_impl = real_run_rq
         rq_dec_posted = postedRQ[n_rq_end:]
         rq_dec_spool = sorted(os.listdir(f"{qs_dec}/carol")) if os.path.isdir(f"{qs_dec}/carol") else []
+        # …and a member's PERMISSION question goes to the permission session's ledger, marked as a member's, with nobody
+        # mentioned; left undeclared, a permission-shaped one is not posted at all
+        root_mp = tempfile.mkdtemp(prefix="cc-slack-selfcheck-perms-"); os.makedirs(f"{root_mp}/ctlx/perms")
+        env_mp = dict(os.environ, CC_REFUSALS_ROOT=root_mp, CC_REFUSALS_CTL="ctlx", CC_REFUSALS_PERMS_LIVE="1", CC_REFUSALS_NOTIFY="/bin/false")
+        ran_mp = []
+        EFFECTS.run_impl = lambda cmd, **kw: ran_mp.append(list(cmd)) or subprocess.run(cmd, env=env_mp, **kw)
+        n_mp = len(postedRQ)
+        r_mp = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.12", "needs_owner": True, "perm_ask": True,
+                       "text": "may my session get a token for the calendar API?"})
+        r_mp_und = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.13", "needs_owner": True,
+                           "text": "please add an allow rule for curl"})
+        EFFECTS.run_impl = real_run_rq
+        mp_posted = postedRQ[n_mp:]; del postedRQ[n_mp:]
+        lg_mp = f"{root_mp}/ctlx/perms/refusals.jsonl"
+        mp_lines = [json.loads(l) for l in open(lg_mp).read().splitlines()] if os.path.exists(lg_mp) else []
+        subprocess.run(["rm", "-rf", root_mp])
         # …and NEITHER of the two handles this dir hands the daemon may park it. The dir is bound rw inside the
         # member's boundary, so she can plant a FIFO at .queries.lock (a blocking open never returns) or simply hold
         # the lock (`flock .queries.lock sleep 1e9` — LOCK_EX never returns). Either one used to leak one hung
@@ -9356,6 +9477,28 @@ def run_selfcheck():
           and "<!channel>" not in ranRQ[0][-1] and "#carol" in ranRQ[0][-1]
           and "THE OWNER WAS NOT MENTIONED" in r_rq_dec.get("text", "")
           and "req-20260920T000000Z-7" in r_rq_dec.get("text", ""))
+    real_sr_mc, reqs_mc = sock_request, []
+    globals()["sock_request"] = lambda req, timeout=None: reqs_mc.append(dict(req)) or {"ok": True, "text": "sent"}
+    try:
+        ch_mc = Channel("carol")
+        for perm_mc in (True, False, None):
+            ch_mc.member_call("reply", {"chat_id": "CCAR", "text": "x", "needs_owner": True,
+                                        **({} if perm_mc is None else {"permission": perm_mc})})
+    finally:
+        globals()["sock_request"] = real_sr_mc
+    check("MEMBER boundary: the session's reply tool forwards `permission` to the socket as perm_ask, as declared — "
+          "true, false, or absent when the session left it out (`permission` itself is the socket's 🔐-answer verb)",
+          [r.get("perm_ask", "absent") for r in reqs_mc] == [True, False, "absent"]
+          and not any("permission" in r for r in reqs_mc))
+    check("MEMBER socket: a needs_owner declared permission:true is an ask line in the permission session's ledger, "
+          "marked as a member's (no authority) under the workspace's name, posted into her thread with no ❓ and no "
+          "mention; an undeclared permission-shaped one is refused unposted with the declare-it error",
+          r_mp.get("ok") is True and "THE OWNER WAS NOT MENTIONED" in r_mp.get("text", "")
+          and [(x.get("kind"), x.get("window"), x.get("repo"), x.get("member")) for x in mp_lines] == [("ask", "carol", "carol", True)]
+          and mp_lines[0].get("text") == "may my session get a token for the calendar API?" and mp_lines[0].get("where") == "#carol thread 3.0"
+          and len(ran_mp) == 1 and ran_mp[0][:2] == [f"{BIN}/cc-refusals", "ask"] and "--member" in ran_mp[0]
+          and [p[1] for p in mp_posted] == ["may my session get a token for the calendar API?"]
+          and r_mp_und.get("ok") is False and "permission:true" in r_mp_und.get("error", ""))
     check("MEMBER socket: a FIFO planted at the member's .queries.lock does NOT park the daemon — record_refusal_query "
           "runs on a cc-slackd handle_conn thread and that dir is bound rw inside her boundary, so a blocking open(2) "
           "of it never returns: one leaked, hung daemon thread per 🔐 reply and a reply that never answers. The open is "
@@ -10369,6 +10512,15 @@ def run_selfcheck():
     c = rc_case(text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it‮ ti trats" + run_card_tail("echo hi", sha_hi))
     check("run card: …and an RLO in the card's own words, with a clean command, runs nothing",
           rc_go(c) is None and not c["ran"] and "zero-width" in rc_log(c))
+    # SLACK STORES THE 👍 AS :+1: (every approved card said "not run", 09-27 to 09-30): the card as Slack hands it
+    # back runs, and one whose command is not the stored one still runs nothing.
+    c = rc_case(text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it"
+                + run_card_tail("echo hi", sha_hi).replace("Your 👍", "Your :+1:"))
+    check("run card: the card as Slack stores it, its 👍 written :+1:, runs", rc_go(c) == 0 and len(c["ran"]) == 1)
+    c = rc_case(text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it"
+                + run_card_tail("echo bye", sha_hi).replace("Your 👍", "Your :+1:"))
+    check("run card: …while a :+1: card showing another command runs nothing",
+          rc_go(c) is None and not c["ran"] and "does not end with" in rc_log(c))
     c = rc_case(cmd="echo a\tb\necho done")
     check("run card: …while a command with a tab and a newline in it runs", rc_go(c) == 0 and len(c["ran"]) == 1)
     # THE CARD AS SLACK HANDS IT BACK (raised-an-approved-run-card-is-not-the-bots-own): conversations.history gives the

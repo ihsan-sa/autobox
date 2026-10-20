@@ -131,11 +131,15 @@ if me == "gh":
         if rest and rest[1]:
             rows = d.get("statusCheckRollup") or []
             if rest[2] == "status":
-                out(0, json.dumps({"statuses": [{"context": r.get("context"), "state": (r.get("state") or "").lower(),
-                                                 "target_url": r.get("targetUrl")} for r in rows if "context" in r]}))
-            out(0, json.dumps({"check_runs": [{"name": r.get("name"), "status": (r.get("status") or "").lower(),
-                                               "conclusion": (r.get("conclusion") or "").lower() or None,
-                                               "details_url": r.get("detailsUrl")} for r in rows if "context" not in r]}))
+                st = [r for r in rows if "context" in r]
+                out(0, json.dumps({"total_count": len(st), "statuses": [
+                    {"context": r.get("context"), "state": (r.get("state") or "").lower(),
+                     "target_url": r.get("targetUrl")} for r in st]}))
+            cr = [r for r in rows if "context" not in r]
+            out(0, json.dumps({"total_count": len(cr), "check_runs": [
+                {"name": r.get("name"), "status": (r.get("status") or "").lower(),
+                 "conclusion": (r.get("conclusion") or "").lower() or None,
+                 "details_url": r.get("detailsUrl")} for r in cr]}))
         if rest:
             mc = d.get("mergeCommit") if d["state"] == "MERGED" else None
             out(0, json.dumps({"number": int(a[2]), "state": "open" if d["state"] == "OPEN" else "closed",
@@ -2117,6 +2121,45 @@ class Repair(Fixture):
         self.assertEqual(self.job().state, T.DEPLOY_PENDING)
         self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "show", "main:a/x"), "both")
         self.assertEqual(len(self.gos()), 1)   # the repaired head needed no second round
+
+    def test_the_rounds_push_requeues_the_held_pr_at_the_next_tick(self):
+        """2026-10-12: #998's round pushed and no queue line followed; it sat held until landing queued it by hand.
+        The tick watches a repair-held PR's branch as it watches a handed one, so the push alone requeues it."""
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        J.submit("demo", 1, chat="C1", ts="1.1")
+        self.land(repair=RP)
+        self.assertEqual(self.job().state, T.HELD)
+        self.assertEqual(TK.sweep_repairs(), [])   # no push yet: nothing
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/track/row-1")
+        subprocess.run(["git", "merge", "-q", "origin/main"], cwd=self.work, capture_output=True)
+        self.write(self.work, {"a/x": "both\n"})
+        self.git(self.work, "commit", "-qam", "merge main")
+        self.git(self.work, "push", "-q", "origin", "track/row-1")
+        self.assertEqual(len(TK.sweep_repairs()), 1)
+        self.assertEqual(TK.sweep_repairs(), [])   # the request already waiting does it; no second one
+        self.assertEqual([(r["who"], r["chat"]) for _, r in J.requests("demo")], [("repair push", "C1")])
+        self.assertIn("repair pushed", self.log())
+        self.land(repair=RP)   # not made due by hand: the request alone takes it up
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertEqual(len(self.gos()), 1)
+
+    def test_a_held_pr_no_round_was_started_for_is_not_watched(self):
+        for pr, why, r in ((1, "PR #1 conflicts with main: a/x — rebase it", {}),
+                           (2, "PR #2 conflicts with main: a/x — rebase round 1 of 2 dispatched in row-2",
+                            {"head": "c" * 40}),
+                           (3, "a draft", {"head": "e" * 40})):
+            j = self.held_job(pr, state=T.HELD)
+            j.extra.update(why=why, hold="pr")
+            J.save(j)
+            if r:
+                J.put_repair("demo", pr, r)
+        with mock.patch.object(G, "remote_head", lambda *a, **k: "f" * 40):
+            self.assertEqual(TK.sweep_repairs(), [])
+            J.put_repair("demo", 2, {"head": "e" * 40})   # the same job with a round at its head is watched
+            self.assertEqual(len(TK.sweep_repairs()), 1)
+        self.assertEqual([r["pr"] for _, r in J.requests("demo")], [2])
 
     def test_a_round_still_running_is_not_dispatched_again(self):
         self.pr(1, {"a/x": "pr\n"})

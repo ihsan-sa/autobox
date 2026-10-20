@@ -95,11 +95,11 @@ Otherwise the lander buys one:
     CC_LAND_REVIEW_MODEL, when set, is the only reader (the old single-read setting).
     A STAND-IN FOR A LIMITED READER (#1116 and #1128 held two hours on 10-17 while Astra sat at its ChatGPT usage
     limit). When a reader that is not claude's comes back with a usage or rate limit (why starting `limit`, as
-    ask_codex() reports codex_limit(): a nonzero exit and codex's own ERROR: or stream error: line, the echoed
-    prompt taken out first, so a diff saying "usage limit" never makes another fault a limit) and the plan names no
-    security path (plan.extra["security"] empty; a plan of None counts as unknown and gets none), one more claude
-    read, independent of the first (its own call, no context shared), stands in for it: CC_LAND_REVIEW_LIMIT_READER (the passwd home's config, like every CC_LAND_REVIEW
-    key), default the first claude reader on readers() (a value that is not a claude model turns the stand-in off).
+    ask_codex() reports when codex_limit() says so: a nonzero exit and an ERROR: or stream error: line of codex's
+    own, every line the prompt also holds dropped first, so PR text or a diff saying "usage limit" never makes
+    another fault a limit) and the plan names no security path (plan.extra["security"] empty; a plan of None counts
+    as unknown and gets none), one more claude read, independent of the first (its own call, no context shared),
+    stands in for it: CC_LAND_REVIEW_LIMIT_READER (the passwd home's config, like every CC_LAND_REVIEW key), default the first claude reader on readers() (a value that is not a claude model turns the stand-in off).
     Its Verdict carries extra stood_in_for (the limited reader) and stood_in_why (the limit text); the marker row
     says `<claude>`: VERDICT (stood in for `<reader>`, at its usage limit), its findings say "read by <claude> for
     <reader>", and the combined Verdict's extra stood_in lists each one, so the record shows the fallback. A stand-in that fails too is handled as that
@@ -410,11 +410,26 @@ def delta_files(root, base, old, new):
     return None if rc or "\ufffd" in out else sorted({p for p in out.split("\0") if p})
 
 
+def old_globs(root, base, old, repo):
+    """The security list as the base `old` was built on had it (its merge-base with `base`, found in blind()), or
+    None when that will not read. perms' read of `old` was judged by a list no newer than the base it read on, and
+    this one is never newer than that, so a glob main added since counts as new here: it can cost a re-read, never
+    carry one."""
+    with blind(root, base, old) as (got, run):
+        if run is None:
+            return None
+        rc, mb = run("merge-base", *got[1])
+    return None if rc else security_globs(root, mb.strip(), repo)
+
+
 def carried_from(job):
     """The earlier head of this PR whose perms LAND carries to job.head, or "". Owner brief: "carried forward to
     the new head, but only if the delta from the old head to the new head touches no security path", and "If the
     delta touches any such path, or the old entry is missing or wasn't a LAND, carry nothing over". An entry with
-    no `verdict` is a LAND (perms records only reads it passes); one naming any other word is not. Newest first."""
+    no `verdict` is a LAND (perms records only reads it passes); one naming any other word is not. Newest first.
+    A path of this change on the base's list now that the old head's own base did not list (old_globs()) was never
+    read as one, so it carries nothing either (perms' read of #1384: a glob main adds after the read, on a path
+    the PR left alone)."""
     olds = [e.get("head") for e in perms_reads(job.repo)[0]
             if e.get("repo") == job.repo and e.get("pr") == job.pr and e.get("verdict", T.LAND) == T.LAND
             and isinstance(e.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", e["head"]) and e["head"] != job.head]
@@ -425,9 +440,13 @@ def carried_from(job):
     if globs is None:
         return ""
     from lander import manifest as M
+    paths = list(job.plan.extra.get("security") or []) if job.plan else []
     for old in reversed(olds):
         files = delta_files(root, job.base_sha, old, job.head)
-        if files is not None and not any(M.match(globs, f) for f in files):
+        if files is None or any(M.match(globs, f) for f in files):
+            continue
+        was = old_globs(root, job.base_sha, old, job.repo) if paths else []
+        if was is not None and all(M.match(was, p) for p in paths):
             return old
     return ""
 
@@ -655,9 +674,10 @@ def over_ceiling(repo, pr):
 
 LIMIT_SAID = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
 # A limit codex itself reports: a line it starts with `ERROR:` or `stream error:` at its first column (after an optional
-# [timestamp]), which no diff line can (each starts with +, - or a space).
-# codex echoes the prompt, PR text and diff included, so a bare LIMIT_SAID over its output would let a diff that says
-# "usage limit" turn any other codex failure into a limit and bring in a stand-in (perms' and an Opus read, 10-20).
+# [timestamp]). codex echoes the prompt, PR text and diff included, so a bare LIMIT_SAID over its output would let a
+# diff that says "usage limit" turn any other codex failure into a limit and bring in a stand-in (perms' and an Opus
+# read, 10-20). The first column alone keeps out a diff line (each starts with +, - or a space) but not the PR body,
+# file and brief blocks, which put PR text at column 0, so codex_limit() also drops every output line the prompt holds.
 CODEX_LIMIT_SAID = re.compile(r"^(?:\[[^\]\n]*\][ \t]*)?(?:ERROR|stream error):[^\n]*?"
                               r"\b(?:session|usage|rate)[ _-]?limit", re.I | re.M)
 WALLS = ("error_max_budget_usd", "error_max_turns")
@@ -842,10 +862,17 @@ def codex_usd(rc, out):
 
 def codex_limit(rc, out, text):
     """True when a `codex exec` that exited `rc` with output `out`, asked `text`, stopped at a usage or rate limit:
-    a nonzero exit, and a CODEX_LIMIT_SAID line in the output once the echoed prompt is taken out of it."""
+    a nonzero exit, and a CODEX_LIMIT_SAID line in the output that is not the prompt's own. The echo can differ from
+    the prompt (cut short, whitespace trimmed, CRLF), so beside taking out the exact echo, a line counts only when
+    its stripped text is no prompt line, nor the start of one (an echo cut mid-line). A real limit line the prompt
+    also holds is missed, which holds the read as a fault rather than bringing in a stand-in."""
     if rc == 0 or not out:
         return False
-    return bool(CODEX_LIMIT_SAID.search(out.replace(text, "") if text else out))
+    said = [line.strip() for line in text.splitlines()] if text else []
+    for line in (out.replace(text, "") if text else out).splitlines():
+        if CODEX_LIMIT_SAID.search(line) and not any(p.startswith(line.strip()) for p in said):
+            return True
+    return False
 
 
 def ask_codex(text, repo, pr, digest, model):
@@ -1794,7 +1821,7 @@ def _buy(job, template, diff, more, prior=None):
                           f"{', '.join(EFFORTS)}", fault=True)
     root = root_of(job)
     text = read_text(job, template, diff, more)
-    kept =C.read_json(partial(job.digest, template), {}) or {}
+    kept = C.read_json(partial(job.digest, template), {}) or {}
     reads, usd = [], 0.0
     for model in readers():
         if isinstance(kept.get(model), dict):
@@ -2102,8 +2129,10 @@ def cmd_will_review(argv):
 #      no other, and load_read() refuses one whose body and name disagree.
 #   3. A read becomes a grant only through `perms-adopt`, run by the perms seat: it finds the file by the PR's LIVE
 #      head (GitHub's, _job_of) and appends perms' ledger entry (perms_recorded) only when that file read exactly
-#      that head at the change digest the PR has now, finished, and says LAND (adoptable()). A stale file names
-#      another head and is never the one found; any file must still match the live head and change.
+#      that head at the change digest the PR has now, finished, by one of readers(), and says LAND (adoptable()). A
+#      stale file names another head and is never the one found; any file must still match the live head and change.
+#   A running read is alive only while its pid is still the process it started (alive(): the start time matches),
+#   and whatever `perms-reads` prints from a file is quoted, control characters spelled out (quoted()).
 # The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge). It holds (box) while a
 # read of the PR runs at any head, or for a read's run window (HOLD_WINDOW) while perms' `perms-hold` stub stands at
 # its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change) is a
@@ -2187,14 +2216,38 @@ def read_files(repo, pr=None):
     return [(p, h) for _, p, h in sorted(found, reverse=True)]
 
 
-def alive(pid):
+def started_at(pid, proc="/proc"):
+    """-> the start time of process `pid` (field 22 of /proc/<pid>/stat, clock ticks since boot) as a string, or None
+    when there is no such live process. A pid and its start time name one process: a reused pid starts later."""
     try:
-        os.kill(int(pid), 0)
-    except PermissionError:
-        return True
+        with open(os.path.join(proc, str(int(pid)), "stat")) as f:
+            fields = f.read().rpartition(")")[2].split()
     except (OSError, TypeError, ValueError):
-        return False
-    return True
+        return None
+    return fields[19] if len(fields) > 19 and fields[0] not in ("Z", "X") else None
+
+
+def alive(e, proc="/proc"):
+    """True when the process stub `e` names is still the one it started: its pid runs and started when the stub says.
+    A pid alone is not enough, since a dead read's pid may be another process's by now; a stub with no start time
+    (one written before this check) counts as dead, so the worst it costs is a second read."""
+    when = started_at(e.get("pid"), proc)
+    return when is not None and when == str(e.get("pid_start") or "")
+
+
+def quoted(v):
+    """Text from a read file, which a reader's answer steers, made safe to print to perms' terminal: in double quotes,
+    with every control or format character (escape sequences, a carriage return, bidi overrides) spelled out."""
+    out = []
+    for ch in str(v):
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif unicodedata.category(ch)[0] in "CZ" and ch != " ":
+            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}" if ord(ch) < 0x10000
+                       else f"\\U{ord(ch):08x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def reads_absent(repo) -> bool:
@@ -2244,7 +2297,7 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
         e, why = load_read(repo, pr, h)
         if not e:
             return f"perms' read file of PR #{pr} at {h[:12]} will not load ({why})", False
-        if e.get("state") == "running" and alive(e.get("pid")):
+        if e.get("state") == "running" and alive(e):
             return f"perms' security read of PR #{pr} at {h[:12]} is still running", True
         if h == head:
             at = e
@@ -2275,8 +2328,9 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
 
 
 def adoptable(job):
-    """-> (entry, why): perms' finished LAND read of the PR's live head at its live change (requirement 3), or (None,
-    why not). `job` is _job_of()'s, from GitHub; nothing in the file says which head is live."""
+    """-> (entry, why): perms' finished LAND read of the PR's live head at its live change, by one of readers()
+    (requirement 3), or (None, why not). `job` is _job_of()'s, from GitHub; nothing in the file says which head is
+    live."""
     # brief: "the successor checks that sha against the PR's live head before it grants a merge, so a stale or
     # planted file can't carry a merge on its own"
     if not (SHA40.fullmatch(job.head or "") and job.digest):
@@ -2293,7 +2347,10 @@ def adoptable(job):
     if e.get("state") != "done":
         return None, f"the read at {at} is {e.get('state') or 'unfinished'}, not done"
     if e.get("verdict") != T.LAND:
-        return None, f"the read at {at} says {e.get('verdict')}"
+        return None, f"the read at {at} says {quoted(e.get('verdict'))}"
+    if e.get("model") not in readers():
+        return None, (f"the read at {at} was by {quoted(e.get('model'))}, which is not one of the readers "
+                      f"({', '.join(readers())})")
     return e, ""
 
 
@@ -2349,6 +2406,8 @@ def _perms_run(repo, pr, head):
     def done(**kw):
         return 0 if write_read(repo, dict(e, finished=C.now(), **kw))[0] else 1
     model = readers()[0]
+    if e.get("model") != model:   # the reader perms started it for, or none
+        return done(state="failed", why=f"started for reader {e.get('model')!r}, and the reader now is {model!r}")
     try:
         job, facts = _job_of(repo, pr)
         if job is None:
@@ -2386,15 +2445,16 @@ def cmd_perms_read(argv):
         print(f"lander perms-read: cannot work out PR #{pr}'s head and change right now; nothing started")
         return 1
     e, _ = load_read(repo, pr, job.head)
-    if e and (e.get("state") == "done" or (e.get("state") == "running" and alive(e.get("pid")))):
-        said = f" ({e.get('verdict')})" if e.get("state") == "done" else ""
+    if e and (e.get("state") == "done" or (e.get("state") == "running" and alive(e))):
+        said = f" ({quoted(e.get('verdict'))})" if e.get("state") == "done" else ""
         print(f"lander perms-read: the read of PR #{pr} at {job.head[:12]} is {e['state']}{said}; nothing started")
         return 0
     p = subprocess.Popen([sys.executable, "-P", CLI, "perms-read", repo, str(pr), "--run", job.head], cwd="/",
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     path, why = write_read(repo, {"repo": repo, "pr": pr, "head": job.head, "base": job.base_sha,
-                                  "change": job.digest, "state": "running", "pid": p.pid, "started": C.now()})
+                                  "change": job.digest, "state": "running", "pid": p.pid,
+                                  "pid_start": started_at(p.pid), "model": readers()[0], "started": C.now()})
     if not path:
         p.kill()
         print(f"lander perms-read: {why}; nothing started")
@@ -2449,11 +2509,13 @@ def cmd_perms_reads(argv):
         if e is None:
             print(f"#{pr} {head[:12]} refused: {why}")
             continue
-        state = "died" if e.get("state") == "running" and not alive(e.get("pid")) else e.get("state")
-        print(f"#{pr} {head[:12]} {state} {e.get('verdict') or '-'} {e.get('model') or '-'} "
-              f"{e.get('finished') or e.get('started') or '-'}{' ' + e['why'] if e.get('why') else ''}")
+        # every field but the name's pr and head is the file's, and a reader's answer steers some: quoted, as data
+        state = "died" if e.get("state") == "running" and not alive(e) else e.get("state")
+        print(f"#{pr} {head[:12]} " + " ".join(quoted(x or "-") for x in (
+            state, e.get("verdict"), e.get("model"), e.get("finished") or e.get("started")))
+              + (f" why={quoted(e['why'])}" if e.get("why") else ""))
         for row in e.get("blocking") or []:
-            print(f"    {row}")
+            print(f"    > {quoted(row)}")
     return 0
 
 

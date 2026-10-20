@@ -2,7 +2,7 @@
 # cc-notify — the one door a request or a notice leaves a session by. Always logs to ~/.cc/notify.log.
 #   A worker the hub placed on a peer host (CC_PEER_SPOOL set, by `cc-peer serve` only) sends nothing from here: its
 #   call goes to that spool and the hub sends it as a worker's when it drains the peer (cc-peer).
-#   cc-notify [-t title] [--heading <text>] [--kind <kind>] [--ask|--decision|--approval|--owner] [--id <id>|--live <subject>] [--from <seat>] [--major] [--keep]
+#   cc-notify [-t title] [--heading <text>] [--kind <kind>] [--ask|--perms|--decision|--approval|--owner] [--not-perms] [--id <id>|--live <subject>] [--from <seat>] [--major] [--keep]
 #                                                                                      [-p …] "message"   (or message on stdin)
 #     --ask       A PLANNER REQUEST: what a session cannot settle itself (a block, a refusal, a fault, a member's
 #                 escalation). Written to ~/.cc/requests/<id>.json and handed to the control repo's planning seat
@@ -18,6 +18,20 @@
 #                 (`cc-slack run-approved`). Refused, with nothing posted, anywhere a --approval card cannot be made:
 #                 a caller that is not the control seat, a member workspace, or a box with no bot token; and a
 #                 --long flag that one of this box's own scripts in the command does not name anywhere in its text.
+#                 PERMS FIRST: on a box whose control repo has a permission session (a `perms` dir in its state), an
+#                 --approval is not posted. It is filed with that session instead (`cc-refusals ask`), and stdout is
+#                 `perms:<id>`. The session grants it (a rule, or it runs the command itself), refuses it, or rules it
+#                 the owner's (`cc-refusals decide … his`), which posts this same card with --his <id>.
+#     --his <id>  with --approval only: the permission session has ruled ledger ask <id> the owner's, so the card is
+#                 posted. Not the caller's word: the ledger must hold a `his` decision on <id>, and the ask under <id>
+#                 must carry this very command (--run, or none) and these very words, or nothing is posted.
+#     --perms     A PERMISSION QUESTION (a permission, an approval of a tool, command or rule, a classifier refusal, a
+#                 credential or a settings question): `cc-refusals ask` puts "<title>: <message>" in the permission
+#                 session's ledger, from the caller's seat, and prints its id. Nobody is mentioned; that session answers
+#                 it or asks the owner. A ledger the caller cannot reach (a sandboxed worker) makes it a --ask, said on stderr.
+#                 A --decision or --approval whose words read like a permission question (PERMISSION_ASK_RE, the one
+#                 cc-slack's reply tool holds a needs_owner to) is refused, exit 2 and nothing posted, until the caller
+#                 says which it is: --perms, or --not-perms for a decision only the owner can make.
 #     --owner     the owner's DM. Same authority as --decision.
 #     --heading   the bold line a person sees in place of the title. The title still routes, dedups and names the kind.
 #     --keep      a plain notice that is HIS TO MOVE (a failure or stop only he can shift): cc-slack's engagement gate
@@ -53,8 +67,10 @@
 #   cc-notify -h | --help   this block, wherever it sits among the arguments — no post, no push, no log line
 # THE ROUTES, in one line each (core/docs/comms-contract.md is the contract this implements):
 #   planner request  --ask        ~/.cc/requests + cc-broker inject <control repo>      never Slack, never dropped
+#   permission ask   --perms      the permission session's ledger (cc-refusals ask)     any seat, nobody mentioned
 #   owner choice     --decision   #<repo>   🔒 @owner *Decision needed:* …               control seat only
 #   authorization    --approval   #approvals 🔒 @owner 🔐 *Approval needed:* …           control seat only
+#                                 …filed with the permission session instead, where a box has one (PERMS FIRST)
 #   work reply       (the session's own reply tool / cc-slack post --thread)             not this script
 #   machine log      a plain call: the table below, #<repo>-updates or #alerts           ambient
 # HOW IT MUST READ. He sees a title and a line or two on a phone, so the point goes FIRST and in bold, and anything
@@ -174,8 +190,12 @@ is_control(){
     [ -f "$d/.cc/member-facing" ] && { from_seat=${d##*/}; return 1; }
     d=${d%/*}
   done
-  local out rc
-  out=$("$HOME/bin/cc-slack" seat 2>/dev/null); rc=$?
+  # THE DAEMON IS ASKED WITH NOTHING OF THE CALLER'S (security read #2 of #904): cc-slack finds its socket from
+  # CC_SLACK_DIR or $HOME, so a caller pointing either at a socket of its own that answers {} read as the box's own
+  # hand. It gets HOME from the password database, a fixed PATH, and no other variable.
+  local out rc pwh
+  pwh=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); [ -n "$pwh" ] || return 1
+  out=$(env -i HOME="$pwh" PATH=/usr/local/bin:/usr/bin:/bin "$HOME/bin/cc-slack" seat 2>/dev/null); rc=$?
   from_seat=${out%%$'\n'*}
   # EXIT 2 IS NOT "NO SEAT". `cc-slack seat` exits 1 when the daemon itself says no seat owns this pid — the box's
   # own hand, which is control — and 2 when it could not be asked at all (socket down, a restart, a timeout). Only
@@ -360,7 +380,7 @@ CC_NOTIFY_LOG_ONLY="$(cfg CC_NOTIFY_LOG_ONLY)"
 # Is this a member-facing session's call? Same walk as cc-guard: the marker is the truth, CC_ROLE only a convenience.
 # `from` is the session dir's name — its Slack channel's name too — and it makes a better default title than the
 # box's. Such a call is a request to the planning seat (it used to be the owner's DM: the member cannot promote itself).
-owner=0; ask=0; approval=0; from=""; from_arg=""; run=""; [ "${CC_ROLE:-}" = member ] && ask=1
+owner=0; ask=0; approval=0; his=0; hisid=""; perms=0; notperms=0; from=""; from_arg=""; run=""; [ "${CC_ROLE:-}" = member ] && ask=1
 d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { ask=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
@@ -369,7 +389,8 @@ while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading
   --kind) want="$2"; shift 2;;
   --id) pid="$2"; shift 2;; --live) live="$2"; shift 2;; --major) major=1; shift;; --keep) keep=1; shift;;
   --ask) ask=1; asked=1; shift;; --approval) approval=1; asked=1; shift;; --from) from_arg="$2"; shift 2;; --run) run="$2"; shift 2;;
-  --decision) decision=1; asked=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
+  --his) his=1; hisid="${2:-}"; shift; [ $# -gt 0 ] && shift;;
+  --decision) decision=1; asked=1; shift;; --perms) perms=1; asked=1; shift;; --not-perms) notperms=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 # A WORKER THE HUB PLACED ON A PEER HOST (cc-peer: CC_PEER_SPOOL is set by its launch and nothing else) has no Slack
 # here: the notice goes to the spool and the hub sends it, as a worker's, when it drains this host.
@@ -379,6 +400,55 @@ if [ -n "${CC_PEER_SPOOL:-}" ]; then
   exec "$(dirname "$(readlink -f "$0")")/cc-peer" spool notify "${a[@]}" -- "$msg"; fi
 # --run is refused here rather than carried: a workspace's words cross its socket as text, never as a command.
 [ -n "$run" ] && [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && { echo "cc-notify: --run cannot leave a member workspace — nothing posted" >&2; exit 2; }
+
+# A PERMISSION QUESTION SENT THROUGH AN OWNER DOOR IS HANDED BACK, not posted (review of #1028: "May I widen the
+# settings.json allow rules?" as a --decision paged him and never reached the permission session). Declared, never
+# guessed: the words only force the caller to say which it is. The same pattern as cc-slack's PERMISSION_ASK_RE —
+# change both together.
+PERMISSION_ASK_RE='\b(permissions?|allow[- ]?lists?|allow[- ]?rules?|settings\.json|classifier|auto[- ]mode|refus(e[ds]?|als?)|sudo|(keys?|secrets?|files?|grants?)[- ](tokens?|credentials?)|(tokens?|credentials?)[- ](keys?|secrets?|files?|grants?))\b'
+# WHICH DOOR IS THE RESOLVED KIND, NOT THE FLAGS (review of #1028): `--kind decision` and a title whose second word
+# is `decision` or `approval` reach the same rung 1 rows as the flags do, so the gate reads the kind the table below
+# will, with the same precedence (the flags, then --kind, then the title). A call that is already a planner request
+# (--ask, a member-facing session) is not held: it pages nobody, and the seat that reads it can take it to perms —
+# cc-land's `--ask -t "<repo> approval"` is one, and holding it would drop the request on a caller that ignores exit 2.
+# An --approval --his is not held either: it is the permission session's own ruling that the card is the owner's
+# (`cc-refusals decide … his`), so it has already been through perms, and PERMS FIRST below posts it only when the
+# ledger holds that ruling on this very ask.
+gwant=$want; [ "$decision" = 1 ] && gwant=decision; [ "$approval" = 1 ] && gwant=approval; [ "$owner" = 1 ] && gwant=escalation
+gkind=$(kind_of "$gwant" "$title")
+if [ "$perms" = 0 ] && [ "$notperms" = 0 ] && [ "$ask" = 0 ] && [ "$his" = 0 ] && { [ "$gkind" = decision ] || [ "$gkind" = approval ]; } \
+   && printf '%s\n%s\n' "$title" "$msg" | grep -Eqi -- "$PERMISSION_ASK_RE"; then
+  printf '%s\t%s\t%s\trung=- kind=undeclared-permission send=refused\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" >> "$LOG"
+  echo "cc-notify: not sent — this reads like a permission question. Send it again with --perms if it is a permission, an approval of a tool, command or rule, a classifier refusal, a credential or a settings question (the permission session answers it or asks the owner), or add --not-perms if it is a decision only the owner can make. Nothing was posted." >&2
+  exit 2
+fi
+
+# A PERMISSION QUESTION (--perms) goes to the permission session's ledger before anyone else: `cc-refusals ask`, from the
+# seat is_control names (the marker, or the daemon's word; the box's own hand is the control repo), into that seat's
+# repo's ledger or the control repo's. Nobody is mentioned and no request is filed. A ledger this caller cannot reach (a
+# sandboxed worker, a member boundary) makes it a --ask instead, and one stderr line says so.
+if [ "$perms" = 1 ]; then
+  # WHO ASKED: the control seat or the box's own hand is the control repo; any other seat is what is_control named
+  # (`<repo>/<track>`, `<repo>@<alias>` for an orch, `<repo>`); a caller nothing could name (the daemon unreachable)
+  # is `unknown`, never the planning seat. The ledger's repo is the seat's with its track or alias taken off.
+  if is_control >/dev/null 2>&1; then pfrom=${from:-${CTL:-$BOX}}; else pfrom=${from:-${from_seat:-unknown}}; fi
+  prepo=${pfrom%%/*}; prepo=${prepo%%@*}; pmember=()
+  { [ -n "$from" ] || [ "${CC_ROLE:-}" = member ]; } && pmember=(--member)
+  # THROWAWAY TEST STATE NEVER WRITES THE LIVE LEDGER: the same gate the request and the doors below keep, unless
+  # the caller named a ledger root of its own (CC_REFUSALS_ROOT, as every fixture that means to write one does).
+  pstop=""; case " $title $msg " in *[!A-Za-z0-9]_cctest*|*[!A-Za-z0-9]_selfcheck*) pstop="test";; esac
+  [ -z "$pstop" ] && [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && pstop="log-only"
+  if [ -n "$pstop" ] && [ -z "${CC_REFUSALS_ROOT:-}" ]; then
+    printf '%s\t%s\t%s\trung=P kind=perms send=%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" "$pstop" >> "$LOG"
+    exit 0
+  fi
+  if pid_out=$("$BIN/cc-refusals" ask "$prepo" --from "$pfrom" "${pmember[@]}" -- "$title: $msg"); then
+    printf '%s\t%s\t%s\trung=P kind=perms send=ledger\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" >> "$LOG"
+    printf '%s\n' "$pid_out"; exit 0
+  fi
+  echo "cc-notify: the permission session's ledger did not take this — filed as a --ask to the planning seat instead" >&2
+  ask=1
+fi
 
 # INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) there is no ~/.cc/config and no token: every rung below is
 # unconfigured, `tried` would stay 0 and this would exit 0 having reached NOBODY — a blocked member told its call
@@ -444,6 +514,7 @@ fi
 # in its title rather than with a flag. Anything else is a plain ask.
 why=ask; case "$kind" in decision|approval) why=$kind;; escalation) why=owner;; esac
 
+msg0=$msg   # the words as the caller wrote them: what the permission session is asked, before --run dresses them
 # A COMMAND THE OWNER'S 👍 RUNS rides only on a card the control seat itself posts to #approvals; anything else that
 # names one is refused whole, never downgraded to a request that drops the command and asks anyway. The command goes
 # into the message, so the card, the log and the dedup key all carry it, with the stamp cc-slack checks the card by.
@@ -507,6 +578,37 @@ PY
   runsha=$(printf '%s' "$run" | sha256sum | cut -c1-64)
   shown=$(printf '%s' "$run" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')   # Slack reads <…> as a link
   msg="$(printf '%s\n```\n%s\n```\nYour 👍 runs this once on the box; the exit code comes back here and the output in your DM · `run:%s`' "$msg" "$shown" "${runsha:0:16}")"
+fi
+
+# PERMS FIRST (the owner, 2026-09-28, in reply to an approval card: "This goes to perms").
+# The permission session's ruling: "Approval asks come to me first … For those I answer 'his', and the session sends
+# him the card as before." So on a box whose control repo has a permission session, an --approval the control seat
+# would post is filed with that session instead, through the ledger it already reads, and nothing reaches the owner
+# here. Its `cc-refusals decide … his` records that ruling and posts the card again with --his <id>.
+# --HIS IS THE LEDGER'S WORD, NOT THE CALLER'S (review of #904): a seat that could say it would skip the permission
+# session, or re-post an ask it declined. So the ledger must hold, under <id>, an approval ask whose command and words
+# are this card's own, and a `his` decision on it. WHO MAY POST IT is still the control seat (is_control above), and
+# the permission session's pane is that: it holds no Slack subscription, so the daemon names no seat for it (the
+# box's own hand), and its directory, the repo's perms state dir, sits under no track or member marker.
+if [ "$his" = 1 ] && { [ "$ask" = 1 ] || [ "$kind" != approval ]; }; then
+  echo "cc-notify: --his rides only on the control seat's --approval card — nothing posted" >&2; exit 2; fi
+# EXACTLY ONE ask under <id> (security read #2 of #904): with any() a second line under the same id, carrying
+# another command, passed beside the real one.
+if [ "$his" = 1 ] && ! { [ -n "$hisid" ] && [ -n "$CTL" ] && jq -e -s --arg id "$hisid" --arg i "$run" --arg r "$msg0" '
+      [.[] | select(.kind == "refusal" and .id == $id)] as $asks
+      | ($asks | length) == 1 and ($asks[0] | .source == "approval" and (.input // "") == $i and .reason == $r)
+      and any(.[]; .kind == "decision" and .id == $id and .decision == "his")' \
+      "$HOME/.cc/state/$CTL/perms/refusals.jsonl" >/dev/null 2>&1; }; then
+  echo "cc-notify: --his ${hisid:-(no id)} is no 'his' ruling in the permission session's ledger on this command and these words — nothing posted" >&2; exit 2; fi
+if [ "$ask" = 0 ] && [ "$kind" = approval ] && [ "$his" = 0 ] && [ -n "$CTL" ] && [ -d "$HOME/.cc/state/$CTL/perms" ]; then
+  case " $title $msg0 " in *[!A-Za-z0-9]_cctest*|*[!A-Za-z0-9]_selfcheck*)
+    echo "cc-notify: synthetic test state, not filed with the permission session ($title)" >&2; exit 0;; esac
+  if [ -n "${CC_NOTIFY_LOG_ONLY:-}" ]; then permsid='log-only'
+  else permsid=$("$HOME/bin/cc-refusals" ask "$CTL" --title "$title" ${heading:+--heading "$heading"} ${run:+--run "$run"} \
+                 ${pid:+--id "$pid"} -- "$msg0") || { echo "cc-notify: the permission session's ledger did not take this — nothing posted" >&2; exit 1; }; fi
+  printf '%s\t%s\t%s\trung=P kind=approval send=perms:%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg0" | tr '\n\t' '  ')" "$permsid" >> "$LOG"
+  echo "cc-notify: filed with the permission session, not posted: it grants, refuses, or rules it the owner's and posts this card" >&2
+  echo "perms:$permsid"; exit 0
 fi
 
 # A PLANNER REQUEST leaves by the broker and stops here: no rung, no phone, no Slack. Its id is the caller's --id

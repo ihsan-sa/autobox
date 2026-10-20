@@ -7,6 +7,11 @@
             member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the inbox, `handed-pushed`,
             removed. The prior verdict is not carried: the reviewer finds it among the box's own PR markers.
             A job for the PR already on the queue ends the watch.
+  repairs   each job held on a conflict (repair.CONFLICT) that a rebase round was started for at its head (the
+            repair record's head is the job's): the branch head moved (ls-remote; '' on any doubt does nothing) ->
+            a request (who "repair push", chat/ts) to the inbox, which makes the held job fresh, and a `notify`
+            line. A request already waiting for the PR is left to do that. (2026-10-12: #998's round pushed and no
+            queue line followed; it sat held until it was queued by hand.)
   strays    for each repo the box knows that lands its own PRs (`cc lands` 0; members skipped) and has a GitHub
             origin, at most every $LANDER_STRAY_SECS (900): the box's own open PRs (`gh pr list --author @me`) are
             read, and one that nothing ever queued is queued here (`queue … --who tick --no-start`, so the protected-
@@ -142,6 +147,31 @@ def sweep_handed() -> list:
             with contextlib.suppress(OSError):
                 os.unlink(p)
             lines.append(f"[{repo}] PR #{pr}: pushed after it was handed back ({head[:12]}) — re-queued")
+    return lines
+
+
+def sweep_repairs() -> list:
+    from lander import repair as RP
+    lines = []
+    for p in J.job_files():
+        job = J.load_path(p)
+        if not (job and job.state == T.HELD and job.extra.get("hold") != "box" and job.head
+                and RP.CONFLICT.match(job.extra.get("why") or "")):
+            continue
+        r = J.repair_record(job.repo, job.pr)
+        if not (r and r.get("head") == job.head) or any(q["pr"] == job.pr for _, q in J.requests(job.repo)):
+            continue
+        try:   # one PR's fault is said, never the tick's end
+            h = M.member_of(job.repo)[0]
+            head = G.remote_head(J.repo_root(job.repo), job.extra.get("branch") or "",
+                                 env=M.env(h, job.repo) if h else None)
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"[{job.repo}] PR #{job.pr}: the repair watch could not read its branch: {e}")
+            continue
+        if head and head != job.head:
+            J.submit(job.repo, job.pr, who="repair push", chat=job.extra.get("chat"), ts=job.extra.get("ts"))
+            E.log("notify", job.repo, job.pr, f"repair pushed {job.head[:12]}->{head[:12]} — re-queued")
+            lines.append(f"[{job.repo}] PR #{job.pr}: its rebase round pushed ({head[:12]}) — re-queued")
     return lines
 
 
@@ -746,6 +776,7 @@ def cmd_tick(argv) -> int:
         lines.append(f"lander: GitHub backoff — {wait}s left; lanes and handed watches wait for it")
     else:
         lines += sweep_handed()
+        lines += sweep_repairs()
         lines += sweep_strays(known_repos(repo))
         lines += sweep_ended(repo)
         repos = [repo] if repo else J.all_repos()   # a push or a stray may have queued a new repo

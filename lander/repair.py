@@ -10,7 +10,9 @@ cutover (#771); this is that round again, on the same door: `cc <repo> <row> --g
 delivery-pending row) and adopts a reservation a refused launch left open, so a retry is never shut out by the last
 try; `--resume-last` when the task record says a worker built it — and `--say` to a seat whose window is live,
 because `--go` refuses one. The worker merges the base into the PR's own branch, resolves, runs its gates and pushes;
-the held job re-reads the PR at its next wake, a new head is a fresh job, and that one lands.
+the tick's repair watch (tick.sweep_repairs) sees the branch move and queues the PR again, as the handed watch
+does for a handed-back one (the held job's own next wake re-reads it too), a new head is a fresh job, and that
+one lands.
 
 Lane.conflict asks start(lane, job, paths) and acts on what it answers, (kind, words):
 

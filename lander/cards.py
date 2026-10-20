@@ -856,7 +856,9 @@ def owner_card(pid, text, run=None):
         log("unsaid", "-", 0, id=pid, why="synthetic test state, no 🔐 card posted")
         return False
     if run:
-        rc, out = sh([os.path.join(BIN, "cc-notify"), "--approval", "--run", run, "--id", pid, "-t",
+        # --not-perms: a card whose 👍 runs a command is the owner's own approval, and its text names protected paths
+        # (settings.json among them), which cc-notify would otherwise hold as an undeclared permission question
+        rc, out = sh([os.path.join(BIN, "cc-notify"), "--approval", "--run", run, "--id", pid, "--not-perms", "-t",
                       "lander approval", text], timeout=60, **box_hand())
         log("owner-card", "-", 0, id=pid, rc=rc)
         return rc == 0

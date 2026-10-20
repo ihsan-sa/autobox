@@ -13,8 +13,12 @@
                                  and its reply printed (waits 120 s, at most 300)
     cc-desk start <project> "<text>"
                                  start work: through the project's hive door (/var/lib/dispatch-door/<project>,
-                                 CC_DESK_DOORS, by CC_DESK_DOOR_HELPER) when it has one, else as a row for its
-                                 planning seat; refused, naming the doors and seats there are, when it has neither
+                                 CC_DESK_DOORS) when it has one, else as a row for its planning seat; refused,
+                                 naming the doors and seats there are, when it has neither. A door owned by
+                                 dispatch-seat-door is written only as that user, `sudo -n -u dispatch-seat-door
+                                 /usr/local/lib/dispatch-seat-door/dispatch-door` (through `systemd-run --user`
+                                 under no_new_privs, as in cc-desk.service); any other door as this uid through the
+                                 release's helper (CC_DESK_DOOR_HELPER), said on stderr when the user is missing
     cc-desk sessions             the live windows of session main, each with what it is
     cc-desk answer <id> "<text>"  the command a session runs to answer a query (text capped at 2000 characters)
     cc-desk serve --spool DIR [--once]
@@ -65,6 +69,7 @@ import hashlib
 import hmac
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -352,6 +357,73 @@ def is_repo(name):
     return bool(PROJECT_RE.fullmatch(name)) and os.path.isdir(os.path.join(home(), "dev", name))
 
 
+def no_new_privs():
+    """Whether this process runs with no_new_privs (cc-desk.service sets NoNewPrivileges), so sudo can't run here."""
+    v = os.environ.get("CC_DESK_NO_NEW_PRIVS")
+    if v in ("0", "1"):
+        return v == "1"
+    try:
+        with open("/proc/self/status") as f:
+            return any(l.split() == ["NoNewPrivs:", "1"] for l in f)
+    except OSError:
+        return False
+
+
+def door_write(door, kind, sender, body):
+    """One ask through a hive door, written as whoever owns the door. dispatch's install.sh makes each door owned by
+    dispatch-seat-door (DISPATCH_DOOR_UID), mode 2750, and lets the owner run root's copy of the helper as that user
+    and nothing else; before it has run, every door is owned by this uid. So the door's owner decides:
+      owned by dispatch-seat-door  `sudo -n -u dispatch-seat-door <copy> DIR KIND FROM`, and nothing else: a write
+                                   as this uid would only hit EACCES, so a failure is the answer. Under no_new_privs
+                                   (cc-desk.service) sudo can't run in this process, so the same line goes through
+                                   the owner's user manager, `systemd-run --user --pipe --wait`, which has no flag.
+      owned by anyone else         as this uid through the release's helper, as before the switch; when the seat
+                                   user is missing too, it says on stderr that hive will not count it as the seats'.
+    -> the CompletedProcess, or None when nothing could run."""
+    user = os.environ.get("CC_DESK_SEAT_DOOR_USER") or "dispatch-seat-door"
+    copy = os.environ.get("CC_DESK_SEAT_DOOR") or "/usr/local/lib/dispatch-seat-door/dispatch-door"
+    helper = os.environ.get("CC_DESK_DOOR_HELPER") or "/opt/dispatch/current/host/dispatch-door"
+
+    def run(argv, env=None):
+        try:
+            return subprocess.run(argv, input=body, capture_output=True, text=True, timeout=30, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    try:
+        seat = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        seat = None
+    try:
+        owner = os.stat(door).st_uid
+    except OSError:
+        owner = None
+    if seat is not None and owner == seat:
+        if not (os.path.isfile(copy) and os.access(copy, os.X_OK)):
+            print(f"cc-desk: {door} is {user}'s and {copy} is not there, so nothing could write it", file=sys.stderr)
+            return None
+        argv = [os.environ.get("CC_DESK_SUDO") or "sudo", "-n", "-u", user, copy, door, kind, sender]
+        env = None
+        if no_new_privs():
+            # the brief: "Give cc-desk.service a path that reaches the seat user: drop NoNewPrivileges for that unit
+            # only if nothing else works" — the user manager runs the line outside this unit's flag
+            argv = [os.environ.get("CC_DESK_SYSTEMD_RUN") or "systemd-run", "--user", "--quiet", "--collect",
+                    "--pipe", "--wait", "--", *argv]
+            env = dict(os.environ)
+            if not env.get("XDG_RUNTIME_DIR"):         # a system unit has none, and systemd-run needs the bus
+                env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+        r = run(argv, env)
+        if r is not None and r.returncode != 0:
+            print(f"cc-desk: writing {door} as {user} failed: "
+                  f"{(r.stderr.strip().splitlines() or ['exit ' + str(r.returncode)])[0][:160]}", file=sys.stderr)
+        return r
+    if seat is None:
+        # the brief: "Until dispatch's install has created dispatch-seat-door, the writers must keep working: fall
+        # back to today's write and say so in the log"
+        print(f"cc-desk: no user {user}, so this ask went to {door} as uid {os.getuid()} through {helper}, "
+              f"and hive will not count it as the owner's seats'", file=sys.stderr)
+    return run([helper, door, kind, sender])
+
+
 def start_text(project, text):
     """Start work: the project's hive door when it has one, else its planning seat. -> (where it went, rc)"""
     if not PROJECT_RE.fullmatch(project):
@@ -363,13 +435,8 @@ def start_text(project, text):
     doors = os.environ.get("CC_DESK_DOORS") or "/var/lib/dispatch-door"
     door = os.path.join(doors, project)
     if os.path.isdir(door) and not os.path.islink(door):
-        helper = os.environ.get("CC_DESK_DOOR_HELPER") or "/opt/dispatch/current/host/dispatch-door"
         sender = os.environ.get("CC_DESK_DOOR_FROM") or "secretary@" + (os.environ.get("CC_BOX") or "box")
-        try:
-            r = subprocess.run([helper, door, "upload", sender], input=body, capture_output=True, text=True,
-                               timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            r = None
+        r = door_write(door, "upload", sender, body)
         if r is None or r.returncode != 0:
             return f"I couldn't file it at the {project} door.", 1
         return f"Filed with {project}: it went through its door as an ask.", 0
@@ -821,7 +888,8 @@ def selfcheck():
         env = {k: v for k, v in os.environ.items() if not k.startswith("CC_")}
         env.update(HOME=T, CC_DESK_OWNER="Pat", CC_DESK_DOOR_HELPER=helper, CC_DESK_DOORS=doors,
                    CC_DESK_DOOR_FROM="secretary@test", CC_DESK_CLAUDE=stub, CC_DESK_TMUX=tmux, CC_DESK_MSG=msg,
-                   CC_DESK_NOTIFY=notify)
+                   CC_DESK_NOTIFY=notify, CC_DESK_SEAT_DOOR_USER="cc-desk-selfcheck-no-such-user",
+                   CC_DESK_NO_NEW_PRIVS="0")
 
         def run(*a, extra=None, timeout=60):
             e = dict(env, **(extra or {}))
@@ -1084,6 +1152,68 @@ def selfcheck():
         ok("start files at a project's door through the helper, as an upload, with the read-back prefix",
            rc == 0 and dargs[:3] == [os.path.join(doors, "proj"), "upload", "secretary@test"] and
            open(os.path.join(T, "door.in")).read() == START_PREFIX + "Write the spec." and "door" in out)
+        rc, out, err = run("start", "proj", "Write the spec.")
+        ok("start with no dispatch-seat-door user still files through the helper and says why on stderr",
+           rc == 0 and "no user cc-desk-selfcheck-no-such-user" in err and "door" in out)
+
+        me_name = pwd.getpwuid(os.getuid()).pw_name
+
+        def seat_case(name, sudo_body, copy_body='cat > "$HOME/{n}.in"\n', user=None, **extra):
+            """Its own fake sudo, systemd-run, seat copy and helper, each writing under {name}.*, so a case reads
+            only its own. The seat user is this uid's own name unless the case names another, so the selfcheck's
+            door (this uid's) is the seat user's."""
+            d = os.path.join(T, name)
+            os.makedirs(d)
+            files = {"sudo": sudo_body, "copy": copy_body,
+                     "systemd-run": 'printf "%s\\n" "$@" > "$HOME/{n}.sdrun.args"; '
+                                    'printf "%s" "$XDG_RUNTIME_DIR" > "$HOME/{n}.sdrun.xdg"; '
+                                    'while [ "$1" != -- ]; do shift; done; shift; exec "$@"\n',
+                     "helper": 'printf "%s\\n" "$@" > "$HOME/{n}.helper.args"; cat > "$HOME/{n}.helper.in"\n'}
+            for k, v in files.items():
+                with open(os.path.join(d, k), "w") as f:
+                    f.write("#!/usr/bin/env bash\n" + v.replace("{n}", name))
+                os.chmod(os.path.join(d, k), 0o755)
+            return run("start", "proj", "Write the spec.", extra=dict(dict(
+                CC_DESK_SEAT_DOOR_USER=user or me_name, CC_DESK_SEAT_DOOR=os.path.join(d, "copy"),
+                CC_DESK_SUDO=os.path.join(d, "sudo"), CC_DESK_SYSTEMD_RUN=os.path.join(d, "systemd-run"),
+                CC_DESK_DOOR_HELPER=os.path.join(d, "helper")), **extra))
+
+        def got(name, leaf):
+            p = os.path.join(T, f"{name}.{leaf}")
+            return open(p).read() if os.path.exists(p) else None
+        SUDO_RUNS = 'printf "%s\\n" "$@" > "$HOME/{n}.sudo.args"; shift 3; exec "$@"\n'
+        rc, out, err = seat_case("seat", SUDO_RUNS)
+        sargs = (got("seat", "sudo.args") or "").split("\n")
+        ok("a door owned by dispatch-seat-door is written as that user through root's copy, non-interactive, "
+           "and not the helper",
+           rc == 0 and sargs[:3] == ["-n", "-u", me_name] and
+           sargs[3:7] == [os.path.join(T, "seat", "copy"), os.path.join(doors, "proj"), "upload", "secretary@test"]
+           and got("seat", "in") == START_PREFIX + "Write the spec." and got("seat", "helper.in") is None
+           and got("seat", "sdrun.args") is None and err == "")
+        rc, out, err = seat_case("own", SUDO_RUNS, user="root")
+        ok("a door this uid still owns is written as today, through the helper, with no sudo and nothing said",
+           rc == 0 and got("own", "helper.in") == START_PREFIX + "Write the spec." and got("own", "in") is None
+           and got("own", "sudo.args") is None and err == "")
+        rc, out, err = seat_case("nnp", 'echo "sudo: The \\"no new privileges\\" flag is set" >&2; exit 1\n')
+        ok("a seat user's door that sudo refuses is a failure, said, and never a write through the helper",
+           rc == 1 and got("nnp", "helper.in") is None and got("nnp", "in") is None
+           and "failed: sudo: The" in err)
+        rc, out, err = seat_case("fail", 'shift 3; exec "$@"\n', copy_body='cat > "$HOME/{n}.in"; exit 3\n')
+        ok("a seat copy that ran and failed is a failure, never a second write through the helper",
+           rc == 1 and got("fail", "in") == START_PREFIX + "Write the spec." and got("fail", "helper.in") is None)
+        rc, out, err = seat_case("nocopy", SUDO_RUNS, CC_DESK_SEAT_DOOR=os.path.join(T, "nocopy", "absent"))
+        ok("a seat user's door with no seat copy is a failure, said, and never a write through the helper",
+           rc == 1 and got("nocopy", "helper.in") is None and got("nocopy", "sudo.args") is None
+           and "is not there" in err)
+        rc, out, err = seat_case("svc", SUDO_RUNS, CC_DESK_NO_NEW_PRIVS="1", XDG_RUNTIME_DIR="")
+        dargs = (got("svc", "sdrun.args") or "").split("\n")
+        ok("under no_new_privs (cc-desk.service) the seat line goes through the user manager and still writes "
+           "as the seat user, not the helper",
+           rc == 0 and dargs[:dargs.index("--")] == ["--user", "--quiet", "--collect", "--pipe", "--wait"]
+           and dargs[dargs.index("--") + 1:dargs.index("--") + 5] == [os.path.join(T, "svc", "sudo"), "-n", "-u",
+                                                                      me_name]
+           and got("svc", "sdrun.xdg") == f"/run/user/{os.getuid()}"
+           and got("svc", "in") == START_PREFIX + "Write the spec." and got("svc", "helper.in") is None)
         rc, out, _ = run("start", "repo", "Add a page.")
         sent = open(os.path.join(T, "msg")).read()
         ok("start with no door goes to the repo's planning seat as a row",

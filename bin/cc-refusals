@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
-# cc-refusals — the refusal ledger a repo's permission session reads: what the auto-mode classifier refused the
-# repo's planning seat, and what the permission session decided about each one.
+# cc-refusals — the ledger a repo's permission session reads: what the auto-mode classifier refused a session, the
+# permission questions sessions asked, and what the permission session decided about each one.
 #   cc-refusals record              THE PermissionDenied HOOK (config/claude-managed.json). Reads the hook's JSON on
 #                                   stdin and appends one refusal line, or nothing. Always exits 0 and prints nothing,
 #                                   so it can never turn a denial into a retry or fail a turn.
-#   cc-refusals open <repo>         one line per refusal nobody has decided yet: `<id> <at> [<window>] <tool>: <input> — <reason>`
+#   cc-refusals collect <repo> <track>   moves what a sandboxed worker's hook spooled into the ledger (cc-loop runs it
+#                                   after each iteration, on the host)
+#   cc-refusals ask <repo> --from <who> [--where <link>] [--member] -- <text>
+#                                   A PERMISSION QUESTION (a permission, approval, refusal, credential or settings ask):
+#                                   one ask line in the ledger, its id printed. cc-slack's reply(needs_owner, permission)
+#                                   and cc-notify --perms call it, so the question reaches the permission session before
+#                                   the owner. With that session down the ask still waits here, and the owner is told
+#                                   once a day that it is down (cc-notify --decision, a count, never the ask's text);
+#                                   from a seat that is not the control seat that line is a request to the planning
+#                                   seat instead, and stderr says which of the two was told.
+#   cc-refusals open <repo>         one line per refusal or ask nobody has decided yet:
+#                                   `<id> <at> [<window>] <tool>: <input> — <reason>` or `<id> <at> [<window>] ask: <text> (<where>)`,
 #                                   control characters shown as spaces; a cut field ends `…(cut: show <id>)`
-#   cc-refusals watch <repo>        the same line for each NEW refusal as it is recorded, one per refusal, never
+#   cc-refusals watch <repo>        the same line for each NEW refusal or ask as it is recorded, one per item, never
 #                                   anything else: the permission session runs it under its Monitor tool
 #   cc-refusals show <repo> <id>    the whole record, and its decision if there is one
-#   cc-refusals decide <repo> <id> grant|decline <text>   the permission session's decision: the rule it added, or why
-#                                   not. Appended to the same ledger; an id already decided is refused.
+#   cc-refusals ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <card id>] -- <text>
+#                                   AN APPROVAL ASK, filed by `cc-notify --approval` on a box with a permission session
+#                                   instead of posting the owner's card: one ledger line (source "approval", tool
+#                                   "approval", input the command, reason the text), listed by open and watch like a
+#                                   refusal. Prints its id. The same ask while its record is open is not written twice.
+#                                   Only the control seat or the box's own hand files one (asker below); anyone else is
+#                                   refused with exit 2 and nothing written. --title makes it this form, --from the
+#                                   permission question above; an ask carrying both is refused.
+#   cc-refusals decide <repo> <id> grant|decline|his <text>   the permission session's decision on a refusal or an ask:
+#                                   the rule it added or its answer, or why not. Appended to the same ledger; an id
+#                                   already decided is refused. `his` is its ruling that the owner decides: on an
+#                                   approval ask it records the ruling, then posts the ask's own card (`cc-notify
+#                                   --approval --his <id>`, which checks that ruling in this ledger) and
+#                                   records that it went out. A card that did not post is posted by the same `decide …
+#                                   his` again; one that did is refused like any decided id.
+#                                   Only the permission seat itself decides (pseat below); anyone else gets exit 2.
 #   cc-refusals selfcheck           its own cases, against a fixture root; the live ledgers are never read
 #
 # WHY (owner, 2026-09-25): the classifier refuses the planning seat's message to the permission session, the one
@@ -18,21 +43,43 @@
 # The owner's answer: the seat writes anything disapproved to a ledger, and the permission session reads it and
 # approves as needed. So nothing here sends a message: the seat's hook writes, the permission session reads, and the seat never asks it to run anything.
 #
-# WHO IS RECORDED. A session with no $CC_ROLE (no track, worker or member), standing in the primary checkout
-# ~/dev/<repo>, in the tmux window named <repo> or its handoff successor's <repo>~next — the planning seat — and only
-# when ~/.cc/state/<repo>/perms/ exists: a repo opts in by having a permission session. Everything else records nothing.
-# WHAT IS NOT. A cc-guard refusal: no settings rule can let one through (the guard is a hook, and the permission
-# session may not edit hooks), so recording it would only queue declines.
-# THE LEDGER is ~/.cc/state/<repo>/perms/refusals.jsonl, one JSON object per line: {kind:"refusal", id, at, window,
-# session, tool, input, reason} and {kind:"decision", id, at, decision, note, by}. The same tool and input refused
-# again while its first record is undecided is not written twice, so a seat retrying a refused call wakes nobody.
+# WHO IS RECORDED (widened 2026-10-05: the owner's "stuff often doesnt go to perms when it should" — four refusals of
+# workers, orchs and other repos' seats reached him and never the ledger). Every session in a repo: one with no
+# $CC_ROLE standing in the primary checkout ~/dev/<repo> (the planning seat in window <repo> or <repo>~next, an orch,
+# any other window there), and a worker or track (CC_ROLE worker|track, or none) in its worktree
+# ~/.cc/worktrees/<repo>/<track>, recorded under window `worker:<track>`. The ledger is that repo's when it has a
+# permission session (~/.cc/state/<repo>/perms/ exists), else the control repo's — the repo this copy lives in, as in
+# cc-notify — with the asking repo in the record. A worker inside the sandbox sees no ledger, so its hook spools the
+# refusal into its own state dir (~/.cc/state/<repo>/<track>/refusals.spool.jsonl) and `collect` moves it in from the
+# host; collect names the window and repo itself, so a spooled line cannot pass for another session's.
+# WHAT IS NOT. A member (CC_ROLE member) records nothing: a member's ask never gains authority by passing through the
+# permission session. A cc-guard refusal: no settings rule can let one through (the guard is a hook, and the
+# permission session may not edit hooks), so recording it would only queue declines.
+# THE LEDGER is ~/.cc/state/<repo>/perms/refusals.jsonl, one JSON object per line: {kind:"refusal", id, at, repo, window,
+# session, tool, input, reason} (an approval ask is one with source "approval", title, heading and card_id),
+# {kind:"ask", id, at, repo, window, member, where, text}, {kind:"decision", id, at, decision, note, by} and, once a
+# `his` card went out, {kind:"posted", id, at}. The same tool and input refused again in one repo (or the same ask from
+# one asker and repo) while its first record is undecided is not written twice, so a session retrying a refused call
+# wakes nobody.
 set -uo pipefail
-ROOT="${CC_REFUSALS_ROOT:-$HOME/.cc/state}"; DEV="${CC_REFUSALS_DEV:-$HOME/dev}"
-USAGE="usage: cc-refusals record | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline <text> | selfcheck"
+# PATH IS PINNED (security read of #904 at ce990bc0): an ask's id is a sha1sum, and a planted sha1sum earlier on the
+# caller's PATH could make a question's id equal an approval's. Nothing here is looked up anywhere else.
+PATH=/usr/local/bin:/usr/bin:/bin; export PATH
+ROOT="${CC_REFUSALS_ROOT:-$HOME/.cc/state}"; DEV="${CC_REFUSALS_DEV:-$HOME/dev}"; WTS="${CC_REFUSALS_WT:-$HOME/.cc/worktrees}"
+SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF")
+# the control repo: the one this copy lives in, read the way cc-notify reads it
+CTL=${CC_REFUSALS_CTL-}; [ -n "$CTL" ] || case "$SELF" in "$HOME/dev/"*) CTL=${SELF#"$HOME/dev/"}; CTL=${CTL%%/*};; esac
+USAGE="usage: cc-refusals record | collect <repo> <track> | ask <repo> --from <who> [--where <link>] [--member] -- <text> | ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <id>] -- <text> | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline|his <text> | selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-refusals: jq is missing" >&2; exit 2; }
 
 ledger(){ printf '%s/%s/perms/refusals.jsonl' "$ROOT" "$1"; }
-okrepo(){ [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ] && [ -d "$ROOT/$1/perms" ]; }
+name_ok(){ [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
+okrepo(){ name_ok "$1" && [ -d "$ROOT/$1/perms" ]; }
+# the repo whose ledger takes <repo>'s items: its own when it has a permission session, else the control repo's
+target(){ if okrepo "$1"; then printf '%s' "$1"; elif [ -n "$CTL" ] && okrepo "$CTL"; then printf '%s' "$CTL"; else return 1; fi; }
+# is the permission session up? Its window is `perms` (cc-handoff PERMS). CC_REFUSALS_PERMS_LIVE=1|0 answers for a fixture.
+perms_live(){ [ -n "${CC_REFUSALS_PERMS_LIVE-}" ] && { [ "$CC_REFUSALS_PERMS_LIVE" = 1 ]; return; }
+              tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qx perms; }
 window(){ [ -n "${CC_REFUSALS_WINDOW-}" ] && { printf '%s' "$CC_REFUSALS_WINDOW"; return; }
           [ -n "${TMUX_PANE:-}" ] && tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null; }
 # CLEAN turns every control character (C0, DEL, C1) and every ESC sequence (CSI, OSC) into a space. A classifier
@@ -42,66 +89,277 @@ CLEAN='def clean: tostring | gsub("\u001b(\\[[0-?]*[ -/]*[@-~]|\\][^\u0007\u001b
                      | gsub("[\\x{00}-\\x{1f}\\x{7f}-\\x{9f}]"; " ");'
 # the summary line open and watch print: one line per refusal, every field cleaned; input cut to 200 chars, the
 # reason to 300, a cut ending in a pointer to `show <id>`, which prints the whole record
-line(){ jq -r "$CLEAN"' select(.kind == "refusal") | . as $r
+line(){ jq -r "$CLEAN"' select(.kind == "refusal" or .kind == "ask") | . as $r
   | def c($n): (. // "") | clean | if length > $n then .[:$n] + " …(cut: show \($r.id | clean))" else . end;
-  "\(.id | c(40)) \(.at | c(40)) [\(.window | c(60))] \(.tool | c(80)): \(.input | c(200)) — \(.reason | c(300))"'; }
+  (if (.repo // "") != "" and (.window // "") != .repo then "\(.repo | c(40)):" else "" end) as $rp
+  | if .kind == "ask" then
+      "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60))\(if .member then " (member: no authority)" else "" end)] ask: \(.text | c(400))\(if (.where // "") != "" then " (\(.where | c(200)))" else "" end)"
+    else
+      "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60))] \(.tool | c(80)): \(.input | c(200)) — \(.reason | c(300))"
+    end'; }
 
-record(){
-  local in cwd repo win rel tool inp why key id lg now
-  in=$(head -c 200000) || return 0
-  [ -z "${CC_ROLE:-}" ] || return 0                                   # a track, worker or member: not the seat
-  cwd=$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null); [ -n "$cwd" ] || cwd=$PWD
-  cwd=$(readlink -f "$cwd" 2>/dev/null) || return 0
-  rel=${cwd#"$(readlink -f "$DEV")"/}; [ "$rel" != "$cwd" ] || return 0   # not under ~/dev: a worktree, a sandbox, home
-  repo=${rel%%/*}; okrepo "$repo" || return 0                          # no permission session for this repo
-  win=$(window); [ "$win" = "$repo" ] || [ "$win" = "$repo~next" ] || return 0   # an orch or a stray session in the checkout
-  tool=$(jq -r "$CLEAN"' .tool_name // "" | clean' <<<"$in" 2>/dev/null)
-  inp=$(jq -c '.tool_input // {}' <<<"$in" 2>/dev/null)
-  why=$(jq -r "$CLEAN"' .reason // "" | clean' <<<"$in" 2>/dev/null)
+# open(<ledger>, <key>, <kind>): is an item of that kind and key still undecided there
+open_key(){ [ -f "$1" ] && jq -e -s --arg k "$2" --arg kd "$3" '(map(select(.kind == "decision") | .id)) as $d
+        | any(.[]; .kind == $kd and .key == $k and ((.id | IN($d[])) | not))' "$1" >/dev/null 2>&1; }
+
+# put(<ledger>, <json object with key>): append it under the ledger's lock unless the same key is still open
+put(){ local lg=$1 obj=$2
+  ( flock -w "${CC_REFUSALS_LOCK_WAIT:-5}" 9 || exit 1
+    # the same call refused again while its first record is still open is the same question: one line, one wake-up
+    open_key "$lg" "$(jq -r .key <<<"$obj")" "$(jq -r .kind <<<"$obj")" && exit 3
+    printf '%s\n' "$obj" >> "$lg" ) 9>"$lg.lock" 2>/dev/null; }
+
+# refusal(<repo> <window> <session> <tool> <input> <reason> <tool_use_id> <at>): the record, every field cleaned and cut
+refusal(){ local tool inp why key
+  tool=$(jq -rn "$CLEAN"' $ARGS.positional[0] | clean' --args "$4")
+  why=$(jq -rn "$CLEAN"' $ARGS.positional[0] | clean' --args "$6"); inp=$5
   [ "${#inp}" -gt 2000 ] && inp="${inp:0:2000} …(cut)"
   [ "${#why}" -gt 2000 ] && why="${why:0:2000} …(cut)"
-  key=$(printf '%s\n%s' "$tool" "$inp" | sha1sum | cut -c1-12)
-  lg=$(ledger "$repo"); now=$(date -u +%FT%TZ)
-  id=r$(printf '%s\n%s\n%s' "$key" "$now" "$(jq -r '.tool_use_id // ""' <<<"$in" 2>/dev/null)" | sha1sum | cut -c1-8)
-  (
-    flock -w 5 9 || exit 0
-    # the same call refused again while its first record is still open is the same question: one line, one wake-up
-    [ -f "$lg" ] && jq -e -s --arg k "$key" '(map(select(.kind == "decision") | .id)) as $d
-        | any(.[]; .kind == "refusal" and .key == $k and ((.id | IN($d[])) | not))' "$lg" >/dev/null 2>&1 && exit 0
-    jq -cn --arg id "$id" --arg at "$now" --arg w "$win" --arg s "$(jq -r '.session_id // ""' <<<"$in" 2>/dev/null)" \
-       --arg t "$tool" --arg i "$inp" --arg r "$why" --arg k "$key" \
-       '{kind:"refusal", id:$id, at:$at, source:"classifier", window:$w, session:$s, tool:$t, input:$i, reason:$r, key:$k}' >> "$lg"
-  ) 9>"$lg.lock" 2>/dev/null
+  # the repo is in the key: two repos sharing the control repo's ledger can be refused the same command, and each is its own
+  key=$(printf '%s\n%s\n%s' "$1" "$tool" "$inp" | sha1sum | cut -c1-12)
+  jq -cn --arg id "r$(printf '%s\n%s\n%s\n%s' "$key" "$8" "$7" "$2" | sha1sum | cut -c1-8)" --arg at "$8" --arg rp "$1" \
+     --arg w "$2" --arg s "$3" --arg t "$tool" --arg i "$inp" --arg r "$why" --arg k "$key" \
+     '{kind:"refusal", id:$id, at:$at, source:"classifier", repo:$rp, window:$w, session:$s, tool:$t, input:$i, reason:$r, key:$k}'; }
+
+record(){
+  local in cwd repo track='' win rel role=${CC_ROLE:-} lg tg obj
+  in=$(head -c 200000) || return 0
+  case $role in ''|worker|track) ;; *) return 0;; esac               # a member (or anything else): nothing
+  cwd=$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null); [ -n "$cwd" ] || cwd=$PWD
+  cwd=$(readlink -f "$cwd" 2>/dev/null) || return 0
+  rel=${cwd#"$(readlink -f "$DEV")"/}
+  if [ "$rel" != "$cwd" ] && [ -z "$role" ]; then                    # the primary checkout: the seat, an orch, any window there
+    repo=${rel%%/*}; win=$(window); [ -n "$win" ] || win=unknown
+  else
+    rel=${cwd#"$(readlink -f "$WTS" 2>/dev/null || printf '%s' "$WTS")"/}
+    [ "$rel" != "$cwd" ] || return 0                                  # not under ~/dev or the worktrees: home, a scratch dir
+    repo=${rel%%/*}; track=${rel#*/}; track=${track%%/*}
+    [ "$track" != "$rel" ] && name_ok "$track" || return 0
+    win="worker:$track"
+  fi
+  name_ok "$repo" || return 0
+  fld(){ jq -r "$1 // \"\"" <<<"$in" 2>/dev/null; }
+  obj=$(refusal "$repo" "$win" "$(fld .session_id)" "$(fld .tool_name)" "$(jq -c '.tool_input // {}' <<<"$in" 2>/dev/null)" \
+                "$(fld .reason)" "$(fld .tool_use_id)" "$(date -u +%FT%TZ)") || return 0
+  if tg=$(target "$repo") && lg=$(ledger "$tg") && [ -w "${lg%/*}" ]; then put "$lg" "$obj"; return 0; fi
+  # no ledger in sight — a worker inside the sandbox: spool it in its own state dir, for collect on the host
+  [ -n "$track" ] && [ -d "$ROOT/$repo/$track" ] && printf '%s\n' "$obj" >> "$ROOT/$repo/$track/refusals.spool.jsonl"
   return 0
 }
 
+# take <spool> <tmp>: the spool renamed out of the worker's reach into <tmp>, a host-only name beside it. The worker
+# owns the spool's directory, so what is read is the renamed entry, and only a regular file: a link or anything else
+# is dropped unread. A spool that is a DIRECTORY cannot be renamed onto <tmp> (a file), so it would fail every
+# collect and never clear (review of #1028): it is renamed onto an empty host-only directory instead and removed.
+take(){ local dd
+  if [ -d "$1" ] && [ ! -L "$1" ]; then
+    dd=$(mktemp -d "${2%/*}/.refusals-drop.XXXXXX") || return 1
+    if mv -f -T -- "$1" "$dd" 2>/dev/null; then rm -rf -- "${dd:?}"; echo "cc-refusals: $1 was a directory — dropped unread" >&2
+    else rmdir -- "${dd:?}" 2>/dev/null; fi
+    return 1
+  fi
+  mv -f -T -- "$1" "$2" 2>/dev/null || return 1
+  if [ -L "$2" ] || [ ! -f "$2" ]; then rm -f -- "${2:?}"; echo "cc-refusals: $1 was not a regular file — dropped unread" >&2; return 1; fi; }
+SPOOL_MAX_LINES=${CC_REFUSALS_SPOOL_MAX_LINES:-500} SPOOL_MAX_BYTES=2000000
+
+# collect <repo> <track>: the spooled refusals into the ledger. Window and repo are named here, not read from the spool.
+# A record leaves the spool only once the ledger took it or already holds it open; one the ledger did not take (its
+# lock held past the wait) goes back into the spool for the next collect. At most SPOOL_MAX_LINES lines and
+# SPOOL_MAX_BYTES bytes are read; the rest is dropped and said.
+collect(){ local repo=$1 track=$2 sp tg lg l n=0 kept=0 rc tmp keep more
+  name_ok "$track" || { echo "$USAGE" >&2; exit 2; }
+  sp=$ROOT/$repo/$track/refusals.spool.jsonl; [ -e "$sp" ] || [ -L "$sp" ] || return 0
+  if ! tg=$(target "$repo"); then    # no permission session anywhere: nothing will ever drain it, so it is not kept
+    rm -f -- "${sp:?}"; echo "cc-refusals: no permission session for $repo or the control repo — its spool from $track dropped" >&2; return 0
+  fi
+  lg=$(ledger "$tg")
+  tmp=$(mktemp "$ROOT/$repo/.refusals-collect.XXXXXX") || return 1
+  keep=$(mktemp "$ROOT/$repo/.refusals-keep.XXXXXX") || { rm -f -- "${tmp:?}"; return 1; }
+  if take "$sp" "$tmp"; then
+    # the size from the inode, and lines counted only inside the byte cap: the worker writes this file, and a sparse
+    # terabyte read whole by wc would stall the host loop that runs collect (review of #1028)
+    [ "$(stat -c %s -- "$tmp")" -gt "$SPOOL_MAX_BYTES" ] || [ "$(head -c "$SPOOL_MAX_BYTES" -- "$tmp" | wc -l)" -gt "$SPOOL_MAX_LINES" ] &&
+      echo "cc-refusals: the spool from $repo/$track is over $SPOOL_MAX_LINES lines or $SPOOL_MAX_BYTES bytes — only that much was read" >&2
+    while IFS= read -r l; do
+      jq -e 'type == "object"' <<<"$l" >/dev/null 2>&1 || continue
+      put "$lg" "$(refusal "$repo" "worker:$track" "$(jq -r '.session // ""' <<<"$l")" "$(jq -r '.tool // ""' <<<"$l")" \
+           "$(jq -r '.input // ""' <<<"$l")" "$(jq -r '.reason // ""' <<<"$l")" "spool" "$(date -u +%FT%TZ)")"; rc=$?
+      case $rc in 0) n=$((n+1));; 3) ;; *) printf '%s\n' "$l" >> "$keep"; kept=$((kept+1));; esac
+    done < <(head -c "$SPOOL_MAX_BYTES" -- "$tmp" | head -n "$SPOOL_MAX_LINES")
+  fi
+  rm -f -- "${tmp:?}"
+  if [ "$kept" -gt 0 ]; then
+    # back into the spool, by rename; a spool the worker wrote meanwhile is taken first and kept after them
+    more=$(mktemp "$ROOT/$repo/.refusals-collect.XXXXXX") && take "$sp" "$more" && head -c "$SPOOL_MAX_BYTES" -- "$more" >> "$keep"
+    [ -n "${more:-}" ] && rm -f -- "${more:?}"
+    mv -f -T -- "$keep" "$sp"
+    echo "cc-refusals: $n collected from $repo/$track, $kept kept for the next collect (the ledger did not take them)"
+  else
+    rm -f -- "${keep:?}"; echo "cc-refusals: $n collected from $repo/$track"
+  fi; }
+
+# ask <repo> --from <who> [--where <link>] [--member] -- <text>: a permission question into the ledger, its id printed
+ask_question(){ local repo=$1 from='' where='' member=false text tg lg now key obj id n rc; shift
+  while [ $# -gt 0 ]; do case $1 in   # a flag with no value is a usage error: `shift 2` on one word shifts nothing and loops
+    --from|--where) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; } ;; esac; case $1 in
+    --from) from=${2-}; shift 2;; --where) where=${2-}; shift 2;; --member) member=true; shift;;
+    --) shift; break;; *) echo "$USAGE" >&2; exit 2;; esac; done
+  text=$*; [ -n "$from" ] && [ -n "$text" ] && name_ok "$repo" || { echo "$USAGE" >&2; exit 2; }
+  tg=$(target "$repo") || { echo "cc-refusals: no permission session for $repo or the control repo" >&2; exit 1; }
+  lg=$(ledger "$tg"); now=$(date -u +%FT%TZ)
+  [ "${#text}" -gt 4000 ] && text="${text:0:4000} …(cut)"
+  key=$(printf 'ask\n%s\n%s\n%s' "$repo" "$from" "$text" | sha1sum | cut -c1-12); id=q$(printf '%s\n%s' "$key" "$now" | sha1sum | cut -c1-8)
+  obj=$(jq -cn --arg id "$id" --arg at "$now" --arg rp "$repo" --arg w "$from" --arg wh "$where" --arg t "$text" \
+     --arg k "$key" --argjson m "$member" \
+     "$CLEAN"'{kind:"ask", id:$id, at:$at, repo:$rp, window:($w | clean), member:$m, where:($wh | clean), text:($t | clean), key:$k}')
+  put "$lg" "$obj"; rc=$?
+  if [ "$rc" = 3 ]; then     # the same ask, still open: its first id
+    id=$(jq -r --arg k "$key" 'select(.kind == "ask" and .key == $k) | .id' "$lg" | tail -1)
+  elif [ "$rc" != 0 ]; then echo "cc-refusals: the ledger is locked" >&2; exit 1; fi
+  echo "$id"
+  # THE PERMISSION SESSION IS DOWN: the ask waits here, and one line a day says so — never the ask. cc-notify reads
+  # the asker again: from the control seat or the box's own hand it reaches the owner, from any other seat it is a
+  # request to the planning seat (only that seat pages him). What is said back is who was actually told.
+  if ! perms_live; then
+    local err nrc who
+    n=$(open_ "$tg" | grep -c .)
+    err=$("${CC_REFUSALS_NOTIFY:-$BIN/cc-notify}" -t "$tg perms down" --decision --not-perms --id "perms-down:$tg:$(date -u +%F)" -- \
+      "The permission session is down, so $n permission question(s) wait in its ledger. Start it and it reads them." \
+      2>&1 >/dev/null); nrc=$?
+    if [ "$nrc" != 0 ]; then who="nobody could be told it is down (cc-notify exited $nrc)"
+    elif grep -q 'only the control seat asks the owner' <<<"$err"; then who="the planning seat was told it is down (only that seat pages the owner)"
+    else who="the owner was told it is down"; fi
+    echo "cc-refusals: the permission session is down; the ask waits in its ledger, and $who" >&2
+  fi; }
+
 decided(){ jq -r 'select(.kind == "decision") | .id' "$1" 2>/dev/null; }
 open_(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || return 0
-  jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select(.kind == "refusal" and ((.id | IN($d[])) | not))' "$lg" | line; }
+  jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select((.kind == "refusal" or .kind == "ask") and ((.id | IN($d[])) | not))' "$lg" | line; }
 watch_(){ local lg; lg=$(ledger "$1"); touch "$lg" || exit 2
   # tail from the end: what is already there is `open`'s to print. One line per refusal, flushed as it comes.
   tail -n0 -F "$lg" 2>/dev/null | while IFS= read -r l; do printf '%s\n' "$l" | line 2>/dev/null; done; }
 show(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $1" >&2; exit 1; }
   jq -c --arg id "$2" 'select(.id == $id)' "$lg" | grep . || { echo "cc-refusals: no refusal $2" >&2; exit 1; }; }
-decide(){ local repo=$1 id=$2 what=$3 note=$4 lg
-  case $what in grant|decline) ;; *) echo "$USAGE" >&2; exit 2;; esac
-  [ -n "$note" ] || { echo "cc-refusals: say the rule you added, or why not" >&2; exit 2; }
-  lg=$(ledger "$repo"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $repo" >&2; exit 1; }
+# AN APPROVAL ASK (the owner, 2026-09-28: approval cards "go to perms"). cc-notify files it here in place of the
+# owner's card, so the permission session reads it where it already reads refusals, and `decide … his` posts the card.
+# WHO MAY FILE ONE (review of #904): only a caller cc-notify itself would let ask the owner, read the way its
+# is_control reads it, and never from a name the caller sets. An ask with --run is a command the owner's 👍 runs, so
+# a worker that could file one could put its own command in front of him. Refused: a member boundary, any CC_ROLE
+# (record's rule: a track, worker, member or steward), a .cc/track or .cc/member-facing marker above the cwd, and any
+# seat the Slack daemon names other than <repo> itself, or no answer from it at all. The daemon's word is read from the
+# cc-slack beside this script, not from $HOME/bin, so an environment cannot swap in a stub that names the seat.
+# Prints who it is, for the record: <repo>, or "box" for the box's own hand (no seat: the lander, a unit).
+asker(){ local repo=$1 d=$PWD out rc pwh PATH=/usr/local/bin:/usr/bin:/bin
+  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 1
+  [ -z "${CC_ROLE:-}" ] || return 1
+  while [ -n "$d" ] && [ "$d" != / ]; do
+    { [ -f "$d/.cc/track" ] || [ -f "$d/.cc/member-facing" ]; } && return 1; d=${d%/*}; done
+  # THE DAEMON IS ASKED WITH NOTHING OF THE CALLER'S (security read #2 of #904): cc-slack finds its socket from
+  # CC_SLACK_DIR or $HOME, so a worker pointing either at a socket of its own that answers {} read as the box's own
+  # hand. Here it gets HOME from the password database, a fixed PATH, and no other variable.
+  pwh=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); [ -n "$pwh" ] || return 1
+  out=$(env -i HOME="$pwh" PATH="$PATH" "$BIN/cc-slack" seat 2>/dev/null); rc=$?; out=${out%%$'\n'*}
+  [ "$rc" = 2 ] && return 1
+  [ -z "$out" ] && { echo box; return 0; }
+  [ "$out" = "$repo" ] && { echo "$repo"; return 0; }
+  return 1; }
+ask_approval(){ local repo=$1 title="" heading="" run="" cid="" text key id lg now win; shift
+  while [ $# -gt 0 ]; do case $1 in
+    --title|--heading|--run|--id) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; } ;; esac; case $1 in
+    --title) title=$2; shift 2;; --heading) heading=$2; shift 2;; --run) run=$2; shift 2;; --id) cid=$2; shift 2;;
+    --) shift; break;; *) echo "$USAGE" >&2; exit 2;; esac; done
+  text="$*"; [ -n "$text" ] || { echo "$USAGE" >&2; exit 2; }
+  win=$(asker "$repo") || { echo "cc-refusals: only $repo's control seat or the box's own hand files an approval ask — nothing written" >&2; exit 2; }
+  key=$(printf 'approval\n%s\n%s\n%s' "$cid" "$run" "$text" | sha1sum | cut -c1-12)
+  lg=$(ledger "$repo"); now=$(date -u +%FT%TZ)
+  id=a$(printf '%s\n%s\n%s' "$key" "$now" "$$" | sha1sum | cut -c1-8)
   (
     flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
-    jq -e --arg id "$id" 'select(.kind == "refusal" and .id == $id)' "$lg" >/dev/null || { echo "cc-refusals: no refusal $id" >&2; exit 1; }
-    decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is already decided" >&2; exit 1; }
-    jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" --arg d "$what" --arg n "$note" --arg b "$(window)" \
-       '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b}' >> "$lg"
-    echo "cc-refusals: $id ${what%e}ed"
+    # the same ask filed again while its record is open (a retried deploy, a seat re-running its line) is one ask
+    old=$([ -f "$lg" ] && jq -r -s --arg k "$key" '(map(select(.kind == "decision") | .id)) as $d
+        | [.[] | select(.kind == "refusal" and .key == $k and ((.id | IN($d[])) | not)) | .id][0] // empty' "$lg" 2>/dev/null)
+    [ -n "$old" ] && { echo "$old"; exit 0; }
+    jq -cn --arg id "$id" --arg at "$now" --arg w "$win" --arg i "$run" --arg r "$text" --arg k "$key" \
+       --arg t "$title" --arg h "$heading" --arg c "$cid" \
+       '{kind:"refusal", id:$id, at:$at, source:"approval", window:$w, session:"", tool:"approval", input:$i, reason:$r,
+         key:$k, title:$t, heading:$h, card_id:$c}' >> "$lg" || exit 1
+    echo "$id"
   ) 9>"$lg.lock"; }
+
+# WHO MAY DECIDE (security read #2 of #904): the permission seat alone, read from the processes the way cc-guard's
+# pseat reads them, never from a name the caller sets (CC_REFUSALS_WINDOW, $TMUX_PANE). The nearest `claude` above
+# this process carries --dangerously-skip-permissions, runs in this repo's perms dir, and has no `claude` above it: a
+# session that starts a flagged child claude has its own claude over the child. Anything else could grant or decline
+# the lander's ask, or rule a forged ask the owner's and post its 🔐 card.
+ppid_(){ awk '/^PPid:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
+pseat(){ local want p=$PPID n=0
+  want=$(realpath -e "$ROOT/$1/perms" 2>/dev/null) || return 1
+  while [ -n "$p" ] && [ "$p" -gt 1 ] && [ "$n" -lt 64 ]; do
+    [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && break; p=$(ppid_ "$p"); n=$((n+1)); done
+  [ "$(cat "/proc/${p:-0}/comm" 2>/dev/null)" = claude ] || return 1
+  tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- --dangerously-skip-permissions || return 1
+  [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$want" ] || return 1
+  p=$(ppid_ "$p"); n=0
+  while [ -n "$p" ] && [ "$p" -gt 1 ] && [ "$n" -lt 64 ]; do
+    [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && return 1; p=$(ppid_ "$p"); n=$((n+1)); done
+  return 0; }
+
+decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
+  case $what in grant|decline|his) ;; *) echo "$USAGE" >&2; exit 2;; esac
+  pseat "$repo" || { echo "cc-refusals: only $repo's permission session decides — nothing written" >&2; exit 2; }
+  [ -n "$note" ] || { echo "cc-refusals: say the rule you added, or why not" >&2; exit 2; }
+  lg=$(ledger "$repo"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $repo" >&2; exit 1; }
+  rec=$(jq -c --arg id "$id" 'select((.kind == "refusal" or .kind == "ask") and .id == $id)' "$lg" | head -1)
+  [ -n "$rec" ] || { echo "cc-refusals: no refusal or ask $id" >&2; exit 1; }
+  [ "$what" = his ] && [ "$(jq -r '.source // ""' <<<"$rec")" = approval ] && card=1
+  prior=$(jq -r --arg id "$id" 'select(.kind == "decision" and .id == $id) | .decision' "$lg" | head -1)
+  # "his" on an approval ask: the ruling goes on the ledger FIRST, because the card's cc-notify --his checks it there,
+  # and then the card goes out; a card that went out is recorded as posted. A ruling of "his" whose card never went
+  # out (Slack down) may be given again, and that only posts the card. Anything else already decided is refused.
+  if [ -n "$prior" ] && ! { [ "$card" = 1 ] && [ "$prior" = his ] \
+       && ! jq -e -s --arg id "$id" 'any(.[]; .kind == "posted" and .id == $id)' "$lg" >/dev/null; }; then
+    echo "cc-refusals: $id is already decided" >&2; exit 1; fi
+  if [ -z "$prior" ]; then
+    (
+      flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
+      decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is already decided" >&2; exit 1; }
+      jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" --arg d "$what" --arg n "$note" --arg b "$(window)" \
+         '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b}' >> "$lg" || exit 1
+    ) 9>"$lg.lock" || exit 1
+  fi
+  if [ "$card" = 1 ]; then
+    local a=(--approval --his "$id" -t "$(jq -r '.title // ""' <<<"$rec")")
+    [ -n "$(jq -r '.heading // ""' <<<"$rec")" ] && a+=(--heading "$(jq -r '.heading' <<<"$rec")")
+    [ -n "$(jq -r '.input // ""' <<<"$rec")" ] && a+=(--run "$(jq -r '.input' <<<"$rec")")
+    # the card's id is the ask's card id AND its ledger id: the lander keys an ask on the unit alone, so a retried
+    # deploy files one ask, and cc-slack posts an id once ever, so a later ask on that unit ruled his still posts
+    [ -n "$(jq -r '.card_id // ""' <<<"$rec")" ] && a+=(--id "$(jq -r '.card_id' <<<"$rec"):$id")
+    "${CC_REFUSALS_NOTIFY:-$HOME/bin/cc-notify}" "${a[@]}" -- "$(jq -r '.reason' <<<"$rec")" >/dev/null \
+      || { echo "cc-refusals: $id is ruled the owner's, but the card did not post — run the same decide again to post it" >&2; exit 1; }
+    ( flock -w 5 9 || exit 1
+      jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" '{kind:"posted", id:$id, at:$at}' >> "$lg" ) 9>"$lg.lock" \
+      || echo "cc-refusals: the card for $id went out, but the ledger did not take that it did" >&2
+  fi
+  case $what in his) echo "cc-refusals: $id is the owner's";; *) echo "cc-refusals: $id ${what%e}ed";; esac; }
 
 selfcheck(){   # the cases are tests/selfcheck/cc-refusals.sh beside this bin/; sourcing it replaces this selfcheck()
   . "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/tests/selfcheck/cc-refusals.sh" || return 1
   selfcheck "$@"; }
 
+# ask: two forms share the verb. --title is an approval ask (cc-notify --approval, PERMS FIRST), filed only into a
+# repo that has a permission session and only by the control seat or the box's own hand; --from is a permission
+# question (cc-notify --perms, cc-slack's reply), which any seat files into its repo's ledger or the control repo's.
+# The flags before `--` pick the form; an ask with both, or neither, is refused.
+ask(){ local a f=0 t=0
+  for a in "${@:2}"; do case $a in --) break;; --from) f=1;; --title) t=1;; esac; done
+  if [ "$t" = 1 ] && [ "$f" = 0 ]; then okrepo "$1" || { echo "$USAGE" >&2; exit 2; }; ask_approval "$@"
+  elif [ "$f" = 1 ] && [ "$t" = 0 ]; then ask_question "$@"
+  else echo "$USAGE" >&2; exit 2; fi; }
+
 case "${1:-}" in
   record) record; exit 0 ;;
+  collect) [ $# = 3 ] && name_ok "$2" || { echo "$USAGE" >&2; exit 2; }; collect "$2" "$3" ;;
+  ask) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }; shift; ask "$@" ;;
   open|watch) [ $# = 2 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; "${1}_" "$2" ;;
   show) [ $# = 3 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; show "$2" "$3" ;;
   decide) [ $# = 5 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; decide "$2" "$3" "$4" "$5" ;;

@@ -1470,6 +1470,13 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   : > "$d/seats"; sq_
   t '…but one sent to a key with no live seat nobody heard: it goes out once as the owner'"'"'s decision card, not as a request' \
     "$(grep -c '^--ask|' "$d/st.n")|$(grep -c '^--decision|.*: which port?|$' "$d/st.n")|$(grep -c 'nobody has heard it) — its question went out as a decision card: yes' "$d/dt.log")" "0|1|1"
+  # …AND ONE cc-notify's WORD GATE REFUSES (exit 2, nothing posted: "the classifier refused my push") is not lost: it
+  # goes again with --perms, once, under the same id. A stub that refuses every --decision stands in for the gate.
+  mkdir -p "$d/stg"; cp "$bd/cc-broker" "$d/stg/"; printf '#!/bin/sh\n' > "$d/stg/cc-green"
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"; echo >> "%s"\n[ "$1" = --decision ] && exit 2\nexit 0\n' "$d/st.n" "$d/st.n" > "$d/stg/cc-notify"; chmod +x "$d/stg"/*
+  ( : > "$d/st.n"; : > "$d/dt.log"; log(){ printf '%s\n' "$*" >> "$d/dt.log"; }; BOARD="$d/dtb/cc-board"; BIN="$d/stg"; eval "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0")"; stop 3 "needs you" "STATUS: BLOCKED: the classifier refused my push" waiting "the classifier refused my push" ) >/dev/null 2>"$d/st.err"
+  t '…and one the word gate refuses as a decision (exit 2) goes again with --perms under the same id, and the log says so' \
+    "$(grep -c '^--decision|' "$d/st.n")|$(grep -c '^--perms|--id|blocked:[^|]*|-t|[^|]*|.*: the classifier refused my push|$' "$d/st.n")|$(grep -c 'its question went out as a permission question (it read like one, so the owner.s card was refused): yes' "$d/dt.log")" "1|1|1"
   eval "$(grep '^seat_windows(){' "$0")"   # the real one back for whatever runs after
   ORCH_KEY=""   # …and no orch recorded either
   : > "$brec"
@@ -1534,7 +1541,7 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t 'the board is written BEFORE the broker is asked and a question is posted AFTER it — so a broker that is \
 down still leaves the board write, which is the half of this that must never be lost' \
     "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -oE 'BOARD" status|tell_planner|BIN/cc-notify' | tr '\n' ' ')" \
-    'BOARD" status tell_planner BIN/cc-notify '
+    'BOARD" status tell_planner BIN/cc-notify BIN/cc-notify '
   # ── the done line says WHAT finished, not how many turns it took ──
   HOME="$d/bh" "$BIN/cc-board" init titled /tmp/titled main >/dev/null
   HOME="$d/bh" "$BIN/cc-board" add titled t1 "worker stop reaches the planner" >/dev/null
@@ -1997,8 +2004,8 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   t '…and a bare word that is not a verb phrase is said in words' \
     "$(sh_ waiting)|$(sh_ paused)|$(sh_ errored)" \
     "Worker stop reaches the planner is waiting|Worker stop reaches the planner is paused|Worker stop reaches the planner failed twice in a row"
-  t '…and the notice still ROUTES on the untouched title, so the ledger and the thread are unmoved' \
-    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -cF -- '-t "$repo/$track $title"')" 1
+  t '…and the notice still ROUTES on the untouched title, so the ledger and the thread are unmoved (the --perms resend too)' \
+    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -cF -- '-t "$repo/$track $title"')/$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -c 'BIN/cc-notify')" 2/2
   # ── THE SHARED DISPATCH TEXT REACHES THE WORKER ── `cc <repo> <track> --go` launches THIS loop's session, and its
   # prompt is built above, not in `cc`, so `cc selfcheck` (which covers the planning, orch and interactive-track
   # variants) cannot see this one. Both halves are asserted: the prompt carries the text, and with the file gone the
@@ -2322,8 +2329,14 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   # #<repo>, or a control-seat request when this caller lacks that authority); any other stop is filed as a planner
   # request, and the log line says where it went (stop_route).
   if [ "$heard" = sent ] || [ -z "$said" ]; then log "$(stop_route "$heard" "$title" "$msg")"
-  else local r=no; "$BIN/cc-notify" --decision --id "$bid" -t "$repo/$track $title" "$(row_title): $said" && r=yes
-    log "the stop went to $tg's session: no$([ "$heard" = dead ] && printf ' (the broker took it, but no session is live there, so nobody has heard it)') — its question went out as a decision card: $r"; fi
+  # A QUESTION THAT READS LIKE A PERMISSION ONE ("the classifier refused my push") is refused by cc-notify's word gate,
+  # exit 2 and nothing posted (review of #904 at ce990bc0: such a question vanished). It belongs to the permission
+  # session anyway, so it is sent again with --perms, and the log says that is where it went.
+  else local r=no rc=0 how="a decision card"; "$BIN/cc-notify" --decision --id "$bid" -t "$repo/$track $title" "$(row_title): $said" || rc=$?
+    if [ "$rc" = 0 ]; then r=yes
+    elif [ "$rc" = 2 ]; then how="a permission question (it read like one, so the owner's card was refused)"
+      "$BIN/cc-notify" --perms --id "$bid" -t "$repo/$track $title" "$(row_title): $said" && r=yes; fi
+    log "the stop went to $tg's session: no$([ "$heard" = dead ] && printf ' (the broker took it, but no session is live there, so nobody has heard it)') — its question went out as $how: $r"; fi
   exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
@@ -2445,6 +2458,9 @@ while [ $i -lt "$MAXI" ]; do
   # is what pushes it. It is a no-op with the sandbox off, and cc-sandbox folds again at the next launch if this run
   # never reached this line, so an iteration killed mid-flight loses nothing.
   "$BIN/cc-sandbox" reconcile "$repo" "$track" || log "the branch $repo/$track committed on could not be folded onto the host's ref — see the line above"
+  # A classifier refusal the worker's hook could not write from inside the sandbox waits in its own state dir; this
+  # host-side line moves it into the permission session's ledger (cc-refusals, WHO IS RECORDED).
+  "$BIN/cc-refusals" collect "$repo" "$track" >/dev/null 2>&1 || true
   ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
   ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push ) || true   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
   after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); after_prog=$(md5sum "$ST/progress.md" | cut -c1-8)

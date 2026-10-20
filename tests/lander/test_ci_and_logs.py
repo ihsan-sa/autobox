@@ -360,10 +360,10 @@ class RestFacts(unittest.TestCase):
         pin = "h" * 40
         calls, p = self.run_gh({
             "api repos/o/r/pulls/7": json.dumps(self.PULL),
-            f"api repos/o/r/commits/{pin}/check-runs?per_page=100": json.dumps({"check_runs": [
+            f"api repos/o/r/commits/{pin}/check-runs?per_page=100": json.dumps({"total_count": 2, "check_runs": [
                 {"name": "check", "status": "completed", "conclusion": "success", "details_url": "u1"},
                 {"name": "slow", "status": "in_progress", "conclusion": None, "details_url": "u2"}]}),
-            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": [
+            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"total_count": 1, "statuses": [
                 {"context": "ci/x", "state": "failure", "target_url": "u3"}]})})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
             j, _ = GH.pr_facts("/x", 7, "headRefOid,statusCheckRollup")
@@ -392,12 +392,14 @@ class RestFacts(unittest.TestCase):
         self.assertEqual(sum("check-runs" in " ".join(c) for c in calls), 2)
         _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),   # page 2 unanswered: unreadable, not green
                             runs: json.dumps({"total_count": 101, "check_runs": [ok] * 100}),
-                            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+                            f"api repos/o/r/commits/{pin}/status?per_page=100":
+                                json.dumps({"total_count": 0, "statuses": []})})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
         calls, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),   # exactly 100: total_count stops it
                                 runs: json.dumps({"total_count": 100, "check_runs": [ok] * 100}),
-                                f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+                                f"api repos/o/r/commits/{pin}/status?per_page=100":
+                                    json.dumps({"total_count": 0, "statuses": []})})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "green")
         self.assertEqual(sum("check-runs" in " ".join(c) for c in calls), 1)
@@ -409,7 +411,8 @@ class RestFacts(unittest.TestCase):
         _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),
                             runs: json.dumps({"total_count": 101, "check_runs": [ok] * 100}),
                             runs + "&page=2": json.dumps({"total_count": 101, "check_runs": []}),
-                            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+                            f"api repos/o/r/commits/{pin}/status?per_page=100":
+                                json.dumps({"total_count": 0, "statuses": []})})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
             j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
@@ -417,10 +420,11 @@ class RestFacts(unittest.TestCase):
         self.assertIn("read short: 100 of 101", why)
 
     def test_a_check_list_that_repeats_its_page_is_unreadable(self):
-        # perms on #1547: no total_count and the same full page every time would page forever and read green
+        # perms on #1547: the same full page every time would page forever and read green
         pin, calls = "h" * 40, []
-        page = json.dumps({"check_runs": [{"id": 5 + i, "name": "c", "status": "completed", "conclusion": "success",
-                                           "details_url": "u"} for i in range(100)]})
+        page = json.dumps({"total_count": 10 ** 6, "check_runs": [
+            {"id": 5 + i, "name": "c", "status": "completed", "conclusion": "success", "details_url": "u"}
+            for i in range(100)]})
 
         def gh(argv, root, token=None, timeout=120, note=True):
             calls.append(argv)
@@ -428,12 +432,71 @@ class RestFacts(unittest.TestCase):
                 raise AssertionError("paged on past a repeated page")
             if argv[1] == "repos/o/r/pulls/7":
                 return 0, json.dumps(self.PULL), ""
-            return 0, page if "check-runs" in argv[1] else json.dumps({"statuses": []}), ""
+            return 0, page if "check-runs" in argv[1] else json.dumps({"total_count": 0, "statuses": []}), ""
         with mock.patch.object(GH, "gh", gh), mock.patch.object(GH, "slug", lambda root: "o/r"):
             j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
         self.assertIsNone(j)
         self.assertIn("repeats an earlier page", why)
+
+    def test_a_total_count_that_is_not_a_count_is_unreadable(self):
+        # perms on #1559: -1, 0 and the string '101' each passed a full page 1 as the whole list
+        pin, ok = "h" * 40, {"name": "c", "status": "completed", "conclusion": "success", "details_url": "u"}
+        runs = f"api repos/o/r/commits/{pin}/check-runs?per_page=100"
+        for total, said in ((-1, "not a count"), ("101", "not a count"), (True, "not a count"),
+                            (None, "not a count"), (100.0, "not a count"), (0, "read past: 100 of 0")):
+            _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),
+                                runs: json.dumps({"total_count": total, "check_runs": [ok] * 100}),
+                                f"api repos/o/r/commits/{pin}/status?per_page=100":
+                                    json.dumps({"total_count": 0, "statuses": []})})
+            with self.subTest(total=total), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+                j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+                self.assertIsNone(j)
+                self.assertIn(said, why)
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),   # statuses are held to it too
+                            runs: json.dumps({"total_count": 1, "check_runs": [ok]}),
+                            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+        self.assertIsNone(j)
+        self.assertIn("status page 1 total_count is None, not a count", why)
+
+    def test_the_largest_total_count_across_pages_is_the_one_read_to(self):
+        # the Opus read on #1559: page 1 says 102 and page 2 says 101, so the last page's total let 101 pass
+        pin, ok = "h" * 40, {"name": "c", "status": "completed", "conclusion": "success", "details_url": "u"}
+        runs = f"api repos/o/r/commits/{pin}/check-runs?per_page=100"
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),
+                            runs: json.dumps({"total_count": 102, "check_runs": [ok] * 100}),
+                            runs + "&page=2": json.dumps({"total_count": 101, "check_runs": [dict(ok, name="late")]}),
+                            f"api repos/o/r/commits/{pin}/status?per_page=100":
+                                json.dumps({"total_count": 0, "statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+        self.assertIsNone(j)
+        self.assertIn("read short: 101 of 102", why)
+
+    def test_pages_stop_at_the_bound_page_ones_total_count_gives(self):
+        # perms on #1559: a list whose total_count grows by a page each time, of rows never seen, pages forever.
+        # Page 1 says 101, so two pages is all there can be
+        pin, calls = "h" * 40, []
+
+        def gh(argv, root, token=None, timeout=120, note=True):
+            calls.append(argv)
+            if len(calls) > 50:
+                raise AssertionError("paged on past the bound")
+            if argv[1] == "repos/o/r/pulls/7":
+                return 0, json.dumps(self.PULL), ""
+            if "check-runs" not in argv[1]:
+                return 0, json.dumps({"total_count": 0, "statuses": []}), ""
+            n = int(argv[1].split("&page=")[1]) if "&page=" in argv[1] else 1
+            return 0, json.dumps({"total_count": 100 * n + 1, "check_runs": [
+                {"id": 1000 * n + i, "name": "c", "status": "completed", "conclusion": "success",
+                 "details_url": "u"} for i in range(100)]}), ""
+        with mock.patch.object(GH, "gh", gh), mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+        self.assertIsNone(j)
+        self.assertIn("check-runs runs past the 2 page(s) its total_count allows", why)
+        self.assertEqual(sum("check-runs" in " ".join(c) for c in calls), 2)
 
     COMMENTS = ("api --paginate repos/o/r/issues/7/comments?per_page=100 -q "
                 ".[] | {body, login: .user.login, createdAt: .created_at}")

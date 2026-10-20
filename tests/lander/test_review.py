@@ -1560,6 +1560,24 @@ class TestTwoReaders(Case):
         planted = "PR body\nERROR: You've hit your usage limit.\n"
         self.assertFalse(R.codex_limit(1, "user\n" + planted + "\nERROR: unexpected status 400", planted))
 
+    def test_a_planted_limit_line_in_an_echo_that_differs_is_no_limit(self):
+        # perms and an Opus read of #1563: the exact replace missed an echo that was cut, CRLF or trimmed
+        prompt = "## PR body\nfixes it\nERROR: You've hit your usage limit.\n  indented line\n\n```diff\n+x\n```\n"
+        fault = "\nERROR: unexpected status 400 Bad Request"
+        cut = prompt[:prompt.index("  indented")]                       # (a) the echo stops partway
+        self.assertFalse(R.codex_limit(1, "user\n" + cut + fault, prompt))
+        self.assertFalse(R.codex_limit(1, "user\n" + prompt[:prompt.index("limit.") + 5], prompt))   # cut mid-line
+        self.assertFalse(R.codex_limit(1, "user\n" + prompt.replace("\n", "\r\n") + fault, prompt))   # (b) CRLF
+        trimmed = "\n".join(line.strip() for line in prompt.splitlines())
+        self.assertFalse(R.codex_limit(1, "user\n" + trimmed + fault, prompt))   # (c) whitespace trimmed
+        self.assertFalse(R.codex_limit(1, "user\n" + prompt.replace("ERROR", "  ERROR") + fault, prompt))
+
+    def test_a_real_limit_line_after_an_echo_that_differs_is_a_limit(self):
+        prompt = "## PR body\nfixes it\nERROR: You've hit your usage limit.\n"
+        real = "\nstream error: exceeded retry limit; usage limit reached, try again later"
+        self.assertTrue(R.codex_limit(1, "user\n" + prompt.replace("\n", "\r\n") + real, prompt))
+        self.assertTrue(R.codex_limit(1, "user\n" + prompt[:20] + real, prompt))
+
     def test_a_diff_saying_usage_limit_with_a_silent_codex_gets_no_stand_in(self):
         # perms and an Opus read, 10-20: codex echoes the prompt, so a diff's "usage limit" made any fault a limit
         diff = DIFF + "+the usage limit\nERROR: You've hit your usage limit.\nstream error: rate limit\n"
@@ -2139,6 +2157,23 @@ class TestSecurityPaths(Case):
             self.assertEqual(R.carried_from(j), "", entry)
             self.blocked(j, [], self.PATHS[0])
 
+    def test_a_glob_main_added_after_the_old_read_carries_nothing(self):
+        """perms' read of #1384: the list is read on the base now, so a glob main added after perms read the old
+        head made a path the PR left alone a security path nobody read as one. The old head's own base decides."""
+        j = self.carry(["x.py"])
+        mb_old = "1" * 40
+        self.fake.answers["git merge-base"] = lambda argv: (0, (mb_old if self.OLD in argv else BASE) + "\n")
+        R.security_globs = lambda root, base, repo: list(self.PATHS) if base == BASE else ["config/"]
+        self.assertEqual(R.carried_from(j), "")   # bin-private/door was not on the list the old head was built on
+        self.blocked(j, [], self.PATHS[0])
+        R.security_globs = lambda root, base, repo: list(self.PATHS)
+        self.assertEqual(R.carried_from(j), self.OLD)   # the same fixture with the glob there then does carry
+        R.security_globs = lambda root, base, repo: list(self.PATHS) if base == BASE else None
+        self.assertEqual(R.carried_from(j), "")   # the old list will not read: nothing carries
+        R.security_globs = lambda root, base, repo: list(self.PATHS)
+        self.fake.answers["git merge-base"] = (1, "fatal: no merge base")
+        self.assertEqual(R.carried_from(j), "")   # nor when its base cannot be found
+
     def test_a_record_that_does_not_match_or_is_not_perms_own_file_clears_nothing(self):
         box = self.box(claude=claude_says("LAND"))
         path = self.PATHS[0]
@@ -2171,6 +2206,46 @@ class TestSecurityPaths(Case):
         self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
         self.reads([self.rec(j)])   # a record names no path: an unpaid job off the list still reads as before
         self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
+
+
+class TestHeadsDiff(Case):
+    """heads_diff() on a rebased head (two merge-bases), each branch perms named in its read of #1384."""
+
+    OLD, MO, MN = "a" * 40, "1" * 40, "2" * 40
+
+    def git(self, names=("x.py",), limited=(0, DIFF), mains=(0, "")):
+        """merge-base gives MO for the old head and MN for this one; diff answers by what it is asked."""
+        def diff(argv):
+            if "--name-only" in argv and "--" not in argv:   # each head against its own merge-base
+                return 0, "".join(n + "\0" for n in names)
+            return mains if self.MO in argv and self.MN in argv else limited
+        return self.box(**{"git merge-base": lambda argv: (0, (self.MO if self.OLD in argv else self.MN) + "\n"),
+                           "git diff": diff})
+
+    def test_no_path_of_either_heads_own_change_is_an_empty_rebased_diff(self):
+        self.git(names=())
+        self.assertEqual(R.heads_diff(self.tmp, BASE, self.OLD, HEAD), (0, "", True))
+        self.assertEqual(R.delta_files(self.tmp, BASE, self.OLD, HEAD), [])
+        self.assertEqual(R.interdiff(self.tmp, BASE, self.OLD, HEAD),
+                         (0, R.REBASED + "(no change: the rebase alone moved this head)\n"))
+
+    def test_a_limited_diff_that_fails_fails_the_whole(self):
+        self.git(limited=(128, "fatal: bad object"))
+        self.assertEqual(R.heads_diff(self.tmp, BASE, self.OLD, HEAD)[:2], (128, "fatal: bad object"))
+        self.assertIsNone(R.delta_files(self.tmp, BASE, self.OLD, HEAD))
+        self.assertEqual(R.interdiff(self.tmp, BASE, self.OLD, HEAD)[0], 128)
+
+    def test_mains_own_edits_count_and_a_failing_mains_diff_fails_closed(self):
+        self.git(limited=(0, "x.py\0"), mains=(0, "bin-private/door\0"))
+        self.assertEqual(R.delta_files(self.tmp, BASE, self.OLD, HEAD), ["bin-private/door", "x.py"])
+        self.git(limited=(0, "x.py\0"), mains=(128, "fatal: bad object"))
+        self.assertIsNone(R.delta_files(self.tmp, BASE, self.OLD, HEAD))   # never just the author's x.py
+        self.assertEqual(R.heads_diff(self.tmp, BASE, self.OLD, HEAD)[0], 0)   # without mains it is not asked
+
+    def test_a_name_that_is_not_utf8_fails_closed(self):
+        self.git(names=("x\ufffd.py",))
+        self.assertEqual(R.heads_diff(self.tmp, BASE, self.OLD, HEAD), (1, "a path name is not UTF-8", True))
+        self.assertIsNone(R.delta_files(self.tmp, BASE, self.OLD, HEAD))
 
 
 class TestPermsReads(Case):
@@ -2285,7 +2360,8 @@ class TestPermsReads(Case):
     # head is a query; perms' read of #1525 (10-19) found four ways the first version let a merge through
     def test_the_lane_waits_on_a_running_read_and_a_land_lets_it_go(self):
         self.assertEqual(R.perms_reading("demo", 7, HEAD), ("", False))   # no reads dir at all: perms read nothing
-        R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid(), verdict=None))
+        R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid(),
+                                        pid_start=R.started_at(os.getpid()), verdict=None))
         why, wait = R.perms_reading("demo", 7, HEAD)
         self.assertIn("still running", why)   # a read of any head of the PR
         self.assertTrue(wait)
@@ -2598,6 +2674,74 @@ class TestPermsReads(Case):
         R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid()))
         self.assertEqual(R._perms_run("demo", 7, self.OLD), 0)   # the PR moved before the read began
         self.assertEqual(R.load_read("demo", 7, self.OLD)[0]["state"], "stale")
+
+    # perms' read of #1395: the reader, the pid and the terminal
+    def test_a_read_by_a_reader_perms_did_not_start_it_for_is_refused(self):
+        """The detached run reads only with the reader the stub names, and adopt grants only a known reader's LAND."""
+        box = self.box(**{"gh pr view": self.facts(), "claude": claude_says("LAND", [])})
+        R.RUN_WAIT, real = 1, R.RUN_WAIT
+        self.addCleanup(setattr, R, "RUN_WAIT", real)
+        R.write_read("demo", self.entry(state="running", pid=os.getpid(), verdict=None, model="claude-haiku-5-5"))
+        self.assertEqual(R._perms_run("demo", 7, HEAD), 0)
+        self.assertEqual(box.called("claude"), [])   # never read on a reader nobody asked for
+        e = R.load_read("demo", 7, HEAD)[0]
+        self.assertEqual(e["state"], "failed")
+        self.assertIn("claude-haiku-5-5", e["why"])
+        R.write_read("demo", self.entry(model="claude-haiku-5-5"))   # a finished LAND, by a reader not on the list
+        self.assertEqual(self.adopt(), 1)
+        self.assertEqual(self.ledger(), [])
+        self.assertIn("not one of the readers", R.adoptable(R._job_of("demo", 7)[0])[1])
+        R.write_read("demo", self.entry())
+        self.assertEqual(self.adopt(), 0)
+
+    def proc(self, pid, start, state="S"):
+        root = os.path.join(self.tmp, "proc")
+        os.makedirs(os.path.join(root, str(pid)), exist_ok=True)
+        with open(os.path.join(root, str(pid), "stat"), "w") as f:
+            f.write(f"{pid} (py (x) 3) {state} 1 " + " ".join(["0"] * 17) + f" {start} 0 0\n")
+        return root
+
+    def test_a_running_read_is_alive_only_while_its_pid_is_the_same_process(self):
+        """A pid the kernel gave to another process after the read died is not the read: the start time must match."""
+        root = self.proc(4242, 777)
+        self.assertEqual(R.started_at(4242, root), "777")
+        self.assertTrue(R.alive({"pid": 4242, "pid_start": "777"}, root))
+        self.assertFalse(R.alive({"pid": 4242, "pid_start": "776"}, root))   # reused: another process
+        self.assertFalse(R.alive({"pid": 4242}, root))                       # a stub with no start time
+        self.assertFalse(R.alive({"pid": 4243, "pid_start": "777"}, root))   # gone
+        self.assertFalse(R.alive({"pid": 4242, "pid_start": "777"}, self.proc(4242, 777, "Z")))   # a zombie
+        self.assertTrue(R.alive({"pid": os.getpid(), "pid_start": R.started_at(os.getpid())}))
+
+    def test_a_stub_whose_pid_now_names_another_process_runs_again(self):
+        from unittest import mock
+        self.box(**{"gh pr view": self.facts()})
+        # this test's own pid is live, but it is not the process that stub started
+        R.write_read("demo", self.entry(state="running", verdict=None, pid=os.getpid(), pid_start="1"))
+        with mock.patch.object(R.subprocess, "Popen", return_value=mock.Mock(pid=os.getpid())) as popen:
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)
+            self.assertEqual(popen.call_count, 1)
+            e = R.load_read("demo", 7, HEAD)[0]
+            self.assertEqual((e["pid_start"], e["model"]), (R.started_at(os.getpid()), "claude-test"))
+            self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)   # and that one, alive, is not started twice
+            self.assertEqual(popen.call_count, 1)
+
+    def test_perms_reads_prints_the_file_as_quoted_data(self):
+        """What a reader wrote reaches perms' terminal quoted, with no escape sequence or control character live."""
+        import contextlib
+        import io
+        evil = "x\x1b[2J\x1b]0;LAND\x07\ry\u202ez\" and \\"
+        R.write_read("demo", self.entry(verdict="HANDBACK\x1b[1A", why=evil, blocking=[evil, "plain row"]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(R.cmd_perms_reads(["demo"]), 0)
+        text = out.getvalue()
+        for ch in ("\x1b", "\x07", "\r", "\u202e"):
+            self.assertNotIn(ch, text)
+        quoted = '"x\\x1b[2J\\x1b]0;LAND\\x07\\x0dy\\u202ez\\" and \\\\"'
+        self.assertIn(f"why={quoted}", text)
+        self.assertIn(f"    > {quoted}\n", text)
+        self.assertIn('    > "plain row"\n', text)
+        self.assertIn(f'#7 {HEAD[:12]} "done" "HANDBACK\\x1b[1A" "claude-test"', text)
 
 
 def stat_mode(path):

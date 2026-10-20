@@ -187,9 +187,11 @@ MISSING_RE = re.compile(r"No such file or directory|not found|command not found|
 
 def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, runner=None) -> dict:
     runner = runner or RUN.run
-    c, cwd = m.checks[name], m.cwd.get(name, "")
+    o, cwd = m.checks[name], m.cwd.get(name, "")
+    c = o
     if sandbox and c.klass != T.STATIC:
-        c = dataclasses.replace(c, klass=T.HERMETIC)
+        # bare only drops cc-nosignal from a host run; inside bwrap it means nothing, so the bwrap try clears it
+        c = dataclasses.replace(c, klass=T.HERMETIC, bare=False)
     r = runner(c, tree, "box", repo_root=repo, cwd=cwd)
     row = {"check": name, "class": m.checks[name].klass, "status": r.status, "secs": round(r.secs),
            "why": r.extra.get("why", ""), "verdict": ""}
@@ -199,7 +201,7 @@ def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, run
     if r.status == T.PASSED:
         row["verdict"] = "passes-in-bwrap"
         return row
-    h = runner(dataclasses.replace(c, klass=T.HOST, mounts=[], where=["box"]), tree, "box", repo_root=repo, cwd=cwd)
+    h = runner(dataclasses.replace(o, klass=T.HOST, mounts=[], where=["box"]), tree, "box", repo_root=repo, cwd=cwd)
     tail = "\n".join(r.extra.get("tail", []))
     home = os.path.expanduser("~")
     if h.status == T.PASSED:

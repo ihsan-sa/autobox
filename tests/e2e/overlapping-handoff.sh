@@ -5,6 +5,14 @@
 # ── fixture: cc main + track creation
 if stanza "cc main + track creation" always; then
 cd ~ && "$B/cc" $REPO >/dev/null 2>&1; sleep 1; tmux list-windows -t main -F '#W' | grep -qx "$REPO" && ok "main window created" || bad "main window"
+# …on THIS RUN'S server, and the same `cc $REPO` aimed at the default socket opens nothing: a `_` name is a fixture's.
+# A stub tmux stands in for the live server, so a broken refusal logs a new-window instead of opening one there.
+mkdir -p "$T/livestub"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/livestub/log"\nexit 0\n' "$T" > "$T/livestub/tmux"; chmod +x "$T/livestub/tmux"
+lo=$(cd ~ && env -u TMUX -u TMUX_TMPDIR PATH="$T/livestub:$PATH" "$B/cc" $REPO 2>&1); lrc=$?
+{ [ "$(tmux display-message -p -t main '#{socket_path}')" = "$T/tmux/tmux-$(id -u)/default" ] && [ "$lrc" = 1 ] \
+  && grep -q "test fixture" <<<"$lo" && ! grep -qs new-window "$T/livestub/log"; } \
+  && ok "a fixture's windows are on the run's own tmux server, and cc refuses a _ name on the default socket" \
+  || bad "fixture on the live tmux server (rc=$lrc): $lo | $(tr '\n' '|' < "$T/livestub/log" 2>/dev/null)"
 "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
 grep -qxF '.cc/' "$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir)/info/exclude" && ok ".cc/ git-excluded" || bad ".cc/ exclusion"

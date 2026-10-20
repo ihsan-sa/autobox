@@ -553,7 +553,7 @@ class OwnerCard(Stubbed):
                                      run="systemctl --user enable --now x.service"))
         self.assertEqual(self.argvs("cc-notify"), [
             ["cc-notify", "--approval", "--run", "systemctl --user enable --now x.service", "--id",
-             "land:demo:deploy:enable-x.service@abc", "-t", "lander approval", "[demo] x.service is new"]])
+             "land:demo:deploy:enable-x.service@abc", "--not-perms", "-t", "lander approval", "[demo] x.service is new"]])
         self.assertIsNone(self.calls("cc-notify")[0]["role"])
         self.assertEqual(self.argvs("cc-slack post"), [])
 

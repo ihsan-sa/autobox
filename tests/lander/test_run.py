@@ -844,6 +844,257 @@ class Tree(Env):
         self.assertIn("in no checkout the host made", err.getvalue())
 
 
+class Pinned(Env):
+    """perms' read of #1425: the guard's differential ran the PR's own guard-replay.sh and guard-probe.jsonl, so a PR
+    could weaken the script or drop probe rows and pass its own check. PINNED: main's copies judge the head too."""
+
+    # main's script: every probe row must be a line of bin/guard (the head's "guard"), skipped with no base ref, as
+    # guard-replay.sh skips its differential
+    SCRIPT = f"#!/bin/sh\ngit rev-parse -q --verify {RUN.BASE_REF} >/dev/null || {{ echo skipped; exit 0; }}\n" \
+             "while read -r r; do grep -qx \"$r\" bin/guard || { echo \"FAIL $r\"; exit 1; }; done" \
+             " < tests/guard-probe.jsonl\necho ok\n"
+
+    def setUp(self):
+        Env.setUp(self)   # BaseKept borrows this setUp
+        self.files({"core/tests/guard-replay.sh": self.SCRIPT, "core/tests/guard-probe.jsonl": "a\nb\n",
+                    "core/bin/guard": "a\nb\n"})
+        self.base = git(self.repo, "write-tree")
+        self.check = chk("guard-replay", run="tests/guard-replay.sh", klass=T.HOST)
+
+    def files(self, files):
+        write(self.repo, files)
+        for f in files:
+            if f.endswith(".sh"):
+                os.chmod(os.path.join(self.repo, f), 0o755)
+        git(self.repo, "add", "-A")
+
+    def head(self, files):
+        self.files(files)
+        return git(self.repo, "write-tree")
+
+    def run_head(self, tree, check=None, cwd="core/"):
+        return RUN.run(check or self.check, tree, "box", repo_root=self.repo, cwd=cwd, base_tree=self.base)
+
+    def test_a_head_that_weakens_the_script_is_judged_by_mains(self):
+        tree = self.head({"core/bin/guard": "a\n", "core/tests/guard-replay.sh": "#!/bin/sh\necho ok\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertIn("with main's core/tests/guard-replay.sh", r.extra["why"])
+        self.assertEqual(r.extra["pinned"], ["core/tests/guard-replay.sh"])
+
+    def test_a_head_that_drops_probe_rows_is_judged_by_mains_rows(self):
+        tree = self.head({"core/bin/guard": "a\n", "core/tests/guard-probe.jsonl": "a\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertEqual(r.extra["pinned"], ["core/tests/guard-probe.jsonl"])
+
+    def test_a_head_script_that_deletes_the_base_ref_cannot_make_mains_skip(self):
+        # Opus on #1453: the PR's script ran read-write in its head; the lander fails that pass for the ref it
+        # deleted (base_kept), and main's runs in a fresh head anyway (the planted-file case below)
+        evil = f"#!/bin/sh\ngit update-ref -d {RUN.BASE_REF}\ntouch tests/planted\necho ok\n"
+        tree = self.head({"core/bin/guard": "a\n", "core/tests/guard-replay.sh": evil})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertIn(f"moved or deleted {RUN.BASE_REF}", r.extra["why"])
+
+    def test_the_second_pass_sees_none_of_what_the_first_left(self):
+        script = "#!/bin/sh\ntest ! -e tests/planted || { echo FAIL planted; exit 1; }\ntouch tests/planted\necho ok\n"
+        self.files({"core/tests/guard-replay.sh": script})
+        self.base = git(self.repo, "write-tree")
+        tree = self.head({"core/tests/guard-probe.jsonl": "a\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertEqual(r.extra["pinned"], ["core/tests/guard-probe.jsonl"])
+
+    def test_the_replay_sets_are_pinned_and_the_box_set_from_the_overlay_root(self):
+        self.files({"core/tests/guard-replay.jsonl": "x\n", "tests/guard-replay-box.jsonl": "y\n"})
+        self.base = git(self.repo, "write-tree")
+        tree = self.head({"core/tests/guard-replay.jsonl": "", "tests/guard-replay-box.jsonl": ""})
+        self.assertEqual(sorted(RUN.pins(self.repo, self.check, "core/", self.base, tree)),
+                         ["core/tests/guard-replay.jsonl", "tests/guard-replay-box.jsonl"])
+        # the public core on its own: the box set is outside its tree and pins nothing
+        core = chk("guard-replay", run="tests/guard-replay.sh")
+        self.assertEqual(list(RUN.pins(self.repo, core, "", self.base, tree)), [])
+
+    def test_the_laid_over_head_is_proved_by_write_tree(self):
+        tree = self.head({"core/tests/guard-probe.jsonl": "a\n"})
+        files = RUN.pins(self.repo, self.check, "core/", self.base, tree)
+        real = RUN.lay_over
+
+        def lay_over_and_more(head, fs):
+            real(head, fs)
+            write(head, {"core/bin/guard": "a\nb\nextra\n"})
+
+        with mock.patch.object(RUN, "lay_over", lay_over_and_more):
+            with self.assertRaises(RUN.Unrunnable) as e:
+                RUN.pinned_head(self.repo, tree, "t", self.base, files)
+        self.assertIn("pinned files laid over", str(e.exception))
+        d, head = RUN.pinned_head(self.repo, tree, "t", self.base, files)
+        try:
+            with open(os.path.join(head, "core/tests/guard-probe.jsonl")) as f:
+                self.assertEqual(f.read(), "a\nb\n")
+        finally:
+            shutil.rmtree(d)
+
+    def test_a_head_that_adds_rows_and_keeps_mains_passes_both(self):
+        tree = self.head({"core/bin/guard": "a\nb\nc\n", "core/tests/guard-probe.jsonl": "a\nb\nc\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertEqual(r.extra["pinned"], ["core/tests/guard-probe.jsonl"])
+
+    def test_a_head_that_leaves_them_alone_runs_once(self):
+        tree = self.head({"core/bin/guard": "a\nb\nz\n"})
+        self.assertEqual(RUN.pins(self.repo, self.check, "core/", self.base, tree), {})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertNotIn("pinned", r.extra)
+
+    def test_the_head_own_red_stays_its_own(self):
+        tree = self.head({"core/bin/guard": "a\n", "core/tests/guard-probe.jsonl": "a\nq\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.FAILED)
+        self.assertNotIn("pinned", r.extra)
+
+    def test_the_overlay_check_running_cores_script_from_the_root_pins_the_same_files(self):
+        box = chk("guard-replay-box", run="core/tests/guard-replay.sh", klass=T.HOST)
+        tree = self.head({"core/tests/guard-replay.sh": "#!/bin/sh\necho ok\n"})
+        self.assertEqual(list(RUN.pins(self.repo, box, "", self.base, tree)), ["core/tests/guard-replay.sh"])
+        self.assertEqual(RUN.pins(self.repo, chk("other", run="tests/other-replay.sh"), "core/", self.base, tree), {})
+
+    def test_a_base_without_the_script_pins_nothing(self):
+        git(self.repo, "rm", "-q", "--cached", "core/tests/guard-replay.sh")
+        base = git(self.repo, "write-tree")
+        tree = self.head({"core/tests/guard-probe.jsonl": "a\n"})
+        self.assertEqual(RUN.pins(self.repo, self.check, "core/", base, tree), {})
+        self.assertEqual(RUN.pins(self.repo, self.check, "core/", self.base, self.base), {})
+        self.assertEqual(RUN.pins(self.repo, self.check, "core/", "", tree), {})
+
+    def test_mains_copy_is_never_written_through_a_symlinked_directory(self):
+        out = os.path.join(self.tmp, "outside")
+        os.mkdir(out)
+        with open(os.path.join(out, "guard-replay.sh"), "w") as f:
+            f.write("#!/bin/sh\necho ok\n")
+        os.chmod(os.path.join(out, "guard-replay.sh"), 0o755)
+        shutil.rmtree(os.path.join(self.repo, "core/tests"))
+        os.symlink(out, os.path.join(self.repo, "core/tests"))
+        git(self.repo, "add", "-A")
+        tree = git(self.repo, "write-tree")
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("resolves outside the tree", r.extra["why"])
+        self.assertEqual(sorted(os.listdir(out)), ["guard-replay.sh"])
+        with open(os.path.join(out, "guard-replay.sh")) as f:
+            self.assertEqual(f.read(), "#!/bin/sh\necho ok\n")
+
+    def test_a_symlinked_file_is_replaced_not_written_through(self):
+        target = os.path.join(self.tmp, "target")
+        with open(target, "w") as f:
+            f.write("a\n")
+        os.unlink(os.path.join(self.repo, "core/tests/guard-probe.jsonl"))
+        os.symlink(target, os.path.join(self.repo, "core/tests/guard-probe.jsonl"))
+        git(self.repo, "add", "-A")
+        tree = git(self.repo, "write-tree")
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertEqual(r.extra["pinned"], ["core/tests/guard-probe.jsonl"])
+        with open(target) as f:
+            self.assertEqual(f.read(), "a\n")
+
+
+class BaseKept(Env):
+    """Opus' read of #1453: a PR's cc-guard (no PINNED file) deleted refs/lander/base, so guard-replay.sh skipped its
+    differential and passed. The lander fails a pass that leaves the ref moved or gone."""
+
+    setUp, files, head, run_head = Pinned.setUp, Pinned.files, Pinned.head, Pinned.run_head
+    SCRIPT = Pinned.SCRIPT
+
+    def check_of(self, body):
+        tree = self.head({"core/tests/other.sh": "#!/bin/sh\n" + body + "echo ok\n"})
+        self.assertEqual(RUN.pins(self.repo, chk("o", run="tests/other.sh"), "core/", self.base, tree), {})
+        return self.run_head(tree, chk("other", run="tests/other.sh", klass=T.HOST))
+
+    def test_a_check_that_deletes_the_base_ref_fails(self):
+        r = self.check_of(f"git update-ref -d {RUN.BASE_REF}\n")
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertIn(f"moved or deleted {RUN.BASE_REF}", r.extra["why"])
+
+    def test_a_check_that_moves_the_base_ref_fails(self):
+        r = self.check_of(f"git update-ref {RUN.BASE_REF} HEAD\n")
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertIn(f"moved or deleted {RUN.BASE_REF}", r.extra["why"])
+
+    def test_a_check_that_leaves_it_passes(self):
+        r = self.check_of(f"git rev-parse -q --verify {RUN.BASE_REF} >/dev/null || exit 1\n")
+        self.assertEqual(r.status, T.PASSED, r.extra)
+
+    def test_a_red_stays_its_own_red(self):
+        r = self.check_of(f"git update-ref -d {RUN.BASE_REF}\necho own; exit 1\n")
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertNotIn("moved or deleted", r.extra.get("why", ""))
+
+    def test_the_pinned_pass_is_held_to_its_own_ref(self):
+        self.files({"core/tests/guard-replay.sh": f"#!/bin/sh\ngit update-ref -d {RUN.BASE_REF}\necho ok\n"})
+        self.base = git(self.repo, "write-tree")
+        tree = self.head({"core/tests/guard-replay.sh": "#!/bin/sh\necho ok\n"})
+        r = self.run_head(tree)
+        self.assertEqual(r.status, T.FAILED, r.extra)
+        self.assertIn("with main's core/tests/guard-replay.sh", r.extra["why"])
+        self.assertIn("moved or deleted", r.extra["why"])
+
+
+@unittest.skipUnless(shutil.which("jq"), "guard-replay.sh needs jq")
+class GuardReplayEvilGuard(unittest.TestCase):
+    """The real tests/guard-replay.sh against a PR whose cc-guard lets everything through and, on its first call,
+    deletes refs/lander/base, empties the row sets and appends `exit 0` to the script: every base verdict was taken
+    first and the script was read whole, so the differential still runs and the let-through is a REGRESSION."""
+
+    HONEST = "#!/bin/bash\njq -r .tool_input.command | grep -q '^rm ' && exit 2\nexit 0\n"
+    EVIL = ("#!/bin/bash\nR=$(cd \"$(dirname \"$0\")/..\" && pwd)\n"
+            "git -C \"$R\" update-ref -d refs/lander/base 2>/dev/null\n"
+            ": > \"$R/tests/guard-probe.jsonl\"; : > \"$R/tests/guard-replay.jsonl\"\n"
+            "grep -qx 'exit 0' \"$R/tests/guard-replay.sh\" || echo 'exit 0' >> \"$R/tests/guard-replay.sh\"\n"
+            "exit 0\n")
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.repo, self.core = d.name, os.path.join(d.name, "core")
+        with open(os.path.join(CORE, "tests", "guard-replay.sh")) as f:
+            script = f.read()
+        write(self.repo, {"core/tests/guard-replay.sh": script, "core/bin/cc-guard": self.HONEST,
+                          "core/tests/guard-replay.jsonl": '{"role":"worker","cmd":"ls","expect":"pass"}\n',
+                          "core/tests/guard-probe.jsonl": '{"role":"worker","cmd":"rm -rf x"}\n'})
+        for a in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b"],
+                  ["update-ref", RUN.BASE_REF, "HEAD"]):
+            git(self.repo, *a)
+
+    def replay(self, guard, **extra):
+        write(self.repo, {"core/bin/cc-guard": guard})
+        env = dict({k: v for k, v in os.environ.items() if k != "GUARD_BASE"}, **extra)
+        p = subprocess.run(["bash", os.path.join(self.core, "tests", "guard-replay.sh")], env=env,
+                           capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_the_honest_guard_passes_with_the_differential(self):
+        rc, out = self.replay(self.HONEST)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("differential: 1 rows against refs/lander/base", out)
+
+    def test_an_evil_guard_cannot_make_it_skip(self):
+        rc, out = self.replay(self.EVIL)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("REGRESSION (base 2, head 0)", out)
+        self.assertIn("differential: 1 rows against refs/lander/base", out)
+
+    def test_a_given_base_the_repo_lacks_fails_rather_than_skips(self):
+        rc, out = self.replay(self.HONEST, GUARD_BASE="refs/lander/nope")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("is not a commit in this repo", out)
+        rc, out = self.replay(self.HONEST, GUARD_BASE="none")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("GUARD_BASE=none, skipped", out)
+
+
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
 class Sandbox(Env):
     def test_inside_there_is_the_tree_and_none_of_the_box(self):
@@ -2737,6 +2988,19 @@ class Sweep(unittest.TestCase):
         self.assertEqual(self.rows(T.FAILED, T.PASSED, "tmux: lost server"), "host")
         self.assertEqual(self.rows(T.FAILED, T.FAILED), "red")
         self.assertEqual(self.rows(T.UNRUNNABLE, T.UNRUNNABLE), "unrunnable")
+
+    def test_a_bare_host_check_sweeps_in_bwrap_then_bare_on_the_host(self):
+        # perms' sweep on main f41cec5e crashed at 'bare = true is for a host or box check, not hermetic'
+        seen = []
+
+        def run(check, tree, where, **kw):
+            seen.append((check.klass, check.bare))
+            return T.Result(check=check.name, tree=tree, status=T.FAILED if check.klass != T.HOST else T.PASSED,
+                            extra={"tail": ["tmux: lost server"], "why": ""})
+        m = M.Manifest(checks={"x": chk(name="x", klass=T.HOST, bare=True)}, cwd={"x": ""})
+        row = CK.sweep_one(".", m, "x", "t" * 40, True, runner=run)
+        self.assertEqual(row["verdict"], "host")
+        self.assertEqual(seen, [(T.HERMETIC, False), (T.HOST, True)])
 
 
 class Ratchet(unittest.TestCase):

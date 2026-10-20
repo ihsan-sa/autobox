@@ -924,11 +924,12 @@ def mention_warning(missed):
               "space), and they must already be in this channel. IF YOU WERE ESCALATING, YOU HAVE NOT: say so in "
               "the channel and reach the owner with `cc-notify --owner`.")
 
-def notify_door(flag, title, body, frm=None, id_=None):
+def notify_door(flag, title, body, frm=None, id_=None, declared=False):
     """One call to cc-notify's door — `--ask` (a planner request) or `--decision` (the owner's 🔒 card) — as
     (why, stdout): `why` empty when the door took it, else the line to hand the caller. Both escalations this file
     makes go through here, so how the door is called is one place and not three."""
-    cmd = [f"{BIN}/cc-notify", "-t", title, flag] + (["--from", frm] if frm else []) + (["--id", id_] if id_ else [])
+    cmd = [f"{BIN}/cc-notify", "-t", title, flag] + (["--not-perms"] if declared else []) \
+          + (["--from", frm] if frm else []) + (["--id", id_] if id_ else [])
     try:
         r = EFFECTS.run(cmd + ["--", body], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
     except Exception as e:
@@ -967,6 +968,51 @@ def owner_ask(title, text, frm=None, where=""):
             f"needs_owner was filed as a request to it{f' ({rid})' if rid else ''} — it answers you here, or asks "
             "him itself once it has verified it cannot settle it. Your reply was posted in the thread as written.")
 
+# A permission-shaped needs_owner: the words a permission, approval-of-a-rule, refusal or credential ask uses. It ROUTES
+# nothing — a reply carrying it with `permission` undeclared is handed back unsent, asking the session to declare it.
+# A token or a credential counts only beside key, secret, file or grant: "which token budget?" is a plain decision.
+# cc-notify holds a --decision or --approval to the same pattern (its PERMISSION_ASK_RE): change both together.
+PERMISSION_ASK_RE = re.compile(r"\b(permissions?|allow[- ]?lists?|allow[- ]?rules?|settings\.json|classifier|auto[- ]mode|"
+                               r"refus(?:e[ds]?|als?)|sudo|(?:keys?|secrets?|files?|grants?)[- ](?:tokens?|credentials?)|"
+                               r"(?:tokens?|credentials?)[- ](?:keys?|secrets?|files?|grants?))\b", re.I)
+DECLARE_PERMISSION = ("not sent — this needs_owner reads like a permission question, and `permission` is not declared. "
+                      "Send it again with permission:true if it is a permission, an approval of a tool, command or rule, a "
+                      "classifier refusal, a credential or a settings question (it goes to the permission session, which "
+                      "answers it or asks the owner), or permission:false if it is a decision only the owner can make. "
+                      "Nothing was posted.")
+
+def undeclared_permission(a, text):
+    """True when a needs_owner reply leaves `permission` out and its words look like a permission ask: the tool then
+    posts nothing and asks for the declaration. Declared, never guessed: the regex only forces the question."""
+    return a.get("permission") is None and bool(PERMISSION_ASK_RE.search(text or ""))
+
+def perms_ask(repo, text, frm, where, member=False):
+    """A needs_owner DECLARED A PERMISSION QUESTION (reply(permission=true)), from any seat, the control repo's own
+    included: one ask line in the permission session's ledger by `cc-refusals ask`, and nobody mentioned. The owner,
+    2026-10-05: "stuff often doesnt go to perms when it should" — a permission ask paged him, when the permission
+    session is the one that answers it or takes it to him. Returns (filed, line, why): `filed` False when the ledger did
+    not take it, `why` then what it said. A caller whose usual way is a planner request takes that and adds `line`,
+    which says so; the control seat, whose usual way is the owner's door, hands the reply back unsent instead
+    (review of #1028: a ledger lock held a few seconds must not turn a permission question into a page)."""
+    body = (text or "").strip() or "(the reply said nothing)"
+    cmd = [f"{BIN}/cc-refusals", "ask", repo, "--from", frm or repo] + (["--where", where] if where else []) \
+          + (["--member"] if member else []) + ["--", body]
+    try:
+        r = EFFECTS.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        why = "" if r.returncode == 0 else ((r.stderr or r.stdout or "").strip()[-160:] or f"cc-refusals exited {r.returncode}")
+    except Exception as e:
+        r, why = None, e.__class__.__name__
+    if why:
+        return False, (f"\n\nTHE PERMISSION SESSION'S LEDGER DID NOT TAKE IT ({why}), so the ask went the usual way:"), why
+    aid = ((r.stdout or "").strip().splitlines() or [""])[-1].strip()
+    # who was told it is down is cc-refusals' to say: the owner from the control seat, the planning seat from any other
+    dl = next((ln for ln in (r.stderr or "").splitlines() if "permission session is down" in ln), "")
+    down = (f" That session is down right now, so {dl.split('ledger, and ', 1)[1]} (not your question)."
+            if "ledger, and " in dl else "")
+    return True, (f"\n\nTHE OWNER WAS NOT MENTIONED: a permission question goes to the permission session first, so "
+                  f"it is in its ledger{f' as {aid}' if aid else ''}; the permission session reads its ledger and "
+                  f"answers you or asks him. Your reply was posted as written.{down}"), ""
+
 def owner_decision(cfg, text, chat, thread, name):
     """THE CONTROL SEAT'S OWN ask, RAISED WHERE HE READS IT, when its reply is going into a lane he does not.
     owner_ask reads WHO is asking; this reads WHERE the ask would land, and both have to pass before a reply keeps
@@ -987,7 +1033,8 @@ def owner_decision(cfg, text, chat, thread, name):
         return (f"\n\nNOT ASKED AGAIN: a 🔒 card from this thread is still standing ({card}), and he gets one per "
                 f"thread while it stands ({LIVE_TTL // 3600} h). Your reply went into the thread as written. If this "
                 f"is a different question, add it in that card's thread.")
-    why, out = notify_door("--decision", f"{CTL} blocked", f"{q}\n\nAsked in #{name}: {where}", id_=pid)
+    # declared: the reply tool already made a permission-shaped needs_owner say which it is, so cc-notify need not ask
+    why, out = notify_door("--decision", f"{CTL} blocked", f"{q}\n\nAsked in #{name}: {where}", id_=pid, declared=True)
     if why:
         return (f"\n\nTHE OWNER WAS NOT MENTIONED AND NO 🔒 CARD WAS RAISED: #{name} is a lane sessions talk in, so "
                 f"your reply went into the thread without the 🔒 and his mention, and cc-notify would not take the "
@@ -5332,7 +5379,16 @@ class Daemon:
                 log(f"reply {h}: refusal not posted into {chat}; recorded as a query" + (f" (spool: {err})" if err else ""))
                 return {"ok": True, "text": "not posted — a refusal is the box's query route, not a line for the member's "
                                             "channel; recorded for the queries session. Say what you CAN do instead."}
+            if dec and undeclared_permission({"permission": first.get("perm_ask")}, text):   # member_call's name for it
+                return {"ok": False, "error": DECLARE_PERMISSION}
             asked = ""
+            if dec and first.get("perm_ask"):
+                # a permission question: the permission session's ledger, marked as a member's (no authority), and nobody
+                # mentioned; only if the ledger does not take it does it fall to the planner request below
+                filed, asked, _ = perms_ask(h, perm_field(text, 1500, inline=False), h,
+                                         f"#{self.names.get(chat) or chat}" + (f" thread {thread}" if thread else ""), member=True)
+                if filed:
+                    dec = False
             if dec:
                 # …AND THE ASK IT DECLARES IS A PLANNER REQUEST, not the owner's door: a member workspace's session is
                 # never the control repo's own seat (that is what this socket is), so its needs_owner posts into her
@@ -5341,7 +5397,7 @@ class Daemon:
                 # The DESTINATION rule the session-side tool also applies (owner_decision: never a -threads lane)
                 # needs no second reading here — this branch is unconditional, so `dec` is already False at the
                 # post below and no reply through this socket can carry the head into any lane at all.
-                asked = owner_ask(f"{h}: a member session needs a decision", perm_field(text, 1500, inline=False), frm=h,
+                asked += owner_ask(f"{h}: a member session needs a decision", perm_field(text, 1500, inline=False), frm=h,
                                   where=f"#{self.names.get(chat) or chat}" + (f" thread {thread}" if thread else ""))
                 dec = False
             if chat in self.member_mirrors(h).values():
@@ -6013,7 +6069,11 @@ class Daemon:
         `asked` is the owner naming a session himself (`!restart`); an arriving message never is, and that
         is the whole difference for a `<repo>/<track>` target — see the "no-session" branch below. A target whose
         window the window directory puts on another host is "elsewhere" and starts nothing here (remote_host). A member
-        workspace whose marker is gone while the host's record remains is "no-marker" and starts nothing (member_unmarked)."""
+        workspace whose marker is gone while the host's record remains is "no-marker" and starts nothing (member_unmarked).
+        A suite's fixture (cc-board's `real` says no) is "queued" and starts nothing, asked or not."""
+        if not ccboard().real(target.split("/")[0]):   # a suite's fixture (_cctest<pid>) outside its own run: never a session on
+            log(f"autostart {target}: a test fixture's name, nothing started")   # the box, asked or not — on 09-26 three
+            return "queued"                                                       # ran real Opus sessions for 40 min to 2 h
         win = window_for(target)   # a member workspace target starts like any other: cc itself puts it inside the boundary (cc-sandbox member)
         if remote_host(win):       # it lives on another host: `cc` here would be a second session of it on this one
             log(f"autostart {target}: its window is on another host — nothing started here, the message waits")
@@ -9407,10 +9467,18 @@ TOOLS = [
                                                            "A question you are not waiting on is false. How loud: the cheapest route "
                                                            "that does the job. `cc-notify --decision` is for a decision that blocks a track, "
                                                            "an approval already waiting, or an incident touching money, access or anything "
-                                                           "outward; needs_owner is for a question that stalls one track. Those two are the "
+                                                           "outward; a permission question goes by `cc-notify --perms` "
+                                                           "instead. needs_owner is for a question that stalls one track. Those two are the "
                                                            "only ways to mention the owner, and a mention that could have waited is a bug. "
                                                            "One tap is an #approvals card, something notable goes to #alerts, ambient posts "
-                                                           "to #<repo>-updates, and the rest waits for the digest."}},
+                                                           "to #<repo>-updates, and the rest waits for the digest."},
+         "permission": {"type": "boolean", "description": "with needs_owner: true = the ask is a permission — an approval of a tool, "
+                                                          "command or rule, a classifier refusal, a credential or a settings "
+                                                          "question. It goes to the permission session's ledger and nobody is "
+                                                          "mentioned, from any seat, the control repo's own included; that session "
+                                                          "answers it or takes it to the owner. false = a decision only the owner "
+                                                          "can make, routed as needs_owner says. Left out on an ask that reads like "
+                                                          "a permission, the reply comes back unsent until you say which."}},
          "required": ["chat_id", "text"]}},
     {"name": "file",
      "description": "Attach a file — an image, a render, a chart, a screenshot, a log — to the thread you are answering. A PDF is "
@@ -9630,8 +9698,29 @@ class Channel:
                         return why, True
                 # an @handle that resolves to nobody is sent as code, not a plain "@Name", and named back in the result so a missed escalation is noticed. needs_owner is the only way to mention the owner for real.
                 dec = bool(a.get("needs_owner"))
+                if dec and undeclared_permission(a, a.get("text", "")):
+                    return DECLARE_PERMISSION, True
                 asked = ""
                 ctl_seat = self.target == CTL and not self.alias
+                if dec and a.get("permission"):
+                    # A PERMISSION QUESTION GOES TO THE PERMISSION SESSION FIRST, from every seat, this repo's own
+                    # included: an ask line in its ledger and nobody mentioned. Only when the ledger does not take it
+                    # does another seat's ask go on to its planner request below; the control seat's is handed back.
+                    frm = self.target + (f"@{self.alias}" if self.alias else "")
+                    where = msg_link(self.cfg, chat, a.get("thread_ts") or a.get("ts") or "") or (
+                        f"{chat}" + (f" thread {a.get('thread_ts')}" if a.get("thread_ts") else ""))
+                    filed, asked, pwhy = perms_ask(self.target.split("/")[0], a.get("text", ""), frm, where)
+                    if filed:
+                        dec = False
+                    elif ctl_seat:
+                        # THE CONTROL SEAT'S USUAL WAY IS HIS DOOR (the 🔒 head here, owner_decision's card from a
+                        # -threads lane), and a permission question never takes it because the ledger was busy or
+                        # broken: nothing is posted and the session gets a failure it can retry. The other seats'
+                        # usual way, below, is a planner request, which a person reads and which pages nobody.
+                        return (f"not sent — this is a permission question and the permission session's ledger did not "
+                                f"take it ({pwhy}). Nothing was posted and the owner was not mentioned. Send the same "
+                                "reply again in a minute; if the ledger keeps refusing, post it without needs_owner and "
+                                "say in it that the permission session's ledger is refusing asks."), True
                 lane = chat_name(self.cfg, chat) if dec and ctl_seat else ""   # only this seat's post can carry the head
                 if dec and ctl_seat and threads_lane(lane):
                     # …AND ONLY WHERE HE READS IT. The rule below is WHO is asking; this one is WHERE the ask would
@@ -9639,7 +9728,7 @@ class Channel:
                     # member's 🙋 card, or the 🔐 card tell_seat hands this seat with that card's chat and thread,
                     # put "🔒 @owner" inside a thread only sessions read. The reply stays in that thread without the
                     # head and the question becomes the one 🔒 card in #<ctl> (owner_decision).
-                    asked = owner_decision(self.cfg, a.get("text", ""), chat, a.get("thread_ts") or a.get("ts") or "", lane)
+                    asked += owner_decision(self.cfg, a.get("text", ""), chat, a.get("thread_ts") or a.get("ts") or "", lane)
                     dec = False
                 elif dec and not ctl_seat:
                     # …AND ONLY THE CONTROL REPO'S OWN SEAT DECLARES IT. The same reading the daemon uses for a 🔐 card
@@ -9651,7 +9740,7 @@ class Channel:
                     # the daemon, so a daemon that is down must not quietly demote the seat's own escalation to a
                     # request nobody has been woken for. The ASK is read again out there — cc-notify's is_control asks
                     # `cc-slack seat`, and names the asker from that, which is why no --from is passed here.
-                    asked = owner_ask(f"{self.target} needs a decision", a.get("text", ""),
+                    asked += owner_ask(f"{self.target} needs a decision", a.get("text", ""),
                                       where=f"{chat}" + (f" thread {a.get('thread_ts')}" if a.get("thread_ts") else ""))
                     dec = False
                 missed = unresolved_mentions(self.cfg, a.get("text", ""), chat if chat != "local" else None, decision=dec)
@@ -9734,6 +9823,8 @@ class Channel:
         req = {name: a.get("chat_id") or "", "target": self.target}
         if name == "reply":
             req.update(text=a.get("text", ""), thread_ts=a.get("thread_ts") or None, ts=a.get("ts") or "", needs_owner=bool(a.get("needs_owner")))
+            if a.get("permission") is not None:   # forwarded as declared, absent stays absent; `permission` is the 🔐-answer verb on the socket
+                req["perm_ask"] = bool(a.get("permission"))
         elif name == "react":
             req.update(ts=a.get("ts", ""), emoji=str(a.get("emoji", "eyes")), thread_ts=a.get("thread_ts") or None)
         elif name == "file":

@@ -91,11 +91,22 @@ cleanup(){ rc=$?; trap - EXIT
   for p in $KIDS; do pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
     if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$p" 2>/dev/null; fi; done
   MT kill-server 2>/dev/null   # the scratch server and its panes die WITH the run: one `cat` fixture outlived a run by 2.5 h
-  for id in $(wins "$REPO"); do tmux kill-window -t "$id"; done
+  tmux -S "$T/tmux/tmux-$(id -u)/default" kill-server 2>/dev/null   # this run's own server, every fixture window with it
+  systemctl --user stop "lander-tick-$REPO-*.timer" 2>/dev/null   # a tick a case armed for the fixture dies with the run (10-03: one re-armed for a day)
   rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock ~/.claude/projects/$REPO-ctx
   ( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.$RUN.sel && mv ~/.claude.json.$RUN.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
   rm -f ~/.claude.json.$RUN.sel; exit $rc; }
 trap cleanup EXIT INT TERM HUP
+# THE BOX'S TMUX SERVER IS NEVER THIS RUN'S. Every window a case opens (`cc $REPO`, a --go loop, an orch) goes on a   # recurring-defect-ok: pause-hold-missing — a test fixture's scratch tmux server, no worker and no board write
+# server of the run's own under $T, with a session `main` started from a scrubbed env the way tmux-main.service starts
+# the real one — so a pane has the server's env, not this shell's. Fixture windows on the live server outlived their
+# runs by hours and sat beside three tmux segfaults (10-03, 10-06); `cc` refuses a `_` name on the default socket too.
+unset TMUX TMUX_PANE; export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR"; chmod 700 "$TMUX_TMPDIR"
+env -i HOME="$HOME" PATH="$PATH" USER="${USER:-}" SHELL=/bin/bash LANG="${LANG:-C.UTF-8}" TMUX_TMPDIR="$TMUX_TMPDIR" \
+  ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} \
+  tmux new-session -d -s main -x 200 -y 50 2>/dev/null
+[ "$(tmux display-message -p -t main '#{socket_path}' 2>/dev/null)" = "$TMUX_TMPDIR/tmux-$(id -u)/default" ] \
+  || { echo "selftest: no tmux server of this run's own under $TMUX_TMPDIR — refusing to run on the box's"; exit 1; }
 # THE BOX'S OWN FLAGS, AS THIS RUN FOUND THEM. Files a person set by hand and no daemon rewrites: `cc` reads
 # ~/.cc/slack/enabled straight from $HOME, no CC_* names it, and a case that toggled it left the box's Slack off for
 # 12 min (2026-09-19). Compared at the end: presence, inode, size and mtime at the resolution the filesystem keeps —

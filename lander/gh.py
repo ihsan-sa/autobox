@@ -252,10 +252,13 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
             if "statusCheckRollup" in want:   # the checks of the head GitHub reports, as GraphQL's rollup is
                 sha, got = (p.get("head") or {}).get("sha") or "", []
                 for path, key in (("check-runs", "check_runs"), ("status", "statuses")):
-                    # paged until total_count is read or a page comes short: a red 101st hides. A page that opens
-                    # on a row an earlier page opened on is the list going round (no total_count and every page
-                    # full), and a list that ends short of its total_count was not all read: both fail the read
-                    runs, page, firsts = [], 1, set()
+                    # paged until total_count is read or a page comes short: a red 101st hides. Every page must
+                    # give total_count as a non-negative int, the largest seen is the one the read must reach, and
+                    # page 1's says how many pages there can be (total//100+1), so a forged list that never ends
+                    # stops there. A page that opens on a row an earlier page opened on is the list going round,
+                    # and a list that ends short of its total_count or runs past it was not read as it is: all
+                    # fail the read
+                    runs, page, firsts, most, pages = [], 1, set(), 0, 1
                     while True:
                         rc, out, err = gh(["api", f"repos/{s}/commits/{sha}/{path}?per_page=100"
                                                   + (f"&page={page}" if page > 1 else "")], root, token, timeout)
@@ -266,6 +269,11 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
                             rows = total = None
                         if not isinstance(rows, list):
                             return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+                        if type(total) is not int or total < 0:
+                            return None, f"{path} page {page} total_count is {total!r}, not a count"
+                        most = max(most, total)
+                        if page == 1:
+                            pages = total // 100 + 1
                         if rows:
                             first = (rows[0].get("id") if isinstance(rows[0], dict) and "id" in rows[0]
                                      else json.dumps(rows[0], sort_keys=True))
@@ -273,11 +281,13 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
                                 return None, f"{path} page {page} repeats an earlier page"
                             firsts.add(first)
                         runs += rows
-                        if len(rows) < 100 or (isinstance(total, int) and len(runs) >= total):
+                        if len(rows) < 100 or len(runs) >= most:
                             break
+                        if page >= pages:
+                            return None, f"{path} runs past the {pages} page(s) its total_count allows"
                         page += 1
-                    if isinstance(total, int) and len(runs) < total:
-                        return None, f"{path} read short: {len(runs)} of {total}"
+                    if len(runs) != most:
+                        return None, f"{path} read {'short' if len(runs) < most else 'past'}: {len(runs)} of {most}"
                     got.append(runs)
                 j["statusCheckRollup"] = rollup(*got)
         if "files" in want:
