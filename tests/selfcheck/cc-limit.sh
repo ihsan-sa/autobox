@@ -587,6 +587,19 @@ EOF
     "$(grep -c '^keys %7 :: .*Escape' "$d/calls")$(calls '^msg beta ')" 11
 
   # `status` ASKS cc-model FOR ITS NOTE, BOUNDED (48 copies piled up behind a cc-model that did not return in 400 s).
+  # TIER STOP: a due record nudges nobody and stays on file, re-armed STOP_RECHECK out; once the tier lifts it goes
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"; : > "$d/calls"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf '@1\talpha\t%s\t%s\t\n' "$((t0 + 1800))" "$t0" > "$d/.cc/state/limit-interrupted"
+  rm -f "$d/.cc/state/claude-limit"
+  printf '#!/bin/sh\nexit 1\n' > "$d/bin/cc-tier"; chmod +x "$d/bin/cc-tier"
+  me $((t0 + 90000)) resume >/dev/null 2>&1
+  t 'tier stop: a due record nudges nobody, stays on file, and is re-armed STOP_RECHECK out' \
+    "$(calls '^msg ')$(wc -l < "$d/.cc/state/limit-interrupted")$(grep -c "^arm $STOP_RECHECK " "$d/calls")" 011
+  rm -f "$d/bin/cc-tier"
+  me $((t0 + 91000)) resume >/dev/null 2>&1
+  t 'tier stop: …and the first resume after it lifts nudges it' "$(calls '^msg alpha ')" 1
+
   # Its own clear HOME: a cc-model that answers is heard on stderr, one that hangs — and leaves a child holding its
   # output — is given up on inside the bound, and either way stdout says "clear" and the exit is 1.
   d2=$(mktemp -d); mkdir -p "$d2/.cc/state"

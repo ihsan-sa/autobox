@@ -894,6 +894,27 @@ green_kick(){   # ON THE HOST, after an iteration: the worker asked ($ST/green.a
   log "could not start the worker's green run on the host: exit $rc — ${o//$'\n'/ }"
   printf -- '- cc-loop: you asked for your green run and the loop could not start it on the host after iteration %s: cc-green said exit %s: %s\n' \
     "$i" "$rc" "$(tail -1 <<<"$o")" >> "$ST/progress.md"; return 1; }
+docs_kick(){   # ON THE HOST, after an iteration: the worker's fenced `cc-docs file` asks ($ST/docs.ask) → filed here, each result journaled
+  # A worker's sandbox holds no document register, so a fenced `cc-docs file` appends its argv to this file and files
+  # nothing (cc-docs, "a fenced worker files through its loop"); the ECE206 notes stayed unfiled 11 h on 2026-10-11 when
+  # it filed into the fence's tmpfs. The file is the worker's, so a link is taken away unread; what runs is fixed
+  # here (`cc-docs fenced $WT`, which holds every path to the worktree), and each line it prints goes to the journal.
+  # It is moved into a directory of the loop's own, made fresh outside anything the worker writes, with -T so the
+  # destination is never read as a directory to move into, and only what landed there is read: a link swapped in
+  # after the test above moves as a link and is refused there, never followed.
+  local ask="$ST/docs.ask" held o rc d="${CC_DOCS:-$BIN/cc-docs}"   # CC_DOCS: test hook
+  inside_boundary && return 0
+  [ -L "$ask" ] && { rm -f -- "$ask"; log "the worker's docs.ask was a link: removed unread, nothing filed"; return 0; }
+  [ -f "$ask" ] || return 0
+  held=$(mktemp -d "${TMPDIR:-/tmp}/cc-loop-docs.XXXXXX") || return 0
+  mv -fT -- "$ask" "$held/ask" || { rm -rf -- "$held"; return 0; }
+  if [ -L "$held/ask" ] || [ ! -f "$held/ask" ]; then
+    rm -rf -- "$held"; log "the worker's docs.ask was not a plain file once moved: removed unread, nothing filed"; return 0; fi
+  o=$(cd "$WT" && "$d" fenced "$WT" < "$held/ask" 2>&1); rc=$?
+  rm -rf -- "$held"
+  log "filed the worker's documents on the host: exit $rc — ${o//$'\n'/ }"
+  while IFS= read -r l; do [ -n "$l" ] && printf -- '- cc-loop: cc-docs file, asked from your sandbox and run on the host after iteration %s: %s\n' "$i" "$l"; done <<<"$o" >> "$ST/progress.md"
+  return 0; }
 own_run_live(){   # a process of the worker's own still running in $WT once claude has exited (a detached EDA run, a
   # `cc-room heavy` slot) → prints "pid command" and 0; none → 1. This loop's own tree (its subshells, the hook) is not
   # one, nor is anything it runs under (the window's shell, a sandbox's pid 1).
@@ -1167,6 +1188,34 @@ EOS
   gk loglink ask loglink >/dev/null
   t 'a link the worker left at green.log is replaced, never written through' \
     "$(cat "$d/gk/loglink/victim")|$([ -L "$d/gk/loglink/st/green.log" ] && echo link || echo file)|$(cat "$d/gk/loglink/st/green.log")" "untouched|file|fixture log line"
+  # THE LOOP FILES A FENCED WORKER'S DOCUMENTS ON THE HOST (docs_kick): what runs is `cc-docs fenced $WT` with the ask on
+  # stdin, from $WT; each line it prints is journaled. Each case on a fixture of its own; the fake cc-docs logs its argv
+  # and cwd, echoes its stdin back as one line, and exits DK_RC.
+  dk(){ ( k="$d/dk/$1"; mkdir -p "$k/wt" "$k/st"; : > "$k/st/progress.md"; : > "$k/calls"
+          printf '#!/bin/sh\necho "$* cwd=$(pwd)" >> "%s/calls"\necho "w.pdf: $(cat)"\nexit ${DK_RC:-0}\n' "$k" > "$k/fake"; chmod +x "$k/fake"
+          case "$2" in ask) echo '{"argv":["file","w.pdf"]}' > "$k/st/docs.ask";;
+            link) echo untouched > "$k/victim"; ln -s "$k/victim" "$k/st/docs.ask";; esac
+          log(){ printf '%s\n' "$*" >> "$k/loop.log"; }
+          WT="$k/wt" ST="$k/st" CC_DOCS="$k/fake" i=4 CC_MEMBER_SANDBOX=${DK_MEM:-}
+          docs_kick; echo "rc=$?|$(tr '\n' '|' < "$k/calls")" ); }
+  t 'the worker asked (docs.ask): the loop runs cc-docs fenced on its worktree, from it, with the ask on stdin' \
+    "$(dk ask ask)" "rc=0|fenced $d/dk/ask/wt cwd=$d/dk/ask/wt|"
+  t '…the ask and its held copy are gone, and each line it printed is in the journal' \
+    "$(ls -A "$d/dk/ask/st" | tr '\n' ' ')|$(grep -c '^- cc-loop: cc-docs file, asked from your sandbox and run on the host after iteration 4: w.pdf: {"argv":\["file","w.pdf"\]}$' "$d/dk/ask/st/progress.md")" "progress.md |1"
+  t 'a filing that is refused (exit 1) is journaled the same, and the loop goes on' "$(DK_RC=1 dk refused ask)|$(grep -c '^- cc-loop: cc-docs file' "$d/dk/refused/st/progress.md")" "rc=0|fenced $d/dk/refused/wt cwd=$d/dk/refused/wt||1"
+  t 'no ask: cc-docs never runs and nothing is journaled' "$(dk idle none)|$(wc -c < "$d/dk/idle/st/progress.md")" "rc=0||0"
+  t 'an ask planted as a link: taken away unread, what it names untouched, nothing run' \
+    "$(dk link link)|$([ -e "$d/dk/link/st/docs.ask" ] || [ -L "$d/dk/link/st/docs.ask" ] && echo there || echo gone)|$(cat "$d/dk/link/victim")" "rc=0||gone|untouched"
+  mkdir -p "$d/dk/heldlink/st" "$d/dk/hl/docs"; ln -s "$d/dk/hl/docs" "$d/dk/heldlink/st/.docs.ask.held"
+  echo '{"argv":["file","w.pdf"]}' > "$d/dk/heldlink/st/docs.ask"
+  t 'a link the worker planted at the old held name is never a destination: nothing written where it points, the ask filed' \
+    "$(dk heldlink keep)|$(ls -A "$d/dk/hl/docs" | wc -l)|$([ -e "$d/dk/heldlink/st/docs.ask" ] && echo kept || echo gone)" \
+    "rc=0|fenced $d/dk/heldlink/wt cwd=$d/dk/heldlink/wt||0|gone"
+  mkdir -p "$d/dk/helddir/st/.docs.ask.held"
+  echo '{"argv":["file","w.pdf"]}' > "$d/dk/helddir/st/docs.ask"
+  t 'a directory the worker planted at the old held name: the ask is still read and filed, not moved into it' \
+    "$(dk helddir keep)|$(ls -A "$d/dk/helddir/st/.docs.ask.held" | wc -l)" "rc=0|fenced $d/dk/helddir/wt cwd=$d/dk/helddir/wt||0"
+  t 'inside a member boundary, even asked: nothing run (that worker files across its socket)' "$(DK_MEM=1 dk member ask)|$([ -e "$d/dk/member/st/docs.ask" ] && echo kept)" "rc=0||kept"
   # A KICKED RUN STILL GOING AT THE 40-WAIT BOUND IS COLLECTED LATER: the next green_wait, though not told "kicked",
   # waits on it with the worker flag, journals it as the loop's run for iteration 4, copies its log, and only once.
   GK_WAIT3=40 gk late ask >/dev/null
@@ -2360,7 +2409,7 @@ while [ $i -lt "$MAXI" ]; do
   # $BIN: there a test can still signal this claude, though not the user manager, tmux or another session. Never over
   # a caller's prefix.
   SPENV=(); [ "${CC_WORKER_SANDBOX:-}" = 0 ] && [ -z "${CLAUDE_CODE_SHELL_PREFIX:-}" ] && SPENV=("CLAUDE_CODE_SHELL_PREFIX=$BIN/cc-nosignal-shell")
-  GAENV=(); inside_boundary || GAENV=("CC_GREEN_ASK=$ST/green.ask")   # where a fenced `cc-green start` asks (green_kick)
+  GAENV=(); inside_boundary || GAENV=("CC_GREEN_ASK=$ST/green.ask" "CC_DOCS_ASK=$ST/docs.ask")   # where a fenced `cc-green start` (green_kick) and `cc-docs file` (docs_kick) ask
   ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
@@ -2392,6 +2441,7 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   # THE ASKED-FOR GREEN COMES BEFORE THE DONE BRANCH, which exits: a worker that asks in the iteration it writes
   # STATUS: DONE still gets the run, and its verdict in the journal.
+  docs_kick   # the documents it asked filed, before the DONE branch for the same reason
   gated=no; green_kick && green_wait kicked && gated=yes
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1

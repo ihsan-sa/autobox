@@ -30,10 +30,33 @@ def selfcheck():
            pick(ancestry(20, proc), None)["pid"] == 20)
         ok("a claude under the manager is still the owner its runtime names",
            pick(ancestry(50, proc), "1")["pid"] == 40)
-        fake(60, 1, "bash", ["bash", str(BIN / "cc")]); fake(70, 60, "bash", ["bash", str(BIN / "cc")])
+        fake(90, 1, "bash", ["bash", str(BIN / "cc")]); fake(91, 90, "bash", ["bash", str(BIN / "cc")])
         ok("a detached `cc --go` whose shell exited, adopted by pid 1 with only `cc` above cc-task, is still a "
            "caller: the nearest `cc` owns it, not 'cannot identify the calling process' (2026-10-12)",
-           pick(ancestry(70, proc), "1")["pid"] == 70)
+           pick(ancestry(91, proc), "1")["pid"] == 91)
+
+        # L1: THE LAUNCH OWNS ITS OWN CLAIM WHEN ITS PARENTS GO (2026-10-15). A seat's Bash runs `cc` (61) whose
+        # reservation walks up to the seat's claude (41); the shell (60) is gone by the claim, `cc` is re-parented
+        # to the manager and walks to itself. Its own claim must still be its own.
+        fake(12, 1, "systemd", ["/usr/lib/systemd/systemd", "--user"], 3100272)   # this case's own manager
+        fake(41, 12, "claude", ["claude"]); fake(60, 41, "bash", ["bash", "-c", "setsid nohup cc"])
+        fake(61, 60, "bash", ["bash", str(BIN / "cc")])
+        reserving = ancestry(61, proc); seat = owner(reserving)
+        Path(proc, "60").rename(Path(proc, "gone60"))
+        (Path(proc, "61") / "stat").write_text("61 (bash) S 12 " + " ".join(["0"] * 17) + " 100\n")
+        orphan = ancestry(61, proc); bare = owner(orphan)
+        held = {"owner": seat, "ended_at": None}
+        ok("L1: a launch re-parented between its reservation and its claim is still that claim's owner, though "
+           "the walk alone now names a different process",
+           not same_owner(seat, bare) and same_owner(launch_owner(held, orphan, bare), seat))
+        fake(70, 12, "bash", ["bash", str(BIN / "cc")]); other = ancestry(70, proc)
+        fake(80, 41, "bash", ["bash", "-c", "cc done"]); fake(81, 80, "bash", ["bash", str(BIN / "cc")]); later = ancestry(81, proc)
+        ok("L1 controls: another `cc` is not that launch, nor is a later `cc` from the same seat whose chain shares "
+           "only the seat, nor the same launch once its claim has ended or on another boot",
+           launch_owner(held, other, owner(other)) == owner(other)
+           and launch_owner(held, later, owner(later)) == owner(later)
+           and launch_owner(dict(held, ended_at=stamp()), orphan, bare) == bare
+           and launch_owner({"owner": dict(seat, boot_id="previous-boot"), "ended_at": None}, orphan, bare) == bare)
     with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
         env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
         def run(*args):
@@ -321,8 +344,14 @@ def selfcheck():
            and not answers[0]["repair"]["resume"] and len(reserved["executions"]) == len(repair_base["executions"]) + 1)
         claimed = run("claim", "r", "t2", "--executor", "worker")
         c = reserved["claim"]
-        ok("R2: the dispatcher's worker claim reuses the repair; no extra build execution or new generation",
-           claimed.returncode == 0 and record2.read_bytes() == before
+        def adoption(b):   # what an adopting claim writes: the reservation's adopted_at, and nothing else
+            d = json.loads(b); r = d["executions"][-1].get("repair") or {}
+            at = r.get("adopted_at"); r["adopted_at"] = None
+            return at, d
+        at, rest = adoption(record2.read_bytes())
+        ok("R2: the dispatcher's worker claim reuses the repair and marks it adopted; no extra build execution or "
+           "new generation",
+           claimed.returncode == 0 and at and rest == json.loads(before)
            and run("renew", "r", "t2", repair_base["claim"]["claim_id"], generation).returncode != 0)
         run("release", "r", "t2", c["claim_id"], str(c["generation"]), "--reason", "worker launched")
         before = record2.read_bytes(); replay = run(*reserve)
@@ -360,6 +389,7 @@ def selfcheck():
         again = (*reserve[:4], str(changed["generation"]), *reserve[5:-1], other, "--relaunch")
         before = record2.read_bytes(); live = run(*again)
         held = live.returncode == 0 and not json.loads(live.stdout)["launch"] and record2.read_bytes() == before
+        run("claim", "r", "t2", "--executor", "worker")   # its worker started (adopted it) and then stopped
         run("release", "r", "t2", changed["claim_id"], str(changed["generation"]), "--reason", "worker launched")
         relaunched = json.loads(run(*again).stdout)
         twice = json.loads(run(*(*again[:4], str(relaunched["generation"]), *again[5:])).stdout)
@@ -401,7 +431,8 @@ def selfcheck():
 
         delivered(); denied = run("claim", "r", "t2", "--executor", "worker")
         granted = answer(run(*reserve2)); after = record2.read_bytes()
-        adopted = run("claim", "r", "t2", "--executor", "worker"); unchanged = record2.read_bytes() == after
+        adopted = run("claim", "r", "t2", "--executor", "worker"); at, rest = adoption(record2.read_bytes())
+        unchanged = bool(at) and rest == json.loads(after)
         sub = run("claim", "r", "t2", "--executor", "subagent")   # the reservation launches ONE worker, not a subagent
         ok("D2: the reservation is the way in that D1 refuses without — it launches, and the `cc … --go` the queue "
            "then runs adopts that repair instead of taking a claim of its own, while a subagent on that same "
@@ -412,6 +443,7 @@ def selfcheck():
            and json.loads(record2.read_text())["executions"][-1]["execution_id"] == granted["execution_id"])
 
         delivered(); spent = answer(run(*reserve2)); held = json.loads(record2.read_text())["claim"]
+        run("claim", "r", "t2", "--executor", "worker")   # the launch adopts it, as claim_track does before any window
         run("release", "r", "t2", held["claim_id"], str(held["generation"]), "--reason", "worker launched")
         before = record2.read_bytes(); replay = answer(run(*reserve2))
         ok("D3: a second repair for the same PR and head buys nothing — the replay grants no launch, and the row "
@@ -421,6 +453,18 @@ def selfcheck():
            and run("claim", "r", "t2", "--executor", "worker").returncode != 0
            and run("claim", "r", "t2", "--executor", "subagent").returncode != 0
            and record2.read_bytes() == before)
+
+        # D3b: A RESERVATION RELEASED BEFORE ANY LAUNCH ADOPTED IT STARTED NO WORKER (2026-10-15: the launch
+        # refused its own claim, the seat released it by hand, and the head's one repair read as spent).
+        delivered(); first = answer(run(*reserve2)); held = json.loads(record2.read_text())["claim"]
+        run("release", "r", "t2", held["claim_id"], str(held["generation"]), "--reason", "launch refused")
+        now = ("--generation", str(held["generation"]))   # `cc` reads the current generation before each reserve
+        again = answer(run(*reserve2, *now)); regranted = json.loads(record2.read_text())["claim"]
+        ok("D3b: a repair reservation released before any launch adopted it may be reserved again at the same "
+           "head — once; D3 is the adopted control, which stays spent",
+           first.get("launch") and again.get("launch") and again["execution_id"] != first["execution_id"]
+           and regranted["generation"] == held["generation"] + 1 and regranted["phase"] == "repair"
+           and answer(run(*reserve2, "--generation", str(regranted["generation"]))).get("launch") is False)
 
         delivered(); old = json.loads(record2.read_text())
         receipts = root / ".cc/state/r/.receipts"; receipts.mkdir(parents=True, exist_ok=True)
@@ -546,6 +590,11 @@ def selfcheck():
             ok("the dispatcher that takes a killed launch's claim says so on the old execution",
                do_claim(killed, other, "worker", by=live_cc) == 1 and killed["claim"]["generation"] == 2
                and killed["executions"][0]["outcome"] == "superseded (its launch was killed)")
+            rep = new_record("r", "k10", root / ".cc/worktrees/r/k10"); do_claim(rep, live_owner, "worker", "repair")
+            rep["executions"][-1]["repair"] = {"adopted_at": None}
+            ok("a --go's claim that hands a repair reservation to its cc also marks that reservation adopted",
+               do_claim(rep, live_owner, "worker", by=live_cc) == 1 and adopt(rep) == 1
+               and rep["executions"][-1]["repair"]["adopted_at"] and adopt(rep) == 0)
             def under_cc(row, *flag):   # cc-task run by a shell whose argv[0] is bin/cc, as `cc` runs it
                 git("-C", str(dev), "worktree", "add", "-q", "-b", f"track/{row}", str(root / f".cc/worktrees/r/{row}"))
                 r = subprocess.run([str(BIN / "cc"), "-c", '"$@"; :', "cc", sys.executable, __file__, "claim", "r", row,

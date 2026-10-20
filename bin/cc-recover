@@ -609,6 +609,7 @@ def tick():
         reboot_clear(st)
     st["last_tick"] = t
     status, lost = save(st)
+    stop_mark()
     # sessions: a host that is not the hub brings nothing back, so its mass loss is logged once and left
     hub = hub_elsewhere()
     if status == "mass-loss" and hub:
@@ -893,7 +894,51 @@ def restore_held(boot):
     msg = catchup_text(saved_at)
     env = {k: v for k, v in os.environ.items() if k not in ("CC_SLACK_ALIAS", "CC_CLAUDE")}   # a cold launch is the plain claude
     log("restore.log", f"restore{' at boot' if boot else ''}: {len(sessions)} saved at {saved.get('saved', '?')}")
+    if stopped():   # tier stop: what was running comes back on its own conversation, and no catch-up turn spends
+        log("restore.log", "the spend tier is stop: only what was running then comes back, and nobody gets a catch-up")
+        sessions, msg = under_stop(sessions), None
     return relaunch(sessions, msg, env)
+
+
+def stopped():
+    """The box's spend tier is stop (`cc-tier` says the word). A cc-tier that cannot answer is "go", as cc-pause is."""
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-tier")], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == "stop"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def stop_mark():
+    """UNDER TIER STOP THE CRASH NET PUTS BACK WHAT WAS RUNNING, AND STARTS NOTHING (owner, 2026-10-17). The first
+    tick under stop writes stop.json, the saved set's windows at that moment — the live set within a minute of the
+    tier being set, or the held set when a mass loss already stood. A tier off stop removes it."""
+    if stopped():
+        if not os.path.exists(path("stop.json")):
+            ss = load("live.json", {}).get("sessions")
+            store("stop.json", {"since": iso(now()), "windows": sorted(ss) if isinstance(ss, dict) else []})
+    else:
+        try:
+            os.remove(path("stop.json"))
+        except OSError:
+            pass
+
+
+def under_stop(sessions, logname="restore.log"):
+    """What a restore under tier stop relaunches: only records stop.json names (no stop.json yet means the whole set
+    predates stop), never a worker (cc-loop would refuse to start one under stop anyway). The rest is logged."""
+    mark = load("stop.json", None)
+    names = set(mark["windows"]) if isinstance(mark, dict) and isinstance(mark.get("windows"), list) else None
+    keep = []
+    for rec in sessions:
+        w = rec.get("window") if isinstance(rec, dict) else None
+        if isinstance(rec, dict) and rec.get("kind") == "worker":
+            log(logname, f"{w}: a worker, and the tier is stop — left down")
+        elif names is not None and w not in names:
+            log(logname, f"{w}: not running when the tier was set to stop — left down")
+        else:
+            keep.append(rec)
+    return keep
 
 
 def paused(repo):
@@ -946,6 +991,9 @@ def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=Tr
             continue
         if rec["kind"] == "worker":
             back.append(w)
+        elif msg is None:   # tier stop: up, and not woken
+            back.append(w)
+            log(logname, f"{w}: no catch-up — the tier is stop")
         else:
             cp = None
             for _ in range(30):
@@ -1629,6 +1677,30 @@ def selfcheck():
         check("restore: a paused project stays down while the rest come back",
               not any(c.startswith("cc|m1|") for c in calls) and any(c.startswith("cc|r1|") for c in calls)
               and "m1 is paused" in open(path("restore.log")).read())
+        # tier stop: the first tick under it marks what runs; a session started after that, and the worker, stay
+        # down; the rest come back on their own conversations and nobody is handed a catch-up turn
+        d = fixture(); live_box(d)
+        with open(f"{BIN}/cc-tier", "w") as f:
+            f.write(f"#!/bin/sh\n[ -f {d}/stop ] && echo stop || echo autonomous\n")
+        os.chmod(f"{BIN}/cc-tier", 0o755)
+        globals()["claude_pid"] = lambda w: "999"
+        tick(); open(f"{d}/stop", "w").close(); tick()
+        marked = load("stop.json", {}).get("windows")
+        proc(400, ["bash", "/b/cc", "__runmain", "r2"], [401]); proc(401, ["/c/claude"], env={"CC_CLAUDE": "/c/claude"}, sid="sid-r2")
+        open(f"{d}/windows.tsv", "a").write("r2\t400\n"); tick()
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        rlog = open(path("restore.log")).read()
+        check("restore under tier stop: what ran when stop was set comes back, with no catch-up turn; a session started "
+              "since and the worker stay down",
+              marked == ["m1", "r1", "r1/fix", "r1/job", "r1@ops"]
+              and "cc|r1|" in calls and "cc|r1|--orch|ops||" in calls and "cc|m1|" in calls
+              and not any(c.startswith("cc|r2|") or c.startswith("cc|r1|job|") for c in calls)
+              and not any(c.startswith("cc-msg|") or "--say" in c for c in calls)
+              and "r2: not running when the tier was set to stop" in rlog and "r1/job: a worker, and the tier is stop" in rlog)
+        os.remove(f"{d}/stop"); tick()
+        check("restore under tier stop: the mark goes when the tier leaves stop", not os.path.exists(path("stop.json")))
         # a member workspace's track window (`cc __runmember <repo> <track>`) comes back as that track, not as the
         # workspace: the hub move lost two this way, `cc m1` finding the workspace window up and returning 0
         d = fixture()

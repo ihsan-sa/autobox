@@ -17,7 +17,9 @@ and what a member session may do all keep coming from the path rules — no fiel
   cc-task receipt <repo> <row>                           print completion evidence and pending work
   cc-task reserve-repair <repo> <row> --generation N --branch BRANCH --pr URL --head SHA
                     [--relaunch]                         reserve once; JSON launch=false means do not launch again.
-                                                         --relaunch: that head again, once its last claim has ended
+                                                         --relaunch: that head again, once its last claim has ended.
+                                                         A reservation released before its launch adopted it
+                                                         started no worker, and that head may be reserved again
   cc-task artifact <repo> <row> --generation N [--committed-sha SHA] [--pushed-sha SHA]
   cc-task error <repo> <row> --generation N <stage> [message]   omit message to clear that error
   cc-task pr <repo> <row> --generation N <url> [--card]    record a PR and the projections it needs
@@ -28,7 +30,9 @@ and what a member session may do all keep coming from the path rules — no fiel
 
 WHO THE OWNER IS is read off the running process: its pid and start time, the boot it started in, the tmux
 window around it, and an agent id when the runtime hands one out. Never a session id somebody typed — a claim
-that can be typed is a claim anyone can take.
+that can be typed is a claim anyone can take. One `cc` launch is one owner from its first call to its last: a
+live claim whose recorded ancestry holds the `cc` this call came from is that launch's own, even when the tree
+above it changed in between (launch_owner).
 
 WHEN A CLAIM STOPS HOLDING. There is no timer and no takeover by waiting. A claim ends when its owner releases
 it, or when that owner's process is provably gone: a different boot, or a pid whose start time no longer
@@ -150,7 +154,7 @@ def window():
         return {"id": wid, "server": process(int(server))}
     except (OSError, ValueError, IndexError, subprocess.SubprocessError): return None
 
-def owner():
+def owner(chain=None):
     """Runtime evidence, walked out of /proc. `cc` is skipped: it is the front door and it exits at once, so a
     claim recorded against it would be dead the moment it was written. Inside a Claude Code or codex session the
     runtime process is the owner; anywhere else it is whoever invoked this.
@@ -159,7 +163,7 @@ def owner():
     manager and recorded IT as the owner (14 claims on 2026-10-03), and a record naming the manager is one stale
     reader away from signalling it. The walk stops at a systemd process (comm `systemd` or `(sd-pam)`) and never
     takes it; with nothing else above `cc`, the owner is the `cc` process itself, a claim dead as soon as it exits."""
-    chain = ancestry(os.getppid())
+    chain = chain if chain is not None else ancestry(os.getppid())
     caller = pick(chain, os.environ.get("CLAUDECODE") or os.environ.get("CODEX_THREAD_ID"))
     return {"process": {k: caller[k] for k in ("pid", "start_ticks")}, "boot_id": boot_id(),
             "agent_id": None, "window": window(),
@@ -200,6 +204,30 @@ def launcher(chain):
         if not p["cc"]: break
         run.append(p)
     return {k: run[-1][k] for k in ("pid", "start_ticks")} if run else None
+
+def launch_run(chain):
+    """The `cc` processes this call was made from: the run of them at the bottom of the chain, up to the first
+    process that is not `cc`. One launch makes every cc-task call of its own from that run, and nothing else does."""
+    run = []
+    for p in chain:
+        if not p["cc"]: break
+        run.append((p["pid"], p["start_ticks"]))
+    return run
+
+def launch_owner(held, chain, who):
+    """THE LAUNCH THAT TOOK A CLAIM IS ITS OWNER FOR AS LONG AS IT RUNS, whatever the tree above it does meanwhile.
+    owner() walks /proc on every call, and the walk can change under one launch: on 2026-10-15 the seat ran
+    `setsid nohup cc … --repair --go` from its Bash, the reservation walked up to the seat's claude, the shell above
+    `cc` was gone by the claim, and `cc` re-parented to the user manager walked to itself. same_owner said no, the
+    seat was alive, and the launch refused its own reservation for as long as the seat lived. So a live claim whose
+    recorded ancestry holds one of this call's own `cc` processes (same pid and start time, same boot) is this
+    launch's, and the call acts as the owner that claim names. Returns that owner, or `who` unchanged."""
+    if not held or held.get("ended_at"): return who
+    o = held.get("owner") or {}
+    if o.get("boot_id") != who.get("boot_id"): return who
+    mine = launch_run(chain)
+    seen = {(p.get("pid"), p.get("start_ticks")) for p in o.get("ancestry") or []}
+    return o if mine and any(m in seen for m in mine) else who
 
 IDENTITY = ("process", "boot_id", "agent_id")   # the window and the session ids are evidence, not identity
 
@@ -365,7 +393,14 @@ def reserve_repair(d, a, wt, who):
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", a.head): raise ValueError("repair needs a full head SHA")
     if a.branch != f"track/{a.row}": raise ValueError("repair needs the canonical branch")
     prepared(a.repo, a.row, wt)
-    spent = [e for e in d["executions"] if e["phase"] == "repair"
+    def unlaunched(e):
+        # A RESERVATION NO LAUNCH ADOPTED STARTED NO WORKER: claim_track adopts it before any window opens, and
+        # records when. One released without that (by hand, after its launch was refused, as on 2026-10-15) spent
+        # nothing, so the head may be reserved again. Anything else stays spent: a record from before `adopted_at`
+        # has no such key, and a reservation another one superseded is not released.
+        r = e.get("repair") or {}
+        return "adopted_at" in r and r["adopted_at"] is None and str(e.get("outcome") or "").startswith("released")
+    spent = [e for e in d["executions"] if e["phase"] == "repair" and not unlaunched(e)
              and ((e.get("repair") or {}).get("pr_url"), (e.get("repair") or {}).get("head")) == (a.pr, a.head)]
     # --relaunch (raised-a-limit-stopped-repair-cannot-restart, 2026-10-17): a repair's worker that stopped before it
     # pushed (a usage limit, exit 8) leaves the head where it was, so the key alone would refuse that head for ever and
@@ -379,9 +414,17 @@ def reserve_repair(d, a, wt, who):
     resume = d["claim"]["executor"] == "worker"
     do_claim(d, who, "worker", "repair")
     e = d["executions"][-1]
-    e["repair"] = {"pr_url": a.pr, "head": a.head, "resume": resume, "at": stamp()}
+    e["repair"] = {"pr_url": a.pr, "head": a.head, "resume": resume, "at": stamp(), "adopted_at": None}
     if spent: e["repair"]["relaunch_of"] = spent[-1]["execution_id"]
     return dict(e, launch=True)
+
+def adopt(d):
+    """The launch a repair reservation granted has claimed it, so that head is spent: 1 when this marked it. It runs
+    after do_claim whatever that returned, since a --go's claim hands the reservation to its `cc` (1) and a plain
+    claim finds it already this owner's (0); a claim that superseded the reservation left nothing to adopt."""
+    r = (d["executions"][-1].get("repair") if d["executions"] else None) or {}
+    if d["claim"]["phase"] != "repair" or "adopted_at" not in r or r["adopted_at"] is not None: return 0
+    r["adopted_at"] = stamp(); return 1
 
 def receipt(d):
     a = d["artifact"]
@@ -597,24 +640,26 @@ def main(argv):
         with Lock(state):
             d = read(state); complete(d, a); save(state, d)
         print(json.dumps(receipt(d), indent=2)); return 0
-    who = owner()
+    chain = ancestry(os.getppid()); who = owner(chain)
     if a.cmd == "reserve-repair":
         if not state.is_dir(): raise ValueError("no task record")
         with Lock(state):
-            d = read(state); reservation = reserve_repair(d, a, wt, who)
+            d = read(state); who = launch_owner((d or {}).get("claim"), chain, who); reservation = reserve_repair(d, a, wt, who)
             if reservation["launch"]: save(state, d)
         print(json.dumps(reservation, indent=2)); return 0
     ex = getattr(a, "executor", None)
     if a.cmd == "check":   # a question, asked without the lock: it creates no state dir for a row that has none,
-        check(read(state), a.repo, a.row, wt, who, ex); return 0   # and only `claim` is ever the atomic answer
+        d = read(state); who = launch_owner((d or {}).get("claim"), chain, who)
+        check(d, a.repo, a.row, wt, who, ex); return 0   # and only `claim` is ever the atomic answer
     with Lock(state):
-        d = read(state)
+        d = read(state); who = launch_owner((d or {}).get("claim"), chain, who)
         check(d, a.repo, a.row, wt, who, ex, claiming=(a.cmd == "claim"))
         moved = d is not None and rekey(d, a.repo, a.row, wt)
         if a.cmd == "claim":
             prepared(a.repo, a.row, wt)
             if d is None: d = new_record(a.repo, a.row, wt)
             took = do_claim(d, who, a.executor, by=launcher(ancestry(os.getppid())) if a.launch else None)
+            took = adopt(d) or took
             write_marker(wt, a.repo, a.row, d["task_id"])   # refused here = nothing claimed: the record is unwritten
             if took or moved: save(state, d)
         else:

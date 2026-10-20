@@ -2197,5 +2197,140 @@ echo https://github.com/o/site/pull/7
         srv.shutdown()
         for k in lkeys:
             os.environ.pop(k, None)
+    # a fenced worker files through its loop: each case on a register, a worktree and an ask file of its own
+    import io
+    import argparse
+    keep_sb, keep_root, keep_ask, keep_members = IN_SANDBOX, ROOT, FENCE_ASK, MEMBERS
+    IN_SANDBOX = False
+    with tempfile.TemporaryDirectory(prefix="cc-docs-sc-fence-") as t:
+        comm = os.path.join(t, "comm")
+        os.environ["CC_DOCS_PID1_COMM"] = comm
+        try:
+            def fence(case, pid1):
+                global ROOT
+                d = os.path.join(t, case)
+                wt = os.path.join(d, "wt")
+                os.makedirs(wt)
+                ROOT = os.path.join(d, "reg")
+                globals()["FENCE_ASK"] = os.path.join(d, "docs.ask")
+                with open(comm, "w") as f:
+                    f.write(pid1 + "\n")
+                return wt
+
+            wt = fence("ask", "bwrap")
+            pdf = mkpdf(wt, "w1", "Worker one")
+            rc, o = run("file", pdf, "--project", "Course W", "--kind", "course", "--title", "Notes")
+            lines = open(FENCE_ASK).read().splitlines()
+            ok("fenced: `file` inside a sandbox appends its argv and cwd to CC_DOCS_ASK, files nothing, and says so",
+               rc == 0 and len(lines) == 1 and json.loads(lines[0])["argv"][:2] == ["file", pdf]
+               and "asked the loop" in o and not os.path.exists(regpath()))
+
+            wt = fence("number", "bwrap")
+            rc, o = run("number", "--project", "Course W", "--title", "Notes")
+            ok("fenced: any other verb inside a sandbox exits 2, asks nothing and makes no register",
+               rc == 2 and "not in your sandbox" in o and not os.path.exists(FENCE_ASK) and not os.path.exists(regpath()))
+
+            wt = fence("host", "bash")
+            rc, o = run("file", mkpdf(wt, "w2", "Worker two"), "--project", "Course W", "--kind", "course",
+                        "--title", "Notes")
+            ok("fenced: with CC_DOCS_ASK set but pid 1 not bwrap, `file` files on the register as ever and asks nothing",
+               rc == 0 and "101-0001" in load()["documents"] and not os.path.exists(FENCE_ASK))
+
+            def host(wt, *asks):
+                si, so = sys.stdin, sys.stdout
+                sys.stdin, sys.stdout = io.StringIO("".join(json.dumps(x) + "\n" for x in asks)), io.StringIO()
+                try:
+                    rc = cmd_fenced(argparse.Namespace(worktree=wt))
+                    return rc, sys.stdout.getvalue()
+                finally:
+                    sys.stdin, sys.stdout = si, so
+
+            wt = fence("kick", "bash")
+            pdf = mkpdf(wt, "w3", "Worker three")
+            rc, o = host(wt, {"argv": ["file", "w3.pdf", "--project", "Course W", "--kind", "course", "--title",
+                                       "Notes"], "cwd": wt})
+            ok("fenced: on the host a request with a PDF inside the worktree is filed, its path read from its cwd",
+               rc == 0 and o.startswith(f"w3.pdf: 101-0001-A\t") and "101-0001" in load()["documents"])
+
+            wt = fence("outside", "bash")
+            out = mkpdf(d := os.path.join(t, "outside"), "w4", "Worker four")
+            os.symlink(out, os.path.join(wt, "link.pdf"))
+            rc, o = host(wt, {"argv": ["file", out, "--project", "Course W", "--kind", "course", "--title", "N"], "cwd": wt},
+                         {"argv": ["file", "link.pdf", "--project", "Course W", "--kind", "course", "--title", "N"],
+                          "cwd": wt},
+                         {"argv": ["file", "w4.pdf", "--project", "Course W", "--kind", "course", "--title", "N"],
+                          "cwd": d})
+            ok("fenced: a PDF outside the worktree, a link out of it, or a cwd outside it is not filed, exit 1",
+               rc == 1 and o.count("not filed:") == 3 and not os.path.exists(regpath()))
+
+            wt = fence("verbs", "bash")
+            pdf = mkpdf(wt, "w5", "Worker five")
+            MEMBERS = os.path.join(t, "members")
+            os.makedirs(os.path.join(MEMBERS, "kid1"))
+            with open(os.path.join(MEMBERS, "kid1", "workspace-id"), "w") as f:
+                f.write("0123456789abcdef\n")
+            run("project", "Kid", "--member", "kid1")
+            made = [q for q, v in load()["projects"].items() if v.get("member") == "kid1"]
+            rc, o = host(wt, {"argv": ["public", "001-0001", "on"], "cwd": wt},
+                         {"argv": ["file", pdf, "--project", "Kid", "--kind", "course", "--title", "N"], "cwd": wt},
+                         {"argv": ["file", pdf, "--project", "Box", "--kind", "work", "--member", "kid1", "--title", "N"],
+                          "cwd": wt},
+                         "not an object")
+            ok("fenced: another verb, a member's project, --member and a malformed line are each refused, nothing filed",
+               len(made) == 1 and rc == 1 and o.count("not filed:") == 4 and "is a member's" in o
+               and not load()["documents"])
+
+            wt = fence("date", "bash")
+            mkpdf(wt, "w6", "Worker six")
+            mkpdf(wt, "w7", "Worker seven")
+            rc, o = host(wt, {"argv": ["file", "--project", "Course W", "--kind", "course", "--title", "N", "--date",
+                                       "invalid", "w6.pdf"], "cwd": wt},
+                         {"argv": ["file", "w7.pdf", "--project", "Course W", "--kind", "course", "--title", "M"],
+                          "cwd": wt})
+            ok("fenced: an invalid --date refuses that request only, labelled by its PDF, and the next one still files",
+               rc == 1 and o.splitlines()[0].startswith("w6.pdf: not filed: --date")
+               and o.splitlines()[1].startswith("w7.pdf: 101-0001-A") and len(load()["documents"]) == 1)
+
+            wt = fence("raises", "bash")
+            mkpdf(wt, "w8", "Worker eight")
+            mkpdf(wt, "w9", "Worker nine")
+            keep_pt = pdftext
+            def boom(src):
+                if src.endswith("w8.pdf"):
+                    raise FileNotFoundError(2, "No such file or directory", "pdftotext")
+                return keep_pt(src)
+            globals()["pdftext"] = boom
+            try:
+                rc, o = host(wt, *({"argv": ["file", f"w{k}.pdf", "--project", "Course W", "--kind", "course",
+                                             "--title", f"N{k}"], "cwd": wt} for k in (8, 9)))
+            finally:
+                globals()["pdftext"] = keep_pt
+            ok("fenced: an error that is not a refusal (pdftotext missing) is that request's `not filed` line, the next files",
+               rc == 1 and o.splitlines()[0].startswith("w8.pdf: not filed: FileNotFoundError")
+               and o.splitlines()[1].startswith("w9.pdf: 101-0001-A"))
+
+            wt = fence("cap", "bash")
+            mkpdf(wt, "w10", "Worker ten")
+            keep_cap = FENCE_ASK_CAP
+            globals()["FENCE_ASK_CAP"] = 4096
+            try:
+                si, so = sys.stdin, sys.stdout
+                late = json.dumps({"argv": ["file", "w10.pdf", "--project", "Course W", "--kind", "course", "--title",
+                                            "N"], "cwd": wt})
+                sys.stdin, sys.stdout = io.StringIO("\n" * 4000 + late + "\n"), io.StringIO()
+                try:
+                    rc = cmd_fenced(argparse.Namespace(worktree=wt))
+                    o = sys.stdout.getvalue()
+                finally:
+                    sys.stdin, sys.stdout = si, so
+            finally:
+                globals()["FENCE_ASK_CAP"] = keep_cap
+            ok("fenced: a request past the read cap is reported as one `not filed` line saying so, never dropped silently",
+               rc == 1 and o.count("not filed:") == 1 and "was not read" in o and "malformed" not in o
+               and not os.path.exists(regpath()))
+        finally:
+            os.environ.pop("CC_DOCS_PID1_COMM", None)
+            IN_SANDBOX, ROOT, MEMBERS = keep_sb, keep_root, keep_members
+            globals()["FENCE_ASK"] = keep_ask
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0

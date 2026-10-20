@@ -33,6 +33,8 @@ def run_selfcheck():
         return cfg
     globals()["load_cfg"] = fixture_cfg
     register_workspaces({})
+    # NOR THE BOX'S SPEND TIER: a box under tier stop would hold every fixture's message. The stop case sets its own.
+    globals()["stopped"] = lambda: False
 
     def as_posted(cfg, text, kw):
         """What post() puts on the wire for a say() stub's text: the 🔒 head under decision=True, both owner marks off
@@ -1357,6 +1359,47 @@ def run_selfcheck():
               len(said6) == 1 and "dropped" in said6[0] and "parked longer" in said6[0])
     finally:
         globals()["paused"] = real_paused
+
+    # TIER STOP, on its own fixture: one live seat. Every message the box sends it on its own is queued, not handed
+    # over, and starts nothing; the owner's own Slack word (hand_off marks it) is delivered, and starts the seat he
+    # wrote to when it is down. The queue outlives the TTL while stop holds, and the sweep hands it over once it lifts.
+    globals()["stopped"] = lambda: True
+    try:
+        dmS = Daemon(use_slack=False)
+        sentS, cS = [], Conn(None, "seat", {"alias": None})
+        cS.send = lambda p: sentS.append(p.get("content"))
+        dmS.subs["seat"] = [cS]
+        dmS.typed = []; dmS.type_into_pane = lambda *a, **k: dmS.typed.append(a) or None   # no pane: a down seat
+        dmS.started = []; dmS.autostart = lambda t, **k: dmS.started.append(t) or "starting"
+        dmS.say = lambda *a, **k: None
+        rS = dmS.deliver("seat", {"type": "message", "content": "reconcile: a row can start",
+                                  "meta": {"chat_id": "local", "role": "owner", "user": "local"}})
+        rD = dmS.deliver("down", {"type": "message", "content": "lander: PR merged"})
+        check("tier stop: a message the box sends a seat is queued, not handed over or typed, and a down seat is "
+              "not started for one",
+              rS == "stopped" and rD == "stopped" and not sentS and not dmS.typed and not dmS.started
+              and len(dmS.queues["seat"]) == 1 and len(dmS.queues["down"]) == 1)
+        with offline_slack():
+            dmS.hand_off("seat", "stop the worker on alpha",
+                         {"chat_id": "C1", "ts": "1.0", "thread_ts": "1.0", "role": "owner", "user": "owner"}, "C1", None, "1.0")
+            dmS.hand_off("down", "what is left on beta?",
+                         {"chat_id": "C2", "ts": "2.0", "thread_ts": "2.0", "role": "owner", "user": "owner"}, "C2", None, "2.0")
+            dmS.hand_off("seat", "a member's word",
+                         {"chat_id": "C1", "ts": "3.0", "thread_ts": "3.0", "role": "member", "user": "m"}, "C1", None, "3.0")
+        check("tier stop: the owner's own Slack message still reaches his seat, and starts a seat that is down; a "
+              "member's waits in the queue with the box's",
+              sentS == ["stop the worker on alpha"] and dmS.started == ["down"] and len(dmS.queues["seat"]) == 2)
+        dmS.queues["seat"][0] = (0.0, dmS.queues["seat"][0][1], None)
+        check("tier stop: the TTL sweep spares what stop held", not dmS.expire_queues() and len(dmS.queues["seat"]) == 2)
+        dmS.queues["seat"][0] = (time.time(), dmS.queues["seat"][0][1], None)   # past the TTL at the lift is drop-and-tell, as for a pause
+        dmS.handoff_sweep()
+        check("tier stop: …and the 30 s sweep leaves it queued while stop holds", not sentS[1:])
+        globals()["stopped"] = lambda: False
+        dmS.handoff_sweep()
+        check("tier stop: once the tier lifts the sweep hands the seat what was held, oldest first",
+              sentS[1:] == ["reconcile: a row can start", "a member's word"] and not dmS.queues["seat"])
+    finally:
+        globals()["stopped"] = lambda: False
 
     # A WINDOW ON ANOTHER HOST IS NEVER STARTED ON THIS ONE (review of #1126). With no subscriber, the keyboard and
     # autostart used to look only at this host's tmux and then run `cc` here, so a member on the session host whose

@@ -1821,6 +1821,24 @@ def paused(target):
     except Exception:
         return False
 
+def stopped():
+    """The spend tier is stop (`cc-tier allows pulse` exits 1): nothing the box does on its own may wake a session.
+    Unlike a pause it is box-wide, and the owner's own word still goes through — stop is when he steers — so the
+    payload he wrote carries `steer` (owner_word) and nothing else does. Any other exit, or a cc-tier that cannot
+    run, is "go", the reading cc-broker and cc-reconcile take of the same dial."""
+    try:
+        return subprocess.run([f"{BIN}/cc-tier", "allows", "pulse"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode == 1
+    except Exception:
+        return False
+
+def owner_word(payload, meta):
+    """Marks a message the owner typed in Slack, so it reaches his seat under tier stop (stopped). A top-level key,
+    never meta: meta is shown to the session, and the queue keeps the payload whole, so the mark survives a wait."""
+    if meta.get("role") == "owner":
+        payload["steer"] = True
+    return payload
+
 def spooled_already(window, text, since):
     """Did this run of cc-msg spool this text? (~/.cc/state/<window>/inbox.spool, one JSON object a line, `at`
     a UTC stamp sorting as a string, so `since` compares as one too.) Asked after cc-msg is killed mid-run, since
@@ -5091,7 +5109,7 @@ class Daemon:
     # workspace he has not minted. Everything else with a target — queued, no-session, live-no-channel, no-track, and
     # a verdict these lists do not know — is a post the sender believed handed over and nobody took: recorded.
     WOKEN = ("delivered", "typed", "spooled", "starting", "held")
-    NOBODY_BY_DESIGN = ("paused", "no-credential")
+    NOBODY_BY_DESIGN = ("paused", "no-credential", "stopped")
     NOBODY_WOKEN_KIND = "channel-wake/nobody-woken"
 
     def record_nobody_woken(self, target, alias, meta, res):
@@ -5628,6 +5646,7 @@ class Daemon:
                 target, alias = first["hello"], first.get("alias") or None
                 hid = first.get("handoff") or None       # a SIDE of an open handoff, not an alias: no join notice, not @-addressable
                 conn = Conn(c, target, {"pid": first.get("pid"), "since": time.time(), "alias": alias, "handoff": hid, "member": member})
+                stop = stopped() if self.queues.get(target) else False   # asked outside the lock: it is a subprocess
                 with self.lock:
                     self.subs[target].append(conn)
                     q = self.queues.get(target)
@@ -5635,6 +5654,8 @@ class Daemon:
                     # each entry waits for its own alias (main's backlog isn't an orch's); the muted half of a
                     # handoff gets none of it — that goes to the promoted conn once the live session is gone.
                     backlog = [e for e in (q or []) if e[2] == alias] if conn in self.live_conns(target, peers) else []
+                    if stop:   # under tier stop a seat coming up hears the owner, and the rest waits
+                        backlog = [e for e in backlog if e[1].get("steer")]
                     for e in backlog:
                         q.remove(e)
                     self.save_queues()
@@ -5850,6 +5871,7 @@ class Daemon:
                 self.given[key] = [g for g in gs if g not in todo]
             for g in todo:
                 self.deliver(split_orch(key)[0], self.rehand(g), autostart=False, alias=g["alias"])
+        held = stopped() if targets else False   # tier stop: only the owner's own word leaves a queue
         for t in targets:
             if paused(t):
                 continue
@@ -5862,7 +5884,7 @@ class Daemon:
                 continue
             with self.lock:
                 q = self.queues.get(t)
-                out = [e for e in (q or []) if e[2] in ready]
+                out = [e for e in (q or []) if e[2] in ready and not (held and not e[1].get("steer"))]
                 for e in out:
                     q.remove(e)
                 if out:
@@ -5899,6 +5921,13 @@ class Daemon:
             with self.lock:
                 self.queues[target].append((time.time(), payload, alias)); self.save_queues()
             return "paused"
+        # Tier stop holds every message the box sends a session on its own, and starts nothing for one; the owner's
+        # own word (owner_word) is delivered, and starts the seat he wrote to, as at any tier. Held, never dropped:
+        # handoff_sweep hands it over once the tier lifts and the queue keeps it past the TTL meanwhile.
+        if payload.get("type") == "message" and not payload.get("steer") and stopped():
+            with self.lock:
+                self.queues[target].append((time.time(), payload, alias)); self.save_queues()
+            return "stopped"
         every = payload.get("type") == "permission"   # the prompt can come from any alias — answer them all, one of them is waiting
         with self.lock:
             conns = [c for c in self.subs.get(target, []) if every or (c.info.get("alias") or None) == alias]
@@ -6727,7 +6756,7 @@ class Daemon:
         save_last(self.last_chat)
         receipt("received", chat, ts, thread, role=meta.get("role"), user=meta.get("user"), channel=meta.get("channel"),
                 session=seat_name(target, alias))
-        res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
+        res = self.deliver(target, owner_word({"type": "message", "content": text, "meta": meta}, meta), alias=alias)
         react(self.cfg, chat, ts, "eyes")
         if res == "delivered":
             return
@@ -6739,7 +6768,7 @@ class Daemon:
             # …and NO notice line (owner, 2026-09-18: "adds bloat"): the thread's root says what the track is, and
             # the answer arrives from the repo session in the same thread, which is all the person needs to see.
             # Only a repo session that can't be reached either is worth a line, and then just the one below.
-            r2 = self.hand_to_repo(target, {"type": "message", "meta": meta, "content": text}, res)
+            r2 = self.hand_to_repo(target, owner_word({"type": "message", "meta": meta, "content": text}, meta), res)
             if r2 in self.WOKEN or r2 in self.NOBODY_BY_DESIGN:
                 return
             res = "unreached"
@@ -6773,6 +6802,10 @@ class Daemon:
                 repo = (target or "").partition("/")[0].partition("@")[0]
                 self.say(chat, f"`{repo}` is paused — nothing there spends until `!resume`. Your message is queued and "
                                f"the session reads it then; it will not be dropped meanwhile.", thread, mail=False)
+            elif res == "stopped":
+                self.say(chat, "The box's spend tier is stop, so no session is woken but by the owner. Your message is "
+                               "queued and the session reads it once the tier lifts; it will not be dropped meanwhile.",
+                         thread, mail=False)
             else:
                 self.say(chat, f"queued for `{target}` ({res}) — `!restart {target}` starts it.", thread, mail=False)
 
@@ -6799,7 +6832,8 @@ class Daemon:
         # because this says so (a parent's seat for a channel-less child is not a guess it could make from the name)
         receipt("delivery", chat, ts, meta.get("thread_ts"), session=target, result="fallback", to=home, why=res)
         r2 = self.deliver(home, {"type": "message", "meta": dict(meta, target=home),
-                                 "content": f"{named}[asked in {chan} {where}] {payload.get('content') or ''}"})
+                                 "content": f"{named}[asked in {chan} {where}] {payload.get('content') or ''}",
+                                 **({"steer": True} if payload.get("steer") else {})})
         log(f"{res} {target}: handed to {home} ({r2})")
         if r2 in self.WOKEN and chat and ts:
             hit = self.find_queued(chat, ts, only=target)
@@ -7505,7 +7539,7 @@ class Daemon:
                 "role": "owner" if is_owner else "member",
                 "channel": "dm" if ev.get("channel_type") == "im" else "#" + self.chan_name(chat), "target": target,
                 "lane": "main" if ev.get("channel_type") == "im" else lane_of(self.chan_name(chat), target)}
-        self.deliver(target, {"type": "message", "content": note, "meta": meta}, autostart=False)
+        self.deliver(target, owner_word({"type": "message", "content": note, "meta": meta}, meta), autostart=False)
 
     def fetch_files(self, files, member=None, pairs=False):
         """Downloads every Slack attachment on the message (≤50 MB each; no count cap, owner 10-16) to ~/.cc/slack/files (or a member's own dir);
@@ -7727,7 +7761,7 @@ class Daemon:
                 "user": self.user_name(who), "target": target,
                 "channel": "dm" if chat.startswith("D") else "#" + self.chan_name(chat),
                 "lane": "main" if chat.startswith("D") else lane_of(self.chan_name(chat), target)}
-        self.deliver(target, {"type": "message", "content": content, "meta": meta}, autostart=False, alias=alias)
+        self.deliver(target, owner_word({"type": "message", "content": content, "meta": meta}, meta), autostart=False, alias=alias)
         return None
 
     def on_return(self, chat, ts, window, who=None):
@@ -9025,12 +9059,12 @@ class Daemon:
 
     def expire_queues(self):
         """Drops what's sat in a queue past QUEUE_TTL, returning [(target, payload)] for the caller to report.
-        A paused project's queue is exempt; pausing must not eat a message the owner knows is coming.
+        A paused project's queue is exempt, and every queue under tier stop; neither may eat what it held.
         `cc-pause is` runs only when something is old enough to drop, so an idle box spawns no subprocess."""
         expired = []
         with self.lock:
             for t, q in list(self.queues.items()):
-                if q and time.time() - q[0][0] > QUEUE_TTL and paused(t):
+                if q and time.time() - q[0][0] > QUEUE_TTL and (paused(t) or stopped()):
                     continue
                 while q and time.time() - q[0][0] > QUEUE_TTL:
                     expired.append((t, q.popleft()[1]))

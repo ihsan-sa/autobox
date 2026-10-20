@@ -200,6 +200,15 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs member <handle> [--files <dir>]
         The host's half of filing from inside a member workspace, run by the Slack daemon for its member verb `docs`
         (below): one ask as JSON on stdin, {"ok", "text"|"error"} on stdout. Nobody else calls it.
+    cc-docs fenced <worktree>
+        The host's half of `file` from inside a worker's sandbox, run by cc-loop once the iteration ends. Inside a
+        fence (pid 1 is bwrap) with CC_DOCS_ASK set by the loop, `file` files nothing: it appends
+        {"argv", "cwd"} as one line to that file and says so, exit 0, and every other verb exits 2 (the register is
+        not in there). This reads those lines on stdin and files each with the host's register, as `file` would from
+        its cwd, printing `<pdf>: <what file printed>` or `<pdf>: not filed: <why>` per line; exit 1 when any was not
+        filed. Refused: anything but `file`, a cwd, PDF, --source, --latex or --attach whose real path is outside the
+        worktree, a member's project, --member, --filer-editor. Its sources are read from the worktree and the
+        style trees only.
     cc-docs fold <keep PPP-NNNN> <other PPP-NNNN>…
         Makes the other documents revisions of <keep>, for old versions filed as documents of their own. Every revision
         of them all is ordered oldest first by date (ties by the order given) with <keep>'s current revision last, so
@@ -3591,6 +3600,155 @@ def cmd_member(a):
         return 2
 
 
+# ── a fenced worker files through its loop ───────────────────────────────────────────────────────────────────
+# A worker's sandbox binds no ~/.cc/documents, so `file` in there used to write a register into the fence's tmpfs
+# $HOME, which went with it: on 2026-10-11 lessons' ece206-ps5 rebuilt the ECE206 notes, found an empty library, and
+# they stayed unfiled for 11 h until a seat filed them by hand. Where pid 1 is bwrap and cc-loop has said where to ask
+# (CC_DOCS_ASK, its $ST/docs.ask, as CC_GREEN_ASK is for cc-green), `file` appends its argv and cwd to that file and
+# files nothing; the loop, on the host once the iteration ends, runs `cc-docs fenced <worktree>` on it and journals
+# each line it prints. Every other verb there is refused: the register is not in the fence, and an answer read off
+# an empty one is wrong. On the host every path the filing names must resolve inside the worktree, its sources are
+# read from the worktree and the style trees only (a member's rule), and no member's project, --member or
+# --filer-editor is taken. A loop inside a member boundary sets no CC_DOCS_ASK: that worker files across its socket.
+FENCE_ASK = os.environ.get("CC_DOCS_ASK", "")
+FENCE_ASK_CAP = 1 << 20   # the most of docs.ask the host reads, in bytes
+
+
+def fenced_in():
+    """Inside a worker's fence: bwrap is pid 1 (cc-green's test, and CC_DOCS_PID1_COMM its test hook)."""
+    try:
+        with open(os.environ.get("CC_DOCS_PID1_COMM") or "/proc/1/comm") as f:
+            return f.read().strip() == "bwrap"
+    except OSError:
+        return False
+
+
+def ask_host(a, argv):
+    """`file` inside a fence: the argv as one line of CC_DOCS_ASK for the loop to file on the host; anything else
+    refused with the reason."""
+    if a.cmd != "file":
+        print(f"cc-docs: {a.cmd} needs the document register, which is on the host and not in your sandbox; only "
+              "`cc-docs file` works from here (the loop files it on the host when this iteration ends). A build "
+              "that prints its own number (`number --tex`) cannot here: build it without that footer and `file` it, "
+              "and the host stamps the number on when it files. Nothing was done.", file=sys.stderr)
+        return 2
+    line = json.dumps({"argv": list(argv), "cwd": os.getcwd()}) + "\n"
+    try:
+        fd = os.open(FENCE_ASK, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"cc-docs: could not write the request {FENCE_ASK} ({e.strerror}): nothing was asked or filed",
+              file=sys.stderr)
+        return 2
+    print(f"cc-docs: asked the loop to file {a.pdf} on the host once this iteration ends (request {FENCE_ASK}); "
+          "the number it gets, or why it was refused, is a '- cc-loop: cc-docs file' line in your journal next time.")
+    return 0
+
+
+def fenced_one(wt, ask):
+    """One line of a worker's docs.ask, filed on the host. -> what `file` printed. Refused: anything but `file`, a
+    path outside the worktree, a member's project, --member, --filer-editor."""
+    import contextlib
+    import io
+    if not isinstance(ask, dict) or not isinstance(ask.get("argv"), list) or not isinstance(ask.get("cwd"), str) \
+            or not all(isinstance(x, str) for x in ask["argv"]):
+        raise Refused("a request is {argv: [str...], cwd: str}")
+    trees = [wt]
+    # the cwd a worker asked from is the host path: cc-sandbox binds the worktree onto its own name (build's
+    # `pinq --bind "$wt"`), so the same path names the same files on both sides of the fence
+    cwd = os.path.realpath(ask["cwd"])
+    if not within(cwd, trees):
+        raise Refused("the request was made outside the worktree")
+    if ask["argv"][:1] != ["file"]:
+        raise Refused(f"a sandbox asks for `file` only, not {str(ask['argv'][:1])[:40]}")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            a = parser().parse_args(ask["argv"])
+    except SystemExit:
+        raise Refused("the request's flags do not parse as `cc-docs file`")
+    if a.member or a.filer_editor:
+        raise Refused("a worker files the owner's documents only: no --member and no --filer-editor")
+    def inside(flag, v):
+        real = os.path.realpath(os.path.join(cwd, v))
+        if not within(real, trees):
+            raise Refused(f"{flag} {v} is not inside the worktree")
+        return real
+    a.pdf = inside("the PDF", a.pdf)
+    a.source = a.source and inside("--source", a.source)
+    a.latex = a.latex and inside("--latex", a.latex)
+    a.attach = a.attach and [inside("--attach", x) for x in a.attach]
+    if not os.path.isfile(a.pdf):
+        raise Refused(f"{a.pdf} is not a file")
+    try:
+        a.date and datetime.date.fromisoformat(a.date)
+    except ValueError:
+        raise Refused(f"--date {a.date[:40]!r} is not a date (YYYY-MM-DD)")
+    p = find_project(load(), a.project) if a.project else None
+    if p and load()["projects"][p].get("member"):
+        raise Refused(f"project {a.project!r} is a member's; a worker files only under the owner's")
+    a.trees = trees
+    here = os.getcwd()
+    out = io.StringIO()
+    try:
+        os.chdir(cwd)   # who filed it (filer) and library.json are read from where the worker ran it
+        with contextlib.redirect_stdout(out):
+            rc = cmd_file(a)
+    finally:
+        os.chdir(here)
+    text = out.getvalue().strip()
+    if rc:
+        raise Refused(text or f"file exited {rc}")
+    return text
+
+
+def fenced_label(ask):
+    """The PDF a request names, for its result line: the parsed positional where it parses, else "?"."""
+    import contextlib
+    import io
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return parser().parse_args(ask["argv"]).pdf
+    except (SystemExit, Exception):
+        return "?"
+
+
+def cmd_fenced(a):
+    """The loop's half: the worker's docs.ask on stdin, one line printed per request (its filed line, or `not filed:
+    <why>`). Exit 1 when any was not filed. The loop deletes the file after, so nothing in it goes unreported: past
+    FENCE_ASK_CAP the rest is one `not filed` line, and an error in one request is that request's line only."""
+    wt = os.path.realpath(a.worktree)
+    if not os.path.isdir(wt):
+        raise Refused(f"no worktree {a.worktree}")
+    data = sys.stdin.read(FENCE_ASK_CAP + 1)
+    over = len(data) > FENCE_ASK_CAP
+    if over:   # the last whole line within the cap is the last one read; the cut one is in the overflow line
+        data = data[:FENCE_ASK_CAP]
+        data = data[:data.rfind("\n") + 1]
+    bad = 0
+    for raw in data.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            ask = json.loads(raw)
+        except ValueError:
+            ask = None
+        what = fenced_label(ask) if isinstance(ask, dict) and isinstance(ask.get("argv"), list) else "?"
+        try:
+            print(f"{str(what)[:200]}: {fenced_one(wt, ask)}")
+        except Exception as e:   # Refused, and anything else one request raises: that request is not filed, the rest go on
+            bad += 1
+            why = str(e) if isinstance(e, Refused) else f"{type(e).__name__}: {e}"
+            print(f"{str(what)[:200]}: not filed: {why[:400]}")
+    if over:
+        bad += 1
+        print(f"?: not filed: the request file passed {FENCE_ASK_CAP >> 20} MiB, so every request after the first "
+              f"{len(data)} bytes was not read; ask for those again")
+    return 1 if bad else 0
+
+
 def selfcheck(*a, **k):
     """The cases are core/tests/selfcheck/cc-docs.py, run in THIS namespace so their stubs and `global`
     rebinds land on the tool as they did when the body was here. Defining them replaces this selfcheck()."""
@@ -3600,7 +3758,7 @@ def selfcheck(*a, **k):
     return globals()["selfcheck"](*a, **k)
 
 
-def main(argv):
+def parser():
     import argparse
     ap = argparse.ArgumentParser(prog="cc-docs", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3684,13 +3842,23 @@ def main(argv):
     p.add_argument("--to", action="append")
     p.add_argument("--name")
     p.add_argument("--pin", action="store_true")
+    p = sub.add_parser("fenced")
+    p.add_argument("worktree")
     sub.add_parser("selfcheck")
+    return ap
+
+
+def main(argv):
+    ap = parser()
     argv = list(argv)
     if argv[:1] == ["token"] and "--" not in argv:   # a minted token may begin with '-'; never let argparse read it as an option
         argv.insert(1, "--")
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
         return selfcheck()
+    # brief: "cc-docs file inside its sandbox saw an empty library" — a worker's fence (not a member's) asks its loop
+    if not IN_SANDBOX and FENCE_ASK and fenced_in():
+        return ask_host(a, argv)
     if IN_SANDBOX and a.cmd == "file" and a.attach:
         print("cc-docs: supporting files are attached on the host: file the PDF alone from a workspace", file=sys.stderr)
         return 2
@@ -3698,11 +3866,13 @@ def main(argv):
         return across(a)
     try:
         if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move", "attach",
-                                    "related", "backfill-sources", "check", "link", "pdf", "gone"):
+                                    "fenced", "related", "backfill-sources", "check", "link", "pdf", "gone"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
         if a.cmd == "member":
             return cmd_member(a)
+        if a.cmd == "fenced":
+            return cmd_fenced(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
                 "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach, "related": cmd_related, "pdf": cmd_pdf,

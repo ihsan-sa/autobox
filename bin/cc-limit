@@ -78,6 +78,9 @@
 # An episode nobody recorded publishes nothing — `resume` is armed by `record` — and neither does one whose
 # records do not all carry a start: a guessed start would call live rows dead, and the six-hour bound still covers
 # them, as it did before.
+# UNDER TIER STOP (`cc-tier allows continue` exit 1) `resume` nudges nobody and ends no turn: a session carrying on at
+# the reset is what stop holds. Every record stays on file and the one-shot is armed again STOP_RECHECK s out (15 min),
+# so the nudges go on the first round after the tier lifts — to panes that still show the line, as ever.
 # ONE RUN'S LIMIT IS NOT THE BOX'S. On 2026-09-04 at 09:13:29Z one headless worker was told "usage limit until
 # 06:00Z" and exited. That stamped the box: `status` read "usage limit until 06:00Z (898m left)" and every session
 # believed it for six hours, while opus went on answering (the spend ledger has successful rows at 14:54, 14:55 and
@@ -108,6 +111,7 @@ REC="${CC_LIMIT_RECORD:-$HOME/.cc/state/limit-interrupted}"
 NUDGED="${CC_LIMIT_NUDGED:-$HOME/.cc/state/limit-nudged}"; QUIET=1800   # see nudged_recently
 RESUMED="${CC_LIMIT_RESUMED:-$HOME/.cc/state/limit-resumed}"   # see WHAT ELSE THE LIMIT KILLED
 SEEN="${CC_LIMIT_SEEN:-$HOME/.cc/state/limit-seen}"; JUDGE=3600         # see first_seen: how long an uncorroborated line stays "not judged yet"
+STOP_RECHECK=900   # see UNDER TIER STOP
 DISB="$S.disbelieved"; GRACE=300   # see answering: how long after a limit was first seen a completed call disproves it
 now="${CC_LIMIT_NOW:-$(date -u +%s)}"; DRY=""
 # What a session shows when the limit stopped it. Tighter than cc-model's (which only decides which MODEL to use):
@@ -270,12 +274,12 @@ note_nudge(){   # $1 pane; entries older than a day are dropped on the way throu
   { [ -f "$NUDGED" ] && awk -F'\t' -v p="$1" -v c=$((now - 86400)) '$1!=p && ($2+0)>c' "$NUDGED"
     printf '%s\t%s\n' "$1" "$now"; } > "$NUDGED.t"; mv "$NUDGED.t" "$NUDGED"; }
 
-arm(){   # one-shot at the earliest reset still on file. NOT a unit that lives on the box: systemd-run makes a transient
+arm(){   # $1 = the soonest it may fire, in seconds (default 15). One-shot at the earliest reset still on file. NOT a unit that lives on the box: systemd-run makes a transient
          # timer that fires once and disposes of itself, so a box with nothing recorded runs nothing.
   local at secs real unit mine u
   at=$(awk -F'\t' '($3+0)>0 && (m==0 || ($3+0)<m){m=$3+0} END{print m+0}' "$REC" 2>/dev/null)
   [ "${at:-0}" -gt 0 ] || return 0
-  secs=$((at - now + 15)); [ "$secs" -lt 15 ] && secs=15   # a few seconds past the reset: the limit lifts on their clock
+  secs=$((at - now + 15)); [ "$secs" -lt "${1:-15}" ] && secs="${1:-15}"   # a few seconds past the reset: the limit lifts on their clock
   unit="cc-limit-resume-$at"   # ONE TRANSIENT UNIT PER RESET TIME — see the sweep below for why the name must differ
   if [ -n "${CC_LIMIT_ARM:-}" ]; then [ "$CC_LIMIT_ARM" = - ] || "$CC_LIMIT_ARM" "$secs" "$unit" >/dev/null 2>&1; return 0; fi
   real=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
@@ -395,6 +399,9 @@ scan(){   # every live INTERACTIVE session under this tmux session
 
 resume(){   # everything due, once each; everything not due, left exactly where it was
   [ -s "$REC" ] || return 0
+  "$BIN/cc-tier" allows continue >/dev/null 2>&1
+  if [ $? = 1 ]; then printf 'the spend tier is stop: nobody nudged, %s record(s) kept\n' "$(grep -c . "$REC")"
+    arm "$STOP_RECHECK"; return 0; fi
   local pane win at started tags cap keep="" due=0 began=0 began_ok=1
   # Five fields since the review of #264 — see record(). A record written before that has three, and every "no"
   # below is the safe answer for it: no start (the episode is not published at all) and no `working` (no Escape).

@@ -14,7 +14,8 @@ def selfcheck():
                 f"[ -f {d}/writes ] && printf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n"
                 f"[ -f {d}/refuse ] && exit 1\nprintf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n")
     os.chmod(stub, 0o755)
-    os.environ.update(CC_STALL_BOARD=stub, CC_STALL_REPO="ctl")
+    os.environ.update(CC_STALL_BOARD=stub, CC_STALL_REPO="ctl",
+                      CC_STALL_TIER="true")   # the box's own tier is nobody's fixture; case 14 sets stop
     ok = bad = 0
 
     def k(cond, what):
@@ -273,6 +274,26 @@ def selfcheck():
     dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)
     with q: run(t, False, 1000); run(t, False, 1000 + DEAD_S)
     k(sent() == [], "without --apply: nothing said")
+
+    # 14 tier stop: the usage-limit prompt is left as it is and raises nothing; a dead orch is said only once it lifts
+    tsub = f"{d}/tier"
+    with open(tsub, "w") as f:
+        f.write(f"#!/bin/sh\n[ -f {d}/stop ] && exit 1\nexit 0\n")
+    os.chmod(tsub, 0o755)
+    os.environ["CC_STALL_TIER"] = tsub
+    open(f"{d}/stop", "w").close()
+    dead_fresh(); t = Fake(); t.add("perms", LIMIT, after=READY)
+    with q:
+        for s in (1000, 1000 + STAND_S, 1000 + 2 * STAND_S):
+            run(t, True, s)
+    k(t.keys == [] and raised() == [], "tier stop: the usage-limit prompt is not pressed, and raises no row")
+    dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    with q: run(t, True, 1000); run(t, True, 1000 + DEAD_S)
+    k(sent() == [] and raised() == [], "tier stop: a dead orch is not said to its seat while stop holds")
+    os.remove(f"{d}/stop")
+    with q: run(t, True, 1000 + DEAD_S + 120)
+    k(len(sent()) == 1, f"…and is said on the first pass after it lifts: {sent()}")
+    os.environ.pop("CC_STALL_TIER")
 
     print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0

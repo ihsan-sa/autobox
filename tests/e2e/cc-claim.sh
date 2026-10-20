@@ -266,7 +266,9 @@ mkdir -p ~/.cc/state/$REPO/c3; printf 'a channel, not a task\n' > ~/.cc/state/$R
 rm -rf ~/.cc/state/${REPO}x ~/.cc/worktrees/${REPO}x ~/.cc/boards/${REPO}x.json ~/.cc/boards/${REPO}x.lock
 # TRACKS DISPATCHED TOGETHER (raised-go-dispatch-race-recurs). `worktree add` writes .git/config, so three
 # dispatches at once lost the race on config.lock and the loser left its branch behind. Three at once all land:
-for d in d1 d2 d3; do mkdir -p ~/.cc/state/$REPO/$d; printf 'Do the %s thing.\n' "$d" > ~/.cc/state/$REPO/$d/task.md; done
+# Each planted dir carries the .cc-track mark a track's own dir gets: a cc that refuses unmarked state dirs (#1041) would
+# otherwise refuse the claim before it reaches the race.
+for d in d1 d2 d3; do mkdir -p ~/.cc/state/$REPO/$d; echo "$REPO/$d" > ~/.cc/state/$REPO/$d/.cc-track; printf 'Do the %s thing.\n' "$d" > ~/.cc/state/$REPO/$d/task.md; done
 dp=""; for d in d1 d2 d3; do ( "$B/cc" claim $REPO $d --executor subagent >"$T/$d.out" 2>&1; echo $? > "$T/$d.rc" ) & dp="$dp $!"; done; wait $dp
 drc=""; for d in d1 d2 d3; do [ "$(cat "$T/$d.rc")" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/$d symbolic-ref --short HEAD 2>/dev/null)" = "track/$d" ] || drc="$drc $d:$(cat "$T/$d.rc") $(tr '\n' ' ' < "$T/$d.out")"; done
 [ -z "$drc" ] && ok "three tracks claimed at once each get their worktree" || bad "concurrent claims collided:$drc"
@@ -278,7 +280,7 @@ gcd=$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir); : >
   && ok "a worktree add that keeps failing leaves no branch and no worktree behind" \
   || bad "a failed add left something: rc=$d4rc branch=$(git -C ~/dev/$REPO show-ref refs/heads/track/d4) $(tr '\n' ' ' < "$T/d4.out")"
 # …and one that clears between tries is retried rather than failed.
-mkdir -p ~/.cc/state/$REPO/d5; printf 'Do the d5 thing.\n' > ~/.cc/state/$REPO/d5/task.md
+mkdir -p ~/.cc/state/$REPO/d5; echo "$REPO/d5" > ~/.cc/state/$REPO/d5/.cc-track; printf 'Do the d5 thing.\n' > ~/.cc/state/$REPO/d5/task.md
 : > "$gcd/config.lock"; ( sleep 1.5; rm -f "$gcd/config.lock" ) & clr=$!
 "$B/cc" claim $REPO d5 --executor subagent >"$T/d5.out" 2>&1; d5rc=$?; wait $clr; rm -f "$gcd/config.lock"
 { [ "$d5rc" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/d5 symbolic-ref --short HEAD 2>/dev/null)" = track/d5 ] && grep -q 'trying again' "$T/d5.out"; } \
@@ -287,7 +289,7 @@ mkdir -p ~/.cc/state/$REPO/d5; printf 'Do the d5 thing.\n' > ~/.cc/state/$REPO/d
 # repo lock, makes the worktree once it clears. The loser's cleanup is all under the lock, so it never removes the
 # winner's worktree. Each dispatch closes the test's own lock fd first: a flock belongs to the open file, so a
 # child that inherits it holds the lock for as long as it lives, and both would wait on themselves.
-mkdir -p ~/.cc/state/$REPO/d6; printf 'Do the d6 thing.\n' > ~/.cc/state/$REPO/d6/task.md
+mkdir -p ~/.cc/state/$REPO/d6; echo "$REPO/d6" > ~/.cc/state/$REPO/d6/.cc-track; printf 'Do the d6 thing.\n' > ~/.cc/state/$REPO/d6/task.md
 exec {tl}>>"$gcd/cc-worktree.lock"; flock "$tl"; : > "$gcd/config.lock"
 ( exec {tl}>&-; "$B/cc" claim $REPO d6 --executor subagent >"$T/d6a.out" 2>&1; echo $? > "$T/d6a.rc" ) & d6a=$!
 ( exec {tl}>&-; sleep 0.5; "$B/cc" claim $REPO d6 --executor subagent >"$T/d6b.out" 2>&1; echo $? > "$T/d6b.rc" ) & d6b=$!
