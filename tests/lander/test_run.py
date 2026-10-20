@@ -3373,6 +3373,21 @@ class Ratchet(unittest.TestCase):
         # and a green run with a line after its tally is still green: the status never reads ends
         self.assertEqual(RUN.status_of(0, "== 9 passed in 0.3s ==\ndone\n"), (T.PASSED, ""))
 
+    def test_a_counted_red_holds_when_a_tally_before_the_last_counts_a_failure(self):
+        # perms' read at a25d572d: a PR printing main's '== 3 failed ==', then a red no form knows, then a tally again
+        # ended on its tally and read 3 against 3, so the red between the two tallies landed
+        res = lambda tree, text: T.Result(check="c", tree=tree, status=T.FAILED, secs=0.0, runner="box:x:y",
+                                          extra={"fails": RUN.fail_ids(text), **RUN.ran(text)})
+        t = "== 3 failed, 9 passed in 0.3s ==\n"
+        base = res("b", "setup ok\n" + t)
+        for again in (t, "== 9 passed in 0.3s ==\n", "FAILED (failures=3)\n"):
+            head = res("h", t + "guard: broke y\n" + again)
+            self.assertFalse(RUN.no_new_reds(head, base), again)
+            self.assertFalse(head.extra["ends"], again)
+        # one honest tally, and green tallies ahead of it, still compare by count
+        self.assertTrue(RUN.no_new_reds(res("h", "setup ok\n" + t), base))
+        self.assertTrue(RUN.no_new_reds(res("h", "== 4 passed in 0.1s ==\nnext suite\n" + t), base))
+
     def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
         store = self.store()
         run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})

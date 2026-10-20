@@ -512,7 +512,7 @@ CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR
 
 def ran(text: str) -> dict:
     """-> {"passes": its last `N passed`, else its count of pass lines; "failed": tally(text); "crash": a crash or
-    abort marker in it; "ends": the run's last words are a closing tally, with only blank lines after it}."""
+    abort marker in it; "ends": ends(text)}."""
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
     return {"passes": passes, "failed": tally(text), "crash": bool(CRASH_RE.search(text)), "ends": ends(text)}
@@ -521,9 +521,12 @@ def ran(text: str) -> dict:
 def ends(text: str) -> bool:
     """True when nothing but blank lines follows the last closing tally (TALLY_RES). A line after it is a red the
     tally does not count: with main's '== 3 failed ==' naming no case, a PR keeping those 3 and adding 'guard: broke
-    y' read 3 against 3 and landed (perms' read of #1645, 10-20)."""
-    last = max((m.end() for rx in TALLY_RES for m in rx.finditer(text)), default=None)
-    return last is not None and not text[last:].strip()
+    y' read 3 against 3 and landed (perms' read of #1645, 10-20). Nor may a tally before the last count a failure: a
+    PR printing main's '== 3 failed ==', then a red, then a tally again (main's or a green one) hid the red between
+    them (perms' read at a25d572d, 10-20), so a failure counted in any tally but the last holds."""
+    tallies = sorted((m for rx in TALLY_RES for m in rx.finditer(text)), key=lambda m: m.start())
+    failing = lambda m: any(int(a or b) for a, _, _, b in TALLY_PART_RE.findall(m.group(1)))
+    return bool(tallies) and not text[tallies[-1].end():].strip() and not any(map(failing, tallies[:-1]))
 
 
 def tally(text: str):

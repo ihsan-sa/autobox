@@ -13,11 +13,15 @@
 #       talking to <path> directly reaches the same host-side list.
 #   cc-egress selfcheck     a scratch proxy and a local upstream: each kept and each refused case, driven
 # THE LIST: comma- or space-separated. `host` is that name on port 443; `.suffix` is every name under it, not the
-# bare suffix (so `.example.com` does not admit `evilexample.com`); `host:port` or `.suffix:port` names another port.
-# An IP literal is refused unless the list names that literal, and a NAME that resolves to a loopback, private,
-# link-local or otherwise non-global address is refused whatever the list says — no listed name reaches the host's
-# own services. With no --allow, DEFAULT below: the model APIs the harnesses call, GitHub, and the npm and PyPI
-# indexes. The box's own list is `cc-config set CC_EGRESS_ALLOW "<list>"` (cc-sandbox reads it and passes it here).
+# bare suffix (so `.example.com` does not admit `evilexample.com`); `host:port` or `.suffix:port` names another port;
+# `*` is every name and every global IP literal on every port, which is what a planning seat reaches.
+# An IP literal is refused unless the list names that literal (or has `*` and the literal is global), and a NAME that
+# resolves to a loopback, private, link-local or otherwise non-global address is refused whatever the list says, and
+# so is any address on the host's own interfaces or on-link with them, and any IPv6 form carrying an IPv4 address —
+# no listed name reaches the host's own services or the LAN. With no --allow, DEFAULT below: `*`, because a worker holds
+# no login and the owner's rule (2026-10-20) is a seat's access with a net, not a wall; the host's own services stay
+# walled, since nothing undoes a worker driving them. A narrower list is `cc-config set CC_EGRESS_ALLOW "<list>"`
+# (cc-sandbox reads it and passes it here), e.g. the old default: the model APIs, GitHub, npm and PyPI.
 # ONLY CONNECT: a plain-HTTP request (`GET http://…`) is refused. What CONNECT opens is a TCP tunnel to the named
 # host and port, and nothing more: the proxy does not check that TLS runs inside it, so it restricts the DESTINATION,
 # not the protocol (a client may speak clear text to an allowed host:port). Nor does it inspect what goes through an
@@ -33,9 +37,7 @@ import sys
 import tempfile
 import threading
 
-DEFAULT = ("api.anthropic.com statsig.anthropic.com api.openai.com chatgpt.com "
-           "github.com api.github.com codeload.github.com .githubusercontent.com "
-           "registry.npmjs.org pypi.org files.pythonhosted.org")
+DEFAULT = "*"
 USAGE = ("usage: cc-egress serve --socket <path> [--allow <list>] [--log <file>] [--parent <pid>]"
          " | inside --socket <path> [--port <n>] -- <command...> | selfcheck")
 HEAD_MAX = 8192
@@ -46,6 +48,9 @@ def parse_list(text):
     rules = []
     for item in text.replace(",", " ").split():
         item = item.strip().lower()
+        if item == "*":
+            rules.append(("*", False, None))
+            continue
         host, port = item, 443
         if item.startswith("[") or item.count(":") > 1:           # an IPv6 literal, [addr]:port or bare
             if item.startswith("[") and "]:" in item:
@@ -71,6 +76,8 @@ def allowed(rules, host, port):
     """→ None when the list admits host:port, else the reason."""
     host = host.lower().rstrip(".")
     for name, suffix, p in rules:
+        if name == "*":
+            return None
         if p != port:
             continue
         if (suffix and host.endswith("." + name)) or (not suffix and host == name):
@@ -78,18 +85,75 @@ def allowed(rules, host, port):
     return "not on the list"
 
 
+# Where the host's own interfaces are, read fresh per connection so a new or rotated address counts at once. A global
+# address of the tower (its IPv6 above all) is still the tower: sshd and anything bound to [::] or published by Docker
+# answer on it, and its neighbours in the same prefix are the LAN. The selfcheck points these at fake tables.
+IF_INET6, FIB_TRIE, ROUTE = "/proc/net/if_inet6", "/proc/net/fib_trie", "/proc/net/route"
+# IPv6 forms that carry an IPv4 address (v4-compatible, v4-mapped, NAT64): refused whole, so none reaches a walled one.
+EMBEDS_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
+
+
+def host_nets():
+    """→ the networks the host sits on: each own address with its prefix, and each on-link IPv4 route."""
+    nets = []
+    try:
+        with open(IF_INET6) as fh:
+            for ln in fh:
+                f = ln.split()
+                if len(f) >= 3 and int(f[2], 16):
+                    own = ipaddress.IPv6Address(int(f[0], 16))
+                    nets.append(ipaddress.ip_network((own, int(f[2], 16)), strict=False))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(FIB_TRIE) as fh:      # an own IPv4 address is a "|-- <addr>" line followed by "/32 host LOCAL"
+            last = None
+            for ln in fh:
+                ln = ln.strip()
+                if ln.startswith("|-- "):
+                    last = ln[4:]
+                elif ln == "/32 host LOCAL" and last:
+                    nets.append(ipaddress.ip_network(last))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(ROUTE) as fh:         # a route with no gateway is on-link; the table is hex, little-endian
+            for ln in list(fh)[1:]:
+                f = ln.split()
+                if len(f) >= 8 and int(f[2], 16) == 0 and int(f[7], 16):
+                    dst, mask = (socket.inet_ntoa(bytes.fromhex(x)[::-1]) for x in (f[1], f[7]))
+                    nets.append(ipaddress.ip_network(f"{dst}/{mask}", strict=False))
+    except (OSError, ValueError):
+        pass
+    return nets
+
+
+def walled(addr, nets):
+    """→ why no list but a verbatim literal may reach addr, else None."""
+    a = ipaddress.ip_address(addr)
+    if not a.is_global:
+        return "is not a global address"
+    if a.version == 6 and any(a in n for n in EMBEDS_V4):
+        return "carries an IPv4 address inside it"
+    if any(a in n for n in nets):
+        return "is on the host's own interfaces or on-link with them"
+    return None
+
+
 def resolve(host, port, rules):
-    """→ (address list, None) or (None, reason). A literal passes only when listed verbatim (checked by allowed)."""
+    """→ (address list, None) or (None, reason). A literal listed verbatim passes; no other address may be walled."""
     if is_ip(host):
-        return [(host, port)], None
+        why = None if any(name == host for name, _, _ in rules) else walled(host, host_nets())
+        return (None, f"{host} {why}") if why else ([(host, port)], None)
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         return None, f"does not resolve ({exc.strerror or exc})"
-    out = []
+    out, nets = [], host_nets()
     for fam, _, _, _, sa in infos:
-        if not ipaddress.ip_address(sa[0]).is_global:
-            return None, f"resolves to {sa[0]}, which is not a global address"
+        why = walled(sa[0], nets)
+        if why:
+            return None, f"resolves to {sa[0]}, which {why}"
         out.append(sa[:2])
     return out, None
 
@@ -370,6 +434,13 @@ def selfcheck():
     t("host:port admits that port", allowed(r, "api.x.org", 8443), None)
     t("host:port refuses 443", allowed(r, "api.x.org", 443), "not on the list")
     t("the default list names no IP literal", [h for h, _, _ in parse_list(DEFAULT) if is_ip(h)], [])
+    w = parse_list(DEFAULT)
+    t("the default is a seat's reach: any name on any port", (allowed(w, "example.org", 443), allowed(w, "a.b.io", 8080)),
+      (None, None))
+    t("`*` admits a global literal", resolve("1.1.1.1", 443, w), ([("1.1.1.1", 443)], None))
+    t("`*` does not reach the host or the LAN: loopback and private literals are refused",
+      (resolve("127.0.0.1", 22, w)[1] is None, resolve("10.0.0.1", 443, w)[1] is None,
+       resolve("::1", 443, w)[1] is None, resolve("localhost", 22, w)[1] is None), (False, False, False, False))
     with open(logf) as fh:
         t("every refusal is logged with its reason", sum(1 for ln in fh if ln.startswith("refused ")), 5)
     capf = os.path.join(d, "capped")
@@ -393,6 +464,44 @@ def selfcheck():
                           str(held.getsockname()[1]), "--", "true"], capture_output=True, text=True, timeout=30)
     held.close()
     t("inside: a port already taken stops the launch, and nothing runs", (out.returncode, "did not start" in out.stderr), (2, True))
+    # The tower's own global addresses: its real IPv6 when it has one, then fake tables so this runs with none.
+    mine = [ipaddress.ip_address(n.network_address) for n in host_nets() if n.version == 6]
+    mine = [str(m) for m in mine if m.is_global]
+    star = os.path.join(d, "star")
+    threading.Thread(target=serve, args=(star, "*", logf, 0), daemon=True).start()
+    for _ in range(100):
+        if os.path.exists(star):
+            break
+        threading.Event().wait(0.02)
+    sock = star                     # ask() dials whatever `sock` names
+    if mine:
+        t("`*`: this host's own global IPv6 prefix is refused", ask(f"CONNECT [{mine[0]}]:22 HTTP/1.1")[0], "403")
+    tables = {"IF_INET6": "26064700abcd00000000000000000005 02 40 00 80 eth0\n"
+                          "fe800000000000000000000000000005 02 40 20 80 eth0\n",
+              "FIB_TRIE": "Local:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 8.8.4.4\n        /32 host LOCAL\n",
+              "ROUTE": "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+                       "eth0\t00000000\t01090909\t0003\t0\t0\t0\t00000000\n"
+                       "eth0\t00090909\t00000000\t0001\t0\t0\t0\t00FFFFFF\n"}
+    real = {k: globals()[k] for k in tables}
+    for k, text in tables.items():
+        globals()[k] = os.path.join(d, k)
+        with open(globals()[k], "w") as fh:
+            fh.write(text)
+    gai = socket.getaddrinfo
+    socket.getaddrinfo = lambda h, *a, **kw: gai("2606:4700:abcd::5" if h == "tower.example" else h, *a, **kw)
+    try:
+        t("`*` refuses the host's own global addresses and their prefixes, by literal and by name",
+          [ask(f"CONNECT {h} HTTP/1.1")[0] for h in ("[2606:4700:abcd::5]:22", "[2606:4700:abcd::77]:443",
+                                                     "tower.example:22", "8.8.4.4:22", "9.9.9.9:443")],
+          ["403"] * 5)
+        t("`*` refuses IPv4 inside IPv6 (v4-compatible, v4-mapped, NAT64)",
+          [resolve(h, 443, w)[1] is None for h in ("::a00:1", "::ffff:10.0.0.1", "64:ff9b::808:404", "64:ff9b::101:101")],
+          [False] * 4)
+        t("`*` still admits a global address off the host's prefixes",
+          (resolve("2606:4700:abce::5", 443, w), resolve("1.1.1.1", 443, w)[1]), (([("2606:4700:abce::5", 443)], None), None))
+    finally:
+        socket.getaddrinfo = gai
+        globals().update(real)
     print(f"cc-egress selfcheck: {n - bad} passed, {bad} failed")
     return 1 if bad else 0
 
