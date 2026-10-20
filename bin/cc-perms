@@ -566,22 +566,27 @@ reads_of(){
     printf '%s · %s · %s · %s\n' "$a" "$pr" "$hd" "$who"; done; }
 
 # drop_reads FILE — take out of FILE's last HAND-OFF ENTRY the reads section an earlier try of this hand-off added
-# (`### Reads still running at hand-off (cc-perms, …)` or `### Reads at hand-off (cc-perms, …)`), from its heading,
-# and the blank line before it, to the next heading or the end. A hand-off that stopped and is run again inside the
-# same 15 minutes reuses that entry, so without this each try stacked another section under it (perms, 2026-10-19).
-# Only the last entry is touched, and only a section cc-perms wrote; the file is rewritten in place only if it had one.
+# (`### Reads still running at hand-off (cc-perms, …)` or `### Reads at hand-off (cc-perms, …)`): its heading, the
+# blank lines before it, the one line of prose cc-perms writes under it and the `- ` bullets after that. It stops at
+# the first line past that list, so text after it, headed or not, stays. A hand-off that stopped and is run again
+# inside the same 15 minutes reuses that entry, so without this each try stacked another section under it (perms,
+# 2026-10-19). Only the last entry is touched, and only a section cc-perms wrote. The file is rewritten only if it had
+# one, through a temp file in its own directory renamed over it, so a write killed halfway leaves the old file whole.
 drop_reads(){
-  local L t
+  local L t tmp
   L=$(grep -nE '^## HAND-OFF ENTRY ' "$1" 2>/dev/null | tail -1 | cut -d: -f1); [ -n "$L" ] || return 0
   tail -n +"$L" "$1" | grep -qE '^### Reads (still running )?at hand-off \(cc-perms, ' || return 0
+  # s: 0 outside a section, 1 on the line under its heading (its prose or its first bullet), 2 in its bullets
   t=$(awk -v L="$L" '
     NR <= L {print; next}
-    /^### Reads (still running )?at hand-off \(cc-perms, / {skip = 1; b = ""; next}
-    /^#/ {skip = 0}
+    /^### Reads (still running )?at hand-off \(cc-perms, / {s = 1; b = ""; next}
+    s == 1 && !/^$/ && !/^#/ {s = 2; next}
+    s == 2 && /^- / {next}
+    {s = 0}
     /^$/ {b = b "\n"; next}
-    skip {b = ""; next}
     {printf "%s", b; b = ""; print}' "$1") || return 1
-  printf '%s\n' "$t" > "$1"; }
+  tmp=$(mktemp "$(dirname -- "$1")/.drop_reads.XXXXXX") || return 1
+  { printf '%s\n' "$t" > "$tmp" && chmod --reference="$1" -- "$tmp" && sync -- "$tmp" && mv -f -- "$tmp" "$1"; } || { rm -f -- "$tmp"; return 1; }; }
 
 # journal_fresh FILE — rc 0 when FILE's last `## HAND-OFF ENTRY <stamp>Z` heading is 0-15 minutes old. Stamps are
 # written to the minute, so the age is counted in whole minutes: the current minute is 0 and fresh, minute 15 is
@@ -1288,6 +1293,18 @@ EOF
       && grep -qx 'keep me' <<<"$hm" && grep -qx '### My notes' <<<"$hm" && grep -qF -- '- an-older · PR #5' "$(sd)/handoff.md" \
       && [ "$(grep -c '^### Reads' "$(sd)/handoff.md")" = 2 ]; echo $?)" \
     "handoff: run again after a try that stopped, it replaces that try's reads section in the entry instead of stacking another"
+  # text after the list with no heading of its own, right under the last bullet or a blank line below it, stays
+  F=$T/dlist; mkdir -p "$F"; jn 0 "$F/h.md"
+  printf 'mine\n\n### Reads still running at hand-off (cc-perms, 2026-10-19T10:00Z)\nThe old seat stays\n- stale · PR #6 · head ? · asker ?\nright under it\n\na paragraph after\n' >> "$F/h.md"
+  drop_reads "$F/h.md"; rc=$?; out=$(cat "$F/h.md")
+  ok "$( [ $rc = 0 ] && [ "$(sed 1d "$F/h.md")" = $'mine\nright under it\n\na paragraph after' ]; echo $?)" \
+    "drop_reads: it stops at the end of the reads list, so the text after it stays whether or not it has a heading"
+  # a write killed halfway (here printf writes a few bytes, then the shell is SIGKILLed) leaves the old file whole
+  F=$T/dkill; mkdir -p "$F"; jn 0 "$F/h.md"
+  printf '\n### Reads at hand-off (cc-perms, 2026-10-19T10:01Z)\ncould not be read\n\n### My notes\nkeep me\n' >> "$F/h.md"; cp "$F/h.md" "$F/before"
+  { ( printf(){ builtin printf '%s' "${2:0:12}"; kill -9 "$BASHPID"; }; drop_reads "$F/h.md" ); } 2>/dev/null; rc=$?; out=$(cat "$F/h.md")
+  ok "$( [ $rc = 137 ] && cmp -s "$F/h.md" "$F/before"; echo $?)" \
+    "drop_reads: a write killed halfway leaves the old file whole, since it writes a temp file beside it and renames it over ($rc)"
   fx hretire; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0; rd 2 >/dev/null
   out=$(CC_HANDOFF_TASKS=$F/tasks V=handoff run "$o"); r1=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
   out=$(CC_HANDOFF_TASKS=$F/tasks V=retire run "$np"); r2=$?; o2=$out; k2=$(grep -c '^kill-window' "$F/tmux.log")
