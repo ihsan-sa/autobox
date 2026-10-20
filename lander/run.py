@@ -496,18 +496,39 @@ SCRATCH_RES = ((re.compile(r"(?:/tmp|/var/tmp)/[^\s:'\"),]*"), "/tmp/…"), (re.
 # ...and how far a run got: its pass lines or its last `N passed`, and whether it crashed or was cut short. A head that
 # ran less than the base, or crashed where the base did not, hides its own reds behind main's (Opus and perms, 10-13)
 PASSED_N_RE = re.compile(r"\b(\d+) passed\b")
+# THE COUNT IS READ OFF A SUITE'S OWN CLOSING TALLY, the whole line: pytest's `== 2 failed, 9 passed in 1.2s ==`,
+# unittest's `FAILED (failures=2, errors=1)`, a selfcheck's `x selfcheck: 9 passed, 2 failed`. Any `N failed` let a
+# PR's atexit print '0 failed' after the real summary and land a new red, and read '10 failed attempts' as a count
+# (perms' read of #1635, 10-20). Only pytest's own words make its tally, so '12 files in 0.30s' is none (#1644). A log
+# with no such line counts its failing lines, and with none of those has no count, and the red holds.
+_PYTEST_WORD = r"\d+ (?:failed|passed|errors?|skipped|deselected|xfailed|xpassed|warnings?|rerun)"
+TALLY_RES = (re.compile(rf"^=*\s*((?:{_PYTEST_WORD}, )*{_PYTEST_WORD}) in [\d.]+s(?: \([\d:.]+\))?\s*=*$", re.M),
+             re.compile(r"^FAILED \(((?:[a-z ]+=\d+, )*[a-z ]+=\d+)\)\s*$", re.M),
+             re.compile(r"^[\w.+-]+(?: [\w.+-]+)* selfcheck: ((?:\d+ passed, )?\d+ failed(?:, \d+ skipped)?)\s*$", re.M))
+TALLY_PART_RE = re.compile(r"(\d+) (failed|errors?)\b|\b(failures|errors)=(\d+)")
 CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR>)|Segmentation fault|core dumped|"
                       r"^\s*(?:Killed|Aborted)\b|\bline \d+:\s+\d+ (?:Killed|Aborted)\b", re.M)
 
 
 def ran(text: str) -> dict:
-    """-> {"passes": its last `N passed`, else its count of pass lines; "failed": its last `N failed`, else its count of
-    failing lines (one case failing twice is two), None when it has neither; "crash": a crash or abort marker in it}."""
+    """-> {"passes": its last `N passed`, else its count of pass lines; "failed": tally(text); "crash": a crash or
+    abort marker in it}."""
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
-    f = FAILED_RE.findall(text)
-    failed = int(f[-1]) if f else sum(1 for ln in text.splitlines() if FAIL_ID_RE.match(ln) and not PASS_RE.search(ln))
-    return {"passes": passes, "failed": failed if f or failed else None, "crash": bool(CRASH_RE.search(text))}
+    return {"passes": passes, "failed": tally(text), "crash": bool(CRASH_RE.search(text))}
+
+
+def tally(text: str):
+    """-> the largest failure count any closing tally in `text` gives (TALLY_RES), or the failing lines after the last
+    one when more; with no tally, the failing lines (one case failing twice is two). None, and the red holds, when that
+    is 0 (the red came from outside every tally) or a nonzero `N failed` follows the last tally: a later line can never
+    lower the count (Opus read of #1645: a green tally after a red one, or a nested tool's ahead of its caller's own)."""
+    tallies = sorted((m for rx in TALLY_RES for m in rx.finditer(text)), key=lambda m: m.start())
+    after = text[tallies[-1].end() if tallies else 0:]
+    lines = sum(1 for ln in after.splitlines() if FAIL_ID_RE.match(ln) and not PASS_RE.search(ln))
+    if tallies and any(int(n) for n in FAILED_RE.findall(after)):
+        return None
+    return max([lines] + [sum(int(a or b) for a, _, _, b in TALLY_PART_RE.findall(m.group(1))) for m in tallies]) or None
 
 
 def case_id(full: str) -> str:
@@ -1074,14 +1095,15 @@ def no_new_reds(head: T.Result, base: T.Result) -> bool:
     """THE RATCHET: True when both reds ran in the same place (the box, a runner, a member) and every case the head's
     run names failing the base's names too, and the head ran as far as the base: no fewer passes, and no crash or abort
     the base lacks (a head cut short names fewer reds only because it ran less), and no more failures than the base (a
-    case failing twice, or a lost test masked by an added passing one). When neither run names a case, the count is
-    all there is: it passes on the rule above only when both runs print a failure count; a head that names none
-    against a base that does, a count either run lacks, or a set fail_ids could not trust (None) holds."""
+    case failing twice, or a lost test masked by an added passing one). A count ran() could not read (None) holds, named
+    or not (Opus read of #1645). When neither run names a case, the count is all there is: it passes only when both
+    runs print a failure count; a head that names none against a base that does, or a set fail_ids could not trust
+    (None), holds."""
     pr, main = head.extra.get("fails"), base.extra.get("fails")
+    hf, bf = head.extra.get("failed", 0), base.extra.get("failed", 0)
     same = head.runner.split(":")[0] == base.runner.split(":")[0]
     went = (head.extra.get("passes") or 0) >= (base.extra.get("passes") or 0) and \
-        not (head.extra.get("crash") and not base.extra.get("crash")) and \
-        (head.extra.get("failed") or 0) <= (base.extra.get("failed") or 0)
+        not (head.extra.get("crash") and not base.extra.get("crash")) and None not in (hf, bf) and hf <= bf
     named = bool(pr) and main is not None and set(pr) <= set(main)
     counted = pr == [] and main == [] and None not in (head.extra.get("failed"), base.extra.get("failed"))
     return same and went and (named or counted)

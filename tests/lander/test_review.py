@@ -2729,6 +2729,30 @@ class TestPermsReads(Case):
                          [("LAND", self.OLD), ("DO-NOT-LAND", HEAD), ("LAND", HEAD)])
         self.assertEqual(R.carried_from(job), "")
 
+    def test_a_clean_land_after_a_do_not_land_is_granted_and_carries(self):
+        """The other side of #1638: a DO-NOT-LAND at A ends A's read, not the PR. Once the author pushes B and perms
+        LANDs it, B merges, and a later head C whose delta from B touches no security path carries B's read, so the
+        old DO-NOT-LAND does not hold the PR forever."""
+        later = "c" * 40
+        real = (R.security_globs, R.delta_files)
+        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
+        R.security_globs = lambda root, base, repo: ["bin-private/**"]
+        R.delta_files = lambda root, base, old, new: ["x.py"]
+        digest = R.change_digest(DIFF)
+        plan = T.Plan(extra={"security": ["bin-private/x"]})
+        at = lambda head: T.Job(repo="demo", pr=7, head=head, base_sha=BASE, digest=digest, plan=plan,
+                                extra={"root": self.tmp})
+        self.assertEqual(self.record_as(True, "DO-NOT-LAND", "--by", "perms", "--head", self.OLD,
+                                        "--findings", "[security] x", head=self.OLD)[0], 0)
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual([(e["verdict"], e["head"]) for e in self.ledger()],
+                         [("DO-NOT-LAND", self.OLD), ("LAND", HEAD)])
+        self.assertIsNone(R._security_unread(at(HEAD), [], {digest}))   # B merges on its own LAND
+        self.assertEqual(R._perms_land(at(HEAD), {digest}).extra, {"read": "perms"})
+        self.assertEqual(R.carried_from(at(later)), HEAD)   # and B's read carries to a clean C
+        self.assertIsNone(R._security_unread(at(later), [], {"other"}))
+        self.assertIsNotNone(R._security_unread(at(self.OLD), [], {digest}))   # A stays held
+
     def test_a_perms_record_says_what_to_do_when_the_ledger_will_not_take_it(self):
         with open(R.perms_reads_path("demo"), "w") as f:
             f.write("[]")

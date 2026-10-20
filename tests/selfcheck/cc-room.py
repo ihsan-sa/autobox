@@ -225,6 +225,8 @@ esac''')):
         t("frees: the queued launch has not run while the cap is held", os.path.exists(mark), False)
         t("frees: its log says it was queued and why",
           "r/queued queued — 1 worker loops are running" in open(f"{d}/loop.log").read(), True)
+        t("frees: `queued` names the waiting launch, and not the one holding the slot",
+          subprocess.run([sys.executable, __file__, "queued"], capture_output=True, text=True).stdout, "r/queued\n")
         h.kill()
         h.wait()
         w.wait(timeout=20)
@@ -385,6 +387,8 @@ esac''')):
         t("restart: …and holds nobody up while it is down", live("queue"), {})
         t("restart: status calls it lost", "lost    r/lost" in subprocess.run(
             [sys.executable, __file__, "status"], capture_output=True, text=True).stdout, True)
+        t("restart: `queued` still names it, since resume starts it again without the seat",
+          subprocess.run([sys.executable, __file__, "queued"], capture_output=True, text=True).stdout, "r/lost\n")
         r = subprocess.run([sys.executable, __file__, "resume"], capture_output=True, text=True)
         t("restart: resume waits while tmux is not back", ("resumed" in r.stdout, os.path.exists(e)), (False, True))
         open(f"{d}/up", "w").close()
@@ -460,6 +464,8 @@ esac''')):
           "lost    r/p — its waiter died while handing it to the peer" in subprocess.run(
               [sys.executable, __file__, "status"], capture_output=True, text=True).stdout, True)
         t("placing: …and it never ran here", os.path.exists(f"{d}/ran-here"), False)
+        t("placing: `queued` leaves it out, since nothing starts it until a person checks the peer",
+          subprocess.run([sys.executable, __file__, "queued"], capture_output=True, text=True).stdout, "")
         os.environ["CC_PEER_DIR"] = f"{base}/nopeer"
 
         d, e, hub, stamped = placing("placed")

@@ -126,6 +126,8 @@ or a row is `blocked`, and the wake would carry a row the last one inside 24 h d
 row and per row `cc-brief ready` names as startable, so a new queued row that cannot start, or a set that only shrank,
 wakes nobody
 (a queued row inside a live bundle — cc-bundle's `bundle: <row>` mark, the bundle row live — is in flight and never offered)
+(nor is a row whose `--go` waits in cc-room's launch queue, or was lost there to a restart that `resume` starts again:
+`cc-room queued` names it, it starts by itself, and the skip line in pulse.log names it)
 (~/.cc/state/<repo>/pulse.look). `cc-tier allows pulse` / `start` gate it. Waking is `cc <repo>` when tmux
 session main has no live `<repo>` window, else one `cc-msg` line — never while the pane shows a turn in progress
 or a usage-limit line, never mid-handoff before the cutover (after it, the successor is the live seat). Orchs (`<repo>@<alias>`) are never woken. Log: ~/.cc/state/pulse.log.
@@ -454,8 +456,9 @@ def room_launches():
     """{repo/track: "waiting" | "lost"} off cc-room's launch queue (CC_ROOM_DIR, else ~/.cc/state/room): `waiting`
     while the `cc-room admit` that wrote the entry is the same live process, `lost` when that waiter died with its
     tmux server (a restart) and the entry holds what `cc-room resume` (this tool's tick, every 20 min) starts it
-    again with. Read-only: an entry neither alive nor lost is cc-room's to drop, and is left out. A launch waiting
-    here is dispatched work with no worker yet, which the abandoned path took for a worker that was killed: raised
+    again with. A lost entry stamped `placing` is left out: resume never relaunches it until a person checks the
+    peer. Read-only: an entry neither alive nor lost is cc-room's to drop, and is left out. A launch waiting here is
+    dispatched work with no worker yet, which the abandoned path took for a worker that was killed: raised
     2026-10-03, a lessons row sat 3 h in the queue, was set blocked "no worker, and nothing says why" and its seat
     was woken to find it only queued."""
     out = {}
@@ -476,7 +479,7 @@ def room_launches():
             srv = e.get("server") or []                 # cc-room's lost(): the waiter's tmux server is gone too
             if not (isinstance(srv, (list, tuple)) and len(srv) == 2):
                 continue                                # cc-room writes [pid, ticks]; anything else is no launch
-            if (str(start_ticks(int(srv[0]))) != str(srv[1]) and e.get("cmd")
+            if (str(start_ticks(int(srv[0]))) != str(srv[1]) and e.get("cmd") and not e.get("placing")
                     and now() - float(e.get("queued") or 0) < 7 * 86400):
                 out.setdefault(what, "lost")
         except (TypeError, ValueError, KeyError, IndexError, AttributeError):
@@ -2531,9 +2534,21 @@ def wake_repo(repo, rows, snap, net, on):
         return b in words and words[b][0] in ("queued", "running", "waiting", "review")
     # …AND NOT A ROW WHOSE LAUNCH ALREADY WAITS IN cc-room: it is dispatched, and offering it again sends a second
     # worker for the same work while the first waits for room (raised 2026-10-03)
-    due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k)
-                 and not (snap.get(f"{repo}/{k}") or {}).get("launch"))
-    due = [k for k in due if tier_allows("start", f"{repo}/{k}")]
+    due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k))
+    launched = [k for k in due if (snap.get(f"{repo}/{k}") or {}).get("launch")]
+    due = [k for k in due if k not in launched and tier_allows("start", f"{repo}/{k}")]
+    # …NOR A ROW WHOSE LAUNCH IS ALREADY IN cc-room's QUEUE. A `--go` the box had no room for leaves the row `queued`
+    # until cc-loop starts, and that start needs nobody: chip-flow's seat was woken twice with "1 of 1 queued row
+    # could start now" for a row 8 launches back in that queue. `cc-room queued` failing reads as nothing queued,
+    # so the wake errs toward waking, as it did before.
+    # The skip line names the rows left out this way, so pulse.log alone says why such a row woke nobody.
+    roomq = []
+    if due:
+        rq = sh(sib("cc-room"), "queued", timeout=30)
+        inq = set((rq.stdout or "").split()) if rq is not None and rq.returncode == 0 else set()
+        roomq = [k for k in due if f"{repo}/{k}" in inq]
+        due = [k for k in due if k not in roomq]
+    roomq = sorted(launched + roomq)
     stopped = [k for k in due if words[k][0] == "blocked"]
     asks_ = open_asks() if stopped else []
     owner = {k: owner_held(repo, k, [(n or {}).get("msg") for n in (rows[k].get("notes") or []) if isinstance(n, dict)], asks_,
@@ -2557,7 +2572,8 @@ def wake_repo(repo, rows, snap, net, on):
                 free = sorted({k.strip() for ln in lines[1:] if ln.startswith("  ") and "builder" in ln and ": " in ln
                                for k in ln.rsplit(": ", 1)[1].split(",") if k.strip()})
     if not stopped and start not in ("free", "withheld", "unread"):
-        return pulse_log(repo, "skip", "nothing a seat can act on")
+        return pulse_log(repo, "skip", "nothing a seat can act on"
+                         + (f" (waiting in cc-room's launch queue: {', '.join(roomq)})" if roomq else ""))
     # ONE LINE PER ROW, and a wake only for a line the last wake did not carry. The look is each stopped row and each
     # row `cc-brief ready` says could start (its verdict line when it names none). Keyed on the whole due list, every
     # new queued row re-sent the same stopped set: the seat was woken every ~20 min to reply nothing (09-27, 10-02).

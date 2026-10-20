@@ -1433,7 +1433,9 @@ def selfcheck():
                          ("3-killed", {"what": "rq/killed", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
                                        "server": [me, str(mine)], "queued": now() - 60}),
                          ("4-old", {"what": "rq/old", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
-                                    "server": [gone.pid, "1"], "queued": now() - 8 * 86400})):
+                                    "server": [gone.pid, "1"], "queued": now() - 8 * 86400}),
+                         ("7-placing", {"what": "rq/placing", "pid": gone.pid, "start": "1", "cmd": ["cc-loop"],
+                                        "server": [gone.pid, "1"], "queued": now() - 60, "placing": now() - 30})):
                 json.dump(e, open(f"{rd}/queue/{n}", "w"))
             json.dump({"what": "rq/half", "pid": me, "start": str(mine)}, open(f"{rd}/queue/5-half.tmp", "w"))
             open(f"{rd}/queue/6-junk", "w").write("not json")
@@ -1452,6 +1454,9 @@ def selfcheck():
                "and an unreadable file are none; an entry whose `server` is a dict, a two-letter string or one item "
                "is skipped and the entries after it are still read (a dict raised KeyError and stopped the pass for "
                "every repo)", got == {"rq/alive": "waiting", "rq/lost": "lost"})
+            ok("room_launches: a lost entry stamped `placing` is none: its waiter died handing it to the peer, resume "
+               "never relaunches it, so the row is not held and its seat is still woken (PR #1461 review)",
+               "rq/placing" not in got)
         other = subprocess.Popen(["sleep", "300"])
         fx, own = f"_cctest{other.pid}", f"_cctest{os.getpid()}"
         try:
@@ -1744,7 +1749,7 @@ def selfcheck():
             fn(*a)
         return buf.getvalue()
     NOOP = {"cc-tier": "exit 0", "cc-limit": "exit 1", "cc-pause": "exit 1", "cc-handoff": "exit 1", "cc-model": "exit 1",
-            "cc-spend": ":", "cc-scope": ":", "tmux": ":"}
+            "cc-spend": ":", "cc-scope": ":", "tmux": ":", "cc-room": ":"}
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - 3 * 86400))
     # (a) a `running` row whose worker AND session are gone past the grace is reconciled; an identical live one is not
     ta = tempfile.mkdtemp(prefix="cc-reconcile-apply-")
@@ -2215,8 +2220,24 @@ def selfcheck():
         ok("…a queued row whose launch already waits in cc-room is dispatched, not startable: offering it sends a second "
            "worker for the same work (raised 2026-10-03), so no wake",
            woke() == ["start wr"] * 4 and "nothing a seat can act on" in open(f"{tb}/.cc/state/pulse.log").read().splitlines()[-1])
+        ok("…and pulse.log names that row as waiting in cc-room's launch queue",
+           open(f"{tb}/.cc/state/pulse.log").read().splitlines()[-1].endswith("(waiting in cc-room's launch queue: q4)"))
         quietly(tick, {"wr/q4": {"state": "queued", "launch": ""}}, True)
         ok("…and with no launch waiting the same row wakes the seat", woke() == ["start wr"] * 5)
+        # raised-ready-wake-for-room-queued-row: chip-flow's seat was woken twice for a row 8 launches back in cc-room
+        def room(body):
+            open(f"{tb}/stubs/cc-room", "w").write("#!/bin/sh\n" + body + "\n"); os.chmod(f"{tb}/stubs/cc-room", 0o755)
+        room('[ "$1" = queued ] && echo wr/q5 && echo other/q6')
+        json.dump({"repo": "wr", "tracks": {"q5": {"status": "queued", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
+        quietly(tick, {}, True)
+        ok("…a queued row whose --go waits in cc-room's launch queue starts by itself, so it wakes nobody",
+           woke() == ["start wr"] * 5 and "nothing a seat can act on" in open(f"{tb}/.cc/state/pulse.log").read().splitlines()[-1])
+        ok("…and pulse.log names the row it left out for waiting in that queue",
+           open(f"{tb}/.cc/state/pulse.log").read().splitlines()[-1].endswith("(waiting in cc-room's launch queue: q5)"))
+        room("exit 2")
+        quietly(tick, {}, True)
+        ok("…and a cc-room that cannot say what is queued leaves the row in, so that row still wakes the seat",
+           woke() == ["start wr"] * 6)
     finally:
         restore(); shutil.rmtree(tb, ignore_errors=True)
     # OWNER-HELD ASKS, end to end: "it is waiting on you" goes out once for a parked or asked row, however short the

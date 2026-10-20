@@ -3227,7 +3227,7 @@ class Ratchet(unittest.TestCase):
 
     def test_ran_reads_passes_and_crashes(self):
         self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "failed": 1, "crash": False})
-        self.assertEqual(RUN.ran("✓ a\n== 7 passed, 1 failed ==\n"), {"passes": 7, "failed": 1, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\n== 1 failed, 7 passed in 0.12s ==\n"), {"passes": 7, "failed": 1, "crash": False})
         self.assertEqual(RUN.ran("✓ a\nTraceback (most recent call last):\n")["crash"], True)
         self.assertEqual(RUN.ran("✓ a\nSegmentation fault (core dumped)\n")["crash"], True)
         # Opus delta read, 10-13: an indented Traceback and bash's own kill line are crashes; a case naming one is not
@@ -3318,8 +3318,40 @@ class Ratchet(unittest.TestCase):
 
     def test_ran_reads_no_count_from_a_red_that_prints_none(self):
         self.assertEqual(RUN.ran("boom\n")["failed"], None)
-        self.assertEqual(RUN.ran("== 0 failed, 3 passed ==\n")["failed"], 0)
-        self.assertEqual(RUN.ran("5 failed\n")["failed"], 5)
+        self.assertEqual(RUN.ran("== 3 passed in 0.10s ==\n")["failed"], None)   # red, but not by its tally
+        self.assertEqual(RUN.ran("5 failed\n")["failed"], None)
+
+    def test_ran_reads_the_count_from_the_suites_closing_tally_only(self):
+        # perms' read of #1635: any `N failed` let a PR's atexit print '0 failed' after the real summary and land a red
+        for text, want in (("✗ x\n=== 2 failed, 9 passed, 1 warning in 1.20s ===\n", 2),
+                           ("✗ x\n2 failed, 1 error in 0.50s\n", 3),
+                           ("FAIL: t (m.T)\n----\nRan 4 tests in 0.1s\n\nFAILED (failures=2, errors=1)\n", 3),
+                           ("✗ x\ncc-x selfcheck: 9 passed, 2 failed\n", 2),
+                           ("✗ x\ndemo-video blender selfcheck: 2 failed, 1 skipped\n", 2),
+                           # a trailing '0 failed', or a tally inside a longer line, is not the suite's
+                           ("✗ x\n== 2 failed, 9 passed in 1.2s ==\n0 failed\n", 2),
+                           ("✗ x\ncc-x selfcheck: 9 passed, 2 failed\nnote: 0 failed after retry\n", 2),
+                           ("✗ x\n== 2 failed, 9 passed in 1.2s ==\nlog: == 0 failed in 0.1s ==\n", 2),
+                           # a line that only says the words is no count, and the red holds
+                           ("login: 10 failed attempts\n", None),
+                           ("retried: 0 failed attempts\nexit 1\n", None)):
+            self.assertEqual(RUN.ran(text)["failed"], want, text)
+
+    def test_an_ordinary_timing_line_after_a_red_tally_is_no_tally(self):
+        # Opus read of #1644: any `N <word> in X.Ys` read '12 files in 0.30s' as the last tally, and the red as 0
+        for tail in ("12 files in 0.30s\n", "4 requests in 1.5s\n"):
+            self.assertEqual(RUN.ran("✗ x\n== 2 failed, 9 passed in 1.2s ==\n" + tail)["failed"], 2, tail)
+
+    def test_a_nested_green_tally_does_not_hide_the_outer_checks_fail_lines(self):
+        # Opus read of #1644: an inner tool's green tally, then the outer check's own reds in a form it doesn't know
+        self.assertEqual(RUN.ran("== 5 passed in 0.1s ==\nFAIL: guard a\nFAIL: guard b\n")["failed"], 2)
+
+    def test_no_line_after_the_last_tally_can_lower_the_count(self):
+        # Opus and perms' reads of #1645, with no fail lines: the count took the last tally alone
+        for text, want in (("== 5 passed in 0.1s ==\nguard check: 3 passed, 2 failed\n", None),
+                           ("== 2 failed in 0.1s ==\n== 9 passed in 0.3s ==\n", 2),
+                           ("== 5 passed in 0.1s ==\nguard: broke y\n", None)):
+            self.assertEqual(RUN.ran(text)["failed"], want, text)
 
     def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
         store = self.store()
@@ -3387,6 +3419,17 @@ class FailIds(unittest.TestCase):
                                            extra={"fails": RUN.fail_ids("\n".join(lines)), **RUN.ran("\n".join(lines))})
         self.assertFalse(RUN.no_new_reds(res("h", [new]), res("b", [old])))
         self.assertTrue(RUN.no_new_reds(res("h", [old]), res("b", [old])))
+
+    def test_ratchet_holds_when_a_named_red_has_no_count(self):
+        # a nonzero `N failed` after the last tally makes the count None; the ratchet read None as 0 and passed a head
+        # failing its case twice against a base failing it once (Opus read of #1645)
+        res = lambda tree, lines: T.Result(check="c", tree=tree, status=T.FAILED, secs=0.0, runner="box:x:y",
+                                           extra={"fails": RUN.fail_ids("\n".join(lines)), **RUN.ran("\n".join(lines))})
+        case = "FAILED tests/x.py::test_a - AssertionError"
+        head = res("h", [case, case, "== 3 failed, 9 passed in 0.3s ==", "wrap: 2 failed"])
+        base = res("b", [case, "== 1 failed, 9 passed in 0.3s =="])
+        self.assertIsNone(head.extra["failed"])
+        self.assertFalse(RUN.no_new_reds(head, base))
 
 
 if __name__ == "__main__":
