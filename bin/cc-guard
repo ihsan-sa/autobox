@@ -838,6 +838,18 @@ W11B
   if [ "$wsbash" = 2 ] && [ "$wsread" = 2 ] && [ "$wsidx" = 2 ] && [ "$planted" != 0 ] && [ "$inside" = 0 ]; then r=0
   else r=1; echo "      workspace bash $wsbash read $wsread index $wsidx, planted $planted, inside a boundary $inside"; fi
   ok "a member workspace on the host and a hook with CC_MEMBER_SANDBOX=1 planted outside a boundary are refused the Slack copy and the index; inside a boundary the member's own attachment under ~/.cc/slack/files reads" $r
+  # …AND A SEARCH FROM ABOVE IT IS A SEARCH OF IT (perms' read of #1642). Grep and Glob walk every dir under their
+  # path, so ~/.cc, ~, or a ../ that climbs to either reaches the Slack copy without ever naming it. The member's own
+  # dir and a dir beside the denied ones still search.
+  mkdir -p "$H/.cc/tmp"
+  sg1=$(g Grep '{"pattern":"x","path":"~/.cc"}' "$H/dev/alice")
+  sg2=$(g Glob '{"pattern":"**/*.jsonl","path":"~"}' "$H/dev/alice")
+  sg3=$(g Grep "{\"pattern\":\"x\",\"path\":\"$H/dev/alice\"}" "$H/dev/alice")
+  sg4=$(g Grep '{"pattern":"x","path":"../../.cc"}' "$H/dev/alice")
+  sg5=$(g Glob "{\"pattern\":\"*\",\"path\":\"$H/.cc/tmp\"}" "$H/dev/alice")
+  if [ "$sg1$sg2$sg3$sg4$sg5" = 22020 ]; then r=0
+  else r=1; echo "      grep ~/.cc $sg1, glob ~ $sg2, own dir $sg3, ../../.cc $sg4, beside $sg5"; fi
+  ok "a member's Grep or Glob on a dir above the Slack copy (~/.cc, ~, or ../ up to one) is refused, while its own dir and a dir beside it search" $r
 
   # 11a''. A MEMBER MARKER IS WRITTEN BY NO SESSION (perms at e00ee984: "Refuse writes to .cc/member-* from
   #      sessions"). Through the file tools and Bash alike, for a member-facing session and a worker; a plain note
@@ -6453,6 +6465,15 @@ secret_all(){
 # files/) and the owner's index is not there at all (cc-sandbox), so nothing is refused there.
 secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json|"$HOME"/.cc/sandbox|"$HOME"/.cc/sandbox/*) return 0;; esac
   [ -z "$inb" ] && case "$1" in "$HOME"/.cc/slack|"$HOME"/.cc/slack/*|"$HOME"/.cc/library/owner|"$HOME"/.cc/library/owner/*) return 0;; esac; return 1; }
+# A SEARCH WALKS EVERYTHING UNDER ITS PATH, so a member's Grep or Glob on ~/.cc or ~ read the Slack copy while
+# secret_path saw only a dir that is no secret itself (perms' read of #1642). This says whether any path on
+# secret_path's list sits under $1; the list is realpath'd as secret_all's is, since ~/ccbox is a symlink.
+secret_below(){ local d l=("$HOME"/.claude/.credentials.json "$HOME"/ccbox/env "$HOME"/.codex/auth.json
+    "$HOME"/.config/cursor/auth.json "$HOME"/.cc/config "$HOME"/.ssh "$HOME"/.claude/settings.json "$HOME"/.cc/sandbox)
+  [ -z "$inb" ] && l+=("$HOME"/.cc/slack "$HOME"/.cc/library/owner)
+  while IFS= read -r d; do case "$d" in "${1%/}"/*) return 0;; esac   # ${1%/}: a search of / is above everything
+  done < <(realpath -m -- "${l[@]}" 2>/dev/null)
+  return 1; }
 # THE PERMISSION SEAT'S STATE IS WRITTEN BY THAT SEAT ALONE, AT EVERY TIER — the planning session included. The seat
 # is the one session the box runs with --dangerously-skip-permissions, in ~/.cc/state/<repo>/perms (brief.md,
 # ledger.md, session-id, handoff.md — the journal `cc-perms handoff` starts its successor from — and .claude/), and
@@ -7551,8 +7572,14 @@ case "$tool" in
     ;;
   Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
+    # Claude Code expands a leading ~ and reads a relative path from the session's cwd, not the hook's, so this
+    # does too: `~/.cc/slack` and `../../.cc` are the same dirs as their absolute spellings.
+    # shellcheck disable=SC2088 # the quoted ~ matches a literal leading tilde in a tool path
+    case "$fp" in '~'|'~/'*) fp=$HOME${fp#\~};; /*|'') ;; *) fp=$cwd/$fp;; esac
     [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
     if [ "$role" = member ]; then secret_path "$fp" && never "reading the box's secrets ($fp)"
+      case "$tool" in Grep|Glob) [ -n "$fp" ] && secret_below "$fp" \
+        && never "searching a dir that holds the box's secrets ($fp) — search your own dir, or one that holds none of them";; esac
     else secret_all "$fp" && never "reading the box's credentials ($fp)"; fi ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
