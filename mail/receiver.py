@@ -267,7 +267,7 @@ it is written on the reload step of the runbook.
       MAIL_MAX_BYTES     10485760 (10 MiB), off Content-Length. More than that is never read off the socket
       MAIL_MAX_CONN      8 connections in flight. Over it, a call waits BUSY_WAIT seconds for a slot and is
                          then answered 503 busy — a bound on threads, memory and open files that a tunnel
-                         cannot talk the box out of
+                         cannot talk the box out of. Each connection keeps its slot REQUEST_WAIT seconds at most
 CC_MAIL_DIR moves the whole store, and CC_MAIL_STATE the pid/port/log, which is how the selfcheck runs against
 a tree of its own and never this box's inbox.
 """
@@ -305,6 +305,7 @@ MAX_BYTES = 10 * 1024 * 1024
 HEADER_BYTES = 65536    # how much of an OVER-cap mail is still read, so its headers can say who sent it
 MAX_CONN = 8
 BUSY_WAIT = 1.0         # seconds a connection waits for one of those slots before it is answered 503 busy
+REQUEST_WAIT = 180      # seconds from accept to answer before the connection is cut and its slot given back
 NOTIFY = os.path.join(H, "bin", "cc-notify")   # the owner line for an allow-listed sender's auth drop
 
 # The daemon's own socket (cc-slack). It is how a stored mail reaches the session it is for without a second
@@ -906,8 +907,9 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             self.say("refuse bad-content-length from=%s" % clip(sender))
             return self._json(400, {"status": "refused", "reason": "bad Content-Length", "reply": None})
-        # An over-cap mail is still read as far as its headers, and only that far, so the 413 below can go to
-        # an allow-listed sender and a stranger's oversize mail is still a silent drop.
+        # An over-cap mail is still read, up to the cap (or HEADER_BYTES if the cap is smaller), so its headers
+        # are there for the 413 below to go to an allow-listed sender and a stranger's oversize mail is still a
+        # silent drop. The rest of it is never read.
         raw = self.rfile.read(min(length, max(cap, HEADER_BYTES)))
         if not raw:
             self.say("refuse empty-body from=%s" % clip(sender))
@@ -967,10 +969,12 @@ class Server(ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on how many connections are in flight at once.
 
     One thread per connection with no bound is a public tunnel hostname's worth of threads, sockets and memory
-    for whoever can reach it, and every one of them can hold its slot for `Handler.timeout` seconds by simply
-    not sending anything. MAIL_MAX_CONN slots; a connection over the ceiling waits BUSY_WAIT seconds for one
-    (a burst is a normal thing and should queue, not fail) and is then answered 503 busy and closed. The
-    worker throws on a 503, so the sending server retries the mail later.
+    for whoever can reach it. MAIL_MAX_CONN slots, and each connection keeps its slot for REQUEST_WAIT seconds
+    at most: `Handler.timeout` is per read, so a caller that trickles a byte at a time would otherwise keep it
+    for as long as it likes. At the deadline the socket is shut, the handler's read or write fails, and the
+    thread ends. 180 s covers a 10 MiB mail and the ROUTE_WAIT after it. A connection over the ceiling waits
+    BUSY_WAIT seconds for a slot (a burst is a normal thing and should queue, not fail) and is then answered
+    503 busy and closed. The worker throws on a 503, so the sending server retries the mail later.
 
     The slot is taken BEFORE the thread is made and given back when that thread ends, which is why it is
     released in process_request_thread and not in shutdown_request — shutdown_request also runs on the path
@@ -1002,10 +1006,21 @@ class Server(ThreadingHTTPServer):
             raise
 
     def process_request_thread(self, request, client_address):
+        cut = threading.Timer(REQUEST_WAIT, lambda: self.cut(request))
+        cut.daemon = True
+        cut.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
+            cut.cancel()
             self.slots.release()
+
+    @staticmethod
+    def cut(request):
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:     # already closed: the request ended as the deadline came
+            pass
 
 
 # ---------------------------------------------------------------- lifecycle

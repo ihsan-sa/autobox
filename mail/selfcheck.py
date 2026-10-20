@@ -971,6 +971,41 @@ def run():
         time.sleep(0.3)
         k(b.post(eml())[0] == 200, "…and the slot comes back when that connection ends")
 
+    # A slot is held for REQUEST_WAIT at most, so callers that trickle a byte at a time, never tripping the
+    # per-read Handler.timeout, cannot keep every slot: the deadline cuts them and the next mail gets in.
+    saved_waits = (r.REQUEST_WAIT, r.BUSY_WAIT)
+    r.REQUEST_WAIT, r.BUSY_WAIT = 2, 3
+    try:
+        with Box() as b:
+            trickles = [socket.create_connection((b.host, b.port), timeout=10) for _ in range(r.MAX_CONN)]
+
+            def trickle(s):
+                try:
+                    for c in b"POST /inbound HTTP/1.1\r\n" + b"X: y\r\n" * 90:
+                        s.sendall(bytes([c]))
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+            for s in trickles:
+                threading.Thread(target=trickle, args=(s,), daemon=True).start()
+            while b.srv.slots._value:       # every slot taken, however slowly this box accepts
+                time.sleep(0.02)
+            started = time.time()
+            code = b.post(eml())[0]
+            k(code == 200,
+              "with %d callers trickling bytes into every slot, a ninth mail is stored once the deadline frees "
+              "one: %r after %.1fs" % (r.MAX_CONN, code, time.time() - started))
+            def cut_off(s):
+                try:
+                    return s.recv(100) == b""
+                except ConnectionError:
+                    return True
+            k(all(cut_off(s) for s in trickles), "…and the trickling callers were cut off")
+            for s in trickles:
+                s.close()
+    finally:
+        r.REQUEST_WAIT, r.BUSY_WAIT = saved_waits
+
     # ---------------------------------------------------------------- 11. serve.log is bounded
     # Every line in it is built out of a stranger's mail and nothing else rotates it.
     with Box() as b:
