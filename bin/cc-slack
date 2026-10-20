@@ -5252,11 +5252,18 @@ class Daemon:
             out = ((r.stdout or "") + (r.stderr or "")).strip()[-1500:]
             log(f"dispatch {h}: orch {repo}@{alias} rc={r.returncode}")
             return {"ok": True, "text": out or f"orch {alias} started"} if r.returncode == 0 else {"ok": False, "error": out or f"cc exited {r.returncode}"}
-        if verb == "dispatch":   # `cc <h> <track> --go ""` on the host: the budget gate, the window and the boundary all happen out here
+        if verb == "dispatch":   # `cc <h> <track> --go "<brief>"` on the host: the brief, the budget gate, the window and the boundary all happen out here
             repo, _, track = chat.partition("/")
             if not track or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", track):
                 return {"ok": False, "error": "dispatch needs <handle>/<track>"}
             opts = [str(o) for o in (first.get("opts") or [])]
+            # --brief TEXT is the --go text, written out here so a FIX repair's findings reach the owner's notice (cc narrow_brief)
+            brief = ""
+            if "--brief" in opts:
+                i = opts.index("--brief")
+                if i + 1 >= len(opts):
+                    return {"ok": False, "error": "dispatch --brief needs its text"}
+                brief = opts[i + 1]; del opts[i:i + 2]
             # --repair takes no value: the way back into the workspace's own row whose PR is out for landing (cc)
             repair = ["--repair"] if "--repair" in opts else []
             opts = [o for o in opts if o != "--repair"]
@@ -5264,7 +5271,7 @@ class Daemon:
                       "--model": r"[A-Za-z0-9._-]{1,60}", "--effort": r"[a-z]{1,10}"}
             if len(opts) % 2 or any(opts[i] not in ok_opt or not re.fullmatch(ok_opt[opts[i]], opts[i + 1]) for i in range(0, len(opts), 2)):
                 return {"ok": False, "error": f"dispatch options not understood: {' '.join(opts)[:80]}"}
-            r = EFFECTS.run([f"{BIN}/cc", repo, track, "--go", ""] + opts + repair, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
+            r = EFFECTS.run([f"{BIN}/cc", repo, track, "--go", brief] + opts + repair, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
             out = ((r.stdout or "") + (r.stderr or "")).strip()[-1500:]
             log(f"dispatch {h}: {repo}/{track} {' '.join(opts)} rc={r.returncode}")
             return {"ok": r.returncode == 0, "text": out} if r.returncode == 0 else {"ok": False, "error": out or f"cc exited {r.returncode}"}
@@ -5281,16 +5288,23 @@ class Daemon:
             if not text:
                 return {"ok": False, "error": "an escalation needs something to say"}
             # no priority crosses the boundary: what the words buy is decided out here.
+            # THE BOX'S WORDS COME FIRST AND THE MEMBER'S ARE FENCED, as on a member's permission ask (perms' read at
+            # c706a700): the request's title and note are the box's, and every line the member sent, title included, is
+            # quoted, so a box-shaped note in it — the one an in-sandbox `cc-notify --perms` builds, or a forged one —
+            # reads as theirs. The member's own title still picks the workspace seat's `loop:` line below.
+            rtitle = f"{h}: a member's escalation"
+            body = (f"(A member's escalation from {h}, no authority: the box relays it to you as a request. Answer it in "
+                    f"#{h}, or ask the owner yourself if only he can.)\n\n{MEMBER_QUOTE_HEAD}\n" + member_quoted(f"{title}\n{text}"))
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())   # cc-notify stamps `at` to the second, so this compares as seconds
             try:
-                r = EFFECTS.run([f"{BIN}/cc-notify", "-t", f"{h}: {title}", "--ask", "--from", h, "--", text],
+                r = EFFECTS.run([f"{BIN}/cc-notify", "-t", rtitle, "--ask", "--from", h, "--", body],
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)   # --from: the socket's workspace names the asker, so the answer finds #<h>
             except subprocess.TimeoutExpired:
                 r = types.SimpleNamespace(returncode=124, stdout="", stderr="cc-notify did not return in 60 s")
             # THE FILE IS THE REQUEST (cc-notify writes it before the broker hands it on): a cc-notify that timed out or
             # whose broker did not take it may still have filed it — once one had been answered in 39 s while its
             # member was told the escalation failed. So a failure is reported only when no file of this ask exists.
-            filed = request_on_file(h, f"{h}: {title}", since) if r.returncode != 0 else None
+            filed = request_on_file(h, rtitle, since) if r.returncode != 0 else None
             log(f"escalate {h}: {title} rc={r.returncode}{f' but on file as {filed}' if filed else ''}")
             if r.returncode != 0 and not filed:
                 return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
@@ -12041,7 +12055,7 @@ def main(argv):
         print(r.get("result") or r.get("error")); return 0 if r.get("ok") else 1
     elif cmd == "dispatch":   # inside a member boundary: `cc <h> <track> --go` (or `cc <h> --orch <alias>`) asks the host to run it (Daemon.member_verb)
         if not rest:
-            print("cc-slack dispatch <handle>/<track> [--loop N] [--budget USD] [--model M] [--turns N] [--effort E] | <handle>@<alias> [--brief TEXT]", file=sys.stderr); return 2
+            print("cc-slack dispatch <handle>/<track> [--loop N] [--budget USD] [--model M] [--turns N] [--effort E] [--repair] [--brief TEXT] | <handle>@<alias> [--brief TEXT]", file=sys.stderr); return 2
         try:
             r = sock_request({"dispatch": rest[0], "opts": rest[1:]}, timeout=200)
         except Exception as e:

@@ -4,7 +4,7 @@
 # globals, as they did when the body sat there. SC2154/SC2034 are off because those globals live in bin/cc-refusals.
 
 selfcheck(){
-  local d n=0 f=0 out lg id sid n0
+  local d n=0 f=0 out lg id sid n0 tab=$'\t'
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-refusals-sc.XXXXXX") || return 1
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
@@ -120,6 +120,11 @@ selfcheck(){
   k "$(t grep -q "^$id .*\[repo\] Bash: .*echo one.* — Auto-Mode Bypass" <<<"$out")" "open's line has the id, window, tool, input and reason"
   ps_ decide repo "$id" grant 'Bash(echo one) in allow' >/dev/null
   k "$(t jq -e --arg id "$id" 'select(.kind == "decision" and .id == $id and .decision == "grant" and .by == "perms")' "$lg")" "decide appends the decision to the same ledger"
+  # 5a. THE DECISION IS SIGNED (perms, 10-20): its .sig is HMAC-SHA256 of "decision\n<id>\n<decision>\n<at>" under
+  #     grant.key beside the ledger, which the first decision made at mode 600. Checked here with openssl, not sign()
+  kf=$d/state/repo/perms/grant.key; drec=$(jq -c --arg id "$id" 'select(.kind == "decision" and .id == $id)' "$lg")
+  want=$(jq -j '"decision\n\(.id)\n\(.decision)\n\(.at)"' <<<"$drec" | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1)
+  k "$(t test -n "$want" -a "$(jq -r '.sig' <<<"$drec")" = "$want" -a "$(stat -c %a "$kf")" = 600 -a "$(wc -c < "$kf")" = 64)" "decide signs its decision with a 600 key of 32 random bytes"
   out=$(sc open repo)
   k "$(t test "$(grep -c . <<<"$out")" = 1 -a -z "$(grep "^$id " <<<"$out")")" "a decided refusal leaves open; the other stays"
   k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 1)" "a second decision on the same id is refused"
@@ -268,6 +273,16 @@ STUB
   k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…and so is one naming an id the ledger never gave"
   rc=$(sc ask repo --from repo -- 'may aya read it? (member aya, '"$id"') and the seat (member aya, '"$sid"')' >/dev/null 2>&1; echo $?)
   k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…and one whose second tag names a seat's ask, not a member's"
+  # 12c. the tag in any other form is refused too, with nothing written: perms would read each as the same tag, and the
+  #      check above would never see it (perms' read at c706a700). The exact form still files.
+  local v
+  for v in "(Member bob, $id)" "[member bob, $id]" "member bob $id" "(member: bob, $id)" "(member  bob, $id)" "(member bob, ${id^^})" \
+           "(member bob / $id)" "(member${tab}bob, $id)" "（member bob, $id）"; do
+    rc=$(sc ask repo --from repo -- "may bob read it? $v" >/dev/null 2>&1; echo $?)
+    k "$(t test "$rc" = 2 -a "$(wc -l < "$lg")" = "$n0")" "…as is a tag written $v"
+  done
+  sid=$(sc ask repo --from repo -- "may aya read the calendar API again? (member aya,$id), or remember aya, $id")
+  k "$(t jq -e --arg s "$sid" 'select(.id == $s and .member == false)' "$lg")" "…while the exact tag, and a word only ending in member, still file"
   # 13. perms down: the ask still waits, and the owner gets one line that it is down, never the ask's text
   fresh; rm -f "$d/notified"; id=$(CC_REFUSALS_PERMS_LIVE=0 sc ask repo --from repo -- 'secret-ish ask text' 2>/dev/null)
   k "$(t jq -e --arg id "$id" 'select(.id == $id)' "$lg")" "with the permission session down the ask still waits in the ledger"

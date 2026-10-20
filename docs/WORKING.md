@@ -178,6 +178,9 @@ or a proxy. The tool retrieves; it never calls a model. The steps:
   A HANDBACK goes to the track's seat, and the lander starts no worker loop for it: the fix is yours to send to
   a worker. `cc <repo> <row> --go "<the findings>" --repair` (add `--resume-last` to keep the
   worker's context) puts one fix onto the same branch, and its `cc done` re-queues the PR.
+  On a row the owner designed (its brief cites his message), findings that name the reviewer's FIX are posted to
+  him in the row's thread before the round runs, one item per list line, so write each narrowing as its own `- ` line.
+  The worker builds each as its own commit; he names any he declines, and landing does not wait on him.
   A subagent's branch has no worker to push it: resume the same builder, then commit and push its worktree yourself.
 - A baseline copy of `bin/` to run an old selfcheck against comes from `cc-bin-at <ref> [dir]`, which prints a directory of real files. Never a directory of `ln -s` into a checkout: twice a later `cp` followed a link and overwrote a live tool.
 - Waiting is not work. Blocked on an owner decision, dispatch everything that does not turn on his answer, and let only the rows that do wait. A checkpoint or handoff that says the same as the last one is not written, because restating "unchanged, still waiting" costs a full context read and moves nothing. Waiting is a scheduled wake-up: pick when you will look again and do not re-read in between. One seat sat on four owner decisions for eleven hours, wrote about ten such entries and dispatched nothing.

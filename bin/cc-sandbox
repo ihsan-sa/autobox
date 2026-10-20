@@ -229,7 +229,7 @@
 #   or tightened to 0700 here, this user's own, and the file plain, this user's and not a symlink. Nor may it hold a
 #   refresh token another live login holds (shared_refresh: the box's own, another ~/.claude-*, a member's), since two
 #   refreshers of one token sign one out. Any other shape, a shared token, or missing, signed out, or expired and not
-#   refreshed: one line on stderr and the worker runs on the box's own login. An expiresAt that is not a number is 0.
+#   refreshed: one line on stderr and the worker runs on the box's own login. An expiresAt that is not a number, or not in 0..1e15, is 0.
 #   `cc-sandbox worker-cred` answers which one a launch would use, and cc-loop keys its limit stamp and model record to
 #   it (CC_LIMIT_STAMP, CC_MODEL_CRED there); member workspaces and every session outside a worker never read the key.
 # THE HOST REFRESHER'S MODE (the dispatch host plan, step 11b): two refreshers of one refresh token sign each other out,
@@ -702,7 +702,11 @@ egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2
 cred_left(){ local e; e=$(cred_exp "$1"); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
 cred_exp(){   # $1 a credentials file → its expiresAt as a whole number, 0 when it is missing or not a number. $(( )) evaluates
   # a word it is handed as shell arithmetic, array subscripts and all, so only jq's own number ever reaches one.
-  jq -r '(.claudeAiOauth.expiresAt | numbers | floor) // 0' "$1" 2>/dev/null; }
+  # …AND ONLY ONE IN RANGE, else 0 (expired, so the launch refreshes it). jq prints 1e17 and up as 1e+17, which $(( ))
+  # cannot read, so a 1e300 made cred_left print nothing and the worker fell back to the box's login. A real token
+  # expires hours from now, about 1.8e12 ms, and the fixtures use 99999999999999; 1e15 is the year 33658, far past
+  # both. A negative one is past already, and nan fails the test as well.
+  jq -r '(.claudeAiOauth.expiresAt | numbers | floor | select(. >= 0 and . < 1e15)) // 0' "$1" 2>/dev/null; }
 refresher_flag(){   # true while the host refresher (dispatch-login) is the one refresher of the workers' login: its flag is
   # root's own regular file. Only root writes /etc/dispatch, so a flag of anyone else's is not the switch and is ignored.
   # The brief: "while /etc/dispatch/login-refresh exists and is a root-owned regular file, cc-sandbox never refreshes".
@@ -3233,6 +3237,12 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   out=$(run "$wf" "$fh/norefresh")
   t "workers' login: an expiresAt that is a string is read as 0 (expired → the box's login), and nothing in it runs" \
     "$(g tok)/$([ -e "$fh/pwned" ] && echo ran || echo none)" box-access/none
+  # …AND ONE OUT OF RANGE is 0 as well, so the launch refreshes it on the workers' login: 1e300 used to reach $(( )) as
+  # 1e+300, which it cannot read, and the worker fell back to the box's login with "expired" (#1488's read)
+  for e in 1e300 -1e300 '"1e300"'; do
+    wk wk-old "$e"; out=$(run "$wf")
+    t "workers' login: an expiresAt of $e is refreshed on the workers' login, not the box's" \
+      "$(g tok)/$(grep -c "this worker runs on the box's own login" <<<"$out")" wk-fresh/0; done
   # TWO LAUNCHES AT ONCE: the refresh is one at a time (the flock in the workers' dir), and the one that waited finds
   # the token already fresh and does not refresh it a second time.
   printf '#!/bin/sh\nsleep 2\nexec %s "$@"\n' "$fh/refresher" > "$fh/slowrefresher"; chmod +x "$fh/slowrefresher"
@@ -3559,6 +3569,8 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
   git -C "$dev" worktree add -q -b track/t "$wt" && git -C "$dev" worktree add -q -b track/u "$H/.cc/worktrees/$r/u" || return 1
   mkdir -p "$wt/.cc"; : > "$wt/.cc/track"
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" perms -- true 2>&1); rc=$?
+  t "a track named perms is refused, so the seat's state dir is never bound" "$rc/$(grep -c 'may not be named perms' <<<"$out")" 2/1
   # Two delete targets nothing else in here touches, so each reads its own effect: one OUTSIDE the worker's branch
   # namespace, which must survive, and one inside it, which does not — that is the limit, measured below and not claimed.
   git -C "$dev" branch other >/dev/null 2>&1 && git -C "$dev" branch track/x >/dev/null 2>&1 || return 1
@@ -4087,6 +4099,9 @@ case "${1:-}" in selfcheck) if [ -n "${CC_SANDBOX_SELFCHECK_HOME:-}" ]; then sel
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
 [ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox worker-cred   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox handle <handle>   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox env <workspace> <VAR> [<secret file> | --revoke]   |   cc-sandbox selfcheck" >&2; exit 2; }
+# NO TRACK NAMED perms (perms' ruling on #1578, 2026-10-20): build binds ~/.cc/state/<repo>/<track> rw, and that name is
+# the permission seat's own dir, grant.key with it. A member's tracks share its one state dir, so the name is moot there.
+[ "$track" = perms ] && { echo "cc-sandbox: a track may not be named perms: its state dir is the permission seat's" >&2; exit 2; }
 # ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
 # for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
 fence_off && exec "$@"   # off means the command runs exactly as given, nothing added

@@ -689,8 +689,8 @@ rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
 ci=$( ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 MEMBER_DAILY_CEILING_USD=1000 "$NB/cc" alice todo --go 'from inside' 2>&1 ) ); ri=$?
 [ "$ri" = 0 ] && grep -q -- 'dispatch alice/todo --loop' "$T/cap.args" && ! grep -q -- '--mention' "$T/cap.args" \
   && ! grep -qi -- 'ceiling\|MEMBER_DAILY\|raised' "$T/cap.args" \
-  && [ ! -f "$GH/.cc/state/member-spend.json" ] && grep -q 'from inside' "$GH/.cc/state/alice/todo/task.md" \
-  && ok "…and inside the boundary the same dispatch is BROKERED, not charged: the brief is written to the workspace's own state dir and the daemon is asked to run it on the host, where the ledger, the cap and the ceiling actually live — a ceiling in the member's own environment raises nothing" \
+  && [ ! -f "$GH/.cc/state/member-spend.json" ] && grep -q -- '--brief from inside' "$T/cap.args" \
+  && ok "…and inside the boundary the same dispatch is BROKERED, not charged: the brief rides in the dispatch and the host writes it and runs it, where the ledger, the cap and the ceiling actually live — a ceiling in the member's own environment raises nothing" \
   || bad "a dispatch from inside the boundary did not broker (rc=$ri, args='$(cat "$T/cap.args" 2>/dev/null)'): $ci"
 rm -f "$GH/.cc/state/member-spend.json"
 # NO CREDENTIAL, NO WINDOW — AND SOMEBODY IS TOLD (review-156d). cc-sandbox member refuses a workspace without its own

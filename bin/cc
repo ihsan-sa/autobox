@@ -35,6 +35,9 @@
 #                             cc-task reserves a repair of that PR at the worktree's HEAD, once per head (again only
 #                             once that head's worker stopped with no new head), and the worker pushes its fix onto the
 #                             same branch and PR. A row with no open PR dispatches as usual
+#                             A repair whose text answers a reviewer's FIX, on a row whose brief cites an owner message,
+#                             posts the findings' list lines to the row's thread before it runs (narrow_brief) and asks
+#                             the worker for one commit per item, a FIX added to a queued repair included. A notice, not a hold
 #   cc <repo> <track> --say "text"           reach that track's running turn: its interactive session (cc-msg --turn), or its
 #                                            headless --go worker after its next tool call (cc-loop say). Exit 0 only once a
 #                                            turn took it; 1 nothing runs there, nothing sent · 2 a live worker loop whose spool
@@ -432,7 +435,7 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
 # THE BOUNDARY (docs/design-member-workspaces.md). A member workspace's session and every worker it dispatches run inside
 # `cc-sandbox member <handle> [<track>]`: only ~/dev/<handle>, its tracks and its member-scoped Slack socket exist there. The
 # host side of a launch (tmux, the board row, the budget ledger, the window) is this script OUTSIDE; claude and cc-loop go
-# in. Inside there is no tmux and no ledger, so `cc <h> <track> --go` writes the brief and asks the daemon (cc-slack dispatch)
+# in. Inside there is no tmux and no ledger, so `cc <h> <track> --go` hands its text to the daemon (cc-slack dispatch --brief)
 # to run the same command out here. The bare internals (__run*) refuse a workspace repo outside the boundary: depth.
 MEMBER_WS_SP="This session belongs to a MEMBER WORKSPACE and runs inside its boundary: only its folder, its tracks and its Slack channels exist here, so a missing path or tool is by design, not a fault. 'cc-notify -t \"<what>\" \"...\"' and reply(needs_owner) both reach the box's planning seat, which answers you or asks the owner itself. A cc-guard REFUSAL is already a query to the box: never post it, a 🔐 line or 'I cannot do that' into the channel; say what you CAN do. ASKING THE BOX (a GitHub repo, a host-side push, a question about the box) is 'cc slack ask -t \"<what>\" \"...\"' (at most 5 an hour), and the answer comes back in this channel. Never ask the owner to relay a question you can send yourself. Dispatch with 'cc <handle> <track> --go \"...\"' (inside this boundary, on the workspace's budget), and start an orchestrator with 'cc <handle> --orch <alias> \"<purpose>\"' (the same, in its own channel #<handle>--<alias>); a track session is opened from its 🧵 thread in #<handle> or by the owner, never from here."
 # PER-WORKSPACE OVERRIDES (owner, 2026-10-13: one fund runs 24/7 with no cap, and raising the shared ceiling would widen
@@ -723,6 +726,60 @@ repair_reserve(){
   echo "cc: a repair of $pr at ${head:0:12} was already dispatched — its worker pushes a new head, and the next --repair starts from that"
   exit 1
 }
+# A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design; owner,
+# 2026-10-19: "this is not perms design it's my design so if stuff is getting silently scoped down i need to be
+# alerted"). On #1544 perms' security read came back FIX with four limits on what his design opened, the seat sent
+# them to a repair round, and nobody showed him. Every FIX repair comes through here (the seat's `--go "<findings>"
+# --repair`; the lander's own --repair is its rebase round, which names no FIX), so this is the one place: a repair
+# whose text answers a reviewer's FIX, on a row whose brief cites an owner message, posts the items to the row's
+# thread before the round runs, and its brief asks for one commit per item so he can drop any. A NOTICE, NOT A HOLD:
+# the round starts either way, and he answers by naming the items he declines. A plain row posts nothing. A member's workspace is no exception (review of #1550): a row there built to his design cites him the same way.
+owner_designed(){   # stdin the row's brief → 0 when it cites the owner: `src: slack:…`, an `OWNER <date>` scope line, or his ask ("Owner, <date>") at a line's head. Pure.
+  awk '/<!-- cc-brief:inflight -->/{skip=1} /<!-- \/cc-brief:inflight -->/{skip=0; next} skip{next}
+    /src: slack:[^ ]/ || /(^|[^A-Za-z])OWNER [0-9]{4}-[0-9]{2}-[0-9]{2}/ || /^[#>* -]*Owner,? [0-9]{4}-[0-9]{2}-[0-9]{2}/ {f=1} END{exit !f}'; }
+fix_repair(){   # $1 the dispatch text → 0 when it answers a reviewer's FIX (the word FIX, LAND-AFTER-FIX included), never the lander's REBASE ROUND. Pure.
+  case "$1" in "REBASE ROUND"*) return 1;; esac
+  grep -qE '(^|[^A-Za-z])FIX([^A-Za-z]|$)' <<<"$1"; }
+narrowings(){   # $1 the dispatch text → one item a line: its list lines (-, *, •, 1. or 1)) with the marker dropped; with none, the whole text on one line. Pure.
+  local items; items=$(printf '%s\n' "$1" | sed -nE 's/^[[:space:]]*(-|\*|•|[0-9]+[.)])[[:space:]]+(.+)$/\2/p')
+  if [ -n "$items" ]; then printf '%s\n' "$items"; else printf '%s' "$1" | tr -s '\n\t ' '   ' | sed 's/^ //; s/ $//'; echo; fi; }
+NARROW_BRIEF='
+
+OWNER'"'"'S DESIGN: this row cites an owner message, and the owner has been shown each item above as a narrowing of his design. Build each item as its own commit, its subject naming the item, so he can drop any he declines without touching the rest.'
+dispatch_brief(){   # the --go launch's brief: a repair reserved first, then narrow_brief
+  local pr=""
+  if [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && pr=$(repair_pr) && [ -n "$pr" ]; then repair_reserve; else pr=""; fi
+  narrow_brief "$pr"; }
+# Both doors that write a --go brief come through here: dispatch_brief's launch and a FIX added to a repair already
+# QUEUED (the --go on a queued window, which reserves nothing new: its launch holds the reservation). Review of #1550:
+# the queued door wrote its brief directly, so a FIX that reached a waiting repair was never shown to the owner.
+narrow_brief(){   # $1 the repair's PR url, or empty for no repair → the brief written, and a FIX on the owner's design noticed once it is (a refused brief runs no round)
+  local pr="$1"
+  if [ -n "$pr" ] && fix_repair "$text" && owner_designed < "$st/task.md" 2>/dev/null; then text="$text$NARROW_BRIEF"; else pr=""; fi
+  write_brief || return 1
+  [ -z "$pr" ] || narrowing_notice; }
+# INSIDE the boundary there is no tmux, no ledger and no repair record, so the launch is brokered: the daemon runs
+# `cc <h> <track> --go "<text>"` on the host, budget gate, window and boundary included. The text goes with it and the
+# host writes the brief: written in here, the host's round got "" and a member seat's FIX repair noticed nothing (review of #1550).
+go_inside(){ local b=(); [ -z "$text" ] || b=(--brief "$text"); exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}" ${REPAIR:+--repair} "${b[@]}"; }
+# A member's $st is theirs to write (perms' read of #1550), so the PR the notice names is the board's, never the
+# record's, and the file goes in by a temp name made and written through one O_EXCL|O_NOFOLLOW fd, then renamed over it:
+# a link planted at either name is replaced or refused, never followed.
+narrowing_notice(){   # → $st/narrowing-notice.md, posted once per text to the row's thread (cc-slack post --route --id)
+  local items msg title pr tmp
+  items=$(narrowings "$text" | sed 's/^/• /')
+  title=$("$BOARD" get "$repo" "$track" title 2>/dev/null); [ -n "$title" ] || title="$track"
+  pr=$("$BOARD" get "$repo" "$track" pr 2>/dev/null); case "$pr" in https://github.com/*/pull/[0-9]*) ;; *) pr="Its PR";; esac
+  msg="*A review is narrowing your design: $title*
+$pr came back FIX, and a repair round starts on it now. What the reviewer would take out or limit:
+$items
+The round builds each as its own commit. Reply here naming any you decline and that commit is dropped; landing does not wait on you."
+  tmp=$(mktemp -u "$st/.narrowing-notice.XXXXXX") && python3 -c 'import os,sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644); os.write(fd, sys.argv[2].encode() + b"\n"); os.close(fd)' "$tmp" "$msg" \
+    && mv -fT "$tmp" "$st/narrowing-notice.md"
+  if [ -f "$SLACKON" ] || [ -n "${CC_SLACK:-}" ]; then
+    "${CC_SLACK:-$BIN/cc-slack}" post --route "$repo/$track narrowing" --id "narrowing:$repo/$track:$(printf %s "$text" | sha256sum | cut -c1-16)" "$msg" >/dev/null 2>&1 \
+      || echo "cc: the owner's narrowing notice did not post — it is in $st/narrowing-notice.md" >&2; fi; }
 
 # A FIX FOR SOMEBODY ELSE'S OPEN PR (raised-repair-push-no-creds, 2026-10-16): a row briefed to fix a hive PR (its
 # branch dispatch/<n>, not track/<row>) committed the fix, but the worker has no GitHub credential and every push here
@@ -1615,6 +1672,83 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   ln -sf "$T/sy/victim" "$T/sy/r/t/pr-body.sent"; : > "$T/sy/gh.log"; printf 'outside\n' > "$T/sy/live"; sync
   grep -q '^pr view' "$T/sy/gh.log" && [ "$(cat "$T/sy/victim")" = outside ]; t "…and a linked record is read as no record, so the live body decides" $?
   compgen -G "$T/sy/r/t/.pr-body.sent.*" >/dev/null && rc=1 || rc=0; t "…and no temp record is left behind" "$rc"
+  # A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design). Each case is
+  # its own row under $T/nw, with a stub cc-slack that logs its posts; the reservation and the brief writer are stubbed.
+  mkdir -p "$T/nw"; printf '#!/bin/bash\necho "$*" >> %q/nw/posts\n' "$T" > "$T/nw/slack"; chmod +x "$T/nw/slack"
+  printf '#!/bin/bash\n[ "$4" = pr ] && echo https://github.com/o/r/pull/9\n' > "$T/nw/board"; chmod +x "$T/nw/board"   # the row's own PR, as the board has it
+  nwgo(){   # $1 row $2 its brief $3 the dispatch text $4 repair (1) or not $5 a member's workspace (1) or not → the dispatch, the row's task.md as the writer leaves it
+    mkdir -p "$T/nw/r/$1"; printf '%s\n' "$2" > "$T/nw/r/$1/task.md"; : > "$T/nw/posts"
+    ( repo=r; track="$1"; st="$T/nw/r/$1"; text="$3"; CLAIM=1; REPAIR="$4"; CC_SLACK="$T/nw/slack"; BOARD="$T/nw/board"
+      repair_pr(){ echo "${NWPR:-https://github.com/o/r/pull/9}"; }; repair_reserve(){ :; }; mw="${5:-}"; member_workspace(){ [ -n "$mw" ]; }
+      write_brief(){ printf '%s\n' "$text" >> "$st/task.md"; }; dispatch_brief ) >/dev/null 2>&1; }
+  FIXT=$'perms\' security read came back FIX on #9:\n- drop the wildcard path\n2. limit the grant to read-only'
+  nwgo own $'Owner, 2026-10-19 22:48Z (C1 thread 1.2): "make the guard simple".' "$FIXT" 1
+  n1=$(cat "$T/nw/r/own/narrowing-notice.md" 2>/dev/null)
+  grep -q '^https://github.com/o/r/pull/9 came back FIX' <<<"$n1" && grep -qx '• drop the wildcard path' <<<"$n1" \
+    && grep -qx '• limit the grant to read-only' <<<"$n1" && [ "$(grep -c '^• ' <<<"$n1")" = 2 ] \
+    && grep -q '^post --route r/own narrowing --id narrowing:r/own:' "$T/nw/posts" && grep -q "OWNER'S DESIGN: .*its own commit" "$T/nw/r/own/task.md"; rc=$?
+  t "cc --repair: a FIX on an owner-designed row writes the notice, one line per narrowing, posts it to the row's thread, and asks the brief for a commit per item" "$rc"
+  nwgo plain 'GOAL: tidy the lander log lines.' "$FIXT" 1
+  [ ! -e "$T/nw/r/plain/narrowing-notice.md" ] && [ ! -s "$T/nw/posts" ] && ! grep -q "OWNER'S DESIGN" "$T/nw/r/plain/task.md"; rc=$?
+  t "…a FIX repair on a plain row writes none" "$rc"
+  nwgo rebase 'GOAL: x. OWNER 2026-10-12 scope: all of it.' 'REBASE ROUND, dispatched by the landing queue itself. GOAL: PR #9 merges cleanly into main. WHY: the two now conflict in docs/FIX-notes.md' 1
+  rc=0; { [ ! -e "$T/nw/r/rebase/narrowing-notice.md" ] && [ ! -s "$T/nw/posts" ]; } || rc=1
+  t "…nor does a rebase round on an owner-designed row, even one whose conflicted file is named FIX" "$rc"
+  nwgo member $'Owner, 2026-10-19: "the guard I set".' "$FIXT" 1 1
+  rc=0; grep -qx '• drop the wildcard path' "$T/nw/r/member/narrowing-notice.md" 2>/dev/null || rc=1
+  grep -q '^post --route r/member narrowing' "$T/nw/posts" || rc=1; grep -q "OWNER'S DESIGN: .*its own commit" "$T/nw/r/member/task.md" || rc=1
+  t "…and a member's row built to the owner's design is noticed too: what decides is the brief citing him, not whose workspace runs it" "$rc"
+  # THROUGH THE INSIDE DOOR (review of #1550): a member seat's `--go "<findings>" --repair` reaches cc-slack dispatch with the
+  # text as --brief, and the host's round (nwgo, as the daemon runs it) is given that text, not "".
+  printf '#!/bin/bash\nprintf "%%s\\0" "$@" > %q/nw/argv\n' "$T" > "$T/nw/cc-slack"; chmod +x "$T/nw/cc-slack"
+  ( repo=r; track=inside; text="$FIXT"; REPAIR=1; LOOPN=1; XTRA=(); BIN="$T/nw"; go_inside ) >/dev/null 2>&1
+  mapfile -d '' av < "$T/nw/argv" 2>/dev/null; brief=""; for i in "${!av[@]}"; do [ "${av[$i]}" = --brief ] && brief="${av[$((i+1))]}"; done
+  nwgo inside $'Owner, 2026-10-19: "the guard I set".' "$brief" 1 1
+  rc=0; [ "${av[0]:-}" = dispatch ] && [ "${av[1]:-}" = r/inside ] && printf '%s\n' "${av[@]}" | grep -qx -- --repair || rc=1
+  grep -qx '• drop the wildcard path' "$T/nw/r/inside/narrowing-notice.md" 2>/dev/null || rc=1; grep -q "OWNER'S DESIGN: .*its own commit" "$T/nw/r/inside/task.md" || rc=1
+  t "…and through the inside door: a member seat's FIX repair carries its findings to the host, which notices them and briefs a commit per item" "$rc"
+  # A MEMBER'S $st IS THEIRS TO WRITE (perms' read of #1550): a link planted at the notice's name, or swapped in after
+  # it is written, is replaced and its target left whole; and a record steered to another PR is not the PR named.
+  mkdir -p "$T/nw/r/link"; printf 'token\n' > "$T/nw/victim"; ln -s "$T/nw/victim" "$T/nw/r/link/narrowing-notice.md"
+  ( NWPR=https://github.com/x/y/pull/666; nwgo link $'Owner, 2026-10-19: "mine".' "$FIXT" 1 1 )
+  rc=0; [ "$(cat "$T/nw/victim")" = token ] && [ -f "$T/nw/r/link/narrowing-notice.md" ] && [ ! -L "$T/nw/r/link/narrowing-notice.md" ] || rc=1
+  grep -q '^https://github.com/o/r/pull/9 came back FIX' "$T/nw/r/link/narrowing-notice.md" && ! grep -q 666 "$T/nw/r/link/narrowing-notice.md" "$T/nw/posts" || rc=1
+  t "…a link planted at the notice's name is replaced, not written through, and the PR named is the board's, not a member-written record's" "$rc"
+  mkdir -p "$T/nw/vdir"; : > "$T/nw/posts"
+  ( mv(){ rm -f "$T/nw/r/link/narrowing-notice.md"; ln -s "$T/nw/victim" "$T/nw/r/link/narrowing-notice.md"; command mv "$@"; }
+    nwgo link $'Owner, 2026-10-19: "mine".' "$FIXT" 1 1 )
+  rc=0; [ "$(cat "$T/nw/victim")" = token ] && [ ! -L "$T/nw/r/link/narrowing-notice.md" ] || rc=1
+  ( mv(){ rm -f "$T/nw/r/link/narrowing-notice.md"; ln -s "$T/nw/vdir" "$T/nw/r/link/narrowing-notice.md"; command mv "$@"; }
+    nwgo link $'Owner, 2026-10-19: "mine".' "$FIXT" 1 1 )
+  [ -z "$(ls -A "$T/nw/vdir")" ] && [ ! -L "$T/nw/r/link/narrowing-notice.md" ] || rc=1
+  t "…and a link swapped in after the notice is written, to a file or a folder, is replaced too, its target untouched" "$rc"
+  printf 'token\n' > "$T/nw/victim"
+  ( mktemp(){ ln -s "$T/nw/victim" "$T/nw/r/link/.narrowing-notice.raced"; echo "$T/nw/r/link/.narrowing-notice.raced"; }
+    nwgo link $'Owner, 2026-10-19: "mine".' "$FIXT" 1 1 ) 2>/dev/null
+  rc=0; [ "$(cat "$T/nw/victim")" = token ] || rc=1; rm -f "$T/nw/r/link/.narrowing-notice.raced"
+  t "…and a link swapped in at the temp name before it is opened is refused, its target untouched" "$rc"
+  nwgo nofix '(src: slack:C1/1.2) the design' "$FIXT" ""
+  rc=0; { [ ! -e "$T/nw/r/nofix/narrowing-notice.md" ] && [ ! -s "$T/nw/posts" ]; } || rc=1
+  t "…nor a --go that is no repair" "$rc"
+  # A FIX ADDED TO A REPAIR ALREADY QUEUED (review of #1550): its own row, a brief already on file, and narrow_brief
+  # called as the queued door calls it — no reservation, since the queued launch holds it. The door itself is read
+  # from the script, so a queued branch that goes back to write_brief alone fails here.
+  mkdir -p "$T/nw/r/queued"; printf '%s
+' 'Owner, 2026-10-19: "my design".' 'first round: rebuild the guard' > "$T/nw/r/queued/task.md"; : > "$T/nw/posts"
+  ( repo=r; track=queued; st="$T/nw/r/queued"; text="$FIXT"; CC_SLACK="$T/nw/slack"; BOARD="$T/nw/board"; member_workspace(){ return 1; }
+    repair_reserve(){ echo reserved >> "$T/nw/posts"; }
+    write_brief(){ printf '%s\n' "$text" >> "$st/task.md"; }; narrow_brief "https://github.com/o/r/pull/9" ) >/dev/null 2>&1
+  q=$(sed -n '/^ *if \[ "$ws" = queued \]; then/,/instruction added to the queued worker/p' "$S")
+  rc=0; grep -qx '• drop the wildcard path' "$T/nw/r/queued/narrowing-notice.md" 2>/dev/null || rc=1
+  grep -q '^post --route r/queued narrowing' "$T/nw/posts" && ! grep -q '^reserved' "$T/nw/posts" || rc=1
+  grep -q "OWNER'S DESIGN: .*its own commit" "$T/nw/r/queued/task.md" || rc=1
+  has "$q" 'narrow_brief "$pr" || exit 1' || rc=1; has "$q" 'write_brief' && rc=1
+  t "…and a FIX added to a repair already queued is noticed and briefed the same way, through narrow_brief and no second reservation" "$rc"
+  rc=0; printf 'GOAL: x\n- (src: slack:C1/1.2) cited\n' | owner_designed || rc=1
+  printf 'GOAL: x\n<!-- cc-brief:inflight -->\nOWNER 2026-10-12\n<!-- /cc-brief:inflight -->\n' | owner_designed && rc=1
+  t "owner_designed: a src: slack: citation counts, a date only the IN FLIGHT block carries does not" "$rc"
+  rc=0; [ "$(narrowings $'FIX:\nno list here')" = "FIX: no list here" ] || rc=1
+  t "narrowings: a text with no list lines is one item on one line" "$rc"
   # DELIVERED OR SAYS WHY (a-delivery-reaches-a-turn-or-says-why). Stub helpers in $T/sb answer with the rc a file
   # names, and log what they were asked, so each route is driven on its own fixture — the dead target included.
   mkdir -p "$T/sb"; for w in cc-loop cc-msg cc-notify; do
@@ -2315,16 +2449,15 @@ case "$mode" in
        # cc-msg --turn (3 queued · 4 a model wall · 5 no turn); a headless --go worker has no pane, and gets cc-loop say
        # (0 its running turn took it · 3 kept for its next tool call or iteration). Each non-zero exit says why.
        say_to "$repo" "$track" "$win" "$text"; exit $? ;;
-  go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
-         # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
-         write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}" ${REPAIR:+--repair}; fi
+  go)  inside && go_inside
        ws=$(win_state "$win")
        if [ "$ws" = loop ]; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
        if [ "$ws" = queued ]; then   # A SECOND --go ON A QUEUED LAUNCH ADDS TO ITS BRIEF and keeps its place in the queue
          "$BIN/cc-pause" is "$repo" 2>/dev/null && { echo "cc: $repo is paused — \`cc-pause off $repo\` first"; exit 1; }
          [ ${#XTRA[@]} -gt 0 ] || [ "$LOOPN" != 1 ] && echo "cc: --loop/--budget/--model apply when a launch is made; this one was queued with its own (cc rm $repo $track and --go again to change them)"
          if [ -z "$text" ]; then echo "cc: $repo/$track is already queued — it starts on its own when there is room; nothing was added"; exit 0; fi
-         write_brief || exit 1
+         pr=""; [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && pr=$(repair_pr)   # a FIX added to a queued repair is noticed as one launched is (narrow_brief)
+         narrow_brief "$pr" || exit 1
          "$BOARD" note "$repo" "$track" "instruction added to the queued worker's brief" >/dev/null
          echo "cc: $repo/$track is queued and not started — your note is on top of its brief, which it reads when it starts"; exit 0; fi
        # A WINDOW WITH NO LOOP IN IT IS REPLACED, and what it was is said: a queued launch whose wait died left a shell
@@ -2352,8 +2485,7 @@ case "$mode" in
        # writes the file, and dispatching only ever ADDS to it — one atomic write, the note on top so the worker
        # reads it first. Replacing a brief stays an explicit act (`cc board set … instructions`), never a side
        # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
-       [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] && repair_reserve   # after every door above: a held launch reserves nothing
-       write_brief || exit 1
+       dispatch_brief || exit 1   # after every door above: a held launch reserves nothing
        # ROOM FOR ONE MORE (cc-room): fewer than CC_WORKER_CAP loops running, and the five-hour window not ahead of
        # its clock by more than CC_WORKER_PACE_MARGIN. Without it the launch is QUEUED, not refused: the window opens
        # with the loop behind `cc-room admit`, which waits (no claude, no model call) and starts it by itself once
