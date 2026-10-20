@@ -62,7 +62,8 @@
 #                             card's `card: <channel> <ts>`); on a kind=session row it pushes and stops there —
 #                             a living project has no PR and is never done — and types READY TO LAND at the repo's
 #                             planning seat (cc-msg --turn); no turn took it = a cc-notify --ask request and exit 7; no request filed either = exit 6. Nothing here merges: for a repo that
-#                             lands itself (any not in CC_SELF_LAND_EXCEPT) it is cc-loop that queues the landing
+#                             lands itself (any not in CC_SELF_LAND_EXCEPT) it queues the PR on the landing queue, as
+#                             a seat would by hand, unless the row is held or the PR is a draft (--json leaves that to its caller)
 #                             Run inside ~/.cc/worktrees/<repo>/<track> the two names may be left off; a worktree made
 #                             by hand (no .cc/track) has the marker written first, and it says so. A commit that
 #                             leaves changes behind is said and exits 1, before any push, PR or board write
@@ -734,6 +735,16 @@ onto_pr(){   # $1 repo $2 track $3 worktree → "<branch> <url>" for a row whose
   v=$(cd / && timeout -k 5 30 gh pr view "$pr" --json url,state,isCrossRepository,headRefName 2>/dev/null) || return 1
   onto_pr_branch "track/$2" "$(default_branch "$DEV/$1")" "$slug" <<<"$v"; }
 
+queue_pr(){   # $1 repo $2 track $3 worktree $4 PR number $5 card "<chat> <ts>" — queues the PR as a seat would by hand, unless the
+  # row is held or the PR is a draft (brief, 2026-10-13); the lane still gates and reviews, and refuses a protected path
+  # itself with the 🔐 card. Prints one `queued: PR #N — …` or `not queued: PR #N — <why>` line, which cc-loop reads.
+  local held lo lchat lts lq=()
+  if held=$("$BOARD" get "$1" "$2" held 2>/dev/null) && [ -n "$held" ]; then echo "not queued: PR #$4 — the row is on hold ($held)"; return 0; fi
+  [ "$(cd "$3" && gh api "repos/$(pr_slug "$3")/pulls/$4" -q .draft 2>/dev/null)" = true ] && { echo "not queued: PR #$4 — it is a draft"; return 0; }
+  read -r lchat lts <<<"${5:-}"; [ -n "${lts:-}" ] && lq=(--chat "$lchat" --ts "$lts")
+  if lo=$("${CC_LAND:-$BIN/cc-land}" queue "$1" "$4" --who "cc done" ${lq[@]+"${lq[@]}"} 2>&1); then echo "queued: PR #$4 — no 👍 needed"   # CC_LAND: test hook
+  else echo "not queued: PR #$4 — the landing queue would not take it, so nothing is merging; a 👍 on its card lands it"; fi
+  [ -n "$lo" ] && echo "landing queue: ${lo//$'\n'/ }"; return 0; }
 # CC DONE ASKS GITHUB OVER REST (raised-graphql-hour-spent-stalls-landing, 2026-10-19): `gh pr list/create` spend the
 # login's GraphQL hour, which the lander's passes had used up at 18:1xZ while REST still held 4815 of 5000, so two
 # finished tracks ended "open PR lookup failed — no PR created". The lookups and the create are `gh api` on
@@ -1999,7 +2010,8 @@ case "${1:-}" in
         "$BOARD" note "$repo" "$track" "cc done: $m" >/dev/null 2>&1 || true; echo "cc: $m"; exit 1; fi
       done_board review "$ourl"
       "$BOARD" note "$repo" "$track" "cc done: pushed ${tip:0:12} onto $obr — $ourl carries the fix, no second PR" >/dev/null 2>&1 || true
-      echo "pushed ${tip:0:12} onto $obr, the branch of $ourl — no second PR. The board's PR is $ourl, so a loop's DONE queues it to land again as it does any PR (or waits on the 👍 where this repo does not land its own); started by hand, nothing re-queues it"; echo "PR: $ourl"; exit 0; fi
+      echo "pushed ${tip:0:12} onto $obr, the branch of $ourl — no second PR"; echo "PR: $ourl"
+      self_lands "$repo" && [ "$done_json" = 0 ] && queue_pr "$repo" "$track" "$wt" "${ourl##*/}" ""; exit 0; fi
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
     if [ "$done_managed" = 1 ]; then
       # THE BRIEF COMES FROM ITS ONE HOME, not through the board: a board that cannot be read must not cost a
@@ -2048,8 +2060,8 @@ PY
       # The card goes up whichever way this project lands: #approvals when the owner's 👍 is the merge, #<repo>-updates
       # for a repo that lands its own PRs (cc-slack card_lane), and cc-land edits that same card to `landed ✓` — so the
       # card is posted BEFORE anything queues.
-      # ITS COORDINATES ARE PRINTED (`card: <channel> <ts>`, from post-approval --print-chat) because the queue is
-      # cc-loop's and it needs somewhere to answer: given them, a landing that STOPS marks that very card ✗ and
+      # ITS COORDINATES ARE PRINTED (`card: <channel> <ts>`, from post-approval --print-chat) and handed to the
+      # queue below, which needs somewhere to answer: given them, a landing that STOPS marks that very card ✗ and
       # replies under it, instead of leaving a pending-looking card in #approvals and saying so somewhere else.
       if [ "$done_managed" = 0 ]; then
       card=""   # CC_SLACK: test hook, and the reason it also opens the guard below — a suite must be able to drive
@@ -2064,12 +2076,15 @@ PY
       under=""   # a self-land grant (sl 0 or 3) does not reach a PROTECTED path — ask before promising "nothing waits on a 👍"
       case "$sl" in 0|3) under=$(protected_hit_line "$repo" "$prn") || under="" ;; esac
       if [ -n "$under" ]; then
-        echo "PR #$prn is not queued — $under. The box never lands one of these on its own, whatever the self-land rule says: only the owner's own 👍 on the 🔐 card in #approvals queues it (the card cc-land raises when it refuses to queue this PR; a 👍 on the PR card itself authorizes nothing)."
+        echo "PR #$prn touches a protected path — $under. The box never lands one of these on its own, whatever the self-land rule says: only the owner's own 👍 on the 🔐 card in #approvals queues it (the card cc-land raises when it refuses to queue this PR; a 👍 on the PR card itself authorizes nothing)."
+        [ "$sl" = 0 ] && [ "$done_json" = 0 ] && ! member_workspace "$repo" && queue_pr "$repo" "$track" "$wt" "$prn" "${card:-}"
       else
       case "$sl" in
         3)  echo "the host lands this for you: cc-checkpoint --sweep queues PR #$prn within five minutes when this workspace holds the grant (a GitHub token, and not named in CC_SELF_LAND_EXCEPT) — nothing here does, and nothing waits on a 👍" ;;
         0)  if member_workspace "$repo"; then echo "$repo lands its own PRs: the host's sweep queues PR #$prn as $repo--$track (cc-checkpoint --sweep, within five minutes) — nothing waits on a 👍. Now? cc-land queue $repo--$track $prn"
-            else echo "$repo lands its own PRs: the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn"; fi ;;
+            # queue_pr: as a seat would by hand, unless held or a draft. --json's caller queues.
+            elif [ "$done_json" = 1 ]; then echo "$repo lands its own PRs: whoever asked for this receipt queues PR #$prn"
+            else queue_pr "$repo" "$track" "$wt" "$prn" "${card:-}"; fi ;;
         2)  echo "cc: $repo is granted no GitHub token (cc-sandbox github $repo) — nothing can land for it. PR #$prn waits for a 👍." ;;
         *)  echo "land it with:  cc-land $repo $prn   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)" ;;
       esac

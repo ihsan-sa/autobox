@@ -218,6 +218,7 @@ case "$*" in
     [ ! -e "$D/merged.fail" ] || exit 1
     [ ! -e "$D/merged.json.fail" ] || { echo '{"message":"Server Error","status":"502"}'; echo "gh: Server Error (HTTP 502)" >&2; exit 1; }
     [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/url"; exit 0;;
+  *"pr view"*"headRefName"*) cat "$D/onto" 2>/dev/null; exit 0;;
   *"-X POST "*"/pulls"*)
     echo create >> "$D/creates"; for a; do case $a in title=@*|body=@*) cat "${a#*=@}"; echo;; *) printf '%s\n' "$a";; esac; done > "$D/create.args"
     [ ! -e "$D/empty" ] || exit 0
@@ -256,7 +257,7 @@ newdone(){
   "$D/bin/cc-task" claim r "$row" --executor subagent >/dev/null
   printf 'Brief from task.md\n<!-- cc-brief:inflight -->\nprivate inflight\n<!-- /cc-brief:inflight -->\nAcceptance stays.\n' > "$st/task.md"
   echo work > "$wt/work.txt"
-  rm -f "$D/"*.fail "$D/zero" "$D/push-zero" "$D/lost" "$D/empty" "$D/card.empty" "$D/legacy" "$D/open" "$D/merged.oid" "$D/url-error" "$D/open.ratelimit" "$D/public-url" "$D/gh-repo"
+  rm -f "$D/"*.fail "$D/zero" "$D/push-zero" "$D/lost" "$D/empty" "$D/card.empty" "$D/legacy" "$D/open" "$D/merged.oid" "$D/url-error" "$D/open.ratelimit" "$D/public-url" "$D/gh-repo" "$D/onto"
   : > "$D/creates"; : > "$D/cards"; : > "$D/gh.calls"; : > "$D/board.calls"
   echo https://github.com/fixture/repo/pull/42 > "$D/url"
 }
@@ -386,6 +387,23 @@ for spelling in https ssh; do
   { [ "$rc" = 0 ] && hasreceipt '.pr_url != null and .committed_sha == .pushed_sha'; } \
     && ok "P22 $spelling: PR lookup pins the push repository in gh format, ignoring caller GH_REPO" || bad "P22 $spelling: $(cat "$D/out" "$D/err")"
 done
+# P24: a repair pushed onto ANOTHER branch's open PR (onto_pr) is queued like any PR of a self-landing repo, once —
+# cc done's onto path used to exit before the queue, and with the loop's own queue call gone nothing queued it.
+newdone onto; rm "$st/delivery.json"; touch "$D/legacy"
+public=https://github.com/fixture/repo.git; git -C "$wt" config --add "url.$D/remote.git.insteadOf" "$public"; echo "$public" > "$D/public-url"
+"$B/cc-board" set r "$row" pr https://github.com/fixture/repo/pull/7 >/dev/null
+printf '{"url":"https://github.com/fixture/repo/pull/7","state":"OPEN","isCrossRepository":false,"headRefName":"dispatch/7"}\n' > "$D/onto"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\n' "$D" > "$D/bin/landstub"; chmod +x "$D/bin/landstub"; : > "$D/land.calls"
+CC_SELF_LAND_EXCEPT= CC_LAND="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(cat "$D/land.calls")" = "queue r 7 --who cc done" ] && [ ! -s "$D/creates" ] \
+  && [ "$(git -C "$D/remote.git" rev-parse dispatch/7)" = "$(git -C "$wt" rev-parse HEAD)" ] && grep -q '^queued: PR #7 ' "$D/onto.out"; } \
+  && ok "P24: a repair pushed onto another branch's open PR queues that PR, once, and opens no second PR" || bad "P24: rc=$rc calls=[$(cat "$D/land.calls")] $(cat "$D/onto.out")"
+: > "$D/land.calls"; newdone onto2; rm "$st/delivery.json"; touch "$D/legacy"; echo "$public" > "$D/public-url"
+"$B/cc-board" set r "$row" pr https://github.com/fixture/repo/pull/7 >/dev/null; "$B/cc-board" set r "$row" held "kept back" >/dev/null
+printf '{"url":"https://github.com/fixture/repo/pull/7","state":"OPEN","isCrossRepository":false,"headRefName":"dispatch/8"}\n' > "$D/onto"
+CC_SELF_LAND_EXCEPT= CC_LAND="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ ! -s "$D/land.calls" ] && grep -q 'onto dispatch/8' "$D/onto.out" && grep -q '^not queued: PR #7 — the row is on hold (kept back)' "$D/onto.out"; } \
+  && ok "P24 control: the same push on a held row pushes but queues nothing, and says why" || bad "P24 control: rc=$rc calls=[$(cat "$D/land.calls")] $(cat "$D/onto.out")"
 newdone local; git -C "$HOME/dev/r" remote remove origin; mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-workspace"
 echo all > "$D/board.fail"; rundone
 { [ "$rc" != 0 ] && hasreceipt '.closed == null and .pushed_sha == null and .pending.board.status == "done"' \
@@ -418,14 +436,11 @@ printf '%s %s\n' "$pass" "$fail" > "$D/counts"
 )
 read -r m2pass m2fail < "$T/done-fixture/counts"; pass=$((pass+m2pass)); fail=$((fail+m2fail))
 # M2 completion fixtures end.
-# P8: THE STANDING GRANT, and where it may NOT be spent. A project CC_SELF_LAND_EXCEPT (~/.cc/config) does not name
-# does not wait for a 👍 — but `cc done` never queues the landing itself, however granted the repo is: a worker and a
-# member-facing session are both told to run that command, and a queue behind it would be the merge cc-guard denies
-# them wearing another name. The queue is cc-loop's (P9 below), and all `cc done` does is say who lands this one and
-# hand over the card. `SLACK_BOT_TOKEN=` pins the real door: this is the first cc done case whose gh stub returns a
-# URL, so it is the first that could reach #approvals with a fixture PR.
+# P8: THE STANDING GRANT. A project CC_SELF_LAND_EXCEPT (~/.cc/config) does not name does not wait for a 👍: `cc done`
+# queues the PR itself unless the row is held or the PR is a draft, and a member-facing repo holds no grant (P8c).
+# `SLACK_BOT_TOKEN=` pins the real door: the first cc done case whose gh stub returns a URL, so it could reach #approvals.
 mkdir -p "$T/ghbin8"
-printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"/pulls/77"*) [ -n "${DRAFT8:-}" ] && echo true;; esac\nexit 0\n' > "$T/ghbin8/gh"
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
 chmod +x "$T/ghbin8/gh" "$T/landstub"; : > "$T/land.calls"
 "$B/cc" $REPO w18 >/dev/null 2>&1; sleep 1
@@ -437,9 +452,15 @@ o8a=$(done8)
   && ok "cc done: a repo named as an exception waits for a 👍, and it says how to land it (P8a)" \
   || bad "cc done on an ungranted repo: $(cat "$T/land.calls") $o8a"
 o8b=$(done8 CC_SELF_LAND_EXCEPT="other")
-{ [ ! -s "$T/land.calls" ] && grep -q "lands its own PRs" <<<"$o8b" && grep -q "the loop queues PR #77" <<<"$o8b"; } \
-  && ok "cc done: even for a repo that holds the grant, cc done queues nothing — it names the loop as what lands it, so the one command a worker is told to run is not a way round the merge gate (P8b)" \
-  || bad "cc done queued a landing itself: $(cat "$T/land.calls") $o8b"
+{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^queued: PR #77 — no 👍 needed" <<<"$o8b"; } \
+  && ok "cc done: a repo that holds the grant has its PR queued by cc done itself, once, as a seat would by hand (P8b)" \
+  || bad "cc done did not queue a granted PR: $(cat "$T/land.calls") $o8b"
+: > "$T/land.calls"; "$B/cc-board" set $REPO w18 held "kept back" >/dev/null
+o8h=$(done8 CC_SELF_LAND_EXCEPT="other"); h8=$(cat "$T/land.calls"); "$B/cc-board" set $REPO w18 held "" >/dev/null
+o8d=$(done8 CC_SELF_LAND_EXCEPT="other" DRAFT8=1)
+{ [ -z "$h8" ] && [ ! -s "$T/land.calls" ] && grep -q "^not queued: PR #77 — the row is on hold (kept back)" <<<"$o8h" && grep -q "^not queued: PR #77 — it is a draft" <<<"$o8d"; } \
+  && ok "…but not a held row's PR, nor a draft (P8b is the control)" \
+  || bad "cc done queued a held or draft PR: held=[$h8 $o8h] draft=[$(cat "$T/land.calls") $o8d]"
 mkdir -p ~/dev/$REPO/.cc; touch ~/dev/$REPO/.cc/member-facing
 o8c=$(done8 CC_SELF_LAND_EXCEPT=); rm -f ~/dev/$REPO/.cc/member-facing
 { [ ! -s "$T/land.calls" ] && grep -q 'land it with:  cc-land' <<<"$o8c" && ! grep -q 'lands its own PRs' <<<"$o8c"; } \
@@ -468,11 +489,15 @@ r8g=$(CC_SELF_LAND_EXCEPT= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
 # nothing waits on a 👍" and nothing did, because it touched learn-fetch/). `cc done` now asks cc-land's OWN
 # protected_hit before saying that, rather than reading CC_PROTECTED_PATHS a second time.
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
-o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/)
-{ [ ! -s "$T/land.calls" ] && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
+# …and it still CALLS the queue: cc-land's own refusal is what raises that 🔐 card (the stub refuses, as cc-land does).
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "protected path: learn-fetch/foo.py"; exit 1\n' "$T" > "$T/landrefuse"; chmod +x "$T/landrefuse"
+: > "$T/land.calls"
+o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND="$T/landrefuse")
+{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^not queued: PR #77 — " <<<"$o8f" \
+  && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
   && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
   && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \
-  && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' (P8f)" \
+  && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' — and asks cc-land to queue it, whose refusal raises that card (P8f)" \
   || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going

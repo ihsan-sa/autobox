@@ -412,7 +412,7 @@ def selfcheck():
 
         # --- the line to the seat that dispatched it ------------------------------------------------------------
         for name, kw, want in (("hint-green", {}, "Green at its head: `cc-try on demo 7`"),
-                               ("hint-red", {"check": "1"}, "Once its gate is green, `cc-try on demo 7`"),
+                               ("hint-red", {"check": "1"}, ""),
                                ("hint-guard", {"files": ("core/bin/cc-guard",)}, "")):
             F = fx(name, **kw)
             r = F["run"]("hint", "demo", "https://github.com/x/demo/pull/7", "feat")

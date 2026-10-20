@@ -269,8 +269,8 @@ rm -f "$T/remote.git/hooks/pre-receive"
   && ! tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 done" && tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 finished, but opened no PR"; } \
   && ok "STATUS: DONE over a dead push is not done: cc done's failure reaches the loop — exit 4, board blocked with the reason, no DONE notice (audit F3)" \
   || bad "a dead push finished green: rc=$rc status=$("$B/cc-board" get $REPO w15 status) notes=$("$B/cc-board" get $REPO w15 notes | tail -c 200)"
-# P9: THE GRANT IS SPENT BY THE LOOP, and by nothing a session can type. A track on a repo
-# CC_SELF_LAND_EXCEPT does not name that finishes DONE has its landing queued right here, once `cc done` has returned a PR — and
+# P9: THE GRANT, END TO END. A track on a repo
+# CC_SELF_LAND_EXCEPT does not name that finishes DONE has its landing queued by the `cc done` the loop runs — and
 # with the coordinates of the card `cc done` just posted, so a landing that STOPS marks and answers that card instead
 # of leaving one that still reads as pending in #approvals. Both real doors are stubbed: CC_LAND, because a real
 # `queue` writes into this box's own landing queue and starts a worker that gates, MERGES and deploys; CC_SLACK,
@@ -286,8 +286,8 @@ printf '#!/bin/sh\ncase "$1" in post-approval) echo "CAPPR 1788000000.000100";; 
 : > "$T/land.calls"
 CC_SELF_LAND_EXCEPT= CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 0 ] && grep -qx "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" "$T/land.calls"; } \
-  && ok "cc-loop spends the grant: a DONE track on a granted repo has its PR queued by the LOOP — on the host, in a process no session can spell — carrying the #approvals card cc done just posted, so a stopped landing answers that card (P9)" \
+{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" ]; } \
+  && ok "the grant end to end: a DONE track on a granted repo has its PR queued by the cc done its loop runs, once, carrying the #approvals card cc done just posted, so a stopped landing answers that card (P9)" \
   || bad "the loop did not queue with the card: rc=$rc calls=[$(cat "$T/land.calls")]"
 : > "$T/land.calls"
 CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
@@ -295,6 +295,16 @@ CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T
 [ ! -s "$T/land.calls" ] \
   && ok "…and a repo named as an exception (the suite's own CC_SELF_LAND_EXCEPT) is left exactly as it was: the loop queues nothing and the PR waits for a 👍 (P9b)" \
   || bad "the loop queued a landing for an ungranted repo: $(cat "$T/land.calls")"
+# P9p: a granted repo's PR on a PROTECTED path still reaches the queue from the loop's DONE: cc-land's refusal is what
+# raises the 🔐 card in #approvals, so a cc done that only printed the door would leave a PR nothing ever asks about.
+printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin9p"; mkdir -p "$T/ghbin9"; mv "$T/ghbin9p" "$T/ghbin9/gh"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "protected path: learn-fetch/foo.py"; exit 1\n' "$T" > "$T/landrefuse"; chmod +x "$T/ghbin9/gh" "$T/landrefuse"
+: > "$T/land.calls"
+env CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND="$T/landrefuse" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin9:$PATH" \
+  "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" ]; } \
+  && ok "…and a granted repo's PR touching a PROTECTED path is still handed to the queue by the loop's cc done, whose refusal raises the 🔐 card (P9p)" \
+  || bad "the loop never asked the queue about a protected-path PR: rc=$rc calls=[$(cat "$T/land.calls")]"
 # P9c-P9j: managed host delivery. Own HOME, board, state and Git remote; systemd-run only records a start.
 (
 pass=0; fail=0
