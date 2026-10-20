@@ -1,7 +1,8 @@
 """The bwrap profile a hermetic check runs in (review B2b), modelled on `cc-suites runner`, not on `cc-sandbox vet`.
 
 WHAT IS INSIDE: the distribution read-only (/usr and the merged-usr links, the real /etc — vet's tmpfs /etc loses
-/usr/bin/awk through /etc/alternatives), /opt when there is one, a fresh /proc, /dev and tmpfs /tmp; the check's tree
+/usr/bin/awk through /etc/alternatives), /opt and /var/lib/texmf (the TeX formats /usr's pdflatex
+loads) when there, a fresh /proc, /dev and tmpfs /tmp; the check's tree
 read-write at /work/tree — never at its host path, whose parent directories would name this user's HOME — as a git
 repo with one commit (the identity check greps it, B1); a tmpfs HOME at /work/home holding only a stub
 `~/.local/bin/claude` that sleeps (the suite stubs every model call; a window that starts one must stay up) — off
@@ -136,7 +137,8 @@ def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | 
             a += ["--symlink", os.readlink(p), p]
         elif os.path.isdir(p):
             a += ["--ro-bind", p, p]
-    a += ["--ro-bind", "/etc", "/etc", "--ro-bind-try", "/opt", "/opt", "--proc", "/proc", "--dev", "/dev",
+    a += ["--ro-bind", "/etc", "/etc", "--ro-bind-try", "/opt", "/opt",
+          "--ro-bind-try", "/var/lib/texmf", "/var/lib/texmf", "--proc", "/proc", "--dev", "/dev",
           "--tmpfs", "/tmp", "--tmpfs", "/run"]
     if check.net:   # the resolver the real /etc points at
         a += ["--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve"]

@@ -506,7 +506,8 @@ def run_selfcheck():
                     # A START THAT DIDN'T HAPPEN IS NEVER SILENT (raised-slack-autostart-silent-on-a-done-track, 2026-10-17): `cc`
                     # refused a member's project whose row was done, cc-slack logged "starting", and the thread said nothing.
                     # A member's landed row is reopened on the board and started; any other refusal is "refused", its
-                    # own text in the log, and the cooldown dropped so the next message tries again.
+                    # own text in the log, and the cooldown dropped so the next message tries again. The thread gets a
+                    # fixed sentence, never cc's text: that can name host paths and a member reads it (perms, 2026-10-20).
                     import contextlib, io
                     os.makedirs(f"{DEV}/memd/.cc", exist_ok=True)
                     open(f"{DEV}/memd/{MEMBER_MARKER}", "w").close()
@@ -523,7 +524,7 @@ def run_selfcheck():
                     try:
                         ccrc[:] = [(1, b"cc: memd/p has landed - no session opened\n"), (0, b"")]
                         st_re = Daemon.autostart(dm, "memd/p"); ran_re = len(scalls) - n_r
-                        ccrc[:] = [(1, b"cc: memd/p: some other refusal\n")]
+                        ccrc[:] = [(1, f"cc: {hw}/.cc/worktrees/memd/p: some other refusal\n".encode())]
                         dm.starting.pop("memd/p", None); buf_r = io.StringIO()
                         with contextlib.redirect_stderr(buf_r):
                             st_rf = Daemon.autostart(dm, "memd/p")
@@ -531,11 +532,32 @@ def run_selfcheck():
                         EFFECTS.popen_impl, EFFECTS.run_impl = _popR, _runR
                     check("autostart: a member's project whose row has landed is reopened on the board (status running, a "
                           "note) and started; a start cc refuses for any other reason is 'refused', with cc's own text in "
-                          "the log and kept for the thread's line, and no cooldown left to swallow the next message",
+                          "the log only, a fixed sentence kept for the thread's line, and no cooldown left to swallow the "
+                          "next message",
                           st_re == "starting" and ran_re == 2 and [b[:4] for b in boardR] == [["status", "memd", "p", "running"],
                           ["note", "memd", "p", boardR[1][3]]] and st_rf == "refused"
-                          and "REFUSED — cc: memd/p: some other refusal" in buf_r.getvalue()
-                          and dm.refused.get("memd/p") == "cc: memd/p: some other refusal" and "memd/p" not in dm.starting)
+                          and f"REFUSED — cc: {hw}/.cc/worktrees/memd/p: some other refusal" in buf_r.getvalue()
+                          and dm.refused.get("memd/p") == "the box refused to open its session"
+                          and hw not in refused_line("memd/p", dm.refused["memd/p"]) and "memd/p" not in dm.starting)
+                    # AN OWNER'S LANDED TRACK IS NEVER REOPENED from a thread (perms, 2026-10-20): the reopen above is for
+                    # a member's own project only. A message, a member's included, runs no cc and touches no row; the
+                    # owner's `!restart` runs cc, whose landed refusal stands and is said, the row left as it is.
+                    ccrc[:] = [(1, b"cc: own/done has landed - no session opened\n")] + [(0, b"")] * 2   # spares: a wrong reopen is a ✗, not a crash
+                    boardR.clear(); n_o = len(scalls)
+                    EFFECTS.popen_impl = pop_rc
+                    EFFECTS.run_impl = lambda cmd, **k: boardR.append(cmd[1:]) or subprocess.CompletedProcess(cmd, 0, "", "")
+                    try:
+                        dm.starting.pop(f"{name}/t1", None)
+                        st_om = Daemon.autostart(dm, f"{name}/t1"); ran_om = len(scalls) - n_o
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            st_oa = Daemon.autostart(dm, f"{name}/t1", asked=True)
+                    finally:
+                        EFFECTS.popen_impl, EFFECTS.run_impl = _popR, _runR; dm.starting.pop(f"{name}/t1", None)
+                    check("autostart: an owner's track whose row has landed is not reopened — a message (a member's "
+                          "too) runs nothing and touches no row; the owner's `!restart` is 'refused', its row untouched",
+                          st_om == "no-session" and ran_om == 0 and st_oa == "refused" and len(scalls) - n_o == 1
+                          and not any(b[:1] in (["status"], ["note"]) for b in boardR)
+                          and dm.refused.get(f"{name}/t1") == "its board row has landed")
 
                     # A TEST FIXTURE'S NAME NEVER STARTS A SESSION (09-26: three _cctest targets ran real Opus sessions
                     # for 40 min to 2 h): queued and nothing run, an arriving message or the owner naming it alike.
@@ -8048,14 +8070,14 @@ def run_selfcheck():
         check("hand_off: 'starting' and 'spooled' post nothing (the 👀 and then the answer are the whole story); "
               "'paused' still says the repo is paused",
               len(saidT) == 1 and "is paused" in saidT[0])
-        saidT.clear(); dmT.refused["myrepo/w1"] = "cc: myrepo/w1 has landed - no session opened\nmore"
+        saidT.clear(); dmT.refused["myrepo/w1"] = "its board row has landed"
         dmT.deliver = lambda target, payload, **k: "refused"
         dmT.hand_off("myrepo/w1", "hi", {}, "CREPO", "9.0", "9.5")
         dmT.hand_off("myrepo/w1", "again", {}, "CREPO", "9.0", "9.6")
         check("hand_off: a refused start gives the thread one line per message saying it didn't start and why "
               "(2026-10-17: a done row's thread said nothing), never handed on to the repo session as if nobody listened",
-              len(saidT) == 2 and saidT[0] == "`myrepo/w1` didn't start: cc: myrepo/w1 has landed - no session opened "
-              "— your message is queued.")
+              len(saidT) == 2 and saidT[0] == "`myrepo/w1` didn't start: its board row has landed — your message is "
+              "queued. The box's log has the details.")
         # THE HOP RECEIPTS (cc-receipts checks them): hand_off writes `received` with the route it picked, and the
         # class's deliver() a `delivery` saying what happened, both keyed by the message's (chat, ts); a payload
         # that is not a message (a permission answer) leaves none. Own scratch dir, emptied first.

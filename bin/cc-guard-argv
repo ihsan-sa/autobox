@@ -40,6 +40,8 @@ Rules for both gated roles:
   ~, for any verb but echo/printf; or one of those path names (ccbox/env, .credentials.json, credentials.json,
   .cc/secrets, .codex/auth.json, cursor/auth.json; member also .cc/config .ssh .claude/settings.json .cc/sandbox) as text inside
   a python/perl/ruby/node/php -c/-e body or awk/sed program (so a commit message or grep pattern still passes) -> never
+  (a member's computed word — `~/.cc/$d`, `$d/x`, `~/.cc/$(..)`, backticks — is read, and fenced as a write target,
+  as the glob it could match: dynpat)
   (the one exception, role pf only: `cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json` alone
   on the line, ~ or $HOME, names the workers' login without reading it, and so does a cc-notify --approval --run of
   exactly that text; namesonly)
@@ -938,6 +940,18 @@ class Guard:
                 out.append(base)
         return out
 
+    def dynpat(g, v):   # a computed word as the glob it could match: its text up to the first $ or `, then anything. The
+        # path deny is matched on text, so `d=slack; cat ~/.cc/$d/x` named no denied path until this (perms' read of #937).
+        # A leading variable this command set is its value, or what its substitution prints; one computed from text that
+        # names a path may be anywhere.
+        m = re.match(r'\$\{?(\w+)\}?', v)
+        if m and m.group(1) in g.vars:
+            k = m.group(1); val = g.vars[k]
+            if val is None: val = g.vout.get(k, '').strip() or ('/*' if re.search(r'[~/]|HOME|\.cc', g.vsrc.get(k, '')) else '$')
+            v = val + v[m.end():]
+        if v == '~' or v.startswith('~/'): v = g.home + v[1:]
+        return re.split(r'[$`]', v)[0] + '*'
+
     def is_secret(g, cand, glob, cwd):
         p = g.absp(cand, cwd)
         if g.own and any(q == g.own or q.startswith(g.own + '/') for q in (p, os.path.realpath(p))): return False
@@ -1013,6 +1027,7 @@ class Guard:
                     hit = any(x == cr or x.startswith(cr + '/') for x in (a, os.path.realpath(a)))
                 if hit: return 'never', f'writing cc-lib\'s caller records ({w.v}): cc-guard writes them, and they decide who sees the Slack copy'
         for w in g.wtargets(R):
+            if w.dyn and g.role == 'member': w = Word(g.dynpat(w.v), glob=True)
             if w.dyn and not w.v.startswith(g.home): continue
             if w.glob:
                 cut = re.split(r'[*?[]', w.v)[0]
@@ -1063,9 +1078,11 @@ class Guard:
             named = g.namesonly(R)
             for w in R['argw'] + [r['w'] for r in R['redirs'] if r['op'] in ('<', '<>')]:
                 if any(w is x for x in named): continue
-                if w.dyn and not w.v.startswith(g.home): continue
+                dyn = w.dyn and g.role == 'member'   # a member's computed word is judged as the glob it could be
+                if w.dyn and not dyn and not w.v.startswith(g.home): continue
                 cands = {w.v} | ({w.v.split('=', 1)[1]} if '=' in w.v else set()) | ({w.v.split('@', 1)[1]} if '@' in w.v else set())
-                if any(c and '\n' not in c and g.is_secret(c, w.glob, R['cwd']) for c in cands):
+                if dyn: cands = {g.dynpat(c) for c in cands if c}
+                if any(c and '\n' not in c and g.is_secret(c, w.glob or dyn, R['cwd']) for c in cands):
                     return 'never', "reading the box's credentials" + (" or secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json, ~/.cc/sandbox)" if mem else '')
         for t in progtext(v or '', R['args'], R['redirs']):
             m = g.secn.search(t)

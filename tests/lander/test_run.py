@@ -1169,6 +1169,14 @@ class GuardReplayEvilGuard(unittest.TestCase):
         self.assertIn("GUARD_BASE=none, skipped", out)
 
 
+class Cage(unittest.TestCase):
+    def test_the_cage_binds_the_tex_formats_when_the_host_has_them(self):
+        # pdflatex from /usr needs its .fmt under /var/lib/texmf (cc-docs went red in the cage, 10-20)
+        a = S.argv(chk(run="true"), "/t", "/s")
+        i = a.index("/var/lib/texmf")
+        self.assertEqual(a[i - 1:i + 2], ["--ro-bind-try", "/var/lib/texmf", "/var/lib/texmf"])
+
+
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
 class Sandbox(Env):
     def test_inside_there_is_the_tree_and_none_of_the_box(self):
