@@ -17,8 +17,9 @@
 # `*` is every name and every global IP literal on every port, which is what a planning seat reaches.
 # An IP literal is refused unless the list names that literal (or has `*` and the literal is global), and a NAME that
 # resolves to a loopback, private, link-local or otherwise non-global address is refused whatever the list says, and
-# so is any address on the host's own interfaces or on-link with them, and any IPv6 form carrying an IPv4 address —
-# no listed name reaches the host's own services or the LAN. With no --allow, DEFAULT below: `*`, because a worker holds
+# so is any address on the host's own interfaces or on-link with them, the home's own public IPv4 (asked of an echo
+# service at start and every few minutes), and any IPv6 form carrying an IPv4 address — no listed name reaches the
+# host's own services or the LAN. With no --allow, DEFAULT below: `*`, because a worker holds
 # no login and the owner's rule (2026-10-20) is a seat's access with a net, not a wall; the host's own services stay
 # walled, since nothing undoes a worker driving them. A narrower list is `cc-config set CC_EGRESS_ALLOW "<list>"`
 # (cc-sandbox reads it and passes it here), e.g. the old default: the model APIs, GitHub, npm and PyPI.
@@ -36,6 +37,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.request
 
 DEFAULT = "*"
 USAGE = ("usage: cc-egress serve --socket <path> [--allow <list>] [--log <file>] [--parent <pid>]"
@@ -91,6 +94,40 @@ def allowed(rules, host, port):
 IF_INET6, FIB_TRIE, ROUTE = "/proc/net/if_inet6", "/proc/net/fib_trie", "/proc/net/route"
 # IPv6 forms that carry an IPv4 address (v4-compatible, v4-mapped, NAT64): refused whole, so none reaches a walled one.
 EMBEDS_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
+# The home's own public IPv4 is on no interface (the router holds it), yet the router may hairpin a connection to it back
+# onto the LAN, so it is walled too. Only an outside service can say what it is, so it is asked at start and every
+# PUBLIC_EVERY seconds after (IPv4-only endpoints, so the answer is never the IPv6 one), and a new lease is walled
+# within that. Every address seen stays walled: a past home address is nobody's server a worker needs.
+PUBLIC_V4 = ("https://api.ipify.org", "https://ipv4.icanhazip.com")
+PUBLIC_EVERY = 300
+public = frozenset()     # replaced whole, never changed in place, so a connection's thread never sees it half-built
+
+
+def lookup_public():
+    """→ the public IPv4 address the first echo service that answers sees this host come from, else None."""
+    for url in PUBLIC_V4:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                return ipaddress.IPv4Address(r.read(64).decode().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def refresh_public(log):
+    global public
+    a = lookup_public()
+    if a is None:
+        log("public IPv4 unknown: no echo service answered" + ("; still walling " + " ".join(map(str, sorted(public)))
+                                                              if public else ""))
+    elif a not in public:
+        public = public | {a}
+
+
+def watch_public(log):
+    while True:
+        time.sleep(PUBLIC_EVERY)
+        refresh_public(log)
 
 
 def host_nets():
@@ -137,6 +174,8 @@ def walled(addr, nets):
         return "carries an IPv4 address inside it"
     if any(a in n for n in nets):
         return "is on the host's own interfaces or on-link with them"
+    if a in public:
+        return "is the home's own public address, which the router may turn back onto the LAN"
     return None
 
 
@@ -283,6 +322,9 @@ def serve(sock, allow_text, logfile, parent):
                 append_capped(logfile, line)
             else:
                 print("cc-egress: " + line, file=sys.stderr, flush=True)
+    # Before the socket appears, so no worker connects while the home's address is still unknown (when a service answers).
+    refresh_public(log)
+    threading.Thread(target=watch_public, args=(log,), daemon=True).start()
     # Bound on a side path and renamed onto <sock> once it listens, so a waiter that sees <sock> (the selfcheck,
     # cc-sandbox's [ -S ]) can connect: bound but not yet listening, a connect is refused.
     side = sock + ".new"
@@ -366,6 +408,8 @@ def selfcheck():
             print(f"  FAIL {name}: got {got!r} want {want!r}")
         else:
             print(f"  ok   {name}")
+    global PUBLIC_V4, public
+    PUBLIC_V4 = ()      # no echo service is asked from here; the public-address case below feeds answers in
     d = tempfile.mkdtemp(prefix="cc-egress.")
     # A waiter polls for the path, then connects; a path that exists before listen() is a refused connect under load.
     early, seen = os.path.join(d, "early"), []
@@ -433,7 +477,6 @@ def selfcheck():
     t(".suffix does not admit the bare suffix", allowed(r, "example.com", 443), "not on the list")
     t("host:port admits that port", allowed(r, "api.x.org", 8443), None)
     t("host:port refuses 443", allowed(r, "api.x.org", 443), "not on the list")
-    t("the default list names no IP literal", [h for h, _, _ in parse_list(DEFAULT) if is_ip(h)], [])
     w = parse_list(DEFAULT)
     t("the default is a seat's reach: any name on any port", (allowed(w, "example.org", 443), allowed(w, "a.b.io", 8080)),
       (None, None))
@@ -474,6 +517,22 @@ def selfcheck():
             break
         threading.Event().wait(0.02)
     sock = star                     # ask() dials whatever `sock` names
+    # The home's public IPv4, as an echo service answers it, then the same after the lease changes.
+    answers, look = ["5.5.5.5", "5.5.5.6"], lookup_public
+    globals()["lookup_public"] = lambda: ipaddress.IPv4Address(answers.pop(0))
+    gai = socket.getaddrinfo
+    socket.getaddrinfo = lambda h, *a, **kw: gai("5.5.5.5" if h == "home.example" else h, *a, **kw)
+    try:
+        before = resolve("5.5.5.5", 443, w)[1] is None
+        refresh_public(print)
+        first = [ask(f"CONNECT {h} HTTP/1.1")[0] for h in ("5.5.5.5:22", "home.example:443")]
+        refresh_public(print)
+        t("`*` refuses the home's public IPv4 by literal and by name, and its new one after it changes",
+          (before, first, resolve("5.5.5.6", 443, w)[1] is None, resolve("5.5.5.5", 443, w)[1] is None,
+           resolve("1.1.1.1", 443, w)[1]), (True, ["403", "403"], False, False, None))
+    finally:
+        socket.getaddrinfo = gai
+        globals()["lookup_public"], public = look, frozenset()
     if mine:
         t("`*`: this host's own global IPv6 prefix is refused", ask(f"CONNECT [{mine[0]}]:22 HTTP/1.1")[0], "403")
     tables = {"IF_INET6": "26064700abcd00000000000000000005 02 40 00 80 eth0\n"

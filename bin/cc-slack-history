@@ -26,7 +26,7 @@ deleted, external or that fails to download is noted on its message and logged O
 Once a day (FILES_EVERY) a finished conversation's files.list is read too, and a file it lists that no held message
 carries (a canvas, or a file whose message the channel's history no longer shows) is kept the same way and noted in
 state.json as one of the chat's loose files. A canvas is kept as <file id>-<updated>-<name>.html, one file per edit.
-Directories are 0700 and files 0600.
+Directories are 0700 and files 0600, and none is opened through a link.
 
 HOW. Read-only against Slack: auth.test, users.list, conversations.list/history/replies, files.list
 and file downloads,
@@ -63,11 +63,13 @@ usage:
 cc-reconcile.service runs `pass --budget 240` on its 20-minute tick.
 """
 import collections
+import contextlib
 import fcntl
 import glob
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -104,6 +106,15 @@ class SlackError(Exception):
     pass
 
 
+def retry_after(headers):
+    """A 429's Retry-After in seconds. Slack sends whole seconds; anything else (an HTTP date, a fraction, nothing)
+    waits 30 s rather than end the pass on a ValueError."""
+    try:
+        return max(0, int((headers or {}).get("Retry-After") or 30))
+    except ValueError:
+        return 30
+
+
 class Slack:
     """The Web API, read-only, paced, and patient with a 429."""
 
@@ -125,7 +136,7 @@ class Slack:
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     self.limited += 1
-                    time.sleep(int((e.headers or {}).get("Retry-After") or 30))
+                    time.sleep(retry_after(e.headers))
                     continue
                 raise SlackError(f"{method}: http {e.code}")
             except (urllib.error.URLError, OSError, ValueError) as e:
@@ -142,8 +153,9 @@ class Slack:
             return d
         raise SlackError(f"{method}: rate limited six times running")
 
-    def download(self, url, dest, cap):
-        """Fetch a private file to dest (0600, through a .part file). None when kept, else why it was not."""
+    def download(self, url, dest, cap, dfd=None):
+        """Fetch a private file to dest, a name in the store directory dfd (0600, through a .part file, neither
+        opened through a link). None when kept, else why it was not."""
         tmp = dest + ".part"
         try:   # a malformed URL (a bad port, a broken IPv6 literal) raises here, and is a skip like any other
             u = urllib.parse.urlsplit(url)
@@ -164,7 +176,8 @@ class Slack:
                                              or "redir=" in (r.geturl() if hasattr(r, "geturl") else "")):
                     return "Slack answered with a web page, not the file"
                 n = 0
-                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                with open(tmp, "wb", opener=in_dir(dfd)) as f:
+                    os.fchmod(f.fileno(), 0o600)
                     while True:
                         b = r.read(1 << 20)
                         if not b:
@@ -173,12 +186,11 @@ class Slack:
                         if n > cap:
                             raise SlackError(f"over the cap of {cap} bytes while downloading")
                         f.write(b)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, dest)
+            os.replace(tmp, dest, src_dir_fd=dfd, dst_dir_fd=dfd)
             return None
         except (SlackError, urllib.error.URLError, OSError, ValueError) as e:
             try:
-                os.unlink(tmp)
+                os.unlink(tmp, dir_fd=dfd)
             except OSError:
                 pass
             return f"download failed: {e}"
@@ -186,59 +198,89 @@ class Slack:
 
 # ── files on disk ──────────────────────────────────────────────────────────────────────────────────────────────
 
-def mkdir(d):
-    """d and every parent up to the history root, 0700 (makedirs' mode is masked and skips existing parents). A
-    symlink anywhere from the root down to d is refused (OSError), never followed: a link planted in the tree would
-    otherwise take the chmod and every file written under it somewhere else."""
+@contextlib.contextmanager
+def at(d, create=True):
+    """A descriptor on d, the history root or a directory under it, made with its parents 0700 (makedirs' mode is
+    masked and skips existing parents); None when create is False and d is not there. Each step from the root's
+    parent down is opened relative to the one above it with O_NOFOLLOW, so a symlink anywhere in the tree is refused
+    (OSError), never followed. There is no check before the open for a link to be swapped in after (perms, #937):
+    mkdir makes no directory through a link, and what the open lands on is what every later call uses."""
     root = os.path.abspath(hist())
     d = os.path.abspath(d)
     if d != root and not d.startswith(root + os.sep):
         raise OSError(f"{d} is not under the history root {root}")
-    os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
-    parts = [] if d == root else d[len(root) + 1:].split(os.sep)
-    p = root
-    for part in [None] + parts:
-        p = p if part is None else os.path.join(p, part)
-        if os.path.islink(p):
-            raise OSError(f"{p} is a symlink; the history tree follows none")
-        try:
-            os.mkdir(p, 0o700)
-        except FileExistsError:
-            pass
-        if os.path.islink(p) or not os.path.isdir(p):
-            raise OSError(f"{p} is not a plain directory")
-        os.chmod(p, 0o700)
-
-
-def write_atomic(path, text):
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
+    if create:
+        os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        fd = os.open(os.path.dirname(root), os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        if create:
+            raise
+        yield None
+        return
+    try:
+        for part in [os.path.basename(root)] + ([] if d == root else d[len(root) + 1:].split(os.sep)):
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                sub = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if create:
+                    raise
+                os.close(fd)
+                fd = None
+                break
+            except OSError as e:
+                raise OSError(f"{part} under {d} is a symlink or not a directory; the history tree follows none") from e
+            os.close(fd)
+            fd = sub
+            if create:
+                os.fchmod(fd, 0o700)
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def in_dir(dfd):
+    """An opener for open(): a name in the directory dfd (or a path, when dfd is None), never through a link."""
+    return lambda name, flags: os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+
+
+def write_atomic(dfd, name, text):
+    tmp = f".tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    try:
+        with open(tmp, "x", encoding="utf-8", opener=in_dir(dfd)) as f:
+            os.fchmod(f.fileno(), 0o600)
             f.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
     except BaseException:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=dfd)
         except OSError:
             pass
         raise
 
 
-def load_json(path, default):
+def load_json(path, default, dfd=None):
+    """With dfd, path is a name in that store directory, opened without following a link. The daemon's own files
+    outside the store (members.json and the rest) are read by path, as before."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", opener=None if dfd is None else in_dir(dfd)) as f:
             d = json.load(f)
         return d if isinstance(d, type(default)) else default
     except (OSError, ValueError):
         return default
 
 
-def read_month(path):
-    """ts → record, in file order."""
+def read_month(path, dfd=None):
+    """ts → record, in file order. A month file that is a link reads as empty, and the next store replaces it."""
     held = {}
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", opener=in_dir(dfd)) as f:
             for line in f:
                 try:
                     d = json.loads(line)
@@ -273,25 +315,34 @@ def store(target, chat, recs):
     for r in recs:
         by[month_of(r["ts"])].append(r)
     new = changed = 0
-    for mon, rs in by.items():
-        d = f"{hist()}/{target}/{chat}"
-        mkdir(d)
-        p = f"{d}/{mon}.jsonl"
-        held, dirty = read_month(p), False
-        for r in rs:
-            old = held.get(r["ts"])
-            if old is None:
-                new += 1
-            elif same(old, r):
-                continue
-            else:
-                changed += 1
-            held[r["ts"]] = r
-            dirty = True
-        if dirty:
-            lines = sorted(held.values(), key=lambda x: float(x["ts"]))
-            write_atomic(p, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
+    if not by:
+        return new, changed
+    with at(f"{hist()}/{target}/{chat}") as dfd:
+        for mon, rs in by.items():
+            p = f"{mon}.jsonl"
+            held, dirty = read_month(p, dfd), False
+            for r in rs:
+                old = held.get(r["ts"])
+                if old is None:
+                    new += 1
+                elif same(old, r):
+                    continue
+                else:
+                    changed += 1
+                held[r["ts"]] = r
+                dirty = True
+            if dirty:
+                lines = sorted(held.values(), key=lambda x: float(x["ts"]))
+                write_atomic(dfd, p, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
     return new, changed
+
+
+def held_records(target, chat):
+    """Every record held for a chat, read through its directory's descriptor, so no link points a read elsewhere."""
+    with at(f"{hist()}/{target}/{chat}", create=False) as dfd:
+        if dfd is None:
+            return []
+        return [r for n in sorted(os.listdir(dfd)) if n.endswith(".jsonl") for r in read_month(n, dfd).values()]
 
 
 # ── which target a conversation belongs to ─────────────────────────────────────────────────────────────────────
@@ -400,22 +451,25 @@ def keep_files(sl, m, chat, target, ctx, st):
             name = re.sub(r"[^A-Za-z0-9._-]+", "_", e["name"]).strip("._")[:120] or "file"
             if f.get("filetype") == "quip":                  # a canvas downloads as its HTML, kept per edit
                 name = f"{f.get('updated') or 0}-{name}.html"
-            d = f"{hist()}/{target}/{chat}/files"
-            dest = f"{d}/{fid}-{name}"
-            if not (os.path.isfile(dest) and os.path.getsize(dest) > 0):
-                mkdir(d)
-                reason = sl.download(url, dest, ctx["cap"])
-                if not reason:
-                    ctx["files"] += 1
+            d, dest = f"{hist()}/{target}/{chat}/files", f"{fid}-{name}"
+            with at(d) as dfd:
+                try:
+                    have = os.stat(dest, dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    have = None
+                if not (have and stat.S_ISREG(have.st_mode) and have.st_size > 0):
+                    reason = sl.download(url, dest, ctx["cap"], dfd)
+                    if not reason:
+                        ctx["files"] += 1
             if not reason:
-                e["path"] = os.path.relpath(dest, hist())
+                e["path"] = os.path.relpath(f"{d}/{dest}", hist())
         if reason:
             e["skipped"] = reason
             key = f"{chat}/{fid or e['name']}"
             if key not in st["skipped"]:
                 st["skipped"].append(key)
                 ctx["skips"] += 1
-                with os.fdopen(os.open(f"{hist()}/skipped.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as lg:
+                with at(hist()) as dfd, open("skipped.log", "a", encoding="utf-8", opener=in_dir(dfd)) as lg:
                     lg.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{target}\t{chat}\t{m.get('ts')}\t"
                              f"{fid}\t{e['name']}\t{e['size']}\t{reason}\n")
         out.append(e)
@@ -427,8 +481,7 @@ def sweep_files(sl, chat, s, ctx, st, deadline):
     shared there whose message history no longer shows. Held in state as the chat's loose files."""
     if s.get("files_at") is not None and now() - float(s["files_at"]) < FILES_EVERY:
         return
-    held = {f.get("id") for p in glob.glob(f"{hist()}/{s['target']}/{chat}/*.jsonl")
-            for r in read_month(p).values() for f in r.get("files") or [] if f.get("path")}
+    held = {f.get("id") for r in held_records(s["target"], chat) for f in r.get("files") or [] if f.get("path")}
     loose, page, pages = s.setdefault("loose", {}), 1, 1
     while page <= pages:
         if now() >= deadline:
@@ -484,7 +537,15 @@ def read_page(sl, conv, s, msgs, ctx, st, deadline, recs, marks):
         if now() >= deadline:
             cut = True
             continue
-        marks[root] = max(latest, read_thread(sl, conv, s, root, held, ctx, st, recs), key=float)
+        try:
+            seen = read_thread(sl, conv, s, root, held, ctx, st, recs)
+        except SlackError as e:                              # as revisit: one bad thread never stops the page
+            if str(e) != "thread_not_found":
+                s["error"] = str(e)
+                ctx["errors"] += 1
+                continue                                     # unmarked: the next read that shows its root tries again
+            seen = latest
+        marks[root] = max(latest, seen, key=float)
         if not held:
             s.setdefault("revisited", {})[root] = now()
         ctx["threads"] += 1
@@ -553,6 +614,7 @@ def sync(sl, conv, st, ctx, deadline):
         s["unreachable"] = "the bot is not a member, and this tool never joins"
         return
     s.pop("unreachable", None)
+    s.pop("error", None)                                     # what this pass is refused, a thread's included, is noted anew
     try:
         while not s.get("done") and now() < deadline:      # BACKFILL, newest → oldest, resumable
             p = {"channel": chat, "limit": "1000"}
@@ -605,7 +667,6 @@ def sync(sl, conv, st, ctx, deadline):
         if deep:
             s["deep_at"] = t
         sweep_files(sl, chat, s, ctx, st, deadline)
-        s.pop("error", None)
     except SlackError as e:
         s["error"] = str(e)
         if str(e) in ("not_in_channel", "channel_not_found", "missing_scope", "access_denied"):
@@ -615,12 +676,13 @@ def sync(sl, conv, st, ctx, deadline):
 
 
 def save_state(st):
-    mkdir(hist())
-    write_atomic(f"{hist()}/state.json", json.dumps(st, indent=1, sort_keys=True))
+    with at(hist()) as dfd:
+        write_atomic(dfd, "state.json", json.dumps(st, indent=1, sort_keys=True))
 
 
 def load_state():
-    st = load_json(f"{hist()}/state.json", {})
+    with at(hist(), create=False) as dfd:
+        st = {} if dfd is None else load_json("state.json", {}, dfd)
     st.setdefault("convs", {})
     st.setdefault("skipped", [])
     return st
@@ -655,8 +717,8 @@ def users_of(sl):
 
 def locked():
     """The pass lock, held for the life of the process, or None when another pass holds it."""
-    mkdir(hist())
-    fd = os.open(f"{hist()}/.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    with at(hist()) as dfd:
+        fd = os.open(".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
@@ -699,13 +761,12 @@ def run_pass(sl, budget, cap, owner):
 def kept(target, chat, loose=None):
     """messages, threads with replies, and distinct files kept and skipped, a chat's loose files among them."""
     msgs, threads, files = 0, set(), {}
-    for p in glob.glob(f"{hist()}/{target}/{chat}/*.jsonl"):
-        for r in read_month(p).values():
-            msgs += 1
-            if r.get("thread_ts") and r["thread_ts"] != r["ts"]:
-                threads.add(r["thread_ts"])
-            for f in r.get("files") or []:
-                files[f.get("id") or f.get("name")] = files.get(f.get("id") or f.get("name")) or bool(f.get("path"))
+    for r in held_records(target, chat):
+        msgs += 1
+        if r.get("thread_ts") and r["thread_ts"] != r["ts"]:
+            threads.add(r["thread_ts"])
+        for f in r.get("files") or []:
+            files[f.get("id") or f.get("name")] = files.get(f.get("id") or f.get("name")) or bool(f.get("path"))
     for fid, f in (loose or {}).items():
         files[fid] = files.get(fid) or bool(f.get("path"))
     n = sum(files.values())
@@ -933,13 +994,78 @@ def selfcheck():
         os.makedirs(f"{tmp}/elsewhere")
         os.symlink(f"{tmp}/elsewhere", f"{hist()}/linked")
         try:
-            mkdir(f"{hist()}/linked/C0X/files")
-            followed = True
+            with at(f"{hist()}/linked/C0X/files"):
+                followed = True
         except OSError:
             followed = False
-        ok("mkdir refuses a symlink in the history tree rather than following it",
+        ok("the directory opener refuses a symlink in the history tree rather than following it",
            not followed and os.listdir(f"{tmp}/elsewhere") == [])
         os.unlink(f"{hist()}/linked")
+
+        # perms, #937: no file or directory of the store is opened through a link, planted or swapped in
+        DIR, out = f"{tmp}/links", f"{tmp}/outside"
+        for d in (f"{hist()}/proj/C0LNK/files", f"{out}/dir", f"{out}/rd"):
+            os.makedirs(d)
+        for n, body in (("month", '{"ts": "1.000001", "text": "planted"}\n'), ("log", ""), ("part", "theirs"),
+                        ("file", "theirs"), ("state", '{"convs": {"C0PLANT": {}}}'), ("rd/1970-01.jsonl", '{"ts": "1"}\n')):
+            open(f"{out}/{n}", "w").write(body)
+        os.symlink(f"{out}/month", f"{hist()}/proj/C0LNK/1970-01.jsonl")
+        os.symlink(f"{out}/part", f"{hist()}/proj/C0LNK/files/F2-F2.png.part")
+        os.symlink(f"{out}/file", f"{hist()}/proj/C0LNK/files/F3-F3.png")
+        os.symlink(f"{out}/state", f"{hist()}/state.json")
+        os.symlink(f"{out}/dir", f"{hist()}/linkdir")
+        os.symlink(f"{out}/rd", f"{hist()}/proj/C0RD")
+        lp = f"{hist()}/proj/C0LNK/1970-01.jsonl"
+        store("proj", "C0LNK", [{"ts": "2.000001", "text": "kept"}])
+        ok("a month file planted as a link is neither read nor written through: the store's own file replaces the link",
+           not os.path.islink(lp) and sorted(read_month(lp)) == ["2.000001"]
+           and open(f"{out}/month").read() == '{"ts": "1.000001", "text": "planted"}\n')
+        lctx, lst = {"cap": FILE_CAP, "files": 0, "skips": 0}, {"skipped": []}
+        part = keep_files(Slack("t"), {"files": [f("F2", 10)]}, "C0LNK", "proj", lctx, lst)[0]
+        got = keep_files(Slack("t"), {"files": [f("F3", 10)]}, "C0LNK", "proj", lctx, lst)[0]
+        ok("a download's .part planted as a link is refused, and a file planted as a link is fetched again in its place",
+           "download failed" in part.get("skipped", "") and open(f"{out}/part").read() == "theirs"
+           and got.get("path") == "proj/C0LNK/files/F3-F3.png" and open(f"{out}/file").read() == "theirs"
+           and not os.path.islink(f"{hist()}/proj/C0LNK/files/F3-F3.png"))
+        if os.path.lexists(f"{hist()}/skipped.log"):       # the refused .part's own skip line, above
+            os.unlink(f"{hist()}/skipped.log")
+        os.symlink(f"{out}/log", f"{hist()}/skipped.log")
+        try:
+            keep_files(Slack("t"), {"files": [f("FDEL2", 5, "tombstone")]}, "C0LNK", "proj", lctx, lst)
+            logged = True
+        except OSError:
+            logged = False
+        st_planted = load_state()
+        save_state({"convs": {}, "skipped": []})
+        ok("skipped.log planted as a link takes no line, and state.json planted as a link is neither read nor written",
+           not logged and open(f"{out}/log").read() == "" and "C0PLANT" not in st_planted["convs"]
+           and open(f"{out}/state").read() == '{"convs": {"C0PLANT": {}}}' and not os.path.islink(f"{hist()}/state.json"))
+        refused = []
+        for what in (lambda: store("linkdir", "C0X", [{"ts": "3.000001", "text": "x"}]), lambda: kept("proj", "C0RD")):
+            try:
+                what()
+                refused.append(False)
+            except OSError:
+                refused.append(True)
+        real_mkdir = os.mkdir
+
+        def swapping(name, mode=0o777, *, dir_fd=None):      # a link swapped in the moment the directory is made
+            real_mkdir(name, mode, dir_fd=dir_fd)
+            if name == "C0RACE":
+                os.rmdir(name, dir_fd=dir_fd)
+                os.symlink(f"{out}/dir", name, dir_fd=dir_fd)
+        os.mkdir = swapping
+        try:
+            store("proj", "C0RACE", [{"ts": "4.000001", "text": "x"}])
+            refused.append(False)
+        except OSError:
+            refused.append(True)
+        finally:
+            os.mkdir = real_mkdir
+        ok("a parent directory that is a link refuses the write and the read under it, and so does one swapped in "
+           "between the mkdir and the open, and nothing lands outside the store",
+           refused == [True, True, True] and os.listdir(f"{out}/dir") == [])
+        DIR = f"{tmp}/slack"
         log = open(f"{hist()}/skipped.log").read()
         ok("…and each skip is logged once, however many passes see it",
            log.count("\tFBIG\t") == 1 and log.count("\tFDEL\t") == 1 and log.count("\tFPG\t") == 1)
@@ -1024,7 +1150,7 @@ def selfcheck():
            and [p["ts"] for m, p in sl.log if m == "conversations.replies"] == ["10.000001"])
         DIR = f"{tmp}/slack"
 
-        # ── a thread read Slack refuses half way leaves that thread unmarked, so the next pass reads it
+        # ── a thread Slack refuses leaves that thread unmarked and the rest of the conversation read, as revisit does
         DIR = f"{tmp}/refuse"
         sl = FakeSlack(cconv, chist, creps)
         inner = sl.call
@@ -1038,14 +1164,15 @@ def selfcheck():
         run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
         rs = load_state()["convs"]["C0CUT"]
         held = read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")
-        ok("a refused thread read keeps the thread read before it, marked, and leaves the refused one unmarked",
+        ok("a thread refused on every read keeps the thread beside it, marked, leaves itself unmarked and the refusal "
+           "noted, and stops neither the backfill nor the increment after it",
            rs.get("error") == "fatal_error" and "21.000001" in held and "11.000001" not in held
-           and list(rs["threads"]) == ["20.000001"])
+           and list(rs["threads"]) == ["20.000001"] and rs.get("done") and rs.get("rescan_at") == 15000.0)
         sl = FakeSlack(cconv, chist, creps)
-        t[0] = 15100.0
+        t[0] = 15000.0 + RESCAN_EVERY
         run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
         rs = load_state()["convs"]["C0CUT"]
-        ok("…and the next pass reads the refused thread and holds its reply",
+        ok("…and the hour's rescan reads the refused thread again and holds its reply",
            not rs.get("error") and "11.000001" in read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")
            and sorted(rs["threads"]) == ["10.000001", "20.000001"])
         DIR = f"{tmp}/slack"
@@ -1259,6 +1386,20 @@ def selfcheck():
         real = Slack("xoxb-fake", pace=0)
         ok("a 429 is waited out by its Retry-After and the call made again",
            real.call("conversations.history", channel="C1").get("x") == 1 and real.limited == 1 and len(seq) == 2)
+        slept, real_sleep, seq[:] = [], time.sleep, []
+
+        def dated(req, timeout=0):
+            seq.append(1)
+            if len(seq) == 1:
+                raise urllib.error.HTTPError(req.full_url, 429, "slow down", {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, None)
+            return FakeResp(json.dumps({"ok": True, "x": 2}).encode())
+        URLOPEN, time.sleep = dated, slept.append
+        try:
+            got = real.call("conversations.history", channel="C1").get("x")
+        finally:
+            time.sleep = real_sleep
+        ok("…and one whose Retry-After is not a number of seconds waits 30 s instead of ending the pass",
+           got == 2 and 30 in slept)
         URLOPEN = lambda req, timeout=0: FakeResp(b"<html>sign in</html>", "text/html", "https://w.slack.com/?redir=%2Ffiles-pri")  # noqa: E731
         ok("a canvas's download that Slack sent to its sign-in page is not kept as the canvas",
            "web page" in (real.download("https://files.slack.com/FCAN", f"{tmp}/c.html", FILE_CAP) or "") and not os.path.exists(f"{tmp}/c.html"))

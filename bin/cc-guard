@@ -899,6 +899,25 @@ W11B
   else r=1; echo "      under a recorded member '$qa' (want '$ta member alice'), under CC_ROLE=member '$qb', under an owner '$qc'"; fi
   ok "a claude a member-facing session starts, in an owner's dir with a clean env, is recorded member by its own hook (the guard reads the whole chain above it), while the same child under an owner's claude is owner" $r
 
+  # 11a'''''. …AND THE RECORDS OF CLAUDES THAT ARE GONE DO NOT PILE UP (the planning seat's read of #937). A record is
+  #      written once per claude, and that write removes each record whose pid is gone or now another process's
+  #      (its start time differs): cc-lib reads neither. A live claude's record stays, member or not, and so does a
+  #      name that is not a bare pid (a write's temp file). Only the names planted here are counted: an earlier
+  #      case's claudes may still be alive, and their records rightly stay.
+  cr=$H/.cc/library/owner/callers; mkdir -p "$cr"
+  (cd "$H" && exec "$T/claude") & cn=$!
+  (cd "$H" && exec "$T/claude") & ck=$!
+  sleep 0.2
+  printf '1 owner\n' > "$cr/99999999"; printf '1 member alice\n' > "$cr/$ck.77"
+  printf '%s member alice\n' "$(cst $ck)" > "$cr/$ck"; printf '1 member alice\n' > "$cr/$$"
+  g Bash '{"command":"ls"}' "$H" CC_GUARD_ROOT_PID=$cn >/dev/null
+  left=""; for x in 99999999 "$$" "$cn" "$ck" "$ck.77"; do [ -e "$cr/$x" ] && left="$left$x "; done; want="$cn $ck $ck.77 "
+  rk=$(cat "$cr/$ck" 2>/dev/null); sk=$(cst $ck)
+  kill $cn $ck 2>/dev/null; wait $cn $ck 2>/dev/null
+  if [ "$left" = "$want" ] && [ "$rk" = "$sk member alice" ]; then r=0
+  else r=1; echo "      left '$left' (want '$want'), the live member '$rk'"; fi
+  ok "a new claude's record removes the records of claudes that are gone or whose pid is another process's now, and keeps a live claude's member record and a write's temp file" $r
+
   # 11b. A MEMBER WORKSPACE MAY SEND A MAIL — owner, 2026-09-11 19:46Z: "all workspaces should be able to send
   #      emails, it's a critical path; we can figure out permissions later". Inside a boundary `cc-mail send` has
   #      no secret and no worker: it hands the ask to the host's daemon over the member socket, and the host sends
@@ -6060,15 +6079,23 @@ case "$role" in worker|member) ;; *) pfonly=1;; esac
 # after its session ended has another start time, so either one sees no Slack. A claude that does run this hook is
 # member if anything above it is (ccrec reads the whole chain, below), so one a member-facing session starts is
 # recorded member however it was launched. Member is sticky: a member record is never rewritten as owner, so a
-# session that `cd`s out of its marked dir does not become the owner on its next call. No
+# session that `cd`s out of its marked dir does not become the owner on its next call. It runs before every Bash
+# call, so it reads /proc with builtins and forks nothing per ancestor (it forked about six each, some 30 a call):
+# one read of stat gives the start time and the parent, and the cwd is a `cd -P` (in the subshell it runs in), with
+# readlink only where that cannot name the dir. A record is written once per claude, and each write removes the
+# records of claudes that are gone or whose pid is now another process's: cc-lib reads neither, so nothing it
+# answers changes, and the dir no longer grows by a file per pid for good. No
 # session writes the record: ~/.cc/library/owner is on a member's secret list for Bash and the file tools (outside
 # a boundary), and a worker's fence is its own tree. Inside a boundary nothing is written: cc-lib there reads the
 # member's own workspace file and never the copy.
 ccrec(){
   [ "$tool" = Bash ] && [ -z "$inb" ] || return 0
-  local p="" n=0 home="" st="" w="" h="" d="$HOME/.cc/library/owner/callers" f="" lq="" e="" up="" ups=""
-  pst(){ local x; x=$(cat "/proc/$1/stat" 2>/dev/null) || return 0; x=${x##*") "}; read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ x _ <<<"$x"
-    case "$x" in ''|*[!0-9]*) ;; *) printf %s "$x";; esac; }
+  local p="" n=0 home="" st="" w="" h="" d="$HOME/.cc/library/owner/callers" f="" lq="" e="" up="" ups="" c="" x=""
+  local sx="" px="" ev=()
+  # sx = pid $1's start time, px = its parent, from one read of its stat; both empty when it is gone
+  pst(){ local y=""; sx="" px=""; read -r y 2>/dev/null < "/proc/$1/stat" || [ -n "$y" ] || return 0; y=${y##*") "}
+    read -r _ px _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ sx _ <<<"$y"
+    case "$sx" in ''|*[!0-9]*) sx="";; esac; case "$px" in ''|*[!0-9]*) px="";; esac; }
   # $HOME is the hook's, inherited from the session's claude at launch, which no Bash call reaches. cc-lib reads the
   # passwd home's (callers_dir), so a claude launched with another HOME (the selfcheck's) is recorded where cc-lib
   # never looks, and fails closed.
@@ -6078,11 +6105,11 @@ ccrec(){
   fi
   if [ -z "$p" ]; then p=$PPID
     while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
-      [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && break
-      p=$(kppid "$p"); n=$((n+1)); done
-    [ "$(cat "/proc/${p:-0}/comm" 2>/dev/null)" = claude ] || return 0
+      c=""; read -r c 2>/dev/null < "/proc/$p/comm"; [ "$c" = claude ] && break
+      pst "$p"; p=$px; n=$((n+1)); done
+    c=""; read -r c 2>/dev/null < "/proc/${p:-0}/comm"; [ "$c" = claude ] || return 0
   fi
-  st=$(pst "$p"); [ -n "$st" ] || return 0
+  pst "$p"; st=$sx; [ -n "$st" ] || return 0
   [ "$role" = member ] && h=${mdir##*/} && w=member
   # THE WHOLE CHAIN, NOT THE NEAREST CLAUDE (perms at d54b4814). A member-facing session picks the cwd and env of any
   # process it starts, a claude included, so that claude's own cwd and environ say nothing. What it cannot change is
@@ -6091,24 +6118,33 @@ ccrec(){
   # its environ) makes this record member, with that one's channel.
   up=$p; n=0
   while [ -z "$w" ] && [ -n "$up" ] && [ "$up" != 0 ] && [ "$n" -lt 64 ]; do
-    ups=$(pst "$up"); e=$(cat "$d/$up" 2>/dev/null)
+    pst "$up"; ups=$sx; e=""; read -r e 2>/dev/null < "$d/$up"
     if [ -n "$ups" ] && [ "$up" != "$p" ]; then
       case "$e" in "$ups member"*) w=member; h=${e#"$ups member"}; h=${h# };; esac; fi
-    lq=$(readlink "/proc/$up/cwd" 2>/dev/null)
+    # a cwd that is gone (or one cd cannot enter) leaves PWD on the /proc link itself: readlink still names it
+    lq=""; if cd -P "/proc/$up/cwd" 2>/dev/null && case "$PWD" in /proc/*) false;; esac; then lq=$PWD
+    else lq=$(readlink "/proc/$up/cwd" 2>/dev/null); fi
     while [ -z "$w" ] && [ -n "$lq" ] && [ "$lq" != / ]; do
       if [ -f "$lq/.cc/member-facing" ]; then w=member; h=${lq##*/}; fi
       case "$lq" in "$HOME"/.cc/worktrees/*/*) e=${lq#"$HOME"/.cc/worktrees/}; e=${e%%/*}
         [ -f "$HOME/dev/$e/.cc/member-workspace" ] && { w=member; h=$e; };; esac
       lq=${lq%/*}; done
-    [ -z "$w" ] && tr '\0' '\n' < "/proc/$up/environ" 2>/dev/null | grep -qxE 'CC_ROLE=member|CC_MEMBER_SANDBOX=1' && w=member
+    if [ -z "$w" ]; then ev=(); mapfile -d '' -t ev 2>/dev/null < "/proc/$up/environ"
+      for x in "${ev[@]}"; do   # a whole line of it, as grep -x read it once tr had split the values on newlines too
+        case $'\n'"$x"$'\n' in *$'\n'CC_ROLE=member$'\n'*|*$'\n'CC_MEMBER_SANDBOX=1$'\n'*) w=member; break;; esac; done; fi
     [ "$up" = 1 ] && break
-    up=$(kppid "$up"); n=$((n+1)); done
+    up=$px; n=$((n+1)); done
   f=$d/$p; e=$(cat "$f" 2>/dev/null)
   case "$e" in "$st member"*) return 0;; esac   # sticky: this claude was member-facing once, and stays so
   case "$h" in *[!A-Za-z0-9._-]*) h="";; esac
   if [ "$w" = member ]; then w="$st member${h:+ $h}"; else w="$st owner"; fi
   [ "$e" = "$w" ] && return 0
   ( umask 077; mkdir -p "$d" && printf '%s\n' "$w" > "$f.$$" && mv -f "$f.$$" "$f" ) 2>/dev/null || rm -f "$f.$$" 2>/dev/null
+  for x in "$d"/*; do   # the records of claudes that are gone; a name that is not a bare pid (a write's temp) stays
+    c=${x##*/}; case "$c" in ''|*[!0-9]*) continue;; esac
+    e=""; read -r e 2>/dev/null < "$x"; pst "$c"
+    [ -n "$sx" ] && [ "${e%% *}" = "$sx" ] || rm -f "$x" 2>/dev/null
+  done
   return 0
 }
 ( ccrec ) 2>/dev/null || :   # a subshell: whatever goes wrong in it, the record is missing (cc-lib fails closed) and no gate is lost

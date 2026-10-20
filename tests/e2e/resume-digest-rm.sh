@@ -13,6 +13,13 @@ lo=$(cd ~ && env -u TMUX -u TMUX_TMPDIR PATH="$T/livestub:$PATH" "$B/cc" $REPO 2
   && grep -q "test fixture" <<<"$lo" && ! grep -qs new-window "$T/livestub/log"; } \
   && ok "a fixture's windows are on the run's own tmux server, and cc refuses a _ name on the default socket" \
   || bad "fixture on the live tmux server (rc=$lrc): $lo | $(tr '\n' '|' < "$T/livestub/log" 2>/dev/null)"
+# …and a TMUX_TMPDIR that spells /tmp another way (/tmp/. or /tmp/) is the same default socket, refused the same way.
+for tdir in /tmp/. /tmp/; do : > "$T/livestub/log"
+  lo=$(cd ~ && env -u TMUX TMUX_TMPDIR="$tdir" PATH="$T/livestub:$PATH" "$B/cc" $REPO 2>&1); lrc=$?
+  { [ "$lrc" = 1 ] && grep -q "test fixture" <<<"$lo" && ! grep -qs new-window "$T/livestub/log"; } \
+    && ok "cc refuses a _ name with TMUX_TMPDIR=$tdir, the default socket spelt another way" \
+    || bad "TMUX_TMPDIR=$tdir got past the live-server refusal (rc=$lrc): $lo | $(tr '\n' '|' < "$T/livestub/log" 2>/dev/null)"
+done
 "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
 grep -qxF '.cc/' "$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir)/info/exclude" && ok ".cc/ git-excluded" || bad ".cc/ exclusion"

@@ -2255,6 +2255,34 @@ class TestSecurityPaths(Case):
         self.assertEqual(R.review(j, comments=[opus]).verdict, T.LAND)   # the same file, plainly there, counts
         self.assertEqual(box.called("claude"), [])
 
+    def test_perms_ledger_land_at_this_head_clears_an_old_security_handback(self):
+        """#1198: perms' ledger held its LAND at the head now, but the HANDBACK marker from an older head stood,
+        since the only LAND marker named a third head, and the lane handed the PR back."""
+        box = self.box(claude=claude_says("LAND"))
+        j = self.sec_job(self.PATHS[0])
+        back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")
+        comments = [back, self.comment("LAND", "0dd", head="b" * 40, by="perms-security-read")]
+        self.reads([self.rec(j)])
+        self.assertEqual(R.review(j, comments=comments).verdict, T.LAND)
+        self.assertEqual(R.delta_review(j, R.imported(back["body"]), comments=comments).verdict, T.LAND)
+        self.assertIsNone(R.standing(j, comments=comments))
+        self.assertNotIn("a security HANDBACK", R.would_read(j, comments)[1])
+        self.assertEqual(box.called("claude"), [])
+
+    def test_a_ledger_land_at_an_old_head_or_only_carried_leaves_the_handback(self):
+        back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")
+        old = self.sec_job(self.PATHS[0])
+        self.box(claude=claude_says("LAND"))
+        self.reads([self.rec(old, head=self.OLD)])
+        carried = self.carry(["x.py"])
+        self.assertEqual(R.carried_from(carried), self.OLD)
+        for j in (old, carried):
+            self.assertEqual(R.review(j, comments=[back]).verdict, T.HANDBACK_VERDICT)
+            self.assertEqual(R.delta_review(j, R.imported(back["body"]), comments=[back]).verdict,
+                             T.HANDBACK_VERDICT)
+            self.assertIsNotNone(R.standing(j, comments=[back]))
+            self.assertIn("a security HANDBACK", R.would_read(j, [back])[1])
+
     def test_a_change_on_no_security_path_is_unaffected(self):
         box = self.box(claude=claude_says("LAND"))
         j = self.job(paid=True)
