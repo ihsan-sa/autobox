@@ -128,7 +128,8 @@ perms_recorded() reads <passwd home>/.cc/state/<repo>/perms/security-reads.json,
 which cc-guard lets no other session write (the Cloudflare door trusts perms-allow.json beside it the same way). It
 must be the box user's own plain 0600 file, reached through no symlink, holding a JSON list of entries like
   {"repo": "<repo>", "pr": 1270, "head": "<40-hex head sha>", "change": "<the change digest>"}
-and one counts only when repo, pr and head are this job's exactly and change is one of keys(). The lander only
+and one counts only when repo, pr and head are this job's exactly, change is one of keys() (never empty), and it
+is the newest entry at that repo, PR and head (newest_reads: a FIX appended after a LAND takes it back). The lander only
 reads that file. Perms writes it in one of two ways, each run only from the perms seat (perms_seat_caller()), and
 each entry adds verdict LAND, read, model and at: `lander record <repo> <pr> LAND --by <who> --head <sha>` from the
 perms seat posts the marker and appends the entry for the PR's live head and change (read "perms" when <who> is
@@ -164,6 +165,7 @@ import fcntl
 import hashlib
 import sys
 import json
+import bisect
 import math
 import os
 import re
@@ -378,15 +380,30 @@ def perms_reads(repo):
     return [e for e in data if isinstance(e, dict)], ""
 
 
+def newest_reads(entries, repo, pr):
+    """{head: the newest of `entries` for exactly this repo and PR at that head}, in the order those newest entries
+    were appended. perms appends under a flock, so the last entry for a head is its newest verdict: a FIX perms
+    records after its LAND at one head takes the LAND back (perms' follow-up to its LAND on #1564)."""
+    out = {}
+    for e in entries:
+        if e.get("repo") == repo and e.get("pr") == pr and isinstance(e.get("head"), str):
+            out.pop(e["head"], None)
+            out[e["head"]] = e
+    return out
+
+
 def perms_recorded(repo, pr, head, digests) -> bool:
-    """True when perms' file holds a LAND for exactly this repo, PR and head at one of `digests`: what a security
-    path merges on (_security_unread, lane.landed_at), a host check runs on (lane.Lane.host_unread) and is released
-    on (release.remote_rules). An entry with no `verdict` is a LAND, as in carried_from; a FIX or DO-NOT-LAND is
-    not one."""
+    """True when perms' newest entry for exactly this repo, PR and head (newest_reads) is a LAND at one of
+    `digests`: what a security path merges on (_security_unread, lane.landed_at), a host check runs on
+    (lane.Lane.host_unread) and is released on (release.remote_rules). An entry with no `verdict` is a LAND, as in
+    carried_from; a FIX or DO-NOT-LAND is not one, and one recorded after a LAND at that head takes it back. An
+    empty digest is no digest (Opus read of #1564: a job with no reviewer unit has digest "", which an entry with
+    an empty change would match)."""
+    digests = {d for d in digests or () if d}
     if not (head and digests):
         return False
-    return any(e.get("repo") == repo and e.get("pr") == pr and e.get("head") == head and e.get("change") in digests
-               and e.get("verdict", T.LAND) == T.LAND for e in perms_reads(repo)[0])
+    e = newest_reads(perms_reads(repo)[0], repo, pr).get(head)
+    return e is not None and e.get("change") in digests and e.get("verdict", T.LAND) == T.LAND
 
 
 def security_globs(root, base, repo):
@@ -431,10 +448,13 @@ def carried_from(job):
     no `verdict` is a LAND (perms records only reads it passes); one naming any other word is not. Newest first.
     A path of this change on the base's list now that the old head's own base did not list (old_globs()) was never
     read as one, so it carries nothing either (perms' read of #1384: a glob main adds after the read, on a path
-    the PR left alone)."""
-    olds = [e.get("head") for e in perms_reads(job.repo)[0]
-            if e.get("repo") == job.repo and e.get("pr") == job.pr and e.get("verdict", T.LAND) == T.LAND
-            and isinstance(e.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", e["head"]) and e["head"] != job.head]
+    the PR left alone). Only each head's newest entry counts (newest_reads): an old head whose LAND perms later
+    took back with a FIX carries nothing, and nothing carries to a head whose own newest entry is not a LAND."""
+    newest = newest_reads(perms_reads(job.repo)[0], job.repo, job.pr)
+    if job.head in newest and newest[job.head].get("verdict", T.LAND) != T.LAND:
+        return ""
+    olds = [h for h, e in newest.items()
+            if e.get("verdict", T.LAND) == T.LAND and re.fullmatch(r"[0-9a-f]{40}", h) and h != job.head]
     if not (olds and job.head):
         return ""
     root = root_of(job)
@@ -867,13 +887,23 @@ def codex_limit(rc, out, text):
     a nonzero exit, and a CODEX_LIMIT_SAID line in the output that is not the prompt's own. The echo can differ from
     the prompt (cut short, whitespace trimmed, CRLF), so beside taking out the exact echo, a line counts only when
     its stripped text is no prompt line, nor the start of one (an echo cut mid-line). A real limit line the prompt
-    also holds is missed, which holds the read as a fault rather than bringing in a stand-in."""
+    also holds is missed, which holds the read as a fault rather than bringing in a stand-in. The prompt lines are a
+    set and a sorted list (perms' read of #1568: any() over them for every limit line was quadratic in planted lines),
+    since the first prompt line at or after a prefix in sorted order starts with it if any does."""
     if rc == 0 or not out:
         return False
-    said = [line.strip() for line in text.splitlines()] if text else []
+    said = {line.strip() for line in text.splitlines()} if text else set()
+    order = sorted(said)
     for line in (out.replace(text, "") if text else out).splitlines():
-        if CODEX_LIMIT_SAID.search(line) and not any(p.startswith(line.strip()) for p in said):
-            return True
+        if not CODEX_LIMIT_SAID.search(line):
+            continue
+        s = line.strip()
+        if s in said:
+            continue
+        i = bisect.bisect_left(order, s)
+        if i < len(order) and order[i].startswith(s):
+            continue
+        return True
     return False
 
 
@@ -2325,7 +2355,7 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
     if state == "done":
         return f"perms' security read of PR #{pr} at {head[:12]} says {at.get('verdict') or 'nothing'}", False
     said = "died with no verdict" if state == "running" else f"is {state or 'unfinished'}"
-    return (f"perms' security read of PR #{pr} at {head[:12]} {said}" + (f" ({at['why']})" if at.get("why") else "")
+    return (f"perms' security read of PR #{pr} at {head[:12]} {said}" + (f" ({quoted(at['why'])})" if at.get("why") else "")
             + f": perms runs `lander perms-read {repo} {pr}` again, then queue it again"), False
 
 
@@ -2375,9 +2405,9 @@ def grant(job, read, model):
             have, why = perms_reads(job.repo)
             if why and os.path.lexists(path):
                 return f"perms' ledger will not read ({why}); nothing written over it"
-            if any((x.get("repo"), x.get("pr"), x.get("head"), x.get("change"))
-                   == (job.repo, job.pr, job.head, job.digest) for x in have):
-                return ""
+            last = newest_reads(have, job.repo, job.pr).get(job.head) or {}
+            if last.get("change") == job.digest and last.get("verdict", T.LAND) == T.LAND:
+                return ""   # already the newest; a LAND after a FIX at this head is appended, so it stands
             rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": T.LAND,
                    "read": read, "model": model, "at": C.now()}
             fd, tmp = tempfile.mkstemp(dir=seat, prefix=".", suffix=".tmp")   # 0600

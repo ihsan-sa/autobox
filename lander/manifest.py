@@ -23,7 +23,7 @@ an entry is gone when it names a file in the base tree and none in the head's (a
 itself or a directory above files), and no base file it names has its blob at any path in the head (a move or a
 rename keeps it). Given the two trees, a head may then remove a check whose run line names a file (run_files) and
 whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone, except a check in KEPT
-(guard-replay), whose removal is always a fault. A run line names a file by
+(guard-replay and the guard selfchecks), whose removal is always a fault. A run line names a file by
 a relative path or by a dotted module after `-m` or `-mX` (tests.test_x is tests/test_x.py; run_files); a file
 git's -M sees renamed, edited or not, is not gone. A check whose run line names files and none of them is in either tree never ran
 here, so a head may remove it too (never_ran; 2026-10-13 #1046 and #1154 left checks on main for tools only unmerged
@@ -81,8 +81,9 @@ NEW_DEFAULT = T.HERMETIC
 BUILTIN = "manifest-widen"
 # Checks a head may never remove as dead (dead_check): the guard's refusal replay and its differential against main's
 # guard. 2026-10-19, perms' read of #1453: a head that deleted guard-replay's run file and every path it lists, cc-guard
-# included, dropped the check and landed with no replay at all.
-KEPT = ("guard-replay", "guard-replay-box")
+# included, dropped the check and landed with no replay at all. The two selfchecks are the guard's own cases (perms'
+# read of #1571).
+KEPT = ("guard-replay", "guard-replay-box", "selfcheck-cc-guard", "selfcheck-cc-guard-argv")
 # A check's name goes into the queue log as `gate=<name>` and keys its recorded run times (events.lead_times): a name
 # with a space or `=` in it could write fields of its own there (2026-10-07, #969's security read)
 NAME_RE = re.compile(r"[\w.-]+")

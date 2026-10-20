@@ -576,7 +576,7 @@ def enable_units(changes, repo, sha, root):
             C.owner_card(f"land:{repo}:deploy:enable-{u}@{sha[:12]}",
                          f"[{repo}] {u} is new, and cc-units keeps turning it on for you: "
                          f"`systemctl --user enable --now {u}`", run=f"systemctl --user enable --now {u}")
-            notes.append(f"{u} linked and left off; the owner has the card")
+            notes.append(f"{u} linked and left off; its approval card is with perms (the owner where a box has no permission session)")
             continue
         _, st = systemctl("is-enabled", u)
         if st.strip() == "enabled":

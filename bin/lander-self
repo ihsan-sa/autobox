@@ -22,7 +22,7 @@ A planning seat runs it by hand; the lander never installs itself.
         (mode 100755) anywhere is binary:
         binaries(), which the ordinary lane loads from this file and runs on every PR too; perms'
         own ledger (~/.cc/state/<repo>/perms/security-reads.json, review.py's perms_reads) records a security read
-        of exactly the PR's head, never a PR marker, and a LAND record by another reader stands at that head
+        of exactly the PR's head as its newest entry there (a later FIX takes a LAND back), never a PR marker, and a LAND record by another reader stands at that head
         (`lander record --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
         box identity in core/) and the candidate's own tests (`<core>/bin/lander selfcheck` and `<core>/tests/lander`)
         pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
@@ -1707,8 +1707,9 @@ PERMS_SECURITY_READER = "perms-security-read"
 
 def perms_read(repo, pr, head, path=None):
     """True when perms' own ledger (<passwd home>/.cc/state/<repo>/perms/security-reads.json, the box user's plain
-    0600 file reached through no symlink) records a read of exactly this repo, PR and head whose verdict is LAND or
-    absent. review.py's perms_reads, copied, since pin copies lander-self alone. A PR marker by perms-security-read
+    0600 file reached through no symlink) records a read of exactly this repo, PR and head, and the newest such
+    entry's verdict is LAND or absent: a FIX perms records after its LAND at one head takes it back (review.py's
+    newest_reads). review.py's perms_reads, copied, since pin copies lander-self alone. A PR marker by perms-security-read
     never counts: any seat can post one with `gh pr comment` (perms, 10-19)."""
     name = str(repo).rsplit("/", 1)[-1]
     path = path or os.path.join(passwd_home(), ".cc", "state", name, "perms", "security-reads.json")
@@ -1730,9 +1731,11 @@ def perms_read(repo, pr, head, path=None):
     finally:
         if fd is not None:
             os.close(fd)
-    return isinstance(data, list) and any(
-        isinstance(e, dict) and e.get("repo") == name and e.get("pr") == int(pr) and e.get("head") == head
-        and e.get("verdict", "LAND") == "LAND" for e in data)
+    if not isinstance(data, list):
+        return False
+    mine = [e for e in data if isinstance(e, dict) and e.get("repo") == name and e.get("pr") == int(pr)
+            and e.get("head") == head]
+    return bool(mine) and mine[-1].get("verdict", "LAND") == "LAND"
 
 
 def land_readers(comments, head, repo, pr, ledger=None):
@@ -2106,6 +2109,10 @@ def selfcheck():
         case("ledger: an entry at this head counts", perms_read("repo", "7", hd, ledger("ok.json", [ent])))
         case("ledger: another head does not", not perms_read("repo", "7", "cd" * 20, ledger("head.json", [ent])))
         case("ledger: another PR does not", not perms_read("repo", "8", hd, ledger("pr.json", [ent])))
+        case("ledger: a FIX recorded after the LAND at this head takes it back",
+             not perms_read("repo", "7", hd, ledger("fix.json", [ent, {**ent, "verdict": "FIX"}])))
+        case("ledger: a LAND recorded after a FIX at this head stands",
+             perms_read("repo", "7", hd, ledger("refix.json", [{**ent, "verdict": "FIX"}, ent])))
         case("ledger: a HANDBACK entry does not",
              not perms_read("repo", "7", hd, ledger("hb.json", [{**ent, "verdict": "HANDBACK"}])))
         case("ledger: a group-readable file does not",

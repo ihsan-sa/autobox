@@ -271,6 +271,12 @@ PY
   k "$(yes_ test "$(tr '\n' ' ' < "$T/refusals.args" 2>/dev/null)" = "ask ctl --title ctl approval --run systemctl --user restart m.service --id land:ctl:9 -- restart the mail daemon to put #9 live ")" \
     "…filed with cc-refusals ask: its title, the raw command, its id, and the words as written"
   k "$(yes_ grep -q 'rung=P kind=approval send=perms:a1234567$' <<<"$(last)")" "…and the log says it went to the permission session"
+  # --not-perms does not route around PERMS FIRST (Opus' read of #904): the lander's owner_card() sends it beside --run,
+  # only so its words (which name settings.json) are not held as an undeclared permission question
+  PC --approval --run "systemctl --user enable --now x.service" --id land:ctl:deploy:enable-x --not-perms -t "lander approval" \
+    "[ctl] x.service is new and touches settings.json"
+  k "$(yes_ test "$(no_ grep -q '^post' "$T/slack.args")$(cat "$T/out")$(head -1 "$T/refusals.args" 2>/dev/null)" = 0perms:a1234567ask)" \
+    "--approval --not-perms is still filed with the permission session first and posts nothing to the owner"
   # the branches beside the filing: synthetic test state goes nowhere, log-only files nothing, and a ledger that
   # refuses the ask posts nothing either and exits 1, so the lander does not read it as filed
   PC --approval -t "ctl approval" "restart _cctest.service to put #9 live"

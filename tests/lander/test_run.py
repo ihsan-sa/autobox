@@ -118,7 +118,8 @@ class Status(unittest.TestCase):
         self.assertEqual(RUN.status_of(1, "cp: No space left on device"),
                          (T.UNRUNNABLE, "the box, not the tree: No space left on device"))
 
-    def test_a_failed_lookup_is_the_network_only_on_a_net_check(self):
+    @mock.patch.object(RUN, "resolves", return_value=False)
+    def test_a_failed_lookup_is_the_network_only_on_a_net_check(self, _down):
         dns = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n1 failed"
         self.assertEqual(RUN.status_of(1, dns, net=True),
                          (T.UNRUNNABLE, "the network, not the tree: Could not resolve host: github.com"))
@@ -130,6 +131,40 @@ class Status(unittest.TestCase):
         self.assertEqual(RUN.status_of(0, "Could not resolve host: x\nok 4 passed, 0 failed", net=True)[0], T.PASSED)
         # …and a net check's red with no lookup in it is the tree's
         self.assertEqual(RUN.status_of(1, "AssertionError: 2 != 3\n1 failed", net=True)[0], T.FAILED)
+
+    def test_a_lookup_that_fails_every_run_is_the_trees_red(self):
+        # perms and an Opus read of #1500: a typo'd host fails the same way every run, so a lookup line holds only
+        # when a name that must resolve (RESOLVE_PROBE) fails too, i.e. the resolver itself is down
+        typo = "Could not resolve host: api.jlcpcb.comm\n1 failed"
+        with mock.patch.object(RUN, "resolves", return_value=True) as up:
+            self.assertEqual(RUN.status_of(1, typo, net=True)[0], T.FAILED)
+            up.assert_called_once_with(RUN.RESOLVE_PROBE)   # the probe is asked, never the line's own host
+            self.assertEqual(RUN.status_of(1, "Could not resolve host: localhost\n1 failed", net=True)[0], T.FAILED)
+            for line in ("ssh: Could not resolve hostname example.test: Temporary failure in name resolution",
+                         "urllib3 NameResolutionError: Failed to resolve 'api.x.com' ([Errno -3] Temporary "
+                         "failure in name resolution)",
+                         "socket.gaierror: [Errno -3] Temporary failure in name resolution"):
+                self.assertEqual(RUN.status_of(1, line, net=True)[0], T.FAILED, line)
+
+    def test_a_lookup_line_holds_when_the_probe_fails_too(self):
+        # the resolver is down: the typo'd host and the probe both fail, and the run is held, not handed back
+        with mock.patch.object(RUN, "resolves", return_value=False) as down:
+            self.assertEqual(RUN.status_of(1, "Could not resolve host: api.jlcpcb.comm\n1 failed", net=True),
+                             (T.UNRUNNABLE, "the network, not the tree: Could not resolve host: api.jlcpcb.comm"))
+            down.assert_called_once_with(RUN.RESOLVE_PROBE)
+            # an early lookup line, then a real assertion red: only the end of the log is read
+            early = "Could not resolve host: github.com\n" + "ok\n" * RUN.RESOLVE_TAIL + "AssertionError: 2 != 3\n1 failed"
+            down.reset_mock()
+            self.assertEqual(RUN.status_of(1, early, net=True)[0], T.FAILED)
+            down.assert_not_called()
+
+    def test_resolves_is_bounded(self):
+        self.assertTrue(RUN.resolves("127.0.0.1"))
+        self.assertFalse(RUN.resolves("no-such-host.invalid"))
+        with mock.patch.object(RUN.socket, "getaddrinfo", side_effect=lambda *a: time.sleep(2)):
+            t0 = time.monotonic()
+            self.assertFalse(RUN.resolves("slow.example", wait=0.2))
+            self.assertLess(time.monotonic() - t0, 1.5)
 
     def test_setup_said_out_of_band_decides_whether_the_sandbox_started(self):
         # perms on #1452: a check that prints setup's words first is the check's red, never unrunnable
@@ -1001,6 +1036,45 @@ class Pinned(Env):
             self.assertEqual(f.read(), "a\n")
 
 
+class BaseOf(unittest.TestCase):
+    """Opus' read of #1453: base_of() runs in the lander's process on a file the check could have written. A FIFO, a
+    link to /dev/zero or bytes that are not ASCII read as "" (base_kept() then fails the check), never hang or raise."""
+
+    def setUp(self):
+        self.head = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.head, True)
+        self.ref = os.path.join(self.head, ".git", *RUN.BASE_REF.split("/"))
+        os.makedirs(os.path.dirname(self.ref))
+
+    def test_a_plain_ref_reads(self):
+        with open(self.ref, "w") as f:
+            f.write("a" * 40 + "\n")
+        self.assertEqual(RUN.base_of(self.head), "a" * 40)
+
+    def test_no_ref_is_empty(self):
+        self.assertEqual(RUN.base_of(self.head), "")
+
+    def test_a_fifo_is_empty_and_does_not_hang(self):
+        os.mkfifo(self.ref)
+        self.assertEqual(RUN.base_of(self.head), "")
+
+    def test_a_link_to_dev_zero_is_empty(self):
+        os.symlink("/dev/zero", self.ref)
+        self.assertEqual(RUN.base_of(self.head), "")
+
+    def test_a_link_to_a_good_ref_is_empty(self):
+        good = os.path.join(self.head, "good")
+        with open(good, "w") as f:
+            f.write("a" * 40 + "\n")
+        os.symlink(good, self.ref)
+        self.assertEqual(RUN.base_of(self.head), "")
+
+    def test_binary_bytes_are_empty(self):
+        with open(self.ref, "wb") as f:
+            f.write(b"\xff\xfe" + b"a" * 38)
+        self.assertEqual(RUN.base_of(self.head), "")
+
+
 class BaseKept(Env):
     """Opus' read of #1453: a PR's cc-guard (no PINNED file) deleted refs/lander/base, so guard-replay.sh skipped its
     differential and passed. The lander fails a pass that leaves the ref moved or gone."""
@@ -1121,7 +1195,8 @@ class Sandbox(Env):
         r = self.run_(chk(run='test "$(grep -c : /proc/net/dev)" -gt 1', net=True))
         self.assertEqual(r.status, T.PASSED, r.extra)
 
-    def test_a_net_check_that_fails_its_lookup_is_held_not_red(self):
+    @mock.patch.object(RUN, "resolves", return_value=False)
+    def test_a_net_check_that_fails_its_lookup_is_held_not_red(self, _down):
         # a fake resolver failure, printed the way git prints it when the box's resolver drops out (10-14)
         flap = "echo \"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\" >&2; exit 1"
         r = self.run_(chk(run=flap, net=True))
@@ -2980,6 +3055,53 @@ class Sweep(unittest.TestCase):
             return T.Result(check=check.name, tree=tree, status=st, extra={"tail": [tail], "why": ""})
         m = M.Manifest(checks={"x": chk(name="x", klass=T.HOST)}, cwd={"x": ""})
         return CK.sweep_one(".", m, "x", "t" * 40, True, runner=run)["verdict"]
+
+    def test_off_main_rev_never_reruns_on_the_host(self):
+        ran = []
+
+        def run(check, tree, where, **kw):
+            ran.append(check.klass)
+            return T.Result(check=check.name, tree=tree, status=T.FAILED if check.klass != T.HOST else T.PASSED,
+                            extra={"tail": ["boom"], "why": ""})
+        m = M.Manifest(checks={"x": chk(name="x", klass=T.HOST)}, cwd={"x": ""})
+        row = CK.sweep_one(".", m, "x", "t" * 40, True, runner=run, host_rerun=False)
+        self.assertEqual(row["verdict"], "red")
+        self.assertNotIn(T.HOST, ran)
+        self.assertEqual(len(ran), 1)
+
+    def test_rev_is_main_cases(self):
+        from lander import git as G
+        with tempfile.TemporaryDirectory() as dev, mock.patch.dict(os.environ, {"CC_DEV": dev}):
+            d = os.path.join(dev, "r")
+            os.mkdir(d)
+
+            def setmain(sha):
+                ref = os.path.join(d, ".git", "refs", "remotes", "origin", "main")
+                if sha is None:
+                    os.unlink(ref)
+                    return
+                os.makedirs(os.path.dirname(ref), exist_ok=True)
+                with open(ref, "w") as f:
+                    f.write(sha + "\n")
+
+            def g(*a):
+                return subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                      check=True, capture_output=True, text=True).stdout.strip()
+            g("init", "-q", "-b", "main")
+            g("commit", "-q", "--allow-empty", "-m", "a")
+            a = g("rev-parse", "HEAD")
+            setmain(a)
+            t = G.host_tree(d)
+            self.assertTrue(CK.rev_is_main(t, "HEAD"))
+            self.assertTrue(CK.rev_is_main(t, a))
+            g("commit", "-q", "--allow-empty", "-m", "b")
+            self.assertFalse(CK.rev_is_main(t, "HEAD"))        # a descendant of main
+            g("checkout", "-q", "-b", "other", a)
+            g("commit", "-q", "--allow-empty", "-m", "c")
+            self.assertFalse(CK.rev_is_main(t, "other"))       # a branch off main
+            self.assertFalse(CK.rev_is_main(t, "nonesuch"))    # names nothing
+            setmain(None)
+            self.assertFalse(CK.rev_is_main(t, a))             # no origin/main at all
 
     def test_the_acceptance_verdicts(self):
         home = os.path.expanduser("~")

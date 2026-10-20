@@ -169,16 +169,25 @@ RESOLVE_WAITS=${CC_RESOLVE_WAITS:-5 15 40}
 RESOLVE_RE='Could not resolve host|Could not resolve hostname|Temporary failure in name resolution|Name or service not known|No address associated with hostname'
 NET_DEV=${CC_NET_DEV:-/proc/net/dev}   # this network namespace's interfaces; the selfcheck points it at a fixture
 has_uplink(){ awk -F: 'NR > 2 && $1 !~ /^ *lo$/ { up = 1 } END { exit !up }' "$NET_DEV" 2>/dev/null; }
+# A 'remote:' line is the server's own text, not our lookup: a hook there that quotes a resolver error is no flap.
+# The pause is a waited-on background sleep, so a kill lands at once and its trap takes the scratch file with it.
 git_unattended(){   # _git_bounded, asked again after each RESOLVE_WAITS pause while the only failure is the name lookup
   local e rc w waits=""; has_uplink && waits=$RESOLVE_WAITS
   e=$(mktemp) || { _git_bounded "$@"; return; }
+  trap 'resolve_gone 143' TERM; trap 'resolve_gone 130' INT; trap 'resolve_gone 129' HUP
+  RESOLVE_TMP=$e
   for w in $waits ""; do
     _git_bounded "$@" 2>"$e"; rc=$?
-    [ "$rc" != 0 ] && [ -n "$w" ] && grep -qE "$RESOLVE_RE" "$e" || break
-    printf '%s %s — asking again in %ss\n' "$(date -u +%FT%TZ)" "$(grep -m1 -oE "($RESOLVE_RE).*" "$e")" "$w" >&2
-    sleep "$w"
+    [ "$rc" != 0 ] && [ -n "$w" ] && grep -v '^remote:' "$e" | grep -qE "$RESOLVE_RE" || break
+    printf '%s %s — asking again in %ss\n' "$(date -u +%FT%TZ)" "$(grep -v '^remote:' "$e" | grep -m1 -oE "($RESOLVE_RE).*")" "$w" >&2
+    sleep "$w" & RESOLVE_SLEEP=$!; wait "$RESOLVE_SLEEP"; RESOLVE_SLEEP=
   done
+  trap - TERM INT HUP; RESOLVE_TMP='' RESOLVE_SLEEP=''
   cat "$e" >&2; rm -f "$e"; return "$rc"; }
+resolve_gone(){   # git_unattended's trap: $1 the exit code. The pause's sleep and the scratch file go with the process.
+  [ -z "${RESOLVE_SLEEP:-}" ] || kill "$RESOLVE_SLEEP" 2>/dev/null
+  [ -z "${RESOLVE_TMP:-}" ] || rm -f "$RESOLVE_TMP"
+  exit "$1"; }
 _git_bounded(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
   # 124/137 from `timeout`. Both locks are needed and neither is enough: the prompt locks turn "ask for a
   # username" into an error the caller can read, and the bound catches everything they do not — a credential

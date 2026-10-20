@@ -128,8 +128,10 @@
 # any, it appends their PR, head, asker and agent id to the START HERE entry in handoff.md, so the successor starts knowing
 # them, and once the names move it keeps the old window as perms~old instead of ending it: the old seat records each
 # read in security-reads.json as it reports (that ledger's writes are flocked) and tells its asker, then runs
-# `cc-perms retire`. The successor ends perms~old with the same verb once nothing of it is still running, and a next
-# hand-off is refused while perms~old is open. No subagent running: the old window ends as before.
+# `cc-perms retire`. The successor ends perms~old with the same verb once nothing of it is still running, and if neither
+# does, cc-handoff's sweep ends it once nothing is running and its pane has sat idle two sweeps apart. A next
+# hand-off is refused while perms~old is open. No subagent running: the old window ends as before. A hand-off run
+# again after a try that stopped replaces that try's reads section in the entry rather than adding a second.
 set -uo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
 AH=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
@@ -563,6 +565,24 @@ reads_of(){
     [[ $who =~ ^asker\ [A-Za-z0-9][A-Za-z0-9@/._~-]{0,63}$ ]] && who="asked by ${who#asker }" || who="asker ?"
     printf '%s · %s · %s · %s\n' "$a" "$pr" "$hd" "$who"; done; }
 
+# drop_reads FILE — take out of FILE's last HAND-OFF ENTRY the reads section an earlier try of this hand-off added
+# (`### Reads still running at hand-off (cc-perms, …)` or `### Reads at hand-off (cc-perms, …)`), from its heading,
+# and the blank line before it, to the next heading or the end. A hand-off that stopped and is run again inside the
+# same 15 minutes reuses that entry, so without this each try stacked another section under it (perms, 2026-10-19).
+# Only the last entry is touched, and only a section cc-perms wrote; the file is rewritten in place only if it had one.
+drop_reads(){
+  local L t
+  L=$(grep -nE '^## HAND-OFF ENTRY ' "$1" 2>/dev/null | tail -1 | cut -d: -f1); [ -n "$L" ] || return 0
+  tail -n +"$L" "$1" | grep -qE '^### Reads (still running )?at hand-off \(cc-perms, ' || return 0
+  t=$(awk -v L="$L" '
+    NR <= L {print; next}
+    /^### Reads (still running )?at hand-off \(cc-perms, / {skip = 1; b = ""; next}
+    /^#/ {skip = 0}
+    /^$/ {b = b "\n"; next}
+    skip {b = ""; next}
+    {printf "%s", b; b = ""; print}' "$1") || return 1
+  printf '%s\n' "$t" > "$1"; }
+
 # journal_fresh FILE — rc 0 when FILE's last `## HAND-OFF ENTRY <stamp>Z` heading is 0-15 minutes old. Stamps are
 # written to the minute, so the age is counted in whole minutes: the current minute is 0 and fresh, minute 15 is
 # still fresh, 16 is stale, and a stamp ahead of the clock is refused rather than trusted.
@@ -628,6 +648,7 @@ handoff(){
   if [ -n "$FX" ]; then lexe=$EXE; else lexe=$cl; fi   # a fixture's stand-in is a bash script
   # RUNNING READS: the old seat's subagents still out go to the successor in the START HERE entry it reads first
   HO_OSID=$(cat "$HO_PD/session-id" 2>/dev/null)
+  drop_reads "$HO_PD/handoff.md" || die "could not take an earlier try's reads out of handoff.md; nothing started"
   if reads=$(reads_of "$HO_OSID"); then
     if [ -n "$reads" ]; then
       HO_KEEP=1
@@ -1255,6 +1276,18 @@ EOF
       && ! grep -q pwned "$(sd)/handoff.md" && [ "$(cat "$(sd)/session-id.old")" = 0123abcd-0000-4000-8000-000000000001 ] \
       && [ "$(cat "$(sd)/session-id")" != "$(cat "$(sd)/session-id.old")" ] && [[ $out == *"stays as main:perms~old"* ]] && [[ $out == *"PR #77"* ]]; echo $?)" \
     "handoff: a read still running goes into the START HERE entry as its id, PR, head and asker alone, and the old seat stays as perms~old instead of ending"
+  # a try that stopped left its reads section under the same entry: the next try replaces it, and touches nothing else
+  fx hretry; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"
+  jn 30; printf '\n### Reads still running at hand-off (cc-perms, 2026-10-19T09:00Z)\n- an-older · PR #5 · head ? · asker ?\n' >> "$(sd)/handoff.md"
+  jn 0; printf 'my own text\n\n### Reads still running at hand-off (cc-perms, 2026-10-19T10:00Z)\nThe old seat stays\n- stale · PR #6 · head ? · asker ?\n\n### Reads at hand-off (cc-perms, 2026-10-19T10:01Z)\ncould not be read\n\n### My notes\nkeep me\n' >> "$(sd)/handoff.md"
+  rd 5 >/dev/null
+  out=$(CC_HANDOFF_TASKS=$F/tasks V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  hm=$(sed -n '/^## HAND-OFF ENTRY .*: START HERE$/h; //!H; ${x;p}' "$(sd)/handoff.md")
+  ok "$( [ $rc = 0 ] && [ "$(grep -c '^### Reads' <<<"$hm")" = 1 ] && ! grep -q stale <<<"$hm" && ! grep -q 'could not be read' <<<"$hm" \
+      && grep -qxF -- '- a-read · PR #77 · head abcdef1 · asked by r1' <<<"$hm" && grep -qx 'my own text' <<<"$hm" \
+      && grep -qx 'keep me' <<<"$hm" && grep -qx '### My notes' <<<"$hm" && grep -qF -- '- an-older · PR #5' "$(sd)/handoff.md" \
+      && [ "$(grep -c '^### Reads' "$(sd)/handoff.md")" = 2 ]; echo $?)" \
+    "handoff: run again after a try that stopped, it replaces that try's reads section in the entry instead of stacking another"
   fx hretire; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0; rd 2 >/dev/null
   out=$(CC_HANDOFF_TASKS=$F/tasks V=handoff run "$o"); r1=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
   out=$(CC_HANDOFF_TASKS=$F/tasks V=retire run "$np"); r2=$?; o2=$out; k2=$(grep -c '^kill-window' "$F/tmux.log")

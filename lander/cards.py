@@ -856,8 +856,9 @@ def owner_card(pid, text, run=None):
         log("unsaid", "-", 0, id=pid, why="synthetic test state, no 🔐 card posted")
         return False
     if run:
-        # --not-perms: a card whose 👍 runs a command is the owner's own approval, and its text names protected paths
-        # (settings.json among them), which cc-notify would otherwise hold as an undeclared permission question
+        # --not-perms only declares the words no permission question: they name protected paths (settings.json among
+        # them), which cc-notify would otherwise refuse as undeclared. It does not skip PERMS FIRST: cc-notify files
+        # every --approval with the permission session, which grants it or rules it his and posts the card itself
         rc, out = sh([os.path.join(BIN, "cc-notify"), "--approval", "--run", run, "--id", pid, "--not-perms", "-t",
                       "lander approval", text], timeout=60, **box_hand())
         log("owner-card", "-", 0, id=pid, rc=rc)

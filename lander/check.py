@@ -19,7 +19,8 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
         table. --sandbox runs every one in the bwrap profile whatever its class and runs a red one again on the host
         to say which it is: passes-in-bwrap, needs-mount (green on the host, and the sandbox's red names a missing
-        path), host (green only on the host), red (red on the host too) or unrunnable. Exit 0 when every check
+        path), host (green only on the host), red (red on the host too) or unrunnable. The host re-run happens only when
+        REV is origin/main's current commit; for any other REV a sandbox-red check is reported red, never run on the host. Exit 0 when every check
         passed on the runner the table names for it.
 """
 from __future__ import annotations
@@ -185,7 +186,19 @@ MISSING_RE = re.compile(r"No such file or directory|not found|command not found|
                         r"|No module named|does not exist")
 
 
-def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, runner=None) -> dict:
+def rev_is_main(t, rev: str) -> bool:
+    """True when rev names the very commit origin/main names now (both read by git._name, no git opens the checkout's
+    config). A rev that names nothing, or a checkout with no origin/main, is not main."""
+    if t.refused:
+        return False
+    with G.fenced(t, bare=True) as env:
+        rc, got = G._name(t, env, rev + "^{commit}")
+        rc2, main = G._name(t, env, "refs/remotes/origin/main^{commit}")
+    return rc == 0 and rc2 == 0 and got == main
+
+
+def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, runner=None,
+              host_rerun: bool = True) -> dict:
     runner = runner or RUN.run
     o, cwd = m.checks[name], m.cwd.get(name, "")
     c = o
@@ -200,6 +213,12 @@ def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, run
         return row
     if r.status == T.PASSED:
         row["verdict"] = "passes-in-bwrap"
+        return row
+    if not host_rerun:   # unread code (REV is not origin/main's commit) never runs on the host, as the owner
+        row["verdict"] = "red"
+        row["why"] = ("failed in the sandbox; host re-run refused, --rev is not origin/main | "
+                      + (r.extra.get("why", "") or next((ln for ln in reversed(r.extra.get("tail", []))
+                                                       if ln.strip()), "")))[:160]
         return row
     h = runner(dataclasses.replace(o, klass=T.HOST, mounts=[], where=["box"]), tree, "box", repo_root=repo, cwd=cwd)
     tail = "\n".join(r.extra.get("tail", []))
@@ -242,8 +261,12 @@ def cmd_sweep(argv):
         return EXIT_NONE
     names = [n for n in m.checks if not a["--only"] or n in a["--only"]]
     jobs = int(a["--jobs"] or 3)
+    rerun = rev_is_main(t, rev) if a["--sandbox"] else True
+    if a["--sandbox"] and not rerun:
+        print(f"lander sweep: --rev {rev} is not origin/main's commit: a check red in the sandbox is reported red, "
+              "not re-run on the host", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
-        rows = list(ex.map(lambda n: said(sweep_one(repo, m, n, tree, a["--sandbox"])), names))
+        rows = list(ex.map(lambda n: said(sweep_one(repo, m, n, tree, a["--sandbox"], host_rerun=rerun)), names))
     print("| check | class | verdict | secs | why |\n|---|---|---|---|---|")
     for r in rows:
         print(f"| {r['check']} | {r['class']} | {r['verdict']} | {r['secs']} | {r['why'].replace('|', '/')} |")

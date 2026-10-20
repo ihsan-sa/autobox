@@ -2065,6 +2065,63 @@ def skill_turn(target, wid, sid, cwd, started, m):
     return 1
 
 
+def perms_old():
+    """--sweep: end `perms~old`, the old permission seat `cc-perms handoff` kept up for the reads it still had
+    running, once they have all reported and it has gone quiet. Until 2026-10-19 only `cc-perms retire` ended it,
+    run by hand from either seat, and nobody ran it: the window stayed up long after its last read was in. Ended
+    only when every one of these holds, so the wrong kill (a read still out, a report not yet recorded) needs all
+    of them wrong at once: the window is named exactly perms~old, the session in it is the one cc-perms recorded
+    in <repo>/perms/session-id.old, running_reads() names nothing for it, its pane is idle (the seat has finished
+    the turn that records the last report), and all of that held on two sweeps CC_HANDOFF_GONE_CONFIRM apart. It
+    starts nothing and never touches the live seat in `perms`. Returns what it did, for the log and the selfcheck."""
+    wid = win_id(PERMS + OLD)
+    if not wid:
+        return ""
+    sid = seat_sid(wid)
+    pds = []
+    for f in glob.glob(os.path.join(STATE, "*", PERMS, "session-id.old")) if sid else []:
+        try:
+            with open(f, errors="replace") as fh:
+                if fh.read().strip() == sid:
+                    pds.append(os.path.dirname(f))
+        except OSError:
+            pass
+    if len(pds) != 1:
+        return ""                                  # not the session cc-perms kept: not ours to end
+    stamp = os.path.join(pds[0], "session-id.old.quiet")
+    if running_reads(sid) or not idle(wid):
+        try:
+            os.remove(stamp)                       # busy again: the two strikes start over
+        except OSError:
+            pass
+        return "busy"
+    since = None
+    try:
+        with open(stamp) as fh:
+            was, t = fh.read().split()
+        if was == sid:                             # a stamp a `cc-perms retire` left from an earlier hand-off
+            since = float(t)                       # is no strike for this one
+    except (OSError, ValueError):
+        pass
+    if since is None:
+        try:
+            with open(stamp, "w") as fh:
+                fh.write("%s %f\n" % (sid, time.time()))
+        except OSError:
+            pass
+        return "quiet"
+    if time.time() - since < cfg("CC_HANDOFF_GONE_CONFIRM", 300):
+        return "quiet"
+    tmux("kill-window", "-t", wid)
+    for f in ("session-id.old", "session-id.old.quiet"):
+        try:
+            os.remove(os.path.join(pds[0], f))
+        except OSError:
+            pass
+    logd(f"main:{PERMS}{OLD} ({wid}) had no read still running and was quiet two sweeps apart; ended it")
+    return "ended"
+
+
 def sweep(rotate_too=False):
     """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit); `--rotate` (rotate_too)
     adds ROTATION, and only the tick's --apply passes it — a bare `cc-reconcile` reports and opens nothing.
@@ -2083,6 +2140,7 @@ def sweep(rotate_too=False):
       any other cut-over record no --retire is finishing (retire_lock is free) -> a detached --retire. The one
         --ready starts can die with the successor's Bash call; without this a stay whose subagents had all
         reported held the record for the stay's whole cap, and the live seat could not hand off again.
+      `perms~old`, the old permission seat kept up for its reads, once they are all in -> ended (perms_old).
     A sweep only ever un-gates, so a WRONG 'gone' is the expensive direction: if tmux cannot be read at all —
     no server, no session main — every window looks gone, so nothing is swept."""
     if tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") is None:
@@ -2144,6 +2202,7 @@ def sweep(rotate_too=False):
                 rec = read(target)                 # the DECIDING read, as above
                 if rec and live_side(rec) == "predecessor" and not side_live(rec, "successor"):
                     expire(rec, "the successor's session died before --ready")
+    perms_old()                                    # the old permission seat, once its carried reads are in
     # A `~next` or `~old` window with NO record is one nothing here will ever finish: reported, once per window,
     # not killed — a session with no record is exactly the case where nobody can say whose it is.
     told_p = os.path.join(HANDOFF, "orphans.told")

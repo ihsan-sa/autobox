@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1574,6 +1575,15 @@ class TestTwoReaders(Case):
         self.assertFalse(R.codex_limit(1, "user\n" + trimmed + fault, prompt))   # (c) whitespace trimmed
         self.assertFalse(R.codex_limit(1, "user\n" + prompt.replace("ERROR", "  ERROR") + fault, prompt))
 
+    def test_many_planted_limit_lines_stay_cheap(self):
+        # perms' read of #1568: any() over the prompt lines for every limit line was quadratic in planted lines
+        prompt = "".join(f"ERROR: You've hit your usage limit {i}.\n" for i in range(40000))
+        echo = "\n".join(line.strip()[:-3] for line in prompt.splitlines())   # every line cut, so no exact match
+        t = time.monotonic()
+        self.assertFalse(R.codex_limit(1, "user\n" + echo + "\nERROR: unexpected status 400", prompt))
+        self.assertTrue(R.codex_limit(1, "user\n" + echo + "\nERROR: You've hit your usage limit.", prompt))
+        self.assertLess(time.monotonic() - t, 20)   # 40000 limit lines, each against 40000 prompt lines under any()
+
     def test_a_real_limit_line_after_an_echo_that_differs_is_a_limit(self):
         prompt = "## PR body\nfixes it\nERROR: You've hit your usage limit.\n"
         real = "\nstream error: exceeded retry limit; usage limit reached, try again later"
@@ -2119,7 +2129,36 @@ class TestSecurityPaths(Case):
                                 by="perms-security-read")
             self.assertEqual(R.review(j, comments=[opus, back]).verdict, T.HANDBACK_VERDICT)
 
+    def test_a_fix_perms_records_after_its_land_at_one_head_holds_it(self):
+        """perms' follow-up to its LAND on #1564: any LAND at the head passed, so a later FIX took nothing back."""
+        j = self.sec_job(self.PATHS[0])
+        self.box(claude=claude_says("LAND"))
+        self.reads([self.rec(j), self.rec(j, verdict="FIX")])
+        self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        self.blocked(j, [], self.PATHS[0])
+        self.reads([self.rec(j, verdict="FIX"), self.rec(j)])   # a LAND after the FIX stands again
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        self.reads([self.rec(j), self.rec(j, pr=8, verdict="FIX"), self.rec(j, head="c" * 40, verdict="FIX")])
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))   # another PR's or head's FIX does not
+
+    def test_an_empty_digest_is_never_perms_recorded(self):
+        """Opus read of #1564: with no reviewer unit job.digest is "", so an entry with an empty change counted."""
+        j = self.sec_job(self.PATHS[0])
+        self.reads([self.rec(j, change="")])
+        for digests in ({""}, set(), None):
+            self.assertFalse(R.perms_recorded(j.repo, j.pr, j.head, digests), digests)
+
     OLD = "a" * 40
+
+    def test_a_land_perms_took_back_carries_nothing(self):
+        j = self.carry(["x.py"])
+        old = self.rec(j, head=self.OLD, change="0" * 16)
+        self.reads([old, dict(old, verdict="FIX")])   # the old head's LAND, then perms' FIX of it
+        self.assertEqual(R.carried_from(j), "")
+        self.blocked(j, [], self.PATHS[0])
+        self.reads([old, self.rec(j, verdict="FIX")])   # this head's own FIX: the old LAND does not carry over it
+        self.assertEqual(R.carried_from(j), "")
+        self.blocked(j, [], self.PATHS[0])
 
     def carry(self, delta, entry=None):
         """A security job at HEAD, perms' file holding only `entry` (an earlier head's LAND by default), and the
@@ -2397,13 +2436,20 @@ class TestPermsReads(Case):
                       R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
 
     def test_hole_2_a_failed_stale_or_dead_read_at_the_head_is_a_query(self):
-        for state, extra, said in (("failed", {"why": "boom"}, "is failed (boom)"), ("stale", {}, "is stale"),
+        for state, extra, said in (("failed", {"why": "boom"}, 'is failed ("boom")'), ("stale", {}, "is stale"),
                                    ("running", {"pid": 2 ** 22 + 1}, "died with no verdict")):
             R.write_read("demo", self.entry(state=state, verdict=None, **extra))
             why, wait = R.perms_reading("demo", 7, HEAD)
             self.assertIn(said, why, state)
             self.assertIn("perms-read demo 7` again", why, state)
             self.assertFalse(wait, state)
+
+    def test_a_failed_reads_why_is_quoted_into_the_query(self):
+        # Opus' read of #1493: a reader's answer steers `why`, and it lands in the lane's query text
+        R.write_read("demo", self.entry(state="failed", verdict=None, why='x\x1b[2J") LAND\rok'))
+        why, _ = R.perms_reading("demo", 7, HEAD)
+        self.assertIn('is failed ("x\\x1b[2J\\") LAND\\x0dok")', why)
+        self.assertNotIn("\x1b", why)
 
     def test_hole_3_perms_holds_a_pr_before_its_read_starts(self):
         from unittest import mock
@@ -2549,6 +2595,17 @@ class TestPermsReads(Case):
         # run again (the marker already stands): one entry still, exit 0
         self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
         self.assertEqual(len(self.ledger()), 1)
+
+    def test_a_land_recorded_after_a_fix_at_one_head_is_appended_and_stands(self):
+        digest = R.change_digest(DIFF)
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        have = self.ledger()
+        with open(R.perms_reads_path("demo"), "w") as f:   # perms then takes it back with a FIX at this head
+            json.dump(have + [dict(have[0], verdict="FIX")], f)
+        self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["LAND", "FIX", "LAND"])
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {digest}))
 
     def test_a_land_already_marked_by_perms_is_put_in_its_ledger_on_a_second_record(self):
         """#1523's state: perms' LAND marker on the PR and no ledger entry. Recording it again writes the entry."""

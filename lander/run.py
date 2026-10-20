@@ -89,6 +89,8 @@ import posixpath
 import re
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -114,6 +116,14 @@ SETUP_RE = re.compile(r"^(bwrap:|systemd-run:|Failed to start transient scope"
 # Only a net check is read this way: a check with no network has no lookup to fail, so its line is the tree's own.
 RESOLVE_RE = re.compile(r"Could not resolve host(?:name)?\b.*|Temporary failure in name resolution|"
                         r"Name or service not known|No address associated with hostname|\bEAI_AGAIN\b")
+# …BUT ONLY WHILE THE RESOLVER ITSELF IS DOWN. A test with a typo'd host (api.jlcpcb.comm) fails the same way every run,
+# and read as the network it was held three times and its author never saw the red, while main's tip answered 'retry'
+# for it on every tick (perms and an Opus read of #1500, 10-20). Asking the line's own host again cannot tell a typo
+# from a flap (neither resolves), and the line is the tree's text, so a PR could print one to be held. So only the last
+# RESOLVE_TAIL lines are read, and a lookup line there holds only when RESOLVE_PROBE, a name that must resolve, fails.
+RESOLVE_TAIL = 20
+RESOLVE_PROBE = "github.com"
+RESOLVE_WAIT = 5   # seconds the probe may take; one that does not answer in time failed
 RED_RE = re.compile(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback")
 PASS_RE = re.compile(r"^\W*[✓✔]|^\s*(?:ok|pass(?:ed)?)\b", re.I)
 KILLED = (124, 137, 143)
@@ -128,6 +138,7 @@ BLOCKED = "blocked-by-main"
 DEFERRED = "deferred"
 # materialise(base_tree=): the base (main at the PR's base_sha) as a commit in the check's repo
 BASE_REF = "refs/lander/base"
+BASE_READ = 128   # bytes of BASE_REF base_of() reads: a sha-256 id and its newline, with room to spare
 # PINNED, perms' read of #1425: a check whose run file is one of these keys (under a manifest prefix) also runs with
 # these files as main has them at the PR's base, laid over the head tree, when the head changed any of them. The
 # guard's differential ran the PR's own guard-replay.sh and guard-probe.jsonl, so a PR could weaken the script or
@@ -206,12 +217,22 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
 
 def base_of(head: str) -> str:
     """BASE_REF as the head repo holds it, read from its file (materialise writes it loose), never through git, whose
-    config the check ran with write access to; "" when there is none."""
+    config the check ran with write access to; "" when there is none. The check could have written the file, and this
+    runs in the lander's own process, so (Opus' read of #1453) it opens without following a link or waiting on a FIFO,
+    takes only a regular file, reads one ref's length of bytes and wants ASCII: anything else is "", which base_kept()
+    fails, never a hang, an endless read or an error into the lane."""
     try:
-        with open(os.path.join(head, ".git", *BASE_REF.split("/"))) as f:
-            return f.read().strip()
+        fd = os.open(os.path.join(head, ".git", *BASE_REF.split("/")), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, BASE_READ).decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    finally:
+        os.close(fd)
 
 
 def base_kept(r: T.Result, head: str, want: str) -> T.Result:
@@ -402,8 +423,8 @@ def status_of(rc: int, text: str, capped: bool = False, started: bool | None = N
     a box-state error (a case that fills a disk on purpose) is not the box failing, so that text counts on rc != 0.
     started: what setup said out of band (read_started) — False is unrunnable whatever the exit, True never reads
     the output for setup's words; None (no pipe: a member, a runner) reads its first line for them.
-    net: the check is a live-network one, so a failed name lookup in a failed run is unrunnable (RESOLVE_RE), which
-    the lane holds and runs again rather than handing back."""
+    net: the check is a live-network one, so a failed name lookup near the end of a failed run while the box's
+    resolver is down (flap_in) is unrunnable, which the lane holds and runs again rather than handing back."""
     if capped:
         return T.UNRUNNABLE, "stopped at its cap"
     if rc < 0 or rc in KILLED:
@@ -422,10 +443,36 @@ def status_of(rc: int, text: str, capped: bool = False, started: bool | None = N
     n = [int(x) for x in FAILED_RE.findall(text)]
     if rc == 0 and not (n and n[-1] > 0):
         return T.PASSED, ""
-    r = RESOLVE_RE.search(text) if net else None
+    r = flap_in(text) if net else None
     if r:
-        return T.UNRUNNABLE, f"the network, not the tree: {r.group(0)[:200]}"
+        return T.UNRUNNABLE, f"the network, not the tree: {r[:200]}"
     return T.FAILED, f"exit {rc}" + (f", {n[-1]} failed" if n and n[-1] else "")
+
+
+def flap_in(text: str) -> str | None:
+    """-> the lookup line in the last RESOLVE_TAIL lines of a failed net check when RESOLVE_PROBE does not resolve
+    either, else None: with the resolver answering, a failed lookup (a typo'd host never resolves) is the tree's red."""
+    for ln in reversed(text.splitlines()[-RESOLVE_TAIL:]):
+        r = RESOLVE_RE.search(ln)
+        if r:
+            return None if resolves(RESOLVE_PROBE) else r.group(0)
+    return None
+
+
+def resolves(host: str, wait: float = RESOLVE_WAIT) -> bool:
+    """True when the box's resolver gives host an address within wait seconds. getaddrinfo has no timeout of its own,
+    so it runs on a daemon thread the caller stops waiting for."""
+    got = []
+
+    def ask():
+        try:
+            got.append(bool(socket.getaddrinfo(host, None)))
+        except (OSError, UnicodeError):
+            got.append(False)
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    t.join(wait)
+    return bool(got and got[0])
 
 
 def red_lines(text: str) -> list:

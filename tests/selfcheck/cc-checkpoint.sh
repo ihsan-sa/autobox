@@ -561,7 +561,7 @@ SH
   # 2026-10-14: two tracks' pushes failed 17 s apart on 'Could not resolve host: github.com'. A git on PATH that fails
   # its lookup for the first $FLAPS calls stands in for that resolver; each case counts the calls it made.
   mkdir -p "$T/flapbin"; RCOUNT="$T/rcount"; export RCOUNT
-  printf '#!/usr/bin/env bash\nn=$(( $(cat "$RCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RCOUNT"\n[ "$n" -le "${FLAPS:-0}" ] || { [ -z "${DENY:-}" ] || { echo "fatal: Authentication failed" >&2; exit 128; }; echo pushed; exit 0; }\necho "fatal: unable to access '"'"'https://github.com/o/r.git/'"'"': Could not resolve host: github.com" >&2; exit 128\n' > "$T/flapbin/git"
+  printf '#!/usr/bin/env bash\nn=$(( $(cat "$RCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RCOUNT"\n[ -z "${REMOTE:-}" ] || { echo "remote: error: hook: Could not resolve host: ci.internal" >&2; exit 1; }\n[ "$n" -le "${FLAPS:-0}" ] || { [ -z "${DENY:-}" ] || { echo "fatal: Authentication failed" >&2; exit 128; }; echo pushed; exit 0; }\necho "fatal: unable to access '"'"'https://github.com/o/r.git/'"'"': Could not resolve host: github.com" >&2; exit 128\n' > "$T/flapbin/git"
   chmod +x "$T/flapbin/git"
   flap(){   # $1 the interfaces file · $2 how many lookups fail · $3 non-empty: then refuse, as a failed login does
     : > "$RCOUNT"; ( PATH="$T/flapbin:$PATH"; NET_DEV="$1"; RESOLVE_WAITS="0 0 0"; FLAPS="$2" DENY="${3:-}"; export FLAPS DENY
@@ -576,6 +576,16 @@ SH
     "…and git's own line is the last on stderr, so push.err names the real reason" "$(cat "$T/flap.err")"
   out=$(flap "$T/net-up" 0 deny); rc=$?
   eq "a failure that is not the lookup is returned at once, never asked again" "rc=$rc calls=$(cat "$RCOUNT")" "rc=128 calls=1"
+  out=$(REMOTE=1 flap "$T/net-up" 0); rc=$?
+  eq "a lookup error on a 'remote:' line is the server's text, returned at once" "rc=$rc calls=$(cat "$RCOUNT")" "rc=1 calls=1"
+  # a kill during the pause takes the scratch file with it, and lands at once rather than after the sleep
+  mkdir -p "$T/flaptmp"; : > "$RCOUNT"
+  ( PATH="$T/flapbin:$PATH"; NET_DEV="$T/net-up"; RESOLVE_WAITS="30"; FLAPS=9 TMPDIR="$T/flaptmp"; export FLAPS TMPDIR
+    git_unattended push origin x ) 2>/dev/null & fp=$!
+  for _ in $(seq 50); do [ -s "$RCOUNT" ] && break; sleep 0.1; done; sleep 0.2
+  t0=$SECONDS; kill -TERM "$fp"; wait "$fp"; rc=$?
+  eq "a kill during the pause exits 143 at once with no scratch file left" \
+    "rc=$rc fast=$([ $((SECONDS - t0)) -lt 10 ] && echo y) left=$(ls -A "$T/flaptmp" | wc -l)" "rc=143 fast=y left=0"
   out=$(flap "$T/net-lo" 9); rc=$?
   eq "inside a fence (loopback only) a failed lookup is final at once: there is no network to come back" "rc=$rc calls=$(cat "$RCOUNT")" "rc=128 calls=1"
   # …AND END TO END through --push, on a real remote behind an ssh whose lookup fails the first time it is called.

@@ -1107,6 +1107,59 @@ def run_selfcheck():
                   "a-read\tPR #1546\thead 0123abcd\tasker planner\tSecurity read of PR #1546 at head 0123abcd for the planner seat "
                   "(asked by planner)."] and running_reads("sid-none") == [])
 
+        # PERMS~OLD ENDS ONCE ITS READS ARE IN (perms_old, from the sweep). Its own fixture: the old seat's window, the
+        # id cc-perms kept for it in session-id.old, the live seat beside it, and a seat id the test moves by hand.
+        _sid_po = seat_sid
+        po_sid = ["sid-pold"]
+        tr = os.path.join(troot, "project", "sid-pold", "tasks")
+        os.makedirs(tr)
+        t = os.path.join(d, "pold-read.jsonl")
+        with open(t, "w") as fh:
+            fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "PR #8 head 0123abcd"}}) + "\n"
+                     + rec_tool + "\n")
+        os.utime(t, (clk[0], clk[0]))
+        os.symlink(t, os.path.join(tr, "pold-read.output"))
+        globals()["seat_sid"] = lambda wid: po_sid[0] if wid == "@pold" else ""
+        wins["perms"], wins["perms~old"] = "@pnew", "@pold"
+        panes["@pold"] = IDLE
+        po_dir = os.path.join(STATE, "r1", "perms")
+        os.makedirs(po_dir, exist_ok=True)
+        po_keep = lambda v: open(os.path.join(po_dir, "session-id.old"), "w").write(v + "\n")   # noqa: E731
+        po_keep("sid-pold")
+        ok("perms~old stays while one of its reads is still running, however quiet its pane",
+           perms_old() == "busy" and wins.get("perms~old") == "@pold")
+        po_sid[0] = "sid-none"
+        po_keep("sid-other")
+        ok("...and a seat that is not the one cc-perms kept in session-id.old is never ended",
+           perms_old() == "" and perms_old() == "" and wins.get("perms~old") == "@pold")
+        po_keep("sid-none")
+        with open(os.path.join(po_dir, "session-id.old.quiet"), "w") as fh:
+            fh.write("sid-earlier %f\n" % (clk[0] - 3600))   # a stamp an earlier hand-off's retire left behind
+        ok("...a stamp left from an earlier hand-off's seat is no strike for this one",
+           perms_old() == "quiet" and wins.get("perms~old") == "@pold")
+        panes["@pold"] = WORKING
+        ok("...nor one still mid-turn once its reads are in (it may be recording the last report)",
+           perms_old() == "busy" and wins.get("perms~old") == "@pold")
+        panes["@pold"] = IDLE
+        clk[0] += 1
+        q1 = perms_old()
+        panes["@pold"] = WORKING
+        q2 = perms_old()                                 # busy again: the two strikes start over
+        panes["@pold"] = IDLE
+        q3 = perms_old()
+        clk[0] += 299
+        q4 = perms_old()
+        ok("...quiet with nothing running is one strike; busy in between starts the count over",
+           (q1, q2, q3, q4) == ("quiet", "busy", "quiet", "quiet") and wins.get("perms~old") == "@pold")
+        clk[0] += 2
+        ok("...and quiet again a confirm interval later it is ended, its kept id with it, and the live seat untouched",
+           perms_old() == "ended" and "perms~old" not in wins and wins.get("perms") == "@pnew"
+           and not os.path.exists(os.path.join(po_dir, "session-id.old"))
+           and not os.path.exists(os.path.join(po_dir, "session-id.old.quiet")) and perms_old() == "")
+        wins.pop("perms", None)
+        panes.pop("@pold", None)
+        globals()["seat_sid"] = _sid_po
+
         def cutover_sub(t):
             """cutover(), for a predecessor whose session id is the one the fixture's subagents belong to"""
             wins[t] = "@" + t

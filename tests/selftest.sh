@@ -992,8 +992,8 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"git log --on
              "Read|{\"file_path\":\"$GH/.cc/config\"}"; do
   [ "$(w "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "...and no wider than that: env.example is not a credential, and the box's OTHER secrets stay member-only as before" || bad "worker gate over-blocks:$miss"
-[ "$(w Bash '{"command":"systemctl --user list-units"}' "$wt")" = 2 ] \
-  && ok "...and a worker's systemctl read is unchanged — denied before stage 0, denied after (the list sorts by spelling, not reach)" || bad "systemctl gate moved under stage 0"
+[ "$(w Bash '{"command":"systemctl --user list-units"}' "$wt")" = 0 ] \
+  && ok "...and a worker's systemctl read passes: listing units reaches nothing outside the box's own work" || bad "a worker's systemctl read is refused"
 MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' 'Bash|{"command":"cc r t --go build it"}'
     'Bash|{"command":"cc board add r t title text; cc r t --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
     'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'

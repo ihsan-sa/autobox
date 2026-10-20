@@ -535,6 +535,29 @@ class DeadWeight(unittest.TestCase):
         self.assertEqual(M.widen_faults(base, head, files), [])
         self.assertNotIn("other", M.widen(base, head, files).checks)
 
+    def test_the_guard_selfchecks_never_go_as_dead(self):
+        """perms' read of #1571: selfcheck-cc-guard and selfcheck-cc-guard-argv are the guard's own cases, so each is
+        kept by name like guard-replay, though a head deleted its run file and every path."""
+        for name, run in (("selfcheck-cc-guard", "bin/cc-guard selfcheck"),
+                          ("selfcheck-cc-guard-argv", "bin/cc-guard-argv selfcheck")):
+            with self.subTest(name):
+                check = textwrap.dedent(f'''
+                    [[check]]
+                    name = "{name}"
+                    run = '{run}'
+                    paths = ["{run.split()[0]}"]
+                    class = "hermetic"
+                ''')
+                files = self.trees()
+                files.base["core/" + run.split()[0]] = "blob:" + name
+                base, head = AddOnly.two(None, self.BASE, self.BASE + check)
+                self.assertEqual(M.widen_faults(base, head, files), [f"check '{name}' was removed"])
+                self.assertIn(name, M.widen(base, head, files).checks)
+                other = (self.BASE + check).replace(f'"{name}"', '"other"')
+                base, head = AddOnly.two(None, self.BASE, other)
+                self.assertEqual(M.widen_faults(base, head, files), [])
+                self.assertNotIn("other", M.widen(base, head, files).checks)
+
     def test_a_check_added_before_its_tool_is_refused(self):
         base, head = AddOnly.two(None, self.BASE + self.GHOST, self.BASE)
         self.assertEqual(M.widen_faults(base, head, self.trees()),
