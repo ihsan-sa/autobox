@@ -865,7 +865,7 @@ out=$("$B/cc-context" $REPO w1 2>&1)
 { grep -q '^18%  180k/1M' <<<"$out" && grep -q 'window from statusline' <<<"$out" && grep -q 'hand off' <<<"$out"; } \
   && ok "a fresh status-line file is the number, and past the line it says hand off" || bad "statusline: $out"
 "$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 0 ] && ok "...and a bare --over exits 0 past the line" || bad "bare --over past the line: rc=$rc"
-"$B/cc-context" --all 2>/dev/null | grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" \
+allout=$("$B/cc-context" --all 2>/dev/null); grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" <<<"$allout" \
   && ok "--all names the track off the file's cwd, nine columns" || bad "--all: $("$B/cc-context" --all 2>&1)"
 lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 18% handoff!" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column: $lsout"
 rm -f "$CC_STATUSLINE_DIR/$sid.json"
@@ -873,7 +873,7 @@ rm -f "$CC_STATUSLINE_DIR/$sid.json"
 # --all built from that directory alone listed no worker: `cc ls`'s ctx column and the dashboard's Context block
 # were blank for exactly the sessions nobody is watching. With none there, the track's own transcript is the number.
 hsl=~/.claude/projects/$(readlink -f ~/.cc/worktrees/$REPO/w1 | tr '/.' '-'); mkdir -p "$hsl"; cp "$PD/$sid.jsonl" "$hsl/$sid.jsonl"
-"$B/cc-context" --all 2>/dev/null | grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" \
+allout=$("$B/cc-context" --all 2>/dev/null); grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" <<<"$allout" \
   && ok "a track with no status-line file is still listed, off its transcript" || bad "--all fallback: $("$B/cc-context" --all 2>&1 | grep "	w1	")"
 rm -rf "$hsl"
 # the Stop hook: UNDER the hand-off line it commits and answers nothing
