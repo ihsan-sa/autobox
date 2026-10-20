@@ -335,11 +335,12 @@ def send_verdicts(cases):
 class Box:
     """One case's whole world. Enter it, post to it, read its log and its store, leave it with nothing behind."""
 
-    KEYS = ("MAIL_SECRET", "MAIL_ALLOW", "LESSONS_EMAILS", "MAIL_DOMAIN", "MAIL_PORT", "PATH")
+    KEYS = ("MAIL_SECRET", "MAIL_ALLOW", "LESSONS_EMAILS", "MAIL_MAX_BYTES", "MAIL_MAX_CONN", "MAIL_DOMAIN",
+            "MAIL_PORT", "PATH")
 
     def __init__(self, secret=SECRET, allow=ALLOWED + "," + OTHER, use_env=True, **cfg):
         self.cfg = dict(MAIL_SECRET=secret, MAIL_ALLOW=allow, LESSONS_EMAILS="",
-                        MAIL_DOMAIN="box.example", MAIL_PORT="")
+                        MAIL_MAX_BYTES="", MAIL_MAX_CONN="", MAIL_DOMAIN="box.example", MAIL_PORT="")
         self.cfg.update({k: str(v) for k, v in cfg.items()})
         # use_env=False puts the same values behind a STUB cc-config on PATH instead, which is the only way to
         # count how many times the server asks for one. See the "read once" case.
@@ -704,13 +705,15 @@ def run():
         k(len(b.lines()) == 1 and b.lines()[0].count("store id=") == 1,
           "…and that too is one line, not two: the http.server default line is off")
 
-    # there is no size cap any more (the allow-list is the gate): a large mail from a stranger is still a silent
-    # drop, and the same mail from an allow-listed address is stored whole.
-    with Box() as b:
-        code, ans = b.post(eml(frm=STRANGER, body="x" * 400000), sender=STRANGER)
-        k(code == 403 and ans.get("reply") is None, "a large mail from a stranger is dropped, never answered")
-        code, ans = b.post(eml(body="x" * 400000), sender=ALLOWED)
-        k(code == 200 and len(b.ids()) == 1, "…the same mail from an allow-listed address is stored, no size cap")
+    # an oversize mail from a stranger must still be a silent drop and never a reason — the check order is
+    # "the sender, then the size", and swapping the two would tell a stranger the address exists.
+    with Box(MAIL_MAX_BYTES=200) as b:
+        code, ans = b.post(eml(frm=STRANGER, body="x" * 4000), sender=STRANGER)
+        k(code == 403 and ans.get("reply") is None,
+          "an oversize mail from a stranger is dropped, not refused with a reason (drops come first)")
+        code, ans = b.post(eml(body="x" * 4000), sender=ALLOWED)
+        k(code == 413 and isinstance(ans.get("reply"), str),
+          "…the same mail from an allow-listed address gets the reason")
 
     # ---------------------------------------------------------------- 3. the call itself
     with Box() as b:
@@ -927,6 +930,19 @@ def run():
         open(os.path.join(r.INBOX, ".20260101T000000Z-deadbeef"), "w").close()
         k(r.ids() == b.ids(), "a directory store() is still writing (leading dot) is not listed as a mail")
 
+    # ---------------------------------------------------------------- 4. size
+    with Box(MAIL_MAX_BYTES=3000) as b:
+        code, ans = b.post(eml(body="x" * 8000))
+        k(code == 413 and ans.get("status") == "refused", "a mail over MAIL_MAX_BYTES is refused (413)")
+        k(isinstance(ans.get("reply"), str) and "3000" in ans["reply"],
+          "…with a one-line reason naming the limit, for the worker to relay: %r" % (ans.get("reply") or "")[:50])
+        k(b.ids() == [], "…and nothing is stored")
+        code, _ = b.post(eml(body="x" * 100))
+        k(code == 200 and len(b.ids()) == 1, "a mail under the cap from the same sender is stored")
+    with Box() as b:
+        code, _ = b.post(eml(body="x" * 400000))
+        k(code == 200 and len(b.ids()) == 1, "the default cap (10 MiB) stores a 400 KB mail whole")
+
     # ---------------------------------------------------------------- 9. no part or attachment cap
     # The part, attachment-byte and connection caps are gone (guard inventory, 2026-10-20): an allow-listed
     # sender's mail with many parts is stored whole, every part written.
@@ -935,6 +951,25 @@ def run():
         k(code == 200 and len(b.ids()) == 1, "a mail with 80 parts from an allow-listed sender is stored: %r" % code)
         k(bool(b.ids()) and len(b.mail(b.ids()[0]).get("attachments") or []) == 80,
           "…with every one of its parts written as an attachment")
+
+    # ---------------------------------------------------------------- 10. the ceiling on connections
+    # One thread per connection with no ceiling is the tunnel's to spend: a caller that connects and then sends
+    # nothing holds a thread for Handler.timeout seconds and can do it as often as it likes. Over the ceiling a
+    # connection waits BUSY_WAIT for a slot and is then answered 503 busy, which the worker turns into a retry.
+    with Box(MAIL_MAX_CONN=1) as b:
+        held = socket.create_connection((b.host, b.port), timeout=10)
+        held.sendall(b"POST /inbound HTTP/1.1\r\nHost: x\r\n")     # no blank line: the handler waits for one
+        time.sleep(0.3)
+        s = socket.create_connection((b.host, b.port), timeout=10)
+        s.sendall(b"POST /inbound HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        first = s.recv(300)
+        s.close()
+        k(b"503" in first and b'"busy"' in first,
+          "with the only slot held, the next connection is answered 503 busy: %r" % first.split(b"\r\n")[0][:40])
+        k(b.ids() == [], "…and stores nothing")
+        held.close()
+        time.sleep(0.3)
+        k(b.post(eml())[0] == 200, "…and the slot comes back when that connection ends")
 
     # ---------------------------------------------------------------- 11. serve.log is bounded
     # Every line in it is built out of a stranger's mail and nothing else rotates it.

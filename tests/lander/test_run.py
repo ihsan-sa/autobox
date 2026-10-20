@@ -13,6 +13,7 @@ import datetime
 import fcntl
 import io
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -1186,6 +1187,29 @@ class Cage(unittest.TestCase):
         with mock.patch.object(S.shutil, "which", have()):
             self.assertFalse(S.available())
 
+    def test_nesting_skip_names_its_reason(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        sysctl = os.path.join(d, "restrict")
+        for val, wrapper, skip in (("1", "gone", True), ("1", sysctl, False), ("0", "gone", False)):
+            write(d, {"restrict": val + "\n"})
+            why = no_nesting_why(sysctl, os.path.join(d, wrapper))
+            self.assertEqual(bool(why), skip, (val, wrapper))
+        write(d, {"restrict": "1\n"})
+        self.assertIn("apparmor_restrict_unprivileged_userns=1", no_nesting_why(sysctl, os.path.join(d, "gone")))
+        self.assertEqual(no_nesting_why(os.path.join(d, "nope"), "gone"), "")
+
+
+def no_nesting_why(sysctl="/proc/sys/kernel/apparmor_restrict_unprivileged_userns", wrapper="/usr/local/libexec/claude-bwrap"):
+    """Why a nested bwrap cannot work here, or "": AppArmor bars unprivileged userns and no claude-bwrap profile frees them."""
+    try:
+        restricted = pathlib.Path(sysctl).read_text().strip() == "1"
+    except OSError:
+        return ""
+    if restricted and not os.path.exists(wrapper):
+        return f"kernel.apparmor_restrict_unprivileged_userns=1 and no {wrapper}, so a bwrap inside the cage cannot start"
+    return ""
+
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
 class Sandbox(Env):
@@ -1212,6 +1236,9 @@ class Sandbox(Env):
 
     def test_a_bwrap_nests_inside(self):
         # cc-lib's member cases launch cc-sandbox member in here (8 reds in the cage, 10-20)
+        why = no_nesting_why()
+        if why:
+            self.skipTest(why)
         r = self.run_(chk(run="bwrap --ro-bind / / --unshare-net --unshare-pid --proc /proc --dev /dev true"))
         self.assertEqual(r.status, T.PASSED, r.extra)
 
