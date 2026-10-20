@@ -16,7 +16,11 @@ that passes (MissingMount).
 
 WHAT IS NOT: the network (unless the check says net = true), this user's HOME and ~/.cc, every token, the host's
 tmux server, and every variable of the caller's environment (--clearenv; env() is all there is). User namespaces
-stay allowed: cc-sandbox's own selfcheck, lessons and the library editor nest bwrap.
+stay allowed: cc-sandbox's own selfcheck, lessons, the library editor and cc-lib's member cases nest bwrap. With
+kernel.apparmor_restrict_unprivileged_userns=1 every child of /usr/bin/bwrap runs under unpriv_bwrap, which denies all
+capabilities, so a bwrap nested in it cannot mount ("No permissions to create a new namespace": cc-lib's eight member
+cases, 10-20). The box's claude-bwrap copy has a profile of its own that leaves its children unconfined
+(config/etc/claude-bwrap), so the cage starts with it where it is installed (WRAPPERS, as tests/member_v2.py does).
 
 The run itself is `/bin/sh -c <run>` from the check's directory inside the tree; CC_SELFTEST_HELD tells selftest.sh
 this run already holds its slot, and CC_SELFTEST_SPILL=0 keeps it from spilling to a laptop from in here.
@@ -61,8 +65,15 @@ class MissingMount(RuntimeError):
     pass
 
 
+WRAPPERS = ("/usr/local/libexec/claude-bwrap", "bwrap")
+
+
+def wrapper() -> str | None:
+    return next((w for w in WRAPPERS if shutil.which(w)), None)
+
+
 def available() -> bool:
-    return shutil.which("bwrap") is not None
+    return wrapper() is not None
 
 
 def env(extra: dict | None = None) -> dict:
@@ -127,7 +138,7 @@ def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | 
     """The full bwrap command line that runs check.run in `tree` (a host directory). stub: write_stub()'s file.
     cwd: the check's directory inside the tree (its manifest prefix). started_fd: said on (say()) once the
     sandbox is up and its SETUP (the stub) is in, before tmux or the check starts."""
-    a = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--hostname", "lander", "--clearenv",
+    a = [wrapper() or "bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--hostname", "lander", "--clearenv",
          "--ro-bind", "/usr", "/usr"]
     if check.net:
         a.append("--share-net")

@@ -1176,6 +1176,16 @@ class Cage(unittest.TestCase):
         i = a.index("/var/lib/texmf")
         self.assertEqual(a[i - 1:i + 2], ["--ro-bind-try", "/var/lib/texmf", "/var/lib/texmf"])
 
+    def test_the_cage_starts_with_claude_bwrap_where_it_is_installed(self):
+        # its children may nest a bwrap, which /usr/bin/bwrap's are refused under AppArmor's userns restriction
+        have = lambda *names: lambda w: w if w in names else None
+        with mock.patch.object(S.shutil, "which", have(S.WRAPPERS[0], "bwrap")):
+            self.assertEqual(S.argv(chk(run="true"), "/t", "/s")[0], S.WRAPPERS[0])
+        with mock.patch.object(S.shutil, "which", have("bwrap")):
+            self.assertEqual(S.argv(chk(run="true"), "/t", "/s")[0], "bwrap")
+        with mock.patch.object(S.shutil, "which", have()):
+            self.assertFalse(S.available())
+
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
 class Sandbox(Env):
@@ -1199,6 +1209,11 @@ class Sandbox(Env):
             r = self.run_(chk(run=probe))
         self.assertEqual(r.status, T.PASSED, r.extra)
         self.assertTrue(r.runner.startswith("box:bwrap:"), r.runner)
+
+    def test_a_bwrap_nests_inside(self):
+        # cc-lib's member cases launch cc-sandbox member in here (8 reds in the cage, 10-20)
+        r = self.run_(chk(run="bwrap --ro-bind / / --unshare-net --unshare-pid --proc /proc --dev /dev true"))
+        self.assertEqual(r.status, T.PASSED, r.extra)
 
     def test_net_true_shares_the_network(self):
         r = self.run_(chk(run='test "$(grep -c : /proc/net/dev)" -gt 1', net=True))
@@ -2883,7 +2898,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(seen, ["laptop", "box"])
 
     def test_an_overloaded_box_sends_check_sh_and_the_e2e_suites_and_keeps_what_needs_it(self):
-        # the shipped manifests, as the lane reads them: the heavy host checks go, the ones bound to this host stay
+        # the shipped manifests, as the lane reads them: the heavy host checks go, the ones bound to this host (check-sh among them since #1700) stay
         with open(os.path.join(CORE, "tests", "LANDING.toml")) as f:
             checks, faults = M.parse_checks(f.read())
         self.assertEqual(faults, [])
@@ -2895,9 +2910,9 @@ class Judge(unittest.TestCase):
         write(d.name, {"id_ed25519": "k\n", "remote": "ccsuite@r\n", "known_hosts": "r ssh-ed25519 AAAA\n"})
         with mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name}), \
                 mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
-            for n in ["check-sh"] + e2e:
+            for n in e2e:
                 self.assertEqual((n, RUN.choose_where(by[n])), (n, "laptop"))
-            for n in ("selfcheck-cc-fence", "selfcheck-cc-sandbox", "selfcheck-lander"):
+            for n in ("check-sh", "selfcheck-cc-fence", "selfcheck-cc-sandbox", "selfcheck-lander"):   # check-sh: box only since #1700
                 self.assertEqual((n, RUN.choose_where(by[n])), (n, "box"))
 
     def test_a_busy_box_that_is_not_saturated_keeps_its_slots(self):
