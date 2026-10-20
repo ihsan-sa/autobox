@@ -1398,7 +1398,7 @@ class Lane:
         """Every other check of the plan has passed and `held` (host_unread) is left: held (box) while perms' read of
         the PR runs or its perms-hold stub stands at this head (review.perms_reading), else a query "planning", which
         asks perms for its read, or, when that read at this head finished LAND but is not in perms' ledger, for its
-        perms-adopt (perms-read would start nothing). Its LAND at this head runs them when the job is queued again."""
+        perms-adopt (perms-read would start nothing). Its LAND at this head re-queues the job (review.requeue_held)."""
         from lander import review as R
         names = ", ".join(held)
         why = (f"{names} run{'s' if len(held) == 1 else ''} the head's code on the host, so "
@@ -1408,6 +1408,7 @@ class Lane:
             return self.hold(job, f"{why}: {reading}", kind="box")
         at, _ = R.load_read(job.repo, job.pr, job.head)
         verb = "perms-adopt" if at and at.get("state") == "done" and at.get("verdict") == T.LAND else "perms-read"
+        job.extra["host_hold"] = job.head
         return self.query(job, f"{why} (lander {verb} {job.repo} {job.pr})"
                                + (f": {reading}" if reading else ""), "planning")
 

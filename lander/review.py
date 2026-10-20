@@ -12,7 +12,8 @@
     lander perms-hold <repo> <pr>    perms only: hold the PR's merge at its head until perms' read of it says LAND
     lander perms-reads <repo> [<pr>] perms' read files, running and done, newest first
     lander perms-adopt <repo> <pr>   perms only: put its finished LAND read in its ledger, only when that read is of
-                                     the PR's live head and change
+                                     the PR's live head and change. A ledger LAND (here or by record) re-queues the
+                                     PR's job that host_hold ended at that head (requeue_held)
 
 ONE READ PER CHANGE DIGEST. The digest is digest_of(): change_digest() of `git diff base...head` as plain_diff()
 makes it (blind to the checkout's config and attributes, so binary means binary bytes), the hunk headers and `index`
@@ -2145,7 +2146,7 @@ def cmd_record(argv):
     # a second reader's LAND is posted too: lander-self needs an Opus read and a security read at one head
     if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
         print(f"lander record: {word} is already recorded for this change; nothing posted")
-        return _perms_ledger(job, seat, args[2], who, head)
+        return _perms_ledger(job, facts, seat, args[2], who, head)
     if stands and stands.verdict == T.HANDBACK_VERDICT and word == T.LAND:
         print(f"lander record: HANDBACK stands for this change and LAND is looser; push the fix instead")
         return 1
@@ -2158,10 +2159,10 @@ def cmd_record(argv):
     C.log("recorded", repo, pr, verdict=word, by=re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]),
           head=job.head[:12], change=job.digest[:12] or "-")
     print(f"lander record: {word} recorded on PR #{pr} at {job.head[:12]}")
-    return _perms_ledger(job, seat, args[2], who, head)
+    return _perms_ledger(job, facts, seat, args[2], who, head)
 
 
-def _perms_ledger(job, seat, said, who, head):
+def _perms_ledger(job, facts, seat, said, who, head):
     """The perms seat's verdict through `record` is its security read, so it goes in perms' ledger in the same step
     (#1523: a LAND marker by perms, and no ledger entry, was refused INCOMPLETE twice). `said` is the word perms
     passed (OLD_WORDS' key), and the entry keeps it. A HANDBACK, LAND-AFTER-FIX or DO-NOT-LAND is appended as a
@@ -2192,6 +2193,8 @@ def _perms_ledger(job, seat, said, who, head):
         return 1
     C.log("perms-recorded", job.repo, job.pr, head=job.head[:12], change=job.digest[:12], verdict=said)
     print(f"lander record: perms' {said} of PR #{job.pr} at {job.head[:12]} is in its ledger")
+    if land:
+        requeue_held(job, facts)
     return 0
 
 
@@ -2516,6 +2519,18 @@ def grant(job, read, model, verdict=T.LAND):
     return ""
 
 
+def requeue_held(job, facts):
+    """Perms' LAND of the open PR's live head is in its ledger: a job that ended a query at that head on host_hold
+    goes back in the lane, as the lander's queue command would put it (drain logs `requeued`). Any other job is left
+    alone."""
+    from lander import jobs as J
+    from lander import lane as L
+    held = J.load(job.repo, job.pr)
+    if facts.get("state") == "OPEN" and held and held.state == T.QUERY and held.extra.get("host_hold") == job.head:
+        J.submit(job.repo, job.pr, who="perms")
+        L.spawn_tick(job.repo)
+
+
 def _perms_run(repo, pr, head):
     """The detached half of perms-read: it runs only for the stub that names its own pid (written by the seat that
     started it), reads the PR at `head`, and writes the verdict into that file."""
@@ -2667,6 +2682,7 @@ def cmd_perms_adopt(argv):
         return 1
     C.log("perms-adopt", repo, pr, head=job.head[:12], change=job.digest[:12])
     print(f"lander perms-adopt: perms' LAND of PR #{pr} at {job.head[:12]} is in its ledger")
+    requeue_held(job, facts)
     return 0
 
 

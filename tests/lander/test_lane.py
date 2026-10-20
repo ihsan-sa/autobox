@@ -3081,6 +3081,7 @@ class HostHold(Fixture):
         self.assertEqual(j.state, T.QUERY)
         self.assertIn("lander perms-adopt demo 1", j.extra["why"])
         self.assertNotIn("perms-read", j.extra["why"])
+        self.assertEqual(j.extra["host_hold"], j.head)   # review.requeue_held finds it by this when the LAND lands
 
 
 class Review(Fixture):

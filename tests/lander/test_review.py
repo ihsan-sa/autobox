@@ -2576,6 +2576,48 @@ class TestPermsReads(Case):
         self.assertEqual(len(self.ledger()), 1)
         self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o600)
 
+    def held_job(self, head=HEAD):
+        """A job that ended a query on host_hold at `head`, the way lane.host_hold leaves it."""
+        from lander import jobs as J
+        J.save(T.Job(repo="demo", pr=7, state=T.QUERY, head=head, extra={"host_hold": head}))
+        return J
+
+    def test_a_land_at_the_held_head_puts_the_job_back_in_the_lane(self):
+        """2026-10-20: six PRs got perms' LAND and sat with no job until a seat queued them by hand."""
+        J = self.held_job()
+        R.write_read("demo", self.entry())
+        with mock.patch("lander.lane.spawn_tick", return_value=(True, "pid 1")) as tick:
+            self.assertEqual(self.adopt(), 0)
+        tick.assert_called_once_with("demo")
+        self.assertEqual(J.drain("demo"), ["demo#7 requeued"])
+        self.assertEqual(J.load("demo", 7).state, T.QUEUED)
+
+    def test_a_land_at_another_head_leaves_the_held_job_alone(self):
+        J = self.held_job(head=self.OLD)
+        R.write_read("demo", self.entry())
+        with mock.patch("lander.lane.spawn_tick") as tick:
+            self.assertEqual(self.adopt(), 0)
+        tick.assert_not_called()
+        self.assertEqual(J.drain("demo"), [])
+        self.assertEqual(J.load("demo", 7).state, T.QUERY)
+
+    def test_a_land_recorded_from_the_seat_puts_the_held_job_back_in_the_lane(self):
+        """The record path is the one perms uses most (Opus read of #1733)."""
+        J = self.held_job()
+        with mock.patch("lander.lane.spawn_tick", return_value=(True, "pid 1")) as tick:
+            self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        tick.assert_called_once_with("demo")
+        self.assertEqual(J.drain("demo"), ["demo#7 requeued"])
+        self.assertEqual(J.load("demo", 7).state, T.QUEUED)
+
+    def test_a_handback_recorded_from_the_seat_leaves_the_held_job_alone(self):
+        J = self.held_job()
+        with mock.patch("lander.lane.spawn_tick") as tick:
+            self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD)[0], 0)
+        tick.assert_not_called()
+        self.assertEqual(J.drain("demo"), [])
+        self.assertEqual(J.load("demo", 7).state, T.QUERY)
+
     # the lane's wait (perms_reading): it holds only while time mends it, and every other stop short of a LAND at the
     # head is a query; perms' read of #1525 (10-19) found four ways the first version let a merge through
     def test_the_lane_waits_on_a_running_read_and_a_land_lets_it_go(self):
