@@ -40,7 +40,9 @@ off the light lane (light.path_hit). A class ranked above lander, which the lane
 lists skip lander-self.
 paid: some file matches paid_review, or UNGATED: some unowned path is code (anything but an added data or asset file,
 inert()) that no check runs on, before the merge or after it: none it widens to, reaches or triggers (a repo with no
-manifest of its own and no host fallback, or an add-only change nothing owns, whatever its other files select). Such
+manifest of its own and no host fallback, or an add-only change nothing owns, whatever its other files select). An
+added file nothing loads by place or name is never covered by the default set: it widens only because another file
+made the change not add-only, so a file a real check owns can't pad it out of a read. Such
 a change is read instead of landing on nothing, and extra["ungated"] says why it was paid.
 SECURITY: the changed files that match the base's tests/LANDING-security.toml (Policy.security_review) go in
 extra["security"], and the plan is paid. review.py then lands it only on a security reader's LAND at its digest
@@ -161,7 +163,7 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
             else:
                 faults.append(f"default check {n!r} is not in the manifest")
         if any(n in m.checks for n in pol.default):
-            covered.update(widening)
+            covered.update(f for f in widening if not (f in added and loads_by_nothing(f)))
     lander = list(pol.lander) + [p + f for p in M.PREFIXES for f in (M.POLICY, M.SECURITY)]
     # brief: "a reach.tsv change that exactly matches what the generator writes on the PR's merge tree follows from
     # the code, so it's not a policy edit"; "a reach.tsv edit that doesn't match the generator still goes to
@@ -193,6 +195,8 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
     # path, added or changed, does". manifest-widen is padding here: it reads the manifest, never the code.
     # review of #1178: a check some other file selects is padding too. An unowned path counts as covered only by a
     # check that runs because of it: the default set it widens to, a caller it reaches, or the e2e set it triggers.
+    # perms' LOW on #1178 at 65084c21, "padding a PR with a covered file still skips the read": an added file nothing
+    # loads widens only because another file made the change not add-only, so the default set never covers it.
     ungated = any(not inert(f, added) and f not in covered for f in unowned)
     if ungated:
         extra["ungated"] = True

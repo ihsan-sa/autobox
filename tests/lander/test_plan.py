@@ -946,10 +946,26 @@ class Select(unittest.TestCase):
         self.assertTrue(P.select(bare, files, added=["collectors/new.py"]).paid)   # suppressed: nothing runs
         bare.checks["e2e"] = T.Check(name="e2e", run="true", paths=["collectors/old.py"], klass=T.BOX)
         self.assertTrue(P.select(bare, files, added=["collectors/new.py"]).paid)   # it runs, but never on new.py
-        bare.policy.default = ["e2e"]   # new.py widens to it, so it runs on new.py too
-        p = P.select(bare, files, added=["collectors/new.py"])
-        self.assertEqual((p.checks, p.extra["tip"], p.unowned), ([], ["e2e"], ["collectors/new.py"]))
+        bare.policy.default = ["e2e"]   # a changed unowned file widens to it, so it runs on that file too
+        p = P.select(bare, ["collectors/old.py", "collectors/mod.py"])
+        self.assertEqual((p.checks, p.extra["tip"], p.unowned), ([], ["e2e"], ["collectors/mod.py"]))
         self.assertEqual((p.paid, p.extra.get("ungated")), (False, None))
+
+    def test_a_file_a_real_check_owns_cannot_pad_added_code_out_of_a_read(self):
+        # perms' LOW on #1178 at 65084c21: "padding a PR with a covered file still skips the read"
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = os.path.join(d.name, "fund")
+        os.mkdir(root)
+        with mock.patch.dict(os.environ, {"CC_DEV": d.name}):
+            bare = self.bare_repo(root)
+        bare.checks["lint"] = T.Check(name="lint", run="true", paths=["collectors/old.py"])
+        bare.policy.default = ["lint"]
+        p = P.select(bare, ["collectors/new.py"], added=["collectors/new.py"])   # alone: add-only, nothing runs
+        self.assertEqual((p.checks, p.paid, p.extra.get("ungated")), ([], True, True))
+        # beside a file lint owns, new.py widens to lint, but lint never loads it: still read
+        p = P.select(bare, ["collectors/new.py", "collectors/old.py"], added=["collectors/new.py"])
+        self.assertEqual((p.checks, p.klass, p.paid, p.extra.get("ungated")), (["lint"], T.WIDE, True, True))
 
     @staticmethod
     def bare_repo(root):
