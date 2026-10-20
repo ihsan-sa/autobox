@@ -3069,20 +3069,13 @@ class Sweep(unittest.TestCase):
         self.assertNotIn(T.HOST, ran)
         self.assertEqual(len(ran), 1)
 
-    def test_rev_is_main_cases(self):
+    @contextlib.contextmanager
+    def repo(self):
+        """A host-made checkout with commits a and b (b on main, HEAD) and a forged local origin/main naming b."""
         from lander import git as G
         with tempfile.TemporaryDirectory() as dev, mock.patch.dict(os.environ, {"CC_DEV": dev}):
             d = os.path.join(dev, "r")
             os.mkdir(d)
-
-            def setmain(sha):
-                ref = os.path.join(d, ".git", "refs", "remotes", "origin", "main")
-                if sha is None:
-                    os.unlink(ref)
-                    return
-                os.makedirs(os.path.dirname(ref), exist_ok=True)
-                with open(ref, "w") as f:
-                    f.write(sha + "\n")
 
             def g(*a):
                 return subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a],
@@ -3090,18 +3083,94 @@ class Sweep(unittest.TestCase):
             g("init", "-q", "-b", "main")
             g("commit", "-q", "--allow-empty", "-m", "a")
             a = g("rev-parse", "HEAD")
-            setmain(a)
-            t = G.host_tree(d)
-            self.assertTrue(CK.rev_is_main(t, "HEAD"))
-            self.assertTrue(CK.rev_is_main(t, a))
             g("commit", "-q", "--allow-empty", "-m", "b")
-            self.assertFalse(CK.rev_is_main(t, "HEAD"))        # a descendant of main
-            g("checkout", "-q", "-b", "other", a)
-            g("commit", "-q", "--allow-empty", "-m", "c")
-            self.assertFalse(CK.rev_is_main(t, "other"))       # a branch off main
-            self.assertFalse(CK.rev_is_main(t, "nonesuch"))    # names nothing
-            setmain(None)
-            self.assertFalse(CK.rev_is_main(t, a))             # no origin/main at all
+            b = g("rev-parse", "HEAD")
+            ref = os.path.join(d, ".git", "refs", "remotes", "origin", "main")
+            os.makedirs(os.path.dirname(ref), exist_ok=True)
+            with open(ref, "w") as f:
+                f.write(b + "\n")
+            yield G.host_tree(d), a, b
+
+    def test_rev_is_main_reads_the_fetch_not_the_local_ref(self):
+        from lander import git as G
+        with self.repo() as (t, a, b):
+            self.assertTrue(CK.rev_is_main(t, a, fetch=lambda root, br: {br: a}))
+            # the local origin/main names b, forged: origin sent a, so b is not main
+            self.assertFalse(CK.rev_is_main(t, b, fetch=lambda root, br: {br: a}))
+            self.assertFalse(CK.rev_is_main(t, "HEAD", fetch=lambda root, br: {br: b}))   # a name, not an id
+            self.assertFalse(CK.rev_is_main(t, "", fetch=lambda root, br: {br: ""}))
+            seen = []
+
+            def fails(root, br):
+                seen.append((root, br))
+                raise G.GitError("git fetch: no remote")
+            self.assertFalse(CK.rev_is_main(t, b, fetch=fails))
+            self.assertEqual(seen, [(t.work_tree, "main")])
+
+    def test_commit_of_resolves_a_name_to_one_full_id(self):
+        with self.repo() as (t, a, b):
+            self.assertEqual(CK.commit_of(t, "HEAD"), b)
+            self.assertEqual(CK.commit_of(t, "HEAD~1"), a)
+            self.assertEqual(CK.commit_of(t, a[:10]), a)
+            self.assertEqual(CK.commit_of(t, "nonesuch"), "")
+
+    def sweep(self, argv, fetch):
+        """cmd_sweep in a fresh checkout with tree_of, the manifest and sweep_one stubbed: what each was handed."""
+        got = {"tree": [], "load": [], "rerun": []}
+
+        def tree_of(repo, rev):
+            got["tree"].append(rev)
+            return "t" * 40
+
+        def load(repo, rev, fallback=""):
+            got["load"].append(rev)
+            return M.Manifest(checks={"x": chk(name="x", klass=T.HOST)}, cwd={"x": ""})
+
+        def one(repo, m, name, tree, sandbox, host_rerun=True):
+            got["rerun"].append(host_rerun)
+            return {"check": name, "class": T.HOST, "verdict": "red", "secs": 0, "why": ""}
+        with self.repo() as (t, a, b), \
+                mock.patch.object(CK.G, "fetch", side_effect=fetch(a, b)) as f, \
+                mock.patch.object(CK.RUN, "tree_of", tree_of), mock.patch.object(CK.M, "load", load), \
+                mock.patch.object(CK, "sweep_one", one), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            got["rc"] = CK.cmd_sweep(["--repo", t.work_tree, *argv(a, b)])
+            got.update(a=a, b=b, fetched=f.call_args_list, err=err.getvalue())
+        return got
+
+    def test_sweep_resolves_rev_once_and_reruns_only_on_the_fetched_main(self):
+        got = self.sweep(lambda a, b: ["--sandbox", "--rev", "HEAD~1"], lambda a, b: lambda root, br: {br: a})
+        self.assertEqual(got["tree"], [got["a"]])
+        self.assertEqual(got["load"], [got["a"]])
+        self.assertEqual(got["rerun"], [True])
+        self.assertEqual(len(got["fetched"]), 1)
+
+    def test_sweep_off_main_and_on_a_forged_local_ref_refuses_the_rerun(self):
+        got = self.sweep(lambda a, b: ["--sandbox"], lambda a, b: lambda root, br: {br: a})
+        self.assertEqual(got["tree"], [got["b"]])   # HEAD, which the forged origin/main also names
+        self.assertEqual(got["rerun"], [False])
+        self.assertIn("not the commit origin sends for main", got["err"])
+
+    def test_sweep_fetch_failure_refuses_the_rerun(self):
+        from lander import git as G
+
+        def fetch(a, b):
+            def f(root, br):
+                raise G.GitError("git fetch: could not read from remote")
+            return f
+        got = self.sweep(lambda a, b: ["--sandbox", "--rev", b], fetch)
+        self.assertEqual(got["rerun"], [False])
+        self.assertEqual(got["rc"], CK.EXIT_RED)
+
+    def test_sweep_without_sandbox_never_fetches(self):
+        got = self.sweep(lambda a, b: [], lambda a, b: lambda root, br: {br: a})
+        self.assertEqual(got["fetched"], [])
+        self.assertEqual(got["rerun"], [True])
+
+    def test_sweep_rev_naming_nothing_is_usage(self):
+        got = self.sweep(lambda a, b: ["--sandbox", "--rev", "nonesuch"], lambda a, b: lambda root, br: {br: a})
+        self.assertEqual(got["rc"], CK.EXIT_USAGE)
+        self.assertEqual((got["tree"], got["load"], got["fetched"]), ([], [], []))
 
     def test_the_acceptance_verdicts(self):
         home = os.path.expanduser("~")

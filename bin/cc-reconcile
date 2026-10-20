@@ -780,22 +780,29 @@ def branch_prs(repo, branch, net=True):
 
 
 def open_heads(repo, net=True):
-    """({head branch}, {head oid}) of <repo>'s OPEN PRs, in one GitHub call; None when GitHub could not be asked.
-    A branch counts only for a PR from <repo> itself: a fork's dispatch/9 is not origin's dispatch/9, so only its
-    head oid stands for it."""
-    cwd = f"{DEV}/{repo}"
-    if not net or not shutil.which("gh") or not os.path.isdir(cwd):
+    """({head branch}, {head oid}) of <repo>'s OPEN PRs, over REST a page of 100 at a time; None when GitHub could not
+    be asked. A branch counts only for a PR from <repo> itself (head.repo is the base repo): a fork's dispatch/9 is
+    not origin's dispatch/9, so only its head oid stands for it, and a PR whose fork was deleted has no head.repo."""
+    if not net or not shutil.which("gh") or not os.path.isdir(f"{DEV}/{repo}"):
         return None
-    p = sh("gh", "pr", "list", "--state", "open", "--limit", "300",
-           "--json", "number,state,headRefName,headRefOid,isCrossRepository", cwd=cwd, timeout=30)
-    if p is None or p.returncode:
-        return None
-    try:
-        rows = [r for r in json.loads(p.stdout or "[]") if str(r.get("state") or "OPEN").upper() == "OPEN"]
-        return ({str(r["headRefName"]) for r in rows if r.get("headRefName") and not r.get("isCrossRepository")},
-                {str(r["headRefOid"]) for r in rows if r.get("headRefOid")})
-    except Exception:
-        return None
+    rows, page = [], 1
+    while True:
+        got = rest(repo, f"repos/{{owner}}/{{repo}}/pulls?state=open&per_page=100&page={page}", timeout=30)
+        if not isinstance(got, list):
+            return None
+        rows += [r for r in got if isinstance(r, dict) and str(r.get("state") or "open").lower() == "open"]
+        if len(got) < 100:
+            break
+        page += 1
+    branches, oids = set(), set()
+    for r in rows:
+        h, b = r.get("head") or {}, r.get("base") or {}
+        own = ((h.get("repo") or {}).get("full_name") or "").lower()
+        if h.get("ref") and own and own == ((b.get("repo") or {}).get("full_name") or "").lower():
+            branches.add(str(h["ref"]))
+        if h.get("sha"):
+            oids.add(str(h["sha"]))
+    return branches, oids
 
 
 def at_open_head(repo, wt, heads, default="main"):

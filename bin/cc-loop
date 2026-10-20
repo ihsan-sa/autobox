@@ -365,6 +365,29 @@ onto_block(){   # → a row whose board PR is ANOTHER branch's open PR (a hive d
   if [ -z "$rurl" ] || ! timeout -k 5 60 env GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$WT" -c core.hooksPath=/dev/null fetch --quiet "$rurl" "+refs/heads/$br:refs/remotes/origin/$br" >/dev/null 2>&1; then
     printf ' This row fixes the open PR %s, whose branch is %s, but the host could not fetch that branch this iteration, so origin/%s is not there to build on: make no edits, and append STATUS: BLOCKED: cannot fetch %s for %s.' "$url" "$br" "$br" "$br" "$url"; return 0; fi
   printf ' This row fixes the open PR %s, whose branch is %s: build your commits on origin/%s (merge origin/%s into track/%s before your first edit if it is not already in it; never reset, so track/%s stays a fast-forward). At DONE, cc done pushes them onto %s as a plain fast-forward and that PR carries the fix, so do not block on the push and do not expect a second PR.' "$url" "$br" "$br" "$br" "$track" "$track" "$br"; }
+issue_block(){   # → the GitHub issues and PRs task.md names, fetched HERE on the host and saved where the worker reads
+                 # them, or NOTHING. The sandbox has no GitHub login, so a brief that only said "#1261" left the worker
+                 # tracing it blind until a seat pasted the body in (raised-dispatch-worker-cant-read-github,
+                 # 2026-10-19). A bare #N is the origin repository's; a github.com/<o>/<r>/(issues|pull)/<n> link is its
+                 # own. The board's inflight block is not the brief and is skipped. A fetch that fails keeps the copy
+                 # an earlier iteration saved, and one never saved is named so the worker asks instead of guessing.
+  local f="$ST/task.md" dir="$ST/github" slug refs s n o saved=() unread=()
+  [ -f "$f" ] || return 0
+  slug=$(git -C "$WT" remote get-url origin 2>/dev/null | sed -nE 's#^.*github\.com[:/]([^/]+/[^/]+)$#\1#p'); slug=${slug%.git}
+  refs=$(awk '/<!-- cc-brief:inflight -->/{s=1} /<!-- \/cc-brief:inflight -->/{s=0; next} !s' "$f" \
+    | grep -oE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(issues|pull)/[0-9]+|(^|[^A-Za-z0-9_/&])#[0-9]+' \
+    | sed -E 's#^github\.com/([^/]+/[^/]+)/(issues|pull)/#\1 #; s#^.*\##'"$slug"' #' | sort -u)
+  [ -n "$refs" ] && mkdir -p "$dir" 2>/dev/null || return 0
+  while read -r s n; do
+    [ -n "$n" ] || continue   # a bare #N with no github origin to read it against
+    o="$dir/${s//\//_}_$n.md"
+    if ( cd / && timeout -k 5 30 gh api "repos/$s/issues/$n" --jq '"# \(.title) (\(.html_url), \(.state))\n\n\(.body // "")"' \
+         && timeout -k 5 60 gh api "repos/$s/issues/$n/comments" --paginate --jq '.[] | "\n## \(.user.login), \(.created_at)\n\n\(.body)"' ) > "$o.tmp" 2>/dev/null
+    then mv "$o.tmp" "$o"; else rm -f "$o.tmp"; fi
+    if [ -f "$o" ]; then saved+=("$o"); else unread+=("$s#$n"); fi
+  done <<<"$refs"
+  [ ${#saved[@]} = 0 ] || printf ' Your sandbox has no GitHub login, so the host saved the issues and PRs task.md names (title, body and comments): %s.' "$(printf '%s\n' "${saved[@]}" | paste -sd' ' -)"
+  [ ${#unread[@]} = 0 ] || printf ' The host could not fetch %s, and your sandbox cannot either: if the brief does not quote what you need from it, append STATUS: BLOCKED: paste the text of %s into task.md.' "${unread[*]}" "${unread[*]}"; }
 SPEND="$(dirname "$BIN")/config/spend-prompt.md"   # what a session spends — written ONCE, in core/, for every session kind
 spend_block(){   # → that shared rule with a leading space, or NOTHING if the file is missing, like the three above.
                  # The worker is the kind this bites hardest: it runs unattended in a loop, so an iteration that
@@ -413,7 +436,7 @@ sp_worker(){   # $1 the base branch → the whole system prompt a headless worke
                # because bash 5.2 reads a bare & in one as the matched text. No file, no prompt: the caller stops.
   local p; p=$(sed 's/[[:space:]]*$//' "$WORKER_PROMPT" 2>/dev/null | tr '\n' ' ') && [ -n "${p// /}" ] || return 1
   p=${p% }; p=${p//\{track\}/"$track"}; p=${p//\{repo\}/"$repo"}; p=${p//\{state\}/"$ST"}; p=${p//\{base\}/"$1"}
-  printf %s "$p$(onto_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
+  printf %s "$p$(onto_block)$(issue_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -2276,6 +2299,19 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
     git -C "$c/wt" rev-parse -q --verify refs/remotes/origin/dispatch/1042 >/dev/null && echo fetched || echo none; }
   t 'onto_block fetches the PR branch from the push repo, though origin fetches from another' "$(ob push 1 | paste -sd'|' -)" "build your commits on origin/dispatch/1042|fetched"
   t '…and a branch it cannot fetch tells the worker to block, never to build on a missing ref' "$(ob nofetch 0 | paste -sd'|' -)" "could not fetch that branch|none"
+  # issue_block: what task.md names is fetched on the host into the state dir. Its own fake gh, repo and task.md.
+  c="$d/ib"; mkdir -p "$c/bin" "$c/st"; git init -q "$c/wt"; git -C "$c/wt" remote add origin https://github.com/o/r.git
+  printf '#!/bin/sh\necho "$*" >> %s/gh.log\ncase "$2" in repos/o/r/issues/12) echo "# T12";; repos/o/r/issues/12/comments) echo "## c1";; *) exit 1;; esac\n' "$c" > "$c/bin/gh"; chmod +x "$c/bin/gh"
+  printf 'Fix #12, see https://github.com/x/y/pull/3 and #12 again.\n<!-- cc-brief:inflight -->\n#99\n<!-- /cc-brief:inflight -->\n' > "$c/st/task.md"
+  ib=$(PATH="$c/bin:$PATH" ST="$c/st" WT="$c/wt" issue_block)
+  t 'issue_block saves a named issue with its comments and names the file to the worker' \
+    "$(cat "$c/st/github/o_r_12.md" | paste -sd'|' -)|$(grep -c "host saved .*$c/st/github/o_r_12.md\." <<<"$ib")" "# T12|## c1|1"
+  t '…names what it could not fetch, and never reads the board'"'"'s inflight block' \
+    "$(grep -o 'could not fetch x/y#3,' <<<"$ib")|$(grep -c '/99' "$c/gh.log")|$(ls "$c/st/github")" "could not fetch x/y#3,|0|o_r_12.md"
+  c="$d/ib0"; mkdir -p "$c/bin" "$c/st"; git init -q "$c/wt"; printf '#!/bin/sh\necho "$*" >> %s/gh.log\n' "$c" > "$c/bin/gh"; chmod +x "$c/bin/gh"
+  printf 'No issue here, only a colour &#35;12 and path a/#3.\n' > "$c/st/task.md"
+  t '…and a brief naming none asks GitHub nothing and adds nothing to the prompt' \
+    "$(PATH="$c/bin:$PATH" ST="$c/st" WT="$c/wt" issue_block | wc -c)|$(cat "$c/gh.log" 2>/dev/null | wc -l)|$([ -e "$c/st/github" ] && echo dir)" "0|0|"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }

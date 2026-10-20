@@ -19,9 +19,12 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
         table. --sandbox runs every one in the bwrap profile whatever its class and runs a red one again on the host
         to say which it is: passes-in-bwrap, needs-mount (green on the host, and the sandbox's red names a missing
-        path), host (green only on the host), red (red on the host too) or unrunnable. The host re-run happens only when
-        REV is origin/main's current commit; for any other REV a sandbox-red check is reported red, never run on the host. Exit 0 when every check
-        passed on the runner the table names for it.
+        path), host (green only on the host), red (red on the host too) or unrunnable. REV is resolved to one commit
+        first, and the manifest, the tree and the host re-run's test are all of it. The host re-run happens only when
+        that commit is the one origin sends for main when sweep fetches it (never the local origin/main ref, which a
+        worker can move); for any other REV, or when the fetch fails, a sandbox-red check is reported red, never run
+        on the host. A REV that names no commit is a usage error. Exit 0 when every check passed on the runner the
+        table names for it.
 """
 from __future__ import annotations
 
@@ -186,15 +189,26 @@ MISSING_RE = re.compile(r"No such file or directory|not found|command not found|
                         r"|No module named|does not exist")
 
 
-def rev_is_main(t, rev: str) -> bool:
-    """True when rev names the very commit origin/main names now (both read by git._name, no git opens the checkout's
-    config). A rev that names nothing, or a checkout with no origin/main, is not main."""
+def commit_of(t, rev: str) -> str:
+    """The full commit id rev names in Tree t (read by git._name, no git opens the checkout's config), or "" when it
+    names none. cmd_sweep resolves --rev once, so the main compare, the manifest and the tree are of one commit."""
     if t.refused:
-        return False
+        return ""
     with G.fenced(t, bare=True) as env:
         rc, got = G._name(t, env, rev + "^{commit}")
-        rc2, main = G._name(t, env, "refs/remotes/origin/main^{commit}")
-    return rc == 0 and rc2 == 0 and got == main
+    return got if rc == 0 else ""
+
+
+def rev_is_main(t, sha: str, fetch=None) -> bool:
+    """True when sha is the commit origin itself sends for main now (G.fetch's own report, never
+    refs/remotes/origin/main, which a worker or a member's clone can move). A fetch that fails is not main."""
+    if t.refused or not G.SHA_RE.fullmatch(sha or ""):
+        return False
+    try:
+        main = (fetch or G.fetch)(t.work_tree, "main")["main"]
+    except G.GitError:   # perms, 10-20: "a GitError means 'not main', so refuse the host rerun"
+        return False
+    return sha == main
 
 
 def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, runner=None,
@@ -214,9 +228,9 @@ def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, run
     if r.status == T.PASSED:
         row["verdict"] = "passes-in-bwrap"
         return row
-    if not host_rerun:   # unread code (REV is not origin/main's commit) never runs on the host, as the owner
+    if not host_rerun:   # unread code (REV is not origin's main) never runs on the host, as the owner
         row["verdict"] = "red"
-        row["why"] = ("failed in the sandbox; host re-run refused, --rev is not origin/main | "
+        row["why"] = ("failed in the sandbox; host re-run refused, --rev is not origin's main | "
                       + (r.extra.get("why", "") or next((ln for ln in reversed(r.extra.get("tail", []))
                                                        if ln.strip()), "")))[:160]
         return row
@@ -252,19 +266,23 @@ def cmd_sweep(argv):
         return usage(2)
     repo = t.work_tree
     rev = a["--rev"] or "HEAD"
-    tree = RUN.tree_of(repo, rev)
+    sha = commit_of(t, rev)
+    if not sha:
+        print(f"lander sweep: --rev {rev} names no commit", file=sys.stderr)
+        return usage(2)
+    tree = RUN.tree_of(repo, sha)
     fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else M.host_fallback(repo_name(repo))
     try:
-        m = M.load(repo, rev, fallback=fb)
+        m = M.load(repo, sha, fallback=fb)
     except M.ManifestError as e:
         print(f"lander sweep: the manifest does not parse: {e}", file=sys.stderr)
         return EXIT_NONE
     names = [n for n in m.checks if not a["--only"] or n in a["--only"]]
     jobs = int(a["--jobs"] or 3)
-    rerun = rev_is_main(t, rev) if a["--sandbox"] else True
+    rerun = rev_is_main(t, sha) if a["--sandbox"] else True
     if a["--sandbox"] and not rerun:
-        print(f"lander sweep: --rev {rev} is not origin/main's commit: a check red in the sandbox is reported red, "
-              "not re-run on the host", file=sys.stderr)
+        print(f"lander sweep: --rev {rev} is not the commit origin sends for main: a check red in the sandbox is "
+              "reported red, not re-run on the host", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
         rows = list(ex.map(lambda n: said(sweep_one(repo, m, n, tree, a["--sandbox"], host_rerun=rerun)), names))
     print("| check | class | verdict | secs | why |\n|---|---|---|---|---|")

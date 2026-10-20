@@ -9,8 +9,9 @@ selfcheck(){
   T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
   # A HOME of its own: its own config (cc-config honours CC_CONFIG), its own boards and its own log — never this
   # box's tier, and never this box's boards. cc-board reads $HOME/.cc/boards, so HOME is the fixture's.
-  mkdir -p "$T/home/.cc/boards" "$T/home/.cc/state/land/queue"
-  C(){ HOME="$T/home" CC_CONFIG="$T/home/.cc/config" "$B/cc-tier" "$@"; }
+  # The hive's steer file is the fixture's too: a real one would stop the hive's loops on every run of this.
+  mkdir -p "$T/home/.cc/boards" "$T/home/.cc/state/land/queue" "$T/steer"
+  C(){ HOME="$T/home" CC_CONFIG="$T/home/.cc/config" CC_TIER_STEER="$T/steer/tier.txt" "$B/cc-tier" "$@"; }
   BOARD(){ HOME="$T/home" "$B/cc-board" "$@"; }
   BOARD init alpha "$T/home/dev/alpha" >/dev/null 2>&1 || true
   BOARD init beta "$T/home/dev/beta" >/dev/null 2>&1 || true
@@ -27,6 +28,7 @@ selfcheck(){
   k "$([ $rc = 0 ] && [ "$(C)" = stop ] && echo 0 || echo 1)" "set stop writes the config and reads back"
   k "$(grep -q '^The spend tier is stop, since 20' <<<"$out" && echo 0 || echo 1)" "…and prints the line, dated since the flip"
   k "$(grep -q ' autonomous -> stop$' "$T/home/.cc/state/tier.log" && echo 0 || echo 1)" "…and logs old -> new"
+  k "$([ "$(cat "$T/steer/tier.txt" 2>/dev/null)" = stop ] && echo 0 || echo 1)" "…and writes the word to the hive's steer file, so its loops hold"
 
   # THE TABLE, every cell, one row of asserts per tier. `t` = the tier, then start / start on a critical row /
   # start on a plain row / continue on a critical row / continue on a plain row / gates / pulse / goals / explore,
@@ -95,6 +97,9 @@ selfcheck(){
   C set stop >/dev/null; echo '{"repo":"alpha","pr":7}' > "$T/home/.cc/state/land/queue/alpha-7.json"
   out=$(C set essential); k "$(grep -q '^1 landing job(s) waited for this' <<<"$out" && echo 0 || echo 1)" "leaving stop names the landing jobs that waited, and the command that drives them"
   out=$(C set moderate); k "$(grep -q 'landing job' <<<"$out" && echo 1 || echo 0)" "…a flip that was not from stop does not"
+  k "$([ "$(cat "$T/steer/tier.txt" 2>/dev/null)" = moderate ] && echo 0 || echo 1)" "the steer file follows each flip"
+  out=$(HOME="$T/home" CC_CONFIG="$T/home/.cc/config" CC_TIER_STEER="$T/none/tier.txt" "$B/cc-tier" set moderate 2>&1); rc=$?
+  k "$([ $rc = 0 ] && [ ! -e "$T/none" ] && echo 0 || echo 1)" "a box with no hive (no steer dir) sets the tier and writes nothing there"
   C allows sideways >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a question this file does not know is usage, not a verdict"
   C allows start alpha >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a row is <repo>/<row>; a bare repo is refused rather than read as one"
   k "$(grep -q '^The spend tier is moderate, since .*\. Work it finds itself' <<<"$(C line)" && echo 0 || echo 1)" "line: the tier, since when, and what it means"

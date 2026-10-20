@@ -1541,6 +1541,12 @@ def selfcheck():
             shutil.rmtree(wt_, ignore_errors=True)
             subprocess.run(["git", "-C", f"{th}/dev/{repo}", "worktree", "prune"], capture_output=True, timeout=30)
 
+        def open_pr(sha, fork=False):
+            """An open PR on dispatch/9 at <sha> in REST's shape: from a fork when head.repo is not the base repo."""
+            return {"number": 9, "state": "open", "head": {"ref": "dispatch/9", "sha": sha,
+                                                           "repo": {"full_name": "fork/r" if fork else "o/r"}},
+                    "base": {"ref": "main", "repo": {"full_name": "o/r"}}}
+
         def flagged(name, rows):
             open(prj, "w").write(json.dumps(rows))
             r_ = subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--grace", "0"],
@@ -1552,21 +1558,18 @@ def selfcheck():
         wtA, _ = remerge("lead-remerge-a", base)
         ok("a detached worktree whose HEAD is an open PR's head merged with main (not pushed yet) is a seat working "
            "on that PR, not a worktree with no board entry: 12 of these filled the 2026-10-16 digests",
-           bool(base) and not flagged("lead-remerge-a", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                                          "headRefOid": base}]))
+           bool(base) and not flagged("lead-remerge-a", [open_pr(base)]))
         drop(wtA)
         wtB, _ = remerge("lead-remerge-b", base)
         ok("…while the same worktree when no open PR's head is in its history is still reported",
-           flagged("lead-remerge-b", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                       "headRefOid": "0" * 40}]))
+           flagged("lead-remerge-b", [open_pr("0" * 40)]))
         drop(wtB)
         wtC, tipC = remerge("lead-remerge-c", base)
         subprocess.run(["git", "-C", f"{th}/dev/{repo}", "update-ref", "refs/remotes/origin/dispatch/9", tipC],
                        capture_output=True, timeout=30)
         ok("…and one whose HEAD was pushed to an open PR's branch is that PR's work under any worktree name, even "
            "after the branch moved past what GitHub last listed",
-           bool(tipC) and not flagged("lead-remerge-c", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                                          "headRefOid": "0" * 40}]))
+           bool(tipC) and not flagged("lead-remerge-c", [open_pr("0" * 40)]))
         subprocess.run(["git", "-C", f"{th}/dev/{repo}", "update-ref", "-d", "refs/remotes/origin/dispatch/9"],
                        capture_output=True, timeout=30)
         drop(wtC)
@@ -1581,8 +1584,7 @@ def selfcheck():
         subprocess.run([*g, "update-ref", "refs/remotes/origin/main", base], capture_output=True, timeout=30)
         ok("…but a worktree left at a commit origin's main already has is main's history, which every open branch "
            "contains: still reported",
-           bool(child) and flagged("lead-remerge-d", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                                       "headRefOid": child}]))
+           bool(child) and flagged("lead-remerge-d", [open_pr(child)]))
         for ref in ("refs/remotes/origin/dispatch/9", "refs/remotes/origin/main"):
             subprocess.run([*g, "update-ref", "-d", ref], capture_output=True, timeout=30)
         drop(wtD)
@@ -1591,19 +1593,16 @@ def selfcheck():
         ok("…but a fork's open PR on a branch that shares origin's name (dispatch/9) is not origin's dispatch/9: a "
            "worktree only origin's unrelated dispatch/9 contains, with neither HEAD nor its parents the fork's head, "
            "is still reported",
-           bool(tipE) and flagged("lead-remerge-e", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                                      "headRefOid": "f" * 40, "isCrossRepository": True}]))
+           bool(tipE) and flagged("lead-remerge-e", [open_pr("f" * 40, fork=True)]))
         ok("…while the same worktree is forgiven once that same-named PR comes from the repo itself",
-           not flagged("lead-remerge-e", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                           "headRefOid": "f" * 40, "isCrossRepository": False}]))
+           not flagged("lead-remerge-e", [open_pr("f" * 40)]))
         bfn = f"{th}/.cc/boards/{repo}.json"
         bsave = open(bfn).read()
         bd = json.loads(bsave); bd["default_branch"] = "trunk"; open(bfn, "w").write(json.dumps(bd))
         subprocess.run([*g, "update-ref", "refs/remotes/origin/trunk", tipE], capture_output=True, timeout=30)
         ok("…and one origin's default branch already holds is that branch's history whatever the board calls it "
            "(trunk here): still reported though an open branch contains it",
-           flagged("lead-remerge-e", [{"number": 9, "state": "OPEN", "headRefName": "dispatch/9",
-                                       "headRefOid": "f" * 40, "isCrossRepository": False}]))
+           flagged("lead-remerge-e", [open_pr("f" * 40)]))
         open(bfn, "w").write(bsave)
         for ref in ("refs/remotes/origin/dispatch/9", "refs/remotes/origin/trunk"):
             subprocess.run([*g, "update-ref", "-d", ref], capture_output=True, timeout=30)
