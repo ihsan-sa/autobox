@@ -741,6 +741,23 @@ def run_selfcheck():
               not errOK and "SHAPE" not in okshort and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1
               and reply_shape("*Left: #430 landing now, one small row next, two guard rows behind #404, the email orch's two fixes, and the four you parked.*") is not None
               and reply_shape("*Landed (#453).* One thing is yours: the mail allow-list.") is None)
+        # `move #<channel>` in a thread goes to the daemon's host socket and is never posted (Daemon.lead_move);
+        # one the daemon does not take, outside a mail thread of the owner's, is posted as written.
+        real_sockMv, mvreqs = globals()["sock_request"], []
+        n_posts0 = sum(1 for m, kw in acalls2 if m == "chat.postMessage")
+        try:
+            globals()["sock_request"] = lambda req, timeout=15: mvreqs.append(req) or {"ok": True, "taken": True, "text": "taken as a move"}
+            mvtext, mverr = ch.call("reply", {"chat_id": "C1", "thread_ts": "5.0", "text": "move #proj"})
+            n_mv = sum(1 for m, kw in acalls2 if m == "chat.postMessage")
+            globals()["sock_request"] = lambda req, timeout=15: mvreqs.append(req) or {"ok": True, "taken": False}
+            mvtext2, mverr2 = ch.call("reply", {"chat_id": "C1", "thread_ts": "5.0", "text": "move #proj"})
+        finally:
+            globals()["sock_request"] = real_sockMv
+        check("reply: a host session's `move #proj` in a thread is sent to the daemon's host socket as `move` and not "
+              "posted; one the daemon does not take is posted as written",
+              not mverr and mvtext == "taken as a move" and n_mv == n_posts0
+              and mvreqs[0] == {"move": "C1", "thread_ts": "5.0", "text": "move #proj"}
+              and not mverr2 and mvtext2.startswith("sent") and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1)
         text, err = ch.call("history", {"chat_id": "C1", "n": 500})
         check("channel tool history: clamps like the CLI, formats compact lines", not err
               and [kw for m, kw in acalls2 if m == "conversations.history"][-1]["limit"] == "100" and "hi" in text)
@@ -11655,6 +11672,81 @@ def run_selfcheck():
               dmA.mail_move("C-SITE", now, "move #box", "UMEM", False) is True
               and msaid[-1][:2] == ("C-SITE", now)
               and "not one of this workspace's channels" in msaid[-1][2] and mhanded == [])
+        # (d2) THE LEAD MOVES ITS OWN WORKSPACE'S MAIL (owner, 2026-10-20: a restriction stays only where its harm
+        # leaves the box). Its reply comes on the member socket, which is the authority: inside that workspace a
+        # `move` re-routes, a channel of another workspace is refused, and a lead of another workspace is not one.
+        mail_write("L1", to=["mem@box.example"], subject="the lease")
+        msaid.clear(); mhanded.clear()
+        dmA.take_mail("L1")
+        rootL = msaid[0][3]
+        msaid.clear(); mhanded.clear()
+        leadOut = dmA.member_verb("mem", {"reply": "C-MEM", "thread_ts": rootL, "text": "move #box", "target": "mem"}, "reply")
+        check("mail: the workspace's lead saying `move #box` in its mail thread is refused — #box is another "
+              "workspace's channel — and nothing is moved or handed",
+              leadOut.get("ok") is True and msaid[-1][:2] == ("C-MEM", rootL)
+              and "not one of this workspace's channels" in msaid[-1][2] and mhanded == []
+              and [r["name"] for r in R.conv_by_root("C-MEM", rootL)["roots"]] == ["mem"])
+        msaid.clear(); mhanded.clear()
+        check("mail: …a lead of ANOTHER workspace cannot move this one's mail at all — it is not that lead's "
+              "conversation, so the reply is ordinary text",
+              dmA.mail_move("C-MEM", rootL, "move #mem--api", "", False, lead="other") is False
+              and msaid == [] and mhanded == [])
+        leadIn = dmA.member_verb("mem", {"reply": "C-MEM", "thread_ts": rootL, "text": "move #mem--api", "target": "mem"}, "reply")
+        nowL = msaid[0][3] if msaid else ""
+        recL = R.conv_by_root("C-API", nowL) or {}
+        check("mail: …and `move #mem--api` from the lead, inside its workspace, re-routes like a person's move — "
+              "the card in #mem--api, the mail handed there, the old thread told, the move on the record as the lead's",
+              leadIn.get("ok") is True and "move" in leadIn.get("text", "")
+              and [(c, t) for c, t, _, _ in msaid] == [("C-API", None), ("C-MEM", rootL)]
+              and msaid[-1][2] == "moved to #mem--api."
+              and [(h[0], h[2]["chat_id"]) for h in mhanded] == [("mem/api", "C-API")]
+              and [(m["from"], m["to"], m["by"]) for m in recL.get("moves") or []] == [("mem", "mem--api", "lead:mem")])
+        # …and the session it was handed to in #mem--api moves it on: `target` is the caller's own field and walls
+        # nothing off, so the socket's handle is the whole authority, whichever of the workspace's sessions replies.
+        msaid.clear(); mhanded.clear()
+        subOut = dmA.member_verb("mem", {"reply": "C-API", "thread_ts": nowL, "text": "move #mem--site", "target": "mem/api"}, "reply")
+        nowS = msaid[0][3] if msaid else ""
+        check("mail: …a reply with target mem/api in that thread, from the session the mail was handed to there, "
+              "moves it too — the card in #mem--site, handed to mem/site, the move on the record as the workspace's",
+              subOut.get("ok") is True and subOut.get("taken") is True
+              and [(c, t) for c, t, _, _ in msaid] == [("C-SITE", None), ("C-API", nowL)]
+              and [(h[0], h[2]["chat_id"]) for h in mhanded] == [("mem/site", "C-SITE")]
+              and [(m["to"], m["by"]) for m in (R.conv_by_root("C-SITE", nowS) or {}).get("moves") or []]
+              == [("mem--api", "lead:mem"), ("mem--site", "lead:mem")])
+        # (d3) A MOVE WHOSE RECORD CANNOT BE SAVED, AFTER ITS CARD IS UP: the card is taken back, the record is as
+        # it was, nothing is handed, the old thread says nothing moved — and the session is not told "sent".
+        mail_write("L2", to=["mem@box.example"], subject="the deposit")
+        msaid.clear(); mhanded.clear()
+        dmA.take_mail("L2")
+        rootF = msaid[0][3]
+        msaid.clear(); mhanded.clear()
+        real_save, real_apiF, deleted, fails = R.save_conv, globals()["api"], [], [1]
+
+        def save_once_fails(rec):
+            if fails:
+                fails.pop()
+                raise OSError("disk full")
+            return real_save(rec)
+
+        def api_deletes(method, token, **kw):
+            if method == "chat.delete":
+                deleted.append((kw["channel"], kw["ts"]))
+                return {"ok": True}
+            return real_apiF(method, token, **kw)
+        R.save_conv, globals()["api"] = save_once_fails, api_deletes
+        try:
+            failOut = dmA.member_verb("mem", {"reply": "C-MEM", "thread_ts": rootF, "text": "move #mem--api"}, "reply")
+        finally:
+            R.save_conv, globals()["api"] = real_save, real_apiF
+        cardF = msaid[0][3] if msaid else ""
+        recF = R.conv_by_root("C-MEM", rootF) or {}
+        check("mail: a move whose record fails to save after its card is posted takes the card back, leaves the "
+              "record where it was (still one root, #mem; no move on it), hands nothing, and says so in the old thread",
+              failOut.get("ok") is True and deleted == [("C-API", cardF)]
+              and [(c, t) for c, t, _, _ in msaid] == [("C-API", None), ("C-MEM", rootF)]
+              and msaid[-1][2] == "I could not record the move to #mem--api, so nothing moved."
+              and mhanded == [] and [r["name"] for r in recF.get("roots") or []] == ["mem"]
+              and not recF.get("moves") and not R.conv_by_root("C-API", cardF))
         msaid.clear(); mhanded.clear()
         mail_write("N3", to=["box@box.example"], subject="a look at your box")
         resC = dmA.take_mail("N3")
@@ -12547,6 +12639,41 @@ def run_selfcheck():
         check("own forward: a #proj-updates the box never recorded (a member could have made it) never gets his mail: "
               "it stays top level in #proj",
               resW6["routed"] and resW6["to"] == ["#proj"] and [(c, t) for c, t, _, _ in saidW6] == [("C-PROJ", None)])
+        # (m3) THE OWNER'S HOST SESSIONS MOVE HIS WORKSPACE'S MAIL, the same way a member's sessions move theirs: the
+        # host reply tool sends `move` to the daemon's host socket, which is the owner's workspace and nothing more.
+        msaid.clear(); mhanded.clear()
+        mail_write("W7", subject="the gutter", **{"from": "stranger@nowhere.example"})
+        dmA.take_mail("W7"); rootW7 = msaid[0][3] if msaid else ""
+
+        def via_host(req):
+            a_, b_ = socket.socketpair()
+            b_.sendall((json.dumps(req) + "\n").encode()); b_.shutdown(socket.SHUT_WR)
+            dmA.handle_conn(a_)
+            out_ = b_.makefile().readline(); b_.close()
+            return json.loads(out_ or "{}")
+        msaid.clear(); mhanded.clear()
+        hostOut = via_host({"move": "C-BOX", "thread_ts": rootW7, "text": "move #mem--site"})
+        check("mail: a host session's `move #mem--site` in the owner's mail thread is refused — a member's channel is "
+              "not the owner's workspace — and nothing is moved or handed",
+              hostOut.get("ok") is True and msaid[-1][:2] == ("C-BOX", rootW7)
+              and "not one of this workspace's channels" in msaid[-1][2] and mhanded == []
+              and [r["name"] for r in (R.conv_by_root("C-BOX", rootW7) or {}).get("roots") or []] == ["box"])
+        msaid.clear(); mhanded.clear()
+        hostIn = via_host({"move": "C-BOX", "thread_ts": rootW7, "text": "move #proj"})
+        nowW7 = msaid[0][3] if msaid else ""
+        check("mail: …and `move #proj` from a host session, inside the owner's workspace, moves it — the card in #proj, "
+              "handed to proj, the old thread told, the move on the record as the owner workspace's",
+              hostIn.get("ok") is True and hostIn.get("taken") is True
+              and [(c, t) for c, t, _, _ in msaid] == [("C-PROJ", None), ("C-BOX", rootW7)]
+              and msaid[-1][2] == "moved to #proj." and [(h[0], h[3]) for h in mhanded] == [("proj", "C-PROJ")]
+              and [(m["from"], m["to"], m["by"]) for m in (R.conv_by_root("C-PROJ", nowW7) or {}).get("moves") or []]
+              == [("box", "proj", "lead:owner")])
+        msaid.clear(); mhanded.clear()
+        check("mail: …the host socket's `move` reaches no member's conversation (the reply is not taken, nothing said), "
+              "and a member socket has no `move` verb at all",
+              via_host({"move": "C-MEM", "thread_ts": rootL, "text": "move #proj"}) == {"ok": True, "taken": False}
+              and msaid == [] and mhanded == []
+              and dmA.refuse_reason({"move": "C-MEM"}, "mem", (os.getpid(), os.getuid(), None)) == "move is not a member verb")
         for k in addW:
             del mchans[k]
         for v in addW.values():

@@ -4947,7 +4947,7 @@ class Daemon:
                 "seat": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
 
     MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject", "channels")
-    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover")
+    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover", "move")
 
     PUBLIC_READS = ("history", "thread")   # the member verbs the owner socket serves too, on a public channel only (public_read)
 
@@ -5155,6 +5155,13 @@ class Daemon:
             target = h
         if verb == "reply":
             text = str(first.get("text") or ""); thread = first.get("thread_ts") or None; ts = first.get("ts") or ""
+            # THE WORKSPACE PLACES ITS OWN MAIL (owner, 2026-10-20: a restriction stays only where its harm leaves the
+            # box): `move #<channel>` in a mail thread is read here, before it is posted, since its post is a bot message
+            # on_event drops. The socket's handle is the authority, never `target` — that is the caller's own field, and
+            # the session the mail was handed to in #<h>--<x> is this workspace's as much as #<h>'s is (lead_move).
+            moved = self.lead_move(h, chat, thread, text)
+            if moved:
+                return moved
             dec = bool(first.get("needs_owner"))   # the same seam as the session-side tool, and the same authority rule
             # A MEMBER'S REFUSAL IS THE BOX'S QUERY, NEVER A LINE IN THE MEMBER'S CHANNEL (owner, 2026-09-04: a member
             # session's refusals "should just be routed to you instead" — the queries session; "nothing in the member's
@@ -5640,6 +5647,11 @@ class Daemon:
                 ask = self.ask_hop(str(first["mention"] or ""), first.get("thread_ts") or None, str(first.get("text") or ""), seat) if seat else None
                 if ask:                  # a reply in a member's ask thread is carried to the member (answer_ask)
                     res["ask"] = ask
+                c.sendall((json.dumps(res) + "\n").encode())
+            elif verb == "move":         # {"move": chat, "thread_ts":…, "text":…} — the host reply tool's `move #<channel>` in a
+                # mail thread: this socket is the owner's workspace, and lead_move holds it to that workspace's own mail and channels
+                res = self.lead_move("owner", str(first["move"] or ""), first.get("thread_ts") or None, str(first.get("text") or "")) \
+                    or {"ok": True, "taken": False}
                 c.sendall((json.dumps(res) + "\n").encode())
             elif verb == "cutover":      # {"cutover": target} — cc-handoff, the moment its record calls the successor live
                 self.handoff_sweep(str(first["cutover"] or ""))
@@ -6989,7 +7001,7 @@ class Daemon:
                 continue
             root, at = posted[pl.chat]
             if dec.offer:
-                # the move is offered to the person reading the channel, posted before the session gets anything so it sits under the mirror line — a session can't take it up itself, since its reply is a bot message on_event drops before mail_move ever sees it
+                # the move is offered to the person reading the channel, posted before the session gets anything so it sits under the mirror line; a session of the workspace can move it too, its reply read off its own socket (lead_move)
                 self.say(pl.chat, dec.offer, root, mail=False)   # the offer names channels the sender can't see
             self.mail_hand(msg, pl, root, at, dec, vet=rec["vet"])
             sent.append("#" + pl.name)
@@ -7346,9 +7358,25 @@ class Daemon:
             body.append(f"\n[{R.EXPLAIN_DEFAULT}]")
         self.hand_off(place.target, "\n".join(body), meta, place.chat, root, at, place.alias)
 
-    def mail_move(self, chat, thread, text, user, is_owner):
+    def lead_move(self, lead, chat, thread, text):
+        """A session's `move #<channel>` reply in a mail thread, read off the socket it came on before anything is
+        posted: `lead` is that socket's workspace — a member socket's handle (member_verb), "owner" for the host
+        socket (the `move` verb the host reply tool sends). One rule for both, mail_move's: only that workspace's
+        own conversation, only to its own channels. None when it is not a move this workspace may make, and the
+        reply is then posted as written; a move that failed is an error to the session and posts nothing."""
+        if not (thread and mail_router().move_to(text)):
+            return None
+        try:
+            took = self.mail_move(chat, thread, text, "", False, lead=lead)
+        except Exception as e:
+            log(f"mail move by lead {lead}: {e!r}")
+            return {"ok": False, "error": f"not moved ({e.__class__.__name__}) — nothing was posted, and the mail is where it was"}
+        return {"ok": True, "taken": True, "text": "taken as a move — the daemon's line in the thread says where it went"} if took else None
+
+    def mail_move(self, chat, thread, text, user, is_owner, lead=""):
         """A "move #<channel>" reply in a mail's own thread; True if handled, False if ordinary text.
-        Only the owner, or the member whose conversation it is, may move it, only to an eligible channel.
+        Only the owner, the member whose conversation it is, or a session of that workspace (`lead`, the workspace of
+        the socket its reply came on — lead_move) may move it, only to one of that workspace's channels.
         mail=False always. A move keeps verdict/hold intact; `deliver it` in the new thread still delivers."""
         R = mail_router()
         name = R.move_to(text)
@@ -7359,7 +7387,9 @@ class Daemon:
             return False
         ws = rec.get("workspace") or ""
         if not is_owner:
-            if not (member_user(ws, user) and member_chat(ws, chat, self.chan_name(chat))):
+            cn = self.chan_name(chat)
+            mine = (not any(member_chat(m, chat, cn) for m in load_members())) if ws == "owner" else member_chat(ws, chat, cn)
+            if not ((lead == ws if lead else member_user(ws, user)) and mine):
                 return False
         here = next((r for r in rec.get("roots") or [] if r["chat"] == chat and r["ts"] == thread), None)
         if here is None:
@@ -7399,10 +7429,11 @@ class Daemon:
         if not ts:
             self.say(chat, f"I could not post in #{pl.name}, so nothing moved.", thread, mail=False)
             return True
+        before = json.loads(json.dumps(rec))   # what the record was, should the card outlive a failed save below
         rec["roots"] = [r for r in rec["roots"] if r is not here]
         rec["roots"].append({"chat": pl.chat, "ts": ts, "name": pl.name, "target": pl.target,
                              "alias": pl.alias, "role": here.get("role") or "to"})
-        rec.setdefault("moves", []).append({"from": here.get("name"), "to": pl.name, "by": user or "",
+        rec.setdefault("moves", []).append({"from": here.get("name"), "to": pl.name, "by": user or (f"lead:{lead}" if lead else ""),
                                             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         for h in held:                     # the hold follows the thread: `deliver it` lands in the new one
             h.setdefault("cards", dict(h.get("ats") or {}))   # a hold from before `cards`: its cards are its ats so far
@@ -7412,17 +7443,43 @@ class Daemon:
                 was = h["cards"].get(pl.chat)   # its card left behind keeps its ts too, and says what was decided —
                 was = [was] if isinstance(was, str) else list(was or [])   # a move BACK keeps the first card there too
                 h["cards"][pl.chat] = was + [ts] if was else ts
-        R.save_conv(rec)
+        try:
+            R.save_conv(rec)
+        except Exception as e:
+            # THE CARD IS UP AND THE RECORD DOES NOT SAY SO: the record goes back as it was (save_conv writes the
+            # record before the index, so a half-done save named the new root), the card is taken back, and the
+            # old thread says nothing moved — the mail stays where the record and the people reading it say it is.
+            log(f"mail {rec['id']}: the move to #{pl.name} was not recorded ({e!r}); taken back")
+            with contextlib.suppress(Exception):
+                R.save_conv(before)
+            gone = self.unpost(pl.chat, ts)
+            self.say(chat, f"I could not record the move to #{pl.name}, so nothing moved"
+                     + ("." if gone else f" — the card it left in #{pl.name} is not this mail's thread."), thread, mail=False)
+            return True
         # mapping updated before the delivery, so an immediate reply lands in the thread the record already
         # names, and a later mail on this conversation follows the move for the same reason.
+        missed = ""
         if (here.get("role") or "to") == "to" and not held:
             # "the vetting verdict travels with the message a session reads" (the brief): the new channel's
             # session gets the verdict the box gave, off the record, not `unread` (review of #543)
-            self.mail_hand(msg, pl, ts, ts, mail_router().Decision(to=[pl], workspace=ws), vet=rec.get("vet") or "")
+            try:
+                self.mail_hand(msg, pl, ts, ts, mail_router().Decision(to=[pl], workspace=ws), vet=rec.get("vet") or "")
+            except Exception as e:   # the move stands, recorded; the one thing missing is said, not thrown
+                log(f"mail {rec['id']}: moved to #{pl.name}, not handed ({e!r})")
+                missed = f" Its session there was not handed it ({e.__class__.__name__}) — the card is there to answer."
         self.say(chat, f"moved to #{pl.name}." + (" It is still held — nothing has been delivered." if held
-                                                  else ""), thread, mail=False)
-        log(f"mail {rec['id']}: moved from #{here.get('name')} to #{pl.name} by {user}")
+                                                  else "") + missed, thread, mail=False)
+        log(f"mail {rec['id']}: moved from #{here.get('name')} to #{pl.name} by {user or 'lead ' + lead}")
         return True
+
+    def unpost(self, chat, ts):
+        """Take back a line this daemon just posted (chat.delete); True if it is gone. Never raises."""
+        try:
+            api("chat.delete", self.cfg["SLACK_BOT_TOKEN"], channel=chat, ts=ts)
+            return True
+        except Exception as e:
+            log(f"unpost {chat} {ts}: {e!r}")
+            return False
 
     def find_queued(self, chat, ts, only=None):
         """(target, index) of a still-queued payload for (chat, ts); search only `only`'s queue when named, since a
@@ -9667,6 +9724,18 @@ class Channel:
                     if not r.get("ok"):
                         return f"not answered — {r.get('error')}; nothing was posted", True
                     return r.get("text") or "answered", False
+                if a.get("thread_ts") and chat != "local" and mail_router().move_to(a.get("text", "") or ""):
+                    # `move #<channel>` in a mail thread goes to the daemon's host socket, the way a member session's goes
+                    # through member_verb: a post here is a bot message on_event drops, so it would move nothing.
+                    # Not a mail thread of the owner's workspace (taken False), it is posted below as written.
+                    try:
+                        r = sock_request({"move": chat, "thread_ts": a["thread_ts"], "text": a.get("text", "")}, timeout=60)
+                    except Exception as e:
+                        return f"not moved — the daemon did not take it ({e.__class__.__name__}); nothing was posted", True
+                    if not r.get("ok"):
+                        return f"{r.get('error') or 'not moved'}", True
+                    if r.get("taken"):
+                        return r.get("text") or "taken as a move", False
                 # writing advice, never a refusal (owner 2026-10-20): measures what a reader would skip and says so on the result after it is sent; not for a member-facing session or the box's own inject path.
                 shape = ""
                 if chat != "local" and not member_facing_here():

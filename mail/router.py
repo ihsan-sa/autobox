@@ -101,9 +101,11 @@ the record's `to` root, with the box's line kept as `line`; the From is then hom
 stays in Slack, one answering the line mails.
 
 MOVING. One form, and only one: a reply in a mirror thread reading `move #<channel>` (the `#` is optional),
-from the owner, or from the member whose own channel it is. It is offered to THEM, in the thread — a session's
-reply is a bot message the daemon never reads back as a move, so the syntax would be a dead letter in a
-session's prompt. Slack substitutes a link for a `#` it
+from the owner, the member whose own channel it is, or a session of that workspace — any of them, the one the
+mail was handed to in a sub-channel included, the owner's host sessions for his own workspace — whose reply the
+daemon reads off the socket it came on before posting it (owner, 2026-10-20: a restriction stays only where its
+harm leaves the box). The socket is the workspace, the conversation must be that workspace's, and a move names
+only its channels. It is offered to the person, in the thread. Slack substitutes a link for a `#` it
 autocompletes, so `move <#C0123|notes>` is that same form as it arrives from a phone and is read as it.
 `move_to()` is the whole grammar; anything else in that thread is an ordinary message and is left alone.
 
@@ -185,8 +187,7 @@ class Decision:
     The classifier's uncertainty is said TWICE, to two different readers, and that is deliberate. `question` is
     appended to what the SESSION reads: why this mail is in front of it and nothing more. `offer` is posted in
     the mirror thread for the PERSON: the other channels it could have gone to, and the `move` reply that sends
-    it there. Moving is a person's word — a session's reply is a bot message the daemon drops before the move
-    is read — so the syntax goes where someone who can use it will see it.
+    it there. A session of that workspace may move it as well (cc-slack lead_move), inside that workspace only.
 
     `rule` is the one word saying which rule placed the mail — the ledger's answer to "why is it there":
     `reply`, `named`, `cc-only`, `classified`, `unsure`, `unmapped` for a sender the door trusts and no row
