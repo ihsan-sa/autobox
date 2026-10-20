@@ -512,10 +512,18 @@ CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR
 
 def ran(text: str) -> dict:
     """-> {"passes": its last `N passed`, else its count of pass lines; "failed": tally(text); "crash": a crash or
-    abort marker in it}."""
+    abort marker in it; "ends": the run's last words are a closing tally, with only blank lines after it}."""
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
-    return {"passes": passes, "failed": tally(text), "crash": bool(CRASH_RE.search(text))}
+    return {"passes": passes, "failed": tally(text), "crash": bool(CRASH_RE.search(text)), "ends": ends(text)}
+
+
+def ends(text: str) -> bool:
+    """True when nothing but blank lines follows the last closing tally (TALLY_RES). A line after it is a red the
+    tally does not count: with main's '== 3 failed ==' naming no case, a PR keeping those 3 and adding 'guard: broke
+    y' read 3 against 3 and landed (perms' read of #1645, 10-20)."""
+    last = max((m.end() for rx in TALLY_RES for m in rx.finditer(text)), default=None)
+    return last is not None and not text[last:].strip()
 
 
 def tally(text: str):
@@ -1097,15 +1105,16 @@ def no_new_reds(head: T.Result, base: T.Result) -> bool:
     the base lacks (a head cut short names fewer reds only because it ran less), and no more failures than the base (a
     case failing twice, or a lost test masked by an added passing one). A count ran() could not read (None) holds, named
     or not (Opus read of #1645). When neither run names a case, the count is all there is: it passes only when both
-    runs print a failure count; a head that names none against a base that does, or a set fail_ids could not trust
-    (None), holds."""
+    runs print a failure count and end on their tally (ends), so no red after the tally goes uncounted; a head that
+    names none against a base that does, or a set fail_ids could not trust (None), holds."""
     pr, main = head.extra.get("fails"), base.extra.get("fails")
     hf, bf = head.extra.get("failed", 0), base.extra.get("failed", 0)
     same = head.runner.split(":")[0] == base.runner.split(":")[0]
     went = (head.extra.get("passes") or 0) >= (base.extra.get("passes") or 0) and \
         not (head.extra.get("crash") and not base.extra.get("crash")) and None not in (hf, bf) and hf <= bf
     named = bool(pr) and main is not None and set(pr) <= set(main)
-    counted = pr == [] and main == [] and None not in (head.extra.get("failed"), base.extra.get("failed"))
+    counted = pr == [] and main == [] and None not in (head.extra.get("failed"), base.extra.get("failed")) \
+        and bool(head.extra.get("ends")) and bool(base.extra.get("ends"))
     return same and went and (named or counted)
 
 

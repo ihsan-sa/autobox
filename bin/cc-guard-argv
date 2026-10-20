@@ -99,6 +99,13 @@ Every role, pf included:
   firewall, disk, container, systemctl, ip, nmcli or netplan verb in it. -o ProxyCommand/LocalCommand/
   KnownHostsCommand run here and are parsed as local commands                                         -> never
 - cc-slack member add / cc slack member add (widening who reaches the box)                           -> never
+- member code on the host: a command that runs a file under a member's tree (~/dev/<h> or ~/.cc/worktrees/<h>,
+  where the host-side ~/.cc/members/<h> exists) as its command word or as the script of a shell, `source` or an
+  interpreter; make whose -C, -f or -I (attached, detached, clustered or a long prefix, as make reads them),
+  MAKEFILES or MAKEFLAGS -I lands in one; or an interpreter, build or EDA tool (MEMCWD) whose cwd after cd is in
+  one. A member's code runs inside its boundary, `cc-sandbox member <h> [<track>] -- <cmd>`, whose own argv is not
+  read as a command here. Reads (cat, grep, git) pass; a member session's own tree is its own. Ceiling: a cd
+  this cannot resolve is judged at the session cwd, and a tool not in MEMCWD run there passes  -> never
 pf (the ungated tier) only, besides those: the seat-state part of the write fence, remove-from-above for the seat's
 state, and the credentials rule.
 Member only:
@@ -130,6 +137,50 @@ def power(v, a):   # a reboot, halt, suspend or target switch, by its verb, its 
 NETUNIT = re.compile(r'(NetworkManager|hostapd|wpa_supplicant|systemd-networkd|iwd|dnsmasq)(@[^.]*)?(\.service|\.socket)?')
 UNITSTOP = {'stop', 'disable', 'mask', 'kill', 'restart', 'try-restart', 'reload-or-restart', 'try-reload-or-restart', 'force-reload'}
 INTERP = re.compile(r'(python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|deno|bun|php[0-9.]*)')
+# what runs code from the directory it starts in: imports from the cwd (python puts '' first on sys.path for -c and
+# -m), a Makefile, a package manifest, a test collector, or an EDA tool's own script language (ngspice `shell`, yosys
+# and magic tcl). A seat that ran ece298a's PLL gate.py by hand on the host ran member code as the box's own user.
+MEMCWD = {'make', 'gmake', 'pytest', 'py.test', 'tox', 'nox', 'npm', 'npx', 'yarn', 'pnpm', 'cargo', 'go', 'uv', 'pip',
+          'pip3', 'poetry', 'hatch', 'ngspice', 'xyce', 'Xyce', 'yosys', 'iverilog', 'vvp', 'verilator', 'magic', 'netgen',
+          'klayout', 'xschem', 'openroad', 'openlane', 'librelane', 'tclsh', 'wish', 'cocotb-config'}
+MEMOPT = {'-o', '+o', '-O', '+O', '--rcfile', '--init-file', '-W', '-X', '-Q', '-r', '--require'}   # take a value
+
+def meminline(v, x):   # does option x make v run inline code (or a module), so it names no script file
+    if x.startswith('--'): return x.split('=', 1)[0] in ('--eval', '--print', '--command')
+    if v in SHELLS: return 'c' in x[1:]
+    m = re.match(r'[a-z]+', v)
+    f = {'python': 'cm', 'pypy': 'cm', 'perl': 'eE', 'ruby': 'e', 'node': 'ep', 'nodejs': 'ep', 'bun': 'e', 'php': 'r'}.get(m.group() if m else '', '')
+    return bool(f) and bool(re.match(r'-[A-Za-z]*?[%s]' % f, x))
+# make's options read the way GNU make's getopt reads them (the review of #1496: `-C<dir>`, `-sC<dir>`, `--directory=<dir>`
+# got past a check that matched only the detached `-C <dir>`). Short options cluster (`-sC dir`, `-sCdir`); one that takes
+# a value takes the rest of its word, or else the next word; a long option may be any unique prefix (`--dir=`)
+MKSHORT = {'C': 'C', 'f': 'f', 'I': 'I', 'E': '', 'o': '', 'W': ''}   # take a value: C/f/I name a directory or makefile
+MKOPTV = 'jlO'   # an optional value, attached only (`-j4`); a detached `-j 4` is a separate number, never a path
+MKLONG = {'directory': 'C', 'file': 'f', 'makefile': 'f', 'include-dir': 'I', 'eval': '', 'old-file': '',
+          'assume-old': '', 'what-if': '', 'new-file': '', 'assume-new': '', 'jobserver-auth': '', 'jobserver-style': ''}
+
+def makepaths(a):   # [(kind, value, as typed)] for each -C (C), makefile (f) or include directory (I) make's argv names
+    out, k = [], 0
+    while k < len(a):
+        x = a[k]; k += 1
+        if x == '--': break
+        if x.startswith('--'):
+            n, eq, val = x[2:].partition('=')
+            hit = [o for o in MKLONG if o == n] or [o for o in MKLONG if n and o.startswith(n)]
+            if not hit: continue
+            # an ambiguous prefix is an error to make; reading it as each candidate only ever refuses more
+            if not eq and k < len(a): val, k = a[k], k + 1
+            out += [(MKLONG[o], val, x if eq else f'{x} {val}') for o in hit if MKLONG[o]]
+        elif x.startswith('-') and len(x) > 1:
+            for i, c in enumerate(x[1:], 1):
+                if c in MKOPTV: break
+                if c in MKSHORT:
+                    val = x[i + 1:]
+                    if not val and k < len(a): val, k = a[k], k + 1
+                    if MKSHORT[c]: out.append((MKSHORT[c], val, x if x[i + 1:] else f'{x} {val}'))
+                    break
+    return out
+HANDLE = re.compile(r'[a-z0-9][a-z0-9-]*')
 AWKS = {'awk', 'gawk', 'mawk', 'nawk', 'busybox-awk'}
 SEATLAB = "the permission seat's state"
 FW = {'iptables', 'ip6tables', 'iptables-nft', 'iptables-legacy', 'ip6tables-nft', 'ip6tables-legacy',
@@ -445,6 +496,13 @@ class Guard:
         seat += [f for f in (H + '/.cc/state/handoff/perms.json', H + '/.cc/state/handoff/perms.brief') if os.path.exists(f)]
         g.above = [(d, "the permission seat's state") for d in seat]
         if g.role != 'pf': g.above += [(H + '/dev', '~/dev (the live checkouts)')] + g.fixed
+        # a member's trees, by the host-side record only a host session sees (~/.cc/members is not inside the boundary)
+        g.mtrees = []
+        for d in sorted(glob.glob(H + '/.cc/members/*')):
+            h = os.path.basename(d)
+            if not HANDLE.fullmatch(h) or not os.path.isdir(d) or h == g.mws: continue
+            for r in (H + '/dev/' + h, H + '/.cc/worktrees/' + h):
+                g.mtrees += [(r, h)] + ([(os.path.realpath(r), h)] if os.path.realpath(r) != r else [])
 
     def ownchans(g):   # the box's channels and this worktree's repo's, each with its -threads and -updates lanes. The
         # repo is read off the worktree's path (~/.cc/worktrees/<repo>/<track>), never its .cc/track, which the worker
@@ -592,9 +650,12 @@ class Guard:
                 out += g.expand([Word(n)] + [Word(x) for x in rest] + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx)
             return out
         b0 = w0.v.rsplit('/', 1)[-1]
+        # a member's own file named like a wrapper (`~/dev/bob/nice make`) is that file, not the wrapper: unwrapping
+        # would drop its path before memcode reads it
+        mine = '/' in w0.v and g.mtrees and g.memtree(g.absp(w0.v, cwd))
         out = []
         for b in (g.deglob(b0) if w0.glob else [b0]):
-            if b in WRAP and len(via) < 8:
+            if b in WRAP and len(via) < 8 and not mine:
                 j, info = g.unwrap(b, ws)
                 for t in info.get('script', []): out += g.script(t, cwd, b, depth + 1)
                 c2 = g.absp(info['cd'].v, cwd) if 'cd' in info and not info['cd'].dyn else cwd
@@ -609,6 +670,7 @@ class Guard:
                 else: out += g.expand(ws[j:], redirs, c2, assigns + info.get('assigns', []), via + [b], nested, depth, ctx)
                 continue
             R = g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw); out.append(R)
+            R['w0'] = w0.v   # the command word as a path (memcode)
             out += g.inner(R, ws, depth, ctx)
         return out
 
@@ -1036,7 +1098,51 @@ class Guard:
                 if bad: return 'never', f'an ssh carrying `{bad[0]}`: a root, power, firewall, disk, container, unit or network verb on any host'
         if (v == 'cc-slack' and a[:2] == ['member', 'add']) or (v == 'cc' and a[:3] == ['slack', 'member', 'add']):
             return 'never', "widening who reaches the box (cc-slack member add) is the owner's to do"
+        return g.memcode(R)
+
+    def memtree(g, p):   # (handle, track) of the member tree path p lands in, or None
+        for q in {p, os.path.realpath(p)}:
+            for r, h in g.mtrees:
+                if q == r or q.startswith(r + '/'):
+                    rest = q[len(r) + 1:].split('/')[0] if '/.cc/worktrees/' in r else ''
+                    return h, rest
         return None
+
+    def memcode(g, R):   # code from a member's tree, run on the host outside cc-sandbox member
+        # Why (from the brief): member-written code ran on the host as the box's own user, with full host access, more than once, and no seat noticed.
+        # So a hit refuses (never), at every tier; no tree recorded under ~/.cc/members means nothing to judge.
+        if not g.mtrees: return None
+        v, a, cwd, hit, what = R['verb'] or '', R['args'], R['cwd'], None, ''
+        w0 = R.get('w0', '')
+        if '/' in w0: hit, what = g.memtree(g.absp(w0, cwd)), w0
+        if not hit and (v in SHELLS or v in ('source', '.') or INTERP.fullmatch(v)):
+            k = 0
+            while k < len(a) and a[k].startswith(('-', '+')) and a[k] not in ('-', '--') and v not in ('source', '.'):
+                if meminline(v, a[k]): k = len(a); break
+                k += 2 if a[k] in MEMOPT else 1
+            if a[k:k + 1] == ['--']: k += 1
+            if k < len(a) and a[k] != '-': hit, what = g.memtree(g.absp(a[k], cwd)), f'{v} {a[k]}'
+        if not hit and v in ('make', 'gmake'):
+            # -C is cumulative and runs first, so a relative makefile or include directory is read from where it lands;
+            # each is judged from the start cwd too. MAKEFILES (makefiles read first) and MAKEFLAGS' -I count as well
+            mf = [x.split('=', 1)[1] for x in R['assigns'] if x.startswith('MAKEFLAGS=')]
+            mf = [w if w.startswith('-') or j else '-' + w for f in mf for j, w in enumerate(f.split())]
+            opts = makepaths(a) + [o for o in makepaths(mf) if o[0] == 'I']
+            opts += [('f', w, f'MAKEFILES={w}') for x in R['assigns'] if x.startswith('MAKEFILES=') for w in x[10:].split()]
+            d = cwd
+            for kind, val, typed in opts:
+                if kind == 'C': d = g.absp(val, d)
+            for kind, val, typed in opts:
+                for q in ([d] if kind == 'C' else [g.absp(val, d), g.absp(val, cwd)]):
+                    hit, what = g.memtree(q), f'{v} {typed}'
+                    if hit: break
+                if hit: break
+        if not hit and (v in MEMCWD or INTERP.fullmatch(v)): hit, what = g.memtree(cwd), f'{v} in {cwd}'
+        if not hit: return None
+        h, tr = hit
+        return 'never', (f"running a member's code on the host ({what}, in {h}'s tree): it would run as the box's own user "
+                         f"with the whole host in reach. Run it inside the member's boundary: cc-sandbox member {h} "
+                         f"{tr or '<track>'} -- <cmd>. Reading the files (cat, grep, git log) stays yours")
 
     def rules(g, R):
         v, a, mem = R['verb'], R['args'], g.role == 'member'
@@ -1571,6 +1677,48 @@ def selfcheck():
                             (f'git --git-dir={mr}/.git push origin +HEAD', True), (f'git --git-dir={tr}/.gitdir push origin +HEAD', False)]:
             got = judge(cmd, dict(base, GUARD_CWD=tr, GUARD_ROOT=tr))
             if (got is not None) != refuse: fail(f'case git -C: {cmd!r} -> {got}')
+            else: ok += 1
+        # member code on the host (raised-member-gate-reruns-ran-unsandboxed): seats reran ece298a's PLL gates with
+        # `setsid nice -n 19 python3 gate.py` and `bash log/scratch/run_sim_tt.sh` from its worktree, as the box's user.
+        # Its own HOME: bob is a member by the host-side record; carol has a ~/dev tree but no record, so is not.
+        MH = tempfile.mkdtemp(dir=H, prefix='mem.')
+        for d in ('.cc/members/bob', '.cc/worktrees/bob/pll/log/scratch', 'dev/bob', 'dev/carol', 'plain'): os.makedirs(MH + '/' + d)
+        mp = MH + '/.cc/worktrees/bob/pll'
+        for role, cwd, cmd, refuse in [
+                ('pf', 'plain', f'cd {mp} && setsid nice -n 19 python3 gate.py > log 2>&1', True),
+                ('pf', 'plain', f'cd {mp}; bash log/scratch/run_sim_tt.sh', True),
+                ('pf', 'plain', f'bash -e {mp}/log/scratch/run_sim_tt.sh', True),
+                ('pf', 'plain', f'{mp}/gate.py', True), ('pf', 'plain', 'python3 -I ~/dev/bob/x.py', True),
+                ('pf', 'plain', 'make -C ~/dev/bob sim', True), ('pf', 'dev/bob', 'make test', True),
+                ('worker', 'plain', "cd ~/dev/bob && python3 -c 'print(1)'", True),
+                ('pf', 'plain', f'systemd-run --user --wait cc-sandbox member bob pll -- python3 {mp}/gate.py', False),
+                ('pf', 'plain', f'cd {mp} && cc-sandbox member bob pll -- python3 gate.py', False),
+                ('pf', 'plain', f'cd {mp} && cat gate.py && git log -3 && grep -rn x .', False),
+                ('pf', 'plain', 'python3 ~/bin/tool.py ~/dev/bob/data.json', False),
+                ('pf', 'dev/bob', "bash -c 'git status'", False), ('pf', 'plain', 'cd ~/dev/carol && make', False),
+                ('member', 'dev/bob', 'python3 x.py', False),
+                # a member's file named like a wrapper is still a member's file (the review of #1496)
+                ('pf', 'plain', f'{mp}/nice -n 19 ls', True), ('pf', 'plain', f'cd {mp} && ./setsid ls', True),
+                ('pf', 'plain', f'nice {mp}/env ls', True), ('pf', 'plain', '/usr/bin/nice -n 19 ls', False),
+                # make's options in every form make reads them (the second review of #1496)
+                ('pf', 'plain', f'make -C{mp} sim', True),
+                ('pf', 'plain', f'make -f{mp}/Makefile', True), ('pf', 'plain', f'make -f {mp}/Makefile', True),
+                ('pf', 'plain', f'make --directory={mp}', True), ('pf', 'plain', f'make --directory {mp}', True),
+                ('pf', 'plain', f'make --file={mp}/Makefile', True), ('pf', 'plain', f'make --makefile={mp}/M', True),
+                ('pf', 'plain', f'make -I{mp}', True), ('pf', 'plain', f'make -I {mp}', True),
+                ('pf', 'plain', f'make --include-dir={mp}', True), ('pf', 'plain', f'make -sC{mp}', True),
+                ('pf', 'plain', f'make -sC {mp}', True), ('pf', 'plain', f'make -kj4 -sf{mp}/M', True),
+                ('pf', 'plain', f'make --dir={mp}', True), ('pf', 'plain', f'make all -C {mp}', True),
+                ('pf', 'plain', f'make -C {MH} -C .cc/worktrees/bob/pll', True),
+                ('pf', 'plain', f'make -C {mp} -f Makefile', True), ('pf', 'plain', f'make -C {MH}/plain -f ../dev/bob/M', True),
+                ('pf', 'plain', f'MAKEFILES={mp}/x.mk make', True), ('pf', 'plain', f'MAKEFLAGS=-I{mp} make', True),
+                ('pf', 'plain', f'make -C {MH}/plain -j 4 -o {mp}/x all', False),
+                ('pf', 'plain', f'make -C {MH}/plain -- -C{mp}', False), ('pf', 'plain', f'make -sC {MH}/plain', False)]:
+            env = {'HOME': MH, 'GUARD_ROLE': role, 'GUARD_CWD': MH + '/' + cwd, 'GUARD_ROOT': MH + '/' + cwd,
+                   'GUARD_MWS': 'bob' if role == 'member' else ''}
+            got = judge(cmd, env)
+            if (got is not None) != refuse or (refuse and 'cc-sandbox member bob' not in got[1]):
+                fail(f'member code {role}: {cmd!r} -> {got} (want {"refuse" if refuse else "pass"})')
             else: ok += 1
         path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'tests', 'guard-replay.jsonl')
         skipped = 0

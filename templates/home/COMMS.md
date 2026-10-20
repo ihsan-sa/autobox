@@ -82,6 +82,7 @@ Split by **kind**, not by the surface the text appeared on. Answering is `~/CLAU
 ## An approval ask (perms first)
 - On a box with a `perms` session, an ask for the owner's approval goes to it first, by SendMessage with the exact command, what it changes and the evidence. A `cc-notify --approval` from the control seat or the box's own tools is filed in its ledger instead of posted (`cc-refusals ask`; stdout `perms:<id>`).
 - It answers with an exact rule to run (or runs the action itself), "his", or a refusal. Only "his" reaches the owner, as the 🔐 card: `cc-notify --approval --his`, or `cc-refusals decide <repo> <id> his` for a filed ask.
+- A member's permission ask never shows perms the member's words: its ledger line is the ask's id, the workspace and the kind. The full text goes to the planning seat as a request naming that id, and the seat sends perms a plain summary or settles it.
 - It decides the box's own operations, including restarting the box's own services to put landed code live once that code was read at its merged head. "His" is anything outward in the owner's name or to new people, credentials, spend over budget, opening the box to the outside, host or network changes, and widening what members or non-owners may do. It does not read Slack.
 
 ## What crosses the wire

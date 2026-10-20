@@ -328,6 +328,17 @@ grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice t9
   && ! grep -q 'runmember other' "$T/tmux.log" && ! grep -q 'cc-sandbox member other' "$T/tmux.log" \
   && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, then \`cc-loop member-stop\` on the host with its exit, while an ordinary repo gets neither" \
   || bad "member launch is not inside the boundary: $(tr '\n' '|' < "$T/tmux.log")"
+# A MEMBER ORCH (owner, 2026-10-13: "suborchs should be able to exist in member workspaces"). On the host `cc <h> --orch`
+# opens the orch window (whose __runorch is the boundary, the am stanza below); inside, it opens nothing and asks the
+# host instead, as a member --go does. Each half starts from an empty log and asserts the other half did not happen.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/mo.slack" > "$T/mo-slack"; chmod +x "$T/mo-slack"
+: > "$T/tmux.log"; : > "$T/mo.slack"; sout "$B/cc" alice --orch helper 'build the rug site'
+mo_host=$(tr '\n' '|' < "$T/tmux.log")
+: > "$T/tmux.log"; env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_MEMBER_SANDBOX=1 CC_SLACK="$T/mo-slack" "$B/cc" alice --orch helper 'build the rug site' >/dev/null 2>&1
+grep -q '__runorch alice helper' <<<"$mo_host" && [ ! -s "$T/tmux.log" ] && grep -qx 'dispatch alice@helper --brief build the rug site' "$T/mo.slack" \
+  && ok "a member workspace has orchs: on the host \`cc alice --orch helper\` opens the orch window, and inside the boundary it opens none and asks the host to (cc-slack dispatch alice@helper)" \
+  || bad "member orch launch: host='$mo_host' inside-tmux='$(tr '\n' '|' < "$T/tmux.log")' inside-ask='$(cat "$T/mo.slack")'"
+rm -f "$T/mo-slack" "$T/mo.slack"
 # A REPO THE BOX ALREADY HAD BECOMES ONE THE SAME WAY. The four that exist came from cc-slack's join flow; `cc-sandbox
 # convert` is the path for a repo already on the box, and it writes the same markers — so every layer that reads them off
 # the path agrees. Here that means `cc`: the window it opens for a converted repo is the boundary, not a planning session.
@@ -802,6 +813,16 @@ amiss=""
 : > "$T/am.argv"; am __runmember other "";        grep -qE -- '^member other .*-- .*--permission-mode auto' "$T/am.argv" || amiss="$amiss __runmember"
 [ -z "$amiss" ] && ok "cc opens every session in auto mode — planning, track, orch, plain, handoff successor, and the member one inside the boundary" \
   || bad "these launchers still start in manual mode:$amiss"
+# …and a MEMBER orch's __runorch is the boundary: `cc-sandbox member alice ""` with the alias carried in, on the member
+# model, never --remote-control (the owner's phone); an ordinary repo's orch is still bare claude with it.
+printf '#!/usr/bin/env bash\nprintf "%%s alias=%%s\\n" "$*" "${CC_SLACK_ALIAS:-}" >> "%s"\n' "$T/mo.argv" > "$AM/cc-sandbox"; chmod +x "$AM/cc-sandbox"
+: > "$T/mo.argv"; : > "$T/am.argv"; am __runorch alice helper
+mo_in=$(cat "$T/mo.argv"); mo_bare=$(cat "$T/am.argv"); : > "$T/mo.argv"; : > "$T/am.argv"; am __runorch other a1
+grep -qE -- '^member alice  -- .*--model claude-sonnet-5.* alias=helper$' <<<"$mo_in" && ! grep -q -- '--remote-control' <<<"$mo_in" && [ -z "$mo_bare" ] \
+  && [ ! -s "$T/mo.argv" ] && grep -q -- '--remote-control other@a1' "$T/am.argv" \
+  && ok "a member orch runs inside \`cc-sandbox member alice \"\"\` with CC_SLACK_ALIAS=helper on the member model and no --remote-control, while another repo's orch is still the owner's" \
+  || bad "member __runorch not in the boundary: sandbox='$mo_in' bare='$mo_bare' other='$(cat "$T/am.argv")'"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/am.argv" > "$AM/cc-sandbox"; chmod +x "$AM/cc-sandbox"; rm -f "$T/mo.argv"
 # A KILLED ORCH KEEPS ITS CHANNEL (2026-09-26: a SIGKILL archived two live orchs' channels). Only a clean exit —
 # the session or the owner ending it — archives; each case builds its own claude and asserts what cc-slack was asked.
 mkdir -p "$GH/.cc/slack"; slk_was=0; [ -f "$GH/.cc/slack/enabled" ] && slk_was=1; : > "$GH/.cc/slack/enabled"
@@ -814,6 +835,9 @@ grep -q '^137 ' "$kom" 2>/dev/null && ok "…and leaves the crash marker, so the
 ko 'exit 1';         grep -q 'archive' "$T/ko.slack" && bad "a crashed orch archived its channel: $(cat "$T/ko.slack")" || ok "…and so does one that crashes (non-zero exit)"
 ko 'exit 0';         grep -qx 'archive --orch other a1' "$T/ko.slack" && ok "…while a clean finish still archives it" || bad "a clean orch exit no longer archives: $(cat "$T/ko.slack")"
 [ -e "$kom" ] && bad "a restarted orch kept the earlier crash marker: $(cat "$kom")" || ok "…and a restart clears the crash marker, so a clean finish is a finish again"
+: > "$T/ko.slack"; env -u CC_SLACK_DIR HOME="$GH" PATH="$B:$PATH" CC_CLAUDE="$T/ko-claude" CC_SLACK="$T/ko-slack" "$AM/cc" __runorch alice helper </dev/null >/dev/null 2>&1
+grep -q 'archive' "$T/ko.slack" && bad "a member orch's clean exit archived its channel: $(cat "$T/ko.slack")" \
+  || ok "…but a member orch's clean exit never archives: #<h>--<alias> is the member's own lane"
 [ "$slk_was" = 1 ] || rm -f "$GH/.cc/slack/enabled"; rm -f "$T/ko-claude" "$T/ko-slack" "$T/ko.slack"; rm -rf "$GH/.cc/slack/orch-crashed"
 # The box's own always-on Remote-Control session is the seventh and cannot be run from here (it waits for the
 # internet and never returns), so its launch line is read instead.

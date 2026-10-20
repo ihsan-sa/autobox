@@ -6,16 +6,21 @@
 #                                   so it can never turn a denial into a retry or fail a turn.
 #   cc-refusals collect <repo> <track>   moves what a sandboxed worker's hook spooled into the ledger (cc-loop runs it
 #                                   after each iteration, on the host)
-#   cc-refusals ask <repo> --from <who> [--where <link>] [--member] -- <text>
+#   cc-refusals ask <repo> --from <who> [--where <link>] -- <text>
+#   cc-refusals ask <repo> --from <workspace> --member [--kind <word>]
 #                                   A PERMISSION QUESTION (a permission, approval, refusal, credential or settings ask):
 #                                   one ask line in the ledger, its id printed. cc-slack's reply(needs_owner, permission)
 #                                   and cc-notify --perms call it, so the question reaches the permission session before
 #                                   the owner. With that session down the ask still waits here, and the owner is told
 #                                   once a day that it is down (cc-notify --decision, a count, never the ask's text);
 #                                   from a seat that is not the control seat that line is a request to the planning
-#                                   seat instead, and stderr says which of the two was told.
+#                                   seat instead, and stderr says which of the two was told. A MEMBER'S ask (--member,
+#                                   from cc-slack's member socket) is written with no text: only its id, the workspace,
+#                                   and the kind of ask; the caller sends the text to the planning seat as a request
+#                                   naming the id.
 #   cc-refusals open <repo>         one line per refusal or ask nobody has decided yet:
 #                                   `<id> <at> [<window>] <tool>: <input> — <reason>` or `<id> <at> [<window>] ask: <text> (<where>)`,
+#                                   a member's `<id> <at> [<window> (member: no authority)] ask (<kind>): no text here; …`,
 #                                   control characters shown as spaces; a cut field ends `…(cut: show <id>)`
 #   cc-refusals watch <repo>        the same line for each NEW refusal or ask as it is recorded, one per item, never
 #                                   anything else: the permission session runs it under its Monitor tool
@@ -59,7 +64,8 @@
 # permission session may not edit hooks), so recording it would only queue declines.
 # THE LEDGER is ~/.cc/state/<repo>/perms/refusals.jsonl, one JSON object per line: {kind:"refusal", id, at, repo, window,
 # session, tool, input, reason} (an approval ask is one with source "approval", title, heading and card_id),
-# {kind:"ask", id, at, repo, window, member, where, text}, {kind:"decision", id, at, decision, note, by} and, once a
+# {kind:"ask", id, at, repo, window, member:false, where, text}, a member's {kind:"ask", id, at, repo, window,
+# member:true, ask} with no text, {kind:"decision", id, at, decision, note, by} and, once a
 # `his` card went out, {kind:"posted", id, at}. The same tool and input refused again in one repo (or the same ask from
 # one asker and repo) while its first record is undecided is not written twice, so a session retrying a refused call
 # wakes nobody.
@@ -71,7 +77,7 @@ ROOT="${CC_REFUSALS_ROOT:-$HOME/.cc/state}"; DEV="${CC_REFUSALS_DEV:-$HOME/dev}"
 SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF")
 # the control repo: the one this copy lives in, read the way cc-notify reads it
 CTL=${CC_REFUSALS_CTL-}; [ -n "$CTL" ] || case "$SELF" in "$HOME/dev/"*) CTL=${SELF#"$HOME/dev/"}; CTL=${CTL%%/*};; esac
-USAGE="usage: cc-refusals record | collect <repo> <track> | ask <repo> --from <who> [--where <link>] [--member] -- <text> | ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <id>] -- <text> | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline|his <text> | selfcheck"
+USAGE="usage: cc-refusals record | collect <repo> <track> | ask <repo> --from <who> [--where <link>] -- <text> | ask <repo> --from <workspace> --member [--kind <word>] | ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <id>] -- <text> | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline|his <text> | selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-refusals: jq is missing" >&2; exit 2; }
 
 ledger(){ printf '%s/%s/perms/refusals.jsonl' "$ROOT" "$1"; }
@@ -94,8 +100,10 @@ CLEAN='def clean: tostring | gsub("\u001b(\\[[0-?]*[ -/]*[@-~]|\\][^\u0007\u001b
 line(){ jq -r "$CLEAN"' select(.kind == "refusal" or .kind == "ask") | . as $r
   | def c($n): (. // "") | clean | if length > $n then .[:$n] + " …(cut: show \($r.id | clean))" else . end;
   (if (.repo // "") != "" and (.window // "") != .repo then "\(.repo | c(40)):" else "" end) as $rp
-  | if .kind == "ask" then
-      "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60))\(if .member then " (member: no authority)" else "" end)] ask: \(.text | c(400))\(if (.where // "") != "" then " (\(.where | c(200)))" else "" end)"
+  | if .kind == "ask" and .member then
+      "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60)) (member: no authority)] ask (\(.ask // "permission" | c(32))): no text here; the planning seat holds it and sends you a plain summary naming \(.id | c(40))"
+    elif .kind == "ask" then
+      "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60))] ask: \(.text | c(400))\(if (.where // "") != "" then " (\(.where | c(200)))" else "" end)"
     else
       "\(.id | c(40)) \(.at | c(40)) [\($rp)\(.window | c(60))] \(.tool | c(80)): \(.input | c(200)) — \(.reason | c(300))"
     end'; }
@@ -200,20 +208,39 @@ collect(){ local repo=$1 track=$2 sp tg lg l n=0 kept=0 rc tmp keep more
     rm -f -- "${keep:?}"; echo "cc-refusals: $n collected from $repo/$track"
   fi; }
 
-# ask <repo> --from <who> [--where <link>] [--member] -- <text>: a permission question into the ledger, its id printed
-ask_question(){ local repo=$1 from='' where='' member=false text tg lg now key obj id rc; shift
+# ask <repo> --from <who> [--where <link>] -- <text>, or a member's textless ask (below): a permission question into the ledger, its id printed
+# A MEMBER'S ASK (--member) CARRIES NO TEXT (perms, 2026-10-20, reading #904: a member's words in this ledger are a
+# prompt-injection path into the one session that grants permissions, "no authority" tag or not). Its line holds the
+# id, the workspace (--from, a plain name) and the kind of ask (--kind, one word, default permission); the full text
+# goes to the planning seat as a request naming this id, and that seat files its own plain summary here. Text or
+# --where with --member is refused, so no caller can put a member's words in front of the permission session. A
+# second ask from the same workspace while the first is open gets the first's id: one line, as a retried ask does.
+ask_question(){ local repo=$1 from='' where='' member=false akind='' text tg lg now key obj id rc; shift
   while [ $# -gt 0 ]; do case $1 in   # a flag with no value is a usage error: `shift 2` on one word shifts nothing and loops
-    --from|--where) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; } ;; esac; case $1 in
+    --from|--where|--kind) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; } ;; esac; case $1 in
     --from) from=${2-}; shift 2;; --where) where=${2-}; shift 2;; --member) member=true; shift;;
+    --kind) akind=${2-}; shift 2;;
     --) shift; break;; *) echo "$USAGE" >&2; exit 2;; esac; done
-  text=$*; [ -n "$from" ] && [ -n "$text" ] && name_ok "$repo" || { echo "$USAGE" >&2; exit 2; }
+  text=$*; name_ok "$repo" && [ -n "$from" ] || { echo "$USAGE" >&2; exit 2; }
+  if [ "$member" = true ]; then
+    [ -z "$text" ] && [ -z "$where" ] || { echo "cc-refusals: a member's ask carries no text or --where here; its text goes to the planning seat" >&2; exit 2; }
+    akind=${akind:-permission}
+    name_ok "$from" && [[ $akind =~ ^[a-z][a-z-]{0,31}$ ]] || { echo "$USAGE" >&2; exit 2; }
+  else
+    [ -n "$text" ] && [ -z "$akind" ] || { echo "$USAGE" >&2; exit 2; }
+  fi
   tg=$(target "$repo") || { echo "cc-refusals: no permission session for $repo or the control repo" >&2; exit 1; }
   lg=$(ledger "$tg"); now=$(date -u +%FT%TZ)
   [ "${#text}" -gt 4000 ] && text="${text:0:4000} …(cut)"
-  key=$(printf 'ask\n%s\n%s\n%s' "$repo" "$from" "$text" | sha1sum | cut -c1-12); id=q$(printf '%s\n%s' "$key" "$now" | sha1sum | cut -c1-8)
-  obj=$(jq -cn --arg id "$id" --arg at "$now" --arg rp "$repo" --arg w "$from" --arg wh "$where" --arg t "$text" \
-     --arg k "$key" --argjson m "$member" \
-     "$CLEAN"'{kind:"ask", id:$id, at:$at, repo:$rp, window:($w | clean), member:$m, where:($wh | clean), text:($t | clean), key:$k}')
+  key=$(printf 'ask\n%s\n%s\n%s\n%s' "$repo" "$from" "$text" "$akind" | sha1sum | cut -c1-12); id=q$(printf '%s\n%s' "$key" "$now" | sha1sum | cut -c1-8)
+  if [ "$member" = true ]; then
+    obj=$(jq -cn --arg id "$id" --arg at "$now" --arg rp "$repo" --arg w "$from" --arg a "$akind" --arg k "$key" \
+       '{kind:"ask", id:$id, at:$at, repo:$rp, window:$w, member:true, ask:$a, key:$k}')
+  else
+    obj=$(jq -cn --arg id "$id" --arg at "$now" --arg rp "$repo" --arg w "$from" --arg wh "$where" --arg t "$text" \
+       --arg k "$key" \
+       "$CLEAN"'{kind:"ask", id:$id, at:$at, repo:$rp, window:($w | clean), member:false, where:($wh | clean), text:($t | clean), key:$k}')
+  fi
   put "$lg" "$obj"; rc=$?
   if [ "$rc" = 3 ]; then     # the same ask, still open: its first id
     id=$(jq -r --arg k "$key" 'select(.kind == "ask" and .key == $k) | .id' "$lg" | tail -1)
@@ -244,7 +271,8 @@ watch_(){ local lg; lg=$(ledger "$1"); touch "$lg" || exit 2
   # tail from the end: what is already there is `open`'s to print. One line per refusal, flushed as it comes.
   tail -n0 -F "$lg" 2>/dev/null | while IFS= read -r l; do printf '%s\n' "$l" | line 2>/dev/null; done; }
 show(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $1" >&2; exit 1; }
-  jq -c --arg id "$2" 'select(.id == $id)' "$lg" | grep . || { echo "cc-refusals: no refusal $2" >&2; exit 1; }; }
+  # a member's words never print here either: an ask filed before 2026-10-20 still carries them in the ledger
+  jq -c --arg id "$2" 'select(.id == $id) | if .kind == "ask" and .member then del(.text, .where) else . end' "$lg" | grep . || { echo "cc-refusals: no refusal $2" >&2; exit 1; }; }
 # AN APPROVAL ASK (the owner, 2026-09-28: approval cards "go to perms"). cc-notify files it here in place of the
 # owner's card, so the permission session reads it where it already reads refusals, and `decide … his` posts the card.
 # WHO MAY FILE ONE (review of #904): only a caller cc-notify itself would let ask the owner, read the way its

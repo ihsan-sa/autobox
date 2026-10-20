@@ -3226,8 +3226,10 @@ class Ratchet(unittest.TestCase):
             self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, ran)
 
     def test_ran_reads_passes_and_crashes(self):
-        self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "failed": 1, "crash": False})
-        self.assertEqual(RUN.ran("✓ a\n== 1 failed, 7 passed in 0.12s ==\n"), {"passes": 7, "failed": 1, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "failed": 1, "crash": False,
+                                                       "ends": False})
+        self.assertEqual(RUN.ran("✓ a\n== 1 failed, 7 passed in 0.12s ==\n"), {"passes": 7, "failed": 1, "crash": False,
+                                                                                 "ends": True})
         self.assertEqual(RUN.ran("✓ a\nTraceback (most recent call last):\n")["crash"], True)
         self.assertEqual(RUN.ran("✓ a\nSegmentation fault (core dumped)\n")["crash"], True)
         # Opus delta read, 10-13: an indented Traceback and bash's own kill line are crashes; a case naming one is not
@@ -3313,7 +3315,8 @@ class Ratchet(unittest.TestCase):
         # planning seat's read of #1635: a red on main that names no case held every PR once health.trim was gone
         for h, b, want in ((2, 3, T.PASSED), (3, 3, T.PASSED), (4, 3, RUN.BLOCKED), (None, 3, RUN.BLOCKED),
                            (2, None, RUN.BLOCKED)):
-            run, _ = self.runner({self.H: [], self.B: []}, ran={self.H: {"failed": h}, self.B: {"failed": b}})
+            run, _ = self.runner({self.H: [], self.B: []}, ran={self.H: {"failed": h, "ends": True},
+                                                                self.B: {"failed": b, "ends": True}})
             self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, (h, b))
 
     def test_ran_reads_no_count_from_a_red_that_prints_none(self):
@@ -3352,6 +3355,23 @@ class Ratchet(unittest.TestCase):
                            ("== 2 failed in 0.1s ==\n== 9 passed in 0.3s ==\n", 2),
                            ("== 5 passed in 0.1s ==\nguard: broke y\n", None)):
             self.assertEqual(RUN.ran(text)["failed"], want, text)
+
+    def test_a_counted_red_holds_unless_both_runs_end_on_their_tally(self):
+        # perms' read of #1645: main red with '== 3 failed ==' naming no case; a PR keeping those 3 and adding a fail
+        # line no form knows read 3 against 3 and landed
+        res = lambda tree, text: T.Result(check="c", tree=tree, status=T.FAILED, secs=0.0, runner="box:x:y",
+                                          extra={"fails": RUN.fail_ids(text), **RUN.ran(text)})
+        base = res("b", "setup ok\n== 3 failed, 9 passed in 0.3s ==\n")
+        head = res("h", "setup ok\n== 3 failed, 9 passed in 0.3s ==\nguard: broke y\n")
+        self.assertFalse(RUN.no_new_reds(head, base))
+        self.assertEqual((head.extra["fails"], head.extra["failed"], head.extra["ends"]), ([], 3, False))
+        self.assertEqual((base.extra["fails"], base.extra["failed"], base.extra["ends"]), ([], 3, True))
+        self.assertFalse(RUN.no_new_reds(base, head))   # a base with a line after its tally is no count to match either
+        # a red that ends on its tally (blank lines aside) still compares by count
+        self.assertTrue(RUN.no_new_reds(res("h", "== 2 failed, 9 passed in 0.3s ==\n\n  \n"), base))
+        self.assertFalse(RUN.no_new_reds(res("h", "== 4 failed, 9 passed in 0.3s ==\n"), base))
+        # and a green run with a line after its tally is still green: the status never reads ends
+        self.assertEqual(RUN.status_of(0, "== 9 passed in 0.3s ==\ndone\n"), (T.PASSED, ""))
 
     def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
         store = self.store()

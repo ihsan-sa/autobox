@@ -46,6 +46,8 @@
 #   --go and --say are both REFUSED while the project is parked (`cc-pause on <repo>`, or `!pause` in its channel);
 #   --go is refused too while the spend tier holds the row (`cc-tier`: stop, or essential with no `critical` on it)
 #   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it ends itself cleanly; never on a kill or crash).
+#                                            In a member workspace it runs inside `cc-sandbox member` on the member's credential and day cap, in
+#                                            #<h>--<alias> of the member's own Slack (never archived); from inside, the host is asked to start it.
 #                             The orch CC_QUERIES_SESSION names (<repo>@<alias>) gets no channel: it answers the repo's -threads lane.
 #                             The brief is that session's FIRST TURN — it starts on it with nobody typing (sp_first)
 #   cc handoff <repo> <track> [--session ID] [--in-flight "…"]  start a fresh session ALONGSIDE that track's: it reads
@@ -430,7 +432,7 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
 # host side of a launch (tmux, the board row, the budget ledger, the window) is this script OUTSIDE; claude and cc-loop go
 # in. Inside there is no tmux and no ledger, so `cc <h> <track> --go` writes the brief and asks the daemon (cc-slack dispatch)
 # to run the same command out here. The bare internals (__run*) refuse a workspace repo outside the boundary: depth.
-MEMBER_WS_SP="This session belongs to a MEMBER WORKSPACE and runs inside its boundary: only its folder, its tracks and its Slack channels exist here, so a missing path or tool is by design, not a fault. 'cc-notify -t \"<what>\" \"...\"' and reply(needs_owner) both reach the box's planning seat, which answers you or asks the owner itself. A cc-guard REFUSAL is already a query to the box: never post it, a 🔐 line or 'I cannot do that' into the channel; say what you CAN do. ASKING THE BOX (a GitHub repo, a host-side push, a question about the box) is 'cc slack ask -t \"<what>\" \"...\"' (at most 5 an hour), and the answer comes back in this channel. Never ask the owner to relay a question you can send yourself. Dispatch with 'cc <handle> <track> --go \"...\"' (inside this boundary, on the workspace's budget); a track session is opened from its 🧵 thread in #<handle> or by the owner, never from here."
+MEMBER_WS_SP="This session belongs to a MEMBER WORKSPACE and runs inside its boundary: only its folder, its tracks and its Slack channels exist here, so a missing path or tool is by design, not a fault. 'cc-notify -t \"<what>\" \"...\"' and reply(needs_owner) both reach the box's planning seat, which answers you or asks the owner itself. A cc-guard REFUSAL is already a query to the box: never post it, a 🔐 line or 'I cannot do that' into the channel; say what you CAN do. ASKING THE BOX (a GitHub repo, a host-side push, a question about the box) is 'cc slack ask -t \"<what>\" \"...\"' (at most 5 an hour), and the answer comes back in this channel. Never ask the owner to relay a question you can send yourself. Dispatch with 'cc <handle> <track> --go \"...\"' (inside this boundary, on the workspace's budget), and start an orchestrator with 'cc <handle> --orch <alias> \"<purpose>\"' (the same, in its own channel #<handle>--<alias>); a track session is opened from its 🧵 thread in #<handle> or by the owner, never from here."
 # PER-WORKSPACE OVERRIDES (owner, 2026-10-13: one fund runs 24/7 with no cap, and raising the shared ceiling would widen
 # every other member). MEMBER_DAILY_USD and MEMBER_DAILY_CEILING_USD each take a per-handle form, <KEY>_<HANDLE> with the
 # handle upper-cased and every character outside A-Z0-9 made `_` (bayesian-squirrel → _BAYESIAN_SQUIRREL), read BEFORE the
@@ -1682,8 +1684,8 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   [ "$bad" = 0 ]
 }
 
-case "${1:-}" in __run|__runmain|__runplain|__runorch)   # depth: a workspace session starts through __runmember → cc-sandbox member, never bare.
-  # __runnext is NOT in this list: like __runmember it opens `cc-sandbox member` itself for a member workspace, and
+case "${1:-}" in __run|__runmain|__runplain)   # depth: a workspace session starts through __runmember → cc-sandbox member, never bare.
+  # __runnext and __runorch are NOT in this list: like __runmember each opens `cc-sandbox member` itself for a member workspace, and
   # `cc-handoff --overlap <handle>` runs it on the host — listed here, the successor was refused before it could (review of #530).
   addr_split "${2:-}"   # `${2%%/*}` left an orch successor's repo as `<repo>@<alias>`, a name no
   member_workspace "$repo" && ! inside && { echo "cc: ~/dev/$repo is a member workspace — its sessions run only inside the boundary (cc $repo ...), never bare on the host. Refused."; exit 1; };; esac   # workspace has, so this guard read no marker and failed OPEN on the one shape it could not parse
@@ -2218,14 +2220,20 @@ PY
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(orch_model_args "$repo" "$alias"); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
     crashed="${CC_SLACK_DIR:-$HOME/.cc/slack}/orch-crashed/$repo@$alias"; rm -f "$crashed"   # a restarted orch is live again
-    "$CLAUDE" "${AUTO[@]}" --name "$repo@$alias" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" "${EF[@]}" ${ft:+"$ft"}; orc=$?
+    if member_workspace "$repo"; then   # a MEMBER orch boots the way __runmember boots: inside `cc-sandbox member` (which carries
+      # CC_SLACK_ALIAS in), on CC_MEMBER_MODEL, no --remote-control and no owner effort pin; the socket takes its alias
+      # only because orchs.json gives <h>@<alias> a channel of the workspace's own
+      export CC_ROLE=member; sp="$sp $MEMBER_SP $MEMBER_WS_SP Your own channel is #$repo--$alias, in this workspace's Slack."; mapfile -t MO < <(member_model_args)
+      "$BIN/cc-sandbox" member "$repo" "" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" "${CH[@]}" "${MO[@]}" ${ft:+"$ft"}; orc=$?
+    else "$CLAUDE" "${AUTO[@]}" --name "$repo@$alias" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" "${EF[@]}" ${ft:+"$ft"}; orc=$?; fi
     # ONLY A DELIBERATE FINISH ARCHIVES THE CHANNEL: claude exits 0 when the session or the owner ends it (/exit).
     # A signal (137 = SIGKILL, the OOM killer under load; 143 = SIGTERM) or a crash exit is not a finish — on
     # 2026-09-26 a SIGKILL archived two orch channels with both windows still up.
     # The channel stays, and so does the marker below: the pane falls back to bash, which cc-slack's janitor would
     # otherwise read as a finished orch and archive ORCH_IDLE later. A crashed orch's channel is never archived by
     # the janitor; restarting the orch clears the marker, and only a clean exit archives.
-    if [ "$orc" = 0 ]; then [ -f "$SLACKON" ] && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
+    # A member orch's channel is the member's own lane (#<h>--<alias>, maybe one they made), so no exit archives it.
+    if [ "$orc" = 0 ]; then [ -f "$SLACKON" ] && ! member_workspace "$repo" && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
     else mkdir -p "${crashed%/*}" && echo "$orc $(date -u +%FT%TZ)" > "$crashed"
          echo; echo "[claude ended with status $orc — not a finish, so $alias@$repo keeps its Slack channel]"; fi
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
@@ -2244,9 +2252,16 @@ repo="${1:?repo}"; track="${2:-}"; shift; [ -n "$track" ] && shift
 valid_name "$repo"
 inside || { no_fixture_on_live "$repo"; ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true; }   # inside the boundary there is no tmux server and the trust copy is already made
 if [ "$track" = "--orch" ]; then
-  member_workspace "$repo" && { echo "cc: a member workspace has no orchestrators — its one session lives in #$repo"; exit 1; }
   alias="${1:-}"; brief="${2:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
-  win="$repo@$alias"; lock "$HOME/.cc/win.lock"; fresh=""
+  win="$repo@$alias"
+  # A MEMBER ORCH (owner, 2026-10-13: "suborchs should be able to exist in member workspaces"): its planning session
+  # starts one as a seat does, brokered to the host like --go; the host checks the credential and charges the day cap
+  # (member_gate, one default dispatch) for a fresh window, and __runorch puts the session inside `cc-sandbox member`.
+  if member_workspace "$repo"; then
+    inside && exec "${CC_SLACK:-$BIN/cc-slack}" dispatch "$repo@$alias" ${brief:+--brief "$brief"}
+    if ! { have_window "$win" && pane_live "$win"; }; then XTRA=(); LOOPN=1; member_credential "$repo" "" || exit 1; member_gate "$repo" || exit 1; fi
+  fi
+  lock "$HOME/.cc/win.lock"; fresh=""
   if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # the orch exited, only the fallback shell is left
   # The brief goes THROUGH to the window: __runorch hands it to claude as the first turn (sp_first). Only a FRESH
   # window gets one — re-running this on a live orch attaches to the session it already has, and a purpose typed
