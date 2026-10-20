@@ -11688,6 +11688,29 @@ def run_selfcheck():
         resT = dmT.take_mail("T4")
         check("mail: …without the row the same mail is the member's", resT["to"] == ["#mem"]
               and [h[0] for h in thanded] == ["mem"])
+        # A member can replace its `files` dir from its sandbox (perms' read of #1669, 10-20): a link planted there
+        # pointing at an owner directory takes no attachment and no mail text, and the turn says nothing was saved.
+        lfiles = f"{member_dir('mem')}/files"
+        lcanary = tempfile.mkdtemp(prefix="cc-slack-selfcheck-canary-")
+        shutil.rmtree(lfiles); os.symlink(lcanary, lfiles)
+        thanded.clear()
+        dmT.cfg["MAIL_NO_TEXT"] = "@allowed.example"
+        lmsg = mail_write("L1", to=["mem@box.example"], subject="s", text="t",
+                          attachments=[{"name": "x.pdf", "path": "x.pdf"}])
+        with open(f"{mdir}/inbox/L1/x.pdf", "wb") as fh:
+            fh.write(b"%PDF-1.4 bytes")
+        try:
+            dmT.mail_hand(lmsg, MailPlaces(dmT).place("mem"), "1.0", "1.0",
+                          R.Decision(to=[], workspace="mem", rule="named"))
+        finally:
+            dmT.cfg["MAIL_NO_TEXT"] = ""
+            os.unlink(lfiles); os.makedirs(lfiles)
+        ltext, lmeta = (thanded[0][1], thanded[0][2]) if thanded else ("", {})
+        check("mail: a link planted at the member's files dir takes no attachment and no mail text into its target, "
+              "and the turn says the file was NOT saved and the text could not be saved (perms 10-20)",
+              os.listdir(lcanary) == [] and len(thanded) == 1 and "1 more (NOT saved)" in ltext
+              and "could not save" in ltext and "file_paths" not in lmeta and "text_path" not in lmeta)
+        shutil.rmtree(lcanary, ignore_errors=True)
 
         # (f) THE DAEMON'S OWN DOOR, through on_event — the half mail_move cannot prove about itself. A move is
         # answered in its thread and the message STOPS there; anything else in that thread carries on to the

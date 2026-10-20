@@ -2329,6 +2329,22 @@ def member_dir(handle):
     """The piece of ~/.cc/slack a member boundary gets: its socket, `enabled` flag and attachment cache, no bot token."""
     return f"{DIR}/member/{handle}"
 
+def member_new_file(handle, name):
+    """A write fd for a new member_dir(h)/files/<name>, or None when a plain file is already there. The member can
+    replace `files` or plant `name` from its sandbox, so both are opened under a dir fd with O_NOFOLLOW: a link or a
+    non-directory at `files`, or anything but a plain file at `name`, raises OSError and nothing is written through
+    it (perms 10-20)."""
+    dfd = open_dir_nofollow(f"{member_dir(handle)}/files")
+    try:
+        try:
+            return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        except FileExistsError:
+            if not stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
+                raise
+            return None
+    finally:
+        os.close(dfd)
+
 def member_files_inside(handle, path):
     """The path a member's session sees for a saved attachment: member_dir(h)/files/X is bound as ~/.cc/slack."""
     out = f"{member_dir(handle)}/files/"
@@ -7172,8 +7188,8 @@ class Daemon:
     def mail_files(self, msg, ws):
         """(attachment, path) pairs the session can open, in the mail's order; nothing here opens one. Pairs,
         not paths: a skipped attachment leaves no path, and mail_hand names it as not saved off the same list.
-        A member's session can't see ~/.cc/mail; copy goes to member_dir/files (bound into her boundary).
-        Created O_CREAT|O_EXCL|O_NOFOLLOW (blocks a symlink attack); a same-name file reused, else skipped."""
+        A member's session can't see ~/.cc/mail; copy goes to member_dir/files (bound into its boundary) through
+        member_new_file, so a link at the dir or the name is refused; a same-name plain file is reused."""
         out, base = [], os.path.realpath(f"{MAIL_DIR}/inbox/{msg['id']}")
         for a in msg.get("attachments") or []:
             src = os.path.realpath(os.path.join(base, a.get("path") or ""))
@@ -7184,25 +7200,12 @@ class Daemon:
                 out.append((a, src))
                 continue
             try:
-                d = f"{member_dir(ws)}/files"
                 name = f"{msg['id']}-{os.path.basename(src)}"
-                dst = os.path.join(d, name)
-                dfd = open_dir_nofollow(d)   # the files dir itself can be swapped for a link, not just the name
-                try:
-                    try:
-                        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
-                    except FileExistsError:
-                        if not stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
-                            log(f"mail {msg['id']}: {name} in {ws}'s files is not a file we wrote — "
-                                f"not copied, and nothing written through it")
-                            continue
-                        out.append((a, member_files_inside(ws, dst)))   # the same bytes are already there
-                        continue
+                fd = member_new_file(ws, name)
+                if fd is not None:                 # None: the same bytes are already there
                     with os.fdopen(fd, "wb") as w, open(src, "rb") as r:   # fdopen first: it owns fd from here on
-                        shutil.copyfileobj(r, w)       # bytes, copied. Not opened, not decoded, not run
-                finally:
-                    os.close(dfd)
-                out.append((a, member_files_inside(ws, dst)))
+                        shutil.copyfileobj(r, w)   # bytes, copied. Not opened, not decoded, not run
+                out.append((a, member_files_inside(ws, f"{member_dir(ws)}/files/{name}")))
             except OSError as e:
                 log(f"mail {msg['id']}: could not copy an attachment into {ws}: {e!r}")
         return out
@@ -7211,30 +7214,18 @@ class Daemon:
         """Where a MAIL_NO_TEXT mail's subject and body are for its session to read, or "" when they could not be put
         anywhere. The owner's session reads the stored message.json itself. A member's cannot see ~/.cc/mail, so the
         two are written to member_dir/files as `<id>.text.txt` — a name no attachment copy can take, since those are
-        `<id>-<name>` — created O_EXCL|O_NOFOLLOW like an attachment (mail_files); a file of ours already there (the
-        same mail handed again by a move) is reused, anything else is left alone and nothing is written."""
+        `<id>-<name>` — created through member_new_file like an attachment (mail_files); a plain file already there
+        (the same mail handed again by a move) is reused, and a link at the dir or the name means nothing is written."""
         if not ws:
             return f"{MAIL_DIR}/inbox/{msg['id']}/message.json"
-        d = f"{member_dir(ws)}/files"
         name = f"{msg['id']}.text.txt"
-        dst = os.path.join(d, name)
         text = "Subject: %s\n\n%s\n" % (msg.get("subject") or "(no subject)", mail_router().body_text(msg).strip())
         try:
-            dfd = open_dir_nofollow(d)   # the files dir itself can be swapped for a link, not just the name
-            try:
-                try:
-                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
-                except FileExistsError:
-                    if not stat.S_ISREG(os.lstat(name, dir_fd=dfd).st_mode):
-                        log(f"mail {msg['id']}: {name} in {ws}'s files is not a file we wrote — "
-                            f"the text was not saved")
-                        return ""
-                    return member_files_inside(ws, dst)
+            fd = member_new_file(ws, name)
+            if fd is not None:
                 with os.fdopen(fd, "w", encoding="utf-8") as w:
                     w.write(text)
-            finally:
-                os.close(dfd)
-            return member_files_inside(ws, dst)
+            return member_files_inside(ws, f"{member_dir(ws)}/files/{name}")
         except OSError as e:
             log(f"mail {msg['id']}: could not save the text into {ws}: {e!r}")
             return ""
