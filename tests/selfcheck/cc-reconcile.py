@@ -684,6 +684,64 @@ def selfcheck():
         finally:
             globals().update(DEV=_d, WTS=_w)
 
+    with tempfile.TemporaryDirectory() as tg:   # ORIGIN IS ASKED, not the tracking ref: a fixture of its own
+        def g(d, *a):
+            return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=30)
+        _d, _w = DEV, WTS
+        globals().update(DEV=f"{tg}/dev", WTS=f"{tg}/wts")
+        try:
+            bare, co, wt2 = f"{tg}/origin.git", f"{tg}/dev/r", f"{tg}/wts/r/t"
+            g(tg, "init", "-q", "--bare", bare)
+            g(tg, "clone", "-q", bare, co)
+            g(co, "config", "user.email", "s@e"); g(co, "config", "user.name", "s")
+            open(f"{co}/a", "w").write("0"); g(co, "add", "a"); g(co, "commit", "-qm", "zero")
+            g(co, "worktree", "add", "-q", "-b", "track/t", wt2)
+            g(wt2, "push", "-q", "-u", "origin", "HEAD")
+            open(f"{wt2}/a", "w").write("1"); g(wt2, "commit", "-qam", "merge round")
+            head, old = g(wt2, "rev-parse", "HEAD").stdout.strip(), g(wt2, "rev-parse", "HEAD~").stdout.strip()
+            g(wt2, "push", "-q", "origin", "HEAD")
+            g(co, "update-ref", "refs/remotes/origin/track/t", old)   # as if pushed from elsewhere: this clone's ref is stale
+            ok("real git: the stale tracking ref alone still says unpushed (what --no-net reads)",
+               branch_unpushed("r", wt2) is True)
+            tips = remote_tracks("r")
+            ok("real git: origin's own listing holds the head, so a branch pushed from elsewhere is NOT unpushed",
+               tips == {"track/t": head} and branch_unpushed("r", wt2, tips) is False)
+            open(f"{wt2}/a", "w").write("2"); g(wt2, "commit", "-qam", "after")
+            ok("real git: …and a commit origin's listing lacks still IS unpushed", branch_unpushed("r", wt2, tips) is True)
+            ok("real git: a tip that is no object here falls back to the tracking ref",
+               branch_unpushed("r", wt2, {"track/t": "f" * 40}) is True)
+        finally:
+            globals().update(DEV=_d, WTS=_w)
+
+    with tempfile.TemporaryDirectory() as tg:   # ORIGIN DELETED THE BRANCH after merging it: a fixture of its own
+        def g(d, *a):
+            return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=30)
+        _d, _w = DEV, WTS
+        globals().update(DEV=f"{tg}/dev", WTS=f"{tg}/wts")
+        try:
+            bare, co, wt2 = f"{tg}/origin.git", f"{tg}/dev/r", f"{tg}/wts/r/t"
+            g(tg, "init", "-q", "--bare", bare)
+            g(tg, "clone", "-q", bare, co)
+            g(co, "config", "user.email", "s@e"); g(co, "config", "user.name", "s")
+            open(f"{co}/a", "w").write("0"); g(co, "add", "a"); g(co, "commit", "-qm", "zero")
+            g(co, "worktree", "add", "-q", "-b", "track/t", wt2)
+            open(f"{wt2}/a", "w").write("1"); g(wt2, "commit", "-qam", "pushed")
+            g(wt2, "push", "-q", "-u", "origin", "HEAD")             # refs/remotes/origin/track/t holds M
+            g(bare, "update-ref", "-d", "refs/heads/track/t")        # origin merged it and deleted the branch
+            tips = remote_tracks("r")
+            ok("real git: origin deleted the merged branch and HEAD is the pushed commit — nothing is unpushed",
+               tips == {} and branch_unpushed("r", wt2, tips) is False)
+            open(f"{wt2}/a", "w").write("2"); g(wt2, "commit", "-qam", "after the push")
+            ok("real git: …but a commit made after the last push IS unpushed, though origin's listing lacks the branch",
+               branch_unpushed("r", wt2, remote_tracks("r")) is True)
+            ok("real git: a listing that failed (None) reads the tracking ref, never 'never on origin'",
+               branch_unpushed("r", wt2, None) is True)
+            g(co, "update-ref", "-d", "refs/remotes/origin/track/t")
+            ok("real git: no branch on origin and no tracking ref cannot be judged — None, the marker's answer stands",
+               branch_unpushed("r", wt2, remote_tracks("r")) is None)
+        finally:
+            globals().update(DEV=_d, WTS=_w)
+
     with tempfile.TemporaryDirectory() as th:
         env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
                    CC_OFFER_AFTER="0")        # the cases below offer on the first pass; the grace has its own case

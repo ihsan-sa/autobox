@@ -46,7 +46,9 @@ cc-board with a `reconciled:` note. Every board's PRs are read in one GraphQL qu
 waits on a budget another board spent; only a PR that query did not answer is read alone, 40 a run. Undecidable
 (closed PR, gone worktree, refused checkpoint, unpushed branch, no worker and nothing says why) is reported and,
 with --notify, offered to the repo's live session through the broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A row
-that never ran — no claim, never started, no journal, no worktree — is reported as never started, not as lost. A
+that never ran — no claim, never started, no journal, no worktree — is reported as never started, not as lost. An
+unpushed branch is one whose HEAD origin's own listing (ls-remote) lacks, not this clone's origin/<branch> ref, which
+a push from anywhere else leaves behind (--no-net reads only that ref). A
 `blocked` or `review` row with nothing alive in it, no PR of its own or one closed unmerged, whose branch has nothing
 left to land on origin's main is set `merged`, naming the PR that carried it: merging its tip into main changes nothing,
 or every commit of its own has its patch in a merged PR's head (stacked under, or rebased into, a PR that was squashed)
@@ -1051,12 +1053,26 @@ def wt_branch(repo, wt):
     return head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""
 
 
-def branch_unpushed(repo, wt):
+def branch_unpushed(repo, wt, tips=None):
     """Does this worktree hold commits origin lacks? True / False / None (cannot tell: no branch, never on origin).
-    The push.err marker is not this answer: nothing clears it when the branch reaches origin another way."""
+    The push.err marker is not this answer: nothing clears it when the branch reaches origin another way.
+    ORIGIN ITSELF IS ASKED FIRST: `tips` is remote_tracks()' {branch: tip} for the repo (None when it was not listed).
+    refs/remotes/origin/<br> moves only when a push from this clone moves it, so a branch pushed from anywhere else —
+    a seat's `cc done`, the host's loop, the lander — read as unpushed until something fetched. On 2026-10-13 two PRs
+    already at origin's head (0/0) were reported as waiting on a seat to push them, and each cost a planning wake.
+    The tracking ref is the answer when origin was not listed, holds a tip this clone has not got, or lacks the branch:
+    origin deletes a merged track's branch, and a commit made after the last push is still undelivered work."""
     br = wt_branch(repo, wt)
     if not br:
         return None
+    tip = (tips or {}).get(br, "")                       # {} is a listing that answered empty; None, one that failed
+    if re.fullmatch(r"[0-9a-f]{40}", tip or ""):
+        head = wt_git(repo, wt, "rev-parse", "-q", "--verify", "HEAD", timeout=10)
+        if head is not None and head.returncode == 0 and head.stdout.strip() == tip:
+            return False
+        anc = wt_git(repo, wt, "merge-base", "--is-ancestor", "HEAD", tip, timeout=10)
+        if anc is not None and anc.returncode in (0, 1):  # 128: origin's tip is no object here, so it cannot say
+            return anc.returncode != 0
     up = wt_git(repo, wt, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", timeout=10)
     if up is None or up.returncode:
         return None
@@ -1515,7 +1531,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
     live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     started = limit_started()
-    prs, remotes, t0, wp = 0, {}, now(), None
+    prs, remotes, tips, t0, wp = 0, {}, {}, now(), None
     ctxs, patches = {}, None
     for fn, d in boards():
         if d is None:
@@ -1533,6 +1549,8 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
             wt = t.get("worktree") or f"{WTS}/{repo}/{track}"
             if repo not in remotes:
                 remotes[repo] = has_remote(repo)
+            if net and remotes[repo] and repo not in tips and os.path.exists(push_marker(repo, track)):
+                tips[repo] = remote_tracks(repo)        # one ls-remote per repo per run, and only for a row that needs it
             key = f"{repo}/{track}"
             ag = (t.get("agent") or "").strip()
             if ag and wp is None:                       # one tmux read per run, and none on a board with no marks
@@ -1554,7 +1572,8 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                  "journal": journal(repo, track), "loop_end": loop_end(repo, track),
                  "commit_err": os.path.exists(commit_marker(repo, track)),
                  "push_err": os.path.exists(push_marker(repo, track)), "has_remote": remotes[repo],
-                 "unpushed": branch_unpushed(repo, wt) if os.path.exists(push_marker(repo, track)) else False,
+                 "unpushed": branch_unpushed(repo, wt, tips.get(repo)) if os.path.exists(push_marker(repo, track))
+                             else False,
                  "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
                  "orphans": workers.get(key, []) if not loops.get(key) else [],
                  "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0,

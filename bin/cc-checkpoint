@@ -19,7 +19,9 @@
 #                          It pushes and NOTHING ELSE: a worktree whose .git is not the workspace's own is refused
 #                          before any git runs in it, so is one whose .cc state files are symlinks the host would
 #                          write through; and no repository is created from the timer, no default branch moved and
-#                          no branch deleted from anywhere (review of #225)
+#                          no branch deleted from anywhere (review of #225). On the owner's own tracks it pushes
+#                          only a head a worker's loop left in ~/.cc/push-owed/<repo>/<track> because its own push
+#                          failed (cc-loop push_host), once that loop is gone
 #   cc-checkpoint adopt <handle> <track> [<sha>]   the ONE way out of --push's rc=3 (no host lease). With no sha it
 #                          says what the remote holds and what this worktree holds, so a PERSON can read that commit;
 #                          given the sha they read, and only while the remote still answers with it, it records the
@@ -1043,8 +1045,15 @@ selfcheck(){   # the cases are tests/selfcheck/cc-checkpoint.sh beside this bin/
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
 [ "$MODE" = gitdir ] && { member_gitdir "${2:?cc-checkpoint gitdir: handle}" "${3:?cc-checkpoint gitdir: worktree}"; exit $?; }
 [ "$MODE" = adopt ] && { adopt "${2:-}" "${3:-}" "${4:-}"; exit $?; }
+owed_live(){   # $1 repo · $2 track → 0 while the cc-loop its loop.pid names still runs for that track (cc-loop's loop_live, owner side)
+  local f="$HOME/.cc/state/$1/$2/loop.pid" p a
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  p=$(head -c 32 "$f" | awk '{print $1; exit}'); case "$p" in ''|*[!0-9]*) return 1;; esac
+  a=$(tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline")
+  case " $a" in *"cc-loop $1 $2 "*) return 0;; esac
+  return 1; }
 [ "$MODE" = bind ] && { bind_track "${2:-}" "${3:-}" "${4:-}"; exit $?; }
-if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes for itself, and the box's own repos push from their own hook
+if [ "$MODE" = sweep ]; then   # member workspaces, and a head an owner track's worker loop could not push (~/.cc/push-owed)
   # SAID ONCE, NOT EVERY FIVE MINUTES, and never inside the member's own tree: ~/.cc/worktrees/<h> and ~/.cc/state/<h>
   # are both bound read-write into the boundary (cc-sandbox), so a marker kept there is the member's to forge or
   # delete — and `.cc` in a worktree they invented could be a symlink at anything the owner can write. ~/.cc/sweep is
@@ -1190,9 +1199,9 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
         # Said once per commit to the timer's own journal (echo), never the project's board: a benign rebase must not
         # nag it. The marker is already this head (mark '' above), so the next tick skips it until a new commit lands.
         echo "$h/$t: not pushed — this branch has moved on from the remote and no lease of the host's says what it last put there, so nothing was forced and nothing overwritten. One way on: 'cc-checkpoint adopt $h $t' says what the remote holds, and records it once you have read that commit; the next tick then pushes."
-      elif [ "$rc" = 2 ]; then msg="push refused — $(tail -1 <<<"$out" | cut -c1-160)"
+      elif [ "$rc" = 2 ]; then msg="push refused — $(tail -1 <<<"$out" | no_userinfo | cut -c1-160)"
         mark "$h" "$t" "$msg"; echo "$h/$t: $msg"   # a person has to look at this one: said for this commit, and not again until there is another
-      elif [ "$rc" != 0 ]; then msg="push failed — $(tail -1 <<<"$out" | cut -c1-160)"
+      elif [ "$rc" != 0 ]; then msg="push failed — $(tail -1 <<<"$out" | no_userinfo | cut -c1-160)"
         head=; printf '%s\n' "$prev" > "$HOME/.cc/sweep/$h/$t" 2>/dev/null   # back to what it said before the push, which is what said_once compares against
         said_once "$h" "$t" "$msg"   # no head in the marker, so the next tick tries this same commit again; the board hears the reason once
       else said_once "$h" "$t" "no repository recorded for this project, and the timer makes none — 'cc done' or the owner does that"; fi
@@ -1212,6 +1221,40 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       [ -n "$lease" ] && [ "$lease" = "$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" ] || continue
       land_queue "$h" "$t" "$sd" "$lease"
     done
+  done
+  # ── A HEAD A WORKER'S LOOP COULD NOT PUSH, on the owner's own tracks ─────────────────────────────────────────────
+  # Inside the sandbox the Stop hook commits with no credential, so cc-loop's push from out here is the only one a
+  # worker's commit gets — and a rebase round is ONE iteration. When that push failed it was swallowed: #1239's merge
+  # of main sat committed on the box for two rounds while the queue kept the old conflicting head, until a seat pushed
+  # it by hand (2026-10-13). cc-loop now leaves ~/.cc/push-owed/<repo>/<track> naming the head (push_host), and this
+  # tick pushes it once that loop is gone. ONLY those: every other owner track pushes from its own hook or its loop.
+  # A refused lease (rc 2/3) is a person's to read — --push has already said it to the board — so it is not retried;
+  # any other failure is said to the board once per head and reason, and tried again next tick.
+  for ow in "$HOME"/.cc/push-owed/*/*; do
+    [ -f "$ow" ] && [ ! -L "$ow" ] || continue
+    r=${ow%/*}; r=${r##*/}; t=${ow##*/}; wt="$HOME/.cc/worktrees/$r/$t"
+    if [ -f "$HOME/dev/$r/.cc/member-workspace" ] || [ -L "$wt" ] || [ ! -f "$wt/.cc/track" ]; then rm -f "$ow"; continue; fi   # a member's is the pass above
+    head=$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null) || { rm -f "$ow"; continue; }
+    if [ "$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)" != "track/$t" ]; then   # --push's own rule: a seat mid-rebase, or on a side branch, is left alone
+      msg="the host's push is held: its worktree is not on track/$t, so nothing is pushed until it is back on it"   # …and said once, not kept in silence
+      [ "$(cat "$ow" 2>/dev/null)" = "$head $msg" ] && continue
+      printf '%s\n' "$head $msg" > "$ow"; echo "$r/$t: $msg"; "$BIN/cc-board" note "$r" "$t" "$msg" >/dev/null 2>&1; continue; fi
+    [ "$(cat "$wt/.cc/pushed" 2>/dev/null)" = "$head" ] && { rm -f "$ow"; continue; }        # pushed since — by its loop, a seat, `cc done`
+    owed_live "$r" "$t" && continue   # a live loop pushes for itself after its next iteration; two pushes at once would read as a foreign write
+    [ ! -L "$wt/.cc/done.lock" ] && exec 7>>"$wt/.cc/done.lock" || continue   # `cc done`'s own lock, and its own refusal of a link at it
+    flock -n 7 || { exec 7>&-; continue; }   # a `cc done` is pushing it right now
+    hp=$(git -C "$HOME/dev/$r" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$HOME/dev/$r/.git/hooks";; /*) ;; *) hp="$HOME/dev/$r/$hp";; esac
+    out=$(cd "$wt" && env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp" CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "$BIN/cc-checkpoint" --push 2>&1 7>&-); rc=$?
+    exec 7>&-
+    if [ "$rc" = 0 ]; then rm -f "$ow"
+      now=$(cat "$wt/.cc/pushed" 2>/dev/null)
+      [ "$now" = "$head" ] && { echo "$r/$t: pushed ${head:0:7}, which its worker's loop could not"
+        "$BIN/cc-board" note "$r" "$t" "the host pushed ${head:0:7}, which its worker's loop could not push" >/dev/null 2>&1; }
+    elif [ "$rc" = 2 ] || [ "$rc" = 3 ]; then rm -f "$ow"; echo "$r/$t: not pushed — $(tail -1 <<<"$out" | no_userinfo | cut -c1-160)"
+    else msg="the host's push of ${head:0:7} failed, and the next tick tries again — $(tail -1 <<<"$out" | no_userinfo | cut -c1-160)"
+      [ "$(cat "$ow" 2>/dev/null)" = "$head $msg" ] && continue
+      printf '%s\n' "$head $msg" > "$ow"; echo "$r/$t: $msg"; "$BIN/cc-board" note "$r" "$t" "$msg" >/dev/null 2>&1
+    fi
   done
   # CURSOR RECONCILIATION for the knowledge base (cc-lib): every registered source whose cursor moved without a
   # write hook — an edit by hand, a tool that bypassed one, a journal a session appended to and never turned on —

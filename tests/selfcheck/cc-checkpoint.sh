@@ -1262,6 +1262,60 @@ SH
   k "$([ "$grc" = 1 ] && grep -q "^refusing to run git in $ev " <<<"$gd" && echo 0 || echo 1)" "gitdir: a redirected .git is refused, and the reason names the worktree" "rc=$grc out='$gd'"
   gd=$(cd / && "$bin/cc-checkpoint" gitdir plain5 "$T/loose"); grc=$?
   k "$([ "$grc" = 0 ] && echo 0 || echo 1)" "gitdir: a repo that is not a member workspace is nobody's business here" "rc=$grc out='$gd'"
+  # ── …and a head an owner track's worker loop could not push (~/.cc/push-owed, cc-loop push_host) ──────────────
+  # A HOME of its own: an owner repo (no member-workspace marker), one real worktree on track/o1 with a commit origin
+  # lacks. Every case builds what it reads here and asserts both the head that is pushed and the one that is left.
+  HOME="$T/home4"; mkdir -p "$HOME/.cc/worktrees/own1" "$HOME/dev"
+  git init -q "$HOME/dev/own1"; git -C "$HOME/dev/own1" symbolic-ref HEAD refs/heads/main
+  git -C "$HOME/dev/own1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  oo=$(bare ownO); git -C "$HOME/dev/own1" remote add origin "$oo"
+  ow1="$HOME/.cc/worktrees/own1/o1"; git -C "$HOME/dev/own1" worktree add -q -b track/o1 "$ow1"
+  mkdir -p "$ow1/.cc"; printf 'own1\no1\n' > "$ow1/.cc/track"
+  echo merge > "$ow1/work.txt"; git -C "$ow1" add -A; git -C "$ow1" -c user.name=t -c user.email=t@t commit -q -m "merge main"
+  oh=$(git -C "$ow1" rev-parse HEAD); owed="$HOME/.cc/push-owed/own1/o1"
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$oo" track/o1 && echo 1 || echo 0)" "owed: an owner track with nothing owed is left to its own hook and loop" "$sw"
+  mkdir -p "${owed%/*}"; printf '%s\n' "$oh" > "$owed"
+  mkdir -p "$HOME/.cc/state/own1/o1"
+  bash -c 'sleep 30; :' cc-loop own1 o1 x & lp=$!; echo "$lp" > "$HOME/.cc/state/own1/o1/loop.pid"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$oo" track/o1 && echo 1 || echo 0)" "owed: a head whose loop is still live is left for that loop to push" "$sw"
+  k "$([ -f "$owed" ] && echo 0 || echo 1)" "…and stays owed" "marker gone"
+  kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
+  git -C "$HOME/dev/own1" remote set-url origin "$T/nowhere.git"   # a push that fails for a reason that may pass
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q "own1/o1: the host's push of ${oh:0:7} failed" <<<"$sw" && echo 0 || echo 1)" "owed: a failed push is said, and kept for the next tick" "$sw"
+  eq "…and the board hears it" "$(grep -c "host's push of ${oh:0:7} failed" "$NOTES")" 1
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "…once per head and reason, not every tick" "$(grep -c "host's push of ${oh:0:7} failed" "$NOTES")/$sw" "1/"
+  git -C "$HOME/dev/own1" remote set-url origin "$oo"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "owed: once its loop is gone the host pushes the head the loop could not" "$(git ls-remote --heads "$oo" refs/heads/track/o1 | cut -c1-40)" "$oh"
+  k "$([ -e "$owed" ] && echo 1 || echo 0)" "…and it is owed no more" "$(cat "$owed" 2>/dev/null)"
+  k "$(grep -q "the host pushed ${oh:0:7}" "$NOTES" && echo 0 || echo 1)" "…and the board hears that it went" "$(cat "$NOTES")"
+  # ── owed, on a side branch, and a failure that quotes a url: a HOME and repo of their own ────────────────────────
+  HOME="$T/home4b"; mkdir -p "$HOME/.cc/worktrees/own2" "$HOME/dev"
+  git init -q "$HOME/dev/own2"; git -C "$HOME/dev/own2" symbolic-ref HEAD refs/heads/main
+  git -C "$HOME/dev/own2" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  o2=$(bare ownO2); git -C "$HOME/dev/own2" remote add origin "$o2"
+  ow2="$HOME/.cc/worktrees/own2/o2"; git -C "$HOME/dev/own2" worktree add -q -b track/o2 "$ow2"
+  mkdir -p "$ow2/.cc"; printf 'own2\no2\n' > "$ow2/.cc/track"
+  echo merge > "$ow2/work.txt"; git -C "$ow2" add -A; git -C "$ow2" -c user.name=t -c user.email=t@t commit -q -m "merge main"
+  oh2=$(git -C "$ow2" rev-parse HEAD); owed2="$HOME/.cc/push-owed/own2/o2"
+  mkdir -p "${owed2%/*}"; printf '%s\n' "$oh2" > "$owed2"
+  git -C "$ow2" checkout -q -b side
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$o2" track/o2 && echo 1 || echo 0)" "owed: a worktree moved to a side branch is not pushed" "$sw"
+  eq "…and the marker is kept, and why is said once to the board" "$([ -f "$owed2" ] && echo kept)|$(grep -c "push is held: its worktree is not on track/o2" "$NOTES")" "kept|1"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "…not every tick" "$(grep -c "push is held" "$NOTES")/$sw" "1/"
+  git -C "$ow2" checkout -q track/o2
+  # git's own words redact a url's password, so a git that quotes one on push stands in for whatever else might
+  mkdir -p "$T/gitshim"; rg=$(type -P git)   # the binary: inside the tool git may be a function, and exec of that name re-runs the shim
+  printf '#!/bin/sh\nfor a; do [ "$a" = push ] && { echo "remote rejected: https://x-access-token:SECRETTOK@github.com/o/r.git" >&2; exit 1; }; done\nexec %s "$@"\n' "$rg" > "$T/gitshim/git"; chmod +x "$T/gitshim/git"
+  : > "$NOTES"; sw=$(cd / && PATH="$T/gitshim:$PATH" "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "owed: a failure quoting a url with a token reaches neither the board nor the tick's output with it" \
+    "$(cat "$NOTES" "$owed2" 2>/dev/null | grep -c SECRETTOK)|$(grep -c SECRETTOK <<<"$sw")|$(grep -c "host's push of ${oh2:0:7} failed.*https://github.com/o/r.git" "$NOTES")" "0|0|1"
   # ── …and the landing (land_queue): a finished track's PR is queued from the same tick, once per PR and head ──────
   # A HOME of its own again. `cc lands` answers 0 for every workspace but the one $NOLANDS names; CC_LAND points at a
   # fake that logs its argv and refuses while $QREFUSE exists; the board row is what the stub answers `get` from $ROWS,

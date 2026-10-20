@@ -42,7 +42,8 @@
 #             and a later cc done (a repair round) patches the open PR when the file changed;
 #             'Closes <row>[, <row>][ and <row>]' in the body closes those board rows when the PR lands)
 # Slack post: ~/.cc/state/<repo>/<track>/slack-post.md (`thread` or #channel on line 1, `file: <path>` optional, text below; the loop posts it once at DONE)
-# Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
+# Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch); a head that
+#             push could not send is left in ~/.cc/push-owed/<repo>/<track> for the host's sweep to push (push_host).
 # Self-review: templates/self-review.md — the six kinds of finding the landing review keeps stopping PRs for. The worker
 #             prompt carries its six headings (selfrev_block, inlined because a sandboxed worker has core/bin bound and
 #             not core/templates), and the worker reads its own `git diff origin/<base>` against them before STATUS: DONE.
@@ -827,6 +828,23 @@ except Refused as e:
 PY
 }
 loop_live(){ say_io live "$1"; }   # $1 the state dir → 0 while a cc-loop for it runs
+# THE HOST'S PUSH AFTER AN ITERATION, AND WHAT A FAILED ONE LEAVES. Inside the sandbox the Stop hook commits with no
+# credential, so this is the only push a worker's commit gets, and it used to end `|| true`. A rebase round is one
+# iteration, so #1239's merge of main sat committed on the box for two rounds while the queue kept the old conflicting
+# head (2026-10-13). A head it could not push is now logged and left in ~/.cc/push-owed/<repo>/<track>, which the
+# host's 5-minute sweep (cc-checkpoint --sweep) pushes once this loop is gone; the next push that lands clears it. A
+# refused lease (rc 2/3) is not owed: --push has told the board and the journal, and a retry would change nothing.
+push_host(){
+  inside_boundary && return 0   # a member workspace's loop has no credential for --push by design: the host's sweep pushes its heads
+  local out rc head ow="$HOME/.cc/push-owed/$repo/$track"
+  out=$(cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push 2>&1); rc=$?
+  head=$(git -C "$WT" rev-parse -q --verify HEAD 2>/dev/null)
+  if [ "$rc" = 0 ]; then rm -f "$ow"; return 0; fi
+  log "push of ${head:0:12} failed (rc=$rc): $(tail -1 <<<"$out" | sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1#g' | cut -c1-200)"   # cc-checkpoint's no_userinfo: a remote url can carry a token
+  if [ "$rc" = 2 ] || [ "$rc" = 3 ]; then rm -f "$ow"; return 0; fi
+  [ -n "$head" ] && [ "$(cut -d' ' -f1 "$ow" 2>/dev/null)" != "$head" ] || return 0   # already owed at this head: the sweep's line about it stands
+  mkdir -p "${ow%/*}" && printf '%s\n' "$head" > "$ow"
+  return 0; }
 say_take(){ say_io take "$1"; }    # $1 the state dir → the spooled messages as one block on stdout (none: rc 1), moved to say.read
 inbox_hook(){   # $1 the state dir. PostToolUse: stdin is the hook's JSON (unread); stdout gives the model its messages
   cat >/dev/null; [ -s "$1/say.spool" ] || exit 0   # every tool call runs this: nothing spooled starts no python
@@ -2231,6 +2249,21 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   mkdir -p "$d/fl/ro"; chmod 500 "$d/fl/ro"
   t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 9 runaway x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
   chmod 700 "$d/fl/ro"
+  # push_host: a head the host could not push is owed to the sweep; a push that lands, or a refused lease, owes nothing.
+  # Its own fixture: a one-commit repo for $WT and a stub cc-checkpoint answering the rc in $d/ph/rc.
+  mkdir -p "$d/ph/bin" "$d/ph/home"; git init -q "$d/ph/wt"; git -C "$d/ph/wt" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
+  printf '#!/usr/bin/env bash\necho "cannot reach origin" >&2\nexit "$(cat %s)"\n' "$d/ph/rc" > "$d/ph/bin/cc-checkpoint"; chmod +x "$d/ph/bin/cc-checkpoint"
+  # log() is the main body's, defined after selfcheck runs, so ph brings its own
+  ph(){ echo "$1" > "$d/ph/rc"; ( HOME="$d/ph/home" BIN="$d/ph/bin" WT="$d/ph/wt" LOG="$d/ph/log" repo=r track=tk HG=(); log(){ printf '%s\n' "$*" >> "$LOG"; }; push_host 2>/dev/null ); cat "$d/ph/home/.cc/push-owed/r/tk" 2>/dev/null; }
+  local phh; phh=$(git -C "$d/ph/wt" rev-parse HEAD)
+  t 'push_host: a failed push leaves the head owed to the host sweep, and the log says why' "$(ph 1)|$(grep -c 'failed (rc=1): cannot reach origin' "$d/ph/log")" "$phh|1"
+  t '…a push that lands owes nothing' "$(ph 0)" ""
+  t '…nor does a refused lease, which --push has already said' "$(ph 1 >/dev/null; ph 2)" ""
+  printf '#!/usr/bin/env bash\necho "fatal: unable to access https://x-access-token:SECRETTOK@github.com/o/r.git/" >&2\nexit 1\n' > "$d/ph/bin/cc-checkpoint"
+  : > "$d/ph/log"; ph 1 >/dev/null
+  t '…and a url in the line it logs loses its token' "$(grep -c SECRETTOK "$d/ph/log")|$(grep -c 'https://github.com/o/r.git' "$d/ph/log")" "0|1"
+  rm -rf "$d/ph/home/.cc/push-owed"; : > "$d/ph/log"
+  t '…inside a member boundary it neither pushes, logs nor owes' "$(CC_MEMBER_SANDBOX=1 ph 1)|$(wc -c < "$d/ph/log")|$(ls "$d/ph/home/.cc" 2>/dev/null | wc -l)" "|0|0"
   # onto_block: the PR's branch is fetched from the PUSH url onto_pr chose it against. Each case its own repos.
   ob(){   # $1 case dir  $2 1 when the push repo carries dispatch/1042 → the prompt's line|whether origin/dispatch/1042 landed
     local c="$d/ob/$1"; mkdir -p "$c/bin"; printf '#!/bin/sh\necho "dispatch/1042 https://github.com/o/d/pull/7"\n' > "$c/bin/cc"
@@ -2469,7 +2502,7 @@ while [ $i -lt "$MAXI" ]; do
   # host-side line moves it into the permission session's ledger (cc-refusals, WHO IS RECORDED).
   "$BIN/cc-refusals" collect "$repo" "$track" >/dev/null 2>&1 || true
   ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
-  ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push ) || true   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
+  push_host   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
   after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); after_prog=$(md5sum "$ST/progress.md" | cut -c1-8)
   moved=no; { [ "$before_head" != "$after_head" ] || [ "$before_prog" != "$after_prog" ]; } && moved=yes
   log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost$costsrc total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
