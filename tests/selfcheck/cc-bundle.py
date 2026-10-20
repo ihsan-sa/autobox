@@ -296,19 +296,21 @@ def selfcheck():
     ok("a bundle whose row already exists (here blocked) is left to the seat, not re-added or re-started",
        go(repo, out=io.StringIO()) == "" and calls_made() == [])
 
-    # …and a refusal at the door is recorded and not retried inside the window. The door is cc-board add and the
-    # refusal is the brief's SHAPE: a member whose brief is a list of edits makes the composed brief one too.
+    # …and a refusal at the door is recorded and not retried inside the window. The door is cc-board add; a brief's
+    # shape is no longer refused there, so the refusal here is the board's own: a link planted where the bundle's
+    # state dir would be made.
     os.remove(log_path(repo))
     board({"row-a": {"status": "queued", "title": "row-a"}, "row-b": {"status": "queued", "title": "row-b"}})
-    brief_of("row-a", "FILES: bin/cc-slackx\nDo this:\n- Add a --flag to bin/cc-slackx\n- Edit bin/cc-slackx to pass it "
-                      "through\n- Run the suite\n")
+    brief_of("row-a", "GOAL: bin/cc-slackx says the wrong thing.\n")
+    shutil.rmtree(os.path.join(state, repo, one["name"]), ignore_errors=True)
+    os.symlink(tmp, os.path.join(state, repo, one["name"]))
     buf = io.StringIO()
     went = go(repo, out=buf)
     tr = B.board_of(repo).get("tracks") or {}
-    ok("a shape refusal at cc-board add stops the bundle: no row, no marks, no worker, said and logged",
+    os.unlink(os.path.join(state, repo, one["name"]))
+    ok("a refusal at cc-board add stops the bundle: no row, no marks, no worker, said and logged",
        went == "" and "refused at the door" in buf.getvalue() and one["name"] not in tr
        and not tr["row-a"].get("bundle") and calls_made() == [] and one["name"] in refused_recently(repo))
-    brief_of("row-a", "GOAL: bin/cc-slackx says the wrong thing.\n")
     ok("…and the same set is not offered again inside the window",
        go(repo, dry=True, out=io.StringIO()) == "")
     os.remove(log_path(repo))

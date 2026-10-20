@@ -152,7 +152,8 @@ CC_HANDOFF_SKILLS (test hooks) ·
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
 CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB) ·
 CC_HANDOFF_V2=1 (opt-in, off by default: --brief, the --rotate line and the cutover row come from cc-handoff-v2,
-the rebuilt parts; docs/rebuilds/handoff-and-context.md says what each one changes and why).
+the rebuilt parts; docs/rebuilds/handoff-and-context.md says what each one changes and why). A cc-handoff-v2 that
+fails to load or raises is one stderr line, and that call runs on the old path.
 """
 import fcntl, glob, json, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time, uuid
 
@@ -1894,10 +1895,14 @@ def rotate():
             continue                               # a loop's window: its iteration is its own handoff (WORKER_REFUSAL)
         seats.append((name, wid) + seat)
     opened = skilled = 0
-    nv = v2()
+    nv = v2_or_old("the rotation sweep")
     deferred = None
     if nv:
-        seats = nv.sweep_order(sys.modules[__name__], seats)   # from where the last sweep ran out of budget
+        try:
+            seats = nv.sweep_order(sys.modules[__name__], seats)   # from where the last sweep ran out of budget
+        except Exception as e:                     # the whole sweep goes back to the old path, never dies every tick
+            v2_failed("the rotation sweep", e)
+            nv = None
     for target, wid, sid, cwd, started in seats:
         stamp = os.path.join(HANDOFF, slug(target) + ".rotated")
         try:
@@ -1911,7 +1916,10 @@ def rotate():
         m = measure_seat(target, sid, peers.get(cwd, 0) == 1, started,
                          **({"timeout": max(int(SWEEP_BUDGET - (time.time() - now)), 1)} if nv else {}))
         if nv and m:                               # v2: the spend band minus headroom, and the decision recorded
-            m["rotate"], m["rotate_line"] = nv.decide(sys.modules[__name__], target, m), nv.rotate_line()[0]
+            try:
+                m["rotate"], m["rotate_line"] = nv.decide(sys.modules[__name__], target, m), nv.rotate_line()[0]
+            except Exception as e:                 # cc-context's own verdict and line stand, as with v2 off
+                v2_failed(f"the rotate decision for {target}", e)
         # "a seat over the hard line is handed off ... a seat under the line is untouched" (the brief): cc-context's
         # `rotate` is that judgement, and nothing else here reads a number
         if not m or not m.get("rotate"):
@@ -1934,7 +1942,10 @@ def rotate():
         journal(target, f"rotated by the box: {why}")
         opened += 1
     if nv:
-        nv.sweep_cursor(sys.modules[__name__], deferred)
+        try:
+            nv.sweep_cursor(sys.modules[__name__], deferred)
+        except Exception as e:
+            v2_failed("the sweep cursor", e)
     # "make the rotation sweep find a past-the-line seat by its pid/session file when the pane id is missing,
     # instead of skipping it silently ... When a seat can't be rotated, it should say so once in the planning
     # seat's events" (the brief, 2026-10-12)
@@ -2509,6 +2520,21 @@ def v2():
     return m
 
 
+def v2_failed(what, e):
+    print(f"cc-handoff: cc-handoff-v2 failed ({type(e).__name__}: {e}); {what} goes on the old path", file=sys.stderr)
+
+
+def v2_or_old(what):
+    """v2() for --brief and the rotation sweep, or None when it fails to load: one stderr line, and `what` runs on
+    the old path, the way v2_cutover keeps a cutover going. A v2 that broke would otherwise kill --brief, and the
+    sweep on every tick."""
+    try:
+        return v2()
+    except Exception as e:
+        v2_failed(what, e)
+        return None
+
+
 def v2_cutover(rec):
     """The cutover row's v2 fields (the packet, the successor's context: what the next baseline needs and no
     transcript may still hold), or None with v2 off. A v2 that fails to load or raises costs the row its two fields
@@ -2526,9 +2552,12 @@ def brief(target):
     """--brief: ONE packet, in the order a successor needs it, so it does not rebuild it a tool call at a
     time. Read-only and best-effort throughout — this must never be the thing that fails a handoff.
     CC_HANDOFF_V2=1 prints the rebuilt packet instead (cc-handoff-v2: a byte budget per section)."""
-    nv = v2()
+    nv = v2_or_old("--brief")
     if nv:
-        return nv.brief(sys.modules[__name__], target)
+        try:
+            return nv.brief(sys.modules[__name__], target)
+        except Exception as e:                     # nothing after v2's packet goes out raises, so none went out
+            v2_failed("--brief", e)
     repo = parts(target)[0]
     rec = read(target)
     journal, jlabel = journal_view(journal_for(target))

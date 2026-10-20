@@ -6,12 +6,8 @@
 
 def selfcheck():
     import tempfile
-    global BOARDS, STATE, OVERRIDES
-    # THE LEDGER FIRST, before any case forces anything: it is resolved at import from the box's own state, and a
-    # case below would otherwise append a fixture line to the real record.
-    sc = tempfile.mkdtemp(prefix="cc-brief-sc.")
-    OVERRIDES = os.path.join(sc, "overrides.jsonl")
-    os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the ledger above is scratch: these cases must be able to write it
+    global BOARDS, STATE
+    import io, contextlib
     p = f = 0
 
     def ok(name, cond):
@@ -19,128 +15,18 @@ def selfcheck():
         print(("ok   " if cond else "FAIL ") + name)
         p, f = p + (1 if cond else 0), f + (0 if cond else 1)
 
-    # ── the check: prose passes, the three shapes do not ──
-    prose = ("GOAL: a brief that prescribes how instead of what cannot be dispatched.\n\n"
-             "WHY: the rule is written in two places and a session that read both still shipped a page of it.\n"
-             "The board and git already know which files another track is holding, so nobody should type them.\n\n"
-             "DONE: a brief carrying step lists is refused at dispatch, with the reason. Run cc board show to see.\n")
-    ok("prose dispatches untouched — the owner's own message is most of a brief", findings(prose) == [])
-    ok("one command named inside a sentence is not a finding",
-       findings("Check with `cc board show <repo>` before you start, then decide for yourself.\n") == [])
-
-    steps = ("Do this:\n"
-             "- Add a --flag to core/bin/cc-foo\n"
-             "- Edit core/bin/cc-bar so it passes the flag through\n"
-             "- Run the suite and make sure it is green\n")
-    sigs = [s for s, _, _ in findings(steps)]
-    ok("three imperative bullets are a step list", sigs == ["step-list"])
-    ok("three bullets of prose are not", findings(
-        "- the owner caught it, not the box\n- the rule is in two places already\n- a third copy fails again\n") == [])
-
-    criteria = ("DONE:\n1. a brief that says how is refused at dispatch, with the reason\n"
-                "2. what is in flight comes from the board, not from somebody typing it\n"
-                "3. the rule is not restated anywhere new\n")
-    ok("a numbered list of done-criteria is what a brief is FOR — it passes", findings(criteria) == [])
-    ok("the same list numbered but opening on edit verbs is a step list",
-       [s for s, _, _ in findings("1. Add the check\n2. Wire it into both doors\n3. Run the suite\n")] == ["step-list"])
-    ok("two imperative items are not yet a step list", findings("- Add the check\n- Wire it in\n") == [])
-
-    # ── THE FOUR REJECTIONS THESE CASES ARE BUILT FROM ──
-    # A small model used to read the prose and say what to cut. Across four dispatches it cut the sentence that
-    # stated the OUTCOME, or the shape of the fixture, as method — and once that sentence was gone it cut the NEXT
-    # one, so the brief could not be repaired by editing: five judge calls and six dispatch turns for one row.
-    # It came out in #494 and the arithmetic above is all that judges a brief now. The sentences it cut are cases
-    # here, each on its own fixture, so nothing put in its place may cut them again.
-    for why, text in (
-        ("an outcome — the reader gets the whole reply",
-         "GOAL: a lost stream does not cost the reader a turn.\n\n"
-         "A client whose stream was lost mid-turn can still get the whole reply.\n"),
-        ("an outcome — the turn is not lost to the reader",
-         "GOAL: a lost stream does not cost the reader a turn.\n\n"
-         "DONE: a turn whose stream was lost mid-way is not lost to the reader.\n"),
-        ("a boundary handing the design over",
-         "GOAL: a lost stream does not cost the reader a turn.\n\n"
-         "What the server keeps between a dropped stream and a re-attach is yours to design.\n"),
-        ("a done clause naming what the PR body carries",
-         "DONE: a keep means this track's PR carries the change and the doc rows, and in its body the figure\n"
-         "before and projected after, the rule texts moved, and the date of the live after-score.\n"),
-        ("a score defined as a before and an after figure",
-         "Scores: before = the tool's own figure over the 7 days before; projected after = the same figure on a\n"
-         "fresh session started on the branch, not an estimate from the diff. A keep is that figure down 20%.\n"),
-    ):
-        ok("the judge cut this and it passes: " + why, findings(text) == [])
-
-    # AND THE REFUSAL THAT IS LEFT IS FIXABLE BY MAKING THE CUT IT QUOTED. What made those four unfixable was the
-    # next sentence going once the first was cut; here the quoted lines are rewritten as the outcome they were
-    # about, nothing else is touched, and that brief passes with no finding of its own.
-    quoted = ("GOAL: a lost stream does not cost the reader a turn.\n\n"
-              "- Add a buffer of the frames of the turn in flight\n"
-              "- Wire a re-attach route that replays it\n"
-              "- Change the client to ask for what it missed\n")
-    repaired = ("GOAL: a lost stream does not cost the reader a turn.\n\n"
-                "DONE: a client whose stream was lost mid-turn still gets the whole reply, and what the server\n"
-                "keeps between the drop and the re-attach is yours to design.\n")
-    ok("a brief refused for its step list passes once those lines are rewritten as the outcome",
-       [s for s, _, _ in findings(quoted)] == ["step-list"] and findings(repaired) == [])
-
-    # …AND A BRIEF THAT PRESCRIBES THE DESIGN IS STILL REFUSED. The first attempt of the dispatch above named
-    # candidate designs and was cut for it, fairly; that is the shape this file still has to hold.
-    design = ("GOAL: a lost stream does not cost the reader a turn.\n\n"
-              "1. Add a ring buffer of the last 200 frames, keyed by turn id, to the stream module\n"
-              "2. Wire a re-attach route that replays that buffer from the client's last seen frame\n"
-              "3. Change the client to send its last frame id on reconnect\n")
-    ok("a brief that prescribes the design is still refused",
-       [s for s, _, _ in findings(design)] == ["step-list"])
-    ok("a line of prose with no full stop is still prose, not a command",
-       findings("Then run the suite and see\nand keep going until it is green\n") == [])
-
-    fenced = "Then run:\n```\ngit checkout -b track/foo\nbash core/tests/selftest.sh\n```\n"
-    fs = findings(fenced)
-    ok("a fenced block of two commands is a command block", [s for s, _, _ in fs] == ["command-block"])
-    ok("the block's finding quotes the commands it found",
-       bool(fs) and any("selftest.sh" in line for line in fs[0][2]))
-    ok("a fenced block with one command is not a script",
-       findings("Like this:\n```\ncc board show <repo>\n```\n") == [])
-
-    bare = "First:\ncc board add <repo> foo \"title\"\ncc <repo> foo --go \"go\"\n"
-    ok("two bare command lines are a command run", [s for s, _, _ in findings(bare)] == ["command-run"])
-    ok("one bare command line is not", [s for s, _, _ in findings("First:\ncc board show <repo>\n")] == [])
-    ok("commands shown with what they printed are evidence, not instructions", findings(
-        "What is actually there:\ngit ls-remote origin foo    -> 48fff51   (correct)\n"
-        "gh pr view 9 --json headRefOid   -> 79fd93b   (STALE)\n") == [])
-    ok("…while the same two commands single-spaced, with no result, are a script",
-       [s for s, _, _ in findings("git ls-remote origin foo\ngh pr view 9 --json headRefOid\n")] == ["command-run"])
-
-    # ── refuse vs flag: the force escape prints the SAME findings and lets it through ──
-    import io, contextlib
-    def run_check(text, force, machine_=False):
-        for k in ("CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
-            os.environ.pop(k, None)
-        if force:
-            os.environ["CC_BRIEF_FORCE"] = "1"
-        if machine_:
-            os.environ["CC_BRIEF_MACHINE"] = "1"
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            rc = check(text, for_="r/t")
-        for k in ("CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
-            os.environ.pop(k, None)
-        return rc, err.getvalue()
-
-    rc, err = run_check(steps, force=False)
-    ok("a step list is refused at dispatch (exit 1)", rc == 1)
-    ok("…and the refusal names the signal and quotes the line", "step-list" in err and "cc-foo" in err)
-    ok("…and names the escape", "CC_BRIEF_FORCE=1" in err)
-    rc2, err2 = run_check(steps, force=True)
-    ok("forced, the same brief is FLAGGED and goes through (exit 0)", rc2 == 0 and "FLAGGED" in err2)
-    ok("…and the flag still says what it found — force is never silence", "step-list" in err2)
-    rc3, err3 = run_check(prose, force=False)
-    ok("clean prose prints nothing at all", rc3 == 0 and err3 == "")
-
     # ── the block: computed from the board, and only the block is ever rewritten ──
     tmp = tempfile.mkdtemp(prefix="cc-brief.")
     BOARDS, STATE = os.path.join(tmp, "boards"), os.path.join(tmp, "state")
     os.makedirs(BOARDS)
+    # ── the check never refuses: a step list, a command block and a command run dispatch as typed ──
+    steps = ("Do this:\n- Add a --flag to core/bin/cc-foo\n- Edit core/bin/cc-bar so it passes the flag through\n"
+             "- Run the suite and make sure it is green\n```\ngit checkout -b track/foo\nbash core/tests/selftest.sh\n```\n")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = check(steps, for_="r/t")
+    ok("a brief of steps and commands passes the check in silence (exit 0): that rule is a line in the prompt now",
+       rc == 0 and err.getvalue() == "")
     def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
         import threading
         box = []
@@ -229,8 +115,10 @@ def selfcheck():
     open(task, "w").write(typed)
     refresh(repo, "mine")
     ok("a brief with no block gets one appended", MARK_A in open(task).read() and typed.strip() in open(task).read())
-    ok("the block is not checked as if a person typed it",
-       findings(open(task).read()) == [] and "held.txt" in open(task).read())
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        check(open(task).read(), for_="r/t")
+    ok("the block is not checked as if a person typed it: no warning", err.getvalue() == "" and "held.txt" in open(task).read())
     refresh(repo, "absent-track")
     ok("a track with no brief is not an error", True)
 
@@ -674,44 +562,6 @@ def selfcheck():
     ok("a board that cannot be read says nothing and offers nothing, and is not the same answer as no overlap",
        belongs("no-such-board", "new") is None and rc == 0 and buf.getvalue() == "")
 
-    # ── the override ledger: force is flag, never silence, and a machine's own row is not a decision ──
-    def rows(path):
-        return [json.loads(l) for l in open(path) if l.strip()]
-    open(OVERRIDES, "w").close()
-    run_check(steps, force=True)
-    lines = rows(OVERRIDES)
-    ok("forcing past the check is recorded — one countable line, named by signal, naming the brief",
-       len(lines) == 1 and lines[0]["what"] == "step-list" and lines[0]["for"] == "r/t" and "cc-foo" in lines[0]["head"])
-    open(OVERRIDES, "w").close()
-    run_check(prose, force=False)
-    ok("a clean brief records nothing — the ledger counts overrides, not dispatches", rows(OVERRIDES) == [])
-    # A MACHINE ROW IS NOT AN OVERRIDE. the landing writes its own repair brief out of a review it bought; counting
-    # those as deliberate overrides would make `wc -l` on the ledger a number about nobody. Both halves here: the
-    # same text is still refused without the flag, so the case cannot pass by the text being harmless.
-    ok("without the flag that same row is still refused — the flag is doing the work", run_check(steps, force=False)[0] == 1)
-    rc, err = run_check(steps, force=False, machine_=True)
-    ok("CC_BRIEF_MACHINE=1: the check lets a machine's own row past, and says nothing", rc == 0 and err == "")
-    ok("…and wrote no line: the ledger stays a count of decisions people made", rows(OVERRIDES) == [])
-    # ── A SUITE'S DISPATCH IS NOT COUNTED. selftest.sh forces briefs of its own through every door, and one
-    # landing's run wrote sixteen fixture rows into the real ledger (2026-09-04).
-    os.environ["CC_NOTIFY_LOG_ONLY"] = "1"
-    run_check(steps, force=True)
-    ok("under the suite's own flag (CC_NOTIFY_LOG_ONLY) a forced brief writes no row", rows(OVERRIDES) == [])
-    os.environ["CC_STATE"] = sc
-    run_check(steps, force=True)
-    ok("…but a ledger the caller pointed elsewhere (CC_STATE) is that caller's to write, flag or not",
-       len(rows(OVERRIDES)) == 1)
-    os.environ.pop("CC_STATE", None)
-    os.environ.pop("CC_NOTIFY_LOG_ONLY", None)
-    open(OVERRIDES, "w").close()
-    os.environ["CC_BRIEF_FORCE"] = "1"
-    with contextlib.redirect_stderr(io.StringIO()):
-        rc = check(steps, for_="_cctest9/w1")
-    os.environ.pop("CC_BRIEF_FORCE", None)
-    ok("…nor does one for a _cctest repo, whatever the env — and it still goes (0)", rc == 0 and rows(OVERRIDES) == [])
-    run_check(steps, force=True)
-    ok("…while a real dispatch after them is still counted", len(rows(OVERRIDES)) == 1)
-
     # ── what the tree no longer has: the door asks git, over the fix scope, against the base as fetched ──
     gsrc = os.path.join(tmp, "gone-repo")
     os.makedirs(os.path.join(gsrc, "core", "bin"))
@@ -779,26 +629,17 @@ def selfcheck():
     try: nowhere = tree_for("")
     finally: os.chdir(here)
     ok("no board and no git tree is nothing to check against — never a refusal", nowhere == ("", ""))
-    # …AND AT THE DOOR, the same three doors the shape check holds: refused with the commit, forced into a
-    # recorded flag, and the good brief through in silence.
-    def door(text, force=False):
-        os.environ.pop("CC_BRIEF_FORCE", None)
-        if force: os.environ["CC_BRIEF_FORCE"] = "1"
+    # …AND AT THE DOOR: a warning with the commit, exit 0, and the good brief through in silence.
+    def door(text):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = check(text, for_="gonerepo/t")
-        os.environ.pop("CC_BRIEF_FORCE", None)
         return rc, err.getvalue()
     rc, err = door("GOAL: cc-old answers in one line.\n")
-    ok("at the door a brief naming an absent tool is REFUSED (exit 1), with the commit and the way out",
-       rc == 1 and "absent-path" in err and "(#12)" in err and "git show" in err and "CC_BRIEF_FORCE=1" in err)
+    ok("at the door a brief naming an absent tool is WARNED (exit 0), with the commit and the way out",
+       rc == 0 and "WARNING" in err and "absent-path" in err and "(#12)" in err and "git show" in err)
     rc, err = door("GOAL: PR #12 is open and wants a line fixed.\n")
-    ok("…and so is one whose named PR has merged", rc == 1 and "merged-pr" in err and "(#12)" in err)
-    os.environ["CC_STATE"] = sc; open(OVERRIDES, "w").close()
-    rc, err = door("GOAL: cc-old answers in one line.\n", force=True)
-    os.environ.pop("CC_STATE", None)
-    ok("forced, it is FLAGGED and goes through, and the ledger names the signal",
-       rc == 0 and "FLAGGED" in err and "absent-path" in err and [r["what"] for r in rows(OVERRIDES)] == ["absent-path"])
+    ok("…and so is one whose named PR has merged", rc == 0 and "merged-pr" in err and "(#12)" in err)
     ok("the good brief passes the door in silence",
        door("GOAL: cc-kept wakes a seat once.\n\nWHY: #12 deleted cc-old; the wake moved here.\n") == (0, ""))
 

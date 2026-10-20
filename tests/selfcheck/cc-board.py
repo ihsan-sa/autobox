@@ -122,13 +122,11 @@ def selfcheck():
         r = run("set", "r", "t1", "instructions", "REPLACED")
         ok("…a replace that changes nothing says so and does not overwrite that copy with the same text",
            "unchanged" in r.stdout and open(bak).read() == was)
-        # …and it is a door, so it is gated like `add`: `set` then `cc … --go ""` would otherwise walk a step list
-        # past both gates, --go having no text of its own to check. The brief already there must survive the refusal.
+        # …a step list is taken as written: `set` is a door, but shape is asked for in the prompt, not refused.
         r = run("set", "r", "t1", "instructions",
                 "Do this:\n- Add a --flag to cc-foo\n- Edit cc-bar to pass it through\n- Run the suite")
-        ok("`set instructions` refuses a step list too, and the brief that was there is untouched",
-           r.returncode == 1 and "step-list" in r.stderr
-           and open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
+        ok("`set instructions` takes a step list like any text — shape is the prompt's to ask for, not a refusal",
+           r.returncode == 0 and "Run the suite" in open(f"{th}/.cc/state/r/t1/task.md").read())
         # migration: a row written before this still carries the brief in the JSON, and is moved once
         d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["t2"] = {"title": "T2", "status": "queued",
             "instructions": "AN OLD BRIEF", "updated": now()}
@@ -138,7 +136,7 @@ def selfcheck():
            got == "AN OLD BRIEF" and open(f"{th}/.cc/state/r/t2/task.md").read().strip() == "AN OLD BRIEF")
         ok("…and is gone from the JSON afterwards, so there is only ever one authority",
            "AN OLD BRIEF" not in run("json", "r").stdout)
-        ok("`show` prints the brief from the file", "REPLACED" in run("show", "r").stdout)
+        ok("`show` prints the brief from the file", "Run the suite" in run("show", "r").stdout)
         d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["t3"] = {"title": "T3", "status": "queued",
             "instructions": "A THIRD OLD BRIEF", "updated": now()}
         json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))

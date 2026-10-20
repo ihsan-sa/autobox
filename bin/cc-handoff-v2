@@ -17,6 +17,8 @@ large the board grows. The old one copied every unfinished row with its notes an
   journal   the checkpoint view (cc-lib view) at the section's budget; failing that, the tail at the same budget.
             The journal is resolved by journal_paths(): BOTH the -handoff.md and -handover.md names are read, so the
             two never fork into two half-histories, and when none exists the section names every path it tried.
+            A track's progress.md is worker-writable, so the newest file is opened once refusing a link or a pipe,
+            and both the view and the tail read that fd.
   board     the rest of the board as one count per state, a line per hold a person put on an unfinished row, and
             the command that prints it.
   land, still out, scope, who   as before, each cut at its budget with a line saying what was cut and how to read it.
@@ -26,17 +28,19 @@ so a later replay can re-read what was sent. The old packet went to stdout only.
 
 THE ROTATE LINE is the spend band minus headroom: CC_SPEND_CONTEXT_BAND (150k, the number cc-spend files
 spend/context-over-band at) minus CC_HANDOFF_V2_HEADROOM (20k). The old line was CC_CONTEXT_ROTATE_TOKENS, 200k, so
-every seat the box rotated had already crossed the band. Every decision that changes a seat's verdict is one line
-in ~/.cc/state/context/rotate-decisions.jsonl; the old path recorded only the rotations it opened. A v2 sweep stops
-measuring seats after cc-handoff's SWEEP_BUDGET (45 s), because cc-reconcile kills the whole sweep at 60 s. The seat
-it stopped before is kept as a cursor (~/.cc/state/handoff/rotate-cursor.json), and the next sweep starts there, in
-name order and wrapping, so a seat whose measurement always runs out the budget can't starve the seats after it.
+every seat the box rotated had already crossed the band; CC_CONTEXT_ROTATE_TOKENS=0 still switches rotation off. Every
+decision that changes a seat's verdict is one line in ~/.cc/state/context/rotate-decisions.jsonl; the old path
+recorded only the rotations it opened. A v2 sweep stops measuring seats after cc-handoff's SWEEP_BUDGET (45 s),
+because cc-reconcile kills the whole sweep at 60 s. The seat it stopped before is kept as a cursor
+(~/.cc/state/handoff/rotate-cursor.json), and the next sweep starts there, in name order and wrapping, so a seat whose
+measurement always runs out the budget can't starve the seats after it.
 
 THE CUTOVER ROW in handoffs.jsonl gains `packet_bytes` (the kept packet) and `ready_ctx` (the successor's context at
 --ready), so the next baseline doesn't depend on transcripts that may be gone.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -86,10 +90,33 @@ def journal_paths(h, target):
     return have, cands
 
 
+def journal_view(h, fd, path, target):
+    """(body, label): the checkpoint view (KEEP: cc-handoff's journal_view, cc-lib view at its 8 kB cap) of the file
+    `fd` holds, or (None, None) when cc-lib is missing or fails. cc-lib is handed /dev/fd/<fd>, so it reads the file
+    journal_section checked and never resolves the path again: a track's progress.md is in its worker's rw bind, and a
+    link swapped in after the check would otherwise be followed. Its header is put back to name the journal."""
+    lib = os.path.join(h.BIN, "cc-lib")
+    if not os.access(lib, os.X_OK):
+        return None, None
+    dev = f"/dev/fd/{fd}"
+    try:
+        r = subprocess.run([lib, "view", dev, "--cap", str(getattr(h, "VIEW_CAP", 8 * 1024)), "--from", r"journal at \d+%"],
+                           capture_output=True, text=True, timeout=15, pass_fds=(fd,), stdin=subprocess.DEVNULL)
+    except Exception:
+        return None, None
+    if r.returncode != 0 or not r.stdout.startswith("checkpoint view"):
+        return None, None
+    repo, alias, track = h.parts(target)
+    head, _, body = r.stdout.partition("\n")
+    head = re.sub(re.escape("--object " + dev) + r"(?!\d)", f"--object {repo}/{track or alias or 'planning'}", head)
+    return body, re.sub(re.escape(dev) + r"(?!\d)", path, head)[len("checkpoint view: "):]
+
+
 def journal_section(h, target, budget):
-    """(label, body): the checkpoint view of the newest journal file through the old journal_view (KEEP: cc-lib view,
-    8 kB), headed by a line per older file; failing cc-lib, the tail from a heading at this section's budget, not the
-    old 64 kB fallback."""
+    """(label, body): the checkpoint view of the newest journal file (journal_view above), headed by a line per older
+    file; failing cc-lib, the tail from a heading at this section's budget, not the old 64 kB fallback. The newest
+    file is opened once the way plain() opens one, and both reads go through that fd: a link or a pipe a worker put
+    at its progress.md is refused, never followed into a file only the host can read, and never left to hang the read."""
     have, tried = journal_paths(h, target)
     if not have:
         return "none found", "(tried " + ", ".join(tried) + ")"
@@ -97,16 +124,19 @@ def journal_section(h, target, budget):
     head = "".join(f"also {p} ({os.path.getsize(os.path.expanduser(p)) // 1024} kB, older entries): "
                    f"cc-lib ask --need history \"<words>\"\n" for p in older)
     room = max(budget - len(head.encode()), 512)
-    view = getattr(h, "journal_view", None)
-    body, label = view(newest) if view else (None, None)
-    if body is not None:
-        return f"checkpoint view: {label}", head + fit(body, room, f"cc-lib view {newest}")
+    fd = opened(os.path.expanduser(newest))
+    if fd is None:
+        return "refused", head + f"{newest} is not one plain file (a link, a pipe or gone), so it was not read"
     try:
-        with open(os.path.expanduser(newest), "rb") as f:
-            f.seek(max(os.path.getsize(os.path.expanduser(newest)) - room, 0))
-            text = f.read().decode(errors="replace")
+        body, label = journal_view(h, fd, newest, target)
+        if body is not None:
+            return f"checkpoint view: {label}", head + fit(body, room, f"cc-lib view {newest}")
+        os.lseek(fd, max(os.fstat(fd).st_size - room, 0), os.SEEK_SET)
+        text = os.read(fd, room).decode(errors="replace")
     except OSError:
         return "unreadable", head + newest
+    finally:
+        os.close(fd)
     cut = text.find("\n## ")
     text = text[cut + 1:] if cut >= 0 else text
     return f"the tail of {newest}, from a heading", head + fit(text, room, f"tail {newest}")
@@ -126,20 +156,32 @@ def state(h):
     return getattr(h, "STATE", None) or STATE
 
 
-def plain(path, tail=4096):
-    """The last `tail` bytes of the regular file at `path`, or None. Everything per-track sits in a dir a worker's sandbox
-    binds rw, so it is opened the way cc-board's read() opens a board: O_NOFOLLOW (a link a worker planted there is
-    refused, never followed into a file only the host can read) and O_NONBLOCK (a FIFO cannot hang the packet), and
-    the fd must be a regular file with one name."""
+def opened(path):
+    """A read fd on the regular file at `path`, or None. Everything per-track sits in a dir a worker's sandbox binds
+    rw, so it is opened the way cc-board's read() opens a board: O_NOFOLLOW (a link a worker planted there is refused,
+    never followed into a file only the host can read) and O_NONBLOCK (a FIFO cannot hang the packet), and the fd must
+    be a regular file with one name."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
-            return None
-        os.lseek(fd, max(st.st_size - tail, 0), os.SEEK_SET)
+        if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def plain(path, tail=4096):
+    """The last `tail` bytes of the regular file at `path` (opened(): no link, no pipe), or None."""
+    fd = opened(path)
+    if fd is None:
+        return None
+    try:
+        os.lseek(fd, max(os.fstat(fd).st_size - tail, 0), os.SEEK_SET)
         return os.read(fd, tail).decode(errors="replace")
     except OSError:
         return None
@@ -150,7 +192,8 @@ def plain(path, tail=4096):
 def orch_of(h, repo, track):
     """The orch that dispatched `track`, from the HOST-SIDE record cc-loop's orch_record keeps at
     <state>/<repo>/.dispatch/<track>. The track's own `orch` file is in the worker's rw bind, so a worker could name
-    any seat there and have its loop.log line printed in that seat's packet; the .dispatch dir is outside it."""
+    any seat there and have its row, that row's last notes and its loop.log line put into that seat's packet, which
+    is kept 30 days (CC_HANDOFF_DONE_TTL); the .dispatch dir is outside the bind."""
     if not track or track.startswith(".") or "/" in track:
         return ""
     text = plain(os.path.join(state(h), repo, ".dispatch", track), 256)
@@ -277,8 +320,11 @@ def brief(h, target):
         packet = fit(packet, TOTAL, f"cc-handoff --brief {target}") + "\n"
     sys.stdout.write(packet)
     sys.stdout.flush()
-    keep(h, rec, target, packet)
-    h.record_packet(target, rec, len(packet.encode()))
+    try:                                           # the packet is out: nothing after it may raise, or cc-handoff's
+        keep(h, rec, target, packet)               # fallback to the old --brief would print a second packet
+        h.record_packet(target, rec, len(packet.encode()))
+    except Exception as e:
+        print(f"cc-handoff-v2: the packet went out but was not kept or measured ({type(e).__name__}: {e})", file=sys.stderr)
     return 0
 
 
@@ -301,10 +347,15 @@ def rotate_line():
 
 def decide(h, target, m):
     """Whether to rotate a seat measured at `m` (cc-context's --json), by the v2 line. A verdict that differs from
-    the seat's last one is one line in rotate-decisions.jsonl, so a decision under the line is on record too."""
+    the seat's last one is one line in rotate-decisions.jsonl, so a decision under the line is on record too.
+    CC_CONTEXT_ROTATE_TOKENS=0 is still the box's rotation off switch (cc-context's rule): no seat is rotated. The
+    measurement carries the line cc-context read it as (`rotate_line`), so the switch costs no second config read."""
     line, band = rotate_line()
     used = (m or {}).get("used")
-    verdict = bool(used is not None and line and used >= line)
+    old = (m or {}).get("rotate_line")
+    # "decide ignores CC_CONTEXT_ROTATE_TOKENS=0 (the rotation off switch). Return False when it is 0." (the read of #1354)
+    off = (old if old is not None else h.cfg("CC_CONTEXT_ROTATE_TOKENS", 200000)) == 0
+    verdict = bool(not off and used is not None and line and used >= line)
     mark = os.path.join(h.HANDOFF, h.slug(target) + ".decision")
     try:
         last = json.load(open(mark)).get("rotate")
@@ -521,6 +572,54 @@ def selfcheck():
     y = planted("a3", "a3@o", lambda td: os.mkfifo(os.path.join(td, "loop.log")))
     ok("a loop.log the worker swapped for a FIFO is refused at once, and the packet is still built",
        y != "HUNG" and "loop w: (loop.log refused" in y)
+
+    # ---- A TRACK'S progress.md IS THE WORKER'S TOO (the security read of #1354, finding 1): a link there must not put
+    # a host-only file into the packet, by the tail or by cc-lib's view, and a FIFO must not hang the section. Each case
+    # plants its own journal under its own repo; the view cases run the real cc-lib beside this file.
+    class HL(H):
+        BIN = os.path.dirname(os.path.realpath(__file__))
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = d
+    try:
+        def journal_of(repo, setup, h=H):
+            td = os.path.join(d, ".cc", "state", repo, "t")
+            os.makedirs(td)
+            setup(os.path.join(td, "progress.md"))
+            signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+            signal.alarm(20)
+            try:
+                return journal_section(h, repo + "/t", 2048)
+            except TimeoutError:
+                return "HUNG", "HUNG"
+            finally:
+                signal.alarm(0)
+        link = lambda pth: os.symlink(secret, pth)
+        label, body = journal_of("j1", link)
+        ok("a track's progress.md swapped for a link is refused: the host-only file it names is not in the tail read",
+           label == "refused" and "SECRET-HOST-TEXT" not in body and "not one plain file" in body)
+        has_lib = os.access(os.path.join(HL.BIN, "cc-lib"), os.X_OK)
+        label, body = journal_of("j2", link, HL)
+        ok("...nor in cc-lib's view of it", has_lib and label == "refused" and "SECRET-HOST-TEXT" not in body)
+        label, body = journal_of("j3", os.mkfifo)
+        ok("a track's progress.md swapped for a FIFO is refused at once, not read until a timeout",
+           label == "refused" and body != "HUNG")
+
+        def hard(pth):
+            os.link(secret, pth)
+        label, body = journal_of("j4", hard)
+        ok("...and one hard-linked to a host file (two names) is refused too",
+           label == "refused" and "SECRET-HOST-TEXT" not in body)
+        label, body = journal_of("j5", lambda pth: open(pth, "w").write(
+            "".join(f"## 2026-10-0{i} entry\n" + "z\n" * 3000 for i in range(1, 4)) + "## 2026-10-14 entry\nnewest\n"), HL)
+        ok("a plain progress.md is read by cc-lib's view, and its header names the journal and the track, not the fd",
+           label.startswith("checkpoint view:") and "## 2026-10-0" in body and "/dev/fd" not in label
+           and "~/.cc/state/j5/t/progress.md" in label and "--object j5/t " in label)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
     os.environ["CC_SPEND_CONTEXT_BAND"] = "150000"
     os.environ.pop("CC_HANDOFF_V2_HEADROOM", None)
     ok("the rotate line is the spend band minus 20k", rotate_line() == (130000, 150000))
@@ -532,6 +631,13 @@ def selfcheck():
     ok("a decision is recorded when a seat's verdict changes, and not again while it holds",
        [(r["target"], r["rotate"]) for r in rows_] == [("r@a", False), ("r@a", True), ("r@b", True)])
     ok("an unmeasured seat is not rotated", decide(H, "r@c", {}) is False)
+    ok("CC_CONTEXT_ROTATE_TOKENS=0, the box's rotation off switch, rotates no seat however full: as cc-context read it",
+       decide(H, "r@off", {"used": 400000, "rotate_line": 0}) is False)
+
+    class Off(H):
+        cfg = staticmethod(lambda n, dflt: 0 if n == "CC_CONTEXT_ROTATE_TOKENS" else dflt)
+    ok("...and read from the config when the measurement doesn't carry the line",
+       decide(Off, "r@off2", {"used": 400000}) is False and decide(H, "r@on2", {"used": 400000}) is True)
     os.environ["CC_HANDOFF_V2_HEADROOM"] = "0"
     ok("headroom is the env's", rotate_line() == (150000, 150000))
     os.environ.pop("CC_HANDOFF_V2_HEADROOM")

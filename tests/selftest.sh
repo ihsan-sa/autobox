@@ -667,6 +667,7 @@ for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
 # a worker still running that head, shaped as cc opens one: the pane's shell with the loop UNDER it. pane_kind skips
 # the pane's own pid, so a lone `bash -c 'exec -a cc-loop …'` (bash execs it in place) read as an empty window.
 tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'; exec bash"
+for _ in $(seq 50); do pgrep -f '^cc-loop 300$' >/dev/null && break; sleep 0.1; done   # a busy box starts it late
 cp "$d6" "$T/c6before.json"
 "$B/cc" $REPO c6 --go "" --repair >"$T/c6rp3.out" 2>&1; p6=$?
 { [ "$p6" != 0 ] && grep -q 'live session\|still running it' "$T/c6rp3.out" && cmp -s "$d6" "$T/c6before.json"; } \
@@ -2115,23 +2116,14 @@ gl=$("$B/cc" $REPO gK --go "a note whose dispatch must stop at the lock" 2>&1); 
   || bad "a dispatch opened a linked lock (rc=$grc): $gl | victim=[$(cat "$T/victimL")]"
 rm -f ~/.cc/state/$REPO/gK/.lock
 
-# THE SHAPE IS CHECKED AT BOTH DOORS a brief comes in by (cc-brief). The rule it enforces is written down twice
-# already and a session that had read both still dispatched a page of steps, so the check is mechanical and lives
-# where the brief is written, not in another prompt. Here: it refuses at each door, and the door writes nothing.
+# A STEP LIST IS NO LONGER REFUSED at any door: the dispatch prompt says not to write one (cc-brief warns only on a
+# path the tree lost or a merged PR). CC_STATE points the state home at this run's temp dir so the brief lands there.
+# recurring-defect-ok: pause-hold-missing — a test of cc-board add on a fixture repo; the pause check is the tool's
 STEPS=$'Do this:\n- Add a --flag to core/bin/cc-foo\n- Edit core/bin/cc-bar to pass it through\n- Run the suite'
-gs=$("$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1); grc=$?
-{ [ $grc != 0 ] && grep -q 'step-list' <<<"$gs" && [ ! -s ~/.cc/state/$REPO/g10/task.md ]; } \
-  && ok "cc-board add refuses a brief of steps, names the signal, and writes nothing" || bad "add took a step list (rc=$grc): $gs"
-gs=$("$B/cc" $REPO g6 --go "$STEPS" 2>&1); grc=$?
-{ [ $grc != 0 ] && grep -q 'step-list' <<<"$gs" && [ ! -s ~/.cc/state/$REPO/g6/task.md ]; } \
-  && ok "--go refuses the same note before it starts a worker" || bad "--go dispatched a step list (rc=$grc): $gs"
-# CC_STATE points the state home — cc-brief's override ledger AND cc-board's task.md — at this run's temp dir:
-# the ledger is one file for the whole box (no repo in its path), so a forced fixture here would otherwise land
-# in the box's own record of real overrides. The brief lands under the same root, and that is where it is read.
-gs=$(CC_STATE="$T/briefstate" CC_BRIEF_FORCE=1 "$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1)
-{ grep -q 'FLAGGED' <<<"$gs" && grep -q 'cc-foo' "$T/briefstate/$REPO/g10/task.md" \
-  && grep -q '"what": "step-list"' "$T/briefstate/brief/overrides.jsonl"; } \
-  && ok "CC_BRIEF_FORCE=1 flags the same brief, lets it through and writes it to the ledger — force is never silence" || bad "force: $gs"
+gs=$(CC_STATE="$T/briefstate" "$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1); grc=$?
+{ [ $grc = 0 ] && ! grep -q 'REFUSED' <<<"$gs" && grep -q 'cc-foo' "$T/briefstate/$REPO/g10/task.md" \
+  && [ ! -e "$T/briefstate/brief/overrides.jsonl" ]; } \
+  && ok "cc-board add takes a brief of steps as typed, with no refusal and no override ledger" || bad "add refused a step list (rc=$grc): $gs"
 # …and what another live track is holding is COMPUTED into the brief, never typed. This case builds its own
 # holder: g1 is live on the board and its branch really does change a file, so the block has something to say.
 "$B/cc-board" status $REPO g1 running >/dev/null

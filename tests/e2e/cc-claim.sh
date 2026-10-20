@@ -202,6 +202,7 @@ for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
 # a worker still running that head, shaped as cc opens one: the pane's shell with the loop UNDER it. pane_kind skips
 # the pane's own pid, so a lone `bash -c 'exec -a cc-loop …'` (bash execs it in place) read as an empty window.
 tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'; exec bash"
+for _ in $(seq 50); do pgrep -f '^cc-loop 300$' >/dev/null && break; sleep 0.1; done   # a busy box starts it late
 cp "$d6" "$T/c6before.json"
 "$B/cc" $REPO c6 --go "" --repair >"$T/c6rp3.out" 2>&1; p6=$?
 { [ "$p6" != 0 ] && grep -q 'live session\|still running it' "$T/c6rp3.out" && cmp -s "$d6" "$T/c6before.json"; } \

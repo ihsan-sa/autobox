@@ -1635,6 +1635,32 @@ def run_selfcheck():
            real_out(["false"], fail="(unavailable: x)") == "(unavailable: x)"
            and real_out(["printf", "hi"], fail="(unavailable: x)") == "hi"
            and real_out(["no-such-binary-here"], fail="(unavailable: x)") == "(unavailable: x)")
+
+        # ---- A v2 THAT BREAKS UNDER --brief (the security read of #1354, finding 2): with CC_HANDOFF_V2=1, a
+        # cc-handoff-v2 that fails to load, or whose brief raises, costs one stderr line and --brief prints the old
+        # packet, as v2_cutover keeps a cutover going. Last of the brief cases, so their call lists stay their own.
+        v2env_b, real_v2_b = os.environ.get("CC_HANDOFF_V2"), v2
+
+        def v2_unloadable():
+            raise SyntaxError("cc-handoff-v2")
+
+        class BriefRaises:
+            @staticmethod
+            def brief(h, t):
+                raise KeyError("rows")
+        try:
+            os.environ["CC_HANDOFF_V2"] = "1"
+            for what, stub in (("fails to load", v2_unloadable), ("raises in its brief", lambda: BriefRaises)):
+                v2 = stub
+                out_b, err_b = _io.StringIO(), _io.StringIO()
+                with contextlib.redirect_stdout(out_b), contextlib.redirect_stderr(err_b):
+                    rc_b = brief("r9/t9")
+                ok(f"v2 on and a cc-handoff-v2 that {what}: --brief prints the old packet, and stderr one line naming it",
+                   rc_b == 0 and "== open PRs" in out_b.getvalue() and "(v2," not in out_b.getvalue()
+                   and len([ln for ln in err_b.getvalue().splitlines() if "cc-handoff-v2 failed" in ln]) == 1)
+        finally:
+            v2 = real_v2_b
+            os.environ.pop("CC_HANDOFF_V2", None) if v2env_b is None else os.environ.__setitem__("CC_HANDOFF_V2", v2env_b)
         clear("r9/t9")
         DEV = dev0
         if home0 is None:
@@ -1846,6 +1872,52 @@ def run_selfcheck():
                 seatd.clear(); seatd.update(seat0)
                 for n in ("rv/a-slow", "rv/b", "rv/c"):
                     wins.pop(n, None)
+
+            # ---- A v2 THAT BREAKS UNDER THE SWEEP (the security read of #1354, finding 2): v2(), sweep_order and
+            # decide used to have no fallback, so a broken cc-handoff-v2 killed the rotation sweep on every tick. Each
+            # case breaks one of them on its own seats and asserts the seat past cc-context's line is still rotated
+            # on the old verdict, the one under it is not, and stderr names the failure.
+            v2env_r, real_v2_r = os.environ.get("CC_HANDOFF_V2"), v2
+
+            class OrderRaises:
+                @staticmethod
+                def sweep_order(h, seats):
+                    raise ValueError("cursor")
+
+            class DecideRaises:
+                sweep_order = staticmethod(lambda h, seats: seats)
+                sweep_cursor = staticmethod(lambda h, deferred: None)
+                rotate_line = staticmethod(lambda: (130000, 150000))
+
+                @staticmethod
+                def decide(h, target, m):
+                    raise TypeError("used")
+
+            def v2_unloadable_r():
+                raise SyntaxError("cc-handoff-v2")
+            try:
+                os.environ["CC_HANDOFF_V2"] = "1"
+                for tag, stub, why in (("load", v2_unloadable_r, "the rotation sweep"),
+                                       ("order", lambda: OrderRaises, "the rotation sweep"),
+                                       ("decide", lambda: DecideRaises, "the rotate decision")):
+                    v2 = stub
+                    seat(f"rf/{tag}-over", f"sid-rf-{tag}-over", used=250000, rotate=True)
+                    seat(f"rf/{tag}-under", f"sid-rf-{tag}-under", used=140000, rotate=False)
+                    err_r = io.StringIO()
+                    with contextlib.redirect_stderr(err_r):
+                        sweep(True)
+                    ok(f"v2 on and its {tag} broken: the sweep still rotates the seat past cc-context's line, leaves the "
+                       f"one under it, and stderr names {why}",
+                       (read(f"rf/{tag}-over") or {}).get("phase") == "overlap" and read(f"rf/{tag}-under") is None
+                       and any("cc-handoff-v2 failed" in ln and why in ln for ln in err_r.getvalue().splitlines()))
+            finally:
+                v2 = real_v2_r
+                os.environ.pop("CC_HANDOFF_V2", None) if v2env_r is None else os.environ.__setitem__("CC_HANDOFF_V2", v2env_r)
+                for tag in ("load", "order", "decide"):
+                    for n in (f"rf/{tag}-over", f"rf/{tag}-under"):
+                        clear(n)
+                        for w in (n, n + OLD, n + NEXT):
+                            wins.pop(w, None)
 
             # ---- A SEAT NO WINDOW HOLDS: the brief (2026-10-12) — "make the rotation sweep find a past-the-line seat
             # by its pid/session file when the pane id is missing, instead of skipping it silently. When a seat can't

@@ -45,8 +45,7 @@ selfcheck(){
   # what makes that true for the cc-board child too: bash's dynamic scope reaches exported variables.
   local HOME CTL SUITE_FAIL pass fail RPT   # NOT BOARD: it is an absolute sibling path and must survive the fake $HOME
   HOME="$d/home"; CTL=sc-repo; pass=0; fail=0; RPT=""
-  # cc-audit's OWN rows skip cc-brief's gate (CC_BRIEF_MACHINE=1), but the hand-typed row below does not: it goes
-  # through cc-brief's arithmetic over the brief's shape, which is all that gate is — nothing here asks a model.
+  # cc-audit's OWN rows are written with CC_BRIEF_MACHINE=1; cc-brief only warns on a lost path or merged PR now.
   mkdir -p "$HOME/.cc"
   "$BOARD" init "$CTL" "$d/repo" main >/dev/null 2>&1
   local RED='tests/check.sh — ✗ the digest names the timezone'
