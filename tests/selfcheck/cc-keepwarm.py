@@ -84,7 +84,7 @@ def selfcheck():
         def tree(self, pid): return [str(pid)] + self.kids.get(str(pid), [])
         def transcript(self, pid): return self.paths.get(str(pid))
         def type(self, wid, text):
-            self.typed.append((wid, text)); return True
+            self.typed.append((wid, text)); return "sent"
 
     q = lambda: contextlib.redirect_stdout(io.StringIO())
     last = NOW - 52 * 60
@@ -224,6 +224,23 @@ def selfcheck():
                        user(NOW - 19000, "resume"), call(NOW - 18990, 151_000, write=151_000)]])
     r = replay_session(s, DEFAULT, NOW - 86400, NOW - 18000)     # ends before the resumed call's own idle window
     k(r["resume_cold"] == 1 and r["ka"] == 0, f"replay: a cold resume after a limit is counted for the add-on, never kept warm ({r})")
+
+    # 14 Host.type re-captures the pane before Enter and presses it only when the box holds the keepalive alone
+    class Tmux(Host):
+        def __init__(self, after): self.after, self.keys = after, []
+        def run(self, *a, timeout=10): self.keys.append(a[-1]); return 0, ""
+        def screen(self, wid): return self.after
+    wrapped = "╭───\n│ ❯ " + KEEPALIVE[:60] + "\n│   " + KEEPALIVE[60:] + "\n╰───\n  ? for shortcuts\n"
+    sleep, time.sleep = time.sleep, lambda s: None
+    try:
+        for after, want, what in [(wrapped, "sent", "the keepalive alone, wrapped"),
+                                  (wrapped.replace("period.", "period.and my own"), "pane changed before Enter", "a person typing after it"),
+                                  (wrapped + "  ✻ Thinking… (esc to interrupt)\n", "pane changed before Enter", "a wake in the gap"),
+                                  (None, "pane changed before Enter", "an unreadable pane")]:
+            h = Tmux(after); said = h.type("@1", KEEPALIVE)
+            k(said == want and (h.keys[-1] == "Enter") == (want == "sent"), f"type with {what}: {said}, keys {h.keys}")
+    finally:
+        time.sleep = sleep
 
     print(f"cc-keepwarm selfcheck: {ok} passed, {bad} failed")
     return 0 if bad == 0 else 1

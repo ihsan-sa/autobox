@@ -24,8 +24,9 @@ holds `~` (a handoff's ~next / ~old). For each, from its transcript (the sid the
             shows a dialog, is in copy mode, or has text in its input box (a person typing): never typed at
   once      ~/.cc/state/keepwarm.json keeps the last call each sid was kept warm for: two ticks in one window send one
   rule      likely() below — the same function the replay scores
-Then it types KEEPALIVE and Enter. Best effort: a seat that fails is a line in ~/.cc/state/keepwarm.log and the
-walk moves on; the tick exits 0.
+Then it types KEEPALIVE, re-captures the pane and presses Enter only if the input box holds exactly that line and
+the pane is not busy, a dialog or a wall, so a wake or a person typing in the gap is never submitted. Best effort: a
+seat that fails is a line in ~/.cc/state/keepwarm.log and the walk moves on; the tick exits 0.
 
 THE RULE, likely(f, chain, p). A seat is kept warm when its context is at least p.min_ctx (a small one is cheap to
 re-write), the keepalives already sent since its last real turn are under p.max_chain (a seat that has slept through
@@ -71,7 +72,7 @@ PRICES = {"claude-fable": (10e-6, 20e-6, 0.25e-6, 50e-6), "claude-mythos": (10e-
 # reminders a seat's hooks add to a turn.
 KA_WRITE = int(os.environ.get("CC_KEEPWARM_KA_WRITE") or 300)
 KA_OUT = int(os.environ.get("CC_KEEPWARM_KA_OUT") or 20)
-HANDOFF_COST = 0.60             # the add-on's alternative to a cold resume: a handoff, as measured by autobox2
+HANDOFF_COST = 0.60             # the add-on's alternative to a cold resume: a handoff, as measured on the host
 
 Rule = namedtuple("Rule", "min_ctx max_chain min_turns")
 DEFAULT = Rule(min_ctx=60_000, max_chain=3, min_turns=2)
@@ -273,9 +274,12 @@ class Host:
 
     def type(self, wid, text):
         if self.run("tmux", "send-keys", "-t", wid, "-l", "--", text)[0] != 0:
-            return False
+            return "type-failed"
         time.sleep(0.4)
-        return self.run("tmux", "send-keys", "-t", wid, "Enter")[0] == 0
+        scr = self.screen(wid)                    # a wake or a person typing in the gap: never submit their text
+        if scr is None or pane_says(scr) in ("busy", "dialog", "parked") or input_text(scr) != " ".join(text.split()):
+            return "pane changed before Enter"
+        return "sent" if self.run("tmux", "send-keys", "-t", wid, "Enter")[0] == 0 else "type-failed"
 
 
 def tail_lines(path):
@@ -303,6 +307,20 @@ def pane_says(scr):
     if box and re.sub(r"^[\s│]*(❯|>)\s*", "", box[-1]).strip(" │"):
         return "typing"
     return None
+
+
+def input_text(scr):
+    """What the input box holds: the last prompt line and the wrapped lines under it, up to the box's edge."""
+    lines = scr.splitlines()
+    i = max((n for n, l in enumerate(lines) if re.match(r"^[\s│]*(❯|>)", l)), default=None)
+    if i is None:
+        return None
+    got = [re.sub(r"^[\s│]*(❯|>)", "", lines[i])]
+    for l in lines[i + 1:]:
+        if not l.strip(" │") or l.strip(" │")[0] in "╰─":
+            break
+        got.append(l)
+    return " ".join(" ".join(got).replace("│", " ").split())
 
 
 def load():
@@ -380,9 +398,9 @@ def tick(host, apply_, now=None):
             verdict, why, sid, last = decide(host, wid, name, pane_pid, in_mode, st, now)
             if verdict == "send" and apply_:
                 st[sid] = last; save(st)           # stamped first: a crash between the two never types twice
-                ok = host.type(wid, KEEPALIVE)
-                log(f"{name}\t{'sent' if ok else 'type-failed'}\t{why}")
-                if ok:
+                said = host.type(wid, KEEPALIVE)
+                log(f"{name}\t{said}\t{why}")
+                if said == "sent":
                     sent.append(name)
             elif verdict == "send":
                 print(f"{name}\twould send\t{why}")

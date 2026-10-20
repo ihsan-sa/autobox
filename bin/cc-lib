@@ -263,8 +263,8 @@ def libroot():
     """~/.cc/library — the PROTECTED PARENT: the host alone writes under it, and no bind of a member's boundary reaches
     it. Under it: owner/ (the aggregate, every record, bound read-only into --go workers on owner-only repos and the
     owner's own workspace, never into a member's), ws/<id>/ (one workspace's records and only those — the one directory
-    cc-sandbox binds into that workspace's boundary), shared/ (the owner's records alone, for a worker on a member-facing
-    repo: build_shared) and registry.json (id → handle)."""
+    cc-sandbox binds into that workspace's boundary), shared/ (the owner's records a worker on a member-facing repo may
+    read, none of the box's talk with members: build_shared) and registry.json (id → handle)."""
     return os.path.join(H, ".cc", "library")
 
 
@@ -1334,6 +1334,9 @@ def build_all_ws(reg, only=None):
     return out
 
 
+SHARED_OUT = ("slack", "chat", "chatlog", "memory", "perms-log", "failures", "land-queue", "docs")   # build_shared
+
+
 def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the index only; launches nothing, writes no board
     """THE OWNER'S RECORDS AND NO MEMBER'S, ~/.cc/library/shared/index.sqlite: what cc-sandbox binds into a worker on a
     member-facing repo in place of the aggregate. Since #1600 a worker reads the aggregate, and a worker on a repo a
@@ -1341,11 +1344,24 @@ def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the 
     just asked to stay out of its output. Copied from the aggregate (c, current after the full pass) into a FRESH file
     rather than pruned from a copy of it: deleted text lingers in free pages and FTS segments, and a worker can read the
     raw bytes. Built only when the owner's sources moved since the last copy, so between full passes (five minutes) it
-    may lag a hook's --touch; renamed in like a workspace's file, so a reader holds a whole one."""
+    may lag a hook's --touch; renamed in like a workspace's file, so a reader holds a whole one.
+    NOT EVERY OWNER RECORD: ws_of tags member workspaces only, so ws='' alone still carries the box's own talk with
+    every member (perms-38, from its read of #1649). Left out by kind: Slack and the chat logs, memory, the perms
+    ledgers and the perms track's docs, the failures log, the landing queue and the document register, and every
+    journal but a track's progress.md (the seats' handoffs). Left out by repo: every source of a member-facing repo
+    (its .cc/member-facing or ~/.cc/members/<repo>, as cc-sandbox decides), its landing records included."""
     d = os.path.join(libroot(), "shared")
     final = os.path.join(d, "index.sqlite")
+    facing = [r for r in boards() if os.path.exists(os.path.join(H, "dev", r, ".cc", "member-facing"))
+              or os.path.exists(os.path.join(H, ".cc", "members", r))]
+    # perms-38: "leave slack, chat, chatlog, memory and perms-log sources out of the shared copy, along with other
+    # member-facing repos' journals and boards" — and the failures log and seats' journals it found leaking too
+    keep = (f"ws='' AND skind NOT IN ({','.join('?' * len(SHARED_OUT))}) AND COALESCE(track, '')<>'perms'"
+            " AND NOT (skind='journal' AND path NOT LIKE '%/progress.md')"
+            f" AND substr(COALESCE(repo, ''), 1, instr(COALESCE(repo, '') || '--', '--') - 1) NOT IN ({','.join('?' * len(facing))})")
+    ka = (*SHARED_OUT, *facing)
     stamp = "|".join(str(v) for v in c.execute(
-        "SELECT COUNT(*), COALESCE(MAX(indexed_at), ''), TOTAL(mtime) FROM sources WHERE ws=''").fetchone())
+        f"SELECT COUNT(*), COALESCE(MAX(indexed_at), ''), TOTAL(mtime) FROM sources WHERE {keep}", ka).fetchone()) + "|" + ",".join(facing)
     try:
         real_dirs(d)
         if os.path.islink(final) or (os.path.lexists(final) and not os.path.isfile(final)):
@@ -1361,7 +1377,7 @@ def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the 
             os.remove(tmp)
         s = db(tmp, wal=False)
         s.execute("ATTACH DATABASE ? AS a", (dbpath(),))
-        s.execute("INSERT INTO sources SELECT * FROM a.sources WHERE ws=''")
+        s.execute(f"INSERT INTO sources SELECT * FROM a.sources WHERE {keep}", ka)
         s.execute("INSERT INTO records SELECT * FROM a.records WHERE source_id IN (SELECT id FROM sources)")   # the trigger fills fts
         s.execute("INSERT INTO rids SELECT * FROM a.rids WHERE record_id IN (SELECT id FROM records)")
         s.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('workspace', 'owner'), ('aggregate', ?)", (stamp,))
