@@ -87,6 +87,16 @@ class ManifestError(ValueError):
     pass
 
 
+def on_host(c: T.Check) -> bool:
+    """Whether the box runs `c` on the host itself, outside the bwrap profile: a box check, and a host check that
+    needs this host — bare, or a `where` that names no laptop. Every other host check runs in the bwrap profile on
+    the box (run.py), as the laptop's cage already runs it: a PR head is code a worker wrote, and a worker reads the
+    web, issue text and members' asks, so the head never runs as the box's user before a read (perms' reviewer,
+    10-19: selfcheck-cc-lib ran a head's cc-lib on the host). These still run on the host before the merge: a read
+    before that run is the open half (raised-lander-runs-pr-code-on-the-host's journal has the groups)."""
+    return c.klass == T.BOX or (c.klass == T.HOST and (c.bare or "laptop" not in c.where))
+
+
 # --- the host's fallback for a repo that ships no manifest ----------------------------------------------------------
 
 CORE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))

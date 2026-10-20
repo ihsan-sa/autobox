@@ -774,6 +774,7 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # Inside it is ~/.cc/egress, not its host path: a bind under ~/.cc/sandbox would make that directory exist in here,
   # and the namespace case holds that it does not.
   B+=(--ro-bind "$eg" "$H/.cc/egress" --ro-bind "$EGRESS" "$EGRESS")
+  pins_unlinked   # last, right before exec: a pinned file git renamed over during the launch goes in as data
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" "${ca[@]}" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <([ -n "$live" ] || jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
@@ -821,8 +822,9 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   # else; or, from a SECOND live session, swap it between the host's check and bwrap's mount. A
   # launch lock does not close the third — the attacker is a session that is already running — and a fourth name check
   # would not either, because whatever is checked gets resolved again by mount(2). So the host OPENS the object here,
-  # confirms the descriptor is still the path it asked for, and hands bwrap /proc/self/fd/<n>: no name is resolved a
-  # second time, and a symlink anywhere in the path shows up as a descriptor whose readlink is the target, not the path.
+  # confirms the descriptor is still the path it asked for, and hands bwrap the descriptor: bwrap re-reads its name and
+  # refuses a mount whose inode is not the descriptor's, so a swap binds nothing of the racer's (an object with no name
+  # left is pins_unlinked's), and a symlink anywhere in the path shows up as a descriptor whose readlink is the target.
   # Refusing beats binding the wrong thing, so a mismatch returns 1 and the caller stops the launch.
   # THE DESCRIPTOR GOES TO BWRAP AS A DESCRIPTOR (--bind-fd/--ro-bind-fd), not as /proc/self/fd/<n>. Both mount the same
   # pinned inode, but bwrap CLOSES an fd it was handed this way and does not close one it merely read a path through:
@@ -841,6 +843,24 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   [ "$(readlink "/proc/self/fd/$fd" 2>/dev/null)" = "$p" ] || { exec {fd}<&-; return 1; }
   B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
 pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another live session. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
+pins_unlinked(){   # → B with every ro FILE pin whose object has no name left handed over as data; run just before exec bwrap
+  # BWRAP RESOLVES THE DESCRIPTOR BY NAME BEFORE IT MOUNTS. For --bind-fd/--ro-bind-fd it records /proc/self/fd/<n> as the
+  # source, and resolve_symlinks_in_ops realpath()s that in the parent: the link's TEXT is the object's current name.
+  # It mounts that name and then checks the mount's inode against the fd ("Race condition binding dirfd"), so an object
+  # RENAMED after the pin still binds the object the host opened (the swap cases below). An object UNLINKED after the pin
+  # has no name to resolve: the text reads "<path> (deleted)", realpath fails, and bwrap dies with "Can't find source
+  # path /proc/self/fd/<n>", rc 1, before claude starts. git replaces ~/dev/<repo>/.git/config, HEAD, index, packed-refs
+  # and ORIG_HEAD that way (write <name>.lock, rename it over), and every new track's worktree, upstream and landing
+  # writes config, so on a busy box one landed between the .git/* pins and the exec a few times a day — fd 15 is .git/config
+  # in en_US glob order — and each one cost a worker an iteration (2026-10-13, and six times on 2026-10-19).
+  # Such a file is read-only inside and already a snapshot (its old inode is what the bind would show), so --ro-bind-data
+  # from the SAME descriptor gives the session exactly the bytes the host opened: no name is resolved and nothing is
+  # re-pinned, so a swap still gets the racer nothing. A rw pin, or a directory, with no name left is left as it was.
+  local k n
+  for ((k = 0; k < ${#B[@]}; k++)); do
+    [ "${B[k]}" = --ro-bind-fd ] || continue; n="${B[k+1]}"
+    [ -f "/proc/self/fd/$n" ] && [ "$(stat -L -c %h "/proc/self/fd/$n" 2>/dev/null)" = 0 ] && B[k]=--ro-bind-data
+  done; :; }
 ws_id(){   # $1 handle → the workspace's IMMUTABLE ID on stdout, or 1: ~/.cc/members/<h>/workspace-id, a host-side file under no
   # bind of the boundary (owner-workspace and github-token sit beside it for the same reason). Minted ONCE, here or by cc-lib
   # index, the same way — written beside, then link(2)ed into place, so two minters at once still agree on the one that
@@ -1247,6 +1267,7 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # to be able to lose that race on demand instead of hoping to hit a microsecond — so it widens the window with this.
   # A NUMBER, never a command, and only ever set on the host: the environment inside is cleared, so no session sets it.
   case "${CC_SANDBOX_TEST_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$CC_SANDBOX_TEST_DELAY";; esac
+  pins_unlinked   # last, after the window above (pins_unlinked)
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" -- "$@" \
     3< <({ jq -c '.projects // {}' "$H/.claude.json" 2>/dev/null || printf '{}'; } \
          | jq -n --arg d "$dev" --arg cwd "$cwd" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
@@ -3508,6 +3529,19 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
       "$(g RAN)/$(grep -c decoy-swapped <<<"$out")/$sw" yes/0/swapped
     [ -n "$(g RAN)" ] || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out:-nothing at all}"   # why a launch never started; FAIL in the line so a gate log, which keeps only FAIL and ✗ lines, keeps it
   done
+  # THE HOST'S GIT RENAMING A PINNED FILE OVER, DURING THE LAUNCH (pins_unlinked): what `git config` does to .git/config —
+  # a <name>.lock written and renamed over the name — lands after the .git/* pins and before bwrap. The pinned inode has
+  # no name left; before pins_unlinked bwrap died "Can't find source path /proc/self/fd/<n>" and nothing ran. The
+  # session gets the config the host opened, not the new one, and the real one comes back after.
+  cp -p "$dev/.git/config" "$dev/.git/config.keep"
+  swap_config(){ { cat "$dev/.git/config"; printf '# ccrenamedover\n'; } > "$dev/.git/config.lock" && mv -f "$dev/.git/config.lock" "$dev/.git/config"; }
+  of="$H/.cc/swap-out.$$"
+  CC_SANDBOX_TEST_DELAY=3 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes; echo marker=$(grep -c ccrenamedover ~/dev/'"$r"'/.git/config)' >"$of" 2>&1 & lp=$!
+  sw=$(race_swap "$lp" "$dev/.git/objects/pack" swap_config); wait "$lp"; out=$(cat "$of"); rm -f "$of"
+  mv -f "$dev/.git/config.keep" "$dev/.git/config"
+  t 'the host renaming .git/config over DURING the launch does not stop it — the session reads the config the host opened' \
+    "$(g RAN)/$(g marker)/$sw" yes/0/swapped
+  [ -n "$(g RAN)" ] || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out:-nothing at all}"
   # A MEMBER'S BOARD THAT GOES AWAY DURING THE LAUNCH does not stop it. build globs ~/.cc/members/*/board and binds each
   # by name, and a board removed between the glob and the mount (a member removed, or another selfcheck's fixture
   # cleaned up, which is how three overlapping lander runs went red on 2026-10-12 with "bwrap: Can't find source path

@@ -9,8 +9,10 @@ in a borrowed repo (git.borrowed) and every git there runs with git.blind_env(),
 replace ref of the checkout's runs or shapes them. Everything under the run directory goes when the run ends.
 
 THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` for a member's landing):
-  box      by class — static, hermetic and timing in the bwrap profile (sandbox.py); host and box on the host with
-           the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
+  box      by class — static, hermetic, timing and every host check the laptop may take in the bwrap profile
+           (sandbox.py), as the laptop's cage runs them: a PR head is code a worker wrote, never run as the box's
+           user (manifest.on_host; perms' reviewer, 10-19). Box checks and the host checks that need this host
+           (bare, or no laptop in `where`) on the host with the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
            under cc-nosignal, so a check signals only what it started (the user manager went down on 2026-10-02).
            A check that says bare = true runs without it: its cases read what cc-nosignal's Landlock domain hides
            (cc-member-v2 reading a live sandbox's /proc/<pid>/fd, cc-fence's no_new_privs case), and nothing leaves
@@ -430,7 +432,7 @@ def _box_argv(check, head, cwd, run_dir, env_extra, started_fd=None):
     setup, before the check's own shell. sandbox.pin() moves it to sandbox.FD first, outermost, since dash takes no
     fd above 9 and the lander's own is often higher."""
     pin, said = (S.pin(started_fd), S.started(S.FD)) if started_fd is not None else ([], [])
-    if check.klass in M.UNSANDBOXED:
+    if M.on_host(check):
         scope = [] if check.bare else [os.path.join(BIN, "cc-nosignal"), "--"]
         return (pin + scope + said + ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
                 clean_env(env_extra), "host")
@@ -904,7 +906,7 @@ def uncaged(check: T.Check) -> str:
     """'' when `check` runs whole inside the default bwrap profile on this box; else why it does not. A fenced worker's
     green (cc-green's pinned host run, `lander check --caged-only`) runs only the first kind: the tree it checks is one
     the worker wrote, so a host or box check there would run the worker's code as the owner, outside every fence."""
-    if check.klass in M.UNSANDBOXED:
+    if M.on_host(check):
         return f"{check.klass}-class, runs on the host outside the sandbox"
     if check.net:
         return "needs the network"

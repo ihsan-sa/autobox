@@ -1047,6 +1047,34 @@ class HostAndRunners(Env):
         self.assertEqual((argv, how), (["bwrap", "--", "sh"], "bwrap"))
         self.assertFalse(any(a.endswith("cc-nosignal") for a in argv))
 
+    def test_a_host_check_the_laptop_may_take_runs_in_the_bwrap_profile_on_the_box(self):
+        # perms' reviewer, 10-19: selfcheck-cc-lib ran a PR head's cc-lib on the host as the box's user. A host check
+        # the laptop's cage takes runs caged here too; bare, or a `where` with no laptop, still needs this host
+        with mock.patch.object(S, "available", return_value=True), \
+                mock.patch.object(S, "write_stub", return_value="/stub"), \
+                mock.patch.object(S, "argv", return_value=["bwrap", "--", "sh"]) as sa:
+            caged = chk(run="true", klass=T.HOST, where=["box", "laptop"])
+            argv, _wd, _env, how = RUN._box_argv(caged, "/head", "", "/run", {})
+            self.assertEqual((argv, how), (["bwrap", "--", "sh"], "bwrap"))
+            self.assertIs(sa.call_args[0][0], caged)
+            self.assertEqual(RUN.uncaged(caged), "")
+            for c in (chk(run="true", klass=T.HOST, where=["box"]),
+                      chk(run="true", klass=T.HOST, where=["box", "laptop"], bare=True),
+                      chk(run="true", klass=T.BOX, where=["box", "laptop"])):
+                argv, _wd, _env, how = RUN._box_argv(c, "/head", "", "/run", {})
+                self.assertEqual(how, "host", c)
+                self.assertNotEqual(RUN.uncaged(c), "", c)
+        self.assertEqual(sa.call_count, 1)
+
+    def test_a_caged_host_check_cannot_reach_the_real_home(self):
+        if not S.available():
+            self.skipTest("no bwrap on this machine")
+        probe = f'test ! -e {os.path.expanduser("~")}/.cc && test "$HOME" = {S.HOME_IN} && echo "0 failed"'
+        r = self.run_(chk(run=probe, klass=T.HOST, where=["box", "laptop"]))
+        if r.status == T.UNRUNNABLE:
+            self.skipTest(f"the bwrap profile does not start here: {r.extra}")
+        self.assertEqual((r.status, r.runner.split(":")[1]), (T.PASSED, "bwrap"), r.extra)
+
     def test_a_runner_the_check_does_not_list_is_refused(self):
         r = self.run_(chk(run="true", where=["box"]), where="laptop")
         self.assertEqual(r.status, T.UNRUNNABLE)

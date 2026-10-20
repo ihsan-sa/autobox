@@ -199,7 +199,7 @@ def sweep_one(repo: str, m: M.Manifest, name: str, tree: str, sandbox: bool, run
     if r.status == T.PASSED:
         row["verdict"] = "passes-in-bwrap"
         return row
-    h = runner(dataclasses.replace(c, klass=T.HOST, mounts=[]), tree, "box", repo_root=repo, cwd=cwd)
+    h = runner(dataclasses.replace(c, klass=T.HOST, mounts=[], where=["box"]), tree, "box", repo_root=repo, cwd=cwd)
     tail = "\n".join(r.extra.get("tail", []))
     home = os.path.expanduser("~")
     if h.status == T.PASSED:

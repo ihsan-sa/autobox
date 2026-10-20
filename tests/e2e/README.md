@@ -16,9 +16,11 @@ reaches instead of the whole suite.
 selfcheck, and one `e2e-<slug>` per file here. The class says where and when a check runs:
 
 - `static` reads files only, with no process state, no `~/.cc` and no tmux, so it runs on every change it owns.
-- `host` is today's run: on the host, with the environment scrubbed, serially per repo, before the merge. While
-  the box is busy, a host check whose `where` names the laptop runs there instead, with a tmux `main` of its own;
-  every e2e file and `check-sh` do. One that needs this box itself (its kernel, a working bwrap) keeps `["box"]`.
+- `host` runs with the environment scrubbed, serially per repo, before the merge. A host check whose `where` names
+  the laptop runs in the lander's bwrap profile (a HOME and a tmux `main` of its own, no network unless `net`),
+  on the box or, while the box is busy, in the laptop's cage; every e2e file and `check-sh` do. One that needs
+  this box itself (its kernel, a working bwrap: `bare`, or `where = ["box"]`) runs on the host itself, as the
+  box's user; keep that set small, since the head it runs is one a worker wrote.
 - `hermetic` is for checks proven to pass in the lander's sandbox. Every existing selfcheck and every e2e file
   started as `host` and moves only after that proof. A check that a change adds is the exception:
   manifest-widen refuses a new check whose class is outside the sandbox, so it starts `hermetic` and must
