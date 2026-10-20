@@ -2332,8 +2332,8 @@ class TestPermsReads(Case):
         os.environ["CC_DEV"] = self.tmp
         self.addCleanup(lambda: os.environ.pop("CC_DEV") if old is None else os.environ.update(CC_DEV=old))
 
-    def facts(self, head=HEAD, state="OPEN"):
-        return (0, json.dumps({"headRefOid": head, "baseRefName": "main", "comments": [], "state": state,
+    def facts(self, head=HEAD, state="OPEN", comments=()):
+        return (0, json.dumps({"headRefOid": head, "baseRefName": "main", "comments": list(comments), "state": state,
                                "files": [{"path": "x.py"}], "headRefName": "track/x"}))
 
     def entry(self, head=HEAD, **kw):
@@ -2594,9 +2594,9 @@ class TestPermsReads(Case):
         self.assertEqual(stat_mode(R.perms_reads_path("demo")), 0o644)
 
     # perms' hand read, recorded with `record` from its seat, is its ledger entry in the same step (#1523)
-    def record_as(self, seat, *argv):
+    def record_as(self, seat, *argv, head=HEAD, comments=()):
         R.perms_seat_caller = lambda repo, *a, **kw: seat
-        box = self.box(**{"gh pr view": self.facts()})
+        box = self.box(**{"gh pr view": self.facts(head=head, comments=comments)})
         return R.cmd_record(["demo", "7", *argv]), box
 
     def test_a_perms_seat_land_record_is_perms_recorded(self):
@@ -2662,11 +2662,16 @@ class TestPermsReads(Case):
                          [("LAND", HEAD, digest), ("HANDBACK", HEAD, digest)])
         self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
         self.assertEqual(R.newest_reads(self.ledger(), "demo", 7)[HEAD]["verdict"], "HANDBACK")
-        # run again (the marker already stands): one HANDBACK still
-        self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD)[0], 0)
+        # run again with the marker on the PR, so record's already-recorded step runs: nothing posted, one HANDBACK
+        back = self.comment("HANDBACK", digest, ["1. [security] x"], by="perms")
+        code, box = self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD, comments=[back])
+        self.assertEqual(code, 0)
+        self.assertEqual(box.called("gh pr comment"), [])
         self.assertEqual(len(self.ledger()), 2)
 
-    def test_a_perms_handback_then_a_land_at_one_head_reads_as_landed(self):
+    def test_a_perms_land_written_after_its_handback_at_one_head_reads_as_landed(self):
+        """The ledger's order decides. The fake PR has no comments, so record posts the LAND; on a real PR the
+        HANDBACK marker stands and record refuses a LAND over it, so this shows the ledger, not the record."""
         digest = R.change_digest(DIFF)
         self.assertEqual(self.record_as(True, "HANDBACK", "--by", "perms", "--head", HEAD)[0], 0)
         self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
@@ -2684,6 +2689,26 @@ class TestPermsReads(Case):
                          {"repo": "demo", "pr": 7, "head": HEAD, "change": digest, "verdict": "DO-NOT-LAND",
                           "read": "perms"})
         self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
+
+    def test_a_handback_with_no_head_after_the_branch_moved_takes_back_the_earlier_land(self):
+        """perms' read of #1624: perms LANDs X, the branch moves to Y, and a HANDBACK with no --head is written at Y
+        only, so X's LAND still carried to a later head whose delta from X touched no security path."""
+        later = "c" * 40
+        real = (R.security_globs, R.delta_files)
+        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
+        R.security_globs = lambda root, base, repo: ["bin-private/"]
+        R.delta_files = lambda root, base, old, new: ["x.py"]
+        job = T.Job(repo="demo", pr=7, head=later, base_sha=BASE, digest=R.change_digest(DIFF),
+                    extra={"root": self.tmp})
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", self.OLD, head=self.OLD)[0], 0)
+        self.assertEqual(R.carried_from(job), self.OLD)   # with nothing handed back, X's LAND carries
+        land = self.ledger()
+        for word in ("HANDBACK", "DO-NOT-LAND"):
+            with open(R.perms_reads_path("demo"), "w") as f:
+                json.dump(land, f)
+            self.assertEqual(self.record_as(True, word, "--by", "perms", "--findings", "[security] x")[0], 0)
+            self.assertEqual([(e["verdict"], e["head"]) for e in self.ledger()], [("LAND", self.OLD), (word, HEAD)])
+            self.assertEqual(R.carried_from(job), "", word)
 
     def test_a_perms_record_says_what_to_do_when_the_ledger_will_not_take_it(self):
         with open(R.perms_reads_path("demo"), "w") as f:

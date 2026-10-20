@@ -148,7 +148,8 @@ interdiff() compares them: after a rebase only the PR's own paths, so main's oth
 them main changed between the two merge-bases) touches no path the base's security list matches (security_globs(),
 plan.select's own list). A delta that touches one, an old head that is gone, a compare git cannot make, or a
 manifest that will not load carries nothing. The LAND then names the old head in extra carried_from, so nobody takes it
-for a fresh read. Only review(), delta_review() and would_read() carry; perms_recorded() itself, and so
+for a fresh read. A LAND older than any non-LAND entry of the PR carries nothing, whatever head that entry names.
+Only review(), delta_review() and would_read() carry; perms_recorded() itself, and so
 lane.landed_at() and release, still want the head exact.
 `lander record ... --by perms` or `--by perms-*` is refused unless the calling Claude session works in the perms
 seat (perms_seat_caller()). The marker itself is only a comment and clears nothing; the ledger entry the perms
@@ -451,12 +452,19 @@ def carried_from(job):
     A path of this change on the base's list now that the old head's own base did not list (old_globs()) was never
     read as one, so it carries nothing either (perms' read of #1384: a glob main adds after the read, on a path
     the PR left alone). Only each head's newest entry counts (newest_reads): an old head whose LAND perms later
-    took back with a FIX carries nothing, and nothing carries to a head whose own newest entry is not a LAND."""
+    took back with a FIX carries nothing, and nothing carries to a head whose own newest entry is not a LAND.
+    Nor does a LAND older than any of this PR's newest non-LAND entries, at whatever head: a HANDBACK recorded with
+    no --head is written at the head the PR had then, which need not be the one perms read (perms' read of #1624:
+    LAND at X, the branch moved to Y, a HANDBACK written at Y, and X's LAND still carried to a later head)."""
     newest = newest_reads(perms_reads(job.repo)[0], job.repo, job.pr)
     if job.head in newest and newest[job.head].get("verdict", T.LAND) != T.LAND:
         return ""
-    olds = [h for h, e in newest.items()
-            if e.get("verdict", T.LAND) == T.LAND and re.fullmatch(r"[0-9a-f]{40}", h) and h != job.head]
+    olds = []
+    for h, e in newest.items():   # in the order perms appended them
+        if e.get("verdict", T.LAND) != T.LAND:
+            olds = []
+        elif re.fullmatch(r"[0-9a-f]{40}", h) and h != job.head:
+            olds.append(h)
     if not (olds and job.head):
         return ""
     root = root_of(job)
@@ -2092,7 +2100,8 @@ def _perms_ledger(job, seat, said, who, head):
     (perms' follow-up to its LAND on #1584: with no entry, the older LAND stood). Any other caller writes nothing
     there. The entry is for job.head, the PR's head now, so a LAND is written only when --head names that head in
     full: with no --head, perms' read of an earlier head would stand in the ledger for one it never read. A non-LAND
-    needs no full --head: it only holds a head, and the marker it goes with is posted at job.head too. The entry
+    needs no full --head: it only holds, the marker it goes with is posted at job.head too, and carried_from() lets
+    no LAND older than it carry, whichever head perms read. The entry
     says `read: perms` only for perms' own name, but perms_recorded ignores `read`, so a LAND recorded from the
     perms seat under any --by also counts as the security read: whoever reads from that seat is within perms'
     trust. -> the exit code."""

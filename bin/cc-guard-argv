@@ -6,7 +6,7 @@
   cc-guard-argv parse      the command on stdin as JSON lines: verb, argv, redirects, cwd after cd, nested-in, via.
   cc-guard-argv selfcheck  parser unit cases + every line of core/tests/guard-replay{,-pending}.jsonl in a fixture HOME.
 Env: GUARD_ROLE worker|member|pf (anything else: allowed; pf = the ungated tier, see below), HOME (or GUARD_HOME),
-GUARD_CWD, GUARD_ROOT (the tree this session writes, ':'-separated), GUARD_MWS (member workspace), GUARD_PSEAT=1 (the permission seat).
+GUARD_CWD, GUARD_ROOT (the tree this session writes, ':'-separated), GUARD_MWS (member workspace), GUARD_INB=1 (inside a member boundary: only then are ~/.cc/slack and ~/.cc/library/owner a member's to read), GUARD_PSEAT=1 (the permission seat).
 GUARD_NEVER_TOUCH (a file) replaces config/never-touch.txt; only the selfcheck sets it, and cc-guard unsets it.
 It only judges: nothing here launches a worker, dispatches or writes the board.
 recurring-defect-ok: pause-hold-missing — a judge that refuses `--go`; it never launches or writes the board
@@ -427,6 +427,9 @@ class Guard:
         g.secf = {H + '/.claude/.credentials.json', H + '/ccbox/env', H + '/.codex/auth.json', H + '/.config/cursor/auth.json'}
         g.secf |= {os.path.realpath(f) for f in g.secf}
         g.secd = [H + '/.cc/config', H + '/.ssh', H + '/.claude/settings.json', H + '/.cc/sandbox', H + '/.cc/members'] if g.role == 'member' else []
+        g.inb = env.get('GUARD_INB') == '1'   # inside a member boundary, as cc-guard decides it ($inb): never from $mws
+        if g.role == 'member' and not g.inb:   # the Slack copy and the owner's index: see secret_path in cc-guard
+            g.secd += [H + '/.cc/slack', H + '/.cc/library/owner']
         g.own = H + '/.cc/members/' + g.mws if g.mws else ''   # member isolation: its own record is its own
         g.allow = [d for d in g.root.split(':') + [H + '/dev/' + g.mws if g.mws else ''] if d]
         g.allow += [os.path.realpath(d) for d in g.allow]
@@ -436,6 +439,7 @@ class Guard:
         g.secx = [H + '/.cc/secrets']   # every role: the box's tokens, and any credentials.json / *.token under ~ (SECBASE)
         names = ['.credentials.json', 'credentials.json', 'ccbox/env', '.codex/auth.json', 'cursor/auth.json', '.cc/secrets']   # as body text
         names += ['.cc/config', '.ssh', '.claude/settings.json', '.cc/sandbox'] if g.role == 'member' else []
+        names += ['.cc/slack', '.cc/library/owner'] if g.role == 'member' and not g.inb else []
         g.secn = re.compile(r'(?<![\w.-])(' + '|'.join(map(re.escape, names)) + r')(?![\w.-])')
         seat = [d for d in glob.glob(H + '/.cc/state/*/perms') if os.path.isdir(d)]   # the seat's state as it stands now
         seat += [f for f in (H + '/.cc/state/handoff/perms.json', H + '/.cc/state/handoff/perms.brief') if os.path.exists(f)]
@@ -903,7 +907,49 @@ class Guard:
             return ws[:k] or [Word('.')]
         return []
 
+    def marker(g, q, cut=False, whole=False):   # q is a member marker (.cc/member-facing, .cc/member-workspace), or
+        # (whole: q is removed or moved away whole) a dir holding one; writing INTO a dir that holds one is not. cut: q
+        # is a glob's literal prefix, and a glob's own `*` never names a dot file, so only a prefix that already spells
+        # `.cc/`, `.cc/m…` or `.c…` can reach a marker.
+        names = ('member-facing', 'member-workspace')
+        holds = lambda d: any(os.path.lexists(os.path.join(d, '.cc', x)) for x in names)
+        slash, q = q.endswith('/'), q.rstrip('/')
+        d, b = os.path.split(q)
+        if os.path.basename(d) == '.cc' and (b.startswith('member-') or (cut and not slash and 'member-'.startswith(b))): return True
+        if b == '.cc' and (cut or whole) and holds(d): return True
+        if cut: return not slash and b.startswith('.') and '.cc'.startswith(b) and holds(d)
+        return whole and holds(q)
+
     def fence(g, R):   # the write fence, and a remove/move of a directory holding a protected place
+        # A MEMBER MARKER IS WRITTEN BY NO SESSION. .cc/member-facing and .cc/member-workspace decide a session's role
+        # and its workspace, and they sit in the session's own tree, so a member-facing session or a worker that could
+        # make, move or remove one would choose its own fence (perms, #937: "Refuse writes to .cc/member-* from
+        # sessions"). The host's provisioning tools write them; a session's command never does.
+        if g.role in ('member', 'worker'):
+            rms = g.rmtargets(R)
+            for w in g.wtargets(R) + rms:
+                if w.dyn: continue
+                if w in rms and os.path.basename(w.v.rstrip('/')) == '.cc': hit = True   # a whole .cc moved or removed away
+                elif w.glob:
+                    cut = re.split(r'[*?[]', w.v)[0]
+                    hit = g.marker(cut if cut.startswith('/') else os.path.join(R['cwd'], cut), cut=True)
+                else:
+                    a, whole = g.absp(w.v, R['cwd']), w in rms
+                    hit = g.marker(a, whole=whole) or g.marker(os.path.realpath(a), whole=whole)
+                if hit: return 'never', f'writing, moving or removing a member marker ({w.v}): .cc/member-facing and .cc/member-workspace are the host\'s to write'
+            # …nor cc-lib's caller records: cc-guard writes ~/.cc/library/owner/callers/<pid> for the session's claude
+            # (ccrec), and a session that wrote one would choose whether cc-lib shows it the owner's Slack copy.
+            cr = g.home + '/.cc/library/owner/callers'
+            for w in g.wtargets(R):
+                if w.dyn: continue
+                if w.glob:
+                    cut = re.split(r'[*?[]', w.v)[0]
+                    cut = cut if cut.startswith('/') else os.path.join(R['cwd'], cut)
+                    hit = cut.startswith(cr) or cr.startswith(cut)
+                else:
+                    a = g.absp(w.v, R['cwd'])
+                    hit = any(x == cr or x.startswith(cr + '/') for x in (a, os.path.realpath(a)))
+                if hit: return 'never', f'writing cc-lib\'s caller records ({w.v}): cc-guard writes them, and they decide who sees the Slack copy'
         for w in g.wtargets(R):
             if w.dyn and not w.v.startswith(g.home): continue
             if w.glob:
@@ -1539,7 +1585,7 @@ def selfcheck():
                 dflt = H + '/dev/' + mws if role == 'member' else base['GUARD_CWD']
                 fx = lambda p: p.replace('~', H, 1) if p.startswith('~') else p
                 env = {'HOME': H, 'GUARD_ROLE': role, 'GUARD_MWS': mws, 'GUARD_CWD': fx(c.get('cwd', dflt)),
-                       'GUARD_ROOT': fx(c.get('root', dflt)), 'GUARD_PSEAT': '1' if c.get('pseat') else '',
+                       'GUARD_ROOT': fx(c.get('root', dflt)), 'GUARD_PSEAT': '1' if c.get('pseat') else '', 'GUARD_INB': '1' if c.get('inb') else '',
                        'GUARD_NEVER_TOUCH': H + '/never-touch.txt'}
                 got = judge(c['cmd'], env)
                 if (got is not None) != (c['expect'] == 'refuse'):

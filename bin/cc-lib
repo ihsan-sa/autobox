@@ -108,8 +108,13 @@ own directory. registry.json (id → handle) is a cache for a person to read.
   and immutable for the life of the connection, re-read no source and say `scope workspace <h>` and `host-indexed`;
   `index` and `--touch` write nothing and exit 0 (the host indexes the workspace: its sweep and the write hooks, which
   the boundary's own cc-checkpoint already skips); tickets go to the session's tmpfs and end with it. A member-facing
-  session WITHOUT the boundary (.cc/member-facing, no bwrap) is unchanged by this: it reads what the host reads, and
-  closing that is the boundary project's (docs/design-member-git-boundary-2026-09-06.md), not the knowledge base's.
+  session WITHOUT the boundary (.cc/member-facing, no bwrap) reads what the host reads, except Slack: `ask` and `get`
+  show ~/.cc/slack sources only to a caller shown to be the owner, by the record cc-guard writes for the session's
+  claude before each Bash call (~/.cc/library/owner/callers/<pid>, which no session writes), and a member-facing
+  one sees only its own channel's (facing_fence), so the owner's DMs with the box and other members' chats stay
+  out of it. A call with no record (cron, a detached process, a terminal, a claude a session started itself) is
+  not shown to be the owner and sees no Slack either. The rest of closing that is the boundary project's
+  (docs/design-member-git-boundary-2026-09-06.md), not the knowledge base's.
 
 QUARANTINE (owner, 2026-10-03: an experiment's output must never shape another session). A member workspace whose
 host-side marker ~/.cc/members/<h>/quarantined is a regular file — beside workspace-id, under no bind of its boundary,
@@ -139,7 +144,9 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               human message received (kind note), titled `slack #<channel> <user> (<role>) <stamp>`; the chat id, the
               message ts and its thread's ts are exact ids, so `ask --object C0…|D0…|<ts>` finds a channel's words, a
               thread (root and every reply) or one message. <target> is the route's — a member handle's archive is
-              that workspace's, everything else the owner's; a `_`-prefixed target is a fixture and never read
+              that workspace's, everything else the owner's; a `_`-prefixed target is a fixture and never read.
+              ~/.cc/slack/history/<target>/<chat>/<YYYY-MM>.jsonl (cc-slack-history: every message, bots' and the
+              box's own too) is read the same way, and a message it holds is not read again from the archive
   board       rows (kind event, span rows/<name>), notes (kind note), log items (kind event)
   landing     ~/.cc/state/land/root/<repo>-<pr>.json (the review tally, kind finding), land/<repo>-<pr>.json (the
               job, kind event), land/queue.log (one event per line)
@@ -367,7 +374,8 @@ def quarantine_of(path):
     if not QUAR:
         return ""
     p = os.path.abspath(path)
-    for base in ((".cc", "state"), ("dev",), (".cc", "worktrees"), (".cc", "members"), (".cc", "slack", "archive")):
+    for base in ((".cc", "state"), ("dev",), (".cc", "worktrees"), (".cc", "members"), (".cc", "slack", "archive"),
+                 (".cc", "slack", "history")):
         b = os.path.join(H, *base) + "/"
         if p.startswith(b) and p[len(b):].split("/")[0] in QUAR:
             return p[len(b):].split("/")[0]
@@ -549,11 +557,13 @@ def registry():
         add(p, "memory")
     # the Slack daemon's inbound archive: ~/.cc/slack/archive/<target>/<chat>/<YYYY-MM>.jsonl — the target is the route's
     # (a repo, a member handle, box, unrouted) and carries the workspace; never under member/<h>, which is what a boundary binds
-    for p in sorted(glob.glob(os.path.join(H, ".cc", "slack", "archive", "*", "*", "*.jsonl"))):
-        tgt = os.path.basename(os.path.dirname(os.path.dirname(p)))
-        if tgt.startswith("_"):
-            continue
-        add(p, "slack", tgt)
+    # cc-slack-history's full copy, ~/.cc/slack/history/<target>/<chat>/<YYYY-MM>.jsonl, is the same line with more on it;
+    # both are read, and an archive month leaves out the messages its twins hold (slack_twins), so nothing is twice
+    for tree in ("history", "archive"):
+        for p in sorted(glob.glob(os.path.join(H, ".cc", "slack", tree, "*", "*", "*.jsonl"))):
+            tgt = os.path.basename(os.path.dirname(os.path.dirname(p)))
+            if not tgt.startswith("_"):
+                add(p, "slack", tgt)
     land = os.path.join(H, ".cc", "state", "land")
     for p in sorted(glob.glob(os.path.join(land, "root", "*.json"))):
         add(p, "land-root", os.path.basename(p)[:-5].rsplit("-", 1)[0])
@@ -576,6 +586,35 @@ def excluded(path):
     """The name policy: a path whose own name says it holds a secret is never opened, whatever list it is on."""
     b = os.path.basename(path)
     return bool(SECRET_NAME.search(b)) or (bool(TOKEN_NAME.search(b)) and not b.endswith(".md")) or "/.cc/config" in path
+
+
+def slack_twins(path):
+    """An archive month's twins: cc-slack-history's file of the same chat and month, under any target, that this tool
+    reads (not a fixture, not quarantined, not over MAX_SOURCE). A twin stands in for the archive message by message,
+    so what only the archive holds is still read, and a month too big to read takes nothing away from it."""
+    if not path.startswith(os.path.join(H, ".cc", "slack", "archive") + "/"):
+        return []
+    out = []
+    for p in sorted(glob.glob(os.path.join(H, ".cc", "slack", "history", "*", glob.escape(os.path.basename(os.path.dirname(path))),
+                                           glob.escape(os.path.basename(path))))):
+        try:
+            if not os.path.basename(os.path.dirname(os.path.dirname(p))).startswith("_") and not quarantine_of(p) \
+                    and not excluded(p) and os.path.isfile(p) and os.path.getsize(p) <= MAX_SOURCE:
+                out.append(p)
+        except OSError:
+            pass
+    return out
+
+
+def cursor(path):
+    """A source's (size, mtime), which says it moved. An archive month's takes in its twins', since they decide which of
+    its messages it holds: their sizes are added and the newest mtime is kept."""
+    st = os.stat(path)
+    size, mt = st.st_size, st.st_mtime_ns
+    for p in slack_twins(path):
+        t = os.stat(p)
+        size, mt = size + t.st_size, max(mt, t.st_mtime_ns)
+    return size, mt
 
 
 # ── parsers: a file -> records at the grain a reader wants back ───────────────────────────────────────────────
@@ -878,7 +917,16 @@ def parse_failures(path, text, repo):
 def parse_slack(path, text):
     """One record per inbound Slack message (kind note): the daemon's archive line carries ts, thread_ts, chat, channel,
     user, role, target, text. The chat id, the message ts and its thread's ts go in the id column, so `ask --object`
-    with any of the three finds the message — the thread's ts finds the root and every reply."""
+    with any of the three finds the message — the thread's ts finds the root and every reply. An archive month leaves
+    out a message one of its twins holds (slack_twins): that copy is the record."""
+    twin = set()
+    for p in slack_twins(path):
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    twin.add(str(json.loads(line).get("ts") or ""))
+                except (ValueError, AttributeError):
+                    pass
     recs = []
     for i, line in enumerate(text.split("\n")):
         if not line.strip():
@@ -890,6 +938,8 @@ def parse_slack(path, text):
         if not isinstance(d, dict):
             continue
         ts, th = str(d.get("ts") or ""), str(d.get("thread_ts") or d.get("ts") or "")
+        if ts and ts in twin:
+            continue
         try:
             stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(float(ts)))
         except (ValueError, OverflowError, OSError):
@@ -1067,6 +1117,103 @@ def db(path=None, wal=True):
     raise RuntimeError("cc-lib: could not create the index")
 
 
+CALLER = None   # the selfcheck's stand-in for caller(): (owner, facing dir). Never read from the environment.
+
+
+def callers_dir():
+    """Where cc-guard records who each session's claude is. Under the account's home as the password database names
+    it, never $HOME: a session sets $HOME for a command it runs, and `HOME=<a dir it writes> cc-lib ask` would read a
+    record it wrote itself. CALLERS is the selfcheck's stand-in, set in-process, never from the environment."""
+    if CALLERS is not None:
+        return CALLERS
+    import pwd
+    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".cc", "library", "owner", "callers")
+
+
+CALLERS = None
+
+
+def caller_claude():
+    """The nearest ancestor process named claude, or None: the session this call runs under."""
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        if comm == "claude":
+            return pid
+        pid = ppid
+    return None
+
+
+def caller():
+    """Is the caller shown to be the owner? → (True, None); a member-facing session of channel <h> → (False, h); anything
+    else → (False, None). cc-lib does not work this out itself: the process tree, a claude's env and its cwd are all
+    things a member-facing session can arrange for a process it starts (perms, #937, round 3). cc-guard does, from
+    the claude that launched the hook, and records it before every Bash call in ~/.cc/library/owner/callers/<pid>
+    (callers_dir: the passwd home, not $HOME) as "<start time> owner" or "<start time> member <h>" (see ccrec in
+    cc-guard). Here the nearest claude above this call only names WHICH record to read: a stand-in claude has none,
+    a reused pid has another start time, and a record that is missing, unreadable, a link, in a dir that is a link
+    or that others can write, or of any other shape is not the owner. No claude above it (a cron job, a detached
+    process, a terminal) is not shown to be the owner either."""
+    if CALLER is not None:
+        return CALLER
+    pid = caller_claude()
+    if not pid:
+        return False, None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read().rsplit(")", 1)[1].split()[19]
+        dfd = os.open(callers_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            ds = os.fstat(dfd)
+            if ds.st_uid != os.getuid() or ds.st_mode & 0o022:
+                return False, None
+            fd = os.open(str(pid), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd) as f:
+            rec = f.read(256).split()
+    except (OSError, IndexError):
+        return False, None
+    if len(rec) < 2 or rec[0] != st:
+        return False, None
+    if rec[1:] == ["owner"]:
+        return True, None
+    if rec[1] == "member" and len(rec) <= 3:
+        return False, (rec[2] if len(rec) == 3 else None)
+    return False, None
+
+
+def facing_fence(c):
+    """THE SLACK COPY IS THE OWNER'S. ~/.cc/slack holds both sides of every chat: the owner's DMs with the box (target
+    box) and every member's channels and DMs (their handles). FAIL CLOSED: unless caller() shows the caller is the
+    owner, `sources` on its connection becomes a TEMP view that leaves out every Slack source but a member-facing
+    session's own channel's (the target named after its dir). The index itself is untouched. Called after the
+    reconcile, so nothing is ever written through the view. cc-guard refuses a member-facing session outside a
+    boundary a direct read of ~/.cc/slack. perms, #937: "Make cc-lib fail closed: hide Slack sources unless it can
+    show the caller is the owner"."""
+    if member_mode():
+        return
+    owner, facing = caller()
+    if owner:
+        return
+    own = os.path.basename(facing) if facing else ""
+    slack = os.path.join(H, ".cc", "slack") + os.sep
+
+    def seen(path):   # <tree>/<target>/<chat>/<month>.jsonl under ~/.cc/slack: only the session's own target
+        if not (path or "").startswith(slack):
+            return 1
+        parts = path[len(slack):].split(os.sep)
+        return 1 if own and len(parts) > 2 and parts[1] == own else 0
+    c.create_function("cc_seen", 1, seen, deterministic=True)
+    c.execute("CREATE TEMP VIEW IF NOT EXISTS sources AS SELECT * FROM main.sources WHERE cc_seen(path)")
+
+
 def db_ro(path):
     """A member's connection: the workspace's file as the host left it, read-only and IMMUTABLE — no lock is taken and
     no -wal or -shm is looked for or made, which a read-only bind could not take anyway; the host never writes the
@@ -1195,15 +1342,15 @@ def index_source(c, path, skind, repo, track, rows):
     over an unchanged body is found by its new words), a new text is inserted, a text that is gone is deleted.
     That is what makes an `ask` cheap on a board whose log grows by five items an hour: five inserts, not 5,800
     (a whole re-insert measured 7 s on this box's board).
-    The cursor is (size, mtime): a truncated or rewritten file differs on it and is re-read whole."""
-    st = os.stat(path)
+    The cursor is (size, mtime) (cursor()): a truncated or rewritten file differs on it and is re-read whole."""
+    size, mtime = cursor(path)
     sid = hashlib.sha1(path.encode()).hexdigest()[:8]
     try:
         recs = parse(path, skind, repo, track, rows)
     except (OSError, ValueError, UnicodeError) as e:
         c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, ws) VALUES (?,?,?,?,?,?,?,?,?) "
                   "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
-                  "status=excluded.status, ws=excluded.ws", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), f"unreadable: {e}", ws_of(skind, repo)))
+                  "status=excluded.status, ws=excluded.ws", (path, skind, repo, track, size, mtime, now_iso(), f"unreadable: {e}", ws_of(skind, repo)))
         if skind == "results":   # QUARANTINE: a results file that is no longer numbers-only keeps not even its old numbers
             c.execute("DELETE FROM rids WHERE record_id IN (SELECT r.id FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path=?)", (path,))
             c.execute("DELETE FROM records WHERE source_id=(SELECT id FROM sources WHERE path=?)", (path,))
@@ -1212,7 +1359,7 @@ def index_source(c, path, skind, repo, track, rows):
     c.execute("BEGIN")
     c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, refused, ws) VALUES (?,?,?,?,?,?,?,'ok',0,?) "
               "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
-              "status='ok', refused=0, ws=excluded.ws", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), ws_of(skind, repo)))
+              "status='ok', refused=0, ws=excluded.ws", (path, skind, repo, track, size, mtime, now_iso(), ws_of(skind, repo)))
     source_id = c.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()[0]
     old = {}   # key -> (id, rid, ts, title, span, pos, prev, next, text)
     for row in c.execute("SELECT id, rid, ts, title, span, pos, prev, next, thash, text FROM records WHERE source_id=?", (source_id,)):
@@ -1303,10 +1450,10 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
             out["excluded"].append(p)
             continue
         try:
-            st = os.stat(p)
+            cur = cursor(p)
         except OSError:
             continue
-        if known.get(p) != (st.st_size, st.st_mtime_ns) or (qmoved and skind in ("docs", "land-queue")):
+        if known.get(p) != cur or (qmoved and skind in ("docs", "land-queue")):
             todo.append((p, skind, repo, track))
     live = set(p for p, *_ in reg) - set(out["excluded"])
     for p in set(known) - live:
@@ -1655,6 +1802,7 @@ def ask(argv):
                     if jp:
                         prefer.append(jp)
         cov = reconcile(c, deadline=RECONCILE_BUDGET, prefer=prefer, reg=reg)
+        facing_fence(c)
     live_lines, live_ok = [], False
     if live:
         name, path = live
@@ -1864,6 +2012,7 @@ def get(argv):
     else:
         T, turns = "-", 0
     c = db()
+    facing_fence(c)
     h = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
                   "FROM records r JOIN sources s ON s.id=r.source_id WHERE r.rid=?", (rid,)).fetchone()
     if not h:
@@ -1915,10 +2064,10 @@ def touch(paths):
             for src in reg:
                 if src[0].startswith(ap + "/") and not excluded(src[0]):
                     try:
-                        st = os.stat(src[0])
+                        cur = cursor(src[0])
                     except OSError:
                         continue
-                    if known.get(src[0]) != (st.st_size, st.st_mtime_ns):
+                    if known.get(src[0]) != cur:
                         todo.append(src)
         elif ap in by_path and not excluded(ap):
             todo.append(by_path[ap])      # named outright: re-read, the record grain keeps that cheap
@@ -2364,6 +2513,7 @@ def selfcheck():
     th = tempfile.mkdtemp(prefix="cclib-sc-")
     H0 = H
     H = th
+    CALLER0, globals()["CALLER"] = CALLER, (True, None)   # the selfcheck runs as the owner; the fence case sets its own
     try:
         def w(rel, text):
             p = os.path.join(th, rel)
@@ -2710,6 +2860,7 @@ def selfcheck():
         selfcheck_quarantine(ok, run)
     finally:
         H = H0
+        globals()["CALLER"] = CALLER0
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-lib selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
@@ -2915,6 +3066,121 @@ def selfcheck_p3(th, ok, run, w):
     os.remove(oj)
     os.remove(osl)
     run("index")   # the narrowed registry above dropped every other source: bring the fixture index back whole
+
+    # ---- the full copy: cc-slack-history's chat-month stands in for the archive's, and the archive's other months stay
+    w(".cc/slack/archive/r1/C0HHHHHHHH1/2026-09.jsonl", json.dumps({"ts": "1789236000.000500", "chat": "C0HHHHHHHH1", "channel": "#h",
+      "user": "ada", "role": "owner", "target": "r1", "text": "the archive's PANGOLIN line"}) + "\n")
+    w(".cc/slack/archive/r1/C0HHHHHHHH1/2026-08.jsonl", json.dumps({"ts": "1787000000.000500", "chat": "C0HHHHHHHH1", "channel": "#h",
+      "user": "ada", "role": "owner", "target": "r1", "text": "an AUGUST line only the archive has"}) + "\n")
+    run("index")                                                      # the archive alone first, as on a box before the copy
+    w(".cc/slack/history/r1/C0HHHHHHHH1/2026-09.jsonl", json.dumps({"ts": "1789236000.000500", "thread_ts": "1789236000.000500",
+      "chat": "C0HHHHHHHH1", "channel": "#h", "user": "ada", "role": "owner", "target": "r1", "text": "the archive's PANGOLIN line",
+      "raw": {}}) + "\n" + json.dumps({"ts": "1789236100.000600", "thread_ts": "1789236100.000600", "chat": "C0HHHHHHHH1",
+      "channel": "#h", "user": "ci", "role": "bot", "target": "r1", "text": "a bot's TAPIR post", "raw": {}}) + "\n")
+    run("index")
+    c = db()
+    ok("the full copy is read under its target, a bot's post with it, and a message both trees hold is one record, not two",
+       c.execute("SELECT COUNT(*) FROM records WHERE text LIKE '%PANGOLIN%'").fetchone()[0] == 1
+       and c.execute("SELECT repo FROM records WHERE text LIKE '%TAPIR%'").fetchone() == ("r1",))
+    ok("…while the archive's month the copy does not hold is still read",
+       c.execute("SELECT COUNT(*) FROM records WHERE text LIKE '%AUGUST line%'").fetchone()[0] == 1)
+    c.close()
+
+    # ---- FAIL CLOSED: Slack sources only for a caller shown to be the owner, a member-facing session its own channel's
+    def fl(ts, chat, text):
+        return json.dumps({"ts": ts, "thread_ts": ts, "chat": chat, "channel": "#f", "user": "ada", "role": "owner", "text": text}) + "\n"
+    w(".cc/slack/history/box/D0OWNDM01/2026-10.jsonl", fl("1791000000.000100", "D0OWNDM01", "an OWNERDMWORD line"))
+    w(".cc/slack/history/ali/C0ALICHAN1/2026-10.jsonl", fl("1791000000.000200", "C0ALICHAN1", "a MEMBERCHATWORD line"))
+    w(".cc/slack/archive/ali/C0ALICHAN1/2026-10.jsonl", fl("1791000000.000300", "C0ALICHAN1", "an ARCHIVEDMEMBERWORD line"))
+    w(".cc/slack/history/helpdesk/C0HELPCHAN/2026-10.jsonl", fl("1791000000.000400", "C0HELPCHAN", "a HELPCHANWORD line"))
+    w("dev/helpdesk/.cc/member-facing", "")
+    run("index")
+    c = db()
+    dm = c.execute("SELECT rid FROM records WHERE text LIKE '%OWNERDMWORD%'").fetchone()
+    c.close()
+    words = ("OWNERDMWORD", "MEMBERCHATWORD", "ARCHIVEDMEMBERWORD", "HELPCHANWORD")
+    helpdesk, g_ = os.path.join(th, "dev", "helpdesk"), globals()
+    here, keep, probe = os.getcwd(), g_["CALLER"], g_["caller_claude"]
+    try:
+        os.chdir(th)
+        g_["CALLER"] = (True, None)
+        owner = [w_ in run("ask", "--need", "history", w_)[1] for w_ in words]
+        g_["CALLER"] = (False, helpdesk)
+        facing = [w_ in run("ask", "--need", "history", w_)[1] for w_ in words]
+        frc = run("get", dm[0])[0] if dm else 0
+        g_["CALLER"], g_["caller_claude"] = None, (lambda: None)   # no claude above the call: a cron job, a detached process
+        nobody = [w_ in run("ask", "--need", "history", w_)[1] for w_ in words]
+    finally:
+        os.chdir(here)
+        g_["CALLER"], g_["caller_claude"] = keep, probe
+    ok("Slack sources show only to a caller shown to be the owner: a member-facing session finds its own channel and "
+       "not the owner's DM or another member's chat in either tree and cannot `get` the DM by id, a call with no "
+       "claude above it finds none, and the owner finds all four", owner == [True] * 4
+       and facing == [False, False, False, True] and frc == 1 and nobody == [False] * 4)
+
+    # …and who the caller is comes from cc-guard's record, never from the process tree (perms at f2aec139): a stand-in
+    # `claude` (a script by that name, so its comm is claude) is a process a member-facing session can start, with no
+    # CC_ROLE and its cwd anywhere. With no record it is refused wherever it was launched, which f2aec139 got wrong
+    # outside the member-facing dir; a record of its own pid and start time, as the guard writes it, is what makes
+    # it the owner, a record with another start time (a reused pid) does not, and a member record sees its channel.
+    # The records are read under the passwd home, so the plain runs below, with HOME=th and a record under th, are a
+    # session's `HOME=<its dir> cc-lib ask` and must see nothing; the rest point CALLERS at th in-process.
+    import shutil
+    import subprocess
+    fake, cdir = os.path.join(th, "fakebin", "claude"), os.path.join(th, ".cc", "library", "owner", "callers")
+    w("fakebin/claude", '#!/bin/sh\numask 077\nm=$1; r=$2; w=$3; shift 3\nst=$(sed "s/.*) //" /proc/$$/stat | cut -d" " -f20)\n'
+      'case $m in\n  link) mkdir -p "$r.real"; echo "$st owner" > "$r.real/$$"; ln -s "$r.real" "$r";;\n'
+      '  none) ;;\n  *) mkdir -p "$r";;\nesac\ncase $m in\n  owner) echo "$st owner" > "$r/$$";;\n'
+      '  stale) echo "1 owner" > "$r/$$";;\n  member) echo "$st member helpdesk" > "$r/$$";;\n'
+      '  wide) echo "$st owner" > "$r/$$"; chmod 777 "$r";;\nesac\n(cd "$w" && exec "$@")\n')
+    os.chmod(fake, 0o700)
+    env = {k: v for k, v in os.environ.items() if k not in ("CC_ROLE", "CC_MEMBER_SANDBOX")}
+    env["HOME"] = th
+    wrap = ("import sys, types; p = sys.argv[1]; m = types.ModuleType('cclib'); m.__file__ = p; "
+            "exec(compile(open(p).read(), p, 'exec'), m.__dict__); m.CALLERS = sys.argv[2]; sys.exit(m.main(sys.argv[3:]))")
+
+    def under(mode, launch, word="OWNERDMWORD", via=True):
+        me = os.path.abspath(__file__)
+        lib = [sys.executable, "-I", "-c", wrap, me, cdir] if via else [sys.executable, "-I", me]
+        try:
+            r = subprocess.run([fake, mode, cdir, launch] + lib + ["ask", "--need", "history", word], env=env,
+                               capture_output=True, text=True, timeout=120)
+            return word in r.stdout
+        finally:
+            if os.path.islink(cdir):
+                os.unlink(cdir)
+            shutil.rmtree(cdir, ignore_errors=True)
+            shutil.rmtree(cdir + ".real", ignore_errors=True)
+    bare = (under("none", th), under("none", helpdesk), under("none", th, via=False))
+    ok("a claude a member-facing session started itself, with no CC_ROLE and launched outside the member-facing dir or "
+       "in it, has no guard record and sees no owner DM", bare == (False, False, False))
+    ok("…and a record it wrote under a HOME it chose (HOME=<its dir> cc-lib ask) is not read: the records live under "
+       "the passwd home", under("owner", th, via=False) is False)
+    ok("…while a record of its pid and start time as the guard writes it shows the owner, one with another start time "
+       "does not, one in a dir others can write or reached through a link does not, and a member record finds its "
+       "own channel and not the owner's DM",
+       under("owner", th) is True and under("stale", th) is False and under("wide", th) is False
+       and under("link", th) is False and under("member", th) is False and under("member", th, "HELPCHANWORD") is True)
+
+    def hl(ts, chat, text):
+        return json.dumps({"ts": ts, "thread_ts": ts, "chat": chat, "channel": "#h", "user": "ada", "role": "owner", "target": "r1",
+                           "text": text}) + "\n"
+    w(".cc/slack/archive/r1/C0HHHHHHHH2/2026-09.jsonl", hl("1789236000.000700", "C0HHHHHHHH2", "a DINGO line both hold")
+      + hl("1789236900.000800", "C0HHHHHHHH2", "a QUOKKA line the daemon wrote after the copy's last pass"))
+    w(".cc/slack/history/r1/C0HHHHHHHH2/2026-09.jsonl", hl("1789236000.000700", "C0HHHHHHHH2", "a DINGO line both hold"))
+    w(".cc/slack/archive/r1/C0HHHHHHHH3/2026-09.jsonl", hl("1789236000.000900", "C0HHHHHHHH3", "a WOMBAT line"))
+    big = w(".cc/slack/history/r1/C0HHHHHHHH3/2026-09.jsonl", hl("1789236000.000900", "C0HHHHHHHH3", "a WOMBAT line")
+            + hl("1789236001.000900", "C0HHHHHHHH3", "x" * MAX_SOURCE))
+    run("index")
+    c = db()
+    ok("a month both trees hold in part: the message both hold is one record, and the one only the archive holds is read",
+       c.execute("SELECT COUNT(*) FROM records WHERE text LIKE '%DINGO%'").fetchone()[0] == 1
+       and c.execute("SELECT COUNT(*) FROM records WHERE text LIKE '%QUOKKA%'").fetchone()[0] == 1)
+    ok("…and a copy's month over the 4 MiB cc-lib reads takes nothing from the archive's: its messages are found once",
+       c.execute("SELECT COUNT(*) FROM records WHERE text LIKE '%WOMBAT%'").fetchone()[0] == 1
+       and c.execute("SELECT status FROM sources WHERE path LIKE '%history/r1/C0HHHHHHHH3/2026-09%'").fetchone()[0] != "ok")
+    c.close()
+    os.remove(big)                                                    # an unreadable source would lead the live checks' coverage
 
     # ---- the cold set: what would leave the hot index, and nothing leaves
     with open(os.path.join(th, ".cc", "boards", "r1.json")) as f:
@@ -3197,7 +3463,7 @@ def selfcheck_docs(th, ok, run, w):
 def selfcheck_quarantine(ok, run):
     """QUARANTINE, on a HOME of its own (no earlier case's state): a quarantined workspace qx, a workspace wsk and a
     repo qx-two whose memory dir shares qx's prefix. A probe word in each of qx's journal, task, doc, board note, memory
-    (its ~/dev dir and a worktree's), Slack archive, landing record, queue line and register document is found before
+    (its ~/dev dir and a worktree's), Slack archive and copy, landing record, queue line and register document is found before
     the mark and absent after it; wsk's and qx-two's stay found; only a numbers-only results.json crosses out."""
     import shutil
     import tempfile
@@ -3222,6 +3488,8 @@ def selfcheck_quarantine(ok, run):
             w(f"dev/{h}/docs/d.md", f"# doc\n\n## sec\n{P}{h}doc.\n")
             w(f".cc/slack/archive/{h}/C0AAAAAAAA/2026-10.jsonl",
               json.dumps({"ts": "1791010630.554129", "user": "U1", "role": "owner", "channel": h, "text": f"{P}{h}slack"}) + "\n")
+            w(f".cc/slack/history/{h}/C0AAAAAAAB/2026-10.jsonl",
+              json.dumps({"ts": "1791010631.554129", "user": "U1", "role": "owner", "channel": h, "text": f"{P}{h}slackcopy"}) + "\n")
             w(f".cc/state/land/{h}-7.json", json.dumps({"repo": h, "pr": 7, "stage": "landed", "track": f"{P}{h}land"}))
         w(".cc/boards/qx-two.json", json.dumps({"repo": "qx-two", "path": os.path.join(th, "dev", "qx-two"), "tracks": {}, "log": []}))
 
@@ -3240,14 +3508,14 @@ def selfcheck_quarantine(ok, run):
                              "revisions": [{"rev": "A", "file": "f.pdf", "date": "2026-10-03"}]},
                 "902-0001": {"number": "902-0001", "project": "902", "member": "wsk", "title": f"{P}wskdocument",
                              "revisions": [{"rev": "A", "file": "g.pdf", "date": "2026-10-03"}]}}}))
-        qx_words = ["qxnote", "qxjournal", "qxtask", "qxdoc", "qxslack", "qxland", "qxdevmem", "qxwtmem", "qxqueue", "qxdocument"]
+        qx_words = ["qxnote", "qxjournal", "qxtask", "qxdoc", "qxslack", "qxslackcopy", "qxland", "qxdevmem", "qxwtmem", "qxqueue", "qxdocument"]
         kept = ["wsknote", "wskjournal", "wskdoc", "wskdevmem", "wskqueue", "wskdocument", "qxtwodevmem"]
 
         def found(word):
             return P + word in run("ask", "--need", "history", P + word)[1]
         run("index")
         before = [x for x in qx_words if not found(x)]
-        ok("quarantine: before the mark, every one of qx's ten probes is found (the fixture is read)"
+        ok("quarantine: before the mark, every one of qx's eleven probes is found (the fixture is read)"
            + (f" — missing {before}" if before else ""), not before)
         rc, o = run("quarantine", "nosuch")
         ok("quarantine: a handle that is not a member workspace is refused and nothing is marked",
@@ -3265,7 +3533,7 @@ def selfcheck_quarantine(ok, run):
         rc, o = run("index")
         ok("quarantine: `index` names the quarantined workspace", rc == 0 and "quarantined 1: qx" in o)
         leaked = [x for x in qx_words if found(x)]
-        ok("quarantine: after the mark and one index, none of qx's ten probes is found by an owner ask"
+        ok("quarantine: after the mark and one index, none of qx's eleven probes is found by an owner ask"
            + (f" — leaked {leaked}" if leaked else ""), not leaked)
         lost = [x for x in kept if not found(x)]
         ok("quarantine: wsk's probes and qx-two's memory (a dir sharing qx's prefix) are still found"

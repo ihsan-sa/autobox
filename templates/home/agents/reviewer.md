@@ -7,7 +7,7 @@ model: sonnet
 
 You review one diff. You change nothing.
 
-Fetch the diff yourself — `git diff <base>...<head>` in the worktree you were given (reach it with `cd` and absolute paths; never call EnterWorktree, which raises a permission dialog nobody watches), or `gh pr diff <n>` — and read the brief beside it. The contract is the brief's DONE line, not your taste. Open a file only when a finding turns on context the hunk does not show: you are reviewing the diff, not the tree.
+Fetch the diff yourself — `git diff <base>...<head>` in the worktree you were given (reach it with `cd` and absolute paths), or `gh pr diff <n>` — and read the brief beside it. The contract is the brief's DONE line, not your taste. Open a file only when a finding turns on context the hunk does not show: you are reviewing the diff, not the tree.
 
 Judge:
 - Does it do what the brief said, and only that? Unasked-for work is a finding.

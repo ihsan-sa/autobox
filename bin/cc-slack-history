@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""cc-slack-history — the box's own complete copy of its Slack workspace, kept current.
+
+WHY. A workspace without a paid plan hides every message older than 90 days, and the daemon's inbound archive
+(cc-slack's archive_in) holds only the human messages it accepted, from the day it started writing them. This copy
+holds everything the bot can read: every message (people, other bots and the box's own posts), every thread reply
+and every attached file, in every public and private channel the bot is in, every DM and group DM, and the archived
+channels it can still read, back to the workspace's first message.
+
+WHERE. ~/.cc/slack/history/<target>/<chat>/<YYYY-MM>.jsonl, beside the inbound archive and in its line format (ts,
+thread_ts, chat, channel, user, role, target, text, at) plus user_id, subtype, files and raw, the message exactly as
+Slack returned it. One parser in cc-lib reads both trees, message by message: a line this copy holds in a chat-month
+stands in for the archive's line of the same ts in that chat and month, and the archive's other lines are still read. role is owner, member, bot (another app) or box (this app's own posts).
+<target> is chosen once per conversation and then kept in state.json:
+  1. a member's channel, its lanes (members.json chan_id/updates_id, or a name whose lane base is the handle) and a
+     DM with that member's user → the member's handle, so a workspace's messages never land under another target;
+  2. a sub-orch channel (orchs.json) → its target's repo;
+  3. the target the inbound archive already files the chat under (its top directory, `unrouted` aside);
+  4. a DM or group DM → box;
+  5. routes.json by chat id or #name → that repo;
+  6. the channel's own name with a -updates/-threads/-ask lane and a --track stripped, when ~/dev has that repo;
+  7. unrouted.
+Only the repo part is ever used and `member` never is, so nothing lands under member/<h>, which a boundary binds.
+Attached files go to <chat>/files/<file id>-<name>, up to --file-cap bytes (100 MiB). A file over the cap, hidden,
+deleted, external or that fails to download is noted on its message and logged ONCE in history/skipped.log.
+Once a day (FILES_EVERY) a finished conversation's files.list is read too, and a file it lists that no held message
+carries (a canvas, or a file whose message the channel's history no longer shows) is kept the same way and noted in
+state.json as one of the chat's loose files. A canvas is kept as <file id>-<updated>-<name>.html, one file per edit.
+Directories are 0700 and files 0600.
+
+HOW. Read-only against Slack: auth.test, users.list, conversations.list/history/replies, files.list
+and file downloads,
+which carry the bot token to files.slack.com alone and never across a redirect; it never joins, posts or asks for a scope. A conversation the bot cannot read (a public channel
+it is not in) is recorded in state.json as unreachable and skipped. Per conversation and pass:
+  · BACKFILL pages newest→oldest to the first message, saving the page cursor after each page, so a pass cut short
+    by --budget resumes where it stopped;
+  · then INCREMENT: what is newer than the newest message held. Once an hour (RESCAN_EVERY) the read reaches back
+    WINDOW_DAYS (30) instead, so an edit or a late file is picked up, and once a day (DEEP_EVERY) it reaches back to
+    the conversation's first message. A history page of 1000 roots is one call, so that costs a few calls a
+    conversation, and it shows every root's latest_reply, so a reply to a root of any age is seen within a day,
+    the first reply to a root that had none included;
+  · a thread is read when its root is first seen and again only when the root's latest_reply passes what is held;
+  · then REVISIT: up to REVISIT (30) held threads a pass are read again in full, the one read longest ago first and
+    none read in the last REVISIT_EVERY (a day), so an edit or a file added to a reply already held, which moves no
+    latest_reply, is picked up too. A thread Slack refuses is noted with the refusal and goes to the back of the
+    queue like one that was read, so it never holds up the threads behind it. When each thread was last read in full
+    is kept in state.json.
+A record that changed is rewritten in place (one rewrite of its month file, atomic); one that did not is left alone.
+Conversations whose backfill is finished go first, so a pending backfill never holds up new messages.
+Web API calls are spaced PACE seconds apart (1.2, so 50 a minute) and a 429 waits its Retry-After. Measured on this
+app: bursts of 150 conversations.history and 150 conversations.replies calls went through in about 4 s each, but a
+backfill held at two calls a second drew nine 429s in 760 calls. So the pace is Slack's Tier 3 rate, which the Slack
+daemon spends from the same per-method budget, and a burst is left to the daemon. One pass at a time: a second
+waits for nothing and says so.
+
+usage:
+  cc-slack-history pass [--budget SECONDS] [--file-cap BYTES]
+                         backfill what is not held, then read what is new (default budget 1800 s)
+  cc-slack-history report [--live]
+                         one row per conversation: messages, threads and files kept; --live sets beside them what Slack
+                         reports now (a full re-read that writes nothing)
+  cc-slack-history selfcheck
+cc-reconcile.service runs `pass --budget 240` on its 20-minute tick.
+"""
+import collections
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
+DEV = f"{HOME}/dev"
+BIN = os.path.dirname(os.path.realpath(__file__))
+PACE = 1.2
+WINDOW_DAYS = 30
+RESCAN_EVERY = 3600
+DEEP_EVERY = 86400
+FILES_EVERY = 86400
+REVISIT, REVISIT_EVERY = 30, 86400
+FILE_CAP = 100 * 2 ** 20
+FILE_HOSTS = ("files.slack.com",)   # the only hosts a download carries the bot token to
+TYPES = "public_channel,private_channel,mpim,im"
+LANES = ("-updates", "-threads", "-ask")
+CHAT_RE = re.compile(r"[A-Z0-9]+\Z")
+SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*\Z")
+now = time.time            # the selfcheck swaps in a clock of its own
+URLOPEN = urllib.request.urlopen
+
+
+def hist():
+    return f"{DIR}/history"
+
+
+class SlackError(Exception):
+    pass
+
+
+class Slack:
+    """The Web API, read-only, paced, and patient with a 429."""
+
+    def __init__(self, token, pace=PACE):
+        self.token, self.pace, self.last, self.calls, self.limited = token, pace, 0.0, 0, 0
+
+    def call(self, method, **params):
+        for attempt in range(6):
+            wait = self.last + self.pace - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self.last = time.time()
+            self.calls += 1
+            req = urllib.request.Request(f"https://slack.com/api/{method}?" + urllib.parse.urlencode(params))
+            req.add_unredirected_header("Authorization", f"Bearer {self.token}")
+            try:
+                with URLOPEN(req, timeout=60) as r:
+                    d = json.load(r)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    self.limited += 1
+                    time.sleep(int((e.headers or {}).get("Retry-After") or 30))
+                    continue
+                raise SlackError(f"{method}: http {e.code}")
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                raise SlackError(f"{method}: {e}")
+            if not d.get("ok"):
+                if d.get("error") == "ratelimited":
+                    self.limited += 1
+                    time.sleep(30)
+                    continue
+                raise SlackError(str(d.get("error") or "not ok"))
+            return d
+        raise SlackError(f"{method}: rate limited six times running")
+
+    def download(self, url, dest, cap):
+        """Fetch a private file to dest (0600, through a .part file). None when kept, else why it was not."""
+        tmp = dest + ".part"
+        try:   # a malformed URL (a bad port, a broken IPv6 literal) raises here, and is a skip like any other
+            u = urllib.parse.urlsplit(url)
+            host = u.hostname or ""
+        except ValueError as e:
+            return f"not a URL this tool reads ({e}), so the token is not sent there"
+        # perms, #937: "allow token-bearing downloads only to Slack's file hosts, and use add_unredirected_header"
+        if u.scheme != "https" or host not in FILE_HOSTS:
+            return f"not on a Slack file host ({host or url[:60]}), so the token is not sent there"
+        # an unredirected header is sent to this host only; urllib would otherwise carry it across a redirect
+        req = urllib.request.Request(url)
+        req.add_unredirected_header("Authorization", f"Bearer {self.token}")
+        try:
+            with URLOPEN(req, timeout=300) as r:
+                ctype = (r.headers or {}).get("Content-Type") or ""
+                # a canvas is HTML itself, so for one the sign is Slack's sign-in redirect (…?redir=/files-pri/…)
+                if "text/html" in ctype and (not dest.lower().endswith((".html", ".htm"))
+                                             or "redir=" in (r.geturl() if hasattr(r, "geturl") else "")):
+                    return "Slack answered with a web page, not the file"
+                n = 0
+                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                    while True:
+                        b = r.read(1 << 20)
+                        if not b:
+                            break
+                        n += len(b)
+                        if n > cap:
+                            raise SlackError(f"over the cap of {cap} bytes while downloading")
+                        f.write(b)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+            return None
+        except (SlackError, urllib.error.URLError, OSError, ValueError) as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return f"download failed: {e}"
+
+
+# ── files on disk ──────────────────────────────────────────────────────────────────────────────────────────────
+
+def mkdir(d):
+    """d and every parent up to the history root, 0700 (makedirs' mode is masked and skips existing parents). A
+    symlink anywhere from the root down to d is refused (OSError), never followed: a link planted in the tree would
+    otherwise take the chmod and every file written under it somewhere else."""
+    root = os.path.abspath(hist())
+    d = os.path.abspath(d)
+    if d != root and not d.startswith(root + os.sep):
+        raise OSError(f"{d} is not under the history root {root}")
+    os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
+    parts = [] if d == root else d[len(root) + 1:].split(os.sep)
+    p = root
+    for part in [None] + parts:
+        p = p if part is None else os.path.join(p, part)
+        if os.path.islink(p):
+            raise OSError(f"{p} is a symlink; the history tree follows none")
+        try:
+            os.mkdir(p, 0o700)
+        except FileExistsError:
+            pass
+        if os.path.islink(p) or not os.path.isdir(p):
+            raise OSError(f"{p} is not a plain directory")
+        os.chmod(p, 0o700)
+
+
+def write_atomic(path, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def read_month(path):
+    """ts → record, in file order."""
+    held = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("ts"):
+                    held[str(d["ts"])] = d
+    except OSError:
+        pass
+    return held
+
+
+def month_of(ts):
+    return time.strftime("%Y-%m", time.gmtime(float(ts)))
+
+
+def same(a, b):
+    """Two records say the same, apart from when they were read and the block_id Slack makes up afresh on every read
+    of a message that has no blocks of its own (measured: 99 of 200 messages differed by that alone, read twice)."""
+    def plain(x):
+        if isinstance(x, dict):
+            return {k: plain(v) for k, v in x.items() if k not in ("at", "block_id")}
+        if isinstance(x, list):
+            return [plain(v) for v in x]
+        return x
+    return plain(a) == plain(b)
+
+
+def store(target, chat, recs):
+    """Merge records into their month files, one rewrite per month that changed. Returns (new, changed)."""
+    by = collections.defaultdict(list)
+    for r in recs:
+        by[month_of(r["ts"])].append(r)
+    new = changed = 0
+    for mon, rs in by.items():
+        d = f"{hist()}/{target}/{chat}"
+        mkdir(d)
+        p = f"{d}/{mon}.jsonl"
+        held, dirty = read_month(p), False
+        for r in rs:
+            old = held.get(r["ts"])
+            if old is None:
+                new += 1
+            elif same(old, r):
+                continue
+            else:
+                changed += 1
+            held[r["ts"]] = r
+            dirty = True
+        if dirty:
+            lines = sorted(held.values(), key=lambda x: float(x["ts"]))
+            write_atomic(p, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
+    return new, changed
+
+
+# ── which target a conversation belongs to ─────────────────────────────────────────────────────────────────────
+
+def top(t):
+    t = str(t or "").split("/")[0].split("@")[0]
+    return t if SAFE.match(t) and t != "member" and not t.startswith("_") else ""
+
+
+def lane_base(name):
+    n = (name or "").lower().lstrip("#")
+    for s in LANES:
+        if n.endswith(s):
+            n = n[:-len(s)]
+            break
+    return n.split("--")[0]
+
+
+def archive_target(chat):
+    """The top directory the inbound archive files this chat under most often (`unrouted` aside), or ''."""
+    n = collections.Counter()
+    for p in glob.glob(f"{DIR}/archive/*/{chat}/*.jsonl") + glob.glob(f"{DIR}/archive/*/*/{chat}/*.jsonl"):
+        t = top(os.path.relpath(p, f"{DIR}/archive"))
+        if t and t != "unrouted":
+            n[t] += 1
+    return n.most_common(1)[0][0] if n else ""
+
+
+def target_of(conv):
+    chat, name = conv["id"], (conv.get("name") or "").lower()
+    base = lane_base(name)
+    members = load_json(f"{DIR}/members.json", {})
+    for h, e in members.items():
+        if not isinstance(e, dict):
+            continue
+        if chat in (e.get("chan_id"), e.get("updates_id")) or (base and base == h.lower()) \
+                or (conv.get("is_im") and conv.get("user") and conv.get("user") == e.get("uid")):
+            return top(h) or "unrouted"
+    o = load_json(f"{DIR}/orchs.json", {}).get(chat)
+    if isinstance(o, dict) and top(o.get("target")):
+        return top(o["target"])
+    a = archive_target(chat)
+    if a:
+        return a
+    if conv.get("is_im") or conv.get("is_mpim"):
+        return "box"
+    routes = load_json(f"{DIR}/routes.json", {})
+    r = top(routes.get(chat) or routes.get("#" + name))
+    if r:
+        return r
+    if top(base) and os.path.isdir(f"{DEV}/{top(base)}"):
+        return top(base)
+    return "unrouted"
+
+
+def label(conv):
+    if conv.get("is_im"):
+        return "dm"
+    return "#" + (conv.get("name") or conv["id"])
+
+
+def readable(conv):
+    return bool(conv.get("is_im") or conv.get("is_mpim") or conv.get("is_member"))
+
+
+# ── one message as a record ────────────────────────────────────────────────────────────────────────────────────
+
+def role_of(m, ctx):
+    if (ctx["bot_id"] and m.get("bot_id") == ctx["bot_id"]) or (ctx["bot_user"] and m.get("user") == ctx["bot_user"]):
+        return "box"
+    if m.get("bot_id") or m.get("subtype") == "bot_message":
+        return "bot"
+    return "owner" if ctx["owner"] and m.get("user") == ctx["owner"] else "member"
+
+
+def fold(m):
+    text = m.get("text") or ""
+    for a in m.get("attachments") or []:
+        extra = (a.get("fallback") or a.get("text") or "") if isinstance(a, dict) else ""
+        if extra and extra not in text:
+            text += "\n" + extra
+    for f in m.get("files") or []:
+        if isinstance(f, dict):
+            text += f"\n[file {f.get('name') or f.get('title') or f.get('id')}]"
+    return text.strip()
+
+
+def keep_files(sl, m, chat, target, ctx, st):
+    out = []
+    for f in m.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        fid = re.sub(r"[^A-Za-z0-9]", "", str(f.get("id") or ""))
+        e = {"id": fid, "name": f.get("name") or f.get("title") or "", "size": f.get("size")}
+        url = f.get("url_private_download") or f.get("url_private")
+        reason = None
+        if f.get("mode") in ("tombstone", "hidden_by_limit"):
+            reason = f"Slack shows it as {f['mode']}"
+        elif f.get("mode") == "external" or f.get("is_external"):
+            reason = "an external file, which Slack does not hold"
+        elif not url or not fid:
+            reason = "no download link"
+        elif (f.get("size") or 0) > ctx["cap"]:
+            reason = f"over the cap ({f.get('size')} > {ctx['cap']} bytes)"
+        if not reason:
+            name = re.sub(r"[^A-Za-z0-9._-]+", "_", e["name"]).strip("._")[:120] or "file"
+            if f.get("filetype") == "quip":                  # a canvas downloads as its HTML, kept per edit
+                name = f"{f.get('updated') or 0}-{name}.html"
+            d = f"{hist()}/{target}/{chat}/files"
+            dest = f"{d}/{fid}-{name}"
+            if not (os.path.isfile(dest) and os.path.getsize(dest) > 0):
+                mkdir(d)
+                reason = sl.download(url, dest, ctx["cap"])
+                if not reason:
+                    ctx["files"] += 1
+            if not reason:
+                e["path"] = os.path.relpath(dest, hist())
+        if reason:
+            e["skipped"] = reason
+            key = f"{chat}/{fid or e['name']}"
+            if key not in st["skipped"]:
+                st["skipped"].append(key)
+                ctx["skips"] += 1
+                with os.fdopen(os.open(f"{hist()}/skipped.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as lg:
+                    lg.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{target}\t{chat}\t{m.get('ts')}\t"
+                             f"{fid}\t{e['name']}\t{e['size']}\t{reason}\n")
+        out.append(e)
+    return out
+
+
+def sweep_files(sl, chat, s, ctx, st, deadline):
+    """Once a day, keep what files.list ties to the chat that no held message carries: its canvases, and a file
+    shared there whose message history no longer shows. Held in state as the chat's loose files."""
+    if s.get("files_at") is not None and now() - float(s["files_at"]) < FILES_EVERY:
+        return
+    held = {f.get("id") for p in glob.glob(f"{hist()}/{s['target']}/{chat}/*.jsonl")
+            for r in read_month(p).values() for f in r.get("files") or [] if f.get("path")}
+    loose, page, pages = s.setdefault("loose", {}), 1, 1
+    while page <= pages:
+        if now() >= deadline:
+            ctx["pending"] += 1
+            return                                           # files_at stays put: the next pass sweeps again
+        d = sl.call("files.list", channel=chat, count="200", page=str(page))
+        for f in d.get("files") or []:
+            fid = re.sub(r"[^A-Za-z0-9]", "", str(f.get("id") or ""))
+            if fid and fid not in held:
+                loose[fid] = keep_files(sl, {"files": [f], "ts": ""}, chat, s["target"], ctx, st)[0]
+        pages, page = int((d.get("paging") or {}).get("pages") or 1), page + 1
+    s["files_at"] = now()
+
+
+def record(sl, m, conv, target, thread, ctx, st):
+    ts = str(m["ts"])
+    who = ctx["users"].get(m.get("user") or "") or m.get("username") or (m.get("bot_profile") or {}).get("name") \
+        or m.get("user") or m.get("bot_id") or "?"
+    return {"ts": ts, "thread_ts": thread or ts, "chat": conv["id"], "channel": label(conv), "user": who,
+            "role": role_of(m, ctx), "target": target, "text": fold(m),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "user_id": m.get("user") or m.get("bot_id") or "",
+            "subtype": m.get("subtype") or "", "files": keep_files(sl, m, conv["id"], target, ctx, st), "raw": m}
+
+
+# ── one pass ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+def ingest(sl, conv, s, msgs, ctx, st, deadline):
+    """Keep one history page and every thread under it that is new or has moved. True when the deadline cut the
+    thread reads short: what was read is kept, and the caller reads the page again next pass rather than move on.
+    A thread is marked read only once its records are stored, so a read Slack refuses half way is read again."""
+    recs, marks = [], {}
+    try:
+        return read_page(sl, conv, s, msgs, ctx, st, deadline, recs, marks)
+    finally:
+        new, changed = store(s["target"], conv["id"], recs)
+        ctx["new"] += new
+        ctx["changed"] += changed
+        s["threads"].update(marks)
+
+
+def read_page(sl, conv, s, msgs, ctx, st, deadline, recs, marks):
+    """ingest's reads: the page's records and its threads' replies into recs, each thread fully read into marks."""
+    target, chat, cut = s["target"], conv["id"], False
+    for m in msgs:
+        if not m.get("ts"):
+            continue
+        recs.append(record(sl, m, conv, target, m.get("thread_ts") if m.get("thread_ts") != m["ts"] else None, ctx, st))
+        if not m.get("reply_count") or (m.get("thread_ts") and m["thread_ts"] != m["ts"]):
+            continue
+        root, latest, held = m["ts"], str(m.get("latest_reply") or m["ts"]), s["threads"].get(m["ts"])
+        if held is not None and float(latest) <= float(held):
+            continue
+        if now() >= deadline:
+            cut = True
+            continue
+        marks[root] = max(latest, read_thread(sl, conv, s, root, held, ctx, st, recs), key=float)
+        if not held:
+            s.setdefault("revisited", {})[root] = now()
+        ctx["threads"] += 1
+    return cut
+
+
+def read_thread(sl, conv, s, root, held, ctx, st, recs):
+    """A thread's replies newer than held (every one when held is None) into recs; the newest ts read, or root's."""
+    cursor, top_seen = "", held or root
+    while True:
+        p = {"channel": conv["id"], "ts": root, "limit": "1000"}
+        if held:
+            p["oldest"] = held
+        if cursor:
+            p["cursor"] = cursor
+        d = sl.call("conversations.replies", **p)
+        for r in d.get("messages") or []:
+            if r.get("ts") and r["ts"] != root:
+                recs.append(record(sl, r, conv, s["target"], root, ctx, st))
+                top_seen = max(top_seen, r["ts"], key=float)
+        cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+        if not d.get("has_more") or not cursor:
+            return top_seen
+
+
+def revisit(sl, convs, st, ctx, deadline):
+    """REVISIT: held threads read again in full, a bounded few a pass, the one read longest ago first. A thread Slack no
+    longer has is noted as read; any other refusal is noted on the conversation and its thread waits its next turn
+    behind the others, since a thread refused every time would otherwise come first on every pass and starve the rest."""
+    due = []
+    for conv in convs:
+        s = st["convs"].get(conv["id"]) or {}
+        if s.get("done") and not s.get("unreachable") and readable(conv):
+            at = s.setdefault("revisited", {})
+            due += [(float(at.get(root) or 0), conv["id"], root, conv) for root in s["threads"]
+                    if now() - float(at.get(root) or 0) >= REVISIT_EVERY]
+    for _, chat, root, conv in sorted(due, key=lambda x: x[:3])[:REVISIT]:
+        if now() >= deadline:
+            ctx["pending"] += 1
+            return
+        s, recs = st["convs"][chat], []
+        try:
+            seen = read_thread(sl, conv, s, root, None, ctx, st, recs)
+        except SlackError as e:
+            if str(e) != "thread_not_found":
+                s["error"] = str(e)
+                ctx["errors"] += 1
+            seen = root
+        new, changed = store(s["target"], chat, recs)
+        ctx["new"] += new
+        ctx["changed"] += changed
+        ctx["threads"] += 1
+        s["threads"][root] = max(s["threads"][root], seen, key=float)
+        s["revisited"][root] = now()
+        save_state(st)
+
+
+def sync(sl, conv, st, ctx, deadline):
+    chat = conv["id"]
+    s = st["convs"].setdefault(chat, {})
+    if "target" not in s:                                    # target_of globs the archive: once per conversation
+        s["target"] = target_of(conv)
+    s.setdefault("threads", {})
+    s["name"], s["archived"] = label(conv), bool(conv.get("is_archived"))
+    if not readable(conv):
+        s["unreachable"] = "the bot is not a member, and this tool never joins"
+        return
+    s.pop("unreachable", None)
+    try:
+        while not s.get("done") and now() < deadline:      # BACKFILL, newest → oldest, resumable
+            p = {"channel": chat, "limit": "1000"}
+            if s.get("back"):
+                p["latest"] = s["back"]
+            d = sl.call("conversations.history", **p)
+            msgs = [m for m in d.get("messages") or [] if m.get("ts")]
+            if ingest(sl, conv, s, msgs, ctx, st, deadline):
+                break
+            if msgs:
+                s.setdefault("newest", max((m["ts"] for m in msgs), key=float))
+                s["back"] = min((m["ts"] for m in msgs), key=float)
+            if not d.get("has_more") or not msgs:
+                s["done"] = True
+            save_state(st)
+        if not s.get("done"):
+            ctx["pending"] += 1
+            return
+        t = now()                    # INCREMENT: what is new, once an hour the last 30 days, once a day all of it
+        rescan = t - float(s.get("rescan_at") or 0) >= RESCAN_EVERY
+        deep = t - float(s.get("deep_at") or 0) >= DEEP_EVERY
+        oldest = float(s.get("newest") or 0)
+        if rescan:
+            oldest = min(oldest, t - WINDOW_DAYS * 86400)
+        if deep:
+            oldest = 0                                       # no oldest: back to the first message
+        cursor, seen = "", s.get("newest") or "0"
+        while True:
+            if now() >= deadline:
+                ctx["pending"] += 1
+                return                                       # newest stays put: the next pass reads this span again
+            p = {"channel": chat, "limit": "1000"}
+            if oldest > 0:                                   # an empty DM holds nothing yet; Slack refuses oldest=0
+                p["oldest"] = f"{oldest:.6f}"
+            if cursor:
+                p["cursor"] = cursor
+            d = sl.call("conversations.history", **p)
+            msgs = [m for m in d.get("messages") or [] if m.get("ts")]
+            if ingest(sl, conv, s, msgs, ctx, st, deadline):
+                ctx["pending"] += 1
+                return
+            for m in msgs:
+                seen = max(seen, m["ts"], key=float)
+            cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+            if not d.get("has_more") or not cursor:
+                break
+        s["newest"] = seen
+        if rescan:
+            s["rescan_at"] = t
+        if deep:
+            s["deep_at"] = t
+        sweep_files(sl, chat, s, ctx, st, deadline)
+        s.pop("error", None)
+    except SlackError as e:
+        s["error"] = str(e)
+        if str(e) in ("not_in_channel", "channel_not_found", "missing_scope", "access_denied"):
+            s["unreachable"] = str(e)
+        ctx["errors"] += 1
+    save_state(st)
+
+
+def save_state(st):
+    mkdir(hist())
+    write_atomic(f"{hist()}/state.json", json.dumps(st, indent=1, sort_keys=True))
+
+
+def load_state():
+    st = load_json(f"{hist()}/state.json", {})
+    st.setdefault("convs", {})
+    st.setdefault("skipped", [])
+    return st
+
+
+def list_convs(sl):
+    out, cursor = [], ""
+    while True:
+        p = {"types": TYPES, "exclude_archived": "false", "limit": "200"}
+        if cursor:
+            p["cursor"] = cursor
+        d = sl.call("conversations.list", **p)
+        out += [c for c in d.get("channels") or [] if isinstance(c, dict) and CHAT_RE.match(str(c.get("id") or ""))]
+        cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            return out
+
+
+def users_of(sl):
+    out, cursor = {}, ""
+    while True:
+        p = {"limit": "200"}
+        if cursor:
+            p["cursor"] = cursor
+        d = sl.call("users.list", **p)
+        for u in d.get("members") or []:
+            out[u.get("id")] = (u.get("profile") or {}).get("real_name") or u.get("real_name") or u.get("name") or u.get("id")
+        cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            return out
+
+
+def locked():
+    """The pass lock, held for the life of the process, or None when another pass holds it."""
+    mkdir(hist())
+    fd = os.open(f"{hist()}/.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def run_pass(sl, budget, cap, owner):
+    fd = locked()
+    if fd is None:
+        print("cc-slack-history: another pass is running; this one did nothing")
+        return 0
+    try:
+        deadline = now() + budget
+        me = sl.call("auth.test")
+        ctx = {"users": users_of(sl), "owner": owner, "bot_id": me.get("bot_id") or "", "bot_user": me.get("user_id") or "",
+               "cap": cap, "new": 0, "changed": 0, "threads": 0, "files": 0, "skips": 0, "pending": 0, "errors": 0}
+        st, convs = load_state(), list_convs(sl)
+        convs.sort(key=lambda c: not (st["convs"].get(c["id"]) or {}).get("done"))   # finished backfills first
+        for conv in convs:
+            if now() >= deadline:
+                ctx["pending"] += 1
+                continue
+            sync(sl, conv, st, ctx, deadline)
+        revisit(sl, convs, st, ctx, deadline)
+        st["pass_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        save_state(st)
+        unreach = sum(1 for s in st["convs"].values() if s.get("unreachable"))
+        print(f"cc-slack-history: {ctx['new']} new and {ctx['changed']} changed messages, {ctx['threads']} threads read, "
+              f"{ctx['files']} files kept, {ctx['skips']} skipped, in {len(convs)} conversations; {ctx['pending']} not "
+              f"finished, {unreach} unreachable, {ctx['errors']} errors; {sl.calls} calls, {sl.limited} rate-limit waits")
+        return 1 if ctx["errors"] else 0
+    finally:
+        os.close(fd)
+
+
+# ── report ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def kept(target, chat, loose=None):
+    """messages, threads with replies, and distinct files kept and skipped, a chat's loose files among them."""
+    msgs, threads, files = 0, set(), {}
+    for p in glob.glob(f"{hist()}/{target}/{chat}/*.jsonl"):
+        for r in read_month(p).values():
+            msgs += 1
+            if r.get("thread_ts") and r["thread_ts"] != r["ts"]:
+                threads.add(r["thread_ts"])
+            for f in r.get("files") or []:
+                files[f.get("id") or f.get("name")] = files.get(f.get("id") or f.get("name")) or bool(f.get("path"))
+    for fid, f in (loose or {}).items():
+        files[fid] = files.get(fid) or bool(f.get("path"))
+    n = sum(files.values())
+    return msgs, len(threads), n, len(files) - n
+
+
+def live_counts(sl, chat):
+    """What Slack reports now: messages (top level + every root's reply_count, a broadcast reply counted once),
+    threads with replies, and files.list's total for the channel."""
+    top, replies, broadcasts, threads, cursor = set(), 0, 0, 0, ""
+    while True:
+        p = {"channel": chat, "limit": "1000"}
+        if cursor:
+            p["cursor"] = cursor
+        d = sl.call("conversations.history", **p)
+        for m in d.get("messages") or []:
+            top.add(m.get("ts"))
+            if m.get("subtype") == "thread_broadcast":
+                broadcasts += 1
+            if m.get("reply_count") and m.get("thread_ts", m.get("ts")) == m.get("ts"):
+                replies += m["reply_count"]
+                threads += 1
+        cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+        if not d.get("has_more") or not cursor:
+            break
+    f = sl.call("files.list", channel=chat, count="1")
+    return len(top) + replies - broadcasts, threads, int((f.get("paging") or {}).get("total") or 0)
+
+
+def report(sl=None):
+    st = load_state()
+    rows = ["| conversation | target | messages kept | threads kept | files kept | files skipped |"
+            + (" Slack: messages | Slack: threads | Slack: files |" if sl else ""),
+            "|---|---|---|---|---|---|" + ("---|---|---|" if sl else "")]
+    tot = [0] * 7
+    for chat, s in sorted(st["convs"].items(), key=lambda kv: (kv[1].get("target") or "", kv[1].get("name") or "")):
+        name = f"{s.get('name') or chat}{' (archived)' if s.get('archived') else ''} `{chat}`"
+        if s.get("unreachable"):
+            rows.append(f"| {name} | {s.get('target')} | not readable: {s['unreachable']} |||" + ("|||" if sl else ""))
+            continue
+        k = kept(s["target"], chat, s.get("loose"))
+        cells = list(k)
+        if sl:
+            try:
+                cells += list(live_counts(sl, chat))
+            except SlackError as e:
+                cells += [f"error: {e}", "", ""]
+        for i, v in enumerate(cells):
+            if isinstance(v, int):
+                tot[i] += v
+        rows.append(f"| {name} | {s['target']} | " + " | ".join(str(v) for v in cells) + " |")
+    rows.append("| **total** | | " + " | ".join(str(v) for v in tot[:7 if sl else 4]) + " |")
+    print("\n".join(rows))
+    return 0
+
+
+# ── selfcheck ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+class FakeSlack(Slack):
+    """conversations and their messages, paged two at a time so every pager is exercised; records each call."""
+
+    def __init__(self, convs, history, replies, files_total=None, files=None):
+        super().__init__("xoxb-fake", pace=0)
+        self.convs, self.history, self.replies, self.files_total, self.log = convs, history, replies, files_total or {}, []
+        self.files = files or {}
+
+    def call(self, method, **p):
+        self.calls += 1
+        self.log.append((method, dict(p)))
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT", "bot_id": "BBOT"}
+        if method == "users.list":
+            return {"ok": True, "members": [{"id": "UOWN", "profile": {"real_name": "Owner"}}, {"id": "UALI", "name": "ali"}]}
+        if method == "conversations.list":
+            return {"ok": True, "channels": self.convs}
+        if method == "files.list":
+            fs = self.files.get(p["channel"], [])
+            return {"ok": True, "files": [dict(f) for f in fs], "paging": {"total": self.files_total.get(p["channel"], len(fs)),
+                                                                          "pages": 1}}
+        if method == "conversations.history":
+            if "oldest" in p and float(p["oldest"]) <= 0:
+                raise SlackError("invalid_ts_oldest")             # as the real API answers it
+            ms = [m for m in self.history.get(p["channel"], [])
+                  if ("latest" not in p or float(m["ts"]) < float(p["latest"])) and ("oldest" not in p or float(m["ts"]) > float(p["oldest"]))]
+            ms.sort(key=lambda m: -float(m["ts"]))
+            i = int(p.get("cursor") or 0)
+            more = len(ms) > i + 2
+            return {"ok": True, "messages": [dict(m) for m in ms[i:i + 2]], "has_more": more,
+                    "response_metadata": {"next_cursor": str(i + 2) if more else ""}}
+        if method == "conversations.replies":
+            rs = [m for m in self.replies.get(p["ts"], []) if m["ts"] == p["ts"] or "oldest" not in p or float(m["ts"]) > float(p["oldest"])]
+            i = int(p.get("cursor") or 0)
+            more = len(rs) > i + 2
+            return {"ok": True, "messages": [dict(m) for m in rs[i:i + 2]], "has_more": more,
+                    "response_metadata": {"next_cursor": str(i + 2) if more else ""}}
+        raise AssertionError(f"selfcheck: {method} is not a read this tool may make")
+
+
+class FakeResp:
+    def __init__(self, body, ctype="application/octet-stream", url="https://files.slack.com/x"):
+        self.body, self.headers, self.url = body, {"Content-Type": ctype}, url
+
+    def geturl(self):
+        return self.url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        b, self.body = (self.body, b"") if n < 0 else (self.body[:n], self.body[n:])
+        return b
+
+
+def selfcheck():
+    global DIR, DEV, now, URLOPEN, REVISIT
+    cases, bad = [], []
+
+    def ok(name, cond):
+        cases.append(name)
+        if not cond:
+            bad.append(name)
+            print(f"FAIL {name}")
+
+    saved = (DIR, DEV, now, URLOPEN)
+    tmp = tempfile.mkdtemp(prefix="cc-slack-history-selfcheck.")
+    try:
+        DIR, DEV = f"{tmp}/slack", f"{tmp}/dev"
+        for d in (f"{DEV}/proj", f"{DEV}/other", f"{DIR}/archive/other/C0ARCH/", f"{DIR}/archive/unrouted/C0PROJ"):
+            os.makedirs(d)
+        open(f"{DIR}/archive/other/C0ARCH/2026-09.jsonl", "w").write("{}\n")
+        open(f"{DIR}/archive/unrouted/C0PROJ/2026-09.jsonl", "w").write("{}\n")
+        json.dump({"ali": {"chan": "ali", "chan_id": "C0ALI", "updates_id": "C0ALIUP", "uid": "UALI"}}, open(f"{DIR}/members.json", "w"))
+        json.dump({"C0ORCH": {"target": "proj", "alias": "x"}}, open(f"{DIR}/orchs.json", "w"))
+        # a member's own attachment, where cc-slack's daemon saves it (member_dir(h)/files, bound as ~/.cc/slack inside)
+        os.makedirs(f"{DIR}/member/ali/files")
+        open(f"{DIR}/member/ali/files/F9-shot.png", "wb").write(b"ali's own")
+        json.dump({"#weird": "other"}, open(f"{DIR}/routes.json", "w"))
+        downloads = []
+
+        def fake_open(req, timeout=0):
+            url = req.full_url
+            downloads.append(url)
+            if "fail429" in url:
+                raise AssertionError("unexpected")
+            if url.endswith("/page"):
+                return FakeResp(b"<html>login</html>", "text/html")
+            return FakeResp(b"x" * 10)
+        URLOPEN = fake_open
+
+        def f(fid, size, mode="hosted"):
+            return {"id": fid, "name": f"{fid}.png", "size": size, "mode": mode, "url_private_download": f"https://files.slack.com/{fid}"}
+        convs = [{"id": "C0PROJ", "name": "proj", "is_private": True, "is_member": True},
+                 {"id": "C0PROJUP", "name": "proj-updates", "is_member": True},
+                 {"id": "C0ALI", "name": "ali", "is_member": True},
+                 {"id": "C0ALIASK", "name": "ali-ask", "is_member": True},
+                 {"id": "D0ALI", "is_im": True, "user": "UALI"},
+                 {"id": "D0OWN", "is_im": True, "user": "UOWN"},
+                 {"id": "C0ARCH", "name": "proj-old", "is_member": True, "is_archived": True},
+                 {"id": "C0ORCH", "name": "proj-x-ab12", "is_member": True},
+                 {"id": "C0WEIRD", "name": "weird", "is_member": True},
+                 {"id": "C0MEMBER", "name": "member", "is_member": True},
+                 {"id": "C0PUB", "name": "public-out", "is_member": False, "is_archived": True}]
+        history = {"C0PROJ": [{"ts": "100.000001", "user": "UOWN", "text": "first"},
+                              {"ts": "200.000001", "user": "UALI", "text": "root", "thread_ts": "200.000001", "reply_count": 3,
+                               "latest_reply": "230.000001"},
+                              {"ts": "300.000001", "bot_id": "BBOT", "text": "box post", "files": [f("F1", 10), f("FBIG", 10 ** 9)]},
+                              {"ts": "400.000001", "bot_id": "BOTHER", "subtype": "bot_message", "username": "ci", "text": "",
+                               "attachments": [{"fallback": "build green"}]},
+                              {"ts": "500.000001", "user": "UOWN", "text": "gone", "files": [f("FDEL", 5, "tombstone")]}],
+                   "C0ALI": [{"ts": "110.000001", "user": "UALI", "text": "hi"}],
+                   "D0ALI": [{"ts": "120.000001", "user": "UALI", "text": "dm"}],
+                   "D0OWN": [{"ts": "130.000001", "user": "UOWN", "text": "owner dm"}]}
+        replies = {"200.000001": [history["C0PROJ"][1], {"ts": "210.000001", "user": "UOWN", "text": "r1", "thread_ts": "200.000001"},
+                                  {"ts": "220.000001", "user": "UALI", "text": "r2", "thread_ts": "200.000001"},
+                                  {"ts": "230.000001", "user": "UOWN", "text": "r3", "thread_ts": "200.000001",
+                                   "files": [{"id": "FPG", "name": "a.png", "size": 3, "url_private_download": "https://files.slack.com/page"}]}]}
+        t = [1000.0]
+        now = lambda: t[0]  # noqa: E731
+
+        # ── a first pass cut short after one call resumes where it stopped, with nothing duplicated
+        sl = FakeSlack(convs, history, replies)
+        clock = sl.call
+
+        def ticking(method, **p):
+            if method == "conversations.history":
+                t[0] += 200
+            return clock(method, **p)
+        sl.call = ticking
+        run_pass(sl, 150, FILE_CAP, "UOWN")
+        st = load_state()
+        ok("a pass out of budget mid-backfill saves its page cursor and is not done",
+           st["convs"]["C0PROJ"].get("back") == "400.000001" and not st["convs"]["C0PROJ"].get("done"))
+        sl = FakeSlack(convs, history, replies)
+        t[0] = 2000.0
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        st = load_state()
+        held = read_month(f"{hist()}/proj/C0PROJ/1970-01.jsonl")
+        ok("…and the next pass finishes it: every message and every reply, each held once",
+           sorted(held) == ["100.000001", "200.000001", "210.000001", "220.000001", "230.000001", "300.000001", "400.000001",
+                            "500.000001"] and st["convs"]["C0PROJ"]["done"]
+           and [json.loads(x)["ts"] for x in open(f"{hist()}/proj/C0PROJ/1970-01.jsonl")].count("210.000001") == 1)
+        ok("a reply carries its thread's ts and a root its own",
+           held["220.000001"]["thread_ts"] == "200.000001" and held["200.000001"]["thread_ts"] == "200.000001")
+        ok("roles: the owner, a member, this app's own post (box) and another app (bot); a bot's attachment text is kept",
+           [held[k]["role"] for k in ("100.000001", "200.000001", "300.000001", "400.000001")] == ["owner", "member", "box", "bot"]
+           and held["400.000001"]["text"] == "build green" and held["400.000001"]["user"] == "ci" and held["100.000001"]["user"] == "Owner")
+        ok("the record is the archive's line plus raw: cc-lib's keys are all there",
+           all(k in held["100.000001"] for k in ("ts", "thread_ts", "chat", "channel", "user", "role", "target", "text", "at", "raw")))
+
+        # ── files
+        fl = {e["id"]: e for e in held["300.000001"]["files"]}
+        p1 = f"{hist()}/proj/C0PROJ/files/F1-F1.png"
+        ok("a file under the cap is downloaded beside its chat, 0600, and its path is on the message",
+           os.path.isfile(p1) and os.stat(p1).st_mode & 0o777 == 0o600 and fl["F1"].get("path") == "proj/C0PROJ/files/F1-F1.png")
+        ok("…one over the cap is not downloaded, and the message says why",
+           "path" not in fl["FBIG"] and "over the cap" in fl["FBIG"]["skipped"] and not any("FBIG" in u for u in downloads))
+        ok("…nor a deleted one, nor a web page Slack sends back in place of a file",
+           "tombstone" in held["500.000001"]["files"][0]["skipped"] and "web page" in held["230.000001"]["files"][0]["skipped"]
+           and not glob.glob(f"{hist()}/proj/C0PROJ/files/FPG*"))
+        ok("a malformed file URL is a skip, not a crash, and nothing is fetched for it",
+           "not a URL" in Slack("t").download("https://[::1/x", f"{tmp}/bad", 100) and not any("[::1" in u for u in downloads))
+        os.makedirs(f"{tmp}/elsewhere")
+        os.symlink(f"{tmp}/elsewhere", f"{hist()}/linked")
+        try:
+            mkdir(f"{hist()}/linked/C0X/files")
+            followed = True
+        except OSError:
+            followed = False
+        ok("mkdir refuses a symlink in the history tree rather than following it",
+           not followed and os.listdir(f"{tmp}/elsewhere") == [])
+        os.unlink(f"{hist()}/linked")
+        log = open(f"{hist()}/skipped.log").read()
+        ok("…and each skip is logged once, however many passes see it",
+           log.count("\tFBIG\t") == 1 and log.count("\tFDEL\t") == 1 and log.count("\tFPG\t") == 1)
+
+        # perms at e00ee984, (e): "Confirm a member's own attachments under ~/.cc/slack/files still reach them"
+        mem = sorted(os.path.relpath(os.path.join(a, x), f"{DIR}/member") for a, ds, fs in os.walk(f"{DIR}/member") for x in fs)
+        ok("a member's own attachment under member/<h>/files, which its boundary sees as ~/.cc/slack/files, is left as the "
+           "daemon saved it, and the passes write nothing else under member/",
+           mem == ["ali/files/F9-shot.png"] and open(f"{DIR}/member/ali/files/F9-shot.png", "rb").read() == b"ali's own")
+
+        # ── targets
+        def tgt(c):
+            return st["convs"][c]["target"]
+        ok("a member's channel, its updates lane, a lane named after the handle and a DM with them all go under the handle",
+           [tgt(c) for c in ("C0ALI", "D0ALI", "C0ALIASK")] == ["ali", "ali", "ali"]
+           and os.path.isfile(f"{hist()}/ali/D0ALI/1970-01.jsonl") and not os.path.exists(f"{hist()}/box/D0ALI"))
+        ok("…while the owner's DM goes under box, a lane by its repo, a sub-orch by its table, a chat the archive files "
+           "by the archive's target, a routes.json name by its route, and a bare `member` never becomes a target",
+           tgt("D0OWN") == "box" and tgt("C0PROJUP") == "proj" and tgt("C0ORCH") == "proj" and tgt("C0ARCH") == "other"
+           and tgt("C0WEIRD") == "other" and tgt("C0MEMBER") == "unrouted" and not os.path.exists(f"{hist()}/member"))
+        ok("the archive's `unrouted` does not outrank the channel's own name", tgt("C0PROJ") == "proj")
+        modes = {os.stat(d).st_mode & 0o777 for d in [hist()] + glob.glob(f"{hist()}/**/", recursive=True)}
+        fmodes = {os.stat(x).st_mode & 0o777 for x in glob.glob(f"{hist()}/**/*", recursive=True) if os.path.isfile(x)}
+        ok("every directory is 0700 and every file 0600", modes == {0o700} and fmodes == {0o600})
+
+        # ── read-only, and what it cannot read
+        ok("a public channel the bot is not in is listed unreachable and never read, and nothing but reads is called",
+           st["convs"]["C0PUB"].get("unreachable") and not any(p.get("channel") == "C0PUB" for _, p in sl.log)
+           and {m for m, _ in sl.log} <= {"auth.test", "users.list", "conversations.list", "conversations.history", "conversations.replies",
+                                     "files.list"})
+
+        # ── the incremental pass
+        history["C0PROJ"].append({"ts": "600.000001", "user": "UALI", "text": "a new one"})
+        sl = FakeSlack(convs, history, replies)
+        t[0] = 2100.0                                            # inside the hour: no rescan
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        held = read_month(f"{hist()}/proj/C0PROJ/1970-01.jsonl")
+        hcalls = [p for m, p in sl.log if m == "conversations.history" and p["channel"] == "C0PROJ"]
+        ok("a new message is picked up by the next pass, which reads only what is newer than held",
+           "600.000001" in held and len(held) == 9 and hcalls and all(float(p["oldest"]) == 500.000001 for p in hcalls))
+        ok("…and a thread whose root has not moved is not read again",
+           not any(m == "conversations.replies" for m, _ in sl.log))
+        replies["200.000001"].append({"ts": "240.000001", "user": "UALI", "text": "late reply", "thread_ts": "200.000001"})
+        history["C0PROJ"][1]["latest_reply"] = "240.000001"
+        history["C0PROJ"][1]["reply_count"] = 4
+        history["C0PROJ"][0]["text"] = "first, edited"
+        sl = FakeSlack(convs, history, replies)
+        t[0] = 2100.0 + RESCAN_EVERY
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        held = read_month(f"{hist()}/proj/C0PROJ/1970-01.jsonl")
+        rcalls = [p for m, p in sl.log if m == "conversations.replies"]
+        ok("once an hour the pass reaches back: a late reply to an old thread is read from what was held, and an edit "
+           "replaces its record", "240.000001" in held and len(held) == 10 and held["100.000001"]["text"] == "first, edited"
+           and len(rcalls) == 1 and rcalls[0].get("oldest") == "230.000001")
+
+        # ── a deadline met between thread reads keeps what was read and reads that page again next pass
+        DIR = f"{tmp}/cut"
+        cconv = [{"id": "C0CUT", "name": "proj", "is_member": True}]
+        chist = {"C0CUT": [{"ts": "10.000001", "user": "UOWN", "text": "a", "reply_count": 1, "latest_reply": "11.000001"},
+                           {"ts": "20.000001", "user": "UOWN", "text": "b", "reply_count": 1, "latest_reply": "21.000001"}]}
+        creps = {"10.000001": [chist["C0CUT"][0], {"ts": "11.000001", "user": "UOWN", "text": "ra", "thread_ts": "10.000001"}],
+                 "20.000001": [chist["C0CUT"][1], {"ts": "21.000001", "user": "UOWN", "text": "rb", "thread_ts": "20.000001"}]}
+        sl = FakeSlack(cconv, chist, creps)
+        inner = sl.call
+
+        def slow_replies(method, **p):
+            if method == "conversations.replies":
+                t[0] += 1000
+            return inner(method, **p)
+        sl.call = slow_replies
+        t[0] = 10000.0
+        run_pass(sl, 500, FILE_CAP, "UOWN")
+        cs = load_state()["convs"]["C0CUT"]
+        ok("a deadline met between two thread reads keeps the one read, and neither marks the page done nor moves past it",
+           len(read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")) == 3 and not cs.get("done") and not cs.get("back")
+           and list(cs["threads"]) == ["20.000001"])
+        sl = FakeSlack(cconv, chist, creps)
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        cs = load_state()["convs"]["C0CUT"]
+        ok("…and the next pass reads only the thread it missed, and finishes",
+           len(read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")) == 4 and cs.get("done")
+           and [p["ts"] for m, p in sl.log if m == "conversations.replies"] == ["10.000001"])
+        DIR = f"{tmp}/slack"
+
+        # ── a thread read Slack refuses half way leaves that thread unmarked, so the next pass reads it
+        DIR = f"{tmp}/refuse"
+        sl = FakeSlack(cconv, chist, creps)
+        inner = sl.call
+
+        def refuse_second(method, **p):
+            if method == "conversations.replies" and p["ts"] == "10.000001":
+                raise SlackError("fatal_error")
+            return inner(method, **p)
+        sl.call = refuse_second
+        t[0] = 15000.0
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        rs = load_state()["convs"]["C0CUT"]
+        held = read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")
+        ok("a refused thread read keeps the thread read before it, marked, and leaves the refused one unmarked",
+           rs.get("error") == "fatal_error" and "21.000001" in held and "11.000001" not in held
+           and list(rs["threads"]) == ["20.000001"])
+        sl = FakeSlack(cconv, chist, creps)
+        t[0] = 15100.0
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        rs = load_state()["convs"]["C0CUT"]
+        ok("…and the next pass reads the refused thread and holds its reply",
+           not rs.get("error") and "11.000001" in read_month(f"{hist()}/proj/C0CUT/1970-01.jsonl")
+           and sorted(rs["threads"]) == ["10.000001", "20.000001"])
+        DIR = f"{tmp}/slack"
+
+        # ── an empty DM: its backfill finds nothing, and its increment asks for everything rather than oldest=0
+        DIR = f"{tmp}/emptydm"
+        econv = [{"id": "D0EMPTY", "is_im": True, "user": "UOWN"}]
+        ehist = {"D0EMPTY": []}
+        t[0] = 20000.0
+        sl = FakeSlack(econv, ehist, {})
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        es = load_state()["convs"]["D0EMPTY"]
+        ok("an empty DM finishes its backfill and its increment without an error, and no read sends oldest",
+           es.get("done") and not es.get("error")
+           and not any("oldest" in p for m, p in sl.log if m == "conversations.history"))
+        ehist["D0EMPTY"].append({"ts": "20000.000001", "user": "UOWN", "text": "hello"})
+        sl = FakeSlack(econv, ehist, {})
+        t[0] = 20100.0
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        es = load_state()["convs"]["D0EMPTY"]
+        ok("…and the first message it gets is kept, and becomes what the next read starts from",
+           not es.get("error") and es.get("newest") == "20000.000001"
+           and "20000.000001" in read_month(f"{hist()}/box/D0EMPTY/1970-01.jsonl"))
+        DIR = f"{tmp}/slack"
+
+        # ── the daily files sweep keeps a canvas and a file no held message carries, and nothing twice
+        DIR = f"{tmp}/sweep"
+        sconv = [{"id": "C0SW", "name": "proj", "is_member": True}]
+        shist = {"C0SW": [{"ts": "10.000001", "user": "UOWN", "text": "a", "files": [f("FMSG", 10)]}]}
+        canvas = {"id": "FCAN", "name": "notes", "filetype": "quip", "size": 4, "updated": 7,
+                  "url_private_download": "https://files.slack.com/FCAN/page"}
+        sfiles = {"C0SW": [f("FMSG", 10), f("FLOOSE", 10), canvas]}
+        t[0] = 30000.0
+        del downloads[:]
+        sl = FakeSlack(sconv, shist, {}, files=sfiles)
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        ss = load_state()["convs"]["C0SW"]
+        fdir = f"{hist()}/proj/C0SW/files"
+        ok("a files sweep keeps a file no message carries and a canvas as its HTML, and the message's file once",
+           sorted(os.listdir(fdir)) == ["FCAN-7-notes.html", "FLOOSE-FLOOSE.png", "FMSG-FMSG.png"]
+           and sorted(ss.get("loose") or {}) == ["FCAN", "FLOOSE"] and downloads.count("https://files.slack.com/FMSG") == 1
+           and kept("proj", "C0SW", ss.get("loose")) == (1, 0, 3, 0))
+        sl = FakeSlack(sconv, shist, {}, files=sfiles)
+        t[0] = 30000.0 + RESCAN_EVERY
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        ok("…and the next pass inside the day does not read files.list again",
+           not any(m == "files.list" for m, _ in sl.log))
+        canvas["updated"] = 9
+        sl = FakeSlack(sconv, shist, {}, files=sfiles)
+        t[0] = 30000.0 + FILES_EVERY
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        ok("…but a day on it does, and an edited canvas is kept beside the version before it",
+           any(m == "files.list" for m, _ in sl.log) and os.path.isfile(f"{fdir}/FCAN-9-notes.html")
+           and os.path.isfile(f"{fdir}/FCAN-7-notes.html") and kept("proj", "C0SW", load_state()["convs"]["C0SW"]["loose"])[2] == 3)
+        DIR = f"{tmp}/slack"
+
+        # ── a re-read that differs only by the block_id Slack makes up is not a change, and rewrites nothing
+        DIR = f"{tmp}/bid"
+        bconv = [{"id": "C0BID", "name": "proj", "is_member": True}]
+        bhist = {"C0BID": [{"ts": "10.000001", "user": "UOWN", "text": "a", "blocks": [{"type": "rich_text", "block_id": "x1"}]}]}
+        t[0] = 50000.0
+        run_pass(FakeSlack(bconv, bhist, {}), 10 ** 6, FILE_CAP, "UOWN")
+        bp = f"{hist()}/proj/C0BID/1970-01.jsonl"
+        before = open(bp).read()
+        bhist["C0BID"][0]["blocks"][0]["block_id"] = "x2"
+        t[0] += RESCAN_EVERY
+        run_pass(FakeSlack(bconv, bhist, {}), 10 ** 6, FILE_CAP, "UOWN")
+        ok("a re-read whose only difference is a made-up block_id leaves the month file as it was", open(bp).read() == before)
+        bhist["C0BID"][0]["text"] = "a, edited"
+        t[0] += RESCAN_EVERY
+        run_pass(FakeSlack(bconv, bhist, {}), 10 ** 6, FILE_CAP, "UOWN")
+        ok("…while a real edit beside it is kept", read_month(bp)["10.000001"]["text"] == "a, edited")
+        DIR = f"{tmp}/slack"
+
+        # ── REVISIT: held threads read again in full, one a pass here, so what no root shows is picked up
+        DIR, REVISIT = f"{tmp}/revisit", 1
+        vconv = [{"id": "C0REV", "name": "proj", "is_member": True}]
+        vhist = {"C0REV": [{"ts": "100.000001", "user": "UOWN", "text": "an old root", "reply_count": 1, "latest_reply": "110.000001"},
+                           {"ts": "9990000.000001", "user": "UOWN", "text": "a recent root", "reply_count": 1,
+                            "latest_reply": "9990010.000001"}]}
+        vreps = {"100.000001": [vhist["C0REV"][0], {"ts": "110.000001", "user": "UALI", "text": "o1", "thread_ts": "100.000001"}],
+                 "9990000.000001": [vhist["C0REV"][1], {"ts": "9990010.000001", "user": "UALI", "text": "n1",
+                                                        "thread_ts": "9990000.000001"}]}
+        t[0] = 10.0 ** 7
+        run_pass(FakeSlack(vconv, vhist, vreps), 10 ** 6, FILE_CAP, "UOWN")
+        vreps["100.000001"].append({"ts": "120.000001", "user": "UALI", "text": "a late reply to an old thread", "thread_ts": "100.000001"})
+        vhist["C0REV"][0].update(reply_count=2, latest_reply="120.000001")    # a root older than the window: no read returns it
+        t[0] += REVISIT_EVERY + RESCAN_EVERY
+        sl = FakeSlack(vconv, vhist, vreps)
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        vp = f"{hist()}/proj/C0REV/1970-01.jsonl"
+        ok("a new reply to a thread whose root is older than the window is read, and REVISIT reads one thread a pass",
+           "120.000001" in read_month(vp) and {p["ts"] for m, p in sl.log if m == "conversations.replies"} == {"100.000001"}
+           and load_state()["convs"]["C0REV"]["threads"]["100.000001"] == "120.000001")
+        vreps["9990000.000001"][1].update(text="n1, edited", files=[f("FREV", 10)])
+        t[0] += 10
+        sl = FakeSlack(vconv, vhist, vreps)
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        r = read_month(f"{hist()}/proj/C0REV/1970-04.jsonl").get("9990010.000001") or {}
+        ok("…and the next pass reads the next thread due, so an edit and a file added to a reply already held are kept",
+           r.get("text", "").startswith("n1, edited") and (r.get("files") or [{}])[0].get("path")
+           and {p["ts"] for m, p in sl.log if m == "conversations.replies"} == {"9990000.000001"})
+        sl = FakeSlack(vconv, vhist, vreps)
+        inner = sl.call
+
+        def gone(method, **p):
+            if method == "conversations.replies":
+                raise SlackError("thread_not_found" if p["ts"] == "100.000001" else "fatal_error")
+            return inner(method, **p)
+        sl.call, REVISIT = gone, 2
+        t[0] += REVISIT_EVERY
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        vs = load_state()["convs"]["C0REV"]
+        ok("…a thread Slack no longer has is noted as read, and any other refusal is noted and sends its thread to the back",
+           vs["revisited"]["100.000001"] == t[0] and vs["revisited"]["9990000.000001"] == t[0] and vs.get("error") == "fatal_error")
+
+        # ── REVISIT: a thread refused every time never holds up the threads due behind it
+        DIR, REVISIT = f"{tmp}/starve", 1
+        sconv = [{"id": "C0STV", "name": "proj", "is_member": True}]
+        shist = {"C0STV": [{"ts": "100.000001", "user": "UOWN", "text": "x", "reply_count": 1, "latest_reply": "110.000001"},
+                           {"ts": "200.000001", "user": "UOWN", "text": "y", "reply_count": 1, "latest_reply": "210.000001"}]}
+        sreps = {"100.000001": [shist["C0STV"][0], {"ts": "110.000001", "user": "UALI", "text": "x1", "thread_ts": "100.000001"}],
+                 "200.000001": [shist["C0STV"][1], {"ts": "210.000001", "user": "UALI", "text": "y1", "thread_ts": "200.000001"}]}
+        t[0] = 10.0 ** 7
+        run_pass(FakeSlack(sconv, shist, sreps), 10 ** 6, FILE_CAP, "UOWN")
+        sreps["200.000001"][1]["text"] = "y1, edited"
+        t[0] += REVISIT_EVERY
+        logs, errs = [], []
+        for _ in range(2):                                       # x is due first both times and refused both times
+            sl = FakeSlack(sconv, shist, sreps)
+            inner_s = sl.call
+
+            def refuse(method, inner_s=inner_s, **p):
+                r = inner_s(method, **p)
+                if method == "conversations.replies" and p["ts"] == "100.000001":
+                    raise SlackError("fatal_error")
+                return r
+            sl.call = refuse
+            run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+            logs.append([p["ts"] for m, p in sl.log if m == "conversations.replies"])
+            errs.append(load_state()["convs"]["C0STV"].get("error"))
+            t[0] += 10
+        sp = f"{hist()}/proj/C0STV/1970-01.jsonl"
+        ok("…the second pass reads the thread due behind it, and the first one's refusal is noted",
+           logs == [["100.000001"], ["200.000001"]] and read_month(sp)["210.000001"]["text"] == "y1, edited"
+           and errs[0] == "fatal_error")
+        sreps["200.000001"][1]["text"] = "y1, kept"
+        logs = []
+        for _ in range(2):                                       # nothing is refused: neither is read again inside its day
+            sl = FakeSlack(sconv, shist, sreps)
+            run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+            logs += [p["ts"] for m, p in sl.log if m == "conversations.replies"]
+            t[0] += 10
+        ok("…and neither thread is read again before its day is out",
+           logs == [] and read_month(sp)["210.000001"]["text"] == "y1, edited")
+
+        # ── DEEP: once a day the read reaches the first message, so a reply to a root of any age is kept
+        DIR, REVISIT = f"{tmp}/deep", 0                          # no REVISIT turns: the deep read alone must find them
+        dconv = [{"id": "C0DEP", "name": "proj", "is_member": True}]
+        dhist = {"C0DEP": [{"ts": "100.000001", "user": "UOWN", "text": "an old root with a reply", "reply_count": 1,
+                            "latest_reply": "110.000001"},
+                           {"ts": "200.000001", "user": "UOWN", "text": "an old root with none"}]}
+        dreps = {"100.000001": [dhist["C0DEP"][0], {"ts": "110.000001", "user": "UALI", "text": "d1", "thread_ts": "100.000001"}],
+                 "200.000001": [dhist["C0DEP"][1]]}
+        t[0] = 10.0 ** 7
+        run_pass(FakeSlack(dconv, dhist, dreps), 10 ** 6, FILE_CAP, "UOWN")
+        dreps["100.000001"].append({"ts": "120.000001", "user": "UALI", "text": "d2", "thread_ts": "100.000001"})
+        dhist["C0DEP"][0].update(reply_count=2, latest_reply="120.000001")
+        dreps["200.000001"].append({"ts": "210.000001", "user": "UALI", "text": "a first reply", "thread_ts": "200.000001"})
+        dhist["C0DEP"][1].update(reply_count=1, latest_reply="210.000001")
+        dp = f"{hist()}/proj/C0DEP/1970-01.jsonl"
+        t[0] += RESCAN_EVERY
+        run_pass(FakeSlack(dconv, dhist, dreps), 10 ** 6, FILE_CAP, "UOWN")
+        ok("a reply to a root older than the window waits for the day's deep read, not the hourly one",
+           "120.000001" not in read_month(dp) and "210.000001" not in read_month(dp))
+        t[0] += DEEP_EVERY
+        run_pass(FakeSlack(dconv, dhist, dreps), 10 ** 6, FILE_CAP, "UOWN")
+        ds = load_state()["convs"]["C0DEP"]["threads"]
+        ok("…which keeps a new reply to an old thread and the first reply to an old root that had none",
+           "120.000001" in read_month(dp) and "210.000001" in read_month(dp)
+           and ds.get("100.000001") == "120.000001" and ds.get("200.000001") == "210.000001")
+        DIR, REVISIT = f"{tmp}/slack", 30
+
+        # ── one pass at a time
+        fd = locked()
+        sl = FakeSlack(convs, history, replies)
+        run_pass(sl, 10 ** 6, FILE_CAP, "UOWN")
+        os.close(fd)
+        ok("a pass that finds another running makes no call at all", sl.calls == 0)
+
+        # ── the report
+        sl = FakeSlack(convs, history, replies, files_total={"C0PROJ": 4})
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(sl)
+        row = next(x for x in buf.getvalue().splitlines() if "`C0PROJ`" in x)
+        ok("the report sets what is kept beside what Slack reports, per conversation, and names what is unreadable",
+           row.split("|")[3:10] == [" 10 ", " 1 ", " 1 ", " 3 ", " 10 ", " 1 ", " 4 "] and "not readable" in buf.getvalue())
+
+        # ── the real Web API wrapper waits out a 429 and goes on
+        seq = []
+
+        def limited(req, timeout=0):
+            seq.append(time.time())
+            if len(seq) == 1:
+                raise urllib.error.HTTPError(req.full_url, 429, "slow down", {"Retry-After": "0"}, None)
+            return FakeResp(json.dumps({"ok": True, "x": 1}).encode())
+        URLOPEN = limited
+        real = Slack("xoxb-fake", pace=0)
+        ok("a 429 is waited out by its Retry-After and the call made again",
+           real.call("conversations.history", channel="C1").get("x") == 1 and real.limited == 1 and len(seq) == 2)
+        URLOPEN = lambda req, timeout=0: FakeResp(b"<html>sign in</html>", "text/html", "https://w.slack.com/?redir=%2Ffiles-pri")  # noqa: E731
+        ok("a canvas's download that Slack sent to its sign-in page is not kept as the canvas",
+           "web page" in (real.download("https://files.slack.com/FCAN", f"{tmp}/c.html", FILE_CAP) or "") and not os.path.exists(f"{tmp}/c.html"))
+
+        # ── the bot token goes to Slack's file host only, and never across a redirect
+        sent = []
+
+        def recording(req, timeout=0):
+            sent.append(req)
+            return FakeResp(b"x" * 3)
+        URLOPEN = recording
+        why = real.download("https://evil.example/files-pri/T/F", f"{tmp}/e.bin", FILE_CAP)
+        got = real.download("https://files.slack.com/files-pri/T/F", f"{tmp}/k.bin", FILE_CAP)
+        req = sent[-1] if sent else urllib.request.Request("https://files.slack.com/")
+        hop = urllib.request.HTTPRedirectHandler().redirect_request(
+            req, None, 302, "Found", {}, "https://elsewhere.example/f")
+        ok("a file link off Slack's file host is not fetched, and the one on it carries the token only to that host",
+           "not on a Slack file host" in (why or "") and not os.path.exists(f"{tmp}/e.bin") and len(sent) == 1
+           and got is None and req.unredirected_hdrs.get("Authorization") == "Bearer xoxb-fake"
+           and "Authorization" not in req.headers and hop is not None
+           and "Authorization" not in hop.headers and "Authorization" not in hop.unredirected_hdrs)
+    finally:
+        DIR, DEV, now, URLOPEN = saved
+        subprocess.run(["rm", "-rf", tmp])
+    print(f"cc-slack-history selfcheck: {len(cases) - len(bad)} passed, {len(bad)} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if argv[:1] not in (["pass"], ["report"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    opts = dict(zip(argv[1::2], argv[2::2]))
+
+    def cfg(k):
+        return subprocess.run([f"{BIN}/cc-config", "get", k], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=10).stdout.strip()
+    token = cfg("SLACK_BOT_TOKEN")
+    if not token and (argv[0] == "pass" or "--live" in argv):
+        print("cc-slack-history: no SLACK_BOT_TOKEN, nothing read", file=sys.stderr)
+        return 1
+    try:
+        if argv[0] == "report":
+            return report(Slack(token) if "--live" in argv else None)
+        return run_pass(Slack(token), int(opts.get("--budget", 1800)), int(opts.get("--file-cap", FILE_CAP)),
+                        cfg("SLACK_OWNER_ID"))
+    except SlackError as e:
+        print(f"cc-slack-history: Slack refused a read: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

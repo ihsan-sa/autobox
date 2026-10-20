@@ -76,6 +76,8 @@ def selfcheck():
     ok("journal DONE + open PR → review", one(journal=("DONE", ""), pr="u", pr_state="OPEN") == ("fix", "review"))
     ok("journal DONE + no PR → asks (nobody opened one)", one(journal=("DONE", "")) == ("ask", "review"))
     ok("loop exit → blocked, with the loop's own reason", decide(F(loop_end="exit 4: stalled"))[0][:2] == ("ask", "blocked"))
+    ok("…but a merged PR outranks how the loop last stopped: no queue entry, not live, past grace → merged",
+       [(k, st) for k, st, _ in decide(F(loop_end="exit 4: stalled", pr="u", pr_state="MERGED"))] == [("fix", "merged")])
     ok("nothing says why → blocked and the owner hears about it", one() == ("ask", "blocked"))
     ok("…BUT A LAUNCH WAITING IN cc-room's QUEUE IS DISPATCHED, NOT ABANDONED: the word stands, nobody is asked, and "
        "the one line says it waits for room (raised 2026-10-03: a lessons row 3 h in the queue was set blocked 'no "
@@ -92,6 +94,15 @@ def selfcheck():
     ok("…and a `blocked` row whose launch waits keeps its word and the report says the launch waits, not nothing",
        decide(F(status="blocked", room="waiting")) == [("held", None, "its launch is waiting in cc-room's queue for room")]
        and eff(status="blocked", room="waiting") == "blocked")
+    ok("…but a confirmed merge outranks the queue entry, with or without a journal DONE or an earlier loop's exit, "
+       "on a running, blocked or queued row: a waiting or lost launch never keeps an already-merged PR open",
+       all([(k, st) for k, st, _ in decide(F(status=s, room=r, pr="u", pr_state="MERGED", **kw, **le))]
+           == [("fix", "merged")]
+           for s in ("running", "blocked", "queued") for r in ("waiting", "lost")
+           for kw in ({}, {"journal": ("DONE", "")}) for le in ({}, {"loop_end": "exit 4: stalled"})))
+    ok("…and a stale journal BLOCKED still outranks the queue entry: waits_for() reads the worker's own line, so the "
+       "row asks its person rather than reading held",
+       decide(F(room="waiting", journal=("BLOCKED", "which board?")))[0][:2] == ("ask", "waiting"))
     ok("…while a live worker still outranks the queue entry: it is running", one(status="queued", live=True, room="waiting")
        == ("fix", "running"))
     ok("review + merged PR → merged", one(status="review", pr="u", pr_state="MERGED") == ("fix", "merged"))

@@ -116,16 +116,20 @@ out=$("$B/cc-context" $REPO w1 2>&1)
 { grep -q '^18%  180k/1M' <<<"$out" && grep -q 'window from statusline' <<<"$out" && grep -q 'hand off' <<<"$out"; } \
   && ok "a fresh status-line file is the number, and past the line it says hand off" || bad "statusline: $out"
 "$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 0 ] && ok "...and a bare --over exits 0 past the line" || bad "bare --over past the line: rc=$rc"
-allout=$("$B/cc-context" --all 2>/dev/null); grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" <<<"$allout" \
-  && ok "--all names the track off the file's cwd, nine columns" || bad "--all: $("$B/cc-context" --all 2>&1)"
+# capture, don't pipe (see cc ls above), and report the same run that failed: a red here once showed a second run's
+# good row, which said nothing about the first
+aout=$("$B/cc-context" --all 2>"$T/all.err"); rc=$?
+{ [ $rc = 0 ] && grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" <<<"$aout"; } \
+  && ok "--all names the track off the file's cwd, nine columns" || bad "--all: rc=$rc $(grep "	w1	" <<<"$aout") $(tail -3 "$T/all.err")"
 lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 18% handoff!" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column: $lsout"
 rm -f "$CC_STATUSLINE_DIR/$sid.json"
 # A HEADLESS WORKER DRAWS NO STATUS LINE. `claude -p` — every `--go` track — writes no status-line file at all, so
 # --all built from that directory alone listed no worker: `cc ls`'s ctx column and the dashboard's Context block
 # were blank for exactly the sessions nobody is watching. With none there, the track's own transcript is the number.
 hsl=~/.claude/projects/$(readlink -f ~/.cc/worktrees/$REPO/w1 | tr '/.' '-'); mkdir -p "$hsl"; cp "$PD/$sid.jsonl" "$hsl/$sid.jsonl"
-allout=$("$B/cc-context" --all 2>/dev/null); grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" <<<"$allout" \
-  && ok "a track with no status-line file is still listed, off its transcript" || bad "--all fallback: $("$B/cc-context" --all 2>&1 | grep "	w1	")"
+aout=$("$B/cc-context" --all 2>"$T/all.err"); rc=$?
+{ [ $rc = 0 ] && grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" <<<"$aout"; } \
+  && ok "a track with no status-line file is still listed, off its transcript" || bad "--all fallback: rc=$rc $(grep "	w1	" <<<"$aout") $(tail -3 "$T/all.err")"
 rm -rf "$hsl"
 # the Stop hook: UNDER the hand-off line it commits and answers nothing
 echo ctx > ~/.cc/worktrees/$REPO/w1/ctx.txt

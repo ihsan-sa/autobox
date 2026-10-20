@@ -199,6 +199,17 @@ FSTUB
     | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$T/fake0/cc-guard" >/dev/null 2>&1; echo $?; }
   r0=0; [ "$(fk "$WT")" = 2 ] || r0=1; ok "0 argv exit 3: worker refused" $r0
   r0=0; [ "$(fk "$T/x0")" = 0 ] || r0=1; ok "0 argv exit 3: no role passes" $r0
+  # …and a GUARD_NEVER_TOUCH in the caller's env never reaches the judge, since it would replace config/never-touch.txt
+  # (perms' LAND on #1575). This judge refuses whenever it sees one, so `ls` passing for each tier shows it saw none.
+  mkdir -p "$T/fake0n"; cp "$(realpath "$0")" "$T/fake0n/cc-guard"; : > "$T/nt0"
+  printf '#!/bin/sh\n[ "$1" = judge ] && [ -n "${GUARD_NEVER_TOUCH+x}" ] && { printf "never\\tleaked\\n"; exit 0; }\nexec "%s" "$@"\n' "$GA0" > "$T/fake0n/cc-guard-argv"
+  chmod +x "$T/fake0n/cc-guard" "$T/fake0n/cc-guard-argv"
+  r0=0; [ "$(echo ls | GUARD_NEVER_TOUCH="$T/nt0" "$T/fake0n/cc-guard-argv" judge)" = "$(printf 'never\tleaked')" ] || r0=1
+  ok "0 the leak-detecting judge refuses when it is handed GUARD_NEVER_TOUCH" $r0
+  fn(){ printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$1" \
+    | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" GUARD_NEVER_TOUCH="$T/nt0" "$T/fake0n/cc-guard" >/dev/null 2>&1; echo $?; }
+  r0=0; [ "$(fn "$WT")" = 0 ] || r0=1; ok "0 GUARD_NEVER_TOUCH in the caller's env: worker's judge never sees it" $r0
+  r0=0; [ "$(fn "$T/x0")" = 0 ] || r0=1; ok "0 GUARD_NEVER_TOUCH in the caller's env: no role's judge never sees it" $r0
 
   # 1. A MEMBER REFUSAL IS A QUERY, NOT A LINE IN THE MEMBER'S CHANNEL. The landing tool from a member-facing
   #    session: refused, a query RECORDED for the box's queries session, and NOTHING in the member's own channel
@@ -762,6 +773,108 @@ W11B
   worig=$(g Read "{\"file_path\":\"$H/.claude/settings.json\"}" "$WT" CC_ROLE=worker)
   if [ "$mbash" = 2 ] && [ "$obash" = 2 ] && [ "$mread" = 2 ] && [ "$morig" = 2 ] && [ "$wcopy" = 0 ] && [ "$worig" = 0 ]; then r=0; else r=1; fi
   ok "the sealed-session settings copy under ~/.cc/sandbox is the same secret as ~/.claude/settings.json — refused to a member through Bash and the file tools alike, and left at the tier of its own source for a worker, which is not refused either one" $r
+
+  # 11a. THE SLACK COPY AND THE OWNER'S INDEX ARE NOT A MEMBER-FACING SESSION'S. ~/.cc/slack holds the owner's DMs
+  #      with the box and every member's chats, ~/.cc/library/owner indexes them, and a member-facing dir with no
+  #      workspace (alice here) has no boundary in front of either. Both doors are refused; the rest of
+  #      ~/.cc/library is not, and a worker (whose fence leaves ~/.cc/slack out of its world) is not refused here.
+  s11=$H/.cc/slack/history/box/D0OWN/2026-10.jsonl; i11=$H/.cc/library/owner/index.sqlite
+  mkdir -p "$(dirname "$s11")" "$(dirname "$i11")"; : > "$s11"; : > "$i11"; : > "$H/.cc/library/README.md"
+  mbash=$(g Bash '{"command":"cat ~/.cc/slack/history/box/D0OWN/2026-10.jsonl"}' "$H/dev/alice")
+  mread=$(g Read "{\"file_path\":\"$s11\"}" "$H/dev/alice")
+  mgrep=$(g Grep "{\"pattern\":\"x\",\"path\":\"$H/.cc/slack\"}" "$H/dev/alice")
+  midx=$(g Read "{\"file_path\":\"$i11\"}" "$H/dev/alice")
+  mlib=$(g Read "{\"file_path\":\"$H/.cc/library/README.md\"}" "$H/dev/alice")
+  wread=$(g Read "{\"file_path\":\"$s11\"}" "$WT" CC_ROLE=worker)
+  if [ "$mbash" = 2 ] && [ "$mread" = 2 ] && [ "$mgrep" = 2 ] && [ "$midx" = 2 ] && [ "$mlib" = 0 ] && [ "$wread" = 0 ]; then r=0
+  else r=1; echo "      bash $mbash read $mread grep $mgrep index $midx library $mlib worker $wread"; fi
+  ok "a member-facing session outside a workspace is refused the Slack copy under ~/.cc/slack and the owner's index, through Bash and the file tools alike, while the rest of ~/.cc/library and a worker's read are not" $r
+
+  # 11a'. A WORKSPACE MARKER IS NO BOUNDARY (perms at e00ee984). The deny is lifted only inside a member boundary:
+  #      CC_MEMBER_SANDBOX=1 in the hook's own environment AND a user namespace that is not the host's. A session in
+  #      a dir carrying .cc/member-workspace, or one whose hook was launched with CC_MEMBER_SANDBOX=1 planted on the
+  #      host, is refused exactly like alice; inside a boundary the member's own attachment under ~/.cc/slack/files
+  #      (its member/<h> dir, bound there) reads. The host-planted and inside cases need the host's identity map
+  #      and `unshare -r` to stage; inside a sandbox that already has its own namespace the planted one cannot be
+  #      staged and reads "-".
+  mkdir -p "$H/dev/ws11/.cc" "$H/.cc/slack/files"; : > "$H/dev/ws11/.cc/member-facing"; : > "$H/dev/ws11/.cc/member-workspace"
+  : > "$H/.cc/slack/files/F0OWN-shot.png"
+  read -r u1 u2 u3 < /proc/self/uid_map; ins=() planted=-
+  if [ "$u1 $u2 $u3" = "0 0 4294967295" ]; then
+    planted=$(g Read "{\"file_path\":\"$s11\"}" "$H/dev/ws11" CC_MEMBER_SANDBOX=1)
+    # A host that refuses an unprivileged `unshare -r` (Ubuntu's apparmor_restrict_unprivileged_userns, as on the
+    # landing lane) still lets bwrap, which has its own apparmor profile, map the user: that is the boundary's own
+    # tool, and the guard inside it sees the same non-identity uid_map a member sandbox shows it.
+    if unshare -r true 2>/dev/null; then ins=(CC_MEMBER_SANDBOX=1 unshare -r)
+    elif bwrap --dev-bind / / --unshare-user true 2>/dev/null; then ins=(CC_MEMBER_SANDBOX=1 bwrap --dev-bind / / --unshare-user); fi
+  else ins=(CC_MEMBER_SANDBOX=1); fi
+  wsbash=$(g Bash '{"command":"cat ~/.cc/slack/history/box/D0OWN/2026-10.jsonl"}' "$H/dev/ws11")
+  wsread=$(g Read "{\"file_path\":\"$s11\"}" "$H/dev/ws11")
+  wsidx=$(g Read "{\"file_path\":\"$i11\"}" "$H/dev/ws11")
+  inside=-; [ ${#ins[@]} -gt 0 ] && inside=$(g Read "{\"file_path\":\"$H/.cc/slack/files/F0OWN-shot.png\"}" "$H/dev/ws11" "${ins[@]}")
+  if [ "$wsbash" = 2 ] && [ "$wsread" = 2 ] && [ "$wsidx" = 2 ] && [ "$planted" != 0 ] && [ "$inside" = 0 ]; then r=0
+  else r=1; echo "      workspace bash $wsbash read $wsread index $wsidx, planted $planted, inside a boundary $inside"; fi
+  ok "a member workspace on the host and a hook with CC_MEMBER_SANDBOX=1 planted outside a boundary are refused the Slack copy and the index; inside a boundary the member's own attachment under ~/.cc/slack/files reads" $r
+
+  # 11a''. A MEMBER MARKER IS WRITTEN BY NO SESSION (perms at e00ee984: "Refuse writes to .cc/member-* from
+  #      sessions"). Through the file tools and Bash alike, for a member-facing session and a worker; a plain note
+  #      in the member's own dir and a read of the marker still pass.
+  mkw=$(g Write "{\"file_path\":\"$H/dev/alice/.cc/member-workspace\"}" "$H/dev/alice")
+  mke=$(g Edit "{\"file_path\":\"$H/dev/alice/.cc/member-facing\"}" "$H/dev/alice")
+  mkb=$(g Bash '{"command":"touch .cc/member-workspace"}' "$H/dev/alice")
+  mkr=$(g Bash '{"command":"rm -f .cc/member-facing"}' "$H/dev/alice")
+  mkm=$(g Bash '{"command":"mv .cc .cc-old"}' "$H/dev/alice")
+  mkt=$(g Write "{\"file_path\":\"$WT/.cc/member-facing\"}" "$WT" CC_ROLE=worker)
+  mkn=$(g Write "{\"file_path\":\"$H/dev/alice/notes.md\"}" "$H/dev/alice")
+  mkc=$(g Bash '{"command":"cat .cc/member-facing"}' "$H/dev/alice")
+  if [ "$mkw$mke$mkb$mkr$mkm$mkt$mkn$mkc" = 22222200 ]; then r=0
+  else r=1; echo "      write $mkw edit $mke touch $mkb rm $mkr mv $mkm worker $mkt note $mkn read $mkc"; fi
+  ok "a member marker is refused to the Write and Edit tools and to touch, rm and mv of its .cc, for a member-facing session and a worker, while a note beside it and a read of it pass" $r
+
+  # 11a'''. WHO ASKS cc-lib IS RECORDED BY THE GUARD, NOT WORKED OUT BY cc-lib (perms at f2aec139). Before a Bash call
+  #      the guard writes ~/.cc/library/owner/callers/<pid of the session's claude> = "<start time> owner|member <h>".
+  #      A member-facing session's claude is recorded member with its channel; one launched in the member dir is
+  #      member even after a `cd` out of it with no role; a member record is never rewritten as owner; a worker's
+  #      claude is owner. No session writes the record, through the file tools or Bash.
+  cst(){ sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f20; }
+  cr=$H/.cc/library/owner/callers; rm -rf "$cr"
+  (cd "$H" && exec "$T/claude") & ca=$!
+  (cd "$H/dev/alice" && exec "$T/claude") & cb=$!
+  (cd "$WT" && exec "$T/claude") & cw=$!
+  sleep 0.2
+  g Bash '{"command":"ls"}' "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$ca >/dev/null
+  g Bash '{"command":"ls"}' "$H" CC_GUARD_ROOT_PID=$ca >/dev/null                # the same claude, cd'd out, no role
+  g Bash '{"command":"ls"}' "$H" CC_GUARD_ROOT_PID=$cb >/dev/null                # launched in alice, cd'd out, no role
+  g Bash '{"command":"ls"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$cw >/dev/null
+  ra=$(cat "$cr/$ca" 2>/dev/null); rb=$(cat "$cr/$cb" 2>/dev/null); rw=$(cat "$cr/$cw" 2>/dev/null)
+  cww=$(g Write "{\"file_path\":\"$cr/$cb\"}" "$H/dev/alice" CC_GUARD_ROOT_PID=$cb)
+  cwb=$(g Bash "{\"command\":\"echo $(cst $cb) owner > ~/.cc/library/owner/callers/$cb\"}" "$H/dev/alice" CC_GUARD_ROOT_PID=$cb)
+  sa=$(cst $ca); sb=$(cst $cb); sw=$(cst $cw)
+  kill $ca $cb $cw 2>/dev/null; wait $ca $cb $cw 2>/dev/null
+  if [ "$ra" = "$sa member alice" ] && [ "$rb" = "$sb member alice" ] && [ "$rw" = "$sw owner" ] && [ "$cww$cwb" = 22 ]; then r=0
+  else r=1; echo "      member '$ra' launched-in '$rb' worker '$rw' write $cww bash $cwb"; fi
+  ok "the guard records the session's claude for cc-lib: member-facing as member of its channel, still member after a cd out with no role and when launched in the member dir, a worker as owner; a member session cannot write the record through Write or Bash" $r
+
+  # 11a''''. …AND A CLAUDE A MEMBER-FACING SESSION STARTS IS MEMBER TOO (perms at d54b4814). The session picks that
+  #      claude's cwd and env, so the REAL ccrec must look above it: a member-facing claude (recorded member, or
+  #      launched with CC_ROLE=member) starts a child claude in $H with a clean env, and the child's own hook records
+  #      it member; the same child under an owner's claude is owner. On d54b4814 both member children were owner.
+  mkdir -p "$T/outer"; printf '#!/bin/sh\ncd "$1" && { env -i "$2" & echo $! > "$3"; wait; }\n' > "$T/outer/claude"; chmod +x "$T/outer/claude"
+  rm -f "$T"/in68?; cr=$H/.cc/library/owner/callers
+  (cd "$H/dev/alice" && exec env -i PATH="$PATH" "$T/outer/claude" "$H" "$T/claude" "$T/in68a") & oa=$!
+  (cd "$H" && exec env -i PATH="$PATH" CC_ROLE=member "$T/outer/claude" "$H" "$T/claude" "$T/in68b") & ob=$!
+  (cd "$H" && exec env -i PATH="$PATH" "$T/outer/claude" "$H" "$T/claude" "$T/in68c") & oc=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/in68a" ] && [ -s "$T/in68b" ] && [ -s "$T/in68c" ] && break; sleep 0.1; done
+  ia=$(cat "$T/in68a" 2>/dev/null); ib=$(cat "$T/in68b" 2>/dev/null); ic=$(cat "$T/in68c" 2>/dev/null)
+  g Bash '{"command":"ls"}' "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$oa >/dev/null   # the member session's own call
+  g Bash '{"command":"ls"}' "$H" CC_GUARD_ROOT_PID=$oc >/dev/null                             # an owner session's
+  for i in "$ia" "$ib" "$ic"; do g Bash '{"command":"ls"}' "$H" CC_GUARD_ROOT_PID=$i >/dev/null; done   # each child's own hook
+  qa=$(cat "$cr/$ia" 2>/dev/null); qb=$(cat "$cr/$ib" 2>/dev/null); qc=$(cat "$cr/$ic" 2>/dev/null)
+  ta=$(cst "$ia"); tb=$(cst "$ib"); tc=$(cst "$ic")
+  kill $ia $ib $ic 2>/dev/null; kill $oa $ob $oc 2>/dev/null; wait $oa $ob $oc 2>/dev/null
+  if [ -n "$ia" ] && [ -n "$ib" ] && [ -n "$ic" ] && [ "$qa" = "$ta member alice" ] && [ "$qb" = "$tb member" ] && [ "$qc" = "$tc owner" ]; then r=0
+  else r=1; echo "      under a recorded member '$qa' (want '$ta member alice'), under CC_ROLE=member '$qb', under an owner '$qc'"; fi
+  ok "a claude a member-facing session starts, in an owner's dir with a clean env, is recorded member by its own hook (the guard reads the whole chain above it), while the same child under an owner's claude is owner" $r
 
   # 11b. A MEMBER WORKSPACE MAY SEND A MAIL — owner, 2026-09-11 19:46Z: "all workspaces should be able to send
   #      emails, it's a critical path; we can figure out permissions later". Inside a boundary `cc-mail send` has
@@ -5791,6 +5904,13 @@ if [ -n "$awt" ]; then
   [ "$awd" != "$awc" ] && [ "${awd%/*}" = "$awc/worktrees" ] || awt=""
 fi
 case "$mws" in *[!a-z0-9-]*) mws="";; esac   # the handle goes into a regex below: [a-z0-9-] or nothing at all
+# INSIDE A MEMBER BOUNDARY ($inb) — decided from what the boundary makes and the session cannot, as cc-sandbox's
+# in_member does: CC_MEMBER_SANDBOX=1 in THIS hook's environment (inherited from the claude process the boundary
+# launched, which no Bash call of the session reaches) AND a user namespace that is not the host's. Never from $mws:
+# that comes from .cc/member-workspace, a file in the session's own tree (perms, #937: "Key both the guard deny and
+# facing_fence on something the session cannot set").
+inb=""; if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then read -r ua ub uc < /proc/self/uid_map 2>/dev/null \
+  && [ "$ua $ub $uc" != "0 0 4294967295" ] && inb=1; fi
 # $mdir is the member-facing session dir, and its basename is its Slack channel: the refusal below is posted there.
 # An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
 # may read, search, think and ask its peer — it may not act on the world. A marker file could not do this: the
@@ -5856,6 +5976,68 @@ fi
 pfonly=""
 case "$role" in worker|member) ;; *) pfonly=1;; esac
 [ -n "$root" ] || root=$cwd   # nothing to anchor on (an env-only role, a handoff-gated session): the cwd, as before
+# WHO IS ASKING cc-lib IS THE GUARD'S TO SAY (perms, #937, round 3). cc-lib shows the Slack copy only to a caller
+# shown to be the owner, and it cannot tell that from its own process tree: a member-facing session can start a
+# process named claude, with whatever env and cwd it likes, and cc-lib would read that one. This hook can: it is
+# started by the session's real claude, so the nearest claude above IT is the session's, and nothing a Bash call
+# does puts a process between the two. So before every Bash call the guard writes that claude's record,
+# ~/.cc/library/owner/callers/<pid> = "<start time> owner" or "<start time> member <handle>", and cc-lib reads it
+# for the claude it finds above itself: a stand-in claude with no hook of its own has no record, and a pid reused
+# after its session ended has another start time, so either one sees no Slack. A claude that does run this hook is
+# member if anything above it is (ccrec reads the whole chain, below), so one a member-facing session starts is
+# recorded member however it was launched. Member is sticky: a member record is never rewritten as owner, so a
+# session that `cd`s out of its marked dir does not become the owner on its next call. No
+# session writes the record: ~/.cc/library/owner is on a member's secret list for Bash and the file tools (outside
+# a boundary), and a worker's fence is its own tree. Inside a boundary nothing is written: cc-lib there reads the
+# member's own workspace file and never the copy.
+ccrec(){
+  [ "$tool" = Bash ] && [ -z "$inb" ] || return 0
+  local p="" n=0 home="" st="" w="" h="" d="$HOME/.cc/library/owner/callers" f="" lq="" e="" up="" ups=""
+  pst(){ local x; x=$(cat "/proc/$1/stat" 2>/dev/null) || return 0; x=${x##*") "}; read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ x _ <<<"$x"
+    case "$x" in ''|*[!0-9]*) ;; *) printf %s "$x";; esac; }
+  # $HOME is the hook's, inherited from the session's claude at launch, which no Bash call reaches. cc-lib reads the
+  # passwd home's (callers_dir), so a claude launched with another HOME (the selfcheck's) is recorded where cc-lib
+  # never looks, and fails closed.
+  if [ -n "${CC_GUARD_ROOT_PID:-}" ]; then
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+    [ -n "$home" ] && [ "$home" != "$HOME" ] && p=$CC_GUARD_ROOT_PID
+  fi
+  if [ -z "$p" ]; then p=$PPID
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+      [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && break
+      p=$(kppid "$p"); n=$((n+1)); done
+    [ "$(cat "/proc/${p:-0}/comm" 2>/dev/null)" = claude ] || return 0
+  fi
+  st=$(pst "$p"); [ -n "$st" ] || return 0
+  [ "$role" = member ] && h=${mdir##*/} && w=member
+  # THE WHOLE CHAIN, NOT THE NEAREST CLAUDE (perms at d54b4814). A member-facing session picks the cwd and env of any
+  # process it starts, a claude included, so that claude's own cwd and environ say nothing. What it cannot change is
+  # what is ABOVE it: so every process from this claude up to init is read, and any one of them that is member-facing
+  # (the guard's member record for it, its launch cwd under a member marker, CC_ROLE=member or CC_MEMBER_SANDBOX=1 in
+  # its environ) makes this record member, with that one's channel.
+  up=$p; n=0
+  while [ -z "$w" ] && [ -n "$up" ] && [ "$up" != 0 ] && [ "$n" -lt 64 ]; do
+    ups=$(pst "$up"); e=$(cat "$d/$up" 2>/dev/null)
+    if [ -n "$ups" ] && [ "$up" != "$p" ]; then
+      case "$e" in "$ups member"*) w=member; h=${e#"$ups member"}; h=${h# };; esac; fi
+    lq=$(readlink "/proc/$up/cwd" 2>/dev/null)
+    while [ -z "$w" ] && [ -n "$lq" ] && [ "$lq" != / ]; do
+      if [ -f "$lq/.cc/member-facing" ]; then w=member; h=${lq##*/}; fi
+      case "$lq" in "$HOME"/.cc/worktrees/*/*) e=${lq#"$HOME"/.cc/worktrees/}; e=${e%%/*}
+        [ -f "$HOME/dev/$e/.cc/member-workspace" ] && { w=member; h=$e; };; esac
+      lq=${lq%/*}; done
+    [ -z "$w" ] && tr '\0' '\n' < "/proc/$up/environ" 2>/dev/null | grep -qxE 'CC_ROLE=member|CC_MEMBER_SANDBOX=1' && w=member
+    [ "$up" = 1 ] && break
+    up=$(kppid "$up"); n=$((n+1)); done
+  f=$d/$p; e=$(cat "$f" 2>/dev/null)
+  case "$e" in "$st member"*) return 0;; esac   # sticky: this claude was member-facing once, and stays so
+  case "$h" in *[!A-Za-z0-9._-]*) h="";; esac
+  if [ "$w" = member ]; then w="$st member${h:+ $h}"; else w="$st owner"; fi
+  [ "$e" = "$w" ] && return 0
+  ( umask 077; mkdir -p "$d" && printf '%s\n' "$w" > "$f.$$" && mv -f "$f.$$" "$f" ) 2>/dev/null || rm -f "$f.$$" 2>/dev/null
+  return 0
+}
+( ccrec ) 2>/dev/null || :   # a subshell: whatever goes wrong in it, the record is missing (cc-lib fails closed) and no gate is lost
 in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac
   [ -n "$awt" ] && case "$1" in "$awt"|"$awt"/*) return 0;; esac; return 1; }   # $awt: the agent worktree this call stands in — see above
 # THE TWO FENCES USED TO BE IMPOSSIBLE TOGETHER, AND THE ANSWER WAS TO REFUSE THE SPAWN. It is now to move the
@@ -6097,7 +6279,13 @@ secret_all(){
 # baseline — the same hook registrations and the same deny rules — so a session that may not read the original may
 # not read the copy either. Same tier as the original, not a stricter one: the whole subtree, because a copy that
 # is a secret under one name is a secret under any name a future launch gives it.
-secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json|"$HOME"/.cc/sandbox|"$HOME"/.cc/sandbox/*) return 0;; esac; return 1; }
+# THE SLACK COPY AND THE OWNER'S INDEX ARE NOT A MEMBER-FACING SESSION'S. ~/.cc/slack holds both sides of every
+# chat (the owner's DMs with the box, every member's channels) and ~/.cc/library/owner indexes them, and a
+# member-facing session on the host has no boundary in front of either, workspace marker or not. So outside a
+# boundary ($inb) both are on its list. Inside one ~/.cc/slack IS its own member/<h> tree (its attachments under
+# files/) and the owner's index is not there at all (cc-sandbox), so nothing is refused there.
+secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json|"$HOME"/.cc/sandbox|"$HOME"/.cc/sandbox/*) return 0;; esac
+  [ -z "$inb" ] && case "$1" in "$HOME"/.cc/slack|"$HOME"/.cc/slack/*|"$HOME"/.cc/library/owner|"$HOME"/.cc/library/owner/*) return 0;; esac; return 1; }
 # THE PERMISSION SEAT'S STATE IS WRITTEN BY THAT SEAT ALONE, AT EVERY TIER — the planning session included. The seat
 # is the one session the box runs with --dangerously-skip-permissions, in ~/.cc/state/<repo>/perms (brief.md,
 # ledger.md, session-id, handoff.md — the journal `cc-perms handoff` starts its successor from — and .claude/), and
@@ -6455,7 +6643,7 @@ argv_layer(){
   gr=$root${mdir:+:$mdir}${awt:+:$awt}               # GUARD_ROOT: the trees this session writes, ':'-separated
   gp=""; [ -z "$pfonly" ] && grep -qF perms <<<"$ac" && pseat && gp=1   # GUARD_PSEAT: the /proc walk only when perms is named
   av=$(env -u GUARD_NEVER_TOUCH HOME="$HOME" GUARD_HOME="$HOME" GUARD_ROLE="$ar" GUARD_CWD="$cwd" \
-         GUARD_ROOT="$gr" GUARD_MWS="$mws" GUARD_PSEAT="$gp" "$GA" judge <<<"$ac" 2>&1); arc=$?
+         GUARD_ROOT="$gr" GUARD_MWS="$mws" GUARD_INB="$inb" GUARD_PSEAT="$gp" "$GA" judge <<<"$ac" 2>&1); arc=$?
   if [ "$arc" != 0 ]; then [ -z "$pfonly" ] && never "the guard could not parse this command (cc-guard-argv rc $arc: ${av:0:200})"
   else case "$av" in
     '') ;;
@@ -7184,6 +7372,12 @@ case "$tool" in
     sbxisc "$fp" && ! pseat && { grep -qF CC_WORKER_SANDBOX <<<"$inp" || { { [ -n "$pfonly" ] || in_root "$fp"; } && sbxedit; }; } \
       && { sbxhit="the $tool tool on ~/.cc/config"; sbxdeny; }
     [ -n "$pfonly" ] && exit 0   # the ungated tier meets this one path check and nothing else
+    # A MEMBER MARKER IS WRITTEN BY NO SESSION (perms, #937: "Refuse writes to .cc/member-* from sessions"): see
+    # marker() in cc-guard-argv, which refuses the Bash spellings.
+    case "$role:$fp" in member:*/.cc/member-*|worker:*/.cc/member-*)
+      never "writing a member marker ($fp) — .cc/member-facing and .cc/member-workspace are the host's to write";; esac
+    case "$role:$fp" in member:"$HOME"/.cc/library/owner/callers|member:"$HOME"/.cc/library/owner/callers/*|worker:"$HOME"/.cc/library/owner/callers|worker:"$HOME"/.cc/library/owner/callers/*)
+      never "writing cc-lib's caller records ($fp) — the guard writes them (ccrec), and they decide who sees the Slack copy";; esac
     if ! in_root "$fp"; then case "$fp" in    # inside the worktree (rule 5: the marker root, not the cwd) / the member's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
       "$HOME"/.cc/tmp/*) ;;                        # scratch on disk: the TMPDIR cc and the units hand every session, Claude Code's scratchpad under it

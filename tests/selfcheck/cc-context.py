@@ -213,6 +213,19 @@ def selfcheck():
         ok("--all --json is the same rows as the TSV, each carrying a ts the TSV has no room for",
            len(jrows) == 6 and all(r.get("ts", "").endswith("Z") for r in jrows)
            and jrows[0]["repo"] == "repo1" and jrows[0]["level"] == "handoff" and jrows[1]["level"] is None)
+        global transcript_for_cwd
+        tfc_keep = transcript_for_cwd
+        os.makedirs(os.path.join(WORKTREES, "repo3", "gone"))
+        def vanished(cwd, since=0):
+            raise FileNotFoundError(cwd)    # the live host: a transcript removed between the glob and the stat
+        transcript_for_cwd = vanished
+        try:
+            rc, out, _ = run(["--all"])
+        finally:
+            transcript_for_cwd = tfc_keep
+            shutil.rmtree(os.path.join(WORKTREES, "repo3"), ignore_errors=True)
+        ok("a track whose transcript goes mid-read is one row less, not an --all that dies and lists nothing",
+           rc == 0 and len(out.rstrip("\n").split("\n")) == 6)
         ok("`cc-context <repo>` is the NEWEST session in that checkout, not the older one beside it",
            newest_in(os.path.join(DEV, "repo2")) == "sid-r"
            and run(["repo2"])[1].startswith("2%  20k/1M"))
