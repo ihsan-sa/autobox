@@ -30,7 +30,9 @@ A planning seat runs it by hand; the lander never installs itself.
         side, also inside bwrap. A job the current release plans and the candidate cannot is a refusal.
         Exit 0 passed, 1 refused, 3 could not run.
     lander-self land <repo> <pr> [--repo-dir DIR]
-        check, then `gh pr merge --squash --match-head-commit <head> --delete-branch`. It does not promote. Then
+        check, then `gh pr merge --squash --match-head-commit <head> --delete-branch --subject "<title> (#<pr>)"`,
+        so main's commit carries the PR's title, not its one commit's subject (a `wip: checkpoint`). It does not
+        promote. Then
         it runs the current release's `lander settle-merged <repo> <pr> --by lander-self` (its own process), which
         moves the PR's query job to merged and writes the lane's merged line; a release without that command, or
         none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
@@ -1930,7 +1932,7 @@ def cmd_check(args, opts):
     root = os.path.realpath(opts.get("repo-dir") or os.path.join(dev, repo))
     if not os.path.isdir(os.path.join(root, ".git")) and not os.path.isfile(os.path.join(root, ".git")):
         return die(f"check: no checkout at {root}", 3), None
-    rc, out, err = sh(["gh", "pr", "view", pr, *gh_repo(root), "--json", "headRefOid,baseRefName,state,files,comments"],
+    rc, out, err = sh(["gh", "pr", "view", pr, *gh_repo(root), "--json", "headRefOid,baseRefName,state,files,comments,title"],
                       cwd=root)
     try:
         facts = json.loads(out) if rc == 0 else None
@@ -2005,17 +2007,25 @@ def cmd_check(args, opts):
         return die(f"check: the candidate cannot plan {bad} job(s) the current release plans"), None
     print(f"lander-self check: {repo}#{pr} at {head[:12]} passed — {len(files)} lander path(s), read by "
           f"{', '.join(sorted(by))}, identity gate and own tests green in bwrap")
-    return 0, head
+    return 0, facts
+
+
+def merge_argv(root, pr, head, title):
+    """`gh pr merge` for a checked PR. --subject is the PR's title, as the lander's own merge (gh.merge_argv) gives
+    it: without it GitHub names a one-commit squash after that commit, so main read `wip: checkpoint …` (#1416)."""
+    title = (title or "").strip()
+    return (["gh", "pr", "merge", str(pr), *gh_repo(root), "--squash", "--match-head-commit", head, "--delete-branch"]
+            + (["--subject", f"{title} (#{pr})"] if title else []))
 
 
 def cmd_land(args, opts):
-    rc, head = cmd_check(args, opts)
+    rc, facts = cmd_check(args, opts)
     if rc != 0:
         return rc
+    head = facts.get("headRefOid") or ""
     dev = os.environ.get("CC_DEV") or os.path.join(HOME, "dev")
     root = os.path.realpath(opts.get("repo-dir") or os.path.join(dev, args[0]))
-    rc, out, err = sh(["gh", "pr", "merge", args[1], *gh_repo(root), "--squash", "--match-head-commit", head,
-                       "--delete-branch"], cwd=root)
+    rc, out, err = sh(merge_argv(root, args[1], head, facts.get("title")), cwd=root)
     if rc != 0:
         return die(f"land: the merge did not go through: {(out + err).strip()[-300:]}")
     print(f"lander-self: merged {args[0]}#{args[1]} at {head[:12]}; `lander-self promote` switches the lander to it")
@@ -2059,6 +2069,14 @@ def selfcheck():
                                                                  "core/tests/lander/test_x.py", "core/bin/cc-x"],
                                                                 ["core/lander/review.py"]) == ["core/bin/cc-x"])
     case("* stays in one segment", outside(["core/bin/lander/x"], ["core/bin/*"]) == ["core/bin/lander/x"])
+    # the squash's subject is the PR's title (#1416 and #1423 landed as `wip: checkpoint …`); a root with no pin has no -R
+    h40 = "a" * 40
+    av = merge_argv("/nonexistent/lander-self-case", "1423", h40, "Cards say what landed\n")
+    case("land names the squash after the PR's title and number",
+         av[av.index("--subject") + 1] == "Cards say what landed (#1423)" and av[:4] == ["gh", "pr", "merge", "1423"]
+         and av[av.index("--match-head-commit") + 1] == h40 and "--squash" in av and "-R" not in av)
+    case("…and an empty title leaves --subject out rather than sending ' (#N)'",
+         "--subject" not in merge_argv("/nonexistent/lander-self-case", "7", h40, " "))
     case("policy without a lander list refuses", _raises(lambda: lander_list("[paths]\ngate_first=['a']\n")))
     case("policy lander list parses", lander_list('[paths]\nlander = ["core/lander/**"]\n') == ["core/lander/**"])
     # records: only the box's own LAND markers at this head count, and both kinds of reader are needed

@@ -377,6 +377,64 @@ class RestFacts(unittest.TestCase):
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):              # is unreadable, never "no CI"
             self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
 
+    def test_more_than_a_page_of_checks_is_paged_on(self):
+        # perms on #1547: one page of check runs held 100, so a red 101st was never read
+        pin, ok = "h" * 40, {"name": "c", "status": "completed", "conclusion": "success", "details_url": "u"}
+        runs = f"api repos/o/r/commits/{pin}/check-runs?per_page=100"
+        calls, p = self.run_gh({
+            "api repos/o/r/pulls/7": json.dumps(self.PULL),
+            runs: json.dumps({"total_count": 101, "check_runs": [ok] * 100}),
+            runs + "&page=2": json.dumps({"total_count": 101, "check_runs": [
+                {"name": "late", "status": "completed", "conclusion": "failure", "details_url": "u9"}]}),
+            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"total_count": 0, "statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "red")
+        self.assertEqual(sum("check-runs" in " ".join(c) for c in calls), 2)
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),   # page 2 unanswered: unreadable, not green
+                            runs: json.dumps({"total_count": 101, "check_runs": [ok] * 100}),
+                            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
+        calls, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),   # exactly 100: total_count stops it
+                                runs: json.dumps({"total_count": 100, "check_runs": [ok] * 100}),
+                                f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "green")
+        self.assertEqual(sum("check-runs" in " ".join(c) for c in calls), 1)
+
+    def test_a_check_list_read_short_of_its_total_is_unreadable(self):
+        # the Opus read at 5f4dad4b: page 1 says 101 and holds 100 green, page 2 answers [], so the 101st was never read
+        pin, ok = "h" * 40, {"name": "c", "status": "completed", "conclusion": "success", "details_url": "u"}
+        runs = f"api repos/o/r/commits/{pin}/check-runs?per_page=100"
+        _, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL),
+                            runs: json.dumps({"total_count": 101, "check_runs": [ok] * 100}),
+                            runs + "&page=2": json.dumps({"total_count": 101, "check_runs": []}),
+                            f"api repos/o/r/commits/{pin}/status?per_page=100": json.dumps({"statuses": []})})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
+        self.assertIsNone(j)
+        self.assertIn("read short: 100 of 101", why)
+
+    def test_a_check_list_that_repeats_its_page_is_unreadable(self):
+        # perms on #1547: no total_count and the same full page every time would page forever and read green
+        pin, calls = "h" * 40, []
+        page = json.dumps({"check_runs": [{"id": 5 + i, "name": "c", "status": "completed", "conclusion": "success",
+                                           "details_url": "u"} for i in range(100)]})
+
+        def gh(argv, root, token=None, timeout=120, note=True):
+            calls.append(argv)
+            if len(calls) > 50:
+                raise AssertionError("paged on past a repeated page")
+            if argv[1] == "repos/o/r/pulls/7":
+                return 0, json.dumps(self.PULL), ""
+            return 0, page if "check-runs" in argv[1] else json.dumps({"statuses": []}), ""
+        with mock.patch.object(GH, "gh", gh), mock.patch.object(GH, "slug", lambda root: "o/r"):
+            j, why = GH.pr_facts("/x", 7, "statusCheckRollup")
+            self.assertEqual(GH.ci_state("/x", 7, pin)[0], "")
+        self.assertIsNone(j)
+        self.assertIn("repeats an earlier page", why)
+
     COMMENTS = ("api --paginate repos/o/r/issues/7/comments?per_page=100 -q "
                 ".[] | {body, login: .user.login, createdAt: .created_at}")
 

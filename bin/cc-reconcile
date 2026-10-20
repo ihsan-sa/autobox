@@ -720,12 +720,13 @@ def pr_state(repo, url, net=True):
 
 
 def board_pr_states(repo, prs, net=True):
-    """{pr: STATE} for the PRs one board names, read from one REST list per GitHub repo (most recently updated first,
-    100 a page, paged on until every PR the board names is seen): a URL names its own repo, a bare number is the board
-    repo's (gh's {owner}/{repo} from its checkout). A PR the list never shows, or a page GitHub did not answer, is left
-    out, and pr_state() under PRMAX reads it. Read one at a time, the 40-a-run budget went in board order, so the boards sorted ahead of a big one spent it every run and
-    its 72 rows were never asked: 22 sat in review long after their PRs merged and each was raised as 'worktree gone'
-    (raised-merged-rows-stay-in-review)."""
+    """{pr: STATE} for the PRs one board names, read from one REST list per GitHub repo (newest number first, 100 a
+    page, paged on until every PR the board names is seen or the pages have gone below a number never shown): a URL
+    names its own repo, a bare number is the board repo's (gh's {owner}/{repo} from its checkout). A PR the list never
+    shows, or a page GitHub did not answer or answered again (no lower than the pages before it), is left out, and
+    pr_state() under PRMAX reads it. Read one at a time, the 40-a-run budget went in board order, so the boards sorted
+    ahead of a big one spent it every run and its 72 rows were never asked: 22 sat in review long after their PRs
+    merged and each was raised as 'worktree gone' (raised-merged-rows-stay-in-review)."""
     if not net or not prs or not shutil.which("gh"):
         return {}
     groups = {}
@@ -738,15 +739,22 @@ def board_pr_states(repo, prs, net=True):
     for (owner, name), want in groups.items():
         if owner == "{owner}" and not os.path.isdir(f"{DEV}/{repo}"):
             continue
-        got, page = {}, 1
-        while any(n not in got for n, _ in want):   # page on until every PR the board names is seen or the list ends
-            rows = rest(repo, f"repos/{owner}/{name}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+        got, page, low = {}, 1, None
+        # page on, newest number first, until every PR the board names is seen, the list ends, or the pages are past
+        # every number not yet seen: a number the list went by without showing is no PR of this repo (an issue's, a
+        # typo), and paging on for it read the whole list each run on the core quota the lander needs (perms, #1547)
+        while any(n not in got and (low is None or n < low) for n, _ in want):
+            rows = rest(repo, f"repos/{owner}/{name}/pulls?state=all&sort=created&direction=desc&per_page=100"
                               f"&page={page}", timeout=30)
             if not isinstance(rows, list):
                 break
-            got.update((r.get("number"), rest_state(r)) for r in rows if isinstance(r, dict))
-            if len(rows) < 100:
+            nums = [r.get("number") for r in rows if isinstance(r, dict) and isinstance(r.get("number"), int)]
+            if nums and low is not None and min(nums) >= low:   # a page no lower than the last: the list went round
                 break
+            got.update((r.get("number"), rest_state(r)) for r in rows if isinstance(r, dict))
+            if len(rows) < 100 or not nums:
+                break
+            low = min(nums if low is None else nums + [low])
             page += 1
         for n, pr in want:
             if got.get(n) in ("MERGED", "OPEN", "CLOSED"):

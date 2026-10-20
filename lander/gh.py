@@ -113,7 +113,7 @@ def last(text, n=200) -> str:
 # login's GraphQL hour, which ran out at 18:1xZ with REST still at 4815 of 5000, and every gh pr call on the box failed
 # until the reset. A read whose fields are all below is one GET of the pull (and its files), answered in the shape
 # `gh pr view --json` gives, so no caller changes; statusCheckRollup is the head's check runs and commit statuses
-# (two more GETs), the CI wait's every-two-minutes read. Comments are the issue's comments, each marked
+# (two more GETs, each paged on past 100), the CI wait's every-two-minutes read. Comments are the issue's comments, each marked
 # viewerDidAuthor when its author is the login gh runs as (GET /user, once per process and token; no answer fails the read), and a refusal on
 # the rate limit says so with its reset.
 REST_FIELDS = {"state", "isDraft", "mergeable", "headRefOid", "headRefName", "baseRefName", "title", "body",
@@ -129,7 +129,8 @@ def viewer(root, token=None) -> str:
     key = token if isinstance(token, str) else "" if token is None else None
     if key is None or key not in _VIEWER:
         rc, out, _ = gh(["api", "user", "-q", ".login"], root, token, 30)
-        if rc or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?", out.strip()):   # rc first, then a login
+        # rc first, then a login; a 200 with no login has gh -q print the word null, which is no login either
+        if rc or out.strip() == "null" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?", out.strip()):
             return ""
         if key is None:
             return out.strip()
@@ -251,13 +252,33 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
             if "statusCheckRollup" in want:   # the checks of the head GitHub reports, as GraphQL's rollup is
                 sha, got = (p.get("head") or {}).get("sha") or "", []
                 for path, key in (("check-runs", "check_runs"), ("status", "statuses")):
-                    rc, out, err = gh(["api", f"repos/{s}/commits/{sha}/{path}?per_page=100"], root, token, timeout)
-                    try:
-                        got.append((json.loads(out) if not rc else {}).get(key))
-                    except (ValueError, AttributeError):
-                        got.append(None)
-                    if not isinstance(got[-1], list):
-                        return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+                    # paged until total_count is read or a page comes short: a red 101st hides. A page that opens
+                    # on a row an earlier page opened on is the list going round (no total_count and every page
+                    # full), and a list that ends short of its total_count was not all read: both fail the read
+                    runs, page, firsts = [], 1, set()
+                    while True:
+                        rc, out, err = gh(["api", f"repos/{s}/commits/{sha}/{path}?per_page=100"
+                                                  + (f"&page={page}" if page > 1 else "")], root, token, timeout)
+                        try:
+                            d = json.loads(out) if not rc else {}
+                            rows, total = d.get(key), d.get("total_count")
+                        except (ValueError, AttributeError):
+                            rows = total = None
+                        if not isinstance(rows, list):
+                            return None, spent(root, err, token) or last(err or out) or f"gh exit {rc}"
+                        if rows:
+                            first = (rows[0].get("id") if isinstance(rows[0], dict) and "id" in rows[0]
+                                     else json.dumps(rows[0], sort_keys=True))
+                            if first in firsts:
+                                return None, f"{path} page {page} repeats an earlier page"
+                            firsts.add(first)
+                        runs += rows
+                        if len(rows) < 100 or (isinstance(total, int) and len(runs) >= total):
+                            break
+                        page += 1
+                    if isinstance(total, int) and len(runs) < total:
+                        return None, f"{path} read short: {len(runs)} of {total}"
+                    got.append(runs)
                 j["statusCheckRollup"] = rollup(*got)
         if "files" in want:
             rc, out, err = gh(["api", "--paginate", f"repos/{s}/pulls/{int(pr)}/files?per_page=100", "-q",

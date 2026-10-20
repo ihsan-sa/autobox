@@ -2043,10 +2043,42 @@ def selfcheck():
             paged = board_pr_states("zz", ["https://github.com/o/zz/pull/5", "https://github.com/o/zz/pull/1003"])
         finally:
             globals()["rest"] = real_rest
-        ok("PR BATCH PAGES: a PR older than the 100 most recently updated is read off the next page, not left to the "
+        ok("PR BATCH PAGES: a PR older than the 100 newest is read off the next page, not left to the "
            "capped one-at-a-time reads, and the paging stops once every PR the board names is seen",
            paged == {"https://github.com/o/zz/pull/5": "MERGED", "https://github.com/o/zz/pull/1003": "OPEN"}
-           and len(pages) == 2)
+           and len(pages) == 2 and all("sort=created&direction=desc" in q for q in pages))
+        def rest_deep(repo, path, timeout=20):   # a list that never ends, newest first, with 1150 and 1050 issues
+            pages.append(path)
+            top = 1201 - 100 * (int(path.rsplit("&page=", 1)[1]) - 1)
+            return [{"number": n, "state": "open", "merged_at": None} for n in range(top, top - 102, -1)
+                    if n not in (1150, 1050)][:100]
+        deep = {}
+        for names in (["1150", "99999"], ["1050"], ["1003", "99999"]):
+            pages.clear()
+            try:
+                globals()["rest"] = rest_deep
+                deep[tuple(names)] = (board_pr_states("zz", names), len(pages))
+            finally:
+                globals()["rest"] = real_rest
+        ok("…and a number the list goes by without showing (an issue's, a typo, one past the newest) stops the "
+           "paging there, so it never reads the whole list on the core quota the lander needs (perms on #1547)",
+           deep == {("1150", "99999"): ({}, 1), ("1050",): ({}, 2), ("1003", "99999"): ({"1003": "OPEN"}, 2)})
+        def rest_round(repo, path, timeout=20):   # the same full page, every page: a list going round
+            pages.append(path)
+            if len(pages) > 50:
+                raise RuntimeError("paged on past a repeated page")
+            return [{"number": n, "state": "open", "merged_at": None} for n in range(1200, 1100, -1)]
+        pages.clear()
+        try:
+            globals()["rest"] = rest_round
+            round_ = board_pr_states("zz", ["1150", "5"])
+        except RuntimeError:
+            round_ = None
+        finally:
+            globals()["rest"] = real_rest
+        ok("…and a page no lower than the one before (the list going round) stops the paging as a failed read: the PR "
+           "it never reached is left to the one-at-a-time reads, never read as no PR",
+           round_ == {"1150": "OPEN"} and len(pages) == 2)
         os.remove(f"{tq}/lists"); os.remove(f"{tq}/gh.log"); globals()["PRMAX"] = 1
         got = {tr: fa["pr_state"] for _, tr, _, fa in facts(["zz"])}
         ok("…and when the lists fail (GitHub refusing), the budget reads one PR alone and the rest are unknown",

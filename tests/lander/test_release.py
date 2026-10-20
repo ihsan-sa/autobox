@@ -563,6 +563,14 @@ class GhViewer(unittest.TestCase):
             self.user = fail
             self.assertEqual(self.GH.comments("/r", 5), (None, "GitHub would not say which login gh runs as"))
 
+    def test_a_null_login_is_no_viewer(self):
+        # perms 10-19: /user answering 200 with no login has gh -q print null, which passed the login pattern
+        self.user = (0, "null\n", "")
+        self.assertEqual(self.GH.viewer("/r"), "")
+        self.assertEqual(self.GH._VIEWER, {})
+        self.assertEqual(self.GH.comments("/r", 5), (None, "GitHub would not say which login gh runs as"))
+        self.assertEqual(self.GH.my_open_prs("/r"), (None, "GitHub would not say which login gh runs as"))
+
     def test_a_callable_token_is_never_cached(self):
         def tok():
             return "t"
