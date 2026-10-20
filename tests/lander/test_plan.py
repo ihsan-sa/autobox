@@ -904,6 +904,12 @@ class Select(unittest.TestCase):
         # padding: a change that also touches tests/reach.tsv selects manifest-widen, which reads no code
         p = P.select(bare, ["collectors/new.py", "tests/reach.tsv"], added=["collectors/new.py"])
         self.assertEqual((p.checks, p.paid), ([M.BUILTIN], True))
+        # review of #1178: so is a real check another file selects, when it never covers the unowned code
+        bare.checks["lint"] = T.Check(name="lint", run="true", paths=["collectors/old.py"])
+        p = P.select(bare, ["collectors/new.py", "collectors/old.py"], added=["collectors/new.py"])
+        self.assertEqual((p.checks, p.unowned, p.paid, p.extra.get("ungated")),
+                         (["lint"], ["collectors/new.py"], True, True))
+        del bare.checks["lint"]
         # kept paid: changed data (it may be read by code), and code added among data
         self.assertTrue(P.select(bare, ["collectors/table.csv"]).paid)
         self.assertTrue(P.select(bare, ["data/x.csv", "lib/run.py"], added=["data/x.csv", "lib/run.py"]).paid)
@@ -939,6 +945,8 @@ class Select(unittest.TestCase):
         files = ["collectors/old.py", "collectors/new.py"]
         self.assertTrue(P.select(bare, files, added=["collectors/new.py"]).paid)   # suppressed: nothing runs
         bare.checks["e2e"] = T.Check(name="e2e", run="true", paths=["collectors/old.py"], klass=T.BOX)
+        self.assertTrue(P.select(bare, files, added=["collectors/new.py"]).paid)   # it runs, but never on new.py
+        bare.policy.default = ["e2e"]   # new.py widens to it, so it runs on new.py too
         p = P.select(bare, files, added=["collectors/new.py"])
         self.assertEqual((p.checks, p.extra["tip"], p.unowned), ([], ["e2e"], ["collectors/new.py"]))
         self.assertEqual((p.paid, p.extra.get("ungated")), (False, None))

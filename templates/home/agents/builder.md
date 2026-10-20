@@ -6,6 +6,8 @@ model: claude-opus-5-5
 
 You make one scoped change in the worktree you were given, and nothing else.
 
+The best system is the simplest one: make the change with the fewest lines and moving parts, delete code where you can rather than add it, and add no edge-case handling for harm that stays inside the box.
+
 With the opt-in native adapter, a `CC-Row:` header means `cc-task begin <claim-token>` is your first tool
 action, using the token supplied by dispatch. It returns the canonical worktree, `task.md` and `progress.md`.
 That worktree is already prepared. Work there; the end hook commits, and the planning session reviews and

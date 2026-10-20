@@ -39,9 +39,9 @@ is no class here: the lane's owner door holds CC_PROTECTED_PATHS, and a policy `
 off the light lane (light.path_hit). A class ranked above lander, which the lane never acted on, let a file on both
 lists skip lander-self.
 paid: some file matches paid_review, or UNGATED: some unowned path is code (anything but an added data or asset file,
-inert()) and no check bar manifest-widen runs on the change, before the merge or after it (a repo with no manifest of
-its own and no host fallback, or an add-only change nothing owns). Such a change is read instead of landing on
-nothing, and extra["ungated"] says why it was paid.
+inert()) that no check runs on, before the merge or after it: none it widens to, reaches or triggers (a repo with no
+manifest of its own and no host fallback, or an add-only change nothing owns, whatever its other files select). Such
+a change is read instead of landing on nothing, and extra["ungated"] says why it was paid.
 SECURITY: the changed files that match the base's tests/LANDING-security.toml (Policy.security_review) go in
 extra["security"], and the plan is paid. review.py then lands it only on a security reader's LAND at its digest
 (perms, after #1265 merged a tunnel unit with no security read and its read found a HIGH).
@@ -113,7 +113,7 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
     make the change lander-class. clean: the manifest and reach files in `files` whose edit is clean (clean_manifest);
     they do not make it lander-class either."""
     pol = m.policy
-    names, tip, owned, unowned, reached = set(), set(), [], [], {}
+    names, tip, owned, unowned, reached, covered = set(), set(), [], [], {}, set()
     builtin = M.builtin_check()
     tools_at = {}
     for n in m.checks:
@@ -141,12 +141,15 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
         for caller in R.callers(m.reach, t) if t else []:
             for cp in tools_at.get(caller, []):
                 for n in owners(cp):
-                    if m.checks[n].klass != T.STATIC and n not in names:
-                        reached.setdefault(n, f)
+                    if m.checks[n].klass != T.STATIC:
+                        covered.add(f)
+                        if n not in names:
+                            reached.setdefault(n, f)
     names.update(reached)
     e2e = next((f for f in files if M.match(E2E_TRIGGERS, f)), "")
-    if e2e:
+    if e2e and any(n.startswith("e2e-") for n in m.checks):
         names.update(n for n in m.checks if n.startswith("e2e-"))
+        covered.update(f for f in files if M.match(E2E_TRIGGERS, f))
     faults = list(m.faults)
     add_only = bool(files) and set(files) <= set(added)
     quiet = [f for f in unowned if add_only and loads_by_nothing(f)]
@@ -157,6 +160,8 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
                 names.add(n)
             else:
                 faults.append(f"default check {n!r} is not in the manifest")
+        if any(n in m.checks for n in pol.default):
+            covered.update(widening)
     lander = list(pol.lander) + [p + f for p in M.PREFIXES for f in (M.POLICY, M.SECURITY)]
     # brief: "a reach.tsv change that exactly matches what the generator writes on the PR's merge tree follows from
     # the code, so it's not a policy edit"; "a reach.tsv edit that doesn't match the generator still goes to
@@ -186,7 +191,9 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
     # before the merge or after it, is read instead: the plan is paid, so the lane buys a review.
     # planning 10-12: "add-only files that aren't code (docs, data, assets) need no paid read, but any unowned code
     # path, added or changed, does". manifest-widen is padding here: it reads the manifest, never the code.
-    ungated = any(not inert(f, added) for f in unowned) and not (names - {M.BUILTIN}) and not tip
+    # review of #1178: a check some other file selects is padding too. An unowned path counts as covered only by a
+    # check that runs because of it: the default set it widens to, a caller it reaches, or the e2e set it triggers.
+    ungated = any(not inert(f, added) and f not in covered for f in unowned)
     if ungated:
         extra["ungated"] = True
     if quiet:
