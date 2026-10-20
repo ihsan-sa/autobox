@@ -266,6 +266,21 @@ STUB
   k "$(t test "$(sc ask repo -- 'neither' >/dev/null 2>&1; echo $?)" = 2 -a ! -s "$lg")" "…and one carrying neither"
   seatis "" 1
   k "$(t test "$(sa other --title t -- 'no session' >/dev/null 2>&1; echo $?)" = 2 -a ! -e "$d/state/other/perms")" "an approval ask into a repo with no permission session is refused, and no ledger is made for it"
+  # 16. an approval ask (a deploy's card) with perms down says so the way a permission question does: it still waits
+  #     in the ledger, one line that the session is down goes out, never the ask, and the caller hears who was told
+  #     sa (defined above, with the approval-ask cases) runs cc-refusals ask in a subshell that inherits CC_REFUSALS_NOTIFY; it is
+  #     set here on the call to the stub $d/notify, which appends each call's argv to $d/notified
+  fresh; seatis "" 1; rm -f "$d/notified"
+  id=$(CC_REFUSALS_PERMS_LIVE=0 CC_REFUSALS_NOTIFY=$d/notify sa repo --title "repo deploy" --run "systemctl --user restart x.service" -- 'secret-ish deploy' 2>"$d/err")
+  k "$(t jq -e --arg id "$id" 'select(.id == $id and .source == "approval")' "$lg")" "perms down: an approval ask still prints its id and waits in the ledger"
+  k "$(t test "$(wc -l < "$d/notified")" = 1)" "…the notify stub received exactly one call"
+  k "$(t grep -q -- '--decision --not-perms --id perms-down:repo:.* -- The permission session is down, so 1 ' "$d/notified")" "…and that the session is down goes out, with the count"
+  k "$(t test -z "$(grep 'secret-ish' "$d/notified")")" "…never the ask itself"
+  k "$(t grep -q 'the ask waits in its ledger, and the owner was told it is down' "$d/err")" "…and the caller is told who was told"
+  fresh; seatis "" 1; rm -f "$d/notified"
+  id=$(CC_REFUSALS_NOTIFY=$d/notify sa repo --title "repo deploy" --run "systemctl --user restart y.service" -- 'deploy with perms up' 2>"$d/err")
+  k "$(t jq -e --arg id "$id" 'select(.id == $id and .source == "approval")' "$lg")" "perms up: an approval ask is filed"
+  k "$(t test ! -e "$d/notified" -a ! -s "$d/err")" "…and nobody is told anything, nor does the caller hear of it"
   rm -rf "$d"
   echo "cc-refusals selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]
 }
