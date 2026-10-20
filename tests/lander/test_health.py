@@ -1,6 +1,6 @@
-"""health.py: main's own record of its blocking checks, the lane's plan trimmed by it, judge() taking it for a base
-run, and the e2e set a lander, manifest or sandbox change selects. Every case builds its own state, manifest and git
-answers; nothing reaches the box. Run:
+"""health.py: main's own record of its blocking checks, judge() taking it for a base run, and the e2e set a lander,
+manifest or sandbox change selects. Every case builds its own state, manifest and git answers; nothing reaches the
+box. Run:
 python3 -m unittest discover -s core/tests/lander -t core/tests/lander -p 'test_health.py'
 """
 import datetime
@@ -294,26 +294,7 @@ class Run(Case):
         self.assertNotIn("e2e-flow", ran)
 
 
-class Trim(Case):
-    def plan(self):
-        return T.Plan(checks=["app", "lib"], klass=T.LEAF)
-
-    def test_a_check_red_on_main_leaves_a_plan_that_touches_none_of_its_paths(self):
-        self.go(TIP1, ["app/x.py"], red={"app"})
-        p = HL.trim("demo", manifest(), self.plan(), ["lib/z.py"])
-        self.assertEqual((p.checks, p.extra["main_red"]), (["lib"], ["app"]))
-
-    def test_a_plan_that_touches_the_red_checks_paths_keeps_it(self):
-        # brief: "unless the PR touches that check's owned paths"
-        self.go(TIP1, ["app/x.py"], red={"app"})
-        p = HL.trim("demo", manifest(), self.plan(), ["app/x.py"])
-        self.assertEqual(p.checks, ["app", "lib"])
-        self.assertNotIn("main_red", p.extra)
-
-    def test_no_record_keeps_every_check(self):
-        p = HL.trim("demo", manifest(), self.plan(), ["lib/z.py"])
-        self.assertEqual(p.checks, ["app", "lib"])
-
+class At(Case):
     def test_at_is_only_the_exact_tree(self):
         self.go(TIP1, ["app/x.py"], red={"app"})
         self.assertEqual(HL.at("demo", "t" + TIP1[:5]), {"app": T.FAILED})

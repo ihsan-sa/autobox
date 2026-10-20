@@ -2882,6 +2882,51 @@ class AtOnce(Fixture):
                 else:
                     self.assertNotIn("rerun", j.extra)
 
+    def test_a_check_red_on_main_still_runs_on_a_pr_that_owns_none_of_its_paths(self):
+        # 10-20: main's record held a check red, so a PR that owned none of its paths was planned without it, and
+        # a new red case in it landed unseen. Kept: the PR runs it, and judge's red is the PR's, handed back;
+        # suppressed: a ratchet pass (every red case red on main too) merges.
+        for status, merged in ((T.FAILED, []), (T.PASSED, [1])):
+            with self.subTest(status=status):
+                self.setUp()
+                self.push("main", {"tests/LANDING.toml": Express.MANIFEST})   # b owns b/** alone
+                self.main_red("b")
+                self.pr(1, {"a/x": "n\n"})
+                J.submit("demo", 1)
+                runner = Runner(status={"b": status}, notes={"b": "ratchet: no new reds, b is red on the base too"})
+                u, lines = self.land(planner=Planner(owners={"a": "a/", "b": ""}), runner=runner)   # b: a default
+                self.assertIn("b", [c[0] for c in runner.calls], lines)
+                self.assertEqual(self.merged_order(), merged)
+                if not merged:
+                    self.assertIn("check b failed", J.read_json(J.handed_path("demo", 1))["why"])
+
+    def test_a_check_red_on_main_that_names_no_case_goes_through_only_on_its_failure_count(self):
+        # planning seat's read of #1635: with health.trim gone, a main red whose output names no case ids must not
+        # hold every PR; run.judge's ratchet passes the head when it fails no more than the base, else holds it
+        from lander import run as RUN
+
+        class Counted(Runner):
+            def __init__(self, counts):
+                super().__init__()
+                self.counts = counts
+
+            def run_plan(self, root, m, plan, files, head_tree, base_tree="", **kw):
+                def run(check, tree, where, alone=False, **k):
+                    return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
+                                    extra={"loaded": False, "fails": [],
+                                           "failed": self.counts[tree == head_tree]})
+                return {n: RUN.judge(T.Check(name=n, run="true"), head_tree, base_tree, runner=run)
+                        for n in plan.checks}
+        for counts, merged in (({True: 2, False: 3}, [1]), ({True: 4, False: 3}, []), ({True: None, False: 3}, [])):
+            with self.subTest(counts=counts):
+                self.setUp()
+                self.push("main", {"tests/LANDING.toml": Express.MANIFEST})
+                self.main_red("b")
+                self.pr(1, {"a/x": "n\n"})
+                J.submit("demo", 1)
+                u, lines = self.land(planner=Planner(owners={"a": "a/", "b": ""}), runner=Counted(counts))
+                self.assertEqual(self.merged_order(), merged, lines)
+
     def checked_both(self, red):
         """#1 (a/x, plan [a]) queued before #2 (b/y, plan [b]); main's record holds `red` red; both planned with no
         slot yet, then the lane runs with one slot. -> the runner"""

@@ -2710,6 +2710,25 @@ class TestPermsReads(Case):
             self.assertEqual([(e["verdict"], e["head"]) for e in self.ledger()], [("LAND", self.OLD), (word, HEAD)])
             self.assertEqual(R.carried_from(job), "", word)
 
+    def test_a_land_over_a_do_not_land_does_not_bring_back_the_earlier_heads_land(self):
+        """Opus read of #1628: perms LANDs X, the branch moves to Y, a DO-NOT-LAND with no --head is written at Y, and
+        perms later LANDs Y. Each head's newest entry is then a LAND, so X's counted again, and a head W whose delta
+        from Y touches a security path (X's files put back) carried X's read. record's marker check does not stop
+        this when main moved between the two (Y's change digest is new) or when the LAND comes from perms-adopt."""
+        later = "c" * 40
+        real = (R.security_globs, R.delta_files)
+        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
+        R.security_globs = lambda root, base, repo: ["bin-private/**"]
+        R.delta_files = lambda root, base, old, new: ["bin-private/x"] if old == HEAD else ["x.py"]
+        job = T.Job(repo="demo", pr=7, head=later, base_sha=BASE, digest=R.change_digest(DIFF),
+                    extra={"root": self.tmp})
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", self.OLD, head=self.OLD)[0], 0)
+        self.assertEqual(self.record_as(True, "DO-NOT-LAND", "--by", "perms", "--findings", "[security] x")[0], 0)
+        self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", HEAD)[0], 0)
+        self.assertEqual([(e["verdict"], e["head"]) for e in self.ledger()],
+                         [("LAND", self.OLD), ("DO-NOT-LAND", HEAD), ("LAND", HEAD)])
+        self.assertEqual(R.carried_from(job), "")
+
     def test_a_perms_record_says_what_to_do_when_the_ledger_will_not_take_it(self):
         with open(R.perms_reads_path("demo"), "w") as f:
             f.write("[]")

@@ -98,9 +98,9 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
              -> query, route "owner". plan(); klass
              lander -> query "lander-self"; then nightly.trim takes out the checks that run nightly instead (not on
-             a member's lane), and health.trim the checks main's own record holds red that the change owns no
-             path of (extra main_red; not on a member's lane). A check
-             main's record holds on this very base tree stands for its base run in run.judge.
+             a member's lane). A check main's record holds red stays in the plan, so run.judge's ratchet compares its
+             failing cases with main's (10-20: leaving it out of the plan let a new red case land behind main's
+             old one). A check main's record holds on this very base tree stands for its base run in run.judge.
   checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
              through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
@@ -1191,7 +1191,7 @@ class Lane:
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
         if job.plan.klass == T.LANDER:
             return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
-        job.plan = self.main_red(job, job.base_sha, self.nightly(job.base_sha, job.plan))
+        job.plan = self.nightly(job.base_sha, job.plan)
         J.move(job, T.PLANNED)
 
     def nightly(self, base, plan):
@@ -1201,16 +1201,6 @@ class Lane:
             return plan
         try:
             return NG.trim(self.repo, MF.load(self.root, base, fallback=self.fallback), plan)
-        except Exception:  # noqa: BLE001 — any fault runs every check, never the wrong answer
-            return plan
-
-    def main_red(self, job, base, plan):
-        """`plan` (planned on `base`) without the checks main's own record holds red that the change owns no path
-        of (health.trim); a member's lane, or a manifest that does not load, keeps every check."""
-        if self.member:
-            return plan
-        try:
-            return HL.trim(self.repo, MF.load(self.root, base, fallback=self.fallback), plan, job.files)
         except Exception:  # noqa: BLE001 — any fault runs every check, never the wrong answer
             return plan
 

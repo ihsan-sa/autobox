@@ -25,10 +25,11 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    record of a PR's base, which run.judge() takes instead of running the check on that
                                    base again. An older one is left out, so the base runs as before: main sitting
                                    still while the box breaks a check must not leave a stale green blaming every PR.
-    trim(repo, m, plan, files)     the lane's plan without the checks red on main that the change owns no path of;
-                                   Plan.extra["main_red"] names them. A change that touches one keeps it: it must turn
-                                   it green, and while main is still red on it a red there is main's (judge's
-                                   blocked-by-main), so it waits for that check alone.
+
+A check red here is never left out of a PR's plan: the record says only that the check is red, not which cases, so a
+PR that owned none of its paths was planned without it, and a red case it added there landed unseen behind main's
+(10-20). The PR runs it, and run.judge's ratchet lets it pass only when every case it fails fails on main's tree too,
+or, where neither run names a case, when it fails no more of them than main's tree.
 
 THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked in full, "running": the tip a
 pass is on ("" between passes), "tries": [tip, passes started on it], "gave_up": the last tip given up on (its
@@ -86,22 +87,6 @@ def at(repo, tree, now=None):
         if e.get("tree") == tree and a is not None and a < FRESH:
             out[n] = e["status"]
     return out
-
-
-def trim(repo, m, plan, files):
-    """Any fault keeps the plan whole: running a check is never the wrong answer."""
-    if plan is None:
-        return plan
-    try:
-        held = set(red(repo)) & set(plan.checks)
-        # brief: "Planning a PR leaves out checks currently red on main unless the PR touches that check's owned paths"
-        out = sorted(n for n in held if n in m.checks and not any(m.owns(n, f) for f in files))
-    except Exception:  # noqa: BLE001
-        return plan
-    if out:
-        plan.checks = [n for n in plan.checks if n not in out]
-        plan.extra["main_red"] = out
-    return plan
 
 
 def select(m, files):
@@ -229,8 +214,8 @@ def alert(repo, base, name, tip, merge, why):
     said = {"code": f"its parent passes it, so {what} broke it",
             "machine": "its parent fails it too, so the box changed, not the code",
             "unknown": "it could not be run on the parent, so whether it is the code or the box is not known"}[why]
-    text = (f"[{repo}] {name} went red on {base} at {tip[:12]} ({merge}): {said}. PRs that touch none of its paths "
-            f"land without it until {base} is green on it again.")
+    text = (f"[{repo}] {name} went red on {base} at {tip[:12]} ({merge}): {said}. Until {base} is green on it "
+            f"again, a PR lands only if every case it fails is red on {base} too.")
     pid = f"land:{repo}:main-red:{name}@{tip[:12]}"
     C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] main red", "--id", pid, text], repo, 0)
 

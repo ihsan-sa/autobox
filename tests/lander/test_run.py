@@ -3309,6 +3309,18 @@ class Ratchet(unittest.TestCase):
             o = RUN.judge(chk(name="c"), self.H, self.B, runner=run)
             self.assertEqual(o.status, RUN.BLOCKED, (head, base))
 
+    def test_where_neither_run_names_a_case_the_failure_counts_decide(self):
+        # planning seat's read of #1635: a red on main that names no case held every PR once health.trim was gone
+        for h, b, want in ((2, 3, T.PASSED), (3, 3, T.PASSED), (4, 3, RUN.BLOCKED), (None, 3, RUN.BLOCKED),
+                           (2, None, RUN.BLOCKED)):
+            run, _ = self.runner({self.H: [], self.B: []}, ran={self.H: {"failed": h}, self.B: {"failed": b}})
+            self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, (h, b))
+
+    def test_ran_reads_no_count_from_a_red_that_prints_none(self):
+        self.assertEqual(RUN.ran("boom\n")["failed"], None)
+        self.assertEqual(RUN.ran("== 0 failed, 3 passed ==\n")["failed"], 0)
+        self.assertEqual(RUN.ran("5 failed\n")["failed"], 5)
+
     def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
         store = self.store()
         run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})
@@ -3361,6 +3373,20 @@ class FailIds(unittest.TestCase):
         # only a scratch path and a full sha are blanked: a duration or a short id is part of the case (same read)
         self.assertNotEqual(RUN.fail_ids("✗ done after 900 s"), RUN.fail_ids("✗ done after 31 s"))
         self.assertNotEqual(RUN.fail_ids("✗ job 12345678"), RUN.fail_ids("✗ job 87654321"))
+
+    def test_long_ids_that_differ_past_the_cut_stay_distinct(self):
+        # two parametrised ids sharing their first 200 characters were one id, so the PR's new red read as main's
+        stem = "FAILED tests/x.py::test_p[" + "a" * 200
+        old, new = stem + "-1]", stem + "-2]"
+        ids = RUN.fail_ids(f"{old}\n{new}")
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(all(len(i) <= 200 and i.startswith(stem[:182]) for i in ids))
+        self.assertEqual(RUN.fail_ids(old), RUN.fail_ids(f"{old} - AssertionError"))   # the same case on two trees
+        self.assertEqual(RUN.fail_ids("✗ short"), ["✗ short"])   # a short id is stored as it was
+        res = lambda tree, lines: T.Result(check="c", tree=tree, status=T.FAILED, secs=0.0, runner="box:x:y",
+                                           extra={"fails": RUN.fail_ids("\n".join(lines)), **RUN.ran("\n".join(lines))})
+        self.assertFalse(RUN.no_new_reds(res("h", [new]), res("b", [old])))
+        self.assertTrue(RUN.no_new_reds(res("h", [old]), res("b", [old])))
 
 
 if __name__ == "__main__":

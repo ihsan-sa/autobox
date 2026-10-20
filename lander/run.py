@@ -63,8 +63,8 @@ on the base too, the head ran as far (no fewer passes, no more failures, no cras
 same place, and the base's red is a run made now, in this judge() (a shared one that would let it pass is run again
 first, and when that re-run is unrunnable the shared red holds as main-red), then it passes with a `ratchet` note and
 Outcome.sets naming both sets (no_new_reds; never for a check that guards a security path — gate_first,
-LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, and never for a head red that names no
-case, where the exit code is all there is); a check the base does not define, or whose run file the base lacks, has no
+LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, and for a head red that names no
+case only when the base names none either and both print a failure count, the head's no higher); a check the base does not define, or whose run file the base lacks, has no
 base run and its red is the diff's — except a check the base defines whose run file is on neither tree, which is not
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
 load, on either tree, gets ONE diagnostic rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import os
 import posixpath
 import re
@@ -501,12 +502,21 @@ CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR
 
 def ran(text: str) -> dict:
     """-> {"passes": its last `N passed`, else its count of pass lines; "failed": its last `N failed`, else its count of
-    failing lines (one case failing twice is two); "crash": a crash or abort marker in it}."""
+    failing lines (one case failing twice is two), None when it has neither; "crash": a crash or abort marker in it}."""
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
     f = FAILED_RE.findall(text)
     failed = int(f[-1]) if f else sum(1 for ln in text.splitlines() if FAIL_ID_RE.match(ln) and not PASS_RE.search(ln))
-    return {"passes": passes, "failed": failed, "crash": bool(CRASH_RE.search(text))}
+    return {"passes": passes, "failed": failed if f or failed else None, "crash": bool(CRASH_RE.search(text))}
+
+
+def case_id(full: str) -> str:
+    """One failing case's stored id: the line itself up to 200 characters, else a readable prefix and a hash of the
+    whole line. A plain cut made two long parametrised ids that share 200 characters one id, so a new red on the PR
+    matched an old one on main (perms' read of #1635, 10-20); 64 bits of sha256 keep a crafted twin out of reach."""
+    if len(full) <= 200:
+        return full
+    return f"{full[:182]} #{hashlib.sha256(full.encode()).hexdigest()[:16]}"
 
 
 def fail_ids(text: str):
@@ -522,7 +532,7 @@ def fail_ids(text: str):
             name = name.split(" - ", 1)[0]
         for rx, to in SCRATCH_RES:
             name = rx.sub(to, name)
-        got.add(f"{ln.split()[0]} {name}"[:200])
+        got.add(case_id(f"{ln.split()[0]} {name}"))
         if len(got) > FAILS_CAP:
             return None
     return sorted(got)
@@ -1064,14 +1074,17 @@ def no_new_reds(head: T.Result, base: T.Result) -> bool:
     """THE RATCHET: True when both reds ran in the same place (the box, a runner, a member) and every case the head's
     run names failing the base's names too, and the head ran as far as the base: no fewer passes, and no crash or abort
     the base lacks (a head cut short names fewer reds only because it ran less), and no more failures than the base (a
-    case failing twice, or a lost test masked by an added passing one). A head run that names none falls back to the
-    exit code, which says only that both are red, so it holds; so does a set fail_ids could not trust (None)."""
+    case failing twice, or a lost test masked by an added passing one). When neither run names a case, the count is
+    all there is: it passes on the rule above only when both runs print a failure count; a head that names none
+    against a base that does, a count either run lacks, or a set fail_ids could not trust (None) holds."""
     pr, main = head.extra.get("fails"), base.extra.get("fails")
     same = head.runner.split(":")[0] == base.runner.split(":")[0]
     went = (head.extra.get("passes") or 0) >= (base.extra.get("passes") or 0) and \
         not (head.extra.get("crash") and not base.extra.get("crash")) and \
         (head.extra.get("failed") or 0) <= (base.extra.get("failed") or 0)
-    return same and went and bool(pr) and main is not None and set(pr) <= set(main)
+    named = bool(pr) and main is not None and set(pr) <= set(main)
+    counted = pr == [] and main == [] and None not in (head.extra.get("failed"), base.extra.get("failed"))
+    return same and went and (named or counted)
 
 
 def may_leave(check: T.Check) -> bool:
