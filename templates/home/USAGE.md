@@ -150,6 +150,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-spend cache [--days N]            cache-read tokens per session per day, biggest first
     cc-wakes [--from D --to D]           cache reads per wake-up: kind × cause, and what they re-read (handoff, re-read, base)
     cc-collect [--since D --until D]     the day's snapshot of the box's own workings for improvement passes, no model (~/.cc/state/improve/snapshots/latest)
+    cc-board-dream run [--live]|undo ID  the nightly consolidation of each board, dry unless --live; every action undoable (~/.cc/state/board-dream/)
     cc-improve-batch [<day>]             the day's ranked problems from that snapshot, and what it cost (~/.cc/state/improve/reports/<day>.md)
     cc-memory-dream scan|run|rollback D  the nightly tidy of each project's memory notes, each night a git commit in the dir (~/.cc/state/memory-dream/nights.log)
     cc-memory-verify run [--dry-run]     the nightly check of memory notes' claims against the live box; undo with cc-memory-dream rollback D

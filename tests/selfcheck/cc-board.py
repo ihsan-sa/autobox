@@ -310,6 +310,19 @@ def selfcheck():
         ok("…while a field that does exist still sets, `status` included",
            run("get", "r", "t1", "status").stdout.strip() == "review")
         run("set", "r", "t1", "status", "queued")   # back to what later cases in this suite expect of t1
+        # cc-board-dream marks a row it set done (`dream`, and `folded_into` for a fold) and never takes such a row as
+        # evidence; a person who reopens or completes it through either door makes it theirs, so the marks go.
+        def dream_mark():
+            bd = json.load(open(f"{th}/.cc/boards/r.json"))
+            bd["tracks"]["t1"].update(status="done", dream="r:x:0", folded_into="t9")
+            json.dump(bd, open(f"{th}/.cc/boards/r.json", "w"))
+        def marks():
+            row = json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["t1"]
+            return [k for k in ("dream", "folded_into") if k in row], row["status"]
+        dream_mark(); run("status", "r", "t1", "queued"); m1 = marks()
+        dream_mark(); run("set", "r", "t1", "status", "queued"); m2 = marks()
+        ok("a status set through `status` or `set … status` clears cc-board-dream's done marks",
+           m1 == ([], "queued") and m2 == ([], "queued"))
         # A STRING `notes` FIELD (three rows on the live board carry one today, from `set … notes "<text>"`
         # writing any field verbatim before this fix): `note` used to crash on it with AttributeError —
         # 'str' object has no attribute 'append'.
