@@ -10,7 +10,7 @@ selfcheck(){
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   ev(){ jq -cn --arg c "$1" --arg cmd "$2" --arg r "${3:-Auto-Mode Bypass}" '{hook_event_name:"PermissionDenied", session_id:"s1",
           cwd:$c, tool_name:"Bash", tool_input:{command:$cmd}, tool_use_id:("t" + $cmd), reason:$r}'; }
-  export CC_REFUSALS_CTL=nobody CC_REFUSALS_WT=$d/wt CC_REFUSALS_PERMS_LIVE=1 CC_REFUSALS_NOTIFY=$d/notify
+  export CC_REFUSALS_CTL=nobody CC_REFUSALS_WT=$d/wt CC_REFUSALS_PERMS_LIVE=1 CC_REFUSALS_NOTIFY=$d/notify CC_BOX=box1
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/notified"\n' "$d" > "$d/notify"; chmod +x "$d/notify"
   rec(){ CC_REFUSALS_ROOT=$d/state CC_REFUSALS_DEV=$d/dev "$0" record; }
   mkdir -p "$d/dev/repo/sub" "$d/dev/other" "$d/state/repo/perms" "$d/state/other" "$d/wt/repo/t1" "$d/wt/repo/t2" "$d/elsewhere"
@@ -120,15 +120,50 @@ selfcheck(){
   k "$(t grep -q "^$id .*\[repo\] Bash: .*echo one.* — Auto-Mode Bypass" <<<"$out")" "open's line has the id, window, tool, input and reason"
   ps_ decide repo "$id" grant 'Bash(echo one) in allow' >/dev/null
   k "$(t jq -e --arg id "$id" 'select(.kind == "decision" and .id == $id and .decision == "grant" and .by == "perms")' "$lg")" "decide appends the decision to the same ledger"
-  # 5a. THE DECISION IS SIGNED (perms, 10-20): its .sig is HMAC-SHA256 of "decision\n<id>\n<decision>\n<at>" under
-  #     grant.key beside the ledger, which the first decision made at mode 600. Checked here with openssl, not sign()
+  # 5a. THE DECISION IS SIGNED (perms, 10-20): its .sig is HMAC-SHA256 of "decision\n<id>\n<decision>\n<at>\n<box>\n
+  #     <command>" under grant.key beside the ledger, which the first decision made at mode 600; the box is CC_BOX
+  #     and the command the refusal's input (perms' read of #1578). Checked here with openssl, not sign()
   kf=$d/state/repo/perms/grant.key; drec=$(jq -c --arg id "$id" 'select(.kind == "decision" and .id == $id)' "$lg")
-  want=$(jq -j '"decision\n\(.id)\n\(.decision)\n\(.at)"' <<<"$drec" | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1)
+  want=$(jq -j --arg c "$(jq -r --arg id "$id" 'select(.kind == "refusal" and .id == $id) | .input' "$lg")" \
+    '"decision\n\(.id)\n\(.decision)\n\(.at)\nbox1\n\($c)"' <<<"$drec" | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1)
   k "$(t test -n "$want" -a "$(jq -r '.sig' <<<"$drec")" = "$want" -a "$(stat -c %a "$kf")" = 600 -a "$(wc -c < "$kf")" = 64)" "decide signs its decision with a 600 key of 32 random bytes"
   out=$(sc open repo)
   k "$(t test "$(grep -c . <<<"$out")" = 1 -a -z "$(grep "^$id " <<<"$out")")" "a decided refusal leaves open; the other stays"
   k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 1)" "a second decision on the same id is refused"
   k "$(t test "$(ps_ decide repo rnope decline no >/dev/null 2>&1; echo $?)" = 1)" "a decision on an id that was never refused is refused"
+  # 5a'. ONLY SIGNED DECISIONS COUNT (perms' read of #1578): after the seat's first signed one, a decision line with no
+  #      sig or an empty one, appended on the ask still open, neither takes it off open nor stops the seat deciding it
+  id=$(idof "echo two")
+  jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", note:"n", by:"perms"}' >> "$lg"
+  jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"decline", note:"n", by:"perms", sig:""}' >> "$lg"
+  k "$(t grep -q "^$id " <<<"$(sc open repo)")" "an unsigned decision line leaves its ask open"
+  ps_ decide repo "$id" decline 'no' >/dev/null
+  k "$(t test "$(ps_ decide repo "$id" grant no >/dev/null 2>&1; echo $?)" = 1 -a "$(decided "$lg" | grep -cxF -- "$id")" = 1)" "…and the seat's own decision on it is written and counts"
+  # 5a''. A MALFORMED SIG FAILS ITS OWN LINE (the review of #1728): a decision whose sig is not ASCII made
+  #       compare_digest raise, and counted() printed nothing, so every decided ask opened again
+  n0=$(decided "$lg" | sort | tr '\n' ' '); out=$(sc open repo)
+  jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", by:"perms", sig:"é"}' >> "$lg"
+  k "$(t test "$(decided "$lg" | sort | tr '\n' ' ')" = "$n0" -a "$(sc open repo)" = "$out")" "a decision with a non-ASCII sig leaves decided and open as they were"
+  # 5a''+. A LINE WHOSE ID IS NOT A STRING IS NO RECORD (the review of #1728): an array or object id raised in counted()'s
+  #       lookups by id, so every decision after it vanished, its ask opened again and a second decision was taken
+  seat "echo three"; id=$(idof "echo three"); n0=$(decided "$lg" | sort | tr '\n' ' ')
+  jq -cn '{kind:"decision", id:[1], at:"x", decision:"grant", by:"perms"}' >> "$lg"
+  jq -cn '{kind:"refusal", id:{}, at:"x", repo:"repo", window:"repo", tool:"Bash", input:"x", reason:"r", key:"k"}' >> "$lg"
+  jq -cn '{kind:"ask", id:[], at:"x", repo:"repo"}' >> "$lg"
+  k "$(t test "$(decided "$lg" | sort | tr '\n' ' ')" = "$n0")" "decision and ask lines with an array or object id leave every earlier decision counted"
+  ps_ decide repo "$id" decline no >/dev/null
+  k "$(t test "$(decided "$lg" | grep -cxF -- "$id")" = 1 -a -z "$(sc open repo | grep "^$id ")" -a "$(ps_ decide repo "$id" grant no >/dev/null 2>&1; echo $?)" = 1)" "…and a decision after them counts, leaves open, and a second one is refused"
+  # 5a'''. ON A LEDGER WITH NOTHING SIGNED YET (the review of #1728), an unsigned line on an ask filed after signing
+  #        landed neither hides it nor stops the seat; on one filed before it, the line is history and counts
+  #        (a non-ASCII sig goes first here, ahead of every signed line, where it once emptied counted() whole)
+  fresh; seat "echo fresh"; id=$(idof "echo fresh")
+  jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", by:"perms", sig:"é"}' >> "$lg"
+  jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", note:"n", by:"perms"}' >> "$lg"
+  k "$(t grep -q "^$id " <<<"$(sc open repo)")" "with nothing signed yet, an unsigned decision line leaves its ask open"
+  k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 0)" "…and the seat can still decide it"
+  jq -cn '{kind:"refusal", id:"rold0001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo old", reason:"r", key:"k"}' >> "$lg"
+  jq -cn '{kind:"decision", id:"rold0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+  k "$(t grep -qxF rold0001 <<<"$(decided "$lg")")" "an unsigned decision on an ask filed before signing landed still counts"
   # 5b. WHO MAY DECIDE (security read #2 of #904): only the permission seat, read from the processes. A caller with
   #     no flagged claude above it, one standing outside the perms dir, and one with a second claude above it are
   #     each refused, exit 2, nothing written, whatever CC_REFUSALS_WINDOW says

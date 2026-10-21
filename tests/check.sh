@@ -89,6 +89,12 @@ for f in slack/*.json config/claude-settings.json config/units.json config/claud
 # harness rejects takes out every spawn of that type at dispatch time, with no earlier signal. install.sh's own case
 # in selftest.sh checks that the installed copies match; this checks the templates are loadable in the first place.
 KNOWN_TOOLS="Bash BashOutput Edit Glob Grep KillShell NotebookEdit Read SlashCommand Task TodoWrite WebFetch WebSearch Write"
+no_html_comment(){ ! grep -q '<!--' "$1"; }   # $1 = a type file → 0 when it carries no HTML comment
+# …held to its fixtures here, every run: a type file with a comment is refused, one without passes.
+_hc(){ local f rc=0; f=$(mktemp); printf '%b' "$1" > "$f"; no_html_comment "$f" || rc=1; rm -f "$f"; return "$rc"; }
+if ! _hc '---\nname: x\n---\nplain body\n' || _hc '---\nname: x\n---\n<!-- a note -->\nbody\n'; then
+  echo "check.sh: the type-file comment rule fails its own fixtures"; exit 1
+fi
 for f in templates/home/agents/*.md; do
   [ -f "$f" ] || { echo "templates/home/agents/: no agent types — install.sh and docs/WORKING.md expect them"; exit 1; }
   n="$(basename "$f" .md)"; [ "$(head -1 "$f")" = "---" ] || { echo "$f: no YAML frontmatter"; exit 1; }
@@ -108,6 +114,9 @@ for f in templates/home/agents/*.md; do
     [ -n "$t" ] || { echo "$f: a review type must list its 'tools' — with no key it gets every tool, Write and Edit included"; exit 1; }
     case ",$t," in *,Write,*|*,Edit,*) echo "$f: a review type must not list Write or Edit — it reads a diff, it does not fix it"; exit 1;; esac;;
   esac
+  # The whole body is the agent's prompt, HTML comments included, so a note for maintainers goes here, not there.
+  # (The review types carry no EnterWorktree warning, unlike builder.md, because their 'tools' list leaves it out.)
+  no_html_comment "$f" || { echo "$f: an HTML comment in a type file is sent to the model as prompt text — put the note in tests/check.sh"; exit 1; }
   # THE READING RULE reaches a subagent through its type file and nothing else: no `$(library_sp)` builds this text,
   # so each type carries the line itself — the command and the page, the two words `cc selfcheck` holds the shared
   # config/library-prompt.md to. A type without it is a spawn that answers from memory with the record on disk.
@@ -118,6 +127,13 @@ for f in templates/home/agents/*.md; do
   grep -qF '"${DIR:?}/name"' "$f" && grep -qF "bash <file>" "$f" \
     || { echo "$f: the type does not carry the rm rule (guarded \${DIR:?} targets, long probes as 'bash <file>')"; exit 1; }
 done
+# The set of types is pinned, so a new one (a fixer, say) meets these rules in the PR that adds it: add its name here.
+[ "$(cd templates/home/agents && ls *.md | sort | tr '\n' ' ')" = 'builder.md reviewer.md security-reviewer.md ' ] \
+  || { echo "templates/home/agents/: the type set changed (expected builder, reviewer, security-reviewer) — add the new type's name to this line in tests/check.sh"; exit 1; }
+# The builder's "rely on what already covers it" line must not stretch to a test for its own new branch. The string
+# is load-bearing: reword that sentence in builder.md and this line changes with it.
+grep -qF 'A test for your own new branch is never one of these.' templates/home/agents/builder.md \
+  || { echo "templates/home/agents/builder.md: the line saying a test for its own new branch is never covered elsewhere is gone"; exit 1; }
 else echo "check.sh: · $PART_WHY"; fi
 # THE UNITS ARE THIS BOX'S HALF, and not because systemd-analyze happens to be missing elsewhere — because where
 # it IS missing this block prints nothing and passes. It is NAMED and refused (part_here) rather than skipped, so

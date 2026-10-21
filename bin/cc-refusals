@@ -286,12 +286,14 @@ perms_down(){ local tg=$1 n err nrc who
   else who="the owner was told it is down"; fi
   echo "cc-refusals: the permission session is down; the ask waits in its ledger, and $who" >&2; }
 
-decided(){ jq -r 'select(.kind == "decision") | .id' "$1" 2>/dev/null; }
 # A DECISION IS SIGNED (perms, 10-20, reading #904): any session that can append to the ledger could write a decision
 # line, and a host-move tool runs its cutover on a grant it finds there. So decide, which only the seat passes, signs each
-# one with HMAC-SHA256 over "decision\n<id>\n<decision>\n<at>" under grant.key beside the ledger, made at mode 600 by
-# the seat's first decision, and a reader that acts on a grant checks .sig with that key. Signing, not a perms-only
-# ledger, because every session's guard hook and the refusal and ask verbs must keep appending to this one file.
+# one with HMAC-SHA256 over "decision\n<id>\n<decision>\n<at>\n<box>\n<command>" under grant.key beside the ledger,
+# made at mode 600 by the seat's first decision, and a reader that acts on a grant checks .sig with that key. The box
+# (CC_BOX, else the short hostname) and the ask's command (its input, empty for a question) are in it so a grant can't
+# be replayed for another command or on another box that was handed this ledger and key (perms' read of #1578).
+# Signing, not a perms-only ledger, because every session's guard hook and the refusal and ask verbs must keep
+# appending to this one file.
 # THE TRUST BOUNDARY: the signature stops a forger who can append to the ledger but cannot read the seat's state dir
 # (a sandboxed worker, a member session; cc-sandbox refuses a track named perms, whose bind would be this dir). A host
 # session under the owner's uid can read grant.key as it can read every other secret on the box, so the box trusts it
@@ -299,6 +301,43 @@ decided(){ jq -r 'select(.kind == "decision") | .id' "$1" 2>/dev/null; }
 # The guard's seat-state fence (cc-guard-argv prot(), "the permission seat's state") refuses only writes, and no guard
 # rule refuses reading it: cc-guard selfcheck case 68 pins both, its writes refused and k1's plain read passed.
 sigkey(){ printf '%s/grant.key' "$(dirname "$(ledger "$1")")"; }
+box(){ "$BIN/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null; }
+# THE DECISIONS THAT COUNT (perms' read of #1578): those the seat signed, so an unsigned line appended on an ask perms
+# has not decided yet neither hides it from open nor stops decide. A line signed before the box and command were bound
+# in still counts as decided here, since only the seat could sign it; the overlay's move tool, which acts on a grant, takes the new
+# form alone. An unsigned line still counts on an ask filed before signing landed (#1578's merge), or every ask decided
+# then would open again; on an ask filed after it, only a signed line counts, so a fresh ledger with nothing signed yet
+# is no gap (the review of #1728). A malformed .sig (not ASCII, so compare_digest would raise) fails its own line and
+# nothing else, and a line whose .id is not a string (an array or object would raise in every lookup by id) is no
+# record at all. The guard's open_key reads no key (a sandboxed session can't) and stays as it was: a forged line there
+# only lets the same refusal be written twice.
+counted(){   # $1 a ledger: the decision lines that count, one JSON object a line
+  python3 -I -c 'import hmac,hashlib,json,os,sys
+lg,kf,box=sys.argv[1:]; k=b""; rs=[]
+if not os.path.islink(kf):
+    try: k=open(kf,"rb").read().strip()
+    except OSError: pass
+for l in open(lg,encoding="utf-8",errors="replace"):
+    try: r=json.loads(l)
+    except ValueError: continue
+    if isinstance(r,dict) and isinstance(r.get("id"),str): rs.append(r)   # an id that is not a string is no record
+cut="2026-10-20T20:04:47Z"   # #1578 merged: a decision on an ask filed after this counts only signed
+cmd={}; at={}
+for r in rs:
+    if r.get("kind") in ("refusal","ask"):
+        cmd.setdefault(r.get("id"),str(r.get("input") or "")); at.setdefault(r.get("id"),str(r.get("at") or ""))
+def ok(r):
+    try:
+        s=r.get("sig"); f=["decision"]+[str(r.get(x)) for x in ("id","decision","at")]
+        if not (k and isinstance(s,str) and s.isascii()): return False
+        return any(hmac.compare_digest(hmac.new(k,"\n".join(m).encode(),hashlib.sha256).hexdigest(),s)
+                   for m in (f+[box,cmd.get(r.get("id"),"")],f))
+    except Exception: return False
+for r in rs:
+    if r.get("kind")!="decision": continue
+    a=at.get(r.get("id"),"")
+    if ok(r) or (a and a<cut): print(json.dumps(r))' "$1" "${1%/*}/grant.key" "$(box)" 2>/dev/null; }
+decided(){ counted "$1" | jq -r '.id'; }
 sign(){   # $1 key file, the message on stdin: its hex HMAC-SHA256
   python3 -I -c 'import hmac,hashlib,sys; k=open(sys.argv[1],"rb").read().strip()
 assert k; print(hmac.new(k,sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' "$1" 2>/dev/null; }
@@ -383,7 +422,7 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
   rec=$(jq -c --arg id "$id" 'select((.kind == "refusal" or .kind == "ask") and .id == $id)' "$lg" | head -1)
   [ -n "$rec" ] || { echo "cc-refusals: no refusal or ask $id" >&2; exit 1; }
   [ "$what" = his ] && [ "$(jq -r '.source // ""' <<<"$rec")" = approval ] && card=1
-  prior=$(jq -r --arg id "$id" 'select(.kind == "decision" and .id == $id) | .decision' "$lg" | head -1)
+  prior=$(counted "$lg" | jq -r --arg id "$id" 'select(.id == $id) | .decision' | head -1)
   # "his" on an approval ask: the ruling goes on the ledger FIRST, because the card's cc-notify --his checks it there,
   # and then the card goes out; a card that went out is recorded as posted. A ruling of "his" whose card never went
   # out (Slack down) may be given again, and that only posts the card. Anything else already decided is refused.
@@ -394,12 +433,14 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
     (
       flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
       decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is already decided" >&2; exit 1; }
-      local key at sig; key=$(sigkey "$repo"); at=$(date -u +%FT%TZ)
+      local key at sig b; key=$(sigkey "$repo"); at=$(date -u +%FT%TZ); b=$(box)
+      [ -n "$b" ] || { echo "cc-refusals: this box has no name (CC_BOX, else hostname -s) to sign with — nothing written" >&2; exit 1; }
       [ -L "$key" ] && { echo "cc-refusals: $key is a symlink — nothing written" >&2; exit 1; }
       # mode 600 keeps other Unix users out, not a host session of the same uid: perms accepted that boundary (see sigkey)
       [ -s "$key" ] || ( umask 077; od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$key" ) \
         || { echo "cc-refusals: could not make the signing key — nothing written" >&2; exit 1; }
-      sig=$(printf 'decision\n%s\n%s\n%s' "$id" "$what" "$at" | sign "$key") && [ -n "$sig" ] \
+      sig=$(jq -j --arg d "$what" --arg at "$at" --arg b "$b" '"decision\n\(.id)\n\($d)\n\($at)\n\($b)\n\(.input // "")"' <<<"$rec" \
+        | sign "$key") && [ -n "$sig" ] \
         || { echo "cc-refusals: could not sign the decision — nothing written" >&2; exit 1; }
       jq -cn --arg id "$id" --arg at "$at" --arg d "$what" --arg n "$note" --arg b "$(window)" --arg s "$sig" \
          '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b, sig:$s}' >> "$lg" || exit 1
