@@ -15,10 +15,10 @@ recurring-defect-ok: held-files-unchecked — a judge that refuses `--go`; it ne
 Only what bash would exec is judged. Words are read after VAR= and wrappers (env timeout nice nohup setsid stdbuf
 ionice time command builtin exec chrt taskset xargs parallel busybox flock watch systemd-run unshare nsenter chroot); the parser
 recurses into sh -c, eval, $( ), backticks, <( ), find -exec, xargs fed by a pipe, env -S/--split-string, and a
-heredoc, here-string, pipe, `< <( )` or `< f` (f written earlier in the line) fed to a shell, source or at/batch, or named
-as its script (`sh <( )`, `bash /dev/stdin`, `. -`, `bash /dev/fd/3 3<<<…`, an interpreter's `/dev/stdin`), what xargs
-or parallel runs with each item it reads (from stdin, -a f, `< f` or parallel's ::: words) as ONE word (the whole input, and
-each line, -I/-i/--replace swapped in; a lone `parallel {}` runs each item as the command), `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
+heredoc, here-string, pipe (`cat f` of an f written earlier reads as its text), `< <( )` or `< f` (f written earlier in the line) fed to a shell, source or at/batch, or named
+as its script (`sh <( )`, `bash /dev/stdin`, `. -`, `bash /dev/fd/3 3<<<…`, an interpreter's stdin, a pipe too), what xargs
+or parallel runs with each item it reads (from stdin, -a f, --arg-file=f, `< f`, parallel's ::: words or :::: f) as ONE word (the whole input, and
+each line, -I/-i/--replace[=] swapped in; a lone `parallel {}` runs each item as the command), `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
 literals of an interpreter's -c/-e code (python perl ruby node php…: each literal, and all of them joined by blanks,
 so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
 does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
@@ -241,9 +241,9 @@ MEMOPTS = {'sh': ({'-c'}, {'-o', '+o', '-O', '+O', '--rcfile', '--init-file'}),
                                                        '-C', '--conditions', '--input-type'}),
            'php': ({'-r', '-B', '-R', '-E'}, {'-d', '-c', '-z'})}
 RUNNERS = {'make', 'gmake', 'npm', 'npx', 'yarn', 'pnpm', 'pytest', 'py.test', 'tox', 'nox', 'cargo', 'just'}
-def fdof(x):   # the descriptor a script operand reads (`-`, /dev/stdin, /dev/fd/N, /proc/self/fd/N), or None
-    m = re.fullmatch(r'-|/dev/stdin|/dev/fd/(\d+)|/proc/self/fd/(\d+)', x)
-    return m and (m.group(1) or m.group(2) or '0')
+def fdof(x):   # the descriptor a script operand reads (`-`, /dev/stdin, /dev/fd/N, /proc/self/fd/N, //dev/./stdin), or None
+    m = re.fullmatch(r'-|/dev/stdin|/dev/fd/(\d+)|/proc/self/fd/(\d+)', x if x == '-' else re.sub('/+', '/', os.path.normpath(x)))
+    return m and str(int(m.group(1) or m.group(2) or 0))
 WRAP = {'env': set(), 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'nice': {'-n', '--adjustment'},
         'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
         'nohup': set(), 'setsid': set(), 'time': {'-f', '--format', '-o', '--output'}, 'command': set(),
@@ -710,13 +710,19 @@ class Guard:
                 c2 = g.absp(info['cd'].v, cwd) if 'cd' in info and not info['cd'].dyn else cwd
                 cw = ws[j:] if j is not None else []
                 if b in ('xargs', 'parallel'):   # its argv grows from stdin, a file it reads (-a, `< f`) or parallel's ::: words
-                    o = [w.v for w in ws[1:j or len(ws)]]
-                    fed = g.feed(redirs, '0', cwd, depth) + [t for k, w in enumerate(ws[2:j or len(ws)], 2)
-                                                              if o[k - 2] in ('-a', '--arg-file') for t in g.feed([{'op': '<', 'w': w, 'fd': ''}], '0', cwd, depth)]
+                    o, af, items, sep = ws[1:j or len(ws)], [], [], ''
+                    for k, w in enumerate(o):   # -a f, --arg-file f, -af, --arg-file=f
+                        if w.v in ('-a', '--arg-file') and k + 1 < len(o): af.append(o[k + 1])
+                        elif re.match(r'-a.|--arg-file=', w.v): af.append(w.like(w.v.split('=', 1)[1] if w.v[1] == '-' else w.v[2:]))
                     if b == 'parallel':
                         k = next((k for k, w in enumerate(cw) if w.v.startswith(':::')), len(cw))
-                        fed += ['\n'.join(w.v for w in cw[k:] if not w.v.startswith(':::'))] if cw[k:] else []
+                        for w in cw[k:]:   # ::: words are items, :::: words files of items
+                            if w.v.startswith(':::'): sep = w.v
+                            elif sep.startswith('::::'): af.append(w)
+                            else: items.append(w.v)
                         cw = [] if [w.v for w in cw[:k]] == ['{}'] else cw[:k]   # a lone {} runs each item as the command
+                    fed = g.feed(redirs, '0', cwd, depth) + [t for w in af for t in g.feed([{'op': '<', 'w': w, 'fd': ''}], '0', cwd, depth)] \
+                        + (['\n'.join(items)] if items else [])
                 if b in ('xargs', 'parallel') and (ctx[1]['pipe'] is not None or fed):
                     stdin = '\n'.join(fed + ([g.produced(ctx)] if ctx[1]['pipe'] is not None else []))
                     text = ' '.join("'" + w.v.replace("'", "'\\''") + "'" for w in cw) + ' ' + stdin \
@@ -775,8 +781,9 @@ class Guard:
         bodies = [r['body'] if r['op'] in ('<<', '<<-') else r['w'].v for r in R['redirs'] if r['op'] in ('<<', '<<-', '<<<')]
         if bodies: return '\n'.join(bodies)
         a = R['args']
-        if R['verb'] in READERS:   # `sed -n p core/bin/cc-land | bash`: a shell fed a gated tool's own text runs that tool
-            ts = [os.path.basename(x) for x in a if not x.startswith('-') and os.path.basename(x) in TOOLS]
+        if R['verb'] in READERS:   # `sed -n p core/bin/cc-land | bash`: a shell fed a gated tool's own text runs that tool,
+            ts = [g.written[g.absp(x, R['cwd'])] for x in a if g.absp(x, R['cwd']) in g.written] \
+                + [os.path.basename(x) for x in a if not x.startswith('-') and os.path.basename(x) in TOOLS]   # and `cat f | bash` what this line wrote to f
             if ts: return '\n'.join(ts)
         if R['verb'] in ('echo', 'printf'):
             while a and re.fullmatch(r'-[neE]+', a[0]): a = a[1:]
@@ -865,7 +872,8 @@ class Guard:
                 if mod.split('.')[0] == 'lander': out += g.script(' '.join(shlex.quote(x) for x in ['lander'] + rest), cwd, b + ' -m', depth + 1)
             prog = progtext(b, a, [])   # a program on stdin is judged only where it runs something (writing docs that name
             fd = '0' if k >= len(a) else fdof(a[k])   # a command is data): system(, popen, subprocess, exec, spawn, backticks
-            if code is None and fd: prog += [t for t in g.feed(R['redirs'], fd, cwd, depth) if RUNS.search(t)]
+            if code is None and fd: prog += [t for t in g.feed(R['redirs'], fd, cwd, depth)
+                                             + ([g.produced(ctx)] if fd == '0' and ctx[1]['pipe'] is not None else []) if RUNS.search(t)]
             for t in literals(prog):
                 n0 = len(g.out)
                 try: out += g.script(t.strip().strip('|'), cwd, b + ' code', depth + 1)
@@ -1577,9 +1585,6 @@ def shq(x):   # one word, single-quoted for the shell
     return "'" + x.replace("'", "'\\''") + "'"
 
 def xrepl(b, opts, cmd):   # the string xargs -I/-i/--replace (or parallel's {}) swaps for each item, or None (items go last)
-    if b == 'parallel':
-        r = next((x[2:] or (opts[k + 1] if k + 1 < len(opts) else '') for k, x in enumerate(opts) if x.startswith('-I')), '{}')
-        return r if r and any(r in x for x in cmd) else None
     r = None
     for k, x in enumerate(opts):
         if x.startswith('--replace'): r = x.partition('=')[2] or '{}'
@@ -1589,6 +1594,7 @@ def xrepl(b, opts, cmd):   # the string xargs -I/-i/--replace (or parallel's {})
                 if c == 'I': r = x[i + 1:] or (opts[k + 1] if k + 1 < len(opts) else None)
                 break
             if c == 'i': r = x[i + 1:] or '{}'; break
+    if b == 'parallel': r = r or '{}'; return r if any(r in x for x in cmd) else None
     return r
 
 def gitcfg(ws):   # the values of git's global -c options, before the subcommand
