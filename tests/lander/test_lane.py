@@ -1595,6 +1595,33 @@ class Machine(Fixture):
         self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "old draft\n")
         self.assertEqual(open(os.path.join(self.root, "keep.txt")).read(), "a local edit\n")
 
+    def test_a_staged_file_already_equal_to_mains_deploys(self):
+        """2026-10-21: a stale staged draft of read.py, its file on disk already main's, held every dispatch deploy
+        for 1.5 h. A local change that is already what the merge brings no longer stops it."""
+        from lander import deploy as D
+        self.write(self.root, {"read.py": "early draft\n"})
+        self.git(self.root, "add", "read.py")
+        merged = self.push("main", {"read.py": "committed\n"})
+        self.write(self.root, {"read.py": "committed\n"})
+        D.pull(self.root, "main", merged)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.root, "status", "--porcelain"), "")
+
+    def test_a_differing_local_edit_fails_named_as_a_dirty_checkout(self):
+        """A person's edit that differs from main is kept, and the failure says it is the checkout, not main."""
+        from lander import deploy as D
+        first = self.push("main", {"keep.txt": "v1\n"})
+        D.pull(self.root, "main", first)
+        self.write(self.root, {"keep.txt": "a local edit\n"})
+        merged = self.push("main", {"keep.txt": "v2\n"})
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertTrue(e.exception.why.startswith(
+            f"a dirty checkout, not main red: {self.root} has local changes the merge would overwrite, left for a "
+            "person: keep.txt; "), e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), first)
+        self.assertEqual(open(os.path.join(self.root, "keep.txt")).read(), "a local edit\n")
+
     def test_an_update_ref_failure_after_a_move_still_names_the_moved_file(self):
         """read-tree succeeds once the draft is aside, then update-ref fails: the move is in the error, not lost."""
         from lander import deploy as D

@@ -21,7 +21,9 @@ THE STEPS, per target, in order; the first that fails stops that target and says
               moved. If read-tree still refuses, the files go back, and the line names any that could not. An
               untracked directory there, or a tracked one holding anything untracked, is never moved: the deploy
               fails and names it, and read-tree never runs (git 2.53's would overwrite an ignored file and delete an
-              ignored directory without refusing)
+              ignored directory without refusing). A staged or changed file the merge changes whose copy on disk
+              is already <sha>'s is staged as it is (settle); one that differs is a person's edit, kept, and the
+              deploy fails as "a dirty checkout, not main red", naming the checkout and the files
   3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
@@ -310,6 +312,7 @@ def fast_forward(root, base, head, sha):
         moved, dest, why = aside(root, files)
         if why:
             raise Failed("pull", f"{why}; nothing merged into {root}")
+        local = settle(root, head, sha, env)
         rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
         said = ""
         if rc and moved:
@@ -322,13 +325,41 @@ def fast_forward(root, base, head, sha):
             said = (f"moved {len(moved)} {MOVED} to {dest}: "
                     + ", ".join(moved[:5]) + (", ..." if len(moved) > 5 else ""))
     if rc:
-        raise Failed("pull", f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out, 600)}")
+        raise Failed("pull", (f"a dirty checkout, not main red: {root} has local changes the merge would overwrite, "
+                              f"left for a person: {', '.join(local[:5])}" + (", ..." if len(local) > 5 else "")
+                              + "; " if local else "")
+                     + f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out, 600)}")
     rc, out = git(root, "update-ref", "-m", f"lander: fast-forward to {sha[:12]}", f"refs/heads/{base}", sha, head,
                   env=G.hookless_env())
     if rc:
         raise Failed("pull", f"git update-ref refs/heads/{base} {sha[:12]} in {root}: {last(out)}"
                      + (f"; {said}" if said else ""))
     return said
+
+
+def settle(root, head, sha, env):
+    """A path `sha` changes that is staged or changed in the checkout, but whose file on disk is already `sha`'s (or
+    is gone where `sha` deletes it), is staged as it is, so read-tree takes it: on 2026-10-21 a stale staged draft of
+    read.py whose file already matched main held every dispatch deploy for 1.5 h, and the brief says "if a staged or
+    modified file already matches what the pull brings in, that alone shouldn't stop the deploy". -> the paths still local after
+    that: a person's edit, never discarded, which read-tree refuses on."""
+    rc, changed = git(root, "diff", "--name-only", "--no-renames", "-z", head, sha, env=env)
+    rc2, staged = git(root, "diff-index", "--cached", "--name-only", "-z", head, env=env)
+    rc3, edited = git(root, "diff-files", "--name-only", "-z", env=env)
+    if rc or rc2 or rc3:
+        return []
+    paths = sorted(set(changed.split("\0")) & set((staged + "\0" + edited).split("\0")) - {""})
+    local = []
+    for p in paths:
+        want = git(root, "rev-parse", "-q", "--verify", f"{sha}:{p}", env=env)[1]
+        full = os.path.join(root, p)
+        if os.path.isfile(full) and not os.path.islink(full):
+            have = git(root, "hash-object", "--no-filters", "--", p, env=env)[1]
+        else:
+            have = "" if not os.path.lexists(full) else None
+        if have != want or git(root, "update-index", "--add", "--remove", "--", p, env=env)[0]:
+            local.append(p)
+    return local
 
 
 def unsafe(p):
