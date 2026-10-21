@@ -109,7 +109,8 @@
 # of them each less than REVIVE_CALM apart) each further one waits twice as long as the last, from REVIVE_BASE up to
 # REVIVE_CEIL, so it is not restarted every minute, and the owner is told once per run, with the line that starts it
 # by hand (owner, 2026-10-16/20: no give-up after N; a time-based give-up backs off and posts once). A pins difference, or nothing pinned yet, does not hold it: it starts and logs the
-# difference in revive.log, and the seat's own stop line (cc-checkpoint, through pins-diff) tells it to check and pin.
+# difference in revive.log, files it with the planning seat (cc-notify --ask; the owner only if that fails), and the
+# seat's own stop line (cc-checkpoint, through pins-diff) tells it to check and pin.
 # Every other refusal tells the owner once (one cc-notify per reason, stamped in revive-alerted) with one line to paste.
 # THE PLANNING SEAT IS TRUSTED. It can edit cc-perms and cc-slack in ~/dev and start a claude that skips permissions
 # on its own, and no PR can fence that. Everything here holds against a prompt, a worker or a member, not against it.
@@ -239,12 +240,14 @@ caller_repo(){
   [ -f "$H/.cc/state/$r/perms/brief.md" ] || { echo "$r has no permission seat"; return 1; }
   printf '%s\n' "$r"; }
 
-# live_seat DIR — prints the pid of a live seat in DIR (a claude carrying the skip flag, standing there), rc 1 if none
+# live_seat DIR — prints the pid of a live seat in DIR (the claude binary carrying the skip flag, standing there), rc 1
+# if none. Any program can be named claude, so a copy of another one there is no seat.
 live_seat(){
   local f p
   for f in /proc/[0-9]*/comm; do
     [ "$(cat "$f" 2>/dev/null)" = claude ] || continue
     p=${f#/proc/}; p=${p%/comm}
+    case "$(readlink "/proc/$p/exe" 2>/dev/null)" in "$EXE"*) ;; *) continue;; esac
     [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$1" ] || continue
     tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$SKIP" || continue
     printf '%s\n' "$p"; return 0; done
@@ -500,6 +503,16 @@ revive_refused(){
       && printf '%s\n' "$k" > "$2/revive-alerted"
   fi
   die "refused — $3. Nothing started."; }
+# revive_pins REPO DIR ENTRIES — revive starts the seat off its pins: log it and hand it to the planning seat as a
+# request (cc-notify --ask: durable, one per set of entries by its --id), so a start no person saw is checked by a
+# seat; the owner hears only when the request cannot be filed
+revive_pins(){
+  local k m; k=$(printf '%s' "$3" | sha256sum | cut -c1-16)
+  revive_log "$2" "started with startup files that differ from its pins: $3"
+  m="The box brought the $1 permission seat back with startup files that differ from what it last pinned: $3. Check what changed, then have the seat run cc-perms pin."
+  "${NOTIFY[@]}" --ask -t "$1 perms" --id "perms-revive-pins:$1:$k" "$m" >/dev/null 2>&1 \
+    || "${NOTIFY[@]}" --owner -t "$1 perms" --heading "The $1 permission seat came back off its pins" --id "perms-revive-pins:$1:$k" "$m" >/dev/null 2>&1
+  return 0; }
 revive_log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$2" >> "$1/revive.log" 2>/dev/null; return 0; }
 
 # revive — `cc-perms revive`, the box's own recover units bringing the seat back with no person (see REVIVE above)
@@ -544,8 +557,9 @@ revive(){
     revive_refused "$r" "$pd" "$why" "Move it away with this, and the box brings the seat back within a minute: mv -- $f $f.off"; fi
   cl=$(launch_target) || revive_refused "$r" "$pd" "$cl" "Check it, then start the seat by hand with: $(hand_cmd "$pd" "")"
   why=$(bin_clean) || revive_refused "$r" "$pd" "$why" "Check it, then start the seat by hand with: $(hand_cmd "$pd" "")"
-  # the pins advise: a difference, or nothing pinned yet, is logged, and the seat's stop line has it check and pin
-  why=$(pins_diff "$pd" "$cl") || revive_log "$pd" "started with startup files that differ from its pins: $(paste -sd , <<<"$why")"
+  # the pins advise: a difference, or nothing pinned yet, is logged and filed with the planning seat, and the seat's
+  # stop line has it check and pin
+  why=$(pins_diff "$pd" "$cl") || revive_pins "$r" "$pd" "$(paste -sd , <<<"$why")"
   printf '%s\n' "$t" >> "$pd/revived"
   # keep the record to the current run, the only part revive_run reads
   f=$(tail -n "$(( n + 1 ))" "$pd/revived") && printf '%s\n' "$f" > "$pd/revived"
@@ -1117,11 +1131,24 @@ EOF
   live=1; [ $r1 = 0 ] && [ "$n" = 1 ] && [[ $out == *"already live"* ]] && live=0
   ok "$live" "revive: a second call while the seat is live does nothing ($n window)"
   rfx rnopin; rm -f "$(rd)/pins"; out=$(rv); r1=$?; rargs >/dev/null
-  ok "$( [ $r1 = 0 ] && started && grep -q 'differ from its pins: nothing pinned yet' "$(rd)/revive.log" && [ ! -e "$F/notify.log" ]; echo $?)" \
-    "revive: nothing pinned yet does not hold the seat down; it starts and logs it, and nobody is paged"
+  ok "$( [ $r1 = 0 ] && started && grep -q 'differ from its pins: nothing pinned yet' "$(rd)/revive.log" \
+      && grep -qxF -- --ask "$F/notify.log" && ! grep -qxF -- --owner "$F/notify.log"; echo $?)" \
+    "revive: nothing pinned yet does not hold the seat down; it starts, logs it and files it with the planning seat, not the owner"
   rfx rpinchg; mkdir -p "$H/.claude"; echo planted > "$H/.claude/CLAUDE.md"; out=$(rv); r1=$?; rargs >/dev/null
-  ok "$( [ $r1 = 0 ] && started && grep -q "differ from its pins: $H/.claude/CLAUDE.md" "$(rd)/revive.log"; echo $?)" \
-    "revive: a changed startup file is logged by name and the seat starts, so its stop line has it check and pin"
+  ok "$( [ $r1 = 0 ] && started && grep -q "differ from its pins: $H/.claude/CLAUDE.md" "$(rd)/revive.log" \
+      && grep -qxF -- --ask "$F/notify.log" && grep -qF "differ from what it last pinned: $H/.claude/CLAUDE.md" "$F/notify.log" \
+      && ! grep -qxF -- --owner "$F/notify.log"; echo $?)" \
+    "revive: a changed startup file starts the seat and is handed by name to the planning seat, which has it checked and pinned"
+  rfx rpinown; mkdir -p "$H/.claude"; echo planted > "$H/.claude/CLAUDE.md"
+  # a cc-notify that cannot file a request: the owner is the one left to hear it
+  printf '#!/bin/sh\n[ "$1" = --ask ] && exit 1\n{ printf "%%s\\n" "$@"; echo ---; } >> %q\n' "$F/notify.log" > "$H/fixture-bin/cc-notify"
+  out=$(rv); r1=$?; rargs >/dev/null
+  ok "$( [ $r1 = 0 ] && started && grep -qxF -- --owner "$F/notify.log" && grep -qF "$H/.claude/CLAUDE.md" "$F/notify.log"; echo $?)" \
+    "revive: off its pins with no planning seat to file it with, the owner is told"
+  rfx rforged; mkdir -p "$T/xr"; cp "$(readlink -f /bin/bash)" "$T/xr/claude"; o=$(SBIN=$T/xr/claude SARG=--fixture-no-bypass stand "$(rd)")
+  pids="$pids $o"; out=$(rv); r1=$?; p=$(HOME=$H "$0" __live "$(rd)"); pids="$pids $p"
+  ok "$( [ -n "$o" ] && [ $r1 = 0 ] && started && [[ $out != *"already live"* ]] && [ -n "$p" ] && [ "$p" != "$o" ]; echo $?)" \
+    "revive: a copy of bash named claude, with the flag, in the seat's directory is no live seat, so the real one is started"
   rfx rwin; echo "perms 1" > "$F/panes"; out=$(rv); r1=$?; out2=$(rv); r2=$?
   ok "$( [ "$r1$r2" = 11 ] && ! started && [ "$(grep -c '^---$' "$F/notify.log")" = 1 ] && grep -q -- '--owner' "$F/notify.log" \
       && grep -q 'tmux kill-window -t main:perms' "$F/notify.log"; echo $?)" \

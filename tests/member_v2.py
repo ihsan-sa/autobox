@@ -681,6 +681,12 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                          " while True:\n  if os.fork(): os._exit(0)\n"
                          "os.close(fd); sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.readline()\n")
 
+                def pidns(p):
+                    try:
+                        return os.readlink(p / "ns/pid")
+                    except OSError:
+                        return None
+
                 def planted(mode, target=v, leaf=("--bind", launcher.data / "repo", "/repo")):
                     vfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
                     try:
@@ -688,8 +694,11 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                         argv = [*minimal, "--die-with-parent", *leaf, "--", "/usr/bin/python3", "-c", plant, mode, vfd]
                         with sp.Popen([str(x) for x in argv],
                                       stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, pass_fds=(vfd,)) as box:
+                            ns = None
                             try:
                                 m.require(box.stdout.readline() == b"ready\n", f"{mode} case did not start")
+                                child = Path(f"/proc/{box.pid}/task/{box.pid}/children").read_text().split()[0]
+                                ns = os.readlink(f"/proc/{child}/ns/pid")
                                 try:
                                     m.inventory(v)
                                     return ""
@@ -697,6 +706,12 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                                     return str(exc)
                             finally:
                                 box.communicate(b"stop\n", timeout=GUARD)
+                                # bwrap can exit while its namespace's last members (a chain's link) still hold V,
+                                # so the next walk waits for the namespace to empty; one that never does still fails.
+                                until = time.monotonic() + GUARD
+                                while (ns and time.monotonic() < until
+                                       and ns in map(pidns, Path("/proc").glob("[0-9]*"))):
+                                    time.sleep(0.01)
                     finally:
                         os.close(vfd)
                 for mode, refusal in (("cwd", "working directory reaching V"), ("map", "mapping reaching V"),

@@ -946,18 +946,23 @@ def cold_not_ours(path, rec, cfg):
         clip(os.path.basename(path)), trees(rec, cfg))
 
 
-def cold_gate(cfg, to, bcc, channel):
+def _addrs(v):
+    return [_norm(p) for p in (v if isinstance(v, (list, tuple)) else re.split(r"[,\s]+", str(v or ""))) if _norm(p)]
+
+
+def cold_gate(cfg, to, bcc, channel, cc=None):
     """send_to's checks on WHO a cold mail goes to, before anything else is looked at -> (to addresses, blind
     addresses, From, "") or ([], [], "", the refusal line). pdf_links runs the same gate before it mints a link,
-    so a mail this refuses never leaves a link behind for somebody it was not allowed to reach."""
+    so a mail this refuses never leaves a link behind for somebody it was not allowed to reach. `cc` (a
+    reply-all's copies, `cc-mail reply --all`) is checked like `to` and comes back as the tail of the to
+    addresses; send_to splits it off again for the Cc header."""
     rcpts, blind, allowed = [], [], verified(cfg)
-    for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
-        a = _norm(piece)
-        if a and a not in rcpts:
+    for a in _addrs(to):
+        if a not in rcpts:
             rcpts.append(a)
-    for piece in (bcc if isinstance(bcc, (list, tuple)) else re.split(r"[,\s]+", str(bcc or ""))):
-        a = _norm(piece)
-        if a and a not in rcpts and a not in blind:
+    copies = [a for a in dict.fromkeys(_addrs(cc)) if a not in rcpts]
+    for a in _addrs(bcc):
+        if a not in rcpts + copies and a not in blind:
             blind.append(a)
     if not rcpts:
         return [], [], "", "no recipient"
@@ -970,12 +975,16 @@ def cold_gate(cfg, to, bcc, channel):
     if unknown:
         return [], [], "", ("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
                             "it is unset)" % clip(unknown[0]))
+    unknown = [a for a in copies if a not in allowed]
+    if unknown:
+        return [], [], "", ("cc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW "
+                            "when it is unset)" % clip(unknown[0]))
     # "every bcc address passes the same verified-list check as to ... a refused bcc refuses the whole send"
     unknown = [a for a in blind if a not in allowed]
     if unknown:
         return [], [], "", ("bcc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW "
                             "when it is unset)" % clip(unknown[0]))
-    return rcpts, blind, from_a, ""
+    return rcpts + copies, blind, from_a, ""
 
 
 def link_kind(cfg, rcpts):
@@ -1044,7 +1053,7 @@ def with_links(body, html, lines):
 
 
 def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
-            html="", images=None, bcc=None):
+            html="", images=None, bcc=None, cc=None, answers=None, dry_run=False):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
@@ -1120,15 +1129,22 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     a new root; 2026-09-11: it still did, because the relay rewrites the Message-ID we mint, so the id in the
     record is never the one a reply names — see build()). A session with no channel gets the same through
     `thread`. An answer to a mail from a channel-less session that named no thread (home@) still arrives at
-    the door as a new mail and is routed like one."""
+    the door as a new mail and is routed like one.
+
+    A REPLY TO A STORED MAIL IS THIS CALL WITH TWO MORE THINGS (`cc-mail reply`). `answers` is the stored
+    mail's message.json: the mail is In-Reply-To its Message-ID, References carries its chain, and the caller
+    passes subject_of() it. `cc` is the reply-all's copies, each checked against verified() like `to` — one
+    that is not refuses the whole mail, naming it. `dry_run` returns the headers after every check and before
+    the caps are charged or anything is posted."""
     subject, body = str(subject or "").strip() or "(no subject)", plain(text)
 
     def refuse(line):
         return False, cold_refused(line)
 
-    rcpts, blind, from_a, why = cold_gate(cfg, to, bcc, channel)
+    rcpts, blind, from_a, why = cold_gate(cfg, to, bcc, channel, cc)
     if why:
         return refuse(why)
+    copies = [a for a in rcpts if a in _addrs(cc)]
     paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
     html = str(html or "")
     pics = [str(p).strip() for p in (images or []) if str(p or "").strip()]
@@ -1170,7 +1186,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
                              if why == TOO_BIG else "not a readable regular file under %s" % trees(rec, cfg)))
         inline.append((path, data))
 
-    why = caps(cfg, COLD_KEY, rcpts + blind, now=now)
+    why = caps(cfg, COLD_KEY, rcpts + blind, now=now, charge=not dry_run)
     if why:
         return refuse(why)
     # THE TAG IS THE THREAD'S KEY, minted here because it has to be on the wire before the daemon writes the
@@ -1183,8 +1199,11 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     tag = os.urandom(4).hex() if keyed else ""
     reply_to = tagged(from_a, tag)
     tag = tag if reply_to else ""          # a tag the mail does not carry is not one the record may index
-    raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to,
-                     html=html, inline=inline)
+    thread_on = {"message_ids": [answers.get("message_id")], "references": answers.get("references")} if answers else {}
+    raw, mid = build(thread_on, from_a, [a for a in rcpts if a not in copies], copies, body, attach=attach, now=now,
+                     subject=subject, reply_to=reply_to, html=html, inline=inline)
+    if dry_run:
+        return True, raw.split(b"\n\n", 1)[0].decode("utf-8", "replace").replace("\r", "")
     # The headers name `rcpts` only; `blind` is on the envelope and nowhere in `raw`.
     ok, failed, err = call_worker(cfg, from_a, rcpts + blind, raw)
     if not ok:

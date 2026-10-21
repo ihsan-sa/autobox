@@ -105,6 +105,13 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             --dry-run prints the mail instead (the link is minted all the
                                             same; the site reuses it).
                                             Host only: inside a member workspace it is refused
+  cc-mail reply <id> [--all] [--body TEXT] [--dry-run]
+                                            answer stored mail <id> in its own thread: In-Reply-To its
+                                            Message-ID, References its chain, "Re: " its subject. To its From;
+                                            --all adds its To and Cc (the box's own addresses dropped). Every
+                                            address passes send's verified-list check, and one that does not
+                                            refuses the whole reply, naming it. The body is --body, or stdin.
+                                            --dry-run prints the headers and sends nothing. Host only
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
 the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path (`doc`
@@ -1430,9 +1437,39 @@ def cmd_doc(opt):
     return 0 if ok else 1
 
 
+def cmd_reply(opt):
+    """`cc-mail reply <id>` — answer a stored mail in its own thread. The addresses are the mail's own (its From;
+    with --all its To and Cc too, ours dropped: outbound.recipients) and every one passes send_to's verified-list
+    check, so a reply-all that would reach an unverified address is refused, naming it, and nothing is sent.
+    Exit 2 for a malformed ask, 1 for a refusal, 0 when it went or --dry-run printed its headers."""
+    args, body = opt.get("_") or [], arg(opt, "--body")
+    if len(args) != 1 or args[0] not in ids():
+        print("usage: cc-mail reply <id> [--all] [--body TEXT] [--dry-run]   (cc-mail list; body on stdin "
+              "without --body)", file=sys.stderr)
+        return 2
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":
+        print("cc-mail reply: not sent — it runs on the host; inside a workspace use cc-mail send", file=sys.stderr)
+        return 1
+    if not body:
+        if sys.stdin.isatty():
+            print("cc-mail reply: no body — pass --body TEXT, or pipe one in", file=sys.stderr)
+            return 2
+        body = sys.stdin.read()
+    with open(os.path.join(INBOX, args[0], "message.json")) as f:
+        m = json.load(f)
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import outbound                          # noqa: E402
+    keys = {k: cfg(k, "") for k in SEND_KEYS}
+    to, cc = outbound.recipients(m if "--all" in opt else {"from": m.get("from")}, keys["MAIL_DOMAIN"])
+    ok, line = outbound.send_to(keys, to, outbound.subject_of(m), body, channel=outbound.session_channel(),
+                                mirror=mirrored, cc=cc, answers=m, dry_run="--dry-run" in opt)
+    print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
 def main(argv):
     cmds = {"serve": serve, "stop": stop, "status": status, "list": cmd_list, "show": cmd_show,
-            "send": cmd_send, "doc": cmd_doc}
+            "send": cmd_send, "doc": cmd_doc, "reply": cmd_reply}
     cmd = argv[0] if argv else ""
     if cmd == "selfcheck":
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))

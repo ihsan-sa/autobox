@@ -4603,6 +4603,73 @@ def run():
         k(rc5 == 1 and n5 == n4b and a5 == [] and "not sent — " in err28 and "MAIL_OUT_PER_HOUR=1" in err28,
           "…and a mail the caps would stop is refused before cc-docs is asked, so no link is minted for it")
 
+    # ------------------------------- 29. `cc-mail reply`: a stored mail answered in its own thread
+    # Brief: "it threads on the original (In-Reply-To/References and the subject), and it checks every From, To and
+    # Cc against the verified list through the same path send uses ... A reply-all that would add an unverified
+    # address is refused with a line naming it, and nothing is sent." Each case builds its own stored mail and worker.
+    with Box(allow=ALLOWED + "," + OTHER) as b:
+        def cold29(worker_url):
+            return {"MAIL_SEND_URL": worker_url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                    "MAIL_SEND_ALLOW": ALLOWED + "," + OTHER}
+
+        def mail29(cc):
+            return {"from": "Friend <%s>" % ALLOWED, "to": [RCPT], "cc": cc, "subject": "the plan",
+                    "message_id": "<m2@allowed.example>", "references": ["<m1@allowed.example>"]}
+
+        # (a) A REPLY TO A VERIFIED SENDER THREADS: In-Reply-To the mail, References its chain, Re: its subject.
+        m29 = mail29([OTHER])
+        to29, cc29 = outbound.recipients(m29, "box.example")
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold29(w.url), to29, outbound.subject_of(m29), "yes", cc=cc29, answers=m29)
+            call = w.one()
+        msg = call["msg"]
+        k(ok and call["to"] == [ALLOWED, OTHER] and msg["To"] == ALLOWED and msg["Cc"] == OTHER
+          and msg["In-Reply-To"] == "<m2@allowed.example>"
+          and msg["References"] == "<m1@allowed.example> <m2@allowed.example>" and msg["Subject"] == "Re: the plan",
+          "a reply-all to a verified sender goes To the sender and Cc the copy, In-Reply-To the mail, References its "
+          "chain, under Re: its subject, and the box's own address is dropped")
+
+        # (b) AN UNVERIFIED To OR Cc REFUSES THE WHOLE REPLY, by name, before the wire.
+        m29 = mail29([STRANGER])
+        to29, cc29 = outbound.recipients(m29, "box.example")
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold29(w.url), to29, "Re: the plan", "yes", cc=cc29, answers=m29)
+            k(not ok and ("cc %s is not one of the box's verified destinations" % STRANGER) in line and not w.calls,
+              "a reply-all whose Cc is not a verified destination is refused naming it, and nothing reaches the worker")
+        m29 = dict(mail29([]), **{"from": STRANGER})
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold29(w.url), outbound.recipients(m29, "box.example")[0], "Re: x", "yes",
+                                        answers=m29)
+            k(not ok and ("%s is not one of the box's verified destinations" % STRANGER) in line and not w.calls,
+              "…and so is a reply whose To (the mail's From) is not, with nothing sent")
+
+        # (c) --dry-run THROUGH THE COMMAND prints the threading headers and posts nothing.
+        os.makedirs(os.path.join(r.INBOX, "20261020-reply29"))
+        with open(os.path.join(r.INBOX, "20261020-reply29", "message.json"), "w") as f:
+            json.dump(mail29([OTHER]), f)
+        env29 = {k29: "" for k29 in r.SEND_KEYS if k29 not in Box.KEYS}
+        with FakeWorker() as w:
+            env29.update(cold29(w.url))
+            saved29 = {k29: os.environ.get(k29) for k29 in env29}
+            out29 = sys.stdout
+            os.environ.update(env29)
+            sys.stdout = io.StringIO()
+            try:
+                rc29 = r.cmd_reply(r.flags(["20261020-reply29", "--all", "--body", "yes", "--dry-run"]))
+                said29 = sys.stdout.getvalue()
+            finally:
+                sys.stdout = out29
+                for k29, v in saved29.items():
+                    if v is None:
+                        os.environ.pop(k29, None)
+                    else:
+                        os.environ[k29] = v
+            calls29 = len(w.calls)
+        k(rc29 == 0 and calls29 == 0 and "To: %s\n" % ALLOWED in said29 and "Cc: %s\n" % OTHER in said29
+          and "In-Reply-To: <m2@allowed.example>" in said29 and "Subject: Re: the plan" in said29,
+          "`cc-mail reply <id> --all --dry-run` prints the reply's headers — To, Cc, In-Reply-To, Re: subject — and "
+          "nothing reaches the worker")
+
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0
 

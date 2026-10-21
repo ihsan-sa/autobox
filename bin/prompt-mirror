@@ -33,7 +33,12 @@ finds nothing to do, so a save made while a PR was being opened is not lost to t
 import fcntl, json, os, shutil, signal, stat, subprocess, sys, tempfile
 
 BIN = os.path.dirname(os.path.realpath(__file__))
-PATTERNS = ["*CLAUDE.md", "*-prompt.md", "prompts/*.md", "*/prompts/*.md", "*/agents/*.md", "*/self-review.md"]
+PATTERNS = ["*CLAUDE.md", "*-prompt.md", "prompts/*.md", "*/prompts/*.md", "*/agents/*.md", "*/self-review.md",
+            ":(glob).dispatch/*.md"]   # the last: a repo's own hive briefs, which the hive reads before its own
+REPO_PATTERNS = {   # prompts a repo names its own way: the hive's, which every lead and run starts from
+    "dispatch": ["philosophy.md", ":(glob)briefs/*.md", "host/improve.md", "judge/policy.md", "tribunal/rules.md",
+                 ":(glob)warden/control/*.md"],
+}
 SKIP = ("docs/", "tests/", "fixtures/")
 MAX_BYTES = 256 * 1024   # the largest real prompt is ~/CLAUDE.md's source at under 7 KB; anything near this is not a prompt
 
@@ -115,9 +120,10 @@ def sources():   # → {draft name: (repo name, repo dir, path)}
     out, dev = {}, dev_dir()
     for repo in sorted(os.listdir(dev)) if os.path.isdir(dev) else []:
         rd = os.path.join(dev, repo)
-        if os.path.islink(rd) or not os.path.exists(os.path.join(rd, ".git")) or member_workspace(dev, repo):
+        if repo.startswith(".") or os.path.islink(rd) or not os.path.exists(os.path.join(rd, ".git")) \
+                or member_workspace(dev, repo):   # a dot dir is put away (.trash-*), not a repo anyone works in
             continue
-        r = git(rd, "ls-files", "--", *PATTERNS, check=False)
+        r = git(rd, "ls-files", "--", *PATTERNS, *REPO_PATTERNS.get(repo, []), check=False)
         for path in r.stdout.splitlines():
             if any(path.startswith(s) or f"/{s}" in path for s in SKIP) or not plain_file(rd, path):
                 continue
@@ -125,6 +131,7 @@ def sources():   # → {draft name: (repo name, repo dir, path)}
     return out
 
 
+WARDEN_LIVE = " (live from /etc/dispatch-warden, so a merged edit waits for perms to install it)"
 FEEDS = {   # what a source feeds, by its path's tail; the README's second column
     "config/worker-prompt.md": "every headless worker (cc-loop): its system prompt. {track} {repo} {state} {base} are filled in; line breaks become spaces",
     "config/dispatch-prompt.md": "every session kind, appended: when to use a subagent, a worker or an orch, and the model bands",
@@ -151,6 +158,20 @@ FEEDS = {   # what a source feeds, by its path's tail; the README's second colum
     "templates/home/agents/security-reviewer.md": "the security-reviewer subagent type (~/.claude/agents, copied in by install.sh)",
     "home/CLAUDE.md": "~/CLAUDE.md: every session on the box",
     "home/claude/CLAUDE.md": "~/.claude/CLAUDE.md: every session the owner runs (it imports BOX.md and OWNER.md)",
+    "philosophy.md": "every hive lead and run: the rules it starts from, read from each release",
+    "briefs/talk.md": "the hive lead in each project's channel: its brief",
+    "briefs/ask.md": "a hive run doing one ask (an issue or a thread): its brief",
+    "briefs/drain.md": "a hive run working toward a project's goals with nobody waiting: its brief",
+    "briefs/continue.md": "a hive run picking up one that stopped at its limit: its brief",
+    "briefs/gate.md": "a hive run fixing a branch whose gate failed on main: its brief",
+    "briefs/merge.md": "a hive run finishing a merge of main that stopped on conflicts: its brief",
+    "briefs/fix.md": "a hive run addressing a review's findings: its brief",
+    "host/improve.md": "the hive's improve run, filed by its timer: its task",
+    "judge/policy.md": "the hive's judge: the policy it reads on every ruling",
+    "tribunal/rules.md": "the Tribunal's seats: their rules",
+    "warden/control/brief.md": "the Warden: its brief" + WARDEN_LIVE,
+    "warden/control/intake.md": "the Warden's intake judge" + WARDEN_LIVE,
+    "warden/control/classify.md": "the Warden's action classifier" + WARDEN_LIVE,
 }
 
 
@@ -158,6 +179,8 @@ def feeds(path):
     for tail, what in FEEDS.items():
         if path == tail or path.endswith("/" + tail):
             return what
+    if path.startswith(".dispatch/"):
+        return f"this repo's hive runs of that kind: used instead of the hive's briefs/{os.path.basename(path)}"
     if path == "CLAUDE.md":
         return "every session working in this repo (its project CLAUDE.md)"
     if path.endswith("CLAUDE.md"):
@@ -531,6 +554,27 @@ def selfcheck():
         sync()
         t("a member's workspace is left out entirely (by its record, or by its own marker)",
           sorted(x for x in os.listdir(f.md) if x.startswith(("alice.", "bob."))), [])
+
+        f = Fixture(root, next(k))
+        for repo, files in {".trash-old": {"CLAUDE.md": "old\n"},
+                            "dispatch": {"philosophy.md": "rules\n", "briefs/talk.md": "lead\n",
+                                         "briefs/notes/main.md": "notes\n", ".dispatch/drain.md": "drain\n",
+                                         ".dispatch/notes/1.md": "a run's note\n", "README.md": "doc\n"},
+                            "other": {"philosophy.md": "not the hive's\n"}}.items():
+            rd = f"{f.d}/dev/{repo}"
+            subprocess.run(["git", "init", "-q", rd], check=True)
+            for p, text in files.items():
+                os.makedirs(os.path.dirname(f"{rd}/{p}"), exist_ok=True)
+                with open(f"{rd}/{p}", "w") as h:
+                    h.write(text)
+            git(rd, "add", "-A"); git(rd, "commit", "-qm", "i")
+        sync()
+        t("the hive's prompts are mirrored by name, and a repo's own hive briefs; a put-away dot dir, run notes and "
+          "another repo's file of the same name are not",
+          sorted(x for x in os.listdir(f.md) if x not in ("README.md", ".state") and not x.startswith("box.")),
+          ["dispatch..dispatch.drain.md", "dispatch.briefs.talk.md", "dispatch.philosophy.md"])
+        t("…and the README says what each feeds", ("every hive lead and run: the rules it starts from" in f.draft("README.md"),
+          "used instead of the hive's briefs/drain.md" in f.draft("README.md")), (True, True))
 
         f = Fixture(root, next(k))
         target = f"{f.d}/outside"
