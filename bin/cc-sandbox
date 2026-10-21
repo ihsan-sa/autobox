@@ -26,7 +26,9 @@
 #                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
 #                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
 #   cc-sandbox handle <handle>              exit 0 when <handle> may name a member workspace, else 2 and why: the shape
-#                                           [a-z0-9-], never one of the dirs core keeps in ~/.cc/state (BOX_STATE: land, …),
+#                                           [a-z0-9-], never one of cc-slack's RESERVED_HANDLES (owner, box, …; asked here
+#                                           and by convert, where a handle is made, not at a launch), never one of the
+#                                           dirs core keeps in ~/.cc/state (BOX_STATE: land, …),
 #                                           never a link there, and never an existing ~/.cc/state/<handle> that is not a
 #                                           member workspace's own (a repo's planning dir). Every command below that takes
 #                                           a handle asks the same, and `member` refuses to start one that fails it.
@@ -992,8 +994,9 @@ lib_bind(){   # $1 handle — THE KNOWLEDGE BASE, THIS WORKSPACE'S FILE OF IT AN
 # @~/OWNER.md, and Claude Code loads user-memory imports with no "external imports" dialog. Docs only: no login, token or
 # credentials file is ever a name on this list, and a member's boundary binds none of it (build_member).
 SHARED_DOCS=(.claude/CLAUDE.md CLAUDE.md OWNER.md BOX.md WORKING.md WRITING.md COMMS.md USAGE.md RUNBOOK.md)
-facing(){ [ -e "$H/.cc/members/$1" ]; }   # $1 repo — a member reads where its worker writes: the host's own record,
-  # ~/.cc/members/<repo>, as cc-lib build_shared reads it, and never the repo's marker, which a member commit can delete (perms)
+facing(){ [ -e "$H/dev/$1/.cc/member-facing" ] || [ -e "$H/.cc/members/$1" ]; }   # $1 repo — a member reads where its worker
+  # writes: the repo's marker, as cc-guard reads it, OR the host's own record, ~/.cc/members/<repo>, as cc-lib build_shared
+  # reads it. A member commit can delete the marker, so it can only add to the record, never stand in for it (perms)
 OWNER_DOCS=" .claude/CLAUDE.md OWNER.md BOX.md "   # the owner's user memory and its imports: no member-facing worker gets them (perms-38)
 shared_docs_bind(){   # [$1 the host dir the owner's own workspace's ~/.claude is; empty for a worker] [$2 non-empty: a member-facing
   # repo's worker, which gets the guides and ~/CLAUDE.md but none of OWNER_DOCS] — SHARED_DOCS, RO, each at its own name.
@@ -1517,6 +1520,12 @@ handle_ok(){   # $1 handle [$2 convert] — the shape a workspace's dir, handle 
   [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || { echo "cc-sandbox: '$1' is not a handle (lower case, digits and -)" >&2; return 1; }
   local why; why=$(handle_taken "$1" "${2:-}") || return 0
   echo "cc-sandbox: '$1' cannot be a member handle — $why" >&2; return 1; }
+handle_new(){   # $1 handle [$2 convert] — handle_ok, and none of cc-slack's RESERVED_HANDLES. Asked only where a handle is MADE
+  # (convert, cc-slack's join flow), never at a launch, so a broken cc-slack refuses a new workspace and no member's start.
+  handle_ok "$1" "${2:-}" || return 1
+  local n; n=$("$(dirname "$SELF")/cc-slack" member reserved) || { echo "cc-sandbox: '$1' unchecked — cc-slack could not list the box's reserved names" >&2; return 1; }
+  grep -qxF -- "$1" <<<"$n" || return 0
+  echo "cc-sandbox: '$1' cannot be a member handle — \`$1\` is one of the box's own names (cc-slack's RESERVED_HANDLES)" >&2; return 1; }
 owners_own(){   # $1 candidate credentials file · $2 the .claude.json that login wrote ("" = none) → prints WHY, exit 0, when it is the OWNER'S
   # This used to REFUSE, and until 2026-09-02 that was right: a member drives the session inside their boundary and can print
   # whatever sits at ~/.claude/.credentials.json, so his credential in there is a working key to his account. The owner has
@@ -1662,7 +1671,7 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   # exist were made by cc-slack's join flow; a repo already on the box has no such path, and hand-editing the markers leaves
   # out the board, the exclude and the first commit. This makes the same workspace that flow makes, and says what it changed.
   local r="${1:-}" dev ctl live n why br x did=()
-  handle_ok "$r" convert || return 2
+  handle_new "$r" convert || return 2
   dev="$H/dev/$r"
   [ -d "$dev" ] || { echo "cc-sandbox: no ~/dev/$r to convert" >&2; return 2; }
   [ -f "$dev/.cc/member-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already a member workspace — nothing changed."; return 0; }
@@ -1680,7 +1689,7 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   [ -n "$live" ] && { echo "cc-sandbox: refusing ~/dev/$r — $live. Those run outside the boundary; finish or remove them (cc rm $r <track>), then convert." >&2; return 2; }
   # A COLLIDING HANDLE IS REFUSED, NEVER ADOPTED (docs/design-member-workspaces.md, "Open risks"): a workspace routes by its
   # NAME, so a name the box already answers to would hand this person a channel that is somebody else's.
-  why=""; case "$r" in box|approvals|alerts) why="\`$r\` is one of the box's own channels";; *-updates) why="\`$r\` reads as the updates lane of #${r%-updates}";; esac
+  why=""; case "$r" in *-updates) why="\`$r\` reads as the updates lane of #${r%-updates}";; esac
   if [ -z "$why" ] && [ -f "$H/.cc/slack/routes.json" ]; then
     why=$(jq -r --arg n "$r" 'to_entries[] | select(((.key|tostring|ltrimstr("#")|ascii_downcase) == $n) or ((.value|tostring|split("/")[0]|ascii_downcase) == $n)) | "`" + $n + "` is already routed to a session on this box"' "$H/.cc/slack/routes.json" 2>/dev/null | head -1) || why=""; fi
   [ -n "$why" ] && { echo "cc-sandbox: refusing ~/dev/$r — $why. Rename the repo to a free handle and convert that one." >&2; return 2; }
@@ -2347,7 +2356,7 @@ EOS
   t 'member instructions: refused on a directory that is not a member workspace, and it writes nothing there' \
     "$rc/$(grep -c 'not a member workspace' <<<"$out")/$([ -e "$fh/dev/plain/README.md" ] && echo wrote || echo none)" 1/1/none
   # ── convert: what must NOT be converted, each on a fixture of its own, each refused with its reason ────────────────
-  mkdir -p "$fh/dev/ctl/core/bin"; cp "$SELF" "$fh/dev/ctl/core/bin/cc-sandbox"; chmod +x "$fh/dev/ctl/core/bin/cc-sandbox"
+  mkdir -p "$fh/dev/ctl/core/bin"; cp "$SELF" "$(dirname "$SELF")/cc-slack" "$fh/dev/ctl/core/bin/"; chmod +x "$fh/dev/ctl/core/bin/cc-sandbox"
   out=$(HOME="$fh" "$fh/dev/ctl/core/bin/cc-sandbox" convert ctl 2>&1); rc=$?
   t 'convert: the repo this cc-sandbox ships in is refused — the box cannot be one member'"'"'s world' \
     "$rc/$(grep -c 'control repo' <<<"$out")/$([ -e "$fh/dev/ctl/.cc" ] && echo made || echo none)" 2/1/none
@@ -2377,7 +2386,7 @@ EOS
   mkdir -p "$fh/dev/box" "$fh/dev/alice-updates"
   o1=$(HOME="$fh" "$SELF" convert box 2>&1); r1=$?; o2=$(HOME="$fh" "$SELF" convert alice-updates 2>&1); r2=$?
   t 'convert: a handle the box already answers to is refused, never adopted (#box, an -updates lane)' \
-    "$r1/$r2/$([ -e "$fh/dev/box/.cc" ] && echo made || echo none)/$([ -e "$fh/dev/alice-updates/.cc" ] && echo made || echo none)/$(grep -c 'own channels' <<<"$o1")/$(grep -c 'updates lane' <<<"$o2")" 2/2/none/none/1/1
+    "$r1/$r2/$([ -e "$fh/dev/box/.cc" ] && echo made || echo none)/$([ -e "$fh/dev/alice-updates/.cc" ] && echo made || echo none)/$(grep -c "box's own names" <<<"$o1")/$(grep -c 'updates lane' <<<"$o2")" 2/2/none/none/1/1
   t '…and a refused convert leaves the host no record of a workspace (~/.cc/members/box/member-workspace)' "$([ -e "$fh/.cc/members/box/member-workspace" ] && echo rec || echo none)" none
   mkdir -p "$fh/.cc/slack" "$fh/dev/notes"; jq -n '{"#notes": "other/x"}' > "$fh/.cc/slack/routes.json"
   out=$(HOME="$fh" "$SELF" convert notes 2>&1); rc=$?
@@ -2503,6 +2512,10 @@ EOS
   out=$(env HOME="$fh" "$SELF" handle land 2>&1); rc=$?
   t "handle: land is refused before ~/.cc/state/land even exists, as the box's own" \
     "$rc/$(grep -c 'belongs to the box' <<<"$out")/$([ -e "$fh/.cc/state/land" ] && echo made || echo none)" 2/1/none
+  mkdir -p "$fh/dev/owner"   # a repo the box has, so convert reaches handle_ok and nothing before it refuses
+  out=$(env HOME="$fh" "$SELF" convert owner 2>&1); rc=$?
+  t "convert: owner is refused as one of the box's own names, so no member socket is given the owner's lead" \
+    "$rc/$(grep -c "one of the box's own names" <<<"$out")/$([ -e "$fh/dev/owner/.cc/member-workspace" ] && echo made || echo none)" 2/1/none
   out=$(env HOME="$fh" "$SELF" handle "free$$" 2>&1); rc=$?
   t 'handle: …while a name nothing on the box holds is accepted' "$rc/$out" 0/
   mkdir -p "$fh/dev/rpo$$" "$fh/.cc/state/rpo$$/plan"   # a repo with a planning dir and no marker: that state is the box's
@@ -4107,12 +4120,12 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # perms track's doc and ledger, the failures log and a failure report, Slack, and an owner-tagged member-facing
   # repo's board — and counted by SQL in the bound index, past cc-lib's own Slack fence. The facing worker also has
   # none of the owner's user memory, BOX.md or OWNER.md, nor the repo's own memory dir (facing), and no register.
-  # The second launch is member-facing by ~/.cc/members/<repo> alone, with no board, as some member repos are; the
-  # first has the repo's marker alone, which makes nothing facing. Two more launch it with ~/.cc/library/shared a link to
+  # The first launch is an owner repo's; the second is member-facing by the repo's marker alone, unregistered; the third
+  # by ~/.cc/members/<repo> alone, with no board, as some member repos are. Two more launch it with ~/.cc/library/shared a link to
   # the aggregate and then gone: each binds an empty knowledge base and says so. The fixtures are removed and the index rebuilt after.
   # It sits after the fold cases because each launch folds the last run onto track/t (build), which they read.
   # The listing leaves out tickets.log: the asks' own tickets, written in the worker's tmpfs, not the library's.
-  local wb="sbxwsb$$" ow="sbxown$$" mf="sbxmf$$" mq mfa mfb mfc mfd mm py b   # its own names: $out still holds the probe the cases below read through `g`
+  local wb="sbxwsb$$" ow="sbxown$$" mf="sbxmf$$" mq mfa mfm mfb mfc mfd mm py b   # its own names: $out still holds the probe the cases below read through `g`
   mm="$H/.claude/projects/$(slug "$dev")/memory"
   mkdir -p "$H/dev/$wb/.cc" "$dev/.cc" "$H/dev/$ow/docs" "$H/.cc/state/$ow/perms" "$H/.cc/state/$ow/t1" "$H/.cc/state/$ow/handoffs" "$H/.cc/members/$mf" \
     "$H/.claude/projects/-sbx/memory" "$mm" "$H/.cc/failures/reports" "$H/.cc/slack/history/box/D1" \
@@ -4143,17 +4156,19 @@ print(" ".join(m for m in "ownnote owndoc ownprog leakmem leakseat leakarch leak
                if c.execute("SELECT COUNT(*) FROM records WHERE text LIKE ?", ("%sbx" + m + "%",)).fetchone()[0]))'
   mq='echo memask=$(~/bin/cc-lib ask sbxmemberbnote 2>&1 | grep -q "ws='"$wb"'" && echo 1 || echo 0)/$(~/bin/cc-lib ask sbxowndoc 2>&1 | grep -c "^OUTCOME answered")/$(ls -A ~/.cc/library | grep -vx tickets.log | paste -sd" " -)/$(python3 -c "$1" 2>&1)/$(ls -d ~/.cc/documents 2>/dev/null | wc -l)/$(ls ~/OWNER.md ~/BOX.md ~/.claude/CLAUDE.md 2>/dev/null | wc -l)/$(ls "$2" 2>/dev/null | wc -l)'
   mrun(){ CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c "$mq" sh "$py" "$mm" 2>&1 | sed -n 's/^memask=//p; s/^cc-sandbox: ~\/.cc\/library\/shared is missing.*/loud/p' | paste -sd' ' -; }
-  : > "$dev/.cc/member-facing"
-  mfa=$(mrun); mkdir -p "$H/.cc/members/$r"
+  mfa=$(mrun); : > "$dev/.cc/member-facing"
+  mfm=$(mrun); rm -f "$dev/.cc/member-facing"; mkdir -p "$H/.cc/members/$r"
   mfb=$(mrun); mv "$H/.cc/library/shared" "$H/.cc/library/shared.sbx"; ln -s owner "$H/.cc/library/shared"
   mfc=$(mrun); rm -f "$H/.cc/library/shared"
-  mfd=$(mrun); mv "$H/.cc/library/shared.sbx" "$H/.cc/library/shared"; rm -f "$dev/.cc/member-facing"
+  mfd=$(mrun); mv "$H/.cc/library/shared.sbx" "$H/.cc/library/shared"
   rm -f "$H/.cc/boards/$wb.json" "$H/.cc/boards/$ow.json" "$H/.cc/boards/$mf.json" "$H/.cc/failures/sbx.jsonl" "$mm/sbx.md" "$H/.cc/config"; rmdir "$dev/.cc" 2>/dev/null
   rm -rf "${H:?}/dev/$wb" "${H:?}/dev/$ow" "${H:?}/.cc/members/$wb" "${H:?}/.cc/members/$mf" "${H:?}/.cc/members/$r" "${H:?}/.cc/state/$ow" "${H:?}/.cc/failures/reports/sbx.md" \
     "${H:?}/.claude/projects/-sbx" "${H:?}/.cc/slack/history/box/D1"
   python3 "$(dirname "$SELF")/cc-lib" index >/dev/null 2>&1
-  t 'a worker on an owner repo, its member-facing marker notwithstanding, finds a member workspace'"'"'s record, its repo docs and every box-talk kind in the aggregate, the register, the owner'"'"'s user memory and the repo memory, as a seat does' \
+  t 'a worker on an owner repo finds a member workspace'"'"'s record, its repo docs and every box-talk kind in the aggregate, the register, the owner'"'"'s user memory and the repo memory, as a seat does' \
     "$mfa" '1/1/owner workspace/ownnote owndoc ownprog leakmem leakseat leakarch leakgoal leakpdoc leakplog leakfail leakrep leakslack leakmf/1/3/1'
+  t '…a worker on a repo marked member-facing in its checkout alone, unregistered, gets the member-facing view below' \
+    "$mfm" '0/0/workspace/ownnote ownprog/0/0/0'
   t '…a worker on a repo member-facing by ~/.cc/members, with no board, gets only an owner repo'"'"'s board and progress (no doc answers), no register, none of his user memory and an empty memory dir' \
     "$mfb" '0/0/workspace/ownnote ownprog/0/0/0'
   t '…with ~/.cc/library/shared a link to the aggregate, it gets an empty knowledge base and the launch says so' "$mfc" 'loud 0/0/workspace/none/0/0/0'
@@ -4386,7 +4401,7 @@ case "${1:-}" in selfcheck) if [ -n "${2:-}" ]; then selfcheck_section "$2"; eli
   vet) shift; [ "${1:-}" = -- ] && shift
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
-  handle) handle_ok "${2:-}" && exit 0; exit 2;;   # cc-slack's join flow asks this before it makes a workspace
+  handle) handle_new "${2:-}" && exit 0; exit 2;;   # cc-slack's join flow asks this before it makes a workspace
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
   signout) shift; signout "${1:-}" "${2:-}"; exit $?;;

@@ -1582,6 +1582,19 @@ def run_selfcheck():
             wasF.install()                                 # install() sets DEV too: put it back after
             globals()["tmux"], globals()["DEV"] = real_tmuxF, real_devF
 
+    # MEMBER_HANDLES SKIPS RESERVED NAMES: a workspace marker under ~/dev/owner, or a members.json entry for `box`, binds
+    # no member socket, because a socket under `owner` would be handed the owner's lead (perms' read of #1745).
+    real_devM, real_lmM = globals()["DEV"], globals()["load_members"]
+    with tempfile.TemporaryDirectory() as dM:
+        try:
+            for h in ("owner", APPROVALS, "memq"):
+                os.makedirs(f"{dM}/{h}/.cc"); open(f"{dM}/{h}/{MEMBER_MARKER}", "w").close()
+            globals()["DEV"], globals()["load_members"] = dM, lambda: {"box": {}, ALERTS: {}, "memr": {}}
+            check("member: member_handles never returns a reserved name, whether a marker or members.json names it",
+                  Daemon.member_handles(None) == ["memq", "memr"])
+        finally:
+            globals()["DEV"], globals()["load_members"] = real_devM, real_lmM
+
     # THE DOOR SOCKET (perms' read of #1126, 10-13): bind_member_sock also serves each member on DIR/door/<h>/sock, in
     # 0700 dirs no sandbox binds, because <h>'s sandbox binds member/<h> and could swap that socket for a link to the
     # owner's. A link planted at door/<h>/sock is removed, not followed; a door dir that is a link refuses the bind.
