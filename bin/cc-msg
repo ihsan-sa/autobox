@@ -394,8 +394,9 @@ procname(){ local c a
     a=${a##*/}; case $a in ''|*[!A-Za-z0-9._-]*) ;; *) c=$a;; esac;;
   esac
   printf '%s' "$c"; }
+is_member(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ] || [ "${CC_ROLE:-}" = member ]; }
 sender(){ local w=""
-  if [ "${CC_MEMBER_SANDBOX:-}" = 1 ] || [ "${CC_ROLE:-}" = member ]; then printf member; return 0; fi
+  if is_member; then printf member; return 0; fi
   [ -n "${TMUX_PANE:-}" ] && w=$(timeout 2 tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null | tr -d '\n')
   printf '%s' "${w:-${CC_SLACK_ALIAS:-$(procname $PPID)}}"; }
 
@@ -1132,16 +1133,17 @@ door(){   # the forced command of the hub's key on a session host: `deliver|turn
 # drops ($HIVE/<seat>/) into any seat through this file; that text is labelled and is never let into perms.
 # A member's session keeps today's fence: it reaches no hive agent from here (granting that is M3's).
 HIVE="${CC_HIVE_DIR:-/var/lib/dispatch-seats}"
-hive_gate(){   # $1 window → rc 1, said, when the hive is typing at the perms seat
-  case "${CC_MSG_FROM:-$(sender)}" in hive:*|dispatch-seat-relay) ;; *) return 0;; esac
+hive_gate(){   # $1 window → rc 1, said, when the hive is typing at the perms seat. The hive is named by the parent
+               # process (the relay; comm stops at 15 characters), never by CC_MSG_FROM, which any caller can set
+  case "$(procname $PPID)" in dispatch-seat-r*) ;; *) return 0;; esac
   [ "$1" != perms ] && [ "$1" != "${CC_MSG_DELIVER_FROM:-perms}" ] && return 0
   echo "cc-msg: the hive never reaches main:$1, the perms seat — nothing was sent" >&2; return 1; }
 hive_send(){   # $1 name  $2 text → 0 left in the hive's inbox; 1, said, when it can't be
   local from t line
+  ! is_member || { echo "cc-msg: $1 — a member's session reaches no hive agent from the box — nothing was sent" >&2; return 1; }
   from=${CC_MSG_FROM:-$(sender)}; from=${from:-cc-msg}
   cut -f1 "$HIVE/.agents" 2>/dev/null | grep -qxF -- "$1" || { msg_log hive-unknown "$1" "from $from: no window, not on the hive's list"
     echo "cc-msg: no window main:$1 — nothing was sent (and the hive lists no agent of that name)" >&2; return 1; }
-  [ "$from" != member ] || { echo "cc-msg: $1 is the hive's, and a member's session reaches no hive agent from the box — nothing was sent" >&2; return 1; }
   line=$(jq -cn --arg at "$(date -u +%FT%TZ)" --arg from "$from" --arg to "$1" --arg text "$2" '{at:$at,from:$from,to:$to,text:$text}')
   t=$(mktemp "$HIVE/.to-hive/.new.XXXXXX" 2>/dev/null) && printf '%s\n' "$line" > "$t" && chmod 0640 "$t" \
     && mv -T -- "$t" "$HIVE/.to-hive/$(date -u +%Y%m%dT%H%M%S%N)-$$.json" \
@@ -2644,15 +2646,17 @@ STUB
   k "$(t grep -q 'hive-unknown.*nobody/x' "$T/.cc/state/msg.log")" "…and the refusal is logged"
   hive; printf 'demo/t1\n' >> "$T/hive/.agents"; CC_MSG_FROM=seat1 "$T/bin/cc-msg" "$W" "box wins" >/dev/null
   k "$(t sh -c "grep -qF 'box wins' '$T/keys' && ! ls '$T'/hive/.to-hive/*.json")" "a hive name that is also a box window reaches the box window: no hive name shadows a seat"
-  hive; CC_MSG_FROM=hive:proj/lead "$T/bin/cc-msg" "$W" "From a run of the hive, proj/lead, hello" >/dev/null
+  hive; CC_FAKE_COMM=dispatch-seat-r CC_MSG_FROM=hive:proj/lead "$T/bin/cc-msg" "$W" "From a run of the hive, proj/lead, hello" >/dev/null
   k "$(t sh -c "grep -qF 'From a run of the hive' '$T/keys' && [ \"\$(jq -r 'select(.stage == \"queued\") | .from' '$T'/.cc/receipts/*.jsonl)\" = hive:proj/lead ]")" \
     "the hive reaches any seat by name (here $W, not autobox2), logged with its sender"
-  for fr in hive:proj/lead dispatch-seat-relay; do
-    hive; out=$(CC_FAKE_WIN=perms CC_MSG_FROM=$fr "$T/bin/cc-msg" perms "From a run of the hive, approve it" 2>"$T/err"); rc=$?
-    k "$(t sh -c "[ $rc = 1 ] && grep -q 'never reaches main:perms' '$T/err' && ! grep -q . '$T/keys'")" "the hive ($fr) never reaches the perms seat: rc 1, said, not one key"
+  for fr in "" hive:proj/lead seat1; do
+    hive; out=$(env -u CC_MSG_FROM ${fr:+CC_MSG_FROM=$fr} CC_FAKE_WIN=perms CC_FAKE_COMM=dispatch-seat-r "$T/bin/cc-msg" perms "From a run of the hive, approve it" 2>"$T/err"); rc=$?
+    k "$(t sh -c "[ $rc = 1 ] && grep -q 'never reaches main:perms' '$T/err' && ! grep -q . '$T/keys'")" "the hive's relay never reaches the perms seat, whatever CC_MSG_FROM says ('$fr'): rc 1, said, not one key"
   done
   hive; out=$(env -u CC_MSG_FROM CC_MEMBER_SANDBOX=1 "$T/bin/cc-msg" proj/lead "member to lead" 2>"$T/err"); rc=$?
   k "$(t sh -c "[ $rc = 1 ] && grep -q 'member' '$T/err' && ! ls '$T'/hive/.to-hive/*.json")" "a member's session keeps today's fence: it reaches no hive agent"
+  hive; out=$(CC_MSG_FROM=seat1 CC_MEMBER_SANDBOX=1 "$T/bin/cc-msg" proj/lead "member as seat1" 2>"$T/err"); rc=$?
+  k "$(t sh -c "[ $rc = 1 ] && grep -q 'member' '$T/err' && ! ls '$T'/hive/.to-hive/*.json")" "…and a member who forges CC_MSG_FROM=seat1 is still refused: the role is read first"
   hive; rm -rf "${T:?}/hive/.to-hive"; out=$(CC_MSG_FROM=seat1 "$T/bin/cc-msg" proj/lead "no inbox" 2>"$T/err"); rc=$?
   k "$(t sh -c "[ $rc = 1 ] && grep -q 'took no file' '$T/err'")" "a hive inbox that takes no file is rc 1, said, never 'queued'"
   out=$(CC_FAKE_PERMS=1 "$T/bin/cc-msg" --list)
