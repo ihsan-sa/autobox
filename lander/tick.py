@@ -38,6 +38,9 @@
             never waited on). Nothing is posted, closed on a board or deployed for it:
             the tip catch-up deploys main. One repo's fault is said and logged (tick-fault), never the tick's end.
             `lander settle-merged <repo> <pr> [--by WHO]` runs the same for one PR at once (lander-self land calls it).
+  landed    each query job host_hold ended at a head perms' ledger now records a LAND for, at the job's change
+            (review.perms_recorded; no gh call): a request to the inbox, so this tick's lane runs it again. Any
+            writer of the ledger counts, since the ledger is what the host check itself runs on.
   waited    each repo with a job (no gh call; none at all in a GitHub backoff): the oldest due job (Lane.due) queued
             more than cards.WAIT_FLAG_SECS (60 min) ago and not held by the box (lane.box_hold: paused, a tier
             stop; or a lane "box" hold) -> one planner request (cards.waited), once per queuing and at most one per
@@ -432,6 +435,22 @@ def sweep_ended(repo="") -> list:
         except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
             E.log("tick-fault", r, None, f"ended: {type(e).__name__}: {e}")
             lines.append(f"[{r}] the ended sweep failed: {type(e).__name__}: {e}")
+    return lines
+
+
+def sweep_landed(repo="") -> list:
+    """The tick's `landed` step: a query job host_hold ended at a head that perms' ledger now records a LAND for, at
+    the job's change (review.perms_recorded, what the host check itself runs on), goes back in the lane however the
+    LAND got there. perms-d3, 10-20: a fresh perms seat that `lander record` refuses writes security-reads.json
+    itself, and #1724's job sat held until a seat queued it by hand. It reads only local files, so it runs every
+    tick."""
+    lines = []
+    for p in sorted(glob.glob(f"{J.rest_dir()}/*.json")):
+        j = J.load_path(p)
+        h = j is not None and j.state == T.QUERY and (not repo or j.repo == repo) and j.extra.get("host_hold")
+        if h and R.perms_recorded(j.repo, j.pr, h, {j.digest}):
+            J.submit(j.repo, j.pr, who="perms")
+            lines.append(f"[{j.repo}] PR #{j.pr}: perms' LAND at {h[:12]} is in its ledger — queued again")
     return lines
 
 
@@ -852,6 +871,7 @@ def cmd_tick(argv) -> int:
         lines += sweep_repairs()
         lines += sweep_strays(known_repos(repo))
         lines += sweep_ended(repo)
+        lines += sweep_landed(repo)
         repos = [repo] if repo else J.all_repos()   # a push or a stray may have queued a new repo
         for r in repos:
             if J.running(r):

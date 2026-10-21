@@ -3083,6 +3083,34 @@ class HostHold(Fixture):
         self.assertNotIn("perms-read", j.extra["why"])
         self.assertEqual(j.extra["host_hold"], j.head)   # review.requeue_held finds it by this when the LAND lands
 
+    def swept(self, **entry):
+        """perms-d3, 10-20: a fresh perms seat writes its LAND into security-reads.json itself, with no `lander
+        record`; the tick's `landed` sweep re-queues the held job only for a LAND at its exact head and change."""
+        head, _, _ = self.lane(False)
+        j = self.job()
+        with mock.patch.object(R, "PERMS_STATE", os.path.join(self.tmp, "perms-state")):
+            path = R.perms_reads_path("demo")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as f:
+                json.dump([dict({"repo": "demo", "pr": 1, "head": head, "change": j.digest}, **entry)], f)
+            os.chmod(path, 0o600)
+            lines = TK.sweep_landed()
+        return lines, [r for _, r in J.requests("demo")]
+
+    def test_a_land_written_into_perms_file_requeues_the_held_job(self):
+        lines, reqs = self.swept(verdict=T.LAND)
+        self.assertEqual([(r["pr"], r["who"]) for r in reqs], [(1, "perms")])
+        self.assertIn("perms' LAND at", lines[0])
+
+    def test_a_land_at_another_head_requeues_nothing(self):
+        self.assertEqual(self.swept(head="c" * 40), ([], []))
+
+    def test_a_land_of_another_change_requeues_nothing(self):
+        self.assertEqual(self.swept(change="other"), ([], []))
+
+    def test_a_fix_in_perms_file_requeues_nothing(self):
+        self.assertEqual(self.swept(verdict="FIX"), ([], []))
+
 
 class Review(Fixture):
     def test_incomplete_holds_without_counting_a_read(self):
