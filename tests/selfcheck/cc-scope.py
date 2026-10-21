@@ -93,6 +93,15 @@ def selfcheck():
           and la["chars"] == len(essay) and la["src"] == "slack:C1/1700000000.000100")
         t("…and two long asks that part only after the excerpt stay two rows",
           add(RL, essay + " and one more point")[0] != al and add(RL, essay) == (al, True))
+        bare = "and with no source given " + essay
+        ab, _ = add(RL, bare)
+        t("a long ask added with no --src keeps its whole text beside the ledger, and show names the file",
+          not get(RL, ab)["src"] and open(full_path(RL, ab)).read().strip() == bare
+          and full_path(RL, ab) in run_capture(["show", RL, ab]))
+        os.remove(full_path(RL, ab))   # as a row from before the side file was
+        t("a long row with no side file says it predates it in show, and asking it again writes the file",
+          "predates" in run_capture(["show", RL, ab]) and add(RL, bare) == (ab, True)
+          and open(full_path(RL, ab)).read().strip() == bare)
         R3 = R + "-ctl"   # its own ledger: an unsettled row left here would be work the cases below count
         a3, _ = add(R3, "a claimed ask whose check is red")
         quiet(["claim", R3, a3, "--track", "t3"]); quiet(["check-cmd", R3, a3, "exit 1"])

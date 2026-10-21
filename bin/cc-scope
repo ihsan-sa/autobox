@@ -83,7 +83,7 @@ DONE = ("delivered", "verified")     # it actually happened, by a check or by a 
 MARK = {"open": "·", "claimed": "▸", "merged": "→", "delivered": "✓", "verified": "✓", "declined": "⊘"}
 EXAMPLES = "systemctl --user is-active <unit> · test bin/x -nt <the merge> · a grep of what the tab renders"
 CHECK_TIMEOUT = 300  # a verification is meant to be CHEAP: one grep, one systemctl is-active, one curl
-EXCERPT = 800          # what a row keeps of a long ask: a whole Slack thread is not a ledger line, and --src points at it
+EXCERPT = 800          # what a row keeps of a long ask: a whole Slack thread is not a ledger line; the rest is in full_path()
 # bash's own two codes for "there was nothing to run": 127 not found, 126 found but not executable. A check
 # that comes back either of these did not answer the question — see CANNOT RUN in the header.
 CANNOT_RUN = (126, 127)
@@ -99,6 +99,14 @@ DOOMED = re.compile(r"(?:(?:^|[;&|(])|(?<![\w./-])(?:bash|sh|source|\.)(?=[ \t])
 
 def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 def path(repo): return os.path.join(SCOPE, repo + ".json")
+def full_path(repo, aid): return os.path.join(SCOPE, repo + ".asks", aid + ".txt")   # a long ask's whole text
+
+
+def keep_whole(repo, aid, whole):
+    """After the row is saved, so a failed save leaves no file for the next row with this id to inherit."""
+    if len(whole) <= EXCERPT: return
+    os.makedirs(os.path.dirname(full_path(repo, aid)), exist_ok=True)
+    with open(full_path(repo, aid), "w") as f: f.write(whole + "\n")
 
 
 class Lock:
@@ -192,7 +200,7 @@ def add(repo, text, who="owner", src="", track="", done_when="", check="", at=""
     text = " ".join(text.split())
     if not text: return None, False
     fp = fingerprint(text)   # of the whole ask, so two long asks that part after the excerpt stay two rows
-    chars = len(text)
+    whole, chars = text, len(text)
     if chars > EXCERPT:
         text = text[:EXCERPT].rstrip() + "…"
     with Lock(repo):
@@ -208,6 +216,7 @@ def add(repo, text, who="owner", src="", track="", done_when="", check="", at=""
                 a["notes"].append({"ts": now(), "msg": "asked again after it was declined — back on the "
                                                        "queue, with the reason it was declined kept above"})
             save(repo, d)
+            keep_whole(repo, a["id"], whole)   # a row from before the side file gets its whole text now
             return a["id"], True
         n = 1
         while "a%d" % n in d["asks"]: n += 1
@@ -216,9 +225,10 @@ def add(repo, text, who="owner", src="", track="", done_when="", check="", at=""
                           "src": src, "track": track, "done_when": done_when, "status": "open",
                           "asked": at or now(), "repeats": 1, "evidence": "", "reason": "", "closed": "",
                           "check": check.strip(), "check_files": check_files(check), "checked": {}, "notes": []}
-        if chars > EXCERPT:
+        if chars > EXCERPT:   # beside the ledger, so an ask with no --src (or a source that goes away) keeps its rest
             d["asks"][aid]["chars"] = chars
         save(repo, d)
+        keep_whole(repo, aid, whole)
         return aid, False
 
 
@@ -570,8 +580,11 @@ def main(argv):
                                     % (c["ts"], c["rc"], "; ".join(c["gone"])) if c.get("gone") else
                                     "ran and FAILED %s (rc %d)" % (c["ts"], c["rc"])))
         print("  %s" % a["text"])
-        if a.get("chars"): print("  (the first %d of %d characters; the whole ask is at %s)"
-                                 % (EXCERPT, a["chars"], a["src"] or "no source: none was given"))
+        if a.get("chars"):
+            side = full_path(args[0], a["id"])
+            print("  (the first %d of %d characters; %s, from %s)"
+                  % (EXCERPT, a["chars"], "the whole ask is in " + side if os.path.exists(side) else
+                     "no side file, because the row predates it", a["src"] or "no source given"))
         for p in a.get("parts", []): print("    – %s" % p)
         for s in a.get("seen", []): print("  again   %s %s" % (s["ts"], s.get("src", "") or "-"))
         if a["evidence"]: print("  evidence %s%s" % (a["evidence"], "  (%s)" % a["closed"] if a["closed"] else ""))

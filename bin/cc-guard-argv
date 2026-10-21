@@ -15,8 +15,10 @@ recurring-defect-ok: held-files-unchecked — a judge that refuses `--go`; it ne
 Only what bash would exec is judged. Words are read after VAR= and wrappers (env timeout nice nohup setsid stdbuf
 ionice time command builtin exec chrt taskset xargs parallel busybox flock watch systemd-run unshare nsenter chroot); the parser
 recurses into sh -c, eval, $( ), backticks, <( ), find -exec, xargs fed by a pipe, env -S/--split-string, and a
-heredoc, here-string, pipe or `< <( )` fed to a shell (or named as its script: `sh <( )`, `bash /dev/stdin`) or to at/batch, what xargs
-or parallel runs with each item it reads as ONE word (the whole input, and each line, -I/-i/--replace swapped in), `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
+heredoc, here-string, pipe, `< <( )` or `< f` (f written earlier in the line) fed to a shell, source or at/batch, or named
+as its script (`sh <( )`, `bash /dev/stdin`, `. -`, `bash /dev/fd/3 3<<<…`, an interpreter's `/dev/stdin`), what xargs
+or parallel runs with each item it reads (from stdin, -a f, `< f` or parallel's ::: words) as ONE word (the whole input, and
+each line, -I/-i/--replace swapped in; a lone `parallel {}` runs each item as the command), `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
 literals of an interpreter's -c/-e code (python perl ruby node php…: each literal, and all of them joined by blanks,
 so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
 does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
@@ -239,7 +241,9 @@ MEMOPTS = {'sh': ({'-c'}, {'-o', '+o', '-O', '+O', '--rcfile', '--init-file'}),
                                                        '-C', '--conditions', '--input-type'}),
            'php': ({'-r', '-B', '-R', '-E'}, {'-d', '-c', '-z'})}
 RUNNERS = {'make', 'gmake', 'npm', 'npx', 'yarn', 'pnpm', 'pytest', 'py.test', 'tox', 'nox', 'cargo', 'just'}
-STDINF = {'-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'}   # a script operand that is the shell's own stdin
+def fdof(x):   # the descriptor a script operand reads (`-`, /dev/stdin, /dev/fd/N, /proc/self/fd/N), or None
+    m = re.fullmatch(r'-|/dev/stdin|/dev/fd/(\d+)|/proc/self/fd/(\d+)', x)
+    return m and (m.group(1) or m.group(2) or '0')
 WRAP = {'env': set(), 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'nice': {'-n', '--adjustment'},
         'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
         'nohup': set(), 'setsid': set(), 'time': {'-f', '--format', '-o', '--output'}, 'command': set(),
@@ -704,19 +708,27 @@ class Guard:
                 j, info = g.unwrap(b, ws)
                 for t in info.get('script', []): out += g.script(t, cwd, b, depth + 1)
                 c2 = g.absp(info['cd'].v, cwd) if 'cd' in info and not info['cd'].dyn else cwd
-                fed = [r['body'] if r['op'] != '<<<' else r['w'].v for r in redirs if r['op'] in ('<<', '<<-', '<<<')]
-                if b in ('xargs', 'parallel') and (ctx[1]['pipe'] is not None or fed):   # its argv grows from the pipe or a heredoc
-                    stdin = g.produced(ctx) if ctx[1]['pipe'] is not None else '\n'.join(fed)
-                    text = ' '.join("'" + w.v.replace("'", "'\\''") + "'" for w in ws[j:]) + ' ' + stdin \
-                        if j is not None and j < len(ws) else stdin if b == 'parallel' or fed else ''   # bare parallel, or a bare xargs fed a heredoc (fails closed): each line is read as a command
+                cw = ws[j:] if j is not None else []
+                if b in ('xargs', 'parallel'):   # its argv grows from stdin, a file it reads (-a, `< f`) or parallel's ::: words
+                    o = [w.v for w in ws[1:j or len(ws)]]
+                    fed = g.feed(redirs, '0', cwd, depth) + [t for k, w in enumerate(ws[2:j or len(ws)], 2)
+                                                              if o[k - 2] in ('-a', '--arg-file') for t in g.feed([{'op': '<', 'w': w, 'fd': ''}], '0', cwd, depth)]
+                    if b == 'parallel':
+                        k = next((k for k, w in enumerate(cw) if w.v.startswith(':::')), len(cw))
+                        fed += ['\n'.join(w.v for w in cw[k:] if not w.v.startswith(':::'))] if cw[k:] else []
+                        cw = [] if [w.v for w in cw[:k]] == ['{}'] else cw[:k]   # a lone {} runs each item as the command
+                if b in ('xargs', 'parallel') and (ctx[1]['pipe'] is not None or fed):
+                    stdin = '\n'.join(fed + ([g.produced(ctx)] if ctx[1]['pipe'] is not None else []))
+                    text = ' '.join("'" + w.v.replace("'", "'\\''") + "'" for w in cw) + ' ' + stdin \
+                        if cw else stdin if b == 'parallel' or fed else ''   # bare parallel, or a bare xargs fed a heredoc or file (fails closed): each line is read as a command
                     try: out += g.script(text, c2, b, depth + 1)
                     except ParseError: pass
                     # …and as it splits items with -0, -d or -I, ONE item may be the whole input or one line of it, a word
                     # of its own (`… | xargs -0 sh -c`, `xargs -I{} sh -c {}`): the command is read with each
-                    rep = xrepl(b, [w.v for w in ws[1:j]], [w.v for w in ws[j:]]) if j is not None and j < len(ws) else None
-                    for it in (dict.fromkeys([stdin.strip('\n')] + stdin.split('\n')) if j is not None and j < len(ws) else ()):
+                    rep = xrepl(b, [w.v for w in ws[1:j]], [w.v for w in cw]) if cw else None
+                    for it in (dict.fromkeys([stdin.strip('\n')] + stdin.split('\n')) if cw else ()):
                         if not it.strip(): continue
-                        cmd = [w.v.replace(rep, it) for w in ws[j:]] if rep else [w.v for w in ws[j:]] + [it]
+                        cmd = [w.v.replace(rep, it) for w in cw] if rep else [w.v for w in cw] + [it]
                         try: out += g.script(' '.join(shq(x) for x in cmd), c2, b, depth + 1)
                         except ParseError: pass
                 if j is None or j >= len(ws): out.append(g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw))
@@ -771,6 +783,15 @@ class Guard:
             return ' '.join(a).replace('\\n', '\n')
         return ' '.join(a)
 
+    def feed(g, redirs, fd, cwd, depth):   # the text on descriptor fd: a heredoc, here-string, <( ) or a file this line wrote
+        out = []
+        for r in redirs:
+            if (r['fd'] or '0') != fd: continue
+            if r['op'] in ('<<', '<<-', '<<<'): out.append(r['body'] if r['op'] != '<<<' else r['w'].v)
+            elif r['op'] == '<' and r['w'].subs: out += ['\n'.join(g.data(x) for x in g.script(t, cwd, '<()', depth + 1)) for t in r['w'].subs]
+            elif r['op'] == '<' and not r['w'].dyn and g.absp(r['w'].v, cwd) in g.written: out.append(g.written[g.absp(r['w'].v, cwd)])
+        return out
+
     def fed(g, subs, cwd, via, depth):   # what a <( ) prints, read as the script a shell or `source` runs
         out = []
         for sub in subs:
@@ -808,16 +829,13 @@ class Guard:
             if c:   # `sh -n -c '…'` only parses the string
                 if k < len(a) and not nx: out += g.script(a[k], cwd, b + ' -c', depth + 1)
                 if k + 1 < len(ws) and ws[k + 1].subs and not nx: out += g.fed(ws[k + 1].subs, cwd, b + ' -c', depth)   # bash -c "$(…)"
-            elif k < len(a) and not s and a[k] not in STDINF:   # `bash core/bin/cc-publish`: a script file that IS one of the gated tools runs as it
+            elif k < len(a) and not s and (not fdof(a[k]) or ws[k + 1].subs):   # `bash core/bin/cc-publish`: a script file that IS one of the gated tools runs as it
                 if not nx: out += g.bypath(b, a[k:], cwd, depth)   # (`bash -n` only parses it)
                 if not nx and ws[k + 1].subs: out += g.fed(ws[k + 1].subs, cwd, b + ' <()', depth)   # `sh <(…)`: what it prints is the script
-            else:
-                for r in R['redirs']:
-                    if r['op'] in ('<<', '<<-', '<<<'):
-                        out += g.script(r['body'] if r['op'] != '<<<' else r['w'].v, cwd, 'stdin>' + b, depth + 1)
-                    if r['op'] == '<' and r['w'].subs:   # `bash < <(echo 'docker run ..')`: what the <( ) prints is the script
-                        out += g.fed(r['w'].subs, cwd, 'stdin>' + b, depth)
-                if ctx[1]['pipe'] is not None:
+            else:   # `bash < <(echo 'docker run ..')`, `bash /dev/fd/3 3<<<'…'`: what that descriptor holds is the script
+                fd = fdof(a[k]) if k < len(a) and not s else '0'
+                for t in g.feed(R['redirs'], fd, cwd, depth): out += g.script(t, cwd, 'stdin>' + b, depth + 1)
+                if fd == '0' and ctx[1]['pipe'] is not None:
                     try: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
                     except ParseError: pass
         elif b == 'script':   # script -c CMD / -qc CMD / --command[=]CMD runs CMD in a shell
@@ -846,8 +864,8 @@ class Guard:
                 mod, rest = (code[1], a[k + 1:]) if code[1] else (a[k + 1] if k + 1 < len(a) else '', a[k + 2:])
                 if mod.split('.')[0] == 'lander': out += g.script(' '.join(shlex.quote(x) for x in ['lander'] + rest), cwd, b + ' -m', depth + 1)
             prog = progtext(b, a, [])   # a program on stdin is judged only where it runs something (writing docs that name
-            if code is None and a[k:k + 1] in ([], ['-']):   # a command is data): system(, popen, subprocess, exec, spawn, backticks
-                prog += [t for t in progtext(b, [], R['redirs']) if RUNS.search(t)]
+            fd = '0' if k >= len(a) else fdof(a[k])   # a command is data): system(, popen, subprocess, exec, spawn, backticks
+            if code is None and fd: prog += [t for t in g.feed(R['redirs'], fd, cwd, depth) if RUNS.search(t)]
             for t in literals(prog):
                 n0 = len(g.out)
                 try: out += g.script(t.strip().strip('|'), cwd, b + ' code', depth + 1)
@@ -896,10 +914,10 @@ class Guard:
                 k += 2 if a[k] in ('-S', '-c', '-p', '-T', '-e', '-h', '-t', '-Logfile') else 1
             rest = a[k + 2:] if a[k:k + 2] == ['-X', 'stuff'] else [] if a[k:k + 1] == ['-X'] else a[k:]
             if rest: out += g.script(' '.join(rest) if a[k:k + 1] == ['-X'] else ' '.join(shq(x) for x in rest), cwd, 'screen', depth + 1)
-        elif b in ('at', 'batch') or (b in ('source', '.') and a[:1] and a[0] in STDINF - {'-'}):   # stdin is the script
-            for r in R['redirs']:
-                if r['op'] in ('<<', '<<-', '<<<'): out += g.script(r['body'] if r['op'] != '<<<' else r['w'].v, cwd, 'stdin>' + b, depth + 1)
-            if ctx[1]['pipe'] is not None: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
+        elif b in ('at', 'batch') or (b in ('source', '.') and a[:1] and fdof(a[0]) and not ws[1].subs):   # stdin (or that descriptor) is the script
+            fd = fdof(a[0]) if b in ('source', '.') else '0'
+            for t in g.feed(R['redirs'], fd, cwd, depth): out += g.script(t, cwd, 'stdin>' + b, depth + 1)
+            if fd == '0' and ctx[1]['pipe'] is not None: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
         elif b in ('source', '.') and a and g.absp(a[0], cwd) in g.written:
             out += g.script(g.written[g.absp(a[0], cwd)], cwd, 'source', depth + 1)
         elif b in AWKS:   # awk's system(), a print piped to a command, or a command piped to getline runs the literal
@@ -1559,7 +1577,9 @@ def shq(x):   # one word, single-quoted for the shell
     return "'" + x.replace("'", "'\\''") + "'"
 
 def xrepl(b, opts, cmd):   # the string xargs -I/-i/--replace (or parallel's {}) swaps for each item, or None (items go last)
-    if b == 'parallel': return '{}' if any('{}' in x for x in cmd) else None
+    if b == 'parallel':
+        r = next((x[2:] or (opts[k + 1] if k + 1 < len(opts) else '') for k, x in enumerate(opts) if x.startswith('-I')), '{}')
+        return r if r and any(r in x for x in cmd) else None
     r = None
     for k, x in enumerate(opts):
         if x.startswith('--replace'): r = x.partition('=')[2] or '{}'
