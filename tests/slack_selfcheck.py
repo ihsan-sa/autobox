@@ -4454,6 +4454,65 @@ def run_selfcheck():
     check("watchdog: Slack down for >300 s exits so systemd restarts the daemon; a live link resets the clock — M10",
           back_up is None and still_ok == nowA and exits == [1])
     check("serve_unix: a failing accept is logged and the loop survives (a dead one = zombie daemon) — M10", len(tries_su) >= 3)
+    # -- a link that is up and deaf (2026-10-20: 97 min of nothing, no disconnect logged): slack_sdk's is_connected()
+    # stays true while the socket object exists, so the proof of life is the pong Slack must send to the SDK's ping
+    class DeafSock:
+        """A Socket Mode client as it was on 10-20: is_connected() true, its session's last pong frozen at `pong`."""
+        def __init__(self, pong):
+            self.current_session = types.SimpleNamespace(last_ping_pong_time=pong)
+            self.socket_mode_request_listeners, self.closed = [], False
+        def is_connected(self): return True
+        def close(self): self.closed = True
+    dmD, nowD = Daemon(use_slack=False), time.time()
+    freshD = DeafSock(None)
+    verdictsD = [dmD.deaf(DeafSock(nowD - 5), nowD), dmD.deaf(DeafSock(nowD - PONG_DEAF - 1), nowD),
+                 dmD.deaf(freshD, nowD), dmD.deaf(freshD, nowD + PONG_DEAF + 1)]
+    check("deaf: a link whose is_connected() is true but whose last pong is older than PONG_DEAF is deaf; a recent "
+          "pong is alive, and a new session that has had no pong yet gets PONG_DEAF s to answer first",
+          verdictsD[0] == "" and verdictsD[1].startswith("no pong") and verdictsD[2] == "" and verdictsD[3].startswith("no pong"))
+    exitsD, errD, realExitD = [], io.StringIO(), os._exit
+    try:
+        os._exit = lambda code: exitsD.append(code)
+        with contextlib.redirect_stderr(errD):
+            dmD.watchdog(True, None, nowD, dmD.deaf(DeafSock(nowD - 600), nowD))
+    finally:
+        os._exit = realExitD
+    check("deaf: the default workspace's deaf link exits at once, logging why, so systemd restarts and reconnects it",
+          exitsD == [1] and "slack link deaf (no pong from Slack for 600 s)" in errD.getvalue())
+    deadD, liveD, builtD = DeafSock(nowD - 600), DeafSock(None), []
+    dmD.ws_up["b"] = {"connected": True}
+    dmD.run_workspace = lambda name, w, pool, wait: builtD.append(name) or (deadD, liveD)[len(builtD) - 1]
+    class StopD(Exception): pass
+    ticksD, realSleepD = [], time.sleep
+    def sleepD(n):
+        ticksD.append(n)
+        if len(ticksD) > 2:
+            raise StopD()
+    errD = io.StringIO()
+    try:
+        time.sleep = sleepD
+        with contextlib.redirect_stderr(errD):
+            try:
+                dmD.watch_workspace("b", {}, None, wait=0)
+            except StopD:
+                pass
+    finally:
+        time.sleep = realSleepD
+    for _ in range(50):                                      # the old client is closed on its own thread
+        if deadD.closed:
+            break
+        time.sleep(0.02)
+    check("deaf: an extra workspace's deaf link is logged with its reason and reconnected in place, the old client "
+          "closed, and the new one (still waiting on its first pong) is left alone",
+          builtD == ["b", "b"] and deadD.closed and not liveD.closed
+          and "slack workspace b: link deaf (no pong from Slack for" in errD.getvalue())
+    dmD.busy["CSTUCK"] = nowD - HANDLER_STUCK - 1
+    stuckD = dmD.stuck(nowD)
+    dmD.busy.clear(); dmD.on_event = lambda ev: None
+    dmD.handle("CQUICK", {"type": "message"})
+    check("stuck: a chat whose message handler has run past HANDLER_STUCK is named, so watchdog restarts the daemon; "
+          "a handler that returns leaves no mark", stuckD.startswith("message handler in CSTUCK stuck")
+          and dmD.stuck(nowD) == "" and dmD.busy == {})
     # -- sending a FILE: the `file` tool and cc-slack post --file share upload_file(); the bounds are the whole point ----
     upd = tempfile.mkdtemp(prefix="cc-slack-upload-")        # under /tmp, which IS an allowed root
     real_cwd_u = os.getcwd(); os.chdir(upd)

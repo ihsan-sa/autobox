@@ -329,7 +329,13 @@ def loop_args(a):
     return None
 
 
+def tidy(v):
+    """A word with the shell's trailing ';' off (`cc-loop r t --max-iter 3;` in a sh -c string)."""
+    return v.rstrip(";") if isinstance(v, str) else v
+
+
 def worker(name, toks):
+    toks = [tidy(t) for t in toks]
     rec = {"kind": "worker", "window": name, "repo": toks[0] if toks else "",
            "track": toks[1] if len(toks) > 1 else "", "loop": "1", "flags": []}
     rest = toks[2:]
@@ -751,11 +757,12 @@ def unsafe(rec):
     if member_record(repo) and not member_ws(repo):   # .cc/ is the member's to delete; the host's record is not (cc member_record)
         return "member record (~/.cc/members) but no .cc/member-workspace marker"
     if k == "worker":
-        if not (isinstance(rec.get("loop", "1"), str) and rec.get("loop", "1").isdigit()):
+        if not (isinstance(rec.get("loop", "1"), str) and tidy(rec.get("loop", "1")).isdigit()):
             return "bad loop"
         fl, i = rec.get("flags", []), 0
         if not isinstance(fl, list):
             return "bad flags"
+        fl = [tidy(x) for x in fl]   # records saved before worker() dropped the ';'
         while i < len(fl):
             if fl[i] in LOOP_SWITCHES:
                 i += 1
@@ -791,10 +798,10 @@ def launch_argv(rec):
     if k == "track" or (k == "member" and rec.get("track")):
         return [cc, rec["repo"], rec["track"]]
     if k == "worker":
-        flags = list(rec.get("flags", []))
+        flags = [tidy(x) for x in rec.get("flags", [])]
         if "--resume-last" not in flags:
             flags.append("--resume-last")
-        return [cc, rec["repo"], rec["track"], "--go", "", "--loop", rec.get("loop", "1"), *flags]
+        return [cc, rec["repo"], rec["track"], "--go", "", "--loop", tidy(rec.get("loop", "1")), *flags]
     return [cc, rec["repo"]]   # a seat (resumed by its CC_CLAUDE wrapper) or a member (cold: see the docstring)
 
 
@@ -1359,6 +1366,11 @@ def selfcheck():
         check("scan: a seat's sid is read off its tasks fd", s["r1"]["kind"] == "seat" and s["r1"]["sid"] == "sid-seat" and s["r1"]["claude"] == "/c/claude")
         check("scan: an orch keeps its alias and sid", s["r1@ops"]["kind"] == "orch" and s["r1@ops"]["alias"] == "ops" and s["r1@ops"]["sid"] == "sid-orch")
         check("scan: a worker keeps its loop and flags", s["r1/job"]["kind"] == "worker" and s["r1/job"]["loop"] == "3" and s["r1/job"]["flags"] == ["--budget", "8"])
+        w = worker("r1/job", ["r1", "job", "--max-iter", "3;", "--budget", "8;"])
+        old = {"kind": "worker", "window": "r1/job", "repo": "r1", "track": "job", "loop": "3;", "flags": ["--budget", "8;"]}
+        check("scan: a worker's trailing ';' is not saved", w["loop"] == "3" and w["flags"] == ["--budget", "8"])
+        check("restore: a record saved with a trailing ';' is accepted and launched clean",
+              unsafe(old) == "" and launch_argv(old)[-4:] == ["3", "--budget", "8", "--resume-last"])
         check("scan: member and track", s["m1"]["kind"] == "member" and s["r1/fix"]["kind"] == "track" and s["r1/fix"]["track"] == "fix")
         check("scan: perms and any --dangerously-skip-permissions session are never saved", "perms" not in s and "odd" not in s)
         # a seat whose claude carries `cc-loop` in its prompt text is a seat, never a worker named by that text

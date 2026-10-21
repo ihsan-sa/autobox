@@ -175,6 +175,8 @@ PR_RE = re.compile(r"^\[([a-z0-9_-]+)\] PR #([0-9]+):")
 # queues the head (on_approval). Routine PR cards live in the log lane, where his 👍 only re-queues (owner_card_thumb).
 APPROVAL_RE = re.compile(r"🔐 \*Approval needed:\* \[([a-z0-9_-]+)\] PR #([0-9]+)\b")
 RETURN_RE = re.compile(r"^(?:<#[A-Z0-9]+(?:\|[^>]*)?>\s+)?\[return\] (\S+):")   # cc-model's card (its card_text): a 👍 on it runs `cc-model return <window>`
+PONG_DEAF = 60                                                      # a link Slack hasn't answered a ping on for this long is deaf, however quiet the channels
+HANDLER_STUCK = 1800                                                # a chat's message handler running this long is hung, and the chat's queue with it
 QUEUE_TTL = 24 * 3600                                               # a message queued for a session that never came up is dropped (and the owner told) after 24 h
 SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
                         r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")   # what a tool preview relayed to Slack must never carry
@@ -4634,6 +4636,7 @@ class Daemon:
         self.queues = collections.defaultdict(collections.deque)   # target -> deque[(t, payload, alias)]
         self.given = collections.defaultdict(list)          # target -> [Given] its unaliased session was handed (rehand_at_cutover)
         self.execs = collections.OrderedDict()               # chat -> ThreadPoolExecutor(1): message/edit events stay in order per chat
+        self.busy = {}                                      # chat -> when its running message handler started (stuck)
         self.seen = collections.OrderedDict()
         self.last_chat = load_last()                        # target -> (chat, root) it last heard from: permission_chat's lane, home.json's channel list
         self.thread_owner = {}                              # (chat, thread_ts) -> alias|None (None = main); routing cache
@@ -9196,8 +9199,8 @@ class Daemon:
         down_since = None
         while True:
             time.sleep(30)
-            self.connected = client.is_connected()
-            down_since = self.watchdog(self.connected, down_since, time.time())
+            self.connected, now = client.is_connected(), time.time()
+            down_since = self.watchdog(self.connected, down_since, now, self.deaf(client, now) or self.stuck(now))
             for t, payload in self.expire_queues():
                 self.expired(t, payload)
 
@@ -9219,6 +9222,11 @@ class Daemon:
         client = self.run_workspace(name, w, pool, wait)
         while True:
             time.sleep(wait)
+            why = self.deaf(client, time.time())
+            if why:
+                log(f"slack workspace {name}: link deaf ({why}) — reconnecting")
+                threading.Thread(target=self._safe, args=(client.close,), daemon=True).start()   # a wedged close must not hold us
+                client = self.run_workspace(name, w, pool, wait)
             up = client.is_connected()
             if up != self.ws_up[name].get("connected"):
                 log(f"slack workspace {name}: {'connected' if up else 'disconnected'}")
@@ -9314,15 +9322,42 @@ class Daemon:
                 self.save_queues()
         return expired
 
-    def watchdog(self, connected, down_since, now):
+    def watchdog(self, connected, down_since, now, deaf=""):
         """Socket-mode health: a daemon whose Slack link stays down is one the owner can't reach, so after 5 min it
-        exits and systemd's Restart=always brings a fresh one. Returns the (possibly new) down_since."""
+        exits and systemd's Restart=always brings a fresh one; a link that is up but `deaf` (why, from deaf() or
+        stuck()) exits at once. Returns the (possibly new) down_since."""
+        if deaf:
+            log(f"slack link deaf ({deaf}) — exiting so systemd restarts the daemon and reconnects"); os._exit(1)
         if connected:
             return None
         down_since = down_since or now
         if now - down_since > 300:
             log("slack disconnected for >300 s — exiting so systemd restarts the daemon"); os._exit(1)
         return down_since
+
+    def deaf(self, client, now):
+        """Why a link that calls itself connected hears nothing from Slack, or "". slack_sdk 3.43's is_connected() says
+        only that the socket object exists, and its own stale check can wedge on a half-open socket and logs nothing
+        (2026-10-20: 97 min deaf). Proof of life is the pong Slack must send back to the SDK's ping every few seconds,
+        so a quiet night never trips it; a fresh session gets PONG_DEAF s to answer first."""
+        s = getattr(client, "current_session", None)
+        if s is None or not client.is_connected():
+            return ""                                       # down, not deaf: the SDK reconnects and watchdog times it
+        heard = s.last_ping_pong_time or vars(s).setdefault("cc_born", now)
+        return f"no pong from Slack for {int(now - heard)} s" if now - heard > PONG_DEAF else ""
+
+    def stuck(self, now):
+        """A chat whose message handler has run past HANDLER_STUCK, so every later message there waits behind it, or ""."""
+        late = [(c, t) for c, t in list(self.busy.items()) if now - t > HANDLER_STUCK]
+        return f"message handler in {late[0][0]} stuck for {int(now - late[0][1])} s" if late else ""
+
+    def handle(self, chat, ev):
+        """One chat's message handler, stamped in busy while it runs so stuck() can see a hung one."""
+        self.busy[chat] = time.time()
+        try:
+            self._safe(self.on_event, ev)
+        finally:
+            self.busy.pop(chat, None)
 
     def expired(self, target, payload, why="never came up"):
         """A queued message aged out: say so where it was asked, instead of dropping it silently. `why` distinguishes
@@ -9378,7 +9413,7 @@ class Daemon:
                 ex = self.execs[chat] = ThreadPoolExecutor(max_workers=1)
                 while len(self.execs) > 64:              # bound the per-chat executors on a busy workspace
                     self.execs.popitem(last=False)[1].shutdown(wait=False)
-        return ex.submit(self._safe, self.on_event, ev)
+        return ex.submit(self.handle, chat, ev)
 
     # -- home.json, the dashboard's source -----------------------------------------
     def home_wins(self):

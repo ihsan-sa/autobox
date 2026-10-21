@@ -26,6 +26,8 @@
 #                               `deliver|turn <window> [<from>]`, the text on stdin, typed here and never forwarded on
 #                               ("A WINDOW ON ANOTHER HOST", below). A window the hub's directory puts on another host
 #                               is delivered there, through this door, by the send, --turn and --drain forms above.
+#   cc-msg --list               every name a send reaches, one a line, peer-host windows and headless workers included
+#                               (THE HIVE IS THE SAME NAME SPACE, below); a name with no window here goes to the hive's list
 #   cc-msg --where <window>     prints the user@addr of the other host the window directory puts <window> on, and
 #                               nothing when it is here or the entry fails a check (win_host, below). cc-slack asks
 #                               this before it types a pane or starts a session, so it starts nothing on the hub
@@ -36,8 +38,8 @@
 # `cc-slack inject`, which hands it to the live side of the overlap ("queued" when it holds it for that side).
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
 # again later are a second message and are queued as one.
-# Refuses TRACK windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
-# would sit on its tty and execute as a command when the loop ends. Give those work by appending to task.md.
+# Never types at a TRACK window with no interactive `claude` under it: a headless --go worker's pane is a shell, and the
+# text would execute as a command there. Its loop's inbox (cc-loop say) takes it instead, or it is refused, said.
 # A seat's window (no `/`: planning, an orch, perms) that is a bare shell is between sessions instead: the text is
 # spooled and reported queued, and typed once its claude is back.
 # Note: between Claude sessions prefer the native SendMessage tool; this is the deterministic waker for scripts/humans.
@@ -1121,8 +1123,44 @@ door(){   # the forced command of the hub's key on a session host: `deliver|turn
   esac
 }
 
+# ── THE HIVE IS THE SAME NAME SPACE (the owner's architecture, M1, 2026-10-20: "any agent messages any other agent by
+# name"). A name with no window here is looked up in the hive's own list, $HIVE/.agents (one name a line, the first
+# tab-separated field; dispatch writes it), and never guessed: a name on it is left in the hive's inbox
+# $HIVE/.to-hive as <time>-<pid>.json {at,from,to,text}, renamed in whole, for dispatch to hand to that lead or
+# warden as a peer's words. A box window always wins, so no hive name ever shadows a seat. Its queued receipt
+# (chat msg:hive:<name>) is the board's row of it. The other way, dispatch's dispatch-seat-relay types the hive's
+# drops ($HIVE/<seat>/) into any seat through this file; that text is labelled and is never let into perms.
+# A member's session keeps today's fence: it reaches no hive agent from here (granting that is M3's).
+HIVE="${CC_HIVE_DIR:-/var/lib/dispatch-seats}"
+hive_gate(){   # $1 window → rc 1, said, when the hive is typing at the perms seat
+  case "${CC_MSG_FROM:-$(sender)}" in hive:*|dispatch-seat-relay) ;; *) return 0;; esac
+  [ "$1" != perms ] && [ "$1" != "${CC_MSG_DELIVER_FROM:-perms}" ] && return 0
+  echo "cc-msg: the hive never reaches main:$1, the perms seat — nothing was sent" >&2; return 1; }
+hive_send(){   # $1 name  $2 text → 0 left in the hive's inbox; 1, said, when it can't be
+  local from t line
+  from=${CC_MSG_FROM:-$(sender)}; from=${from:-cc-msg}
+  cut -f1 "$HIVE/.agents" 2>/dev/null | grep -qxF -- "$1" || { msg_log hive-unknown "$1" "from $from: no window, not on the hive's list"
+    echo "cc-msg: no window main:$1 — nothing was sent (and the hive lists no agent of that name)" >&2; return 1; }
+  [ "$from" != member ] || { echo "cc-msg: $1 is the hive's, and a member's session reaches no hive agent from the box — nothing was sent" >&2; return 1; }
+  line=$(jq -cn --arg at "$(date -u +%FT%TZ)" --arg from "$from" --arg to "$1" --arg text "$2" '{at:$at,from:$from,to:$to,text:$text}')
+  t=$(mktemp "$HIVE/.to-hive/.new.XXXXXX" 2>/dev/null) && printf '%s\n' "$line" > "$t" && chmod 0640 "$t" \
+    && mv -T -- "$t" "$HIVE/.to-hive/$(date -u +%Y%m%dT%H%M%S%N)-$$.json" \
+    || { rm -f -- "${t:-}"; echo "cc-msg: $1 is the hive's, but its inbox $HIVE/.to-hive took no file — nothing was sent" >&2; return 1; }
+  receipt queued "hive:$1" "$line"; }
+
+list(){   # --list: every name a send here reaches, one a line — the phonebook dispatch's relay reads. A live claude, a
+          # seat between sessions, a headless worker's live loop, and each window the directory puts on another host;
+          # never the perms seat
+  local id w
+  { while read -r id w; do
+      live_claude "$id" || [ "${w#*/}" = "$w" ] || [ -s "$HOME/.cc/state/$w/loop.pid" ] && printf '%s\n' "$w"
+    done < <(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null)
+    [ -n "${CC_MSG_NO_FORWARD:-}" ] || ! owned "$WINDIR" || awk '$2 != "" { print $1 }' "$WINDIR"
+  } | grep -vxF -e perms -e "${CC_MSG_DELIVER_FROM:-perms}" | sort -u; }
+
 send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
   local id res dest
+  hive_gate "$1" || exit 1
   dest=$(win_host "$1"); [ -z "$dest" ] || { send_remote "$1" "$2" "$dest"; return 0; }
   # A NAME MID-HANDOFF IS TWO SESSIONS, and the keyboard of whichever holds it is the wrong door: on 2026-09-16 a
   # relay typed into the retiring `lessons` seat was never acted on, and its successor never saw it. With an open
@@ -1134,12 +1172,14 @@ send(){    # $1 window  $2 text — THE contract: delivered, or queued and repor
     return 0
   fi
   id=$(win_id "$1") || true
-  [ -n "$id" ] || { echo "cc-msg: no window main:$1" >&2; exit 1; }
+  [ -n "$id" ] || { hive_send "$1" "$2" || exit 1; echo queued; return 0; }
   # A SEAT'S BARE SHELL IS A SEAT BETWEEN SESSIONS, not a worker: on 2026-10-18 main:<repo> was a shell when
   # autobox2 relayed four owner directions, this refused them, and planning never had them. A window with no `/`
-  # (planning, an orch, perms) gets its claude back, and the 60 s drain and cc-started type the spool then; a
-  # track window's headless loop never takes typed text, so that one is still refused with the door it does read.
-  live_claude "$id" || [ "${1#*/}" = "$1" ] || { echo "cc-msg: main:$1 runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
+  # (planning, an orch, perms) gets its claude back, and the 60 s drain and cc-started type the spool then.
+  # A HEADLESS --go WORKER is reached by name too (M1, 2026-10-20): its text goes to the inbox its loop already reads
+  # after each tool call, cc-loop say, the door `cc --say` takes; a track window with no live loop is refused, said.
+  live_claude "$id" || [ "${1#*/}" = "$1" ] || { CC_SAY_WAIT=0 "$BIN/cc-loop" say "${1%%/*}" "${1#*/}" "$2" >/dev/null
+    case $? in 0|3) echo queued; return 0;; *) exit 1;; esac; }
   local line sp                                   # ALWAYS the spool first, even for a free pane: it is what keeps
   line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for main:$1" >&2; exit 1; }   # a burst in order
   drain_window "$1"                                       # …and what makes "never dropped" true of every path
@@ -1207,6 +1247,7 @@ turn_seen(){   # $1 window id  $2 the text as typed → the verdict on stdout; r
 }
 send_turn(){   # $1 window  $2 text — send(), then the verdict --turn promises (above)
   local id out sp line why st rc res dest
+  hive_gate "$1" || return 1
   dest=$(win_host "$1")
   if [ -n "$dest" ]; then   # the session host answers --turn itself; only a door that never answered is ours to keep
     [ -s "$(sdir "$1")/inbox.spool" ] || { printf '%s' "$2" | door_ssh "$dest" turn "$1"; rc=$?; [ "$rc" = 255 ] || return "$rc"; }
@@ -1221,7 +1262,9 @@ send_turn(){   # $1 window  $2 text — send(), then the verdict --turn promises
     return 3
   fi
   id=$(win_id "$1") || true
-  [ -n "$id" ] || { echo "cc-msg: no window main:$1 — nothing was sent" >&2; return 1; }
+  [ -n "$id" ] || { hive_send "$1" "$2" || return 1
+                    echo "cc-msg: $1 is the hive's: left in its inbox, no turn seen from here (do not send it again)" >&2; return 3; }
+  live_claude "$id" || [ "${1#*/}" = "$1" ] || { "$BIN/cc-loop" say "${1%%/*}" "${1#*/}" "$2" >/dev/null; return $?; }
   live_claude "$id" || { echo "cc-msg: main:$1 runs no interactive claude — nothing was sent" >&2; return 1; }
   line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for main:$1" >&2; return 1; }
   drain_window "$1"
@@ -1495,13 +1538,20 @@ case "${2:-}" in
 esac
 exit 0
 STUB
+  cat > "$T/bin/cc-loop" <<'STUB'
+#!/bin/bash
+# cc-loop say stub: records its args; CC_FAKE_SAY_RC is the verdict (unset: no live loop)
+printf '%s\n' "$*" >> "$HOME/say.calls"
+[ "${CC_FAKE_SAY_RC:-1}" = 1 ] && echo "cc-loop: no live worker loop for $2/$3 — nothing was sent (its brief is task.md)" >&2
+exit "${CC_FAKE_SAY_RC:-1}"
+STUB
   cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
   # TZ: a zone of its own, never this box's (check.sh's clock rule) — and never UTC either, or the one case
   # that proves the blank stamp is rendered in local time would pass just as well on a `date -u` regression.
   export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
          CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude \
          CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" CC_FAKE_SWAP_N="$T/swapn" CC_FAKE_SWALLOW_F="$T/swallow" \
-         CC_MSG_KEY_WAIT=0 CC_MSG_SUBMIT_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck \
+         CC_MSG_KEY_WAIT=0 CC_MSG_SUBMIT_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck CC_HIVE_DIR="$T/hive" \
          TZ='Asia/Tokyo'
   local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
@@ -1651,7 +1701,7 @@ STUB
   reset; scr "$FREE"; out=$(CC_FAKE_WIN='' tm "to nobody")
   k "$(t sh -c "[ '$out' = rc=1 ] && grep -q 'no window main:$W — nothing was sent' '$T/err' && ! test -e '$SP'")" "--turn: a dead target (no window) is rc 1, 'nothing was sent', and nothing is spooled"
   reset; scr "$FREE"; out=$(CC_FAKE_PROC=bash tm "to a shell")
-  k "$(t sh -c "[ '$out' = rc=1 ] && grep -q 'runs no interactive claude' '$T/err' && ! grep -q . '$T/keys'")" "--turn: a window whose claude is gone is rc 1, and not one key reaches the shell"
+  k "$(t sh -c "[ '$out' = rc=1 ] && grep -q 'no live worker loop' '$T/err' && ! grep -q . '$T/keys'")" "--turn: a track window whose claude and loop are gone is rc 1, and not one key reaches the shell"
   # (1e) review of #635. after_enter: once the Enter lands, wait $1 s and redraw the whole pane as $2.
   after_enter(){ ( i=0; until grep -q Enter "$T/keys" 2>/dev/null || [ "$i" -ge 80 ]; do sleep 0.1; i=$((i+1)); done; sleep "$1"; scr "$2" ) & }
   reset; scr "$(printf '%s\n' '⏺ an earlier answer' "$FREE")"
@@ -2066,8 +2116,14 @@ $BUSY"; out=$(msg "hello mid-turn")
   # (10) what is still REFUSED: a pane with no interactive claude, and a window that does not exist
   reset; scr "$FREE"; out=$(CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "no claude here" 2>&1); rc=$?
   k "$(t test "$rc" != 0)" "a pane with no interactive claude is still refused (rc≠0) — the text would run as a command"
-  k "$(t grep -q 'task.md' <<<"$out")" "…and still points at task.md"
+  k "$(t grep -q 'no live worker loop' <<<"$out")" "…and says its loop is not live (cc-loop say's reason)"
   k "$(nt test -f "$SP")" "…and nothing is spooled for it: a headless worker has no keyboard to drain to"
+  # (10c) A HEADLESS --go WORKER BY NAME (M1): its live loop's inbox takes the text, and nothing is typed at its shell
+  reset; rm -f "$T/say.calls"; scr "$FREE"; out=$(CC_FAKE_SAY_RC=3 CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "to the worker"); rc=$?
+  k "$(t sh -c "[ '$rc/$out' = 0/queued ] && grep -qxF 'say demo t1 to the worker' '$T/say.calls' && ! grep -q . '$T/keys'")" \
+    "a headless worker is reached by name: its loop's inbox (cc-loop say) takes it, rc 0 queued, not one key typed"
+  reset; out=$(CC_FAKE_SAY_RC=0 CC_FAKE_PROC=bash "$T/bin/cc-msg" --turn "$W" "heard?" 2>&1); rc=$?
+  k "$(t test "$rc" = 0)" "…and --turn passes on cc-loop say's verdict (0: its running turn took it)"
   # (10b) A SEAT'S BARE SHELL (2026-10-18): main:<repo> between sessions refused four relayed owner directions. A
   # window with no `/` is spooled and reported queued, and the drain types it once a claude is back in the pane.
   rm -rf "${T:?}/.cc/state/demo"; reset; scr "$FREE"
@@ -2572,6 +2628,44 @@ STUB
   k "$(nt test -s "$FAR/keys")" "…and typed nothing for any of them"
   rm -rf "$FAR" "$T/.cc/windows" "$T/.cc/hosts" "$T/.cc/door" "$T/dev/mem"
 
+  # ONE NAME SPACE WITH THE HIVE (M1): seat → lead, worker → warden, hive → any seat, an unknown name refused, each on
+  # the receipts the board reads. Each case starts from a fresh hive fixture and fresh receipts.
+  hive(){ reset; scr "$FREE"; rm -rf "${T:?}/hive" "${T:?}/.cc/receipts" "${T:?}/.cc/state/msg.log"; mkdir -p "$T/hive/.to-hive"
+          printf 'proj/lead\tlead\nwarden\twarden\n' > "$T/hive/.agents"; }
+  drop(){ cat "$T"/hive/.to-hive/*.json 2>/dev/null | jq -r "select(.to == \"$1\") | \"\(.from) \(.text)\""; }
+  rcpt(){ jq -r "select(.stage == \"queued\" and .chat == \"msg:$1\") | \"\(.from) \(.text)\"" "$T"/.cc/receipts/*.jsonl 2>/dev/null; }
+  hive; out=$(CC_MSG_FROM=seat1 "$T/bin/cc-msg" proj/lead "seat to lead"); rc=$?
+  k "$(t test "$rc/$out/$(drop proj/lead)" = "0/queued/seat1 seat to lead")" "a seat names a hive lead: left in the hive's inbox with its sender, and said queued"
+  k "$(t test "$(rcpt hive:proj/lead)" = "seat1 seat to lead")" "…and its queued receipt (msg:hive:<name>) carries sender and text for the board"
+  hive; out=$(env -u CC_MSG_FROM TMUX_PANE=%9 CC_FAKE_SENDER_WIN=demo/t9 "$T/bin/cc-msg" --turn warden "worker to warden" 2>"$T/err"); rc=$?
+  k "$(t test "$rc/$(drop warden)/$(rcpt hive:warden)" = "3/demo/t9 worker to warden/demo/t9 worker to warden")" "a worker names a warden: dropped and logged as from its window, and --turn is rc 3 (no turn seen here)"
+  hive; out=$(CC_MSG_FROM=seat1 "$T/bin/cc-msg" nobody/x "to nobody" 2>"$T/err"); rc=$?
+  k "$(t sh -c "[ $rc = 1 ] && grep -q 'hive lists no agent' '$T/err' && ! ls '$T'/hive/.to-hive/*.json")" "a name neither the box nor the hive knows is refused, rc 1, said, and nothing dropped"
+  k "$(t grep -q 'hive-unknown.*nobody/x' "$T/.cc/state/msg.log")" "…and the refusal is logged"
+  hive; printf 'demo/t1\n' >> "$T/hive/.agents"; CC_MSG_FROM=seat1 "$T/bin/cc-msg" "$W" "box wins" >/dev/null
+  k "$(t sh -c "grep -qF 'box wins' '$T/keys' && ! ls '$T'/hive/.to-hive/*.json")" "a hive name that is also a box window reaches the box window: no hive name shadows a seat"
+  hive; CC_MSG_FROM=hive:proj/lead "$T/bin/cc-msg" "$W" "From a run of the hive, proj/lead, hello" >/dev/null
+  k "$(t sh -c "grep -qF 'From a run of the hive' '$T/keys' && [ \"\$(jq -r 'select(.stage == \"queued\") | .from' '$T'/.cc/receipts/*.jsonl)\" = hive:proj/lead ]")" \
+    "the hive reaches any seat by name (here $W, not autobox2), logged with its sender"
+  for fr in hive:proj/lead dispatch-seat-relay; do
+    hive; out=$(CC_FAKE_WIN=perms CC_MSG_FROM=$fr "$T/bin/cc-msg" perms "From a run of the hive, approve it" 2>"$T/err"); rc=$?
+    k "$(t sh -c "[ $rc = 1 ] && grep -q 'never reaches main:perms' '$T/err' && ! grep -q . '$T/keys'")" "the hive ($fr) never reaches the perms seat: rc 1, said, not one key"
+  done
+  hive; out=$(env -u CC_MSG_FROM CC_MEMBER_SANDBOX=1 "$T/bin/cc-msg" proj/lead "member to lead" 2>"$T/err"); rc=$?
+  k "$(t sh -c "[ $rc = 1 ] && grep -q 'member' '$T/err' && ! ls '$T'/hive/.to-hive/*.json")" "a member's session keeps today's fence: it reaches no hive agent"
+  hive; rm -rf "${T:?}/hive/.to-hive"; out=$(CC_MSG_FROM=seat1 "$T/bin/cc-msg" proj/lead "no inbox" 2>"$T/err"); rc=$?
+  k "$(t sh -c "[ $rc = 1 ] && grep -q 'took no file' '$T/err'")" "a hive inbox that takes no file is rc 1, said, never 'queued'"
+  out=$(CC_FAKE_PERMS=1 "$T/bin/cc-msg" --list)
+  k "$(t test "$out" = "$W")" "--list, the phonebook the hive relay reads, lists the live windows and never perms"
+  out=$(CC_FAKE_PROC=bash "$T/bin/cc-msg" --list)
+  k "$(t test -z "$out")" "…and leaves out a track window that is a shell with no live loop"
+  mkdir -p "$T/.cc/state/$W"; echo 1 > "$T/.cc/state/$W/loop.pid"; out=$(CC_FAKE_PROC=bash "$T/bin/cc-msg" --list)
+  k "$(t test "$out" = "$W")" "…but lists a headless worker whose loop is live"; rm -f "$T/.cc/state/$W/loop.pid"
+  printf 'far/seat far\nperms far\n' > "$T/.cc/windows"; chmod 644 "$T/.cc/windows"; chmod 755 "$T/.cc"
+  out=$("$T/bin/cc-msg" --list | tr '\n' ' ')
+  k "$(t test "$out" = "$W far/seat ")" "…and the windows the directory puts on a peer host, perms still left out"; rm -f "$T/.cc/windows"
+  rm -rf "${T:?}/hive"
+
   echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]
 }
@@ -2583,8 +2677,9 @@ case "${1:-}" in
   --sweep)    sweep;;
   --turn)     shift; w=${1:?cc-msg: --turn needs a window}; shift; send_turn "$w" "${*:-$(cat)}"; exit $?;;
   --door)     door;;
+  --list)     list;;
   --where)    shift; d=$(win_host "${1:?cc-msg: --where needs a window}"); [ -z "$d" ] || echo "$d";;
   selfcheck)  selfcheck;;
-  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --turn <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg --door | cc-msg --where <window> | cc-msg selfcheck' >&2; exit 2;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --turn <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg --door | cc-msg --list | cc-msg --where <window> | cc-msg selfcheck' >&2; exit 2;;
   *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
 esac

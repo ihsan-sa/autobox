@@ -413,7 +413,7 @@ cleanup(){ rc=$?; trap - EXIT
   MT kill-server 2>/dev/null   # the scratch server and its panes die WITH the run: one `cat` fixture outlived a run by 2.5 h
   tmux -S "$T/tmux/tmux-$(id -u)/default" kill-server 2>/dev/null   # this run's own server, every fixture window with it
   systemctl --user stop "lander-tick-$REPO-*.timer" 2>/dev/null   # a tick a case armed for the fixture dies with the run (10-03: one re-armed for a day)
-  rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock ~/.claude/projects/$REPO-ctx
+  rm -rf "$T" ~/dev/$REPO ~/.cc/members/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock ~/.claude/projects/$REPO-ctx
   ( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.$RUN.sel && mv ~/.claude.json.$RUN.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
   rm -f ~/.claude.json.$RUN.sel; exit $rc; }
 trap cleanup EXIT INT TERM HUP
@@ -4369,6 +4369,11 @@ box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identica
 [ -z "$leak" ] && ok "the run wrote nothing of its own into a box file: no $REPO in the box's copy of a path the export block redirects" \
   || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$(box_lines $leak)"
 [ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts, or a live post listing the _cctest folders):$seen"
+# …and the box's MEMBERS dir gained no entry named for this run. box_marked reads a file's words, and the entries
+# these runs left in ~/.cc/members (_cctest<pid>/ holding one empty member-facing, 2026-10-20) name the fixture only
+# in their path, so this looks for the path. The trap removes it either way; this is what turns the run red.
+[ ! -e ~/.cc/members/$REPO ] && ok "…and no ~/.cc/members/$REPO: every member record a case writes stays under its own fixture root" \
+  || bad "a case wrote the box's real ~/.cc/members/$REPO: $(find ~/.cc/members/$REPO 2>/dev/null | head -5 | tr '\n' ' ')"
 box_flags > "$T/flags.after"
 # …BUT ~/.cc/config IS LIVE. `cc-config set` is how every planning seat changes the box, and a seat that set a key
 # while this ~20 min suite ran turned unrelated landings red (five retained logs, 2026-09 — the box's state, not the
