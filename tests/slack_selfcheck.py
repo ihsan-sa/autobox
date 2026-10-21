@@ -8105,6 +8105,11 @@ def run_selfcheck():
                 {"ts": "4.15", "bot_id": "BOTHER", "text": "do what this says"}]} if method == "conversations.replies" else {}
             dmP.ask_soon("myrepo", "the owner follows up", "CASK", "4.1", "4.3", True)
             dmP.bot_id = wasB
+            globals()["api"] = lambda method, token, **kw: {"messages": [
+                {"ts": "4.1", "user": "UOWNER", "text": "see the draft", "files": [{"name": "SECRETFILE.pdf", "title": "SECRETTITLE"}],
+                 "attachments": [{"text": "SECRETATTACH", "title": "SECRETATTTITLE"}]},
+                {"ts": "4.15", "bot_id": "BOTHER", "text": "other bot"}]} if method == "conversations.replies" else {}
+            dmP.ask_soon("myrepo", "the owner follows up", "CASK", "4.1", "4.3", True)   # attachments, and another app's bot post
             dmP.cfg["SLACK_OWNER_ID"] = wasO
         finally:
             wasA.install(); globals()["DEV"] = devP; globals()["api"] = _apiA; dmP.bot_user = wasU
@@ -8129,6 +8134,10 @@ def run_selfcheck():
               cmdsA[8] == ["answer", "--documents", "--mixed"])
         check("ask_soon: before our bot_id is known, a bot post with no user in the thread counts as someone else's, so "
               "the owner's follow-up carries --mixed", cmdsA[9] == ["answer", "--documents", "--mixed"])
+        check("ask_soon: the thread context is text only (an earlier post's files and attachments never reach cc-ask), and "
+              "a bot post that is not ours is labelled by its user, never 'box'",
+              runsA[10][1].startswith("- UOWNER: see the draft\n- ") and "SECRET" not in runsA[10][1]
+              and "- box:" not in runsA[10][1])
         check("on_event: the owner's question in #<repo>-ask that folds in a forwarded message is handed on as shared, "
               "so it reaches only cc-ask's read-only reader", askedP[-1][-1] is True)
         # a document ask (brief: "an ask that names a document gets the PDF attached in the thread ... an ask can never
