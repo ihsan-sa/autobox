@@ -37,9 +37,10 @@ WHAT IT REPORTS (a `raised-stall-<window>-<kind>` row on the control repo's boar
           never the session's prose above it.
 ONCE PER STALL: a report is stamped in ~/.cc/state/stall.json and re-armed only after a pass where that stall is
 gone (the dialog closed, the count stood still past LOOP_REARM, cc-rc's longest wait), so the same stall never raises twice. A board that refused the row
-is retried on every later pass under the same row name, with no give-up: the log says once, at the TELL_AT-th refusal,
-that the board keeps refusing it. A retry that finds the row already on the board (an add that wrote it, then timed
-out or exited non-zero) counts it raised.
+is retried on every later pass under the same row name, with no give-up. The log says it once, at the first refusal,
+and again only when that changes (raised, or found on the board), so a board that keeps refusing writes one line, not
+one a pass. A retry that finds the row already on the board (an add that wrote it, then timed out or exited non-zero)
+counts it raised.
 A healthy window — no dialog, or mid-turn, or a count that does not move — is left alone and its state dropped.
 
 A DEAD ORCH (a window named <repo>@<alias> with no interactive claude under it, seen on two passes DEAD_S apart, not
@@ -66,8 +67,6 @@ LOOP_STREAK = 3                                               # …or this many 
 LOOP_GAP = 900                                                # passes further apart than this start a new baseline
 LOOP_REARM = 300                                              # a count still longer than this is a stopped loop: cc-rc's
                                                               # longest wait between relaunches (120 s backoff, 300 s limit fallback)
-TELL_AT = 3                                                   # refusals of one row before the log says so, once;
-                                                              # the row is still tried on every pass after
 DEAD_S = int(os.environ.get("CC_STALL_DEAD_S") or 360)      # an orch with no claude this long is dead: past cc-rc's
                                                               # longest relaunch wait (LOOP_REARM) and a handoff's swap
 ORCH_RE = re.compile(r"([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)")  # <repo>@<alias>; `~next`/`~old` handoff windows never match
@@ -270,9 +269,8 @@ def report(st, key, repo, window, kind, what, detail, apply_):
         log(f"{window}\t{kind}\traised {repo}/{name}\t{what}")
         return True
     ent["tries"] = ent.get("tries", 0) + 1
-    log(f"{window}\t{kind}\tboard refused {repo}/{name} (try {ent['tries']})")
-    if ent["tries"] == TELL_AT:
-        log(f"{window}\t{kind}\tthe board has refused {repo}/{name} {TELL_AT} times; still trying it every pass")
+    if ent["tries"] == 1:   # once per state change: every later refusal is the same news
+        log(f"{window}\t{kind}\tboard refused {repo}/{name}; trying it again every pass")
     return False
 
 
@@ -330,10 +328,13 @@ def check_orch(t, st, now, ctl_repo, win, apply_):
         d["told"] = True
         log(f"{name}\tdead\ttold {seat}\t{what}")
         return
+    if "refused" not in d:
+        log(f"{name}\tdead\tcc-msg {seat} refused; asking again every pass")
     if now - d.setdefault("refused", now) < DEAD_S:  # a seat mid-handoff refuses for a minute or two: ask again
-        log(f"{name}\tdead\tcc-msg {seat} refused; asking again next pass")
         return
-    log(f"{name}\tdead\tcc-msg {seat} refused since {time.strftime('%H:%MZ', time.gmtime(d['refused']))}; raising a row")
+    if not d.get("raising"):   # said once: report() is called every pass until the board takes the row
+        d["raising"] = True
+        log(f"{name}\tdead\tcc-msg {seat} refused since {time.strftime('%H:%MZ', time.gmtime(d['refused']))}; raising a row")
     report(st, dk, ctl_repo, name, "dead", what + f" (and the planning seat main:{seat} refused the message)", last, apply_)
 
 

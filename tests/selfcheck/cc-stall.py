@@ -154,7 +154,7 @@ def selfcheck():
         for s in (1000, 1000 + STAND_S):
             run(t, True, s)
     k(len(raised()) == 1, "…but a dialog drawn below an empty prompt line is still raised")
-    # 8 a board that refuses: tried again on every later pass, never given up; the log says so once, at TELL_AT
+    # 8 a board that refuses: tried again on every later pass, never given up; the log says so once, not each pass
     fresh(); open(f"{d}/refuse", "w").close(); t = Fake(); t.add("box", ODD)
     if os.path.exists(LOG):
         os.remove(LOG)
@@ -163,9 +163,9 @@ def selfcheck():
             run(t, True, 1000 + i * STAND_S)
     st = load()
     k(st.get("box\tdialog", {}).get("tries") == 7, f"a refused row is tried on every pass after it stands (7 of 8): {st}")
-    said = [l for l in open(LOG) if "still trying it every pass" in l] if os.path.exists(LOG) else []
-    k(len(said) == 1 and f"refused ctl/" in said[0] and f" {TELL_AT} times" in said[0],
-      f"…and the log says once that the board keeps refusing it: {said}")
+    said = open(LOG).read().splitlines() if os.path.exists(LOG) else []
+    k(len(said) == 1 and "board refused ctl/" in said[0],
+      f"…and the log says once that the board refused it, not once a pass: {said}")
     # 8b a board that writes the row and then exits non-zero (a timeout after the save): one row, never three
     fresh(); open(f"{d}/refuse", "w").close(); open(f"{d}/writes", "w").close(); t = Fake(); t.add("box", ODD)
     with q:
@@ -270,10 +270,19 @@ def selfcheck():
     os.remove(f"{d}/msgrefuse")
     with q: run(t, True, 1000 + DEAD_S + 240)
     k(len(sent()) == 1 and raised() == [], f"…and told once it answers again: {sent()} {raised()}")
-    dead_fresh(); open(f"{d}/msgrefuse", "w").close(); t = Fake(); t.add("demo@landing", "$ ", live=False)
+    dead_fresh(); open(f"{d}/msgrefuse", "w").close(); open(f"{d}/refuse", "w").close()
+    t = Fake(); t.add("demo@landing", "$ ", live=False)
+    if os.path.exists(LOG):
+        os.remove(LOG)
     with q:
-        for s in (1000, 1000 + DEAD_S, 1000 + DEAD_S + 120, 1000 + 2 * DEAD_S, 1000 + 2 * DEAD_S + 120):
+        for s in (1000, 1000 + DEAD_S, 1000 + DEAD_S + 120, 1000 + 2 * DEAD_S, 1000 + 2 * DEAD_S + 120,
+                  1000 + 2 * DEAD_S + 240, 1000 + 2 * DEAD_S + 360):
             run(t, True, s)
+    said = open(LOG).read().splitlines() if os.path.exists(LOG) else []
+    k(len(said) == 3 and [("asking again" in said[0]), ("raising a row" in said[1]), ("board refused" in said[2])]
+      == [True] * 3, f"a seat and a board that both keep refusing log each change once, not each pass: {said}")
+    os.remove(f"{d}/refuse")
+    with q: run(t, True, 1000 + 2 * DEAD_S + 480)
     k(len(raised()) == 1 and re.match(r"raised-stall-demo-landing-dead-\d{8}\|", raised()[0]),
       f"a planning seat that refuses the message for DEAD_S (down too) gets one row instead: {raised()}")
     dead_fresh(); t = Fake(); t.add("demo@landing", "$ ", live=False)

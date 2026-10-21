@@ -50,7 +50,10 @@ planted link gets a 503), and sends the request on over HTTPS to UPSTREAM with t
 CAPS, per workspace and per UTC day of a run's start: SUBJECT_DAILY_USD dollars (10),
 SUBJECT_DAILY_NET_MB megabytes through the proxy (1024), SUBJECT_MAX_HOURS per run (6; a run that names none gets 2,
 or the cap if lower), SUBJECT_CONCURRENT at once (2), SUBJECT_KEPT_MB kept on disk (8192) — `cc-config set` changes
-them. How many runs a day start is not capped: the dollars are. A run charges the
+them. How many runs a day start is not capped: the dollars are. A run whose --in copy failed holds back the next
+copy of that same source for COPY_BACKOFF (60s), doubled for each failure in a row up to COPY_BACKOFF_MAX (a day),
+and a copy that goes through starts it over: a wait, not a count, so a member's loop cannot copy a GB in and delete
+it again back to back, and the source can always be tried again later. A run charges the
 ledger of the UTC day it started, however long it goes on. Dollars and bytes are both kept by the proxy, the
 subject's only way out, in ONE ledger per workspace and day (subjects/<h>/ledger/<day>.json, edited under a flock),
 which every run of that workspace shares, so two runs at once cannot each spend what is left:
@@ -141,6 +144,7 @@ SEARCH_USD = 0.01                            # per web search the usage reports
 PROXY_PORT = 3128
 TICK = 5.0
 COPY_WAIT = 300
+COPY_BACKOFF, COPY_BACKOFF_MAX = 60, 86400   # after a failed --in copy, the wait before that source is copied again
 WORK_ENTRIES = 100_000         # a /work holding more entries than this is not copied out at all
 ENTRY_BYTES = 4096             # what every entry costs the kept cap at least: an empty file takes an inode, not a block
 CRED_MARGIN = 15 * 60          # a login closer than this to expiry cannot start a run
@@ -235,6 +239,28 @@ def runs_of(h):
             if isinstance(st, dict):
                 out.append((d.name, st))
     return out
+
+
+def copy_wait(h, src):
+    """Seconds before `src` may be copied in again: none unless that source's last copies failed. The wait doubles
+    with each failure in a row and the newest run of that source decides, so a copy that went through clears it.
+    Newest by `t0`, since two run ids made in one second sort by their random tail. A run still `starting` has not
+    shown its copy went through, so it is passed over: a newer copy in progress never clears an older one's failure."""
+    n, last = 0, ""
+    for st in sorted((st for _, st in runs_of(h) if st.get("input") == src), key=lambda st: -float(st.get("t0") or 0)):
+        if st.get("state") == "starting":
+            continue
+        if not st.get("copy_failed"):
+            break
+        n += 1
+        last = last or str(st.get("ended") or "")
+    if not n:
+        return 0
+    try:
+        ended = calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:   # no end stamp it can read: wait from now, never not at all
+        ended = time.time()
+    return max(0, ended + min(COPY_BACKOFF << min(n - 1, 20), COPY_BACKOFF_MAX) - time.time())
 
 
 def alive(pid):
@@ -1442,6 +1468,10 @@ def start(h, ask, cap, spawn=True):
                                           f"proxy today, the cap is {cap['SUBJECT_DAILY_NET_MB']:g} MB"}
         if live >= cap["SUBJECT_CONCURRENT"]:
             return {"ok": False, "error": f"workspace {h} already has {live} subject runs going, the most at once"}
+        wait = copy_wait(h, src) if src else 0
+        if wait:
+            return {"ok": False, "error": f"the last copy of {src} failed, so it is not copied again for another "
+                                          f"{wait:.0f}s (COPY_BACKOFF, doubled for each failure in a row)"}
         run = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
         rd = root / run
         rd.mkdir(mode=0o700)
@@ -1449,13 +1479,13 @@ def start(h, ask, cap, spawn=True):
             (rd / "in").mkdir(mode=0o700)
         # `supervisor` is the process that will end this run: this one while it copies, the supervisor once spawned
         st = {"run": run, "argv": argv, "input": src, "hours": hours, "state": "starting", "started": now(), "usd": 0.0,
-              "supervisor": os.getpid()}
+              "supervisor": os.getpid(), "t0": time.time()}
         write_json(rd / "status.json", st)
     if src:
         ok = copy_in(src, rd / "in", int(cap["SUBJECT_DISK_MB"]) << 20)
-        if ok is not True:   # counted all the same, so a copy that fails cannot be retried without end
+        if ok is not True:   # marked, so copy_wait holds the next copy of this source back
             prune(rd / "in")
-            write_json(rd / "status.json", {**st, "state": "failed", "ended": now(), "why": ok})
+            write_json(rd / "status.json", {**st, "state": "failed", "ended": now(), "why": ok, "copy_failed": True})
             return {"ok": False, "error": ok}
     if spawn:
         with open(rd / "supervise.log", "ab") as log, open(root / ".lock", "a") as lk:

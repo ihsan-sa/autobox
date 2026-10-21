@@ -1689,6 +1689,28 @@ def docs_bin():
 def is_pdf(path, name=None):
     return str(name or path or "").lower().endswith(".pdf")
 
+def came_in_on_slack(path):
+    """Whether `path` is a file a person sent the box, as fetch_files saved it: named `<UTC stamp>-<file id>-<name>`
+    and lying, once every link is resolved, directly in ~/.cc/slack/files or in a member's own files dir, as one
+    link. Such a PDF is somebody's own (cc-docs never files a PDF somebody else wrote), so it goes back as the file:
+    10-10, the owner asked for his own homework PDF 35 minutes before a deadline and got only its photo page, then a
+    library number for a handwritten draft. The test is on where the file really lies, never on a member's root as
+    resolved: a member can swap their files dir for a symlink (open_member_file), and one to /tmp must not let
+    /tmp/draft.pdf go out as bytes. A PDF a session copied into the inbox under that name passes too; the inbox is
+    where people's files land, and the mail door attaches from it as well (outbound's files_dir)."""
+    real = os.path.realpath(path)
+    d, name = os.path.split(real)
+    base = os.path.realpath(DIR)
+    if not re.match(r"\d{8}T\d{6}Z-[A-Za-z0-9]+-", name):
+        return False
+    if d != f"{base}/files" and not re.fullmatch(re.escape(f"{base}/member/") + r"[^/]+/files", d):
+        return False
+    try:
+        st = os.stat(real)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
 def docs_link(path, kind="signed-in", to=()):
     """`cc-docs link <path> --kind <kind> [--to <addr>]…` → its one URL, else UploadRefused with its last stderr line."""
     cmd = [docs_bin(), "link", path, "--kind", kind] + [x for a in to for x in ("--to", a)]
@@ -1746,13 +1768,14 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
     is never said of a file the sender did not get. `name` is the Slack name when `path` lacks it (an fd's
     /proc/self/fd/<n>); `mail_path` is the name the mail door opens itself, O_NOFOLLOW (a /proc link never passes).
     A PDF is never uploaded (owner, 2026-09-28): a filed one is posted as its link (returned id is that post's ts), an
-    unfiled one is refused with cc-docs' line, and with no cc-docs it uploads as any file. `library=False` keeps the
-    upload, for the member workspace, whose PDFs are not in the owner's library."""
+    unfiled one is refused with cc-docs' line, and with no cc-docs it uploads as any file. A PDF a person sent in
+    (came_in_on_slack: where it lies and its fetch_files name, not who wrote it) goes back as the file, in mail too.
+    `library=False` keeps the upload, for the member workspace, whose PDFs are not in the owner's library."""
     if os.path.isdir(path):
         raise UploadRefused(f"{path} is a directory — send one file, not a folder")
     if not os.path.isfile(path):
         raise UploadRefused(f"no such file: {path}")
-    if library and is_pdf(path, name) and os.access(docs_bin(), os.X_OK):
+    if library and is_pdf(path, name) and os.access(docs_bin(), os.X_OK) and not came_in_on_slack(path):
         return pdf_link_post(cfg, path, to, thread, comment=comment, title=title, mail=mail, ts=ts, name=name)
     size = os.path.getsize(path)
     if size > MAX_UPLOAD:

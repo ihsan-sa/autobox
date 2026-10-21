@@ -2173,7 +2173,15 @@ echo https://github.com/o/site/pull/7
                rc1 == 1 and rc2 == 1 and "/d/" not in o1 + o2 and "does not know that document" in o1)
             Site.answer[0] = 403
             rc, o = run("link", "001-0001-A", "--kind", "public")
-            ok("link: a refused token exits 1 for public", rc == 1 and "refused the service token" in o)
+            Site.plain[0] = "an Access assertion with no email"
+            rcS, oS = run("link", "001-0001-A", "--kind", "public")
+            Site.plain[0] = "<!DOCTYPE html>\n<title>Forbidden</title>"
+            rcA, oA = run("link", "001-0001-A", "--kind", "public")
+            Site.plain[0] = None
+            ok("link: a refused token exits 1 for public, and the line says which door refused it: the site's own "
+               "403 names BOX_LINK_TOKENS, Access's HTML page names the Service Auth policy and quotes no HTML",
+               rc == 1 and "refused the service token" in o and rcS == 1 and "BOX_LINK_TOKENS" in oS
+               and rcA == 1 and "Service Auth policy" in oA and "<" not in oA)
 
             lenv(LIBRARY_URL=site)
             rc1, o1 = run("link", "001-0001")

@@ -13202,6 +13202,31 @@ def run_selfcheck():
                       "reaches Slack or the mail door",
                       "is not filed; file it first with `cc-docs file`" in why_u and sent == [] and taps == [])
                 taps.clear(); sent.clear(); os.remove(docs_argv)
+                os.makedirs(f"{DIR}/files", exist_ok=True)
+                sentInP = f"{DIR}/files/20261010T030000Z-F1-unfiled-ps4.pdf"   # "unfiled" in it: the fake would refuse a link
+                open(sentInP, "w").write("x")
+                upload_file(tapcfg, sentInP, "C-MEM", "9.0", comment="your PS4", mail=False)
+                check("pdf link: a PDF a person sent in on Slack (under ~/.cc/slack/files) goes back as the file "
+                      "itself, unfiled, and cc-docs is never asked (10-10: the owner's own homework PDF)",
+                      not os.path.exists(docs_argv) and [s[2] for s in sent] == ["your PS4"]
+                      and came_in_on_slack(sentInP) and not came_in_on_slack(unfiledP))
+                sent.clear(); os.remove(sentInP)
+                os.makedirs(f"{DIR}/member/swapped", exist_ok=True)
+                elsewhere = tempfile.mkdtemp(prefix="cc-slack-pdflink-elsewhere-")
+                os.symlink(elsewhere, f"{DIR}/member/swapped/files")   # a member may do this (open_member_file)
+                draftP = f"{elsewhere}/20261010T030000Z-F2-unfiled-draft.pdf"   # the inbox's own name shape, even
+                open(draftP, "w").write("x")
+                try:
+                    upload_file(tapcfg, draftP, "C-MEM", "9.0", comment="draft", mail=False); why_s = ""
+                except UploadRefused as e:
+                    why_s = str(e)
+                check("pdf link: a member's files dir swapped for a symlink to another tree does not make a PDF there "
+                      "count as sent in; it still needs the library, and nothing reaches Slack",
+                      not came_in_on_slack(draftP) and not came_in_on_slack(f"{DIR}/member/swapped/files/"
+                                                                            + os.path.basename(draftP))
+                      and "is not filed" in why_s and sent == [])
+                taps.clear(); sent.clear(); os.path.exists(docs_argv) and os.remove(docs_argv)
+                shutil.rmtree(f"{DIR}/member/swapped", ignore_errors=True); shutil.rmtree(elsewhere, ignore_errors=True)
                 upload_file(tapcfg, pngP, "C-MEM", "9.0", comment="a chart")
                 upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="a member's own", mail=False, library=False)
                 check("pdf link: a non-PDF, and a PDF with library=False (the member workspace's own files), upload as "

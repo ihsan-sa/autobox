@@ -801,8 +801,8 @@ def case_input_unreadable(m):
 
 def case_input_size(m):
     """An --in source past SUBJECT_DISK_MB is refused before the host copies anything, counted through the pinned
-    descriptor with no link followed, and the refused run counts as one of the day's. One that grows past it while
-    it is copied is stopped too."""
+    descriptor with no link followed, and the refused run is left a failed one. One that grows past it while it is
+    copied is stopped too."""
     root, h = fixture(m)
     src = root / "dev" / h / "in"
     (src / "big").write_bytes(os.urandom(2 << 20))
@@ -1207,6 +1207,68 @@ def case_long_handle(m):
     shutil.rmtree(root)
 
 
+def case_copy_backoff(m):
+    """A source whose copy keeps failing waits longer before each next copy (no count of them), and one that copies
+    clears the wait."""
+    root, h = fixture(m)
+    src = root / "dev" / h / "in"
+    (src / "big").write_bytes(os.urandom(2 << 20))
+    cap, ask = dict(CAP, SUBJECT_DISK_MB=1, SUBJECT_CONCURRENT=100), {"op": "run", "argv": ["true"], "input": str(src)}
+
+    def age(secs):   # every run so far ended `secs` ago: only the newest failure's end decides the wait
+        for run, st in m.runs_of(h):
+            st["ended"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - secs))
+            (m.subjects(h) / run / "status.json").write_text(json.dumps(st))
+
+    first = m.start(h, ask, cap, spawn=False)
+    again = m.start(h, ask, cap, spawn=False)
+    check(not first["ok"] and "SUBJECT_DISK_MB" in first["error"] and not again["ok"] and "COPY_BACKOFF" in again["error"]
+          and len(m.runs_of(h)) == 1, f"a failed copy holds the next copy of that source back, before any run dir "
+                                      f"is made ({again.get('error')}, {len(m.runs_of(h))} runs)")
+    other = m.start(h, {"op": "run", "argv": ["true"]}, cap, spawn=False)
+    check(other["ok"], f"…but not a run without that source ({other.get('error')})")
+    age(m.COPY_BACKOFF + 1)
+    second = m.start(h, ask, cap, spawn=False)
+    check(not second["ok"] and "SUBJECT_DISK_MB" in second["error"], f"once the wait is past it is copied again ({second})")
+    age(m.COPY_BACKOFF + 1)
+    held = m.start(h, ask, cap, spawn=False)
+    check(not held["ok"] and "COPY_BACKOFF" in held["error"], f"…and the second failure in a row doubles the wait ({held})")
+    for _ in range(30):   # no count: however many failed, the wait is past at COPY_BACKOFF_MAX
+        age(m.COPY_BACKOFF_MAX + 1)
+        m.start(h, ask, cap, spawn=False)
+    age(m.COPY_BACKOFF_MAX + 1)
+    late = m.start(h, ask, cap, spawn=False)
+    check("COPY_BACKOFF" not in late.get("error", ""), f"the wait stops growing at COPY_BACKOFF_MAX, never a refusal for good ({late})")
+    (src / "big").unlink()
+    age(m.COPY_BACKOFF_MAX + 1)
+    ok = m.start(h, ask, cap, spawn=False)
+
+    def state(run, **kv):
+        st = json.loads((m.subjects(h) / run / "status.json").read_text())
+        (m.subjects(h) / run / "status.json").write_text(json.dumps({**st, **kv}))
+
+    state(ok["run"], state="done")   # spawn=False starts no supervisor, so nothing else moves it past `starting`
+    (src / "big").write_bytes(os.urandom(2 << 20))
+    bad = m.start(h, ask, cap, spawn=False)
+    retry = m.start(h, ask, cap, spawn=False)
+    check(ok["ok"] and not bad["ok"] and "SUBJECT_DISK_MB" in bad["error"] and "COPY_BACKOFF" in retry["error"]
+          and 0 < m.copy_wait(h, str(src)) <= m.COPY_BACKOFF,
+          f"a copy that goes through starts the wait over at COPY_BACKOFF ({ok}, {bad}, {m.copy_wait(h, str(src))})")
+    # B starts after A and is still copying (`starting`) when A fails: B has not cleared A's failure, so C waits
+    age(m.COPY_BACKOFF_MAX + 1)
+    (src / "big").unlink()
+    b = m.start(h, ask, cap, spawn=False)
+    (src / "big").write_bytes(os.urandom(2 << 20))
+    a = m.start(h, ask, cap, spawn=False)
+    runs = dict(m.runs_of(h))
+    a_run = max(runs, key=lambda r: float(runs[r]["t0"]))   # the copy that just failed; A started before B
+    state(a_run, t0=float(runs[b["run"]]["t0"]) - 1e-6)
+    c = m.start(h, ask, cap, spawn=False)
+    check(b["ok"] and not a["ok"] and "SUBJECT_DISK_MB" in a["error"] and not c["ok"] and "COPY_BACKOFF" in c["error"],
+          f"a newer copy still in progress does not clear an older copy's failure ({b}, {a}, {c})")
+    shutil.rmtree(root)
+
+
 def selfcheck(m):
     global FAKE, SHIPPED
     if not all(shutil.which(t) for t in ("bwrap", "systemd-run", "prlimit")):
@@ -1221,7 +1283,7 @@ def selfcheck(m):
     cases = (case_net, case_files, case_tree, case_caps, case_spend, case_proxy_units, case_concurrent, case_stop,
              case_credential, case_cred_link, case_limits, case_disk, case_status, case_sweep, case_supervisor_fails,
              case_long_handle, case_net_cap, case_count, case_kept, case_entries, case_count_deep,
-             case_count_link, case_status_link, case_input_unreadable, case_input_size)
+             case_count_link, case_status_link, case_input_unreadable, case_input_size, case_copy_backoff)
     try:
         for case in cases:
             print(case.__name__)
