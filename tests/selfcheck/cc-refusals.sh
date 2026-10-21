@@ -153,31 +153,56 @@ selfcheck(){
   k "$(t test "$(decided "$lg" | sort | tr '\n' ' ')" = "$n0")" "decision and ask lines with an array or object id leave every earlier decision counted"
   ps_ decide repo "$id" decline no >/dev/null
   k "$(t test "$(decided "$lg" | grep -cxF -- "$id")" = 1 -a -z "$(sc open repo | grep "^$id ")" -a "$(ps_ decide repo "$id" grant no >/dev/null 2>&1; echo $?)" = 1)" "…and a decision after them counts, leaves open, and a second one is refused"
-  # 5a'''. ON A LEDGER WITH NOTHING SIGNED YET (the review of #1728), an unsigned line on an ask filed after signing
-  #        landed neither hides it nor stops the seat; one at the file's head, before any line stamped after signing
-  #        landed, is history and counts (a non-ASCII sig goes ahead of every signed line, where it once emptied
-  #        counted() whole)
+  # 5a'''. HISTORY COUNTS ONCE THE SEAT VOUCHES FOR IT (perms' read of #1743, the review of #1748): an unsigned
+  #        decision at the file's head, before any line stamped after signing landed, counts only after the seat
+  #        names it to `freeze`, whose dry run lists it with its signer, line, sha and ask and writes nothing; a copy or
+  #        restore of the ledger and its key keeps it counted. An unsigned line on an ask filed after signing landed
+  #        neither hides it nor stops the seat (the review of #1728; a non-ASCII sig there once emptied counted() whole)
   fresh
   jq -cn '{kind:"refusal", id:"rold0001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo old", reason:"r", key:"k"}' >> "$lg"
   jq -cn '{kind:"decision", id:"rold0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
-  k "$(t grep -qxF rold0001 <<<"$(decided "$lg")")" "an unsigned decision at the head of the ledger, before signing landed, still counts"
+  k "$(t test -z "$(decided "$lg")" -a -n "$(sc open repo | grep '^rold0001 ')")" "an unsigned decision from before signing landed counts for nothing until it is frozen"
   seat "echo fresh"; id=$(idof "echo fresh")
   jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", by:"perms", sig:"é"}' >> "$lg"
   jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", note:"n", by:"perms"}' >> "$lg"
-  k "$(t grep -q "^$id " <<<"$(sc open repo)")" "with nothing signed yet, an unsigned decision line leaves its ask open"
-  k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 0)" "…and the seat can still decide it"
   # 5a''''. A PLANTED OLD .at IS NOT HISTORY (perms' read of #1728): an ask appended after the cut line with an old
-  #         .at, under the id a real ask will take, then an unsigned decision, leave the real ask open
+  #         .at, under the id a real ask will take, then an unsigned decision, are no candidate of freeze's
   jq -cn '{kind:"ask", id:"qplant01", at:"2026-10-01T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
-  jq -cn '{kind:"ask", id:"qplant01", at:"2026-10-21T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
+  jq -cn '{kind:"ask", id:"qplant01", at:"2099-01-01T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
   jq -cn '{kind:"decision", id:"qplant01", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
-  k "$(t test -z "$(decided "$lg" | grep -xF qplant01)" -a -n "$(sc open repo | grep '^qplant01 ')")" "an unsigned decision on an ask planted with an old .at past the cut line leaves the ask open"
-  #         …and a line stamped past the cut with no id is the boundary too (the review of #1743)
+  n0=$(sha256sum < "$lg"); out=$(ps_ freeze repo)
+  k "$(t test "$(grep -c . <<<"$out")" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "freeze's dry run lists the one decision ahead of the line stamped past the cut, and writes nothing"
+  k "$(t grep -qF "rold0001 grant at 2026-10-01T01:00:00Z by perms, line 2 sha256 $(sed -n 2p "$lg" | tr -d '\n' | sha256sum | cut -c1-64): closes line 1: rold0001 " <<<"$out")" \
+    "…naming its signer, its line and the sha of its bytes, and the refusal it would close"
+  k "$(t test "$(ps_ freeze repo qplant01 >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "…an id not in that list is refused, nothing written"
+  k "$(t test "$(sc freeze repo rold0001 >/dev/null 2>&1; echo $?)" = 2 -a "$(sha256sum < "$lg")" = "$n0")" "…as is anyone but the permission seat"
+  k "$(t test "$(ps_ freeze repo rold0001 >/dev/null 2>&1; echo $?)" = 0 -a "$(decided "$lg")" = rold0001)" "…and the seat's named id is signed and counts"
+  n0=$(sha256sum < "$lg")
+  k "$(t test "$(ps_ freeze repo rold0001 >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "…an id signed already is refused, nothing written"
+  k "$(t grep -q "^$id " <<<"$(sc open repo)")" "…an unsigned decision on an ask filed after signing landed leaves it open"
+  k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 0)" "…and the seat can still decide it"
+  k "$(t test -z "$(decided "$lg" | grep -xF qplant01)" -a -n "$(sc open repo | grep '^qplant01 ')")" "…an unsigned decision on an ask planted with an old .at past the cut line leaves the ask open"
+  mkdir -p "$d/restored"; cp "$lg" "${lg%/*}/grant.key" "$d/restored/"; rm -f "${lg%/*}/grant.key"; fresh
+  cp "$d/restored/refusals.jsonl" "$d/restored/grant.key" "${lg%/*}/"
+  k "$(t test -z "$(sc open repo | grep '^rold0001 ')" -a "$(decided "$lg" | grep -cxF rold0001)" = 1)" "…and a copied or restored ledger and key keep its frozen history decided"
+  #         …and a line stamped past the cut with no id, or with an array id, is freeze's boundary too (the review of #1743)
+  for b in '{kind:"note"}' '{kind:"decision", id:[], decision:"grant"}'; do
+    fresh
+    jq -cn "$b + {at:\"2099-01-01T00:00:00Z\"}" >> "$lg"
+    jq -cn '{kind:"refusal", id:"rnoid001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo x", reason:"r", key:"k"}' >> "$lg"
+    jq -cn '{kind:"decision", id:"rnoid001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+    k "$(t test -z "$(ps_ freeze repo | grep rnoid001)")" "freeze lists no unsigned decision after a line $b stamped past the cut"
+  done
+  # 5a'''''. A NEW LEDGER HAS NO HISTORY (perms' read of #1743, the review of #1748): a new repo's ledger has no
+  #          stamped line yet, so an unsigned decision planted first with an old .at, under the id a real ask then
+  #          takes, hid it, and a freeze that signed what it found signed it too. The dry run shows it closing an
+  #          ask filed today; the seat names no id, and the real ask stays open and decidable
   fresh
-  jq -cn '{kind:"note", at:"2026-10-21T00:00:00Z"}' >> "$lg"
-  jq -cn '{kind:"refusal", id:"rnoid001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo x", reason:"r", key:"k"}' >> "$lg"
-  jq -cn '{kind:"decision", id:"rnoid001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
-  k "$(t test -z "$(decided "$lg" | grep -xF rnoid001)")" "an unsigned decision after an id-less line stamped past the cut does not count"
+  jq -cn '{kind:"decision", id:"qnew0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+  jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"ask", id:"qnew0001", at:$at, repo:"repo", from:"orch", text:"t"}' >> "$lg"
+  k "$(t grep -q '^qnew0001 grant at 2026-10-01T01:00:00Z by perms, line 1 .*: closes line 2: qnew0001 ' <<<"$(ps_ freeze repo)")" "freeze's dry run lists a decision planted at the head of a new ledger, with the ask it would close"
+  k "$(t test -z "$(decided "$lg" | grep -xF qnew0001)" -a -n "$(sc open repo | grep '^qnew0001 ')")" "…which, with no id named, leaves the real ask open"
+  k "$(t test "$(ps_ decide repo qnew0001 decline no >/dev/null 2>&1; echo $?)" = 0 -a "$(decided "$lg")" = qnew0001)" "…and the seat decides it"
   # 5b. WHO MAY DECIDE (security read #2 of #904): only the permission seat, read from the processes. A caller with
   #     no flagged claude above it, one standing outside the perms dir, and one with a second claude above it are
   #     each refused, exit 2, nothing written, whatever CC_REFUSALS_WINDOW says

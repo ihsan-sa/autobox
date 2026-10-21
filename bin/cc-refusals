@@ -43,6 +43,9 @@
 #                                   records that it went out. A card that did not post is posted by the same `decide …
 #                                   his` again; one that did is refused like any decided id.
 #                                   Only the permission seat itself decides (pseat below); anyone else gets exit 2.
+#   cc-refusals freeze <repo> [<id>…]   the permission session's signing of decisions written unsigned before decisions
+#                                   were signed, so they keep counting; any other unsigned one never counts. With no id
+#                                   it lists the candidates and writes nothing; it signs only the ids the seat names.
 #   cc-refusals selfcheck           its own cases, against a fixture root; the live ledgers are never read
 #
 # WHY (owner, 2026-09-25): the classifier refuses the planning seat's message to the permission session, the one
@@ -77,7 +80,7 @@ ROOT="${CC_REFUSALS_ROOT:-$HOME/.cc/state}"; DEV="${CC_REFUSALS_DEV:-$HOME/dev}"
 SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF")
 # the control repo: the one this copy lives in, read the way cc-notify reads it
 CTL=${CC_REFUSALS_CTL-}; [ -n "$CTL" ] || case "$SELF" in "$HOME/dev/"*) CTL=${SELF#"$HOME/dev/"}; CTL=${CTL%%/*};; esac
-USAGE="usage: cc-refusals record | collect <repo> <track> | ask <repo> --from <who> [--where <link>] -- <text> | ask <repo> --from <workspace> --member [--kind <word>] | ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <id>] -- <text> | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline|his <text> | selfcheck"
+USAGE="usage: cc-refusals record | collect <repo> <track> | ask <repo> --from <who> [--where <link>] -- <text> | ask <repo> --from <workspace> --member [--kind <word>] | ask <repo> --title <t> [--heading <h>] [--run <cmd>] [--id <id>] -- <text> | open <repo> | watch <repo> | show <repo> <id> | decide <repo> <id> grant|decline|his <text> | freeze <repo> [<id>…] | selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-refusals: jq is missing" >&2; exit 2; }
 
 ledger(){ printf '%s/%s/perms/refusals.jsonl' "$ROOT" "$1"; }
@@ -305,48 +308,63 @@ box(){ "$BIN/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null; }
 # THE DECISIONS THAT COUNT (perms' read of #1578): those the seat signed, so an unsigned line appended on an ask perms
 # has not decided yet neither hides it from open nor stops decide. A line signed before the box and command were bound
 # in still counts as decided here, since only the seat could sign it; the overlay's move tool, which acts on a grant, takes the new
-# form alone. An unsigned line still counts if it sits in the file before the first line stamped at or after #1578's
-# merge, or every ask decided then would open again; past that line only a signed one counts, so a fresh ledger with
-# nothing signed yet is no gap (the review of #1728). Position, not the ask's .at, because whoever appends a line sets
-# its .at: an ask planted later with an old .at under the id a real ask will take would let an unsigned line hide that
-# ask (perms' read of #1728), and any line so stamped is the boundary, with an id or without (the review of #1743).
+# form alone. A decision written unsigned before #1578 merged counts once the seat has named it to `freeze` (below),
+# which signs it, so the file itself carries its history: a copy or restore of the ledger and its key keeps it, and a
+# new ledger, or an old one appended to later, has nothing unsigned that counts, whatever .at a line claims (perms'
+# read of #1743). A ledger restored from before its freeze is unsigned again and is frozen again the same way.
 # A malformed .sig (not ASCII, so compare_digest would raise) fails its own line and nothing else, and a line whose .id
-# is not a string (an array or object would raise in every lookup by id) is no decision and names no command. The guard's open_key reads no key (a sandboxed session can't) and stays as it was: a forged line there
-# only lets the same refusal be written twice.
-counted(){   # $1 a ledger: the decision lines that count, one JSON object a line
+# is not a string (an array or object would raise in every lookup by id) is no decision and names no command; open and
+# watch skip such a line too. The guard's open_key reads no key (a sandboxed session can't) and stays as it was: a
+# forged line there only lets the same refusal be written twice.
+# FREEZE (perms' read of #1743 and the review of #1748): the seat vouches for each id before anything is signed. The
+# candidates (counted "$lg" cand) are the unsigned decisions before the first line stamped at or after #1578's merge,
+# the first for each id not yet decided, each with its line number, the sha256 of its exact bytes and the ask it would
+# close. Position, not the ask's .at, because whoever appends a line sets its .at, and any line so stamped is the
+# boundary, with an id or without (perms' reads of #1728, the review of #1743); freeze's closing line is one, so a line
+# appended after a freeze is never a candidate. But a new ledger's head is "before" that boundary too, so a line
+# planted there is a candidate, and only the seat, reading the list, can tell it from history: `counted "$lg" sign
+# <id>…` signs the named candidates alone, in the old form, which the move tool never takes.
+counted(){   # $1 a ledger: the decision lines that count, one JSON object a line; $2 cand|sign [ids]: freeze's (above)
   python3 -I -c 'import hmac,hashlib,json,os,sys
-lg,kf,box=sys.argv[1:]; k=b""; rs=[]
+lg,kf,box,mode=sys.argv[1:5]; want=set(sys.argv[5:]); k=b""; rs=[]; ns=[]; hs=[]
 if not os.path.islink(kf):
     try: k=open(kf,"rb").read().strip()
     except OSError: pass
-for l in open(lg,encoding="utf-8",errors="replace"):
-    try: r=json.loads(l)
+for n,b in enumerate(open(lg,"rb"),1):
+    try: r=json.loads(b.decode("utf-8",errors="replace"))
     except ValueError: continue
-    if isinstance(r,dict): rs.append(r)
-cut="2026-10-20T20:04:47Z"   # #1578 merged: a decision past the first line stamped at or after this counts only signed
-cmd={}
-for r in rs:
-    if r.get("kind") in ("refusal","ask") and isinstance(r.get("id"),str): cmd.setdefault(r["id"],str(r.get("input") or ""))
+    if isinstance(r,dict): rs.append(r); ns.append(n); hs.append(hashlib.sha256(b.rstrip(b"\n")).hexdigest())
+cmd={}; ask={}
+for n,r in zip(ns,rs):
+    if r.get("kind") in ("refusal","ask") and isinstance(r.get("id"),str):
+        cmd.setdefault(r["id"],str(r.get("input") or "")); ask.setdefault(r["id"],dict(r,line=n))
+def f(r): return ["decision"]+[str(r.get(x)) for x in ("id","decision","at")]
 def ok(r):
     try:
-        s=r.get("sig"); f=["decision"]+[str(r.get(x)) for x in ("id","decision","at")]
+        s=r.get("sig")
         if not (k and isinstance(s,str) and s.isascii()): return False
         return any(hmac.compare_digest(hmac.new(k,"\n".join(m).encode(),hashlib.sha256).hexdigest(),s)
-                   for m in (f+[box,cmd.get(r.get("id"),"")],f))
+                   for m in (f(r)+[box,cmd.get(r.get("id"),"")],f(r)))
     except Exception: return False
-past=False
-for r in rs:
-    past=past or str(r.get("at") or "")>=cut   # any line, id or none, flips it
-    if r.get("kind")=="decision" and isinstance(r.get("id"),str) and (ok(r) or not past): print(json.dumps(r))' "$1" "${1%/*}/grant.key" "$(box)" 2>/dev/null; }
+ds=[r for r in rs if r.get("kind")=="decision" and isinstance(r.get("id"),str)]
+if not mode: [print(json.dumps(r)) for r in ds if ok(r)]; sys.exit()
+done={r["id"] for r in ds if ok(r)}
+for n,h,r in zip(ns,hs,rs):
+    if str(r.get("at") or "")>="2026-10-20T20:04:47Z": break   # #1578 merged
+    if r.get("kind")!="decision" or not isinstance(r.get("id"),str) or r["id"] in done: continue
+    done.add(r["id"])
+    if mode=="cand": print(json.dumps({"line":n,"sha":h,"rec":r,"ask":ask.get(r["id"])}))
+    elif r["id"] in want and k: print(json.dumps(dict(r,sig=hmac.new(k,"\n".join(f(r)).encode(),hashlib.sha256).hexdigest())))' \
+    "$1" "${1%/*}/grant.key" "$(box)" "${2:-}" "${@:3}" 2>/dev/null; }
 decided(){ counted "$1" | jq -r '.id'; }
 sign(){   # $1 key file, the message on stdin: its hex HMAC-SHA256
   python3 -I -c 'import hmac,hashlib,sys; k=open(sys.argv[1],"rb").read().strip()
 assert k; print(hmac.new(k,sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' "$1" 2>/dev/null; }
 open_(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || return 0
-  jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select((.kind == "refusal" or .kind == "ask") and ((.id | IN($d[])) | not))' "$lg" | line; }
+  jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select((.kind == "refusal" or .kind == "ask") and (.id | type == "string") and ((.id | IN($d[])) | not))' "$lg" | line; }
 watch_(){ local lg; lg=$(ledger "$1"); touch "$lg" || exit 2
   # tail from the end: what is already there is `open`'s to print. One line per refusal, flushed as it comes.
-  tail -n0 -F "$lg" 2>/dev/null | while IFS= read -r l; do printf '%s\n' "$l" | line 2>/dev/null; done; }
+  tail -n0 -F "$lg" 2>/dev/null | while IFS= read -r l; do printf '%s\n' "$l" | jq -c 'select(.id | type == "string")' 2>/dev/null | line 2>/dev/null; done; }
 show(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $1" >&2; exit 1; }
   # a member's words never print here either: an ask filed before 2026-10-20 still carries them in the ledger
   jq -c --arg id "$2" 'select(.id == $id) | if .kind == "ask" and .member then del(.text, .where) else . end' "$lg" | grep . || { echo "cc-refusals: no refusal $2" >&2; exit 1; }; }
@@ -415,6 +433,39 @@ pseat(){ local want p=$PPID n=0
     [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && return 1; p=$(ppid_ "$p"); n=$((n+1)); done
   return 0; }
 
+# mkkey <key file>: the signing key, made by the seat's first decision or freeze
+mkkey(){ [ -L "$1" ] && { echo "cc-refusals: $1 is a symlink — nothing written" >&2; return 1; }
+  # mode 600 keeps other Unix users out, not a host session of the same uid: perms accepted that boundary (see sigkey)
+  [ -s "$1" ] || ( umask 077; od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$1" ) \
+    || { echo "cc-refusals: could not make the signing key — nothing written" >&2; return 1; }; }
+
+# freeze <repo> [<id>…]: no id lists the candidates (FREEZE above) and writes nothing; ids sign those candidates alone,
+# and an id that is not one now, or is signed already, refuses the lot. The seat reads the list before it names an id.
+freeze(){ local repo=$1 lg c id out; shift
+  pseat "$repo" || { echo "cc-refusals: only $repo's permission session freezes — nothing written" >&2; exit 2; }
+  lg=$(ledger "$repo"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $repo" >&2; exit 1; }
+  (
+    flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
+    c=$(counted "$lg" cand) || { echo "cc-refusals: could not read $lg — nothing written" >&2; exit 1; }
+    if [ $# = 0 ]; then
+      [ -n "$c" ] || { echo "cc-refusals: no unsigned decision from before signing landed"; exit 0; }
+      while IFS= read -r l; do
+        jq -rj "$CLEAN"'"\(.rec.id | clean) \(.rec.decision | clean) at \(.rec.at | clean) by \(.rec.by | clean), line \(.line) sha256 \(.sha): "' <<<"$l"
+        if jq -e '.ask' <<<"$l" >/dev/null; then printf 'closes line %s: ' "$(jq -r '.ask.line' <<<"$l")"
+          jq -c '.ask | del(.line)' <<<"$l" | line; else echo "no ask"; fi
+      done <<<"$c"
+      exit 0; fi
+    for id in "$@"; do
+      decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is signed already — nothing written" >&2; exit 1; }
+      jq --arg id "$id" '.rec.id == $id' <<<"$c" 2>/dev/null | grep -qx true \
+        || { echo "cc-refusals: $id is not in freeze's list — nothing written" >&2; exit 1; }; done
+    mkkey "$(sigkey "$repo")" || exit 1
+    out=$(counted "$lg" sign "$@") && [ "$(grep -c . <<<"$out")" = $# ] \
+      || { echo "cc-refusals: could not sign them — nothing written" >&2; exit 1; }
+    { printf '%s\n' "$out"; jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"frozen", at:$at}'; } >> "$lg" || exit 1
+    jq -r '"cc-refusals: signed \(.id)"' <<<"$out"
+  ) 9>"$lg.lock"; }
+
 decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
   case $what in grant|decline|his) ;; *) echo "$USAGE" >&2; exit 2;; esac
   pseat "$repo" || { echo "cc-refusals: only $repo's permission session decides — nothing written" >&2; exit 2; }
@@ -436,10 +487,7 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
       decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is already decided" >&2; exit 1; }
       local key at sig b; key=$(sigkey "$repo"); at=$(date -u +%FT%TZ); b=$(box)
       [ -n "$b" ] || { echo "cc-refusals: this box has no name (CC_BOX, else hostname -s) to sign with — nothing written" >&2; exit 1; }
-      [ -L "$key" ] && { echo "cc-refusals: $key is a symlink — nothing written" >&2; exit 1; }
-      # mode 600 keeps other Unix users out, not a host session of the same uid: perms accepted that boundary (see sigkey)
-      [ -s "$key" ] || ( umask 077; od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$key" ) \
-        || { echo "cc-refusals: could not make the signing key — nothing written" >&2; exit 1; }
+      mkkey "$key" || exit 1
       sig=$(jq -j --arg d "$what" --arg at "$at" --arg b "$b" '"decision\n\(.id)\n\($d)\n\($at)\n\($b)\n\(.input // "")"' <<<"$rec" \
         | sign "$key") && [ -n "$sig" ] \
         || { echo "cc-refusals: could not sign the decision — nothing written" >&2; exit 1; }
@@ -482,6 +530,7 @@ case "${1:-}" in
   ask) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }; shift; ask "$@" ;;
   open|watch) [ $# = 2 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; "${1}_" "$2" ;;
   show) [ $# = 3 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; show "$2" "$3" ;;
+  freeze) [ $# -ge 2 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; shift; freeze "$@" ;;
   decide) [ $# = 5 ] && okrepo "$2" || { echo "$USAGE" >&2; exit 2; }; decide "$2" "$3" "$4" "$5" ;;
   selfcheck) selfcheck ;;
   *) echo "$USAGE" >&2; exit 2 ;;

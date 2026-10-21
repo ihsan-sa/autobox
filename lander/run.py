@@ -100,6 +100,7 @@ import time
 from dataclasses import dataclass, field
 
 from lander import admission as A
+from lander import cards as C
 from lander import git as G
 from lander import manifest as M
 from lander import records as REC
@@ -494,8 +495,10 @@ FAIL_ID_RE = re.compile(r"^\s*(?:[✗✘]|FAIL(?:ED)?\b:?|ERROR\s(?=\S*(?:\.py\b
                         r"\s*(.*?)\s*$")
 FAILS_CAP = 500   # more failing lines than this and the set is not trusted: fail_ids says None, and the red holds
 # Only a scratch path and a full 40-char sha are blanked: a duration or a short hex run is part of the id, because
-# blanking it made 'after 900 s' the same case as 'after 31 s' (Opus read of #1305, 10-13)
-SCRATCH_RES = ((re.compile(r"(?:/tmp|/var/tmp)/[^\s:'\"),]*"), "/tmp/…"), (re.compile(r"\b[0-9a-f]{40}\b"), "…"))
+# blanking it made 'after 900 s' the same case as 'after 31 s' (Opus read of #1305, 10-13). A lane's scratch is
+# <passwd home>/.cc/tmp since #1713, so that is blanked too.
+SCRATCH_RES = ((re.compile(rf"(?:/tmp|/var/tmp|{re.escape(os.path.join(C.PASSWD_HOME, '.cc', 'tmp'))})/[^\s:'\"),]*"),
+                "/tmp/…"), (re.compile(r"\b[0-9a-f]{40}\b"), "…"))
 
 
 # ...and how far a run got: its pass lines or its last `N passed`, and whether it crashed or was cut short. A head that

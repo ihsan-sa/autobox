@@ -3522,6 +3522,10 @@ class FailIds(unittest.TestCase):
             "✗ cc-context reads /tmp/…", "FAIL: race at …", "FAILED tests/x.py::test_a", "not tap case"]))
         same = RUN.fail_ids("  ✗ cc-context reads /tmp/tmp.Qq99zz/state")
         self.assertTrue(set(same) <= set(RUN.fail_ids(text)))   # another run's scratch is the same case
+        scratch = os.path.join(RUN.C.PASSWD_HOME, ".cc", "tmp")   # a lane's scratch since #1713
+        self.assertEqual(RUN.fail_ids(f"  ✗ cc-context reads {scratch}/tmp.Xy12ab/state"),
+                         RUN.fail_ids(f"  ✗ cc-context reads {scratch}/tmp.Qq99zz/state"))
+        self.assertEqual(RUN.fail_ids(f"  ✗ cc-context reads {scratch}/tmp.Xy12ab/state"), same)
         self.assertEqual(RUN.fail_ids("exit 1 and nothing to say\nTraceback x"), [])
         self.assertIsNone(RUN.fail_ids("\n".join(f"✗ case {i}" for i in range(RUN.FAILS_CAP + 1))))
         # an ERROR line is a case only in pytest's summary form; a log's own ERROR line names none (Opus read, 10-13)

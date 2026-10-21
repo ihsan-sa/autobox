@@ -3933,7 +3933,7 @@ class Branches(Fixture):
                   "https_proxy": "http://127.0.0.1:9", "SSL_CERT_FILE": "/tmp/ca", "NODE_OPTIONS": "--require /tmp/x",
                   "LD_PRELOAD": "/tmp/x.so", "PYTHONPATH": "/tmp/py"}
         with mock.patch.dict(os.environ, chosen), mock.patch.object(L.subprocess, "Popen", fake), \
-                mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
+                mock.patch("lander.cards.PASSWD_HOME", "/home/owner"), mock.patch.object(L.os, "makedirs"):
             self.assertEqual(REAL_SPAWN_TICK("demo"), (True, "pid 9"))
         env = started[0][1]["env"]
         self.assertEqual([k for k in chosen if k in env and k not in ("HOME", "PATH")], [])
@@ -3948,7 +3948,7 @@ class Branches(Fixture):
         hostile = {"XDG_CONFIG_HOME": "/tmp/own-xdg", "GH_REPO": "evil/decoy", "BASH_ENV": "/tmp/x.sh",
                    "ENV": "/tmp/x.sh", "XDG_RUNTIME_DIR": "/tmp/own-run", "LANDER_SYSTEMD_RUN": "/tmp/fake",
                    "SOMETHING_NEW": "1"}
-        with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
+        with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"), mock.patch.object(L.os, "makedirs"):
             env = L.tick_env(dict(hostile, LANG="C.UTF-8", LC_CTYPE="C.UTF-8", USER="owner", HOME="/tmp/h"))
         self.assertEqual([k for k in hostile if k in env and k != "XDG_RUNTIME_DIR"], [])
         self.assertNotEqual(env.get("XDG_RUNTIME_DIR"), "/tmp/own-run")
@@ -3960,9 +3960,8 @@ class Branches(Fixture):
         home = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, home, True)
         with mock.patch("lander.cards.PASSWD_HOME", home):
-            self.assertNotIn("TMPDIR", L.tick_env({"TMPDIR": "/tmp/own"}))
-            os.makedirs(os.path.join(home, ".cc", "tmp"))
             self.assertEqual(L.tick_env({"TMPDIR": "/tmp/own"})["TMPDIR"], os.path.join(home, ".cc", "tmp"))
+            self.assertTrue(os.path.isdir(os.path.join(home, ".cc", "tmp")))   # a missing scratch is made, not skipped
 
     def test_tick_path_puts_the_system_dirs_first(self):
         # a gh, git or claude a worker drops in ~/bin or ~/.local/bin must not shadow the system's (#862 review reads)

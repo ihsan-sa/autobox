@@ -1880,9 +1880,8 @@ def tick_env(env):
     run = f"/run/user/{os.getuid()}"
     if os.path.isdir(run):
         out["XDG_RUNTIME_DIR"] = run
-    scratch = os.path.join(C.PASSWD_HOME, ".cc", "tmp")
-    if os.path.isdir(scratch):
-        out["TMPDIR"] = scratch
+    out["TMPDIR"] = os.path.join(C.PASSWD_HOME, ".cc", "tmp")
+    os.makedirs(out["TMPDIR"], exist_ok=True)   # install.sh makes it; a missing one must not fall back to /tmp
     if env.get("INVOCATION_ID"):
         out["INVOCATION_ID"] = env["INVOCATION_ID"]
     return out
