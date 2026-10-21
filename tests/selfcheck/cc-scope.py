@@ -102,6 +102,11 @@ def selfcheck():
         t("a long row with no side file says it predates it in show, and asking it again writes the file",
           "predates" in run_capture(["show", RL, ab]) and add(RL, bare) == (ab, True)
           and open(full_path(RL, ab)).read().strip() == bare)
+        short = "keep the digest short " * 35   # under the excerpt; the same words with commas run past it
+        asho, _ = add(RL, short)
+        t("a short row re-asked in a longer spelling gets chars with its side file, so show names it",
+          "chars" not in get(RL, asho) and add(RL, short.replace(" ", ", "))[1]
+          and get(RL, asho).get("chars") and full_path(RL, asho) in run_capture(["show", RL, asho]))
         R3 = R + "-ctl"   # its own ledger: an unsettled row left here would be work the cases below count
         a3, _ = add(R3, "a claimed ask whose check is red")
         quiet(["claim", R3, a3, "--track", "t3"]); quiet(["check-cmd", R3, a3, "exit 1"])
