@@ -211,6 +211,17 @@
 #   WORKER_GH_READ_TOKEN`, empty → /var/lib/dispatch-login-workers/gh-read.token), read at launch, and GH_CONFIG_DIR is
 #   /nonexistent/gh; gh and git over https read his private repos with it. No file, or an unreadable one, or a
 #   member-facing repo (facing): neither is set.
+# THE CARD (gpu_bind; docs/architecture/gpu.md, 'The sandbox'): on a host with an NVIDIA card a worker on an owner repo sees it.
+#   A member workspace never does, nor a worker on a member-facing repo (facing), since a member steers it: the queue below is the host's own, and a member holding it could read every job's argv,
+#   rewrite the log cc-gpu status prints into box sessions and hold the lock against the owner's jobs. Bound: the
+#   /dev/nvidia* character devices that exist of nvidia<N>, nvidiactl and nvidia-uvm (--dev-bind: a device bound any
+#   other way cannot be opened, and the driver opens them read-write) — never nvidia-uvm-tools (the profiler's) or
+#   nvidia-modeset (the display's), which a compute job does not open — and the two FILES of cc-gpu's queue,
+#   ~/.cc/gpu/lock and ~/.cc/gpu/jobs.jsonl, rw because cc-gpu locks the one and appends to the other — the files and
+#   never the directory, so a link planted inside is planted in the sandbox's own tmpfs and no host write goes through
+#   it. The host makes the two files when they are missing. Nothing else of /dev, and no capability. A host with no
+#   nvidia<N> node binds none of it and makes nothing; a queue file that is a link or not a regular file binds no card
+#   at all, one line, so the card is never inside without the host's queue in front of it.
 # OTHER HARNESSES' LOGINS ARE ABSENT, not stripped: $HOME inside is a tmpfs and only the binds above are in it, so
 #   ~/.codex (auth.json, config.toml), ~/.cursor and ~/.config/cursor do not exist in a worker's world at all. The
 #   selfcheck plants each one in a fixture HOME and reads for it from inside. A harness that needs its own credential
@@ -628,6 +639,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   skills_bind   # the box's shared skills, ro, one per name (skills_bind); ~/.claude is a tmpfs here, so no member name is in the way
   toolchains_bind   # ~/.cc/toolchains, ro, when it is the host's own and closed to every other writer (toolchains_bind)
+  gpu_bind "$1"   # the card and cc-gpu's two queue files, when the host has a card and the repo is the owner's (gpu_bind)
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   shared_docs_bind "" "$(facing "$1" && echo 1)"   # the docs a planning seat reads, ro, each at its own name (SHARED_DOCS): ~/CLAUDE.md and the guides, his user memory and its imports
@@ -1186,6 +1198,29 @@ toolchains_bind(){   # ~/.cc/toolchains, RO, INTO BOTH BOUNDARIES — nothing el
   perm=$(stat -c '%a' "$t" 2>/dev/null) || { echo "cc-sandbox: ~/.cc/toolchains could not be read — not bound" >&2; return 0; }
   if [ $(( 8#$perm & 0022 )) -ne 0 ]; then echo "cc-sandbox: ~/.cc/toolchains is group- or world-writable — not bound" >&2; return 0; fi
   pin --ro-bind "$t" || echo "cc-sandbox: ~/.cc/toolchains is not the path it should be — not bound" >&2; }
+gpu_bind(){   # [$1 the repo · $2 the device dir, default /dev · $3 the test a node passes, default -c] → B += the card and cc-gpu's queue, or nothing
+  # THE CARD paragraph in the header is the contract. The devices are bound BY NAME: /dev is the kernel's, and nothing a
+  # sandbox reaches can rename or plant in it. The queue files are pinned (pin), because ~/.cc is the owner's and a
+  # name is a promise only a descriptor keeps. $2/$3 are the selfcheck's: a fixture dir of plain files stands in for /dev.
+  # A WORKER ON A MEMBER-FACING REPO gets no card: a member steers it, and the queue is the host's own (facing).
+  [ -n "${1:-}" ] && facing "$1" && return 0
+  local d="${2:-/dev}" k="${3:--c}" f q="$H/.cc/gpu" card="" devs=()
+  for f in "$d"/nvidia*; do
+    case "${f##*/}" in nvidia[0-9]|nvidia[0-9][0-9]|nvidiactl|nvidia-uvm) ;; *) continue;; esac   # perms: nvidiactl, nvidia<N>, nvidia-uvm and no other
+    [ ! -L "$f" ] && test "$k" "$f" || continue
+    case "${f##*/}" in nvidia[0-9]|nvidia[0-9][0-9]) card=1;; esac   # a card is an nvidia<N> node; nvidiactl alone is a driver, not a card
+    devs+=(--dev-bind "$f" "/dev/${f##*/}"); done
+  [ -n "$card" ] || return 0   # "A host with no card binds nothing and changes nothing" (the brief)
+  mkdir -p "$q" 2>/dev/null
+  for f in lock jobs.jsonl; do
+    [ -e "$q/$f" ] || [ -L "$q/$f" ] || ( set -C; : > "$q/$f" ) 2>/dev/null   # O_EXCL: a dangling link is not created through
+    [ -f "$q/$f" ] && [ ! -L "$q/$f" ] || { echo "cc-sandbox: ~/.cc/gpu/$f is not a plain file — no card is bound, so cc-gpu inside says there is none" >&2; return 0; }
+  done
+  local n=${#B[@]} fd
+  pin --bind "$q/lock" && pin --bind "$q/jobs.jsonl" \
+    || { fd=${B[n+1]:-}; [ -n "$fd" ] && exec {fd}<&-; B=("${B[@]:0:n}")   # the lock's descriptor too, when only it was pinned
+         echo "cc-sandbox: ~/.cc/gpu is not the path it should be — no card is bound" >&2; return 0; }
+  B+=("${devs[@]}"); }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc why
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
@@ -3217,6 +3252,74 @@ selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its
     sudo -n chown "$(id -u):$(id -g)" "$tc" 2>/dev/null
   fi
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_gpu(){   # THE CARD (gpu_bind), in a HOME of its own. The bind list and the no-card host are driven on a fixture
+  # dir of plain files standing in for /dev, so they run on every host; the launch cases run where the host has a card,
+  # and on one without it they prove a worker sees no /dev/nvidia* and the host's ~/.cc/gpu is never made.
+  local fh fx h dev m wt out probe f want="" card=""
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxgpu-XXXXXX") || return 1; chmod 700 "$fh"; fx="$fh/fakedev"
+  mkdir -p "$fx/nvidia-caps" || return 1
+  for f in nvidia0 nvidia1 nvidiactl nvidia-uvm nvidia-uvm-tools nvidia-modeset nvidia-foo nvme0 fb0; do : > "$fx/$f"; done
+  ln -s nvidia0 "$fx/nvidia2"
+  out=$(H="$fh"; B=(); gpu_bind r "$fx" -f; printf '%s\n' "${B[@]}")
+  t 'gpu: the bind list is nvidia<N>, nvidiactl and nvidia-uvm, each at its /dev name with --dev-bind — not uvm-tools or modeset, no other node, no link, no directory' \
+    "$(grep -A2 -x -- --dev-bind <<<"$out" | grep -v -x -- --dev-bind | grep -v -x -- -- | paste - - | sed "s|$fx/||" | LC_ALL=C sort | tr '\t\n' '> ')" \
+    'nvidia-uvm>/dev/nvidia-uvm nvidia0>/dev/nvidia0 nvidia1>/dev/nvidia1 nvidiactl>/dev/nvidiactl '
+  t 'gpu: …and the two queue FILES, rw by descriptor at their own paths, never the directory' \
+    "$(grep -A2 -x -- --bind-fd <<<"$out" | sed -n "s|^$fh/||p" | tr '\n' ' ')/$(grep -c -- "$fh/.cc/gpu\$" <<<"$out")" '.cc/gpu/lock .cc/gpu/jobs.jsonl /0'
+  t 'gpu: the host made both files when they were missing, as plain files' \
+    "$(cd "$fh/.cc/gpu" && for f in *; do [ -f "$f" ] && [ ! -L "$f" ] && printf '%s ' "$f"; done)" 'jobs.jsonl lock '
+  rm -rf "$fh/.cc/gpu"; mkdir -p "$fh/nocard"; : > "$fh/nocard/nvidiactl"; : > "$fh/nocard/nvme0"
+  out=$(H="$fh"; B=(); gpu_bind r "$fh/nocard" -f; echo "n=${#B[@]}")
+  t 'gpu: a host with no card node (nvidiactl alone is not a card) binds nothing and makes no ~/.cc/gpu' \
+    "$(g n)/$([ -e "$fh/.cc/gpu" ] && echo made || echo none)" 0/none
+  out=$(H="$fh"; B=(); gpu_bind r "$fx" -c 2>&1; echo "n=${#B[@]}")
+  t 'gpu: plain files are not character devices — on the real test nothing in the fixture is a card' "$(g n)" 0
+  mkdir -p "$fh/.cc/gpu"; : > "$fh/.cc/gpu/lock"; : > "$fh/elsewhere"; ln -s "$fh/elsewhere" "$fh/.cc/gpu/jobs.jsonl"
+  out=$(H="$fh"; B=(); gpu_bind r "$fx" -f 2>&1; echo "n=${#B[@]}")
+  t 'gpu: a queue file that is a link binds NO card at all, one line, and the link target is not written' \
+    "$(g n)/$(grep -c 'not a plain file' <<<"$out")/$(stat -c %s "$fh/elsewhere")/$([ -L "$fh/.cc/gpu/jobs.jsonl" ] && echo link)" 0/1/0/link
+  rm -rf "$fh/.cc/gpu" "$fh/elsewhere"
+  mkdir -p "$fh/.cc/members/mfh"
+  out=$(H="$fh"; for r in mfh r; do B=(); gpu_bind "$r" "$fx" -f; printf '%s=%s ' "$r" "$(printf '%s\n' "${B[@]}" | grep -c -x -- --dev-bind)"; done)
+  t 'gpu: a worker on a member-facing repo (the host'"'"'s ~/.cc/members/<repo>) gets no card, and an owner repo'"'"'s worker still does' \
+    "$out" 'mfh=0 r=4 '
+  rm -rf "$fh/.cc/gpu" "$fh/.cc/members/mfh"
+  # ── THE LAUNCHES. A worker and a member in the fixture HOME, against the host's real /dev. A member never gets the card.
+  h="ccsbxgpu$$"; dev="$fh/dev/$h"; m="$fh/.cc/members/$h"
+  mkdir -p "$dev/.cc" "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" "$m/claude" || return 1
+  : > "$dev/.cc/member-workspace"; git -C "$dev" init -q -b main >/dev/null 2>&1
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  jq -n '{claudeAiOauth: {accessToken: "sk-access", expiresAt: 99999999999999}}' > "$m/credentials.json"
+  ln -s "$BIN/cc-loop" "$fh/bin/cc-loop"; [ -x "$BIN/cc-gpu" ] && ln -s "$BIN/cc-gpu" "$fh/bin/cc-gpu"   # cb = the real bin, so cc-gpu runs inside
+  wt="$fh/.cc/worktrees/r/t"; mkdir -p "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$wt" >/dev/null 2>&1 || return 1
+  for f in /dev/nvidia[0-9] /dev/nvidia[0-9][0-9]; do [ -c "$f" ] && card=1; done
+  probe='echo devs=$(cd /dev && ls -d nvidia* 2>/dev/null | LC_ALL=C sort | tr "\n" " ")
+    echo smi=$(nvidia-smi -L 2>/dev/null | grep -c "^GPU ")
+    echo run=$( [ -x ~/bin/cc-gpu ] && CC_GPU_SETTLE=0 ~/bin/cc-gpu run --name sbx --vram 1 -- nvidia-smi -L 2>/dev/null | grep -c "^GPU " || echo nocc)
+    echo inline=$(echo "{\"planted\":1}" >> ~/.cc/gpu/jobs.jsonl 2>/dev/null && echo wrote || echo refused)
+    echo unlink=$(rm -f ~/.cc/gpu/jobs.jsonl 2>/dev/null && echo removed || echo busy)
+    mv ~/.cc/gpu ~/.cc/gpu.was 2>/dev/null; mkdir -p ~/.cc/gpu; ln -sf ~/planted ~/.cc/gpu/jobs.jsonl; ln -sf ~/planted ~/.cc/gpu/lock
+    echo planted=$( [ -L ~/.cc/gpu/jobs.jsonl ] && echo link || echo refused)'   # the dir swapped for links, or the bound names refuse it: either way inside only
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" 2>&1)
+  if [ -z "$card" ]; then
+    t 'gpu: on a host with no card a worker sees no /dev/nvidia*, and the host made no ~/.cc/gpu' "$(g devs)/$([ -e "$fh/.cc/gpu" ] && echo made || echo none)" /none
+  else
+    want=""; for f in /dev/nvidia[0-9] /dev/nvidia[0-9][0-9] /dev/nvidia-uvm /dev/nvidiactl; do [ -c "$f" ] && want+="${f#/dev/} "; done
+    t 'gpu: a worker on a host with a card sees exactly its nodes, and nvidia-smi inside lists it' "$(g devs)/$( [ "$(g smi)" -ge 1 ] 2>/dev/null && echo listed)" "$(printf '%s\n' $want | LC_ALL=C sort | paste -sd' ')/listed"
+    [ -x "$BIN/cc-gpu" ] && t 'gpu: …and a cc-gpu run job inside gets the card, through the host queue' \
+      "$( [ "$(g run)" -ge 1 ] 2>/dev/null && echo got)/$(grep -c '"name": *"sbx"' "$fh/.cc/gpu/jobs.jsonl")" got/1
+    t 'gpu: a write inside lands in the host file; the bound name cannot be removed; and after links are planted at the queue paths inside, the host paths are still its own plain files with the write in them' \
+      "$(g inline)/$(g unlink)/$(case "$(g planted)" in link|refused) echo tried;; esac)/$(cd "$fh/.cc" && ls -A gpu | tr '\n' ' ')/$( [ -f "$fh/.cc/gpu/jobs.jsonl" ] && [ ! -L "$fh/.cc/gpu/jobs.jsonl" ] && [ ! -L "$fh/.cc/gpu/lock" ] && echo plain)/$(grep -c planted "$fh/.cc/gpu/jobs.jsonl")/$(find "$fh" -mindepth 1 -maxdepth 1 -name "*planted*" | wc -l)" \
+      'wrote/busy/tried/jobs.jsonl lock /plain/1/0'
+    echo x >> "$fh/.cc/gpu/jobs.jsonl"   # a host write after the session: through the host's own name, nowhere else
+    t 'gpu: …and a host write after it goes to the host file, not through anything planted' "$(tail -1 "$fh/.cc/gpu/jobs.jsonl")/$(find "$fh" -mindepth 1 -maxdepth 1 -name "*planted*" | wc -l)" x/0
+  fi
+  rm -rf "$fh/.cc/gpu"; out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo devs=$(cd /dev && ls -d nvidia* 2>/dev/null | tr "\n" " "); echo q=$(ls -A ~/.cc/gpu 2>/dev/null | tr "\n" " ")' 2>&1)
+  t 'gpu: a member workspace sees no card and no queue, and the host made no ~/.cc/gpu for it, card or not' \
+    "$(g devs)/$(g q)/$([ -e "$fh/.cc/gpu" ] && echo made || echo none)" //none
+  git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_workercred(){   # THE WORKERS' LOGIN (worker_cred), in a HOME of its own: a worker's copy comes from the box's
   # login when WORKER_CLAUDE_CREDENTIALS is empty and from the workers' file when it is set, with the same settings and
   # hooks either way; a near-expiry workers' token is refreshed on the host in ITS dir and nowhere else; a missing,
@@ -4094,7 +4197,7 @@ print(" ".join(m for m in "ownnote owndoc ownprog leakmem leakseat leakarch leak
   out="$(env HOME="$out" CC_SANDBOX_SELFCHECK_HOME="$out" "$SELF" selfcheck 2>&1; echo "rc=$?")|$(env CC_SANDBOX_SELFCHECK_HOME="$H/x" "$SELF" selfcheck 2>&1; echo "rc=$?")"
   t 'selfcheck refuses the real HOME, and a marker that is not HOME, in one line each' \
     "$(grep -c '^cc-sandbox selfcheck: refused: ' <<<"${out//|/$'\n'}")/$(grep -o 'rc=[0-9]*' <<<"$out" | tr '\n' ' ')" '2/rc=1 rc=1 '
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_workercred; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_cfgwt; selfcheck_gpu; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip. Where no pid namespace of
   # its own here can hold the sandboxes its cases start, they run unnested over the host's /proc and print an
   # UNNESTED line saying why (tests/member_v2.py, own_pidns). That reason goes on this tally's last line.

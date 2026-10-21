@@ -120,13 +120,23 @@ selfcheck(){
   k "$(t grep -q "^$id .*\[repo\] Bash: .*echo one.* — Auto-Mode Bypass" <<<"$out")" "open's line has the id, window, tool, input and reason"
   ps_ decide repo "$id" grant 'Bash(echo one) in allow' >/dev/null
   k "$(t jq -e --arg id "$id" 'select(.kind == "decision" and .id == $id and .decision == "grant" and .by == "perms")' "$lg")" "decide appends the decision to the same ledger"
-  # 5a. THE DECISION IS SIGNED (perms, 10-20): its .sig is HMAC-SHA256 of "decision\n<id>\n<decision>\n<at>\n<box>\n
-  #     <command>" under grant.key beside the ledger, which the first decision made at mode 600; the box is CC_BOX
-  #     and the command the refusal's input (perms' read of #1578). Checked here with openssl, not sign()
+  # 5a. THE DECISION IS SIGNED (perms, 10-20): its .sig is HMAC-SHA256 of "cc-refusals sig/2 live\n" and the JSON
+  #     array ["decision", id, decision, at, box, command, by, note] under grant.key beside the ledger, which the first
+  #     decision made at mode 600; the box is CC_BOX and the command the refusal's input (perms' reads of #1578 and
+  #     #1772). Checked here with openssl, not sign(); m2 builds the array with json.dumps, as cc-refusals does
+  m2(){ python3 -I -c 'import json,sys; r=json.loads(sys.argv[1])
+print(end="cc-refusals sig/2 live\n"+json.dumps(["decision",r["id"],r["decision"],r["at"],"box1",sys.argv[2],r["by"],r.get("note")]))' "$1" "$2"; }
   kf=$d/state/repo/perms/grant.key; drec=$(jq -c --arg id "$id" 'select(.kind == "decision" and .id == $id)' "$lg")
-  want=$(jq -j --arg c "$(jq -r --arg id "$id" 'select(.kind == "refusal" and .id == $id) | .input' "$lg")" \
-    '"decision\n\(.id)\n\(.decision)\n\(.at)\nbox1\n\($c)"' <<<"$drec" | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1)
+  want=$(m2 "$drec" "$(jq -r --arg id "$id" 'select(.kind == "refusal" and .id == $id) | .input' "$lg")" \
+    | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1)
   k "$(t test -n "$want" -a "$(jq -r '.sig' <<<"$drec")" = "$want" -a "$(stat -c %a "$kf")" = 600 -a "$(wc -c < "$kf")" = 64)" "decide signs its decision with a 600 key of 32 random bytes"
+  # 5a0. WHO DECIDED AND WHY ARE SIGNED TOO (perms' read of #1748): a signed decision whose by or note was edited
+  #      counts for nothing (the copy sits beside grant.key, which counted reads from the ledger's own dir)
+  kept=${lg%/*}/kept.jsonl; cp "$lg" "$kept"
+  for e in '.by = "orch"' '.note = "other"'; do
+    jq -c --arg id "$id" "if .kind == \"decision\" and .id == \$id then $e else . end" "$kept" > "$lg"
+    k "$(t test -z "$(decided "$lg")" -a "$(decided "$kept")" = "$id")" "a signed decision edited with $e counts for nothing"
+  done; mv "$kept" "$lg"
   out=$(sc open repo)
   k "$(t test "$(grep -c . <<<"$out")" = 1 -a -z "$(grep "^$id " <<<"$out")")" "a decided refusal leaves open; the other stays"
   k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 1)" "a second decision on the same id is refused"
@@ -153,6 +163,30 @@ selfcheck(){
   k "$(t test "$(decided "$lg" | sort | tr '\n' ' ')" = "$n0")" "decision and ask lines with an array or object id leave every earlier decision counted"
   ps_ decide repo "$id" decline no >/dev/null
   k "$(t test "$(decided "$lg" | grep -cxF -- "$id")" = 1 -a -z "$(sc open repo | grep "^$id ")" -a "$(ps_ decide repo "$id" grant no >/dev/null 2>&1; echo $?)" = 1)" "…and a decision after them counts, leaves open, and a second one is refused"
+  # 5a''-. A LEGACY SIG STILL COUNTS, BUT NO FIELD CARRIES A NEWLINE (the review of #1772): a line signed in a legacy
+  #       form, by and note outside it, counts; one whose .at packs the rest of a message in, signed over that legacy
+  #       string, is refused, as is a legacy or sig/2 line with a newline in its .at, .by or .note, and decide signs none
+  sl(){ printf '%s' "$1" | openssl dgst -sha256 -hmac "$(cat "$kf")" -r | cut -d' ' -f1; }
+  dl(){ jq -cn --arg id "$id" --arg at "$1" --arg s "$2" '{kind:"decision", id:$id, at:$at, decision:"grant", note:"other", by:"orch", sig:$s}' >> "$lg"; }
+  fresh; seat "echo one"; id=$(idof "echo one"); c=$(jq -r --arg id "$id" 'select(.id == $id) | .input' "$lg")
+  dl T "$(sl "$(printf 'decision\n%s\ngrant\nT\nbox1\n%s' "$id" "$c")")"
+  k "$(t test "$(decided "$lg")" = "$id")" "a decision signed in the legacy form counts, whatever its by and note say"
+  for e in '.by = "perms\norch"' '.note = "a\nb"'; do
+    jq -c "if .kind == \"decision\" then $e else . end" "$lg" > "$lg.x"; mv "$lg.x" "$lg"
+    k "$(t test -z "$(decided "$lg")")" "…but not once $e puts a newline in it"
+  done
+  fresh; seat "echo one"; id=$(idof "echo one"); at=$(printf 'T\nbox1\n%s\n["orch", "other"]' "$c")
+  dl "$at" "$(sl "$(printf 'decision\n%s\ngrant\n%s' "$id" "$at")")"
+  k "$(t test -z "$(decided "$lg")" -a -n "$(sc open repo | grep "^$id ")")" "an .at packing box, command, by and note under a legacy sig counts for nothing"
+  for fld in "" at by note; do
+    fresh; seat "echo one"; id=$(idof "echo one")
+    r=$(jq -cn --arg id "$id" --arg f "$fld" '{kind:"decision", id:$id, at:"T", decision:"grant", note:"n", by:"perms"} | if $f == "" then . else .[$f] += "\nx" end')
+    jq -c --arg s "$(sl "$(m2 "$r" "$c")")" '. + {sig:$s}' <<<"$r" >> "$lg"
+    if [ -z "$fld" ]; then k "$(t test "$(decided "$lg")" = "$id")" "a sig/2 line built here counts"
+    else k "$(t test -z "$(decided "$lg")")" "…and with a newline in its .$fld counts for nothing"; fi
+  done
+  fresh; seat "echo one"; id=$(idof "echo one"); n0=$(sha256sum < "$lg")
+  k "$(t test "$(ps_ decide repo "$id" grant "$(printf 'a\nb')" >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "decide refuses a note carrying a newline, nothing written"
   # 5a'''. HISTORY COUNTS ONCE THE SEAT VOUCHES FOR IT (perms' read of #1743, the review of #1748): an unsigned
   #        decision at the file's head, before any line stamped after signing landed, counts only after the seat
   #        names it to `freeze`, whose dry run lists it with its signer, line, sha and ask and writes nothing; a copy or
@@ -171,9 +205,10 @@ selfcheck(){
   jq -cn '{kind:"ask", id:"qplant01", at:"2099-01-01T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
   jq -cn '{kind:"decision", id:"qplant01", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
   n0=$(sha256sum < "$lg"); out=$(ps_ freeze repo)
-  k "$(t test "$(grep -c . <<<"$out")" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "freeze's dry run lists the one decision ahead of the line stamped past the cut, and writes nothing"
-  k "$(t grep -qF "rold0001 grant at 2026-10-01T01:00:00Z by perms, line 2 sha256 $(sed -n 2p "$lg" | tr -d '\n' | sha256sum | cut -c1-64): closes line 1: rold0001 " <<<"$out")" \
-    "…naming its signer, its line and the sha of its bytes, and the refusal it would close"
+  k "$(t test "$(grep -c '^[^ ]' <<<"$out")" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "freeze's dry run lists the one decision ahead of the line stamped past the cut, and writes nothing"
+  k "$(t test "$(head -1 <<<"$out")" = "rold0001 grant at 2026-10-01T01:00:00Z by perms, line 2 sha256 $(sed -n 2p "$lg" | tr -d '\n' | sha256sum | cut -c1-64), under its id:" \
+    -a "$(grep -c '^  line 1: rold0001 ' <<<"$out")" = 1 -a "$(grep -c . <<<"$out")" = 2)" \
+    "…naming its signer, its line and the sha of its bytes, and the refusal it would close, as history"
   k "$(t test "$(ps_ freeze repo qplant01 >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "…an id not in that list is refused, nothing written"
   k "$(t test "$(sc freeze repo rold0001 >/dev/null 2>&1; echo $?)" = 2 -a "$(sha256sum < "$lg")" = "$n0")" "…as is anyone but the permission seat"
   k "$(t test "$(ps_ freeze repo rold0001 >/dev/null 2>&1; echo $?)" = 0 -a "$(decided "$lg")" = rold0001)" "…and the seat's named id is signed and counts"
@@ -200,9 +235,22 @@ selfcheck(){
   fresh
   jq -cn '{kind:"decision", id:"qnew0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
   jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"ask", id:"qnew0001", at:$at, repo:"repo", from:"orch", text:"t"}' >> "$lg"
-  k "$(t grep -q '^qnew0001 grant at 2026-10-01T01:00:00Z by perms, line 1 .*: closes line 2: qnew0001 ' <<<"$(ps_ freeze repo)")" "freeze's dry run lists a decision planted at the head of a new ledger, with the ask it would close"
+  out=$(ps_ freeze repo)
+  k "$(t grep -q '^qnew0001 grant at 2026-10-01T01:00:00Z by perms, line 1 sha256 [0-9a-f]*, not history, under its id:$' <<<"$out" && grep -q '^  line 2: qnew0001 ' <<<"$out")" \
+    "freeze's dry run lists a decision planted at the head of a new ledger as not history, with the ask it would close"
   k "$(t test -z "$(decided "$lg" | grep -xF qnew0001)" -a -n "$(sc open repo | grep '^qnew0001 ')")" "…which, with no id named, leaves the real ask open"
   k "$(t test "$(ps_ decide repo qnew0001 decline no >/dev/null 2>&1; echo $?)" = 0 -a "$(decided "$lg")" = qnew0001)" "…and the seat decides it"
+  # 5a'''''+. A PLANTED OLD ASK IS NOT HISTORY EITHER (the review of #1748): a decision, then an ask under its id with
+  #          an old .at and plausible text, both ahead of the real ask, read like history closing an old ask. The dry
+  #          run shows both asks with their lines and marks the decision not history, and one with no by says so
+  fresh
+  jq -cn '{kind:"decision", id:"qold0001", at:"2026-10-01T01:00:00Z", decision:"grant"}' >> "$lg"
+  jq -cn '{kind:"ask", id:"qold0001", at:"2026-10-01T00:00:00Z", repo:"repo", from:"orch", text:"may I read the logs"}' >> "$lg"
+  jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"ask", id:"qold0001", at:$at, repo:"repo", from:"orch", text:"t"}' >> "$lg"
+  out=$(ps_ freeze repo)
+  k "$(t grep -q '^qold0001 grant at 2026-10-01T01:00:00Z by (none), line 1 sha256 [0-9a-f]*, not history, under its id:$' <<<"$out" \
+    && grep -q '^  line 2: qold0001 .* ask: may I read the logs' <<<"$out" && grep -q '^  line 3: qold0001 ' <<<"$out")" \
+    "freeze's dry run marks a decision ahead of a planted old ask not history, and shows every ask under its id"
   # 5b. WHO MAY DECIDE (security read #2 of #904): only the permission seat, read from the processes. A caller with
   #     no flagged claude above it, one standing outside the perms dir, and one with a second claude above it are
   #     each refused, exit 2, nothing written, whatever CC_REFUSALS_WINDOW says

@@ -45,7 +45,8 @@
 #                                   Only the permission seat itself decides (pseat below); anyone else gets exit 2.
 #   cc-refusals freeze <repo> [<id>…]   the permission session's signing of decisions written unsigned before decisions
 #                                   were signed, so they keep counting; any other unsigned one never counts. With no id
-#                                   it lists the candidates and writes nothing; it signs only the ids the seat names.
+#                                   it lists the candidates, each with every ask line under its id and marked "not
+#                                   history" when that can't be one, and writes nothing; it signs only the ids named.
 #   cc-refusals selfcheck           its own cases, against a fixture root; the live ledgers are never read
 #
 # WHY (owner, 2026-09-25): the classifier refuses the planning seat's message to the permission session, the one
@@ -291,10 +292,15 @@ perms_down(){ local tg=$1 n err nrc who
 
 # A DECISION IS SIGNED (perms, 10-20, reading #904): any session that can append to the ledger could write a decision
 # line, and a host-move tool runs its cutover on a grant it finds there. So decide, which only the seat passes, signs each
-# one with HMAC-SHA256 over "decision\n<id>\n<decision>\n<at>\n<box>\n<command>" under grant.key beside the ledger,
+# one with HMAC-SHA256 over "cc-refusals sig/2 live\n" and the JSON array ["decision", id, decision, at, box, command,
+# by, note] (msg() below) under grant.key beside it,
 # made at mode 600 by the seat's first decision, and a reader that acts on a grant checks .sig with that key. The box
 # (CC_BOX, else the short hostname) and the ask's command (its input, empty for a question) are in it so a grant can't
-# be replayed for another command or on another box that was handed this ledger and key (perms' read of #1578).
+# be replayed for another command or on another box that was handed this ledger and key (perms' read of #1578). Who
+# decided and the note are in it too (perms' read of #1748). One JSON array, so no text slides from one field to the
+# next, under a versioned prefix, so it never equals a message in either legacy form below; and a field carrying a
+# newline is refused at signing and at checking, so no legacy message can be rebuilt by packing fields into .at (the
+# review of #1772: an .at of "T\nbox1\necho one\n<[by, note]>" once made a re-signed by and note pass as legacy).
 # Signing, not a perms-only ledger, because every session's guard hook and the refusal and ask verbs must keep
 # appending to this one file.
 # THE TRUST BOUNDARY: the signature stops a forger who can append to the ledger but cannot read the seat's state dir
@@ -306,9 +312,12 @@ perms_down(){ local tg=$1 n err nrc who
 sigkey(){ printf '%s/grant.key' "$(dirname "$(ledger "$1")")"; }
 box(){ "$BIN/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null; }
 # THE DECISIONS THAT COUNT (perms' read of #1578): those the seat signed, so an unsigned line appended on an ask perms
-# has not decided yet neither hides it from open nor stops decide. A line signed before the box and command were bound
-# in still counts as decided here, since only the seat could sign it; the overlay's move tool, which acts on a grant, takes the new
-# form alone. A decision written unsigned before #1578 merged counts once the seat has named it to `freeze` (below),
+# has not decided yet neither hides it from open nor stops decide. A line signed in a legacy form, "decision\n<id>\n
+# <decision>\n<at>" with or without "\n<box>\n<command>", still counts as decided here, since only the seat could sign
+# it, but its by and note are unsigned, so anyone who can append may have changed them; nothing re-signs those lines,
+# and none is needed, since only the decision counts. The overlay's move tool, which acts on a grant, takes the live
+# sig/2 form alone. A decision
+# written unsigned before #1578 merged counts once the seat has named it to `freeze` (below),
 # which signs it, so the file itself carries its history: a copy or restore of the ledger and its key keeps it, and a
 # new ledger, or an old one appended to later, has nothing unsigned that counts, whatever .at a line claims (perms'
 # read of #1743). A ledger restored from before its freeze is unsigned again and is frozen again the same way.
@@ -318,14 +327,24 @@ box(){ "$BIN/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null; }
 # forged line there only lets the same refusal be written twice.
 # FREEZE (perms' read of #1743 and the review of #1748): the seat vouches for each id before anything is signed. The
 # candidates (counted "$lg" cand) are the unsigned decisions before the first line stamped at or after #1578's merge,
-# the first for each id not yet decided, each with its line number, the sha256 of its exact bytes and the ask it would
-# close. Position, not the ask's .at, because whoever appends a line sets its .at, and any line so stamped is the
+# the first for each id not yet decided, each with its line number, the sha256 of its exact bytes and every ask or
+# refusal line under its id with its line number. Position, not the ask's .at, because whoever appends a line sets
+# its .at, and any line so stamped is the
 # boundary, with an id or without (perms' reads of #1728, the review of #1743); freeze's closing line is one, so a line
 # appended after a freeze is never a candidate. But a new ledger's head is "before" that boundary too, so a line
-# planted there is a candidate, and only the seat, reading the list, can tell it from history: `counted "$lg" sign
-# <id>…` signs the named candidates alone, in the old form, which the move tool never takes.
+# planted there is a candidate, and only the seat, reading the list, can tell it from history. So the list marks "not
+# history" one whose first ask comes after the decision or any ask sits at or past the boundary, which no decision
+# before signing landed could close (the review of #1748). `counted "$lg" sign <id>…` signs the named candidates alone,
+# in the frozen sig/2 form, by and note with them but no box or command, which the move tool never takes.
+# msg(r, box, command): the message a decision is signed over (A DECISION IS SIGNED above); with no box and command,
+# freeze's. None when a field carries a newline, so that line is never signed nor counted
+MSG='import hmac,hashlib,json,os,sys
+def nl(v): return any(isinstance(x,str) and "\n" in x for x in v)
+def msg(r,*bc):
+    v=["decision"]+[r.get(x) for x in ("id","decision","at")]+list(bc)+[r.get("by"),r.get("note")]
+    return None if nl(v) else "cc-refusals sig/2 %s\n%s"%("live" if bc else "frozen",json.dumps(v))'
 counted(){   # $1 a ledger: the decision lines that count, one JSON object a line; $2 cand|sign [ids]: freeze's (above)
-  python3 -I -c 'import hmac,hashlib,json,os,sys
+  python3 -I -c "$MSG"'
 lg,kf,box,mode=sys.argv[1:5]; want=set(sys.argv[5:]); k=b""; rs=[]; ns=[]; hs=[]
 if not os.path.islink(kf):
     try: k=open(kf,"rb").read().strip()
@@ -337,29 +356,31 @@ for n,b in enumerate(open(lg,"rb"),1):
 cmd={}; ask={}
 for n,r in zip(ns,rs):
     if r.get("kind") in ("refusal","ask") and isinstance(r.get("id"),str):
-        cmd.setdefault(r["id"],str(r.get("input") or "")); ask.setdefault(r["id"],dict(r,line=n))
-def f(r): return ["decision"]+[str(r.get(x)) for x in ("id","decision","at")]
+        cmd.setdefault(r["id"],str(r.get("input") or "")); ask.setdefault(r["id"],[]).append(dict(r,line=n))
 def ok(r):
     try:
-        s=r.get("sig")
-        if not (k and isinstance(s,str) and s.isascii()): return False
-        return any(hmac.compare_digest(hmac.new(k,"\n".join(m).encode(),hashlib.sha256).hexdigest(),s)
-                   for m in (f(r)+[box,cmd.get(r.get("id"),"")],f(r)))
+        s=r.get("sig"); c=cmd.get(r.get("id"),"")
+        if not (k and isinstance(s,str) and s.isascii()) or nl([r.get(x) for x in ("id","decision","at","by","note")]+[box,c]): return False
+        o=["decision"]+[str(r.get(x)) for x in ("id","decision","at")]   # the legacy forms, by and note unsigned
+        return any(hmac.compare_digest(hmac.new(k,m.encode(),hashlib.sha256).hexdigest(),s)
+                   for m in [msg(r,box,c),msg(r)]+["\n".join(v) for v in (o+[box,c],o)])
     except Exception: return False
 ds=[r for r in rs if r.get("kind")=="decision" and isinstance(r.get("id"),str)]
 if not mode: [print(json.dumps(r)) for r in ds if ok(r)]; sys.exit()
 done={r["id"] for r in ds if ok(r)}
+cut=next((n for n,r in zip(ns,rs) if str(r.get("at") or "")>="2026-10-20T20:04:47Z"),float("inf"))   # #1578 merged
 for n,h,r in zip(ns,hs,rs):
-    if str(r.get("at") or "")>="2026-10-20T20:04:47Z": break   # #1578 merged
+    if n>=cut: break
     if r.get("kind")!="decision" or not isinstance(r.get("id"),str) or r["id"] in done: continue
-    done.add(r["id"])
-    if mode=="cand": print(json.dumps({"line":n,"sha":h,"rec":r,"ask":ask.get(r["id"])}))
-    elif r["id"] in want and k: print(json.dumps(dict(r,sig=hmac.new(k,"\n".join(f(r)).encode(),hashlib.sha256).hexdigest())))' \
+    done.add(r["id"]); a=ask.get(r["id"],[])
+    if mode=="cand": print(json.dumps({"line":n,"sha":h,"rec":r,"asks":a,"history":not a or (n>a[0]["line"] and a[-1]["line"]<cut)}))
+    elif r["id"] in want and k and msg(r): print(json.dumps(dict(r,sig=hmac.new(k,msg(r).encode(),hashlib.sha256).hexdigest())))' \
     "$1" "${1%/*}/grant.key" "$(box)" "${2:-}" "${@:3}" 2>/dev/null; }
 decided(){ counted "$1" | jq -r '.id'; }
-sign(){   # $1 key file, the message on stdin: its hex HMAC-SHA256
-  python3 -I -c 'import hmac,hashlib,sys; k=open(sys.argv[1],"rb").read().strip()
-assert k; print(hmac.new(k,sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' "$1" 2>/dev/null; }
+sign(){   # $1 key file, $2 box, $3 the ask; the decision on stdin: its .sig in the live sig/2 form (msg() above)
+  python3 -I -c "$MSG"'
+k=open(sys.argv[1],"rb").read().strip(); m=msg(json.load(sys.stdin),sys.argv[2],str(json.loads(sys.argv[3]).get("input") or ""))
+assert k and m; print(hmac.new(k,m.encode(),hashlib.sha256).hexdigest())' "$@" 2>/dev/null; }
 open_(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || return 0
   jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select((.kind == "refusal" or .kind == "ask") and (.id | type == "string") and ((.id | IN($d[])) | not))' "$lg" | line; }
 watch_(){ local lg; lg=$(ledger "$1"); touch "$lg" || exit 2
@@ -450,9 +471,8 @@ freeze(){ local repo=$1 lg c id out; shift
     if [ $# = 0 ]; then
       [ -n "$c" ] || { echo "cc-refusals: no unsigned decision from before signing landed"; exit 0; }
       while IFS= read -r l; do
-        jq -rj "$CLEAN"'"\(.rec.id | clean) \(.rec.decision | clean) at \(.rec.at | clean) by \(.rec.by | clean), line \(.line) sha256 \(.sha): "' <<<"$l"
-        if jq -e '.ask' <<<"$l" >/dev/null; then printf 'closes line %s: ' "$(jq -r '.ask.line' <<<"$l")"
-          jq -c '.ask | del(.line)' <<<"$l" | line; else echo "no ask"; fi
+        jq -r "$CLEAN"'"\(.rec.id | clean) \(.rec.decision | clean) at \(.rec.at | clean) by \(.rec.by // "(none)" | clean), line \(.line) sha256 \(.sha)\(if .history then "" else ", not history" end)\(if .asks == [] then ": no ask" else ", under its id:" end)"' <<<"$l"
+        jq -c '.asks[]' <<<"$l" | while IFS= read -r a; do printf '  line %s: ' "$(jq -r '.line' <<<"$a")"; jq -c 'del(.line)' <<<"$a" | line; done
       done <<<"$c"
       exit 0; fi
     for id in "$@"; do
@@ -488,11 +508,11 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
       local key at sig b; key=$(sigkey "$repo"); at=$(date -u +%FT%TZ); b=$(box)
       [ -n "$b" ] || { echo "cc-refusals: this box has no name (CC_BOX, else hostname -s) to sign with — nothing written" >&2; exit 1; }
       mkkey "$key" || exit 1
-      sig=$(jq -j --arg d "$what" --arg at "$at" --arg b "$b" '"decision\n\(.id)\n\($d)\n\($at)\n\($b)\n\(.input // "")"' <<<"$rec" \
-        | sign "$key") && [ -n "$sig" ] \
-        || { echo "cc-refusals: could not sign the decision — nothing written" >&2; exit 1; }
-      jq -cn --arg id "$id" --arg at "$at" --arg d "$what" --arg n "$note" --arg b "$(window)" --arg s "$sig" \
-         '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b, sig:$s}' >> "$lg" || exit 1
+      local dl; dl=$(jq -cn --arg id "$id" --arg at "$at" --arg d "$what" --arg n "$note" --arg b "$(window)" \
+         '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b}')
+      sig=$(sign "$key" "$b" "$rec" <<<"$dl") && [ -n "$sig" ] \
+        || { echo "cc-refusals: could not sign the decision (a field carrying a newline is never signed) — nothing written" >&2; exit 1; }
+      jq -c --arg s "$sig" '. + {sig:$s}' <<<"$dl" >> "$lg" || exit 1
     ) 9>"$lg.lock" || exit 1
   fi
   if [ "$card" = 1 ]; then
