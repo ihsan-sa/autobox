@@ -4675,7 +4675,9 @@ def run():
     # reply is refused with a plain line and nothing reaches the worker. Each case stores its own mail.
     with Box(allow=ALLOWED) as b:
         for i30, (key30, val30) in enumerate((("subject", "the\r\nplan"), ("message_id", "<m2@allowed.example>\nX: y"),
-                                              ("references", ["<m1@allowed.example>\r"]))):
+                                              ("references", ["<m1@allowed.example>\r"]),
+                                              ("subject", "the\x0bplan"), ("subject", "the\x85plan"),
+                                              ("subject", "the\u2028plan"), ("subject", "the\u2029plan"))):
             id30 = "20261021-crlf30-%d" % i30
             os.makedirs(os.path.join(r.INBOX, id30))
             with open(os.path.join(r.INBOX, id30, "message.json"), "w") as f:

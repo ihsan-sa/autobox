@@ -1461,8 +1461,9 @@ def cmd_reply(opt):
         m = json.load(f)
     # The receiver folds these onto one line, so a break in one means the stored mail was written some other way;
     # a header cannot carry it (build() raises), so the reply is refused rather than ending in a traceback.
-    broken = [k for k in ("subject", "message_id", "references")
-              if re.search(r"[\r\n]", " ".join(map(str, m[k])) if isinstance(m.get(k), list) else str(m.get(k) or ""))]
+    text = {k: " ".join(map(str, m[k])) if isinstance(m.get(k), list) else str(m.get(k) or "")
+            for k in ("subject", "message_id", "references")}
+    broken = [k for k, t in text.items() if t and t.splitlines() != [t]]
     if broken:
         print("cc-mail reply: not sent — the stored mail's %s carries a line break" % ", ".join(broken), file=sys.stderr)
         return 1

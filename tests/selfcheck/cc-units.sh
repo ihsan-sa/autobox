@@ -255,6 +255,8 @@ J
   printf '[Unit]\nDescription=fx\n[Service]\nExecCondition=%%h/bin/cc-tier allows goals\nExecStart=/bin/true\n' > "$X/units/fx.service"
   printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\n' "$X" > "$X/shim/systemctl"; chmod +x "$X/shim/systemctl"
   k "$(t test "$(UD="$X/units" OV="" tiered)" = "fx.service	goals	fx")" "tiered lists the declared unit, its word and its description"
+  printf '[Unit]\nDescription=two\n[Service]\nExecCondition=/bin/true\nExecCondition=%%h/bin/cc-tier allows lessons\nExecStart=/bin/true\n' > "$X/units/two.service"
+  k "$(t test "$(UD="$X/units" OV="" tiered | grep -c '^two.service	lessons	two$')" = 1)" "tiered finds the cc-tier condition second among two ExecConditions"
   u="$(sed -n "s|^ExecCondition=%h|$X/home|p" "$X/units/fx.service")"
   C set essential >/dev/null; k "$(nt env PATH="$X/shim:$PATH" HOME="$X/home" CC_CONFIG="$X/config" $u)" "under essential the unit's condition skips it"
   C set autonomous >/dev/null; k "$(t env PATH="$X/shim:$PATH" HOME="$X/home" CC_CONFIG="$X/config" $u)" "…and under autonomous the same unit runs, with no restart"
