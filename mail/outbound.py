@@ -472,6 +472,7 @@ def bases(rec, cfg):
 
 NOT_OURS = "not in a tree a mail may attach from"
 TOO_BIG = "too large to attach"
+CHANGED = "not the file that was checked"
 
 
 def _open_ours(path, rec, cfg):
@@ -493,7 +494,7 @@ def _open_ours(path, rec, cfg):
     return None, None, ""
 
 
-def attach_bytes(path, rec, cfg, cap):
+def attach_bytes(path, rec, cfg, cap, same=None):
     """The bytes to attach, read from ONE open file descriptor, or (None, why) when the file does not travel.
 
     THE FILE IS OPENED ONCE AND NEVER RE-OPENED. Checking a path and then opening it is two lookups of the
@@ -503,11 +504,14 @@ def attach_bytes(path, rec, cfg, cap):
     O_NOFOLLOW refuses a symlink as the last component, os.fstat says it is a regular file and how big it
     was, /proc/self/fd/<n> says where that fd actually is (which catches a symlinked DIRECTORY on the way,
     which O_NOFOLLOW does not), and the read stops at cap+1 bytes so a file that grew after the fstat is
-    still capped. The bytes handed back are the ones the checks were made against."""
+    still capped. The bytes handed back are the ones the checks were made against. `same` is the (st_dev,
+    st_ino) a caller already judged under this name (cc-slack's sent_back): any other file is CHANGED."""
     fd, st, _real = _open_ours(path, rec, cfg)
     if fd is None:
         return None, NOT_OURS
     try:
+        if same and (st.st_dev, st.st_ino) != tuple(same):
+            return None, CHANGED       # the name was swapped after the caller's check
         if st.st_size > cap:
             return None, TOO_BIG       # the common case, and no byte of it is read
         data = b""
@@ -590,6 +594,8 @@ def not_attached(path, rec, cfg, why, cap):
         except OSError:
             size = 0
         return "📎 %s (%s) is over the %s attachment cap" % (name, human_size(size), human_size(cap))
+    if why == CHANGED:
+        return "📎 %s changed after it was checked" % name
     return "📎 %s is not in a tree a mail may attach from — put it under %s" % (name, trees(rec, cfg))
 
 
@@ -809,7 +815,7 @@ def mail_bound(cfg, chat, thread, ts):
     return rec
 
 
-def attach_check(cfg, chat, thread, ts, path):
+def attach_check(cfg, chat, thread, ts, path, same=None):
     """"" when `path` would travel with the mail a post at (chat, thread) answering `ts` sends — as a file, or
     as a MAIL_OUT_LINKS link — or when that post would not be mailed at all; else the one line saying why it
     would not, for the caller to REFUSE ON BEFORE anything reaches Slack. "an attachment that cannot be sent
@@ -821,14 +827,14 @@ def attach_check(cfg, chat, thread, ts, path):
     if not rec:
         return ""
     cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
-    _data, why = attach_bytes(path, rec, cfg, cap)
-    if not why or link_for(path, cfg):
+    _data, why = attach_bytes(path, rec, cfg, cap, same)
+    if not why or (why != CHANGED and link_for(path, cfg)):   # a link to a swapped name would carry the new file
         return ""
     log("%s: refused before upload — %s: %s" % (rec.get("id"), clip(os.path.basename(path)), why))
     return not_attached(path, rec, cfg, why, cap) + ". Nothing was sent, to Slack or by mail"
 
 
-def send(cfg, chat, thread, text="", path="", now=None, ts=""):
+def send(cfg, chat, thread, text="", path="", now=None, ts="", same=None):
     """ONE POST IN A MIRROR THREAD, MAILED WHEN IT ANSWERS A MAIL. Returns "" when there is nothing to say in
     Slack, or the one line the caller posts in that thread saying the mail did not go and why.
 
@@ -854,7 +860,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     attach, note = None, ""
     if path:
         cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
-        data, why = attach_bytes(path, rec, cfg, cap)
+        data, why = attach_bytes(path, rec, cfg, cap, same)
         if not why:
             attach = (path, data)
         else:
@@ -864,7 +870,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
             # mail whose only news is that a file was left out is not an answer, and the session that posted
             # it is better told where to put the file and asked to post it again.
             note = not_attached(path, rec, cfg, why, cap)
-            if not link_for(path, cfg):
+            if why == CHANGED or not link_for(path, cfg):
                 log("%s: not sent — %s: %s" % (rec.get("id"), clip(os.path.basename(path)), why))
                 return note + ". Nothing was mailed; post it again once it is."
             body = (body + "\n\n" + link_line(path, cfg, why)).strip()

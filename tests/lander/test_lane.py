@@ -4112,6 +4112,16 @@ class Branches(Fixture):
             self.assertEqual(L.tick_env({"TMPDIR": "/tmp/own"})["TMPDIR"], os.path.join(home, ".cc", "tmp"))
             self.assertTrue(os.path.isdir(os.path.join(home, ".cc", "tmp")))   # a missing scratch is made, not skipped
 
+    def test_tick_env_scratch_is_made_0700_and_an_unmakeable_one_fails_the_spawn_not_the_caller(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        with mock.patch("lander.cards.PASSWD_HOME", home):
+            L.tick_env({})
+            self.assertEqual(os.stat(os.path.join(home, ".cc", "tmp")).st_mode & 0o777, 0o700)
+            shutil.rmtree(os.path.join(home, ".cc"))
+            open(os.path.join(home, ".cc"), "w").close()   # ~/.cc is a file: makedirs raises whoever runs this
+            self.assertFalse(REAL_SPAWN_TICK("demo")[0])
+
     def test_tick_path_puts_the_system_dirs_first(self):
         # a gh, git or claude a worker drops in ~/bin or ~/.local/bin must not shadow the system's (#862 review reads)
         with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):

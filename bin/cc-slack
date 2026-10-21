@@ -1709,7 +1709,8 @@ def sent_back(cfg, path, to):
         return None
     if to and to.startswith("#"):
         to = resolve_channel(cfg, to[1:]) or to
-    if not f or (to or cfg.get("SLACK_OWNER_ID")) not in {f.get("user"), *[c for k in ("channels", "groups", "ims") for c in f.get(k) or ()]}:
+    who = to or cfg.get("SLACK_OWNER_ID")   # a missing id is nobody: None never matches a sender files.info left out
+    if not (f and who) or who not in {f.get("user"), *[c for k in ("channels", "groups", "ims") for c in f.get(k) or ()]}:
         return None
     try:
         return open_member_file(path, (root,))
@@ -1771,7 +1772,8 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
     post(): no token or local means outbox log only. Returns (file_id, chat); file_id None means nothing reached Slack.
     Answering a mail (`mail`), the file goes as an attachment or link or the call is refused before upload, so `sent`
     is never said of a file the sender did not get. `name` is the Slack name when `path` lacks it (an fd's
-    /proc/self/fd/<n>); `mail_path` is the name the mail door opens itself, O_NOFOLLOW (a /proc link never passes).
+    /proc/self/fd/<n>); `mail_path` is the name the mail door opens itself, O_NOFOLLOW (a /proc link never passes),
+    and attaches only while that name is still the fd's file (`same`), so a swap after the check mails nothing.
     A PDF is never uploaded (owner, 2026-09-28): a filed one is posted as its link (returned id is that post's ts), an
     unfiled one is refused with cc-docs' line, and with no cc-docs it uploads as any file. A PDF a person sent in
     goes back to them as the file (sent_back: its sender or a conversation it was shared in), in mail too.
@@ -1810,12 +1812,14 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
         to = resolve_channel(cfg, to[1:]) or to
     if not to or to.startswith("U"):
         to = api("conversations.open", tok, users=to or cfg.get("SLACK_OWNER_ID"))["channel"]["id"]
+    st = os.stat(path) if mail_path else None   # the fd's own file: the mail door attaches that one or none (`same`)
+    same = (st.st_dev, st.st_ino) if st else None
     said = comment or ""   # as written, kept before the rewrites below: this is what mail_tap gets
     if mail and thread:
         # A file answering a mail is judged by the mail door BEFORE Slack has it, so one that would not travel
         # refuses the whole call instead of Slack getting it while the mail goes without and the tool says `sent`.
         try:
-            why = mail_outbound().attach_check(cfg, to, thread, ts or "", mail_path or path)
+            why = mail_outbound().attach_check(cfg, to, thread, ts or "", mail_path or path, same=same)
         except Exception as e:
             log(f"mail out: {e!r}"); why = ""       # a broken mail door costs the outbound copy, never the Slack post
         if why:
@@ -1836,7 +1840,7 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
     outbox("file", to or "dm", thread, line)              # accepted: the line follows the upload, as post() does
     if mail:
         # `said`, not `comment`: comment is now Slack markup, no use to a mail reader (post() taps as written too).
-        mail_tap(cfg, to, thread, text=said, path=mail_path or path, ts=ts)
+        mail_tap(cfg, to, thread, text=said, path=mail_path or path, ts=ts, same=same)
     return done["files"][0]["id"], to
 
 def tmux(*args):
@@ -4469,7 +4473,7 @@ def run_subject(h, ask):
     return res if isinstance(res, dict) else {"ok": False, "error": "nothing started — the launcher gave no answer "
                                               f"(exit {p.returncode}: {(p.stderr or '').strip()[-160:]})"}
 
-def mail_tap(cfg, chat, thread, text="", path="", ts=None):
+def mail_tap(cfg, chat, thread, text="", path="", ts=None, same=None):
     """Offers one already-sent Slack post to milestone 4 (outbound). A top-level post (empty `thread`) is
     filtered out first. `ts` passes through as-is; the door decides whether it came by mail, not this
     function. A returned line means it did not go out and is posted with mail=False rather than tapped again.
@@ -4478,7 +4482,7 @@ def mail_tap(cfg, chat, thread, text="", path="", ts=None):
     if not (chat and thread):
         return
     try:
-        note = mail_outbound().send(cfg, chat, thread, text=text, path=path, ts=ts or "")
+        note = mail_outbound().send(cfg, chat, thread, text=text, path=path, ts=ts or "", same=same)
     except Exception as e:
         log(f"mail out: {e!r}")
         return
@@ -9208,7 +9212,8 @@ class Daemon:
         while True:
             time.sleep(30)
             self.connected, now = client.is_connected(), time.time()
-            down_since = self.watchdog(self.connected, down_since, now, self.deaf(client, now) or self.stuck(now))
+            down_since = self.watchdog(self.connected, down_since, now, self.deaf(client, now))
+            self.unstick(now)
             for t, payload in self.expire_queues():
                 self.expired(t, payload)
 
@@ -9332,8 +9337,8 @@ class Daemon:
 
     def watchdog(self, connected, down_since, now, deaf=""):
         """Socket-mode health: a daemon whose Slack link stays down is one the owner can't reach, so after 5 min it
-        exits and systemd's Restart=always brings a fresh one; a link that is up but `deaf` (why, from deaf() or
-        stuck()) exits at once. Returns the (possibly new) down_since."""
+        exits and systemd's Restart=always brings a fresh one; a link that is up but `deaf` (why, from deaf()) exits
+        at once. Returns the (possibly new) down_since."""
         if deaf:
             log(f"slack link deaf ({deaf}) — exiting so systemd restarts the daemon and reconnects"); os._exit(1)
         if connected:
@@ -9354,18 +9359,28 @@ class Daemon:
         heard = s.last_ping_pong_time or vars(s).setdefault("cc_born", now)
         return f"no pong from Slack for {int(now - heard)} s" if now - heard > PONG_DEAF else ""
 
-    def stuck(self, now):
-        """A chat whose message handler has run past HANDLER_STUCK, so every later message there waits behind it, or ""."""
-        late = [(c, t) for c, t in list(self.busy.items()) if now - t > HANDLER_STUCK]
-        return f"message handler in {late[0][0]} stuck for {int(now - late[0][1])} s" if late else ""
+    def unstick(self, now):
+        """A chat whose message handler has run past HANDLER_STUCK holds every later message there behind it. Abandon
+        that handler: say so in the chat and give it a fresh executor, so its next message runs and every other
+        chat's in-flight messages go on as before. Messages already queued behind the hung one stay with it."""
+        for chat, t in list(self.busy.items()):
+            if now - t > HANDLER_STUCK:
+                log(f"message handler in {chat} stuck for {int(now - t)} s — abandoned, chat gets a fresh executor")
+                with self.lock:
+                    self.busy.pop(chat, None)
+                    ex = self.execs.pop(chat, None)
+                if ex:
+                    ex.shutdown(wait=False)
+                self.say(chat, f"⚠️ a message here hung for {int(now - t) // 60} min, so I dropped it — resend it, and anything sent after it")
 
     def handle(self, chat, ev):
-        """One chat's message handler, stamped in busy while it runs so stuck() can see a hung one."""
-        self.busy[chat] = time.time()
+        """One chat's message handler, stamped in busy while it runs so unstick() can see a hung one."""
+        self.busy[chat] = t = time.time()
         try:
             self._safe(self.on_event, ev)
         finally:
-            self.busy.pop(chat, None)
+            if self.busy.get(chat) == t:                    # an abandoned handler that wakes leaves its successor's stamp alone
+                self.busy.pop(chat, None)
 
     def expired(self, target, payload, why="never came up"):
         """A queued message aged out: say so where it was asked, instead of dropping it silently. `why` distinguishes

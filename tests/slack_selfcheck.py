@@ -4506,13 +4506,38 @@ def run_selfcheck():
           "closed, and the new one (still waiting on its first pong) is left alone",
           builtD == ["b", "b"] and deadD.closed and not liveD.closed
           and "slack workspace b: link deaf (no pong from Slack for" in errD.getvalue())
-    dmD.busy["CSTUCK"] = nowD - HANDLER_STUCK - 1
-    stuckD = dmD.stuck(nowD)
-    dmD.busy.clear(); dmD.on_event = lambda ev: None
-    dmD.handle("CQUICK", {"type": "message"})
-    check("stuck: a chat whose message handler has run past HANDLER_STUCK is named, so watchdog restarts the daemon; "
-          "a handler that returns leaves no mark", stuckD.startswith("message handler in CSTUCK stuck")
-          and dmD.stuck(nowD) == "" and dmD.busy == {})
+    hangD, gotD, saidD = threading.Event(), [], []
+    def eventD(ev):
+        if ev["ts"] == "hang":
+            hangD.wait(10)
+        gotD.append((ev["channel"], ev["ts"]))
+    dmD.on_event, dmD.say = eventD, lambda chat, text, *a, **k: saidD.append((chat, text))
+    dmD.dispatch({"type": "message", "channel": "CHUNG", "ts": "hang"}, None)
+    dmD.dispatch({"type": "message", "channel": "CHUNG", "ts": "behind"}, None)
+    for _ in range(50):                                      # the hung handler has stamped busy
+        if "CHUNG" in dmD.busy:
+            break
+        time.sleep(0.02)
+    dmD.busy["CHUNG"] -= HANDLER_STUCK + 1                   # as if it had hung past HANDLER_STUCK
+    exitsD, errD = [], io.StringIO()
+    try:
+        os._exit = lambda code: exitsD.append(code)
+        with contextlib.redirect_stderr(errD):
+            dmD.unstick(time.time())
+            dmD.watchdog(True, None, nowD, "")
+    finally:
+        os._exit = realExitD
+    fokD = dmD.dispatch({"type": "message", "channel": "COK", "ts": "1"}, None)
+    fnewD = dmD.dispatch({"type": "message", "channel": "CHUNG", "ts": "next"}, None)
+    fokD.result(5); fnewD.result(5)
+    check("stuck: a chat whose handler hangs past HANDLER_STUCK is told so and gets a fresh executor, so its next "
+          "message and another chat's still arrive, and the daemon does not exit",
+          exitsD == [] and gotD == [("COK", "1"), ("CHUNG", "next")] and "CHUNG" not in dmD.busy
+          and len(saidD) == 1 and saidD[0][0] == "CHUNG" and "resend" in saidD[0][1]
+          and "message handler in CHUNG stuck" in errD.getvalue())
+    hangD.set()                                              # the abandoned handler and the one behind it end, leaving the new stamp alone
+    for exD in list(dmD.execs.values()):
+        exD.shutdown(wait=True)
     # -- sending a FILE: the `file` tool and cc-slack post --file share upload_file(); the bounds are the whole point ----
     upd = tempfile.mkdtemp(prefix="cc-slack-upload-")        # under /tmp, which IS an allowed root
     real_cwd_u = os.getcwd(); os.chdir(upd)
@@ -13108,7 +13133,7 @@ def run_selfcheck():
         # tap runs after Slack has the message and never before it, that the door's answer is posted in the
         # thread without being offered back to the door, and that a broken door costs the copy and not the
         # reply. So the door itself is a stand-in through these cases and the real one is never opened.
-        taps, sent, answered, checked = [], [], [], []
+        taps, sent, answered, checked, sames = [], [], [], [], []
 
         class FakeOut:
             """core/mail/outbound.py as post() sees it: send() takes the post and answers "" or one line;
@@ -13116,12 +13141,13 @@ def run_selfcheck():
             note = ""
             refuse = ""
 
-            def send(self, cfg, chat, thread, text="", path="", now=None, ts=""):
+            def send(self, cfg, chat, thread, text="", path="", now=None, ts="", same=None):
                 taps.append((chat, thread, text, path))
                 answered.append(ts)
+                sames.append(same)
                 return self.note
 
-            def attach_check(self, cfg, chat, thread, ts, path):
+            def attach_check(self, cfg, chat, thread, ts, path, same=None):
                 checked.append((chat, thread, ts, path))
                 return self.refuse
 
@@ -13139,7 +13165,11 @@ def run_selfcheck():
                 sent.append((kw.get("channel_id"), kw.get("thread_ts"), kw.get("initial_comment")))
                 return {"files": [{"id": "F4"}]}
             if method == "files.info":   # sent_back asks who sent an inbox file and where it was shared
-                return {"file": {"F1": {"user": "U-OWN", "channels": ["C-MEM"]}, "F3": {"user": "U-B", "ims": ["D-B"]}}[kw["file"]]}
+                info = {"F1": {"user": "U-OWN", "channels": ["C-MEM"]}, "F3": {"user": "U-B", "ims": ["D-B"]},
+                        "F5": {"channels": []}}.get(kw["file"])   # F5: Slack names no sender; any other id fails
+                if info is None:
+                    raise RuntimeError("files.info: file_not_found")
+                return {"file": info}
             return mail_api(method, token, **kw)
 
         class TapResp:
@@ -13351,6 +13381,52 @@ def run_selfcheck():
                       "the PDF it points at still needs the library and nothing reaches Slack",
                       "is not filed" in why_s and sent == [])
                 taps.clear(); sent.clear(); os.path.exists(docs_argv) and os.remove(docs_argv); os.remove(linkP)
+
+                def back(name, to):   # what Slack got (comments) and the refusal, for one sent-in PDF sent to `to`
+                    sent.clear(); os.path.exists(docs_argv) and os.remove(docs_argv)
+                    p_ = f"{inbox}/20261010T030000Z-{name}"
+                    open(p_, "w").write("x")
+                    try:
+                        upload_file(tapcfg, p_, to, "9.0", comment=name, mail=False); why_ = ""
+                    except UploadRefused as e:
+                        why_ = str(e)
+                    os.remove(p_)
+                    return [s_[2] for s_ in sent], why_
+                got_n, why_n = back("F5-unfiled-nobody.pdf", None)
+                check("pdf link: with no recipient, no owner id and no sender from files.info, the missing ids are "
+                      "never a match: it needs the library and nothing reaches Slack (perms on #1787)",
+                      "SLACK_OWNER_ID" not in tapcfg and got_n == [] and "is not filed" in why_n)
+                got_f, why_f = back("F6-unfiled-gone.pdf", "C-MEM")
+                check("pdf link: a files.info lookup that fails falls back to the library, so an unfiled one is refused "
+                      "and nothing reaches Slack",
+                      got_f == [] and "is not filed" in why_f)
+                check("pdf link: a DM channel id is a recipient like any other: the DM the PDF was shared in gets it back "
+                      "as the file, another DM gets nothing",
+                      back("F3-unfiled-hers.pdf", "D-B") == (["F3-unfiled-hers.pdf"], "")
+                      and back("F3-unfiled-hers.pdf", "D-C")[0] == [])
+
+                # THE MAIL ATTACHES THE FILE THAT WAS CHECKED (perms on #1787): the door reopens the name, so it is
+                # handed the checked fd's (dev, ino) and a file swapped in under the name during the upload is refused.
+                swapP, swapNew = f"{inbox}/20261010T030000Z-F1-unfiled-swap.pdf", f"{inbox}/swap-new"
+                open(swapP, "w").write("checked")
+                open(swapNew, "w").write("swapped")
+                taps.clear(); sent.clear(); sames.clear()
+                was_up = urllib.request.urlopen
+                urllib.request.urlopen = lambda req, timeout=None: (os.replace(swapNew, swapP), TapResp())[1]
+                try:
+                    upload_file(tapcfg, swapP, "C-MEM", "9.0", comment="your PS4", ts="9.0")
+                finally:
+                    urllib.request.urlopen = was_up
+                roots = dict(tapcfg, MAIL_OUT_ROOTS=f"{pdfD}:{inbox}")
+                swapped = real_ob.attach_bytes(swapP, {}, roots, 1 << 20, sames[0])
+                st_ = os.stat(swapP)
+                kept = real_ob.attach_bytes(swapP, {}, roots, 1 << 20, (st_.st_dev, st_.st_ino))
+                os.remove(swapP)
+                check("pdf link: a sent-in PDF swapped under its name between the check and the mail is not mailed — "
+                      "the door gets the checked file's id and refuses any other, and attaches the one that matches",
+                      taps and taps[0][3] == swapP and swapped == (None, real_ob.CHANGED) and kept == (b"swapped", "")
+                      and real_ob.not_attached(swapP, {}, roots, real_ob.CHANGED, 1).endswith("changed after it was checked"))
+                taps.clear(); sent.clear(); os.path.exists(docs_argv) and os.remove(docs_argv)
                 upload_file(tapcfg, pngP, "C-MEM", "9.0", comment="a chart")
                 upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="a member's own", mail=False, library=False)
                 check("pdf link: a non-PDF, and a PDF with library=False (the member workspace's own files), upload as "

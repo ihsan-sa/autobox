@@ -369,6 +369,17 @@ class Spawn(unittest.TestCase):
         self.assertEqual(seen["PATH"], L.tick_path())
         self.assertEqual(seen["PYTHONDONTWRITEBYTECODE"], "1")
 
+    def test_an_unmakeable_scratch_is_a_line_not_a_raise(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        open(os.path.join(home, ".cc"), "w").close()   # ~/.cc is a file: tick_env's makedirs raises
+        env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("lander.cards.PASSWD_HOME", home), \
+                mock.patch.object(L, "run", lambda *a, **k: (1, "", "no manager")):
+            ok, line = NG.spawn("demo")
+        self.assertFalse(ok)
+        self.assertIn("would not start", line)
+
 
 class Reuse(State):
     def job(self):
