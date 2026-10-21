@@ -25,7 +25,8 @@ That orch is the one cc-loop recorded host-side at dispatch (~/.cc/state/<repo>/
 
 stopped()'s route "seat" and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
 a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. A "query" or "planning" stop in a
-repo that is not the box's control repo (own_seat) goes to that repo's own seat through cc-broker instead, and planning
+repo that is not the box's control repo (own_seat) goes to that repo's own seat through cc-broker instead, once per head
+and words rather than per queuing, and planning
 hears of it only if the broker will not take it. owner_card() is the 🔐 card
 in #approvals, the one cc-slack turns the owner's 👍 into a queue from: the protected door's refusal ("door"), a
 protected head stopped in the lane ("owner"), and what cc-units policy keeps for the owner at deploy.
@@ -43,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import pwd
@@ -763,10 +765,12 @@ def own_seat(job, route):
 
 
 def tell_own_seat(job, text):
-    """The stop into the repo's own seat through cc-broker, once: source `lander`, so ordinary stops that come in a
-    run are one broker digest there rather than a wake each (a line asking for a choice still wakes it at once).
-    True when the broker took it (or did before); False files the planner request instead (stopped)."""
-    pid = producer_id(job, "own-seat")
+    """The stop into the repo's own seat through cc-broker, once per head and words: source `lander`, so ordinary
+    stops that come in a run are one broker digest there rather than a wake each (a line asking for a choice still
+    wakes it at once). Keyed on the head and the text, not queued_at: on 10-21 five PRs held for perms' read woke the
+    lessons seat once per lane pass, each queued again at the same head and reason. True when the broker took it (or
+    did before); False files the planner request instead (stopped)."""
+    pid = f"land:{job.repo}:{job.pr}:own-seat@{job.head[:12]}:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
     if pid in (read_json(_sent_path(), []) or []):
         return True
     rc, out = sh([broker(), "inject", "--no-start", "--source", "lander", job.repo, text], timeout=120)

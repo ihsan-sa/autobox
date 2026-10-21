@@ -247,6 +247,19 @@ class Routes(Stubbed):
                          [f"land:dispatch:22:query@{Q}", f"land:h--t:23:query@{Q}"])
         self.assertEqual(len(self.argvs("cc-broker inject")), 2)
 
+    def test_a_held_pr_tells_its_seat_once_per_head_and_reason(self):
+        """10-21: a PR held for perms' read, queued again each lane pass at the same head, woke the lessons seat each
+        time. A new queued_at alone says nothing; a new head or a new reason says it again."""
+        why = "check x runs the head's code on the host, so it waits for perms' security LAND"
+        for at in (Q, "2026-09-27T00:05:00Z"):
+            C.stopped(T.Job(repo="dispatch", pr=40, head=HEAD, extra={"queued_at": at}), why, "planning")
+        self.assertEqual(len(self.argvs("cc-broker inject")), 1)
+        C.stopped(T.Job(repo="dispatch", pr=40, head="c" * 40, extra={"queued_at": Q}), why, "planning")
+        C.stopped(T.Job(repo="dispatch", pr=40, head="c" * 40, extra={"queued_at": Q}), "a check is red", "planning")
+        self.assertEqual([a[-1] for a in self.argvs("cc-broker inject")][1:], [
+            f"[dispatch] PR #40: NOT merged ❌ — {why}. It is dispatch's own seat's to settle.",
+            "[dispatch] PR #40: NOT merged ❌ — a check is red. It is dispatch's own seat's to settle."])
+
     def test_a_stop_the_broker_refuses_still_reaches_planning(self):
         self.answer({"cc-broker inject": [1, "broker down"]})
         C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
