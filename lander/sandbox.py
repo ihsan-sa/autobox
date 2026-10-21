@@ -2,7 +2,8 @@
 
 WHAT IS INSIDE: the distribution read-only (/usr and the merged-usr links, the real /etc — vet's tmpfs /etc loses
 /usr/bin/awk through /etc/alternatives), /opt and /var/lib/texmf (the TeX formats /usr's pdflatex
-loads) when there, a fresh /proc, /dev and tmpfs /tmp; the check's tree
+loads) when there, a fresh /proc, /dev and tmpfs /tmp, /var/tmp and /root (cc-suites' own cage
+mounts tmpfs there, and bwrap can't mkdir them on the read-only root); the check's tree
 read-write at /work/tree — never at its host path, whose parent directories would name this user's HOME — as a git
 repo with one commit (the identity check greps it, B1); a tmpfs HOME at /work/home holding only a stub
 `~/.local/bin/claude` that sleeps (the suite stubs every model call; a window that starts one must stay up) — off
@@ -150,7 +151,7 @@ def argv(check: T.Check, tree: str, stub: str, cwd: str = "", extra_env: dict | 
             a += ["--ro-bind", p, p]
     a += ["--ro-bind", "/etc", "/etc", "--ro-bind-try", "/opt", "/opt",
           "--ro-bind-try", "/var/lib/texmf", "/var/lib/texmf", "--proc", "/proc", "--dev", "/dev",
-          "--tmpfs", "/tmp", "--tmpfs", "/run"]
+          "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/root", "--tmpfs", "/run"]
     if check.net:   # the resolver the real /etc points at
         a += ["--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve"]
     for p in mounts(check, home):

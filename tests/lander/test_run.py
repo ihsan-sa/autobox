@@ -1177,6 +1177,12 @@ class Cage(unittest.TestCase):
         i = a.index("/var/lib/texmf")
         self.assertEqual(a[i - 1:i + 2], ["--ro-bind-try", "/var/lib/texmf", "/var/lib/texmf"])
 
+    def test_the_cage_has_writable_var_tmp_and_root_for_a_nested_cage(self):
+        # cc-suites' job cage mounts tmpfs on both; on a read-only root bwrap can't mkdir them (selfcheck red, 10-21)
+        a = S.argv(chk(run="true"), "/t", "/s")
+        for d in ("/var/tmp", "/root"):
+            self.assertEqual(a[a.index(d) - 1], "--tmpfs", d)
+
     def test_the_cage_starts_with_claude_bwrap_where_it_is_installed(self):
         # its children may nest a bwrap, which /usr/bin/bwrap's are refused under AppArmor's userns restriction
         have = lambda *names: lambda w: w if w in names else None
