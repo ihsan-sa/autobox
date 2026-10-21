@@ -187,6 +187,14 @@ print(end="cc-refusals sig/2 live\n"+json.dumps(["decision",r["id"],r["decision"
   done
   fresh; seat "echo one"; id=$(idof "echo one"); n0=$(sha256sum < "$lg")
   k "$(t test "$(ps_ decide repo "$id" grant "$(printf 'a\nb')" >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "decide refuses a note carrying a newline, nothing written"
+  # a decision from before signing landed, on its own ledger: freeze signs it, but not once a field carries a newline
+  for by in perms 'perms\nx'; do
+    fresh; jq -cn '{kind:"refusal", id:"rnl00001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo nl", reason:"r", key:"k"}' >> "$lg"
+    jq -cn --arg b "$(printf "$by")" '{kind:"decision", id:"rnl00001", at:"2026-10-01T01:00:00Z", decision:"grant", by:$b}' >> "$lg"
+    n0=$(sha256sum < "$lg"); ps_ freeze repo rnl00001 >/dev/null 2>&1; r=$?
+    if [ "$by" = perms ]; then k "$(t test $r = 0 -a "$(decided "$lg")" = rnl00001)" "freeze signs a history decision with no newline in it"
+    else k "$(t test $r != 0 -a "$(sha256sum < "$lg")" = "$n0")" "…and refuses one whose .by carries a newline, nothing written"; fi
+  done
   # 5a'''. HISTORY COUNTS ONCE THE SEAT VOUCHES FOR IT (perms' read of #1743, the review of #1748): an unsigned
   #        decision at the file's head, before any line stamped after signing landed, counts only after the seat
   #        names it to `freeze`, whose dry run lists it with its signer, line, sha and ask and writes nothing; a copy or

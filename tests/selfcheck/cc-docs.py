@@ -423,7 +423,7 @@ def _selfcheck():
         vjunk = os.path.join(ROOT, "ws", wid, os.path.relpath(junk, ROOT))
         ok("before the retire, the member's view links the document", os.path.exists(vjunk))
         os.environ["DOCS_PUBLIC_HOOK"] = f"{sys.executable} {hook} {hlog}.retire"
-        rc, o = run("retire", "901-0001")
+        rc, o = run("retire", "901-0001", "--reason", "filed by mistake")
         os.environ.pop("DOCS_PUBLIC_HOOK")
         with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
             view = json.load(fh)
@@ -437,12 +437,18 @@ def _selfcheck():
         rc, o = run("file", e1, "--project", "Kid", "--title", "Junk")
         ok("a retired number is never handed out again: the same title files as a new number",
            rc == 0 and o.startswith("901-0003-A") and "901-0001" not in load()["documents"])
-        rc, o = run("retire", "901-0002-C")
+        rc, o = run("retire", "901-0002-C", "--reason", "a draft")
         rc2, o2 = run("file", e3, "--project", "Kid", "--title", "Keep")
         d = load()["documents"]["901-0002"]
         ok("retiring one revision keeps the document, and its letter is not filed again",
            rc == 0 and rc2 == 0 and [r["rev"] for r in d["revisions"]] == ["A", "B", "D"] and d["retired_revs"] == ["C"])
-        rc, o = run("retire", "901-0001")
+        ok("a retired revision keeps its reason and its file under retired/",
+           json.load(open(os.path.join(ROOT, "retired", "901-0002-C.json")))["reason"] == "a draft"
+           and os.path.isfile(o.split("\t")[2].strip()) and "/retired/files/" in o)
+        rc, o = run("retire", "901-0003-A", "--reason", "x")
+        ok("a document's only live revision is refused, and stays",
+           rc == 2 and [r["rev"] for r in load()["documents"]["901-0003"]["revisions"]] == ["A"])
+        rc, o = run("retire", "901-0001", "--reason", "filed by mistake")
         rc2, o2 = run("fold", "901-0002", "901-0003")
         ok("retiring a retired number is refused, and so is folding a document with a retired revision",
            rc == 2 and rc2 == 2 and "901-0003" in load()["documents"])
@@ -747,7 +753,7 @@ def _selfcheck():
             rc, o = run("file", "--title", "Physics two", m2)
             rcp, op_ = run("public", f"{k1[0]}-0001-A", "on")
             rct, ot = run("token", "x", f"{k1[0]}-0001-A")
-            rcr, orr = run("retire", f"{k1[0]}-0001")
+            rcr, orr = run("retire", f"{k1[0]}-0001", "--reason", "x")
             rcf, of = run("fold", f"{k1[0]}-0001", f"{k1[0]}-0002")
             os.environ["LIBRARY_URL"] = "http://127.0.0.1:1"
             rcl, ol = run("link", f"{k1[0]}-0001", "--kind", "public")
