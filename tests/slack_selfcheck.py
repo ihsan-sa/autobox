@@ -8753,6 +8753,9 @@ def run_selfcheck():
         os.makedirs(f"{BOX_STATE}/house"); os.makedirs(f"{BOX_STATE}/hank")
         state_own = state_taken("hank")
         state_rot = state_taken("rotation")   # cc-rotation's proposals, which `cc-rotation archive` acts on as the owner
+        check("member: `owner` is reserved as a handle — mail_move takes lead='owner' to mean a host session, so a "
+              "workspace called that would move the owner's mail threads as its own (perms' read of #1729)",
+              "box's own names" in reserved_name("owner", routes={}) and "box's own names" in reserved_name("Owner", routes={}))
         before_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
         coll = {u: ensure_member(cfgw, u)[0] for u in ("UBOX", "UUPD", "UCAROL", "UDAVE", "UROOM", "UHOUSE")}
         after_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
@@ -11827,6 +11830,23 @@ def run_selfcheck():
               and msaid[-1][2] == "I could not record the move to #mem--api, so nothing moved."
               and mhanded == [] and [r["name"] for r in recF.get("roots") or []] == ["mem"]
               and not recF.get("moves") and not R.conv_by_root("C-API", cardF))
+        # (d3b) …AND THE ROLLBACK SAVE FAILS TOO: the record may name the new card, so the card is NOT taken back
+        # (a record pointing at a deleted card is the one state nobody can recover from), and the thread says so.
+        mail_write("L3", to=["mem@box.example"], subject="the second deposit")
+        msaid.clear(); mhanded.clear()
+        dmA.take_mail("L3")
+        rootF2 = msaid[0][3]
+        msaid.clear(); mhanded.clear(); deleted.clear(); fails[:] = [1, 1]
+        R.save_conv, globals()["api"] = save_once_fails, api_deletes
+        try:
+            failOut2 = dmA.member_verb("mem", {"reply": "C-MEM", "thread_ts": rootF2, "text": "move #mem--api"}, "reply")
+        finally:
+            R.save_conv, globals()["api"] = real_save, real_apiF
+        check("mail: a move whose save AND rollback save both fail leaves its card up, hands nothing, and says in "
+              "the old thread that the record could not be put back (perms' read of #1729)",
+              failOut2.get("ok") is True and deleted == [] and fails == [] and mhanded == []
+              and [(c, t) for c, t, _, _ in msaid] == [("C-API", None), ("C-MEM", rootF2)]
+              and "nor put its record back, so I left its card there" in msaid[-1][2])
         msaid.clear(); mhanded.clear()
         mail_write("N3", to=["box@box.example"], subject="a look at your box")
         resC = dmA.take_mail("N3")

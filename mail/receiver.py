@@ -110,8 +110,10 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             Message-ID, References its chain, "Re: " its subject. To its From;
                                             --all adds its To and Cc (the box's own addresses dropped). Every
                                             address passes send's verified-list check, and one that does not
-                                            refuses the whole reply, naming it. The body is --body, or stdin.
-                                            --dry-run prints the headers and sends nothing. Host only
+                                            refuses the whole reply, naming it. A stored subject, Message-ID
+                                            or References with a line break refuses it too. The body is
+                                            --body, or stdin. --dry-run prints the headers and sends nothing.
+                                            Host only
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
 the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path (`doc`
@@ -1457,6 +1459,13 @@ def cmd_reply(opt):
         body = sys.stdin.read()
     with open(os.path.join(INBOX, args[0], "message.json")) as f:
         m = json.load(f)
+    # The receiver folds these onto one line, so a break in one means the stored mail was written some other way;
+    # a header cannot carry it (build() raises), so the reply is refused rather than ending in a traceback.
+    broken = [k for k in ("subject", "message_id", "references")
+              if re.search(r"[\r\n]", " ".join(map(str, m[k])) if isinstance(m.get(k), list) else str(m.get(k) or ""))]
+    if broken:
+        print("cc-mail reply: not sent — the stored mail's %s carries a line break" % ", ".join(broken), file=sys.stderr)
+        return 1
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import outbound                          # noqa: E402
     keys = {k: cfg(k, "") for k in SEND_KEYS}

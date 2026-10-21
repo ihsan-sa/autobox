@@ -4670,6 +4670,40 @@ def run():
           "`cc-mail reply <id> --all --dry-run` prints the reply's headers — To, Cc, In-Reply-To, Re: subject — and "
           "nothing reaches the worker")
 
+    # ------------------------------- 30. `cc-mail reply` refuses a stored header with a line break
+    # Perms' read of #1735: a CR or LF in a stored subject ended in a traceback. A header cannot carry one, so the
+    # reply is refused with a plain line and nothing reaches the worker. Each case stores its own mail.
+    with Box(allow=ALLOWED) as b:
+        for i30, (key30, val30) in enumerate((("subject", "the\r\nplan"), ("message_id", "<m2@allowed.example>\nX: y"),
+                                              ("references", ["<m1@allowed.example>\r"]))):
+            id30 = "20261021-crlf30-%d" % i30
+            os.makedirs(os.path.join(r.INBOX, id30))
+            with open(os.path.join(r.INBOX, id30, "message.json"), "w") as f:
+                json.dump(dict({"from": ALLOWED, "to": [RCPT], "subject": "s", "message_id": "<m@allowed.example>",
+                                "references": []}, **{key30: val30}), f)
+            with FakeWorker() as w:
+                env30 = {k30: "" for k30 in r.SEND_KEYS if k30 not in Box.KEYS}
+                env30.update({"MAIL_SEND_URL": w.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                              "MAIL_SEND_ALLOW": ALLOWED})
+                saved30 = {k30: os.environ.get(k30) for k30 in env30}
+                err30 = sys.stderr
+                os.environ.update(env30)
+                sys.stderr = io.StringIO()
+                try:
+                    rc30 = r.cmd_reply(r.flags([id30, "--body", "yes"]))
+                    said30 = sys.stderr.getvalue()
+                finally:
+                    sys.stderr = err30
+                    for k30, v in saved30.items():
+                        if v is None:
+                            os.environ.pop(k30, None)
+                        else:
+                            os.environ[k30] = v
+                calls30 = len(w.calls)
+            k(rc30 == 1 and calls30 == 0 and ("the stored mail's %s carries a line break" % key30) in said30,
+              "`cc-mail reply` to a stored mail whose %s carries a line break is refused with a plain line naming it, "
+              "and nothing reaches the worker" % key30)
+
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0
 
