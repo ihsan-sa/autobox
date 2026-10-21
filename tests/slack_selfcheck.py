@@ -10212,13 +10212,15 @@ def run_selfcheck():
           and "own seat" not in r_esc_bob.get("text", ""))
     # A cc-notify that TIMES OUT after filing the request is not a failed escalation (a member was told it failed after
     # the seat answered in 39 s): its own requests dir, one ask that files and then hangs, one that hangs having filed
-    # nothing, and one whose only file of that title is from before the ask.
+    # nothing, one whose only file of that title is from before the ask, and two from one workspace where only the
+    # first filed (every escalation from a workspace has the same title; the text is what tells them apart). A filing
+    # ask writes its own text, the body it was handed.
     reqD, was_reqs, was_impl = tempfile.mkdtemp(prefix="cc-slack-selfcheck-req-"), globals()["REQUESTS"], EFFECTS.run_impl
     def hang(write=None):
         def impl(cmd, **kw):
             if write:
                 os.makedirs(os.path.dirname(f"{reqD}/{write[0]}"), exist_ok=True)
-                json.dump(write[1], open(f"{reqD}/{write[0]}", "w"))
+                json.dump(dict(write[1], text=cmd[-1]), open(f"{reqD}/{write[0]}", "w"))
             raise subprocess.TimeoutExpired(cmd, 60)
         return impl
     now_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -10233,6 +10235,11 @@ def run_selfcheck():
         EFFECTS.run_impl = hang(("req-old.json", {"id": "req-old", "from": "alice", "title": "alice: a member's escalation",
                                                  "at": "2026-01-01T00:00:00Z"}))
         r_old = dmMS.member_verb("alice", {"escalate": "stuck", "text": "help"}, "escalate")
+        shutil.rmtree(reqD); os.makedirs(reqD)
+        EFFECTS.run_impl = hang(("req-one.json", {"id": "req-one", "from": "alice", "title": "alice: a member's escalation", "at": now_s}))
+        r_one = dmMS.member_verb("alice", {"escalate": "stuck", "text": "the build is red"}, "escalate")
+        EFFECTS.run_impl = hang()   # req-one is still on file, same workspace and title, at or after this ask
+        r_other = dmMS.member_verb("alice", {"escalate": "stuck", "text": "the disk is full"}, "escalate")
         # …and cc-loop's stop (titled with an own track) recovered the same way still reaches the workspace's own seat;
         # a broker that raises is that line's failure only. `notify`/`broker` are what each one does: an exit code or
         # an exception to raise; a filing cc-notify writes the request first.
@@ -10240,7 +10247,7 @@ def run_selfcheck():
             def impl(cmd, **kw):
                 seen.append(list(cmd))
                 if cmd[0].endswith("/cc-notify") and write:
-                    json.dump(dict(write, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())), open(f"{reqD}/{write['id']}.json", "w"))
+                    json.dump(dict(write, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), text=cmd[-1]), open(f"{reqD}/{write['id']}.json", "w"))
                 rc = notify if cmd[0].endswith("/cc-notify") else broker
                 if isinstance(rc, BaseException):
                     raise rc
@@ -10267,6 +10274,11 @@ def run_selfcheck():
           r_filed.get("ok") is True and "req-a" in r_filed.get("text", "")
           and r_lost.get("ok") is False and "did not return" in r_lost.get("error", "")
           and r_old.get("ok") is False)
+    check("MEMBER socket: of two escalations from one workspace (the same title), one filed and one whose cc-notify timed "
+          "out having filed nothing, the timed-out one is reported as not filed — the request on file is matched by its "
+          "text, not the workspace's title (escalation-filed-check-matches-its-own-request)",
+          r_one.get("ok") is True and "req-one" in r_one.get("text", "")
+          and r_other.get("ok") is False and "req-one" not in json.dumps(r_other))
     seat_call = [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", "alice", "loop: alice/pna was refused — every model refused"]
     check("MEMBER socket: cc-loop's stop whose cc-notify exited nonzero or timed out AFTER filing the request still hands "
           "the workspace's own seat its `loop:` line, and the reply names the request and that seat; a broker inject "
