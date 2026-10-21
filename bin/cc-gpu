@@ -15,9 +15,8 @@
 #        enough free after --wait-max seconds (default 0, which waits as long as it takes). REFUSED too, exit 4: the
 #        queue's lock cannot be opened, as when a link sits at ~/.cc/gpu/lock (it is never followed).
 #        THE LOCK IS NOT TRUSTED BLINDLY: the job that takes it writes its pid and pid namespace into it. When it is
-#        busy and its holder is gone, is not a cc-gpu process, or named no pid, a fresh lock file is put in its place
-#        and the job queues on that; where it cannot be replaced (a sandbox, where the file is bound) the job is
-#        admitted without it. The holder is the one /proc/locks names, else the pid written in the lock; one written
+#        busy and its holder is gone, is not a cc-gpu process, or named no pid, the job queues on a POSIX lock of the
+#        same file instead (the file is never replaced, so a sandbox that bound it still queues with the host). The holder is the one /proc/locks names, else the pid written in the lock; one written
 #        from another pid namespace cannot be checked and is waited for.
 #   cc-gpu ffmpeg -- <ffmpeg args...>
 #        an x264/x265 encode on the GPU when there is a card: `-c:v libx264` becomes h264_nvenc and `libx265` hevc_nvenc,
@@ -197,13 +196,12 @@ def run(argv):
             os.ftruncate(lk, 0); os.pwrite(lk, f"{os.getpid()} {pidns()}\n".encode(), 0); break
         except BlockingIOError:
             why = holder(lk)
-            if why:   # "a lock held by a dead or foreign holder is taken back rather than trusted"
-                print(f"cc-gpu: the queue's lock is held by {why}; taking it back", file=sys.stderr)
+            if why:   # a lock held by a dead or foreign holder is not waited for: queue on a POSIX lock of the same file instead
                 try:
-                    os.close(opened(lock + ".new", os.O_RDWR)); os.replace(lock + ".new", lock)
-                    os.close(lk); lk = opened(lock, os.O_RDWR); continue
-                except OSError:   # a bound lock (a sandbox) cannot be replaced: admitted without it
-                    break
+                    fcntl.lockf(lk, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+                    print(f"cc-gpu: the queue's lock is held by {why}; queueing beside it", file=sys.stderr); break
+                except OSError:
+                    pass
             if wait_max and time.time() - t0 > wait_max:
                 print(f"cc-gpu: gave up: the queue was still busy after {wait_max:g} s", file=sys.stderr); return GAVE_UP
             time.sleep(poll)
@@ -410,11 +408,13 @@ def selfcheck():
             while not os.path.exists(ready) or not open(ready).read(): time.sleep(0.05)
             if kind != "forged": h.wait()   # the pid that took the lock is gone; its child holds it on
             r = go(["run", "--vram", "100", "--wait-max", "2", "--", "touch", os.path.join(q, "ran")], CC_GPU_DIR=q)
-            t(f"a {kind} lock (its holder {says}) is taken back: the job runs, and says so",
+            t(f"a {kind} lock (its holder {says}) is queued beside: the job runs, and says so",
               (r.returncode, os.path.exists(os.path.join(q, "ran")), says in r.stderr), (0, True, True))
-            r = go(["run", "--vram", "100", "--wait-max", "2", "--", "true"], CC_GPU_DIR=q)
-            t(f"…and the next job queues on the fresh lock without taking anything back",
-              (r.returncode, "taking it back" in r.stderr), (0, False))
+            a = subprocess.Popen([sys.executable, me, "run", "--vram", "100", "--", "sleep", "4"], env=env(CC_GPU_DIR=q, CC_GPU_SETTLE="10"))
+            time.sleep(1.5)   # a second holder of the same old file: the two still serialise
+            r = go(["run", "--vram", "100", "--wait-max", "1", "--", "true"], CC_GPU_DIR=q)
+            t(f"…and a second job beside the first on the same {kind} lock waits its turn (gives up, exit 5)", r.returncode, 5)
+            a.wait()
             os.kill(int(open(ready).read()), signal.SIGKILL); h.wait()
         # a link at the log is not written through
         os.remove(os.path.join(tmp, "q", "jobs.jsonl")); target = os.path.join(tmp, "elsewhere")
