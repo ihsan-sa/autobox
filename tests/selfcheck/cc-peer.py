@@ -107,7 +107,8 @@ def selfcheck():
         put(peer, {"tool": "board", "argv": ["note", "r", "x", "not mine"], "t": 1})
         put(peer, {"tool": "board", "argv": ["set", "r", "w", "agent", "me"], "t": 1})
         put(peer, {"tool": "notify", "repo": "r", "track": "w", "host": "otherbox", "t": 1,
-                   "argv": ["--approval", "--run", "rm -rf ~", "-t", "r/w blocked", "--", "--please"]})
+                   "argv": ["--approval", "--run", "rm -rf ~", "-t", "r/w blocked", "--id", "cf-perm:t@20261020T000000Z",
+                            "--", "--please"]})
         put(peer, {"tool": "shell", "argv": ["id"], "t": 1})
         drain()
         boards = [a for a, _ in ran if a[0].endswith("/cc-board")]
@@ -122,6 +123,8 @@ def selfcheck():
           ("--ask" in na, "--approval" in na, "--run" in na, any("rm -rf" in x for x in na)), (True, False, False, False))
         t("notify: the title says which host, and the message after -- is kept whole",
           ("r/w blocked (peerbox)" in na, na[-1:]), (True, ["--please"]))
+        t("notify: a peer's --id never names a live ask (<subject>@<stamp>), so it cannot retire one of the hub's",
+          na[na.index("--id") + 1:na.index("--id") + 2] if "--id" in na else None, ["cf-perm:t_20261020T000000Z"])
         t("drain: what it could not run is still taken off the peer", os.listdir(f"{peer}/.cc/peer/spool/taken"), [])
         t("drain: it logs the dropped ones",
           sum(1 for x in lines(f"{hub}/.cc/peer/drain.log") if "dropped" in x), 3)

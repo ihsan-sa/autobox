@@ -5746,15 +5746,17 @@ def run_selfcheck():
                 ts = kw.get("latest")
                 return {"ok": True, "messages": [{"ts": ts}] if (kw.get("channel"), ts) in here else [{"ts": "1.000000"}]}
             if method == "conversations.replies":
-                if kw.get("channel") == "CGONE":
-                    raise RuntimeError("conversations.replies: channel_not_found")
+                if kw.get("channel") in ("CGONE", "CLEFT"):
+                    raise RuntimeError("conversations.replies: " + ("thread_not_found" if kw.get("channel") == "CGONE"
+                                                                    else "channel_not_found"))
                 return {"ok": True, "messages": [{"ts": kw.get("ts")}]}
             return {"ok": True}
         save_table(OWNER_ASKS, {k: dict(v, text=k, at=1) for k, v in {
             "CAPPR:301.000100": {"chat": "CAPPR", "ts": "301.000100", "thread": ""},          # never closes, still there
             "CREPO:302.000100": {"chat": "CREPO", "ts": "302.000100", "thread": "", "id": "disk@20261019T000000Z"},
             "CDEL:303.000100": {"chat": "CDEL", "ts": "303.000100", "thread": ""},             # deleted while the daemon was down
-            "CGONE:304.000100": {"chat": "CGONE", "ts": "304.000100", "thread": "40.000100"},  # its channel is gone
+            "CGONE:304.000100": {"chat": "CGONE", "ts": "304.000100", "thread": "40.000100"},  # its thread is gone
+            "CLEFT:306.000100": {"chat": "CLEFT", "ts": "306.000100", "thread": "41.000100"},  # private, the bot left it
             "CKILL:305.000100": {"chat": "CKILL", "ts": "305.000100", "thread": ""}}.items()})
         said = []
         real_logOA, globals()["log"] = globals()["log"], lambda *a: said.append(" ".join(map(str, a)))
@@ -5769,9 +5771,10 @@ def run_selfcheck():
             globals()["log"] = real_logOA
         check("owner asks: A CARD THAT NEVER CLOSES stays while Slack has it; one deleted (on_edit, our own card too) "
               "or no longer in Slack (owner_asks_sweep) is retired, and a newer ask on the same live_id subject "
-              "supersedes the old one — each retirement a log line, and nothing is dropped on age alone",
+              "supersedes the old one — each retirement a log line, and nothing is dropped on age alone; "
+              "channel_not_found retires nothing (a private channel the bot left says it too)",
               sorted(swept) == ["CDEL:303.000100", "CGONE:304.000100"]
-              and oa_open() == ["CAPPR:301.000100", "CREPO:401.000100"]
+              and oa_open() == ["CAPPR:301.000100", "CLEFT:306.000100", "CREPO:401.000100"]
               and len([x for x in said if "retired" in x]) == 4
               and any("superseded by CREPO:401.000100" in x for x in said)
               and any("CKILL:305.000100, its card was deleted" in x for x in said))

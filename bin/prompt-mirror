@@ -36,7 +36,9 @@ else decides:
     pass moves it into its folder whatever it holds. A file at the top the state does not know is left alone.
 A draft not where its `dir` says (a pass killed after a move, before the state was saved) is looked for in every
 folder and at the top, and taken up where it is found. A draft deleted by hand comes back from git, which is also
-how an edit is dropped. A source that left git takes
+how an edit is dropped. A draft it cannot read (a link, not UTF-8, over MAX_BYTES), or one map.json has no entry for
+(the state was lost), is left as it is and logged unless it already is git's text; and a move never replaces a draft
+of the same name. A source that left git takes
 its draft with it unless the draft is edited, which is then left alone and never pushed. Passes repeat until one
 finds nothing to do, so a save made while a PR was being opened is not lost to the path unit's single trigger.
 """
@@ -347,9 +349,10 @@ def merge3(ours, base, theirs):   # → (merged text, 0 or the number of clashes
 def one_pass(state, srcs, where):   # → True when it did anything (wrote or moved a draft, or opened a PR)
     md, did = mirror_dir(), False
     for name in sorted(set(state) | set(srcs)):
-        st, draft = state.get(name), None
+        st, draft, dp = state.get(name), None, None
         for d in (st.get("dir", ""), *FOLDERS, "") if st else (where[name],):   # no `dir`: the flat mirror's, at the top
-            if (draft := read(dp := os.path.join(md, d, name))) is not None:   # a pass cut short after a move saved no `dir`
+            if os.path.lexists(p := os.path.join(md, d, name)):   # a pass cut short after a move saved no `dir`
+                dp, draft = p, read(p)
                 if st and d:
                     st["dir"] = d
                 elif st:
@@ -366,13 +369,19 @@ def one_pass(state, srcs, where):   # → True when it did anything (wrote or mo
                 os.remove(dp); did = True
             state.pop(name, None)
             continue
+        if dp and draft != src and (st is None or draft is None):   # nothing says it is unedited: never written over
+            log(f"{name}: left as it is, " + ("unread (a link, not UTF-8 or over 256 KiB)" if draft is None else "not in map.json"))
+            continue
         if st is None or draft is None:   # new, or deleted by hand: made from git, in its folder
             write(os.path.join(md, where[name], name), src)
             state[name] = {"repo": repo, "path": path, "dir": where[name], "base": src, "sent": src}; did = True
             continue
         if st.get("dir") != where[name] and ("dir" not in st or draft == st["base"]):   # an edited draft moves only off the flat mirror
-            os.replace(dp, new := os.path.join(md, where[name], name))
-            dp = new; st["dir"] = where[name]; did = True
+            if os.path.lexists(new := os.path.join(md, where[name], name)):
+                log(f"{name}: not moved, {where[name]} already has a draft of that name")
+            else:
+                os.replace(dp, new)
+                dp = new; st["dir"] = where[name]; did = True
         if draft == st["base"]:   # unedited: follows git
             if src != draft:
                 write(dp, src); st.update(base=src, sent=src); did = True
@@ -721,6 +730,26 @@ def selfcheck():
         t("…once: the next pass says nothing", f.calls(), "")
         os.remove(f.path(C)); sync()
         t("a draft deleted by hand comes back as git's text, proposing nothing", (f.draft(C), f.calls()), ("their rules\n", ""))
+
+        f = Fixture(root, next(k))
+        os.remove(f"{f.md}/.state/map.json")
+        f.save(W, mine); sync()
+        t("a lost map.json: an edited draft is left as it is, and nothing is proposed", (f.draft(W), f.calls()), (mine, ""))
+
+        for label, junk in (("over 256 KiB", b"x" * (MAX_BYTES + 1)), ("not UTF-8", b"\xffmy edit\n")):
+            f = Fixture(root, next(k))
+            with open(f.path(W), "wb") as h:
+                h.write(junk)
+            f.land(WP, "git moved\n"); sync()
+            with open(f.path(W), "rb") as h:
+                t(f"a draft {label} is left as it is, not made again from git", (h.read(), f.calls()), (junk, ""))
+
+        f = Fixture(root, next(k))
+        write(f"{f.md}/5-quiet/{B}", "mine\n")
+        f.put("core/bin/tool", "code v2\n"); git(f.rd, "add", "-A"); commit_at(f.rd, OLD)   # the repo goes quiet
+        sync()
+        t("a move never replaces a draft of the same name in its new folder",
+          (read(f"{f.md}/5-quiet/{B}"), read(f"{f.md}/3-box/{B}")), ("mine\n", "builder\n"))
 
         f = Fixture(root, next(k))
         f.save(C, "kept edit\n")
