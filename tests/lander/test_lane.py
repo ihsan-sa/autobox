@@ -3390,6 +3390,40 @@ class Review(Fixture):
         self.assert_clean(J.read_json(J.handed_path("demo", 1))["why"], prefix)
         self.assert_clean(u["cards"].calls[0][2], prefix)
 
+    def test_a_red_on_a_main_that_moved_is_gated_again_not_handed_back(self):
+        """#1468, 10-20: queued, then main took a fix (#1471) while its gate ran on the old main, which failed it.
+        The red is gated again on the main it would merge into, which passes, so it lands, never handed back."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        runner = Runner(status={"a": T.FAILED})
+
+        def hook(name, count):
+            if count == 1:   # main takes the fix mid-gate; this run still fails on the old main
+                self.push("main", {"b/fix": "10\n"}, fresh=False)
+            else:
+                runner.status.clear()
+        runner.hook = hook
+        self.land(runner=runner)
+        self.assertFalse(os.path.exists(J.handed_path("demo", 1)))
+        self.assertEqual(len(runner.calls), 2)
+        self.assertNotEqual(runner.calls[0][1], runner.calls[1][1])   # the second gate's tree is the new main's
+        self.assertRegex(self.log(), r"gate=a ok=no secs=\d+\n\S+\tstage demo#1 queued\n")   # back, not handed
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "show", "main:b/fix"), "10")
+
+    def test_a_red_again_on_a_newer_main_is_handed_back_after_one_regate(self):
+        """Opus read of #1767: main moves under every gate, so a PR that is really red is gated again once at its
+        head, then handed back naming both mains, never re-queued without end."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        runner = Runner(status={"a": T.FAILED})
+        runner.hook = lambda name, count: self.push("main", {f"b/m{count}": "x\n"}, fresh=False)
+        self.land(runner=runner)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertTrue(os.path.exists(J.handed_path("demo", 1)))
+        mains = re.search(r"red on (\w{12}) and again on (\w{12})", J.read_json(J.handed_path("demo", 1))["why"])
+        self.assertNotEqual(mains[1], mains[2])
+
 
 class HeldRereads(Fixture):
     """A held job re-reads the PR's state and head when it is looked at again (2026-09-30: a PR sat closed for days,

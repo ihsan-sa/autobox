@@ -117,7 +117,9 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so no check
              runs on for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
              it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED (a red run.judge
-             saw twice on the same tree) -> handback; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
+             saw twice on the same tree) -> handback, or queued again when main has moved off base_sha since (#1468:
+             a fix main took mid-gate), once per head (extra regated), so a red again on the newer main is handed
+             back naming both mains; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
              a red whose failing cases are all red on the base too (run.no_new_reds, the ratchet) passes, with
              `stage … gate ok=ratchet` and a `ratchet <repo>#<pr> check= pr_reds= main_reds=` line naming both sets;
              blocked-by-main (red on the base tree too, with a case the base does not fail or none named) -> held 15
@@ -1460,9 +1462,24 @@ class Lane:
                 and retry.get("head") == job.head:   # red twice at this head before it was handed back, green now
             E.log("flake", job.repo, job.pr, check=n, head=job.head[:12], on="retry")
             job.extra.pop("retry")
-        if o.status == T.FAILED:   # the handed record names it, so a green on the retry at this head is a flake
+        if o.status == T.FAILED:
+            # #1468 (10-20): the gate ran on the main of its queueing, and a fix main took meanwhile turned the red
+            # into a handback; a red is the PR's only on the main it would merge into, so a moved main gates it again,
+            # once per head: a red again on the newer main is the PR's own (main moves faster than a gate runs)
+            regated = job.extra.get("regated") if isinstance(job.extra.get("regated"), dict) else {}
+            if regated.get("head") != job.head:
+                with self.lock():
+                    now = self.fetch(base_ref)[base_ref]
+                if now != job.base_sha:
+                    self.stop_checks(job)
+                    job.extra["regated"] = {"head": job.head, "main": job.base_sha}
+                    return J.move(job, T.QUEUED, why=f"check {n} failed on {base_ref} {job.base_sha[:12]}, which "
+                                                     f"has moved to {now[:12]}: gated again on it")
+            # the handed record names it, so a green on the retry at this head is a flake
             job.extra["red"] = {"check": n, "head": job.head}
-            return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
+            again = (f", red on {(regated.get('main') or '')[:12]} and again on {job.base_sha[:12]}"
+                     if regated.get("head") == job.head else "")
+            return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]}{again})"
                                       + (f": {J.quoted(o.note)}" if o.note else ""))   # a gate's line
         if o.status == RUN.BLOCKED and job.extra.get("light") is True:
             # security read of #1316: since the ratchet, blocked-by-main means reds it refused (a security check, a

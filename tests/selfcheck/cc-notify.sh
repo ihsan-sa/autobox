@@ -453,6 +453,9 @@ PY
   mkdir -p "$T/rwt/.cc"; printf 'demorepo\nrtrack\nsid\n' > "$T/rwt/.cc/track"; rm -rf "$NH/.cc/approvals"
   NC "$T/rwt" --approval --run "echo from a worker" -t "demorepo approval" "may a worker's card run this?"
   k "$(yes_ test "$(no_ test -s "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(grep -c 'nothing posted' "$T/err")" = 001)" "--run from a worker is refused whole: nothing posted, no record, one stderr line"
+  # #1757 let a permission-worded --approval --run past the permission-words check; a seat that is not the control seat must still be refused
+  NC "$T/rwt" --approval --run "cc-guard repin" -t "demorepo approval" "repin the guard so the sudo rule holds"; rc=$?
+  k "$(yes_ test "$rc$(no_ test -s "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(no_ test -e "$T/refusals.args")" = 2000)" "a permission-worded --approval --run from a non-control seat is still refused: exit 2, nothing posted, no record, nothing filed with perms"
   N --decision --run "echo on a decision" -t "demorepo blocked" "does a decision card run this?"
   k "$(yes_ test "$(no_ grep -q "^post" "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")" = 00)" "--run on anything but --approval is refused, nothing posted"
   : > "$T/slack.args"
