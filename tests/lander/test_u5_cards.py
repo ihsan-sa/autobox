@@ -170,17 +170,18 @@ class Routes(Stubbed):
     def test_member_stop_goes_to_its_channel_not_a_route_title(self):
         j = self.job(repo="h--t", member="h")
         C.stopped(j, "a check is red", "#h")
-        pid = f"land:h--t:7:stopped@{Q}"
+        text = "[h--t] PR #7: NOT merged ❌ — a check is red."
         self.assertEqual(self.argvs("cc-slack"), [
-            ["cc-slack", "post", "-c", "#h", "--id", pid, "[h--t] PR #7: NOT merged ❌ — a check is red."]])
+            ["cc-slack", "post", "-c", "#h", "--id", f"land:h--t:7:stopped@{C.head_reason(j, text)}", text]])
 
     def test_seat_stop_is_routed_and_injected_once(self):
         C.stopped(self.job(), "a check is red", "seat")
         C.stopped(self.job(), "a check is red", "seat")
+        text = ("[demo] PR #7: NOT merged ❌ — a check is red. The track's seat fixes it and pushes; the lane takes the "
+                "new head.")
         self.assertEqual(self.argvs("cc-slack post"), [
-            ["cc-slack", "post", "--route", "[demo] PR #7 stopped", "--id", f"land:demo:7:stopped@{Q}",
-             "[demo] PR #7: NOT merged ❌ — a check is red. The track's seat fixes it and pushes; the lane takes the "
-             "new head."]])
+            ["cc-slack", "post", "--route", "[demo] PR #7 stopped", "--id",
+             f"land:demo:7:stopped@{C.head_reason(self.job(), text)}", text]])
         self.assertEqual(self.argvs("cc-slack inject"), [
             ["cc-slack", "inject", "demo", "[demo] PR #7 landing stopped: a check is red. The way back in: fix it and "
              "push; the lane takes the new head."]])
@@ -218,7 +219,7 @@ class Routes(Stubbed):
             post = self.argvs("cc-slack post")[-1]
             self.assertEqual(post[:5], ["cc-slack", "post", "--route", f"[demo] PR #{10 + i} stopped", "--id"])
             ask = self.argvs("cc-notify")[-1]
-            self.assertEqual(ask[:6], ["cc-notify", "--ask", "--id", f"land:demo:{10 + i}:query@{Q}", "-t",
+            self.assertEqual(ask[:6], ["cc-notify", "--ask", "--id", f"land:demo:{10 + i}:query@{C.head_reason(j, ask[-1])}", "-t",
                                        "demo landing"])
             self.assertEqual(ask[-1], post[-1])
             self.assertIsNone(self.calls("cc-notify")[-1]["role"])
@@ -243,8 +244,8 @@ class Routes(Stubbed):
         # lander-self stays the planning seat's, and so does a member's stop
         C.stopped(T.Job(repo="dispatch", pr=22, extra={"queued_at": Q}), why, "lander-self")
         C.stopped(T.Job(repo="h--t", pr=23, member="h", extra={"queued_at": Q}), why, "planning")
-        self.assertEqual([a[3] for a in self.argvs("cc-notify")],
-                         [f"land:dispatch:22:query@{Q}", f"land:h--t:23:query@{Q}"])
+        self.assertEqual([a[3].rsplit("@", 1)[0] for a in self.argvs("cc-notify")],
+                         ["land:dispatch:22:query", "land:h--t:23:query"])
         self.assertEqual(len(self.argvs("cc-broker inject")), 2)
 
     def test_a_held_pr_tells_its_seat_once_per_head_and_reason(self):
@@ -260,11 +261,18 @@ class Routes(Stubbed):
             f"[dispatch] PR #40: NOT merged ❌ — {why}. It is dispatch's own seat's to settle.",
             "[dispatch] PR #40: NOT merged ❌ — a check is red. It is dispatch's own seat's to settle."])
 
+    def test_the_stop_line_posts_once_per_head_and_reason(self):
+        why = "check x runs the head's code on the host, so it waits for perms' security LAND"
+        for at in (Q, "2026-09-27T00:05:00Z"):
+            C.stopped(T.Job(repo="demo", pr=41, head=HEAD, extra={"queued_at": at}), why, "seat")
+        self.assertEqual(len(self.argvs("cc-slack post")), 1)
+        C.stopped(T.Job(repo="demo", pr=41, head="c" * 40, extra={"queued_at": Q}), why, "seat")
+        self.assertEqual(len(self.argvs("cc-slack post")), 2)
+
     def test_a_stop_the_broker_refuses_still_reaches_planning(self):
         self.answer({"cc-broker inject": [1, "broker down"]})
         C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
-        self.assertEqual([a[:4] for a in self.argvs("cc-notify")],
-                         [["cc-notify", "--ask", "--id", f"land:dispatch:30:query@{Q}"]])
+        self.assertEqual([a[3].rsplit("@", 1)[0] for a in self.argvs("cc-notify")], ["land:dispatch:30:query"])
         self.answer({})
         C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
         self.assertEqual(len(self.argvs("cc-broker inject")), 2)   # not marked told: the next stop tries it again

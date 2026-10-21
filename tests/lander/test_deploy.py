@@ -720,7 +720,7 @@ class TestCards(Box):
         C.stopped(self.job(), "a check is red", "seat")
         self.assertEqual(len(box.called("cc-slack post")), 1)
         self.assertEqual(len(box.called("cc-slack inject")), 1)
-        self.assertIn("land:demo:7:stopped@2026-09-27T00:00:00Z", box.called("cc-slack post")[0]["argv"])
+        self.assertTrue(any(a.startswith("land:demo:7:stopped@") for a in box.called("cc-slack post")[0]["argv"]))
 
     def test_a_refused_card_is_retried_up_to_say_tries(self):
         box = self.fake(**{"cc-slack post": (1, "slack down")})

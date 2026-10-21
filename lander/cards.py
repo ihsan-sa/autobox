@@ -312,8 +312,8 @@ def retry():
     mark_sent(*sent)
 
 
-def post(job, kind, text, args):
-    pid = producer_id(job, kind)
+def post(job, kind, text, args, pid=None):
+    pid = pid or producer_id(job, kind)
     return say(pid, [slack(), "post", *args, "--id", pid, text], job.repo, job.pr)
 
 
@@ -734,9 +734,10 @@ def stopped(job, why, route):
     known = route in ("seat",) + QUERY_ROUTES or route.startswith("#")
     if not known and not job.extra.get("chat"):
         args = ["--route", route]
-    said = post(job, "stopped", text, args)
+    held = lambda kind: f"land:{job.repo}:{job.pr}:{kind}@{head_reason(job, text)}"
+    said = post(job, "stopped", text, args, held("stopped"))
     if (not tell_own_seat(job, text)) if mine else route in QUERY_ROUTES:   # a refused hand-off still reaches planning
-        sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", producer_id(job, "query"), "-t", f"{job.repo} landing",
+        sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", held("query"), "-t", f"{job.repo} landing",
             text], timeout=60, **box_hand())
     if not job.member and not mine and route in ("seat", "query"):
         sent = read_json(_sent_path(), []) or []
@@ -764,13 +765,18 @@ def own_seat(job, route):
     return route in ("query", "planning") and not job.member and job.repo != control_repo()
 
 
+def head_reason(job, text):
+    """`<head>:<hash of text>`: a stop notice keyed on this says a held PR once per head and reason, not once per queuing."""
+    return f"{(job.head or '')[:12]}:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+
+
 def tell_own_seat(job, text):
     """The stop into the repo's own seat through cc-broker, once per head and words: source `lander`, so ordinary
     stops that come in a run are one broker digest there rather than a wake each (a line asking for a choice still
-    wakes it at once). Keyed on the head and the text, not queued_at: on 10-21 five PRs held for perms' read woke the
+    wakes it at once). Keyed on the head and the text (head_reason), not queued_at: on 10-21 five PRs held for perms' read woke the
     lessons seat once per lane pass, each queued again at the same head and reason. True when the broker took it (or
     did before); False files the planner request instead (stopped)."""
-    pid = f"land:{job.repo}:{job.pr}:own-seat@{job.head[:12]}:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+    pid = f"land:{job.repo}:{job.pr}:own-seat@{head_reason(job, text)}"
     if pid in (read_json(_sent_path(), []) or []):
         return True
     rc, out = sh([broker(), "inject", "--no-start", "--source", "lander", job.repo, text], timeout=120)
