@@ -9,7 +9,7 @@
   cc-slack live-id <SUBJECT>          the producer id of the one live ask about SUBJECT: the newest <SUBJECT>@<stamp> on file while it is under 12 h old, else a fresh one (cc-notify --live).
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot (a PDF goes as its library link, and one not yet filed is refused); --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
   cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url> "[repo] PR #n: title — url" into #approvals, where the owner's :+1: squash-merges it — or, for a repo that lands itself (any not in CC_SELF_LAND_EXCEPT), into #<repo>-updates (a channel-less child's: its parent's, per CC_PROJECT_CHILDREN) as a landing record nobody taps. One card per PR — a repeat call finds the first and does nothing (--force re-posts); a merged/closed PR's card is edited to "landed ✓" instead (--landed: on the caller's word).
-  cc-slack approvals-sweep [--dry-run] [--now]      edit every card whose PR is in (or closed) but still reads pending.
+  cc-slack approvals-sweep [--dry-run] [--now]      edit every card whose PR is in (or closed) but still reads pending, and retire the owner's open asks whose card Slack no longer has.
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]      read a channel or a full thread, newest first, cursor-paged.
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>      rewrite or delete one of the bot's own posts (signed ones too).
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md      pin a message; replace a channel's canvas.
@@ -80,7 +80,7 @@ A :+1: on cc-model's return card — `[return] <window>: Fable 5.1 is back…`, 
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands and @alias hand-offs.
 The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!restart <box|repo[/track]|slack|tmux>`, `!reboot`, `!handoff`, `!status` and `!needs`, owner-only, any channel or thread; anything else typed is a message to the session.
-`!status` reads back what runs, lands and idles; `!needs` reads back NEEDS YOU, which includes every post that paged the owner (a 🔒 with his mention, or a DM to his user id) until he replies in its thread, reacts to it, or a week passes (owner-asks.json).
+`!status` reads back what runs, lands and idles; `!needs` reads back NEEDS YOU, which includes every post that paged the owner (a 🔒 with his mention, or a DM to his user id) until he replies in its thread, reacts to it, or its card is deleted, replaced by a newer ask on the same subject, or gone from Slack (owner-asks.json).
 `!pause` parks this channel's project and everything declared under it, queuing what arrives; `!resume` unparks it; a project parked on its own stays parked when its parent resumes.
 `!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
 ~/.cc/state/owner-words.jsonl is the owner's own words: a line per message he sends where the daemon hears him, and per edit or deletion of one. It is a cache, not evidence: cc-infer fetches a cited message from Slack itself, and reads a deletion here as revoking every goal citing it.
@@ -538,15 +538,17 @@ def at_token(text, bot_user=None):
     return m.group(1).lower() if m else None
 
 ALIAS_MENTION_RE = re.compile(r"(^|[\s(\[*_~])@([A-Za-z0-9][A-Za-z0-9._-]*)")   # MENTION_RE, plus *bold*/_italic_ around it
+URL_TEXT_RE = re.compile(r"<(?:https?|mailto):[^<>\n]*>|(?<!\S)[^\s@]*/\S*")   # a <link>, or a word with a / before any @: a URL
 
 def alias_mentions(text):
-    """The @tokens a post addresses, lowercased, once each. Nothing in a ``` fence, `code` span or > line counts."""
+    """The @tokens a post addresses, lowercased, once each. Nothing in a ``` fence, `code` span, > line or URL counts
+    (raised-slack-reply-reads-at-in-a-url-as-a-handoff: board.example.com/to/box@whiteboard woke planning)."""
     found = []
 
     def grab(t):
         for line in t.split("\n"):
             if not re.match(r"\s*(>|&gt;)", line):
-                for m in ALIAS_MENTION_RE.finditer(line):
+                for m in ALIAS_MENTION_RE.finditer(URL_TEXT_RE.sub(" ", line)):
                     tok = m.group(2).rstrip("._-").lower()
                     if tok and tok not in found:
                         found.append(tok)
@@ -1370,7 +1372,7 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
         receipt("posted", where or chat, first, thread, session=poster_window())
     if first and (owner_asked(cfg, chat, text) if ask is None else ask):
         try:                         # the post went out; a ledger that cannot be written never unsends it
-            owner_ask_open(cfg, where or chat, thread, first, text)   # a DM sent to his user id is recorded under its D… id
+            owner_ask_open(cfg, where or chat, thread, first, text, pid=meta)   # a DM sent to his user id is recorded under its D… id
         except Exception as e:
             log(f"{OWNER_ASKS}: {e!r}")
     if mail:
@@ -1403,8 +1405,9 @@ def react(cfg, chat, ts, name, remove=False, thread=None):
 # he answers: a reply in its thread, a later top-level word in the same DM, or any reaction. Home's NEEDS YOU and `!needs`
 # read this one table. A CLI `post` and the daemon both write it, so a file lock guards it, not TABLE_LOCK.
 # HIS ANSWER CAN ARRIVE FIRST (a CLI post still awaiting getPermalink), so answers are kept OWNER_ASK_RACE under a "_"
-# key, and an ask one of them already answers is never opened. An unanswered ask stays until he answers it or its card
-# is closed (owner 2026-10-20: nothing drops an ask on a timer).
+# key, and an ask one of them already answers is never opened. An unanswered ask stays until he answers it, its card is
+# deleted, a newer ask about the same subject replaces it (live_id), or Slack says its card no longer exists
+# (owner_asks_sweep); each of those is a log line. Nothing drops an ask on a timer (owner 2026-10-20).
 OWNER_ASKS = "owner-asks.json"      # {"<chat>:<ts>": {chat, thread, ts, text, link, at}, "_<answer>": {chat, thread, ts, after, dm, at}}
 OWNER_ASK_RACE = 900                # how long an answer is kept for an ask still being registered
 
@@ -1425,18 +1428,63 @@ def owner_asks_locked():
         if json.dumps(d, sort_keys=True) != was:
             save_table(OWNER_ASKS, d)
 
-def owner_ask_open(cfg, chat, thread, ts, text, now=None):
-    """Record one ask as it goes out, with its permalink (one call, at post time, so Home never reads Slack)."""
+def owner_ask_open(cfg, chat, thread, ts, text, now=None, pid=None):
+    """Record one ask as it goes out, with its permalink (one call, at post time, so Home never reads Slack). An ask
+    posted under a live_id (`<subject>@<stamp>`) supersedes every open one about the same subject: cc-notify --live
+    mints a fresh stamp only once the old card has stood LIVE_TTL, so the new card is the one he answers."""
     now = time.time() if now is None else now
     link = msg_link(cfg, chat, ts)
     a = {"chat": chat, "thread": thread or "", "ts": ts, "link": link, "at": now,
-         "text": DECISION_HEAD_RE.sub("", str(text or "")).strip()[:400]}
+         "text": DECISION_HEAD_RE.sub("", str(text or "")).strip()[:400], **({"id": pid} if pid else {})}
+    subject = pid.rpartition("@")[0] if pid and "@" in pid else ""
     with owner_asks_locked() as d:
         if any(owner_ask_answers(a, **{f: s.get(f) for f in ("chat", "thread", "ts", "after", "dm")})
                for k, s in d.items() if k.startswith("_")):
             return False                             # he answered it before it was registered: it never waits on him
+        old = [k for k, o in d.items() if subject and not k.startswith("_") and o.get("id") != pid
+               and str(o.get("id") or "").rpartition("@")[0] == subject]
+        gone = {k: d.pop(k) for k in old}
         d[f"{chat}:{ts}"] = a
+    for k, o in gone.items():
+        log(f"{OWNER_ASKS}: retired {k}, superseded by {chat}:{ts} ({pid}) — {str(o.get('text') or '')[:80]!r}")
     return True
+
+def owner_ask_retire(chat, ts, why):
+    """Drop the ask at (chat, ts) because its card is closed or gone, with a log line saying why. True if one was open."""
+    with owner_asks_locked() as d:
+        a = d.pop(f"{chat}:{ts}", None)
+    if a is not None:
+        log(f"{OWNER_ASKS}: retired {chat}:{ts}, {why} — {str(a.get('text') or '')[:80]!r}")
+    return a is not None
+
+OWNER_ASK_GONE = ("channel_not_found", "thread_not_found", "message_not_found")   # Slack's words for a card that is not there
+
+def owner_ask_exists(cfg, a):
+    """Is ask a's card still in Slack? False only when Slack says it is gone (deleted, a tombstone, its thread or
+    channel gone); None when Slack could not be asked, which never retires anything."""
+    tok, chat, ts, thread = cfg.get("SLACK_BOT_TOKEN"), a.get("chat"), a.get("ts"), a.get("thread")
+    if not (tok and chat and ts):
+        return None
+    try:
+        if thread and thread != ts:              # a thread reply: history only holds the root
+            msgs = api("conversations.replies", tok, channel=chat, ts=thread, oldest=ts, latest=ts, inclusive="true",
+                       limit="10").get("messages") or []
+        else:
+            msgs = api("conversations.history", tok, channel=chat, latest=ts, inclusive="true", limit="1").get("messages") or []
+    except Exception as e:
+        return False if any(w in str(e) for w in OWNER_ASK_GONE) else None
+    return any(m.get("ts") == ts and m.get("subtype") != "tombstone" for m in msgs)
+
+def owner_asks_sweep(cfg, dry=False):
+    """Ages out the asks whose card no longer exists: a card deleted while the daemon was down (on_edit missed it), or
+    a channel gone. One Slack read per open ask; approvals-sweep runs it at most once per SWEEP_EVERY. The keys retired."""
+    gone = []
+    for k, a in sorted(load_table(OWNER_ASKS).items()):
+        if k.startswith("_") or not isinstance(a, dict) or owner_ask_exists(cfg, a) is not False:
+            continue
+        if dry or owner_ask_retire(a.get("chat"), a.get("ts"), "its card no longer exists in Slack"):
+            gone.append(k)
+    return gone
 
 def owner_ask_answers(a, chat, thread=None, ts=None, after=None, dm=False):
     """PURE: does his word settle ask `a`? A reaction names the message (`ts`); a reply names its thread root and its own
@@ -7506,6 +7554,11 @@ class Daemon:
         ts = (prev.get("ts") if deleted else new_msg.get("ts")) or ev.get("deleted_ts")
         if not (chat and ts):
             return
+        if deleted:                  # our own card too (unsay, or he deleted it): it no longer waits on him
+            try:
+                owner_ask_retire(chat, ts, "its card was deleted")
+            except Exception as e:
+                log(f"{OWNER_ASKS}: {e!r}")
         src = prev if deleted else new_msg
         who = src.get("user") or prev.get("user")
         if src.get("bot_id") or prev.get("bot_id") or (self.bot_user and who == self.bot_user):
@@ -11454,7 +11507,7 @@ def cmd_post_approval(argv):
     say(ts); return 0
 
 def cmd_approvals_sweep(argv):
-    """approvals-sweep [--dry-run] [--now] — cards still pending (":+1: … merges" in #approvals, "lands itself" in a log lane, the latter found through the ledger) whose PR GitHub reports MERGED/CLOSED get the "landed ✓"/"closed ✗" edit, once; catches merges the landing itself missed. cc-reconcile calls it every run; a real sweep happens at most once per SWEEP_EVERY unless --now. Exit 3 no token, 1 no channel."""
+    """approvals-sweep [--dry-run] [--now] — first the owner's open asks whose card Slack no longer has are retired (owner_asks_sweep); then cards still pending (":+1: … merges" in #approvals, "lands itself" in a log lane, the latter found through the ledger) whose PR GitHub reports MERGED/CLOSED get the "landed ✓"/"closed ✗" edit, once; catches merges the landing itself missed. cc-reconcile calls it every run; a real sweep happens at most once per SWEEP_EVERY unless --now. Exit 3 no token, 1 no channel."""
     dry, now = "--dry-run" in argv, "--now" in argv
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
@@ -11466,6 +11519,8 @@ def cmd_approvals_sweep(argv):
         age = None
     if age is not None and age < SWEEP_EVERY and not (now or dry):
         print(f"swept {int(age // 60)} min ago — next in {int((SWEEP_EVERY - age) // 60) + 1} min (--now sweeps anyway)"); return 0
+    for k in owner_asks_sweep(cfg, dry):         # before #approvals is looked up: a DM or thread ask needs no such channel
+        print(f"  owner ask {k} {'would be ' if dry else ''}retired: its card no longer exists")
     cid, member = find_channel(cfg, APPROVALS)
     if not (cid and member):
         print(f"cc-slack approvals-sweep: no #{APPROVALS} channel the bot is in", file=sys.stderr); return 1

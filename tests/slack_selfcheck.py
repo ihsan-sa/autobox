@@ -159,6 +159,10 @@ def run_selfcheck():
           lm("`@ada` and ```\n@ada\n``` but @ada") == "`@ada` and ```\n@ada\n``` but <@UADA>")
     check("mentions: an @ that is not at a word boundary is not a mention (addresses, urls, foo@bar)",
           lm("to a@b.com, see https://x/@ada, foo@bar") == "to a@b.com, see https://x/@ada, foo@bar")
+    check("mentions: an @alias inside a URL is no hand-off (raised-slack-reply-reads-at-in-a-url-as-a-handoff)",
+          alias_mentions("board: board.example.com/to/box@whiteboard") == []
+          and alias_mentions("see <https://board.example.com/to/box@whiteboard|the board> (https://x/a_@main) foo@bar") == []
+          and alias_mentions("@whiteboard look at https://board.example.com/to/box@whiteboard, @main too") == ["whiteboard", "main"])
     check("mentions: one handle two people answer to is ambiguous — never guessed, and marked as not-a-mention",
           lm("@twin vs @d.one") == "`@twin` vs <@UD1>")
     check("mentions: bots, apps, deleted accounts and Slackbot are not mentionable",
@@ -5707,6 +5711,44 @@ def run_selfcheck():
               "drops an ask on a timer)",
               [r["text"] for r in owner_ask_rows({"a": {"text": "old", "at": 0}, "b": {"text": "new", "at": 9e5}},
                                                  now=9e5 + 60)] == ["new", "old"])
+        # A CARD THAT NEVER CLOSES (perms' read of #1618): with no answer it stays, however long, but a card that is
+        # deleted, replaced by a newer ask on its subject, or gone from Slack is retired, each with a log line.
+        oa_reset()
+        here = {("CAPPR", "301.000100"), ("CREPO", "302.000100")}   # what Slack still holds
+        def oa_slack(method, token, **kw):
+            if method == "conversations.history":
+                ts = kw.get("latest")
+                return {"ok": True, "messages": [{"ts": ts}] if (kw.get("channel"), ts) in here else [{"ts": "1.000000"}]}
+            if method == "conversations.replies":
+                if kw.get("channel") == "CGONE":
+                    raise RuntimeError("conversations.replies: channel_not_found")
+                return {"ok": True, "messages": [{"ts": kw.get("ts")}]}
+            return {"ok": True}
+        save_table(OWNER_ASKS, {k: dict(v, text=k, at=1) for k, v in {
+            "CAPPR:301.000100": {"chat": "CAPPR", "ts": "301.000100", "thread": ""},          # never closes, still there
+            "CREPO:302.000100": {"chat": "CREPO", "ts": "302.000100", "thread": "", "id": "disk@20261019T000000Z"},
+            "CDEL:303.000100": {"chat": "CDEL", "ts": "303.000100", "thread": ""},             # deleted while the daemon was down
+            "CGONE:304.000100": {"chat": "CGONE", "ts": "304.000100", "thread": "40.000100"},  # its channel is gone
+            "CKILL:305.000100": {"chat": "CKILL", "ts": "305.000100", "thread": ""}}.items()})
+        said = []
+        real_logOA, globals()["log"] = globals()["log"], lambda *a: said.append(" ".join(map(str, a)))
+        try:
+            Daemon.on_edit(types.SimpleNamespace(cfg=oa_cfg), {"type": "message", "subtype": "message_deleted",
+                           "channel": "CKILL", "previous_message": {"ts": "305.000100", "bot_id": "B1"}})
+            globals()["api"] = oa_slack
+            swept = owner_asks_sweep(oa_cfg)
+            globals()["api"] = oa_fake(start=400)
+            owner_ask_open(oa_cfg, "CREPO", None, "401.000100", "*disk* still filling", pid="disk@20261020T130000Z")
+        finally:
+            globals()["log"] = real_logOA
+        check("owner asks: A CARD THAT NEVER CLOSES stays while Slack has it; one deleted (on_edit, our own card too) "
+              "or no longer in Slack (owner_asks_sweep) is retired, and a newer ask on the same live_id subject "
+              "supersedes the old one — each retirement a log line, and nothing is dropped on age alone",
+              sorted(swept) == ["CDEL:303.000100", "CGONE:304.000100"]
+              and oa_open() == ["CAPPR:301.000100", "CREPO:401.000100"]
+              and len([x for x in said if "retired" in x]) == 4
+              and any("superseded by CREPO:401.000100" in x for x in said)
+              and any("CKILL:305.000100, its card was deleted" in x for x in said))
     finally:
         globals()["api"] = real_apiOA
         oa_reset()

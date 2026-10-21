@@ -169,6 +169,23 @@ def selfcheck():
         t("late: once its tip reaches origin it lands, and the mark goes",
           ([a[1:] for a, _ in ran if "queue" in a], os.listdir(f"{hub}/.cc/peer/late")),
           ([["queue", "--task", "r", "w"]], []))
+        # …AND ITS LINE CARRIES NO SLACK MARKUP (perms' read of #1618): git's answer is the remote's to write, so a
+        # planted <!channel> or <url|text> link in it reaches the channel as plain words, never a page or a link
+        planted = "remote: <!channel> <@U0OWNER> see <https://evil.example/x|the fix>"
+        def planting(argv, env=None):
+            ran.append((list(argv), dict(env or {})))
+            return (1, planted) if "fetch" in argv else (0, "")
+        run_here = planting
+        ran.clear()
+        put(peer, {"tool": "land", "argv": ["r", "w"], "sha": "c" * 40, "t": int(time.time()) - 2 * RETRY_FOR})
+        drain()
+        line = ([a[-1] for a, _ in ran if a[0].endswith("cc-notify")] or [""])[0]
+        t("late: the line has no <…> markup left, and still says what git said",
+          ("<" in line or ">" in line, "‹!channel›" in line, "‹https://evil.example/x|the fix›" in line), (False, True, True))
+        run_here = record
+        shutil.rmtree(f"{hub}/.cc/peer/late")
+        for f in os.listdir(f"{peer}/.cc/peer/spool/taken"):
+            os.unlink(f"{peer}/.cc/peer/spool/taken/{f}")
         tip[0] = sha                               # the cases below land the first tip
         # A LINK THE WORKER PLANTED IN ITS STATE DIR IS NEVER WRITTEN THROUGH (security read of #1159): the old fixed
         # temp name pointed at a hub tool, and a state dir that is itself a link, are both left alone
