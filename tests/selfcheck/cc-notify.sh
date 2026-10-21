@@ -326,6 +326,16 @@ PY
     "[ctl] x.service is new and touches settings.json"
   k "$(yes_ test "$(no_ grep -q '^post' "$T/slack.args")$(cat "$T/out")$(head -1 "$T/refusals.args" 2>/dev/null)" = 0perms:a1234567ask)" \
     "--approval --not-perms is still filed with the permission session first and posts nothing to the owner"
+  # AN --approval --run WHOSE WORDS READ AS A PERMISSION is not held for --perms (the #1647 repin was refused here and
+  # filed twice as a plain ask with no command): PERMS FIRST takes it, command and all, with no --not-perms
+  PC --approval --run "cc-guard repin" --id repin:1647 -t "ctl approval" "repin the guard so the sudo rule holds"; rc=$?
+  k "$(yes_ test "$rc$(no_ grep -q '^post' "$T/slack.args")$(cat "$T/out")" = 00perms:a1234567)" \
+    "a permission-shaped --approval --run is filed with the permission session, not refused, and posts nothing"
+  k "$(yes_ grep -qx -- 'cc-guard repin' "$T/refusals.args")" "…carrying its command"
+  # --perms has no command to carry, so --perms --run is refused whole and names the form that carries it
+  PC --perms --run "cc-guard repin" -t "ctl blocked" "repin the guard so the sudo rule holds"; rc=$?
+  k "$(yes_ test "$rc$(no_ test -e "$T/refusals.args")" = 20)" "--perms --run is refused, exit 2, and files nothing…"
+  k "$(yes_ grep -q -- 'send it as --approval --run' "$T/err")" "…naming --approval --run as the form that carries a command"
   # the branches beside the filing: synthetic test state goes nowhere, log-only files nothing, and a ledger that
   # refuses the ask posts nothing either and exits 1, so the lander does not read it as filed
   PC --approval -t "ctl approval" "restart _cctest.service to put #9 live"
