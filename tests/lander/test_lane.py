@@ -2212,6 +2212,15 @@ class Repair(Fixture):
         self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
         self.assertIn("no row owns it", cards.calls[-1][2])
 
+    def test_a_cloud_pr_its_body_closes_a_row_for_still_goes_to_planning(self):
+        cards = Rec()
+        j = self.held_job(1, branch="cloud/fix-it-x7")
+        j.extra["body"] = "Closes row-1"
+        self.assertEqual(L.BoardRules().find_track("demo", j), "")   # the body names its row for close only
+        L.Lane("demo", self.units(repair=RP, cards=cards)).conflict(j, ["a/x"])
+        self.assertEqual(self.gos(), [])
+        self.assertIn("no row owns it", cards.calls[-1][2])
+
     def conflicting_push(self, text):
         """The round's worker pushed, but the head still conflicts; its re-queue goes through the request path."""
         self.push("track/row-1", {"a/x": text}, fresh=False)
@@ -3638,6 +3647,43 @@ class Board(Fixture):
         self.assertIn("left open: r-held, r-live", line)
         self.assertIn("no row on the board: no-such-row", line)
         self.assertNotIn("prose", line)
+
+    def test_cloud_pr_closes_its_row_merged(self):
+        self.board_file({"row-a": {"status": "review", "agent": "x"}, "row-b": {"status": "queued"}})
+        j = self.job("Fixes it.\n\nCloses row-a and row-b")
+        j.extra["branch"] = "cloud/fix-it-x7"
+        line = L.BoardRules().close(j)
+        r = self.rows()
+        self.assertEqual((r["row-a"]["status"], r["row-b"]["status"]), ("merged", "done"))
+        self.assertIn("demo/row-a -> merged", line)
+
+    def test_cloud_pr_skips_a_held_row_named_first(self):
+        self.board_file({"row-h": {"status": "queued", "held": "someone"}, "row-l": {"status": "running"},
+                         "row-a": {"status": "review", "agent": "x"}})
+        j = self.job("Closes row-h, row-l and row-a")
+        j.extra["branch"] = "cloud/fix-it-x7"
+        line = L.BoardRules().close(j)
+        r = self.rows()
+        self.assertEqual([r[n]["status"] for n in ("row-h", "row-l", "row-a")], ["queued", "running", "merged"])
+        self.assertIn("demo/row-a -> merged", line)
+        self.assertIn("left open: row-h, row-l", line)
+
+    def test_cloud_pr_skips_a_row_carrying_another_pr(self):
+        self.board_file({"row-x": {"status": "review", "agent": "x", "pr": "42"},
+                         "row-a": {"status": "review", "agent": "y"}})
+        j = self.job("Closes row-x and row-a")
+        j.extra["branch"] = "cloud/fix-it-x7"
+        line = L.BoardRules().close(j)
+        r = self.rows()
+        self.assertEqual((r["row-x"]["status"], r["row-a"]["status"]), ("done", "merged"))
+        self.assertIn("demo/row-a -> merged", line)
+
+    def test_other_branch_no_row_carries_falls_through_to_closes(self):
+        self.board_file({"row-a": {"status": "queued"}})
+        j = self.job("Closes row-a")
+        j.extra["branch"] = "fix-it"
+        self.assertEqual(L.BoardRules().find_track("demo", j), "")
+        self.assertIn("demo/row-a -> merged", L.BoardRules().close(j))
 
     def test_orch_held_row_gets_a_note_only(self):
         self.board_file({"own": {"status": "review", "agent": "@7:1"}})

@@ -187,7 +187,8 @@ cards.stopped routes it to
 "#<h>" or "seat", or the route the caller names. DONE and QUERY move the job file to rest/ (jobs.py): off the readers' queue, as the old lander's
 unlink was, but still loaded by a re-queue. A unit that is not installed holds the job ("<unit> is not
 installed"); a board unit that is absent is BoardRules below: the row carrying the PR -> merged (an orch-held row
-gets a note only), each `Closes <row>` of the same board -> done unless held or live without an agent mark, that
+gets a note only; a PR no row carries takes the first row its body Closes that carries no PR and the rules below would close),
+each `Closes <row>` of the same board -> done unless held or live without an agent mark, that
 mark cleared, an unknown row named; a symlinked board file is refused.
 
 A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
@@ -476,6 +477,13 @@ DRAFT = re.compile(r"PR #\d+ is a draft — ")
 CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)[A-Za-z0-9][A-Za-z0-9_-]*)*)")
 
 
+def closable(row):
+    """board.closable: a row (dict) not merged/done, not held by a person and not live on a track with no mark."""
+    if not isinstance(row, dict) or row.get("status") in ("merged", "done") or row.get("held"):
+        return False
+    return not (row.get("status") in ("running", "review") and not (row.get("agent") or "").strip())
+
+
 def closes_rows(body):
     """The row names a PR body says it closes, in order, each once."""
     seen = []
@@ -529,8 +537,9 @@ class BoardRules:
     def close(self, job):
         project = M.member_of(job.repo)[0] or job.repo
         what = f"PR #{job.pr}" + (f" ({job.extra.get('title')})" if job.extra.get("title") else "")
-        t = self.find_track(project, job)
         rows = self.board(project).get("tracks") or {}
+        t = self.find_track(project, job) or next(   # a cloud/ PR names its row only in Closes; for close only
+            (r for r in closes_rows(job.extra.get("body") or "") if closable(rows.get(r)) and not rows[r].get("pr")), "")
         if not t:
             return f"board: no row on {project} carries PR #{job.pr} — nothing to close"
         if t not in rows:
@@ -555,7 +564,7 @@ class BoardRules:
                     unknown.append(r)
                 continue
             mark = (rows[r].get("agent") or "").strip()
-            if rows[r].get("held") or (rows[r].get("status") in ("running", "review") and not mark):
+            if not closable(rows[r]):
                 held.append(r)
                 continue
             rc, out, err = self.cc_board("status", project, r, "done")

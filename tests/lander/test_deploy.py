@@ -775,6 +775,21 @@ class TestBoard(Box):
         self.assertIn("left open: live", line)
         self.assertIn("no row on the board: no-such-row", line)
 
+    def test_a_cloud_pr_closes_the_row_its_body_names(self):
+        self.board({"row-h": {"status": "queued", "held": "someone"}, "row-a": {"status": "review", "agent": "x"}})
+        box = self.fake(**{"cc-board status": (0, ""), "cc-board note": (0, ""), "cc-board set": (0, "")})
+        job = T.Job(repo="demo", pr=7, extra={"branch": "cloud/fix-it-x7", "body": "Fixes it.\n\nCloses row-h, row-a"})
+        self.assertEqual(B.track_for(job), "")   # the review brief, scope asks and requests see no row
+        self.assertIn("demo/row-a -> merged", B.close(job))
+        self.assertEqual([c["argv"][3:] for c in box.called("cc-board status")], [["row-a", "merged"]])
+
+    def test_a_cloud_pr_skips_a_row_carrying_another_pr(self):
+        self.board({"row-x": {"status": "review", "agent": "x", "pr": "42"}, "row-a": {"status": "review", "agent": "y"}})
+        box = self.fake(**{"cc-board status": (0, ""), "cc-board note": (0, ""), "cc-board set": (0, "")})
+        job = T.Job(repo="demo", pr=7, extra={"branch": "cloud/fix-it-x7", "body": "Closes row-x and row-a"})
+        self.assertIn("demo/row-a -> merged", B.close(job))
+        self.assertEqual([c["argv"][3:] for c in box.called("cc-board status")], [["row-a", "merged"], ["row-x", "done"]])
+
     def test_an_orch_held_row_gets_a_note_only(self):
         self.board({"own": {"pr": "7", "agent": "@5:123"}})
         box = self.fake(tmux=(0, "@5\tdemo@lander\n"), **{"cc-board note": (0, "")})

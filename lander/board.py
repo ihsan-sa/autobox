@@ -4,6 +4,10 @@
                                      `branch` is the head branch, else `track/<row>`, `planning/<row>` or
                                      `builder/<row>` naming a row; "" when none does
     close(job)                       the row goes `merged` with a note, unless an orch holds it (then a note only);
+                                     a PR no row carries (a cloud session's `cloud/<x>` branch) takes the first row
+                                     its body Closes that carries no PR and the CLOSES RULES would close, for close only
+                                     (track_for never reads the body, so the review brief, scope asks and the
+                                     requests a brief Closes see no row for it);
                                      every row the PR body names with `Closes <row>` goes `done` (same board only);
                                      every OPEN planner request it names the same way (`Closes req-…`)
                                      and the row's brief also Closes is answered (at most 3)
@@ -130,10 +134,19 @@ def close(job):
     return "; ".join([line] + tail + ([asked] if asked else []))
 
 
+def closable(row):
+    """The CLOSES RULES: a row (dict) not merged/done, not held by a person and not live on a track with no mark."""
+    if not isinstance(row, dict) or row.get("status") in ("merged", "done") or row.get("held"):
+        return False
+    return not (row.get("status") in ("running", "review") and not str(row.get("agent") or "").strip())
+
+
 def _close(job, project, track):
+    tracks = rows(project)
+    track = track or next((r for r in closes(job.extra.get("body", ""))   # a row carrying another PR is not this one's
+                           if closable(tracks.get(r)) and not tracks[r].get("pr")), "")
     if not track:
         return "board: this PR is no board row's"
-    tracks = rows(project)
     row = tracks.get(track)
     if not isinstance(row, dict):
         return f"board: {project}/{track} is not on the board"
@@ -159,7 +172,7 @@ def _close(job, project, track):
                 unknown.append(r)
             continue
         mark = str(cur.get("agent") or "").strip()
-        if cur.get("held") or (cur.get("status") in ("running", "review") and not mark):
+        if not closable(cur):
             held.append(r)
             continue
         rc, out = C.sh([b, "status", project, r, "done"], timeout=60)
