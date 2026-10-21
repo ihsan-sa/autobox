@@ -171,8 +171,9 @@ print(end="cc-refusals sig/2 live\n"+json.dumps(["decision",r["id"],r["decision"
   fresh; seat "echo one"; id=$(idof "echo one"); c=$(jq -r --arg id "$id" 'select(.id == $id) | .input' "$lg")
   dl T "$(sl "$(printf 'decision\n%s\ngrant\nT\nbox1\n%s' "$id" "$c")")"
   k "$(t test "$(decided "$lg")" = "$id")" "a decision signed in the legacy form counts, whatever its by and note say"
+  cp "$lg" "$lg.ok"
   for e in '.by = "perms\norch"' '.note = "a\nb"'; do
-    jq -c "if .kind == \"decision\" then $e else . end" "$lg" > "$lg.x"; mv "$lg.x" "$lg"
+    jq -c "if .kind == \"decision\" then $e else . end" "$lg.ok" > "$lg"
     k "$(t test -z "$(decided "$lg")")" "…but not once $e puts a newline in it"
   done
   fresh; seat "echo one"; id=$(idof "echo one"); at=$(printf 'T\nbox1\n%s\n["orch", "other"]' "$c")
@@ -187,6 +188,11 @@ print(end="cc-refusals sig/2 live\n"+json.dumps(["decision",r["id"],r["decision"
   done
   fresh; seat "echo one"; id=$(idof "echo one"); n0=$(sha256sum < "$lg")
   k "$(t test "$(ps_ decide repo "$id" grant "$(printf 'a\nb')" >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0")" "decide refuses a note carrying a newline, nothing written"
+  # an ask whose command carries a raw newline (record writes a classifier's input as one line of JSON, but an approval
+  # ask's --run is kept as given) is never signed, so decide refuses it and it stays open for perms to settle by hand
+  fresh; jq -cn '{kind:"refusal", id:"rnlin001", at:"T", repo:"repo", window:"repo", tool:"approval", input:"a\nb", reason:"r", key:"k"}' >> "$lg"
+  n0=$(sha256sum < "$lg")
+  k "$(t test "$(ps_ decide repo rnlin001 grant ok >/dev/null 2>&1; echo $?)" = 1 -a "$(sha256sum < "$lg")" = "$n0" -a -n "$(sc open repo | grep '^rnlin001 ')")" "decide refuses an ask whose command carries a newline, nothing written, and it stays open"
   # a decision from before signing landed, on its own ledger: freeze signs it, but not once a field carries a newline
   for by in perms 'perms\nx'; do
     fresh; jq -cn '{kind:"refusal", id:"rnl00001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo nl", reason:"r", key:"k"}' >> "$lg"
