@@ -154,7 +154,7 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
-             the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. Perms reading the PR
+             the CI_UNREADS+1th at one head a query "planning", but a spent rate limit is held uncounted; green or no CI at all -> on. Perms reading the PR
              (review.perms_reading: its read of any head still running, or its perms-hold stub at this head) ->
              held (box), so a read perms started or claimed is waited on; any other read of the PR short of a LAND
              at this head (or an older head's LAND at this change), or perms' reads that will not read -> query
@@ -1615,7 +1615,8 @@ class Lane:
         #27-29 and #64-68 merged and deployed on a red build): red hands it back, running holds it. An empty check
         list on a base with workflows waits CI_REGISTER_WAITS for GitHub to register the runs, then lands as no CI
         (workflows that never run on a PR). Unreadable holds, and the CI_UNREADS+1th at one head is a query: a token
-        that reads the PR but not its checks would otherwise hold it every sweep, silently."""
+        that reads the PR but not its checks would otherwise hold it every sweep, silently. A spent rate limit is never
+        counted (2026-10-21: three PRs became queries over a spent hour and sat two hours past its reset)."""
         try:
             workflows = G.has_workflows(self.root, job.base_sha)
         except G.GitError:
@@ -1652,6 +1653,8 @@ class Lane:
         if state in ("red", "starved"):
             self.handback(job, f"GitHub CI is red at {job.head[:12]}: {detail} — fix it, or re-run it on GitHub, "
                                f"and queue it again")
+        elif GH.SPENT in detail:   # time mends a spent quota: held, uncounted, so its hour never makes a query
+            self.hold(job, f"GitHub CI could not be read: {detail}", kind="box", deferred=True)
         elif self.count(job, "ci_unread") > CI_UNREADS:
             self.query(job, f"GitHub CI could not be read at {job.head[:12]} {CI_UNREADS + 1} times running: "
                             f"{detail or 'no answer'} — can the lander's token read this repo's checks?", "planning")

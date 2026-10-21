@@ -170,6 +170,22 @@ class CIGate(TL.Fixture):
         self.assertIn("403", j.extra["why"])
         self.assertEqual(self.box().get("merges", []), [])
 
+    def test_a_spent_rate_limit_keeps_its_job_and_lands_after_the_reset(self):
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
+        self.set_box(checks_denied="gh: API rate limit exceeded for user ID 1. (HTTP 403)")
+        J.submit("demo", 1)
+        self.land()
+        for _ in range(L.CI_UNREADS + 2):   # more spent reads than an unreadable CI is allowed before a query
+            os.unlink(GH.backoff_path())    # the backoff the spent read set has run out
+            j = self.again()
+            self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.MERGEABLE))
+            self.assertIn(GH.SPENT, j.extra["why"])
+            self.assertNotIn("ci_unread", j.extra)
+        self.set_box(checks_denied="")   # the quota resets
+        os.unlink(GH.backoff_path())
+        self.again()
+        self.assertEqual(len(self.box()["merges"]), 1)
+
     def test_a_readable_ci_clears_the_unread_count(self):
         self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
         self.set_box(checks_denied="HTTP 403: Resource not accessible by integration")

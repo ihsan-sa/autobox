@@ -221,6 +221,9 @@ def rollup(runs, statuses) -> list:
                 "targetUrl": c.get("target_url") or ""} for c in statuses if isinstance(c, dict)])
 
 
+SPENT = "GitHub's API rate limit for this login is spent"
+
+
 def spent(root, text, token=None) -> str:
     """One plain line when gh's failure is GitHub's rate limit, naming when it resets; else ""."""
     if "rate limit" not in (text or "").lower():
@@ -232,7 +235,7 @@ def spent(root, text, token=None) -> str:
         when = " until " + time.strftime("%H:%MZ", time.gmtime(at))
     except (ValueError, TypeError, KeyError, AttributeError):
         when = ""
-    return f"GitHub's API rate limit for this login is spent{when}"
+    return f"{SPENT}{when}"
 
 
 def pr_facts(root, pr, fields, token=None, timeout=120):
