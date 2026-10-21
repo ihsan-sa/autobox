@@ -184,6 +184,7 @@ TICKET. One line per call in ~/.cc/library/owner/tickets.log (a member's: its se
   That log is the telemetry every later phase reads.
 """
 import calendar
+import contextlib
 import glob
 import hashlib
 import json
@@ -192,6 +193,7 @@ import os
 import re
 import resource
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -1334,6 +1336,9 @@ def build_all_ws(reg, only=None):
     return out
 
 
+NEVER_SHARED = {"lessons", "career", "resume"}   # boards no member-facing worker reads, whatever CC_LIB_SHARED_BOARDS says; the control repo (CC_BOX) too
+
+
 def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the index only; launches nothing, writes no board
     """THE OWNER'S RECORDS AND NO MEMBER'S, ~/.cc/library/shared/index.sqlite: what cc-sandbox binds into a worker on a
     member-facing repo in place of the aggregate. Since #1600 a worker reads the aggregate, and a worker on a repo a
@@ -1346,20 +1351,33 @@ def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the 
     talk with every member (perms-38, from its reads of #1649 and #1665). In: an owner repo's board and its tracks'
     progress.md. Nothing else, so a source kind added later is out until named here. No doc: the box's repos keep the
     owner's profile, his messages, perms' briefs, coursework and mail receipts beside their shareable docs, under no
-    name a list could hold to (perms, its read of #1671). An owner repo is one not listed in ~/.cc/members, the
-    host's own record, which cc-sandbox's `facing` reads too; never a marker in the repo, which a member commit can delete."""
+    name a list could hold to (perms, its read of #1671).
+    AND ONLY THE REPOS THE OWNER NAMED: `cc-config get CC_LIB_SHARED_BOARDS` (space-separated; unset shares nothing),
+    from ~/.cc/config, which only the host writes, and never from the environment, which a worker's may carry. "Every repo not in ~/.cc/members" handed member-facing workers the
+    coursework notes, the career boards and the control repo board's notes on what members asked for (perms, its read of
+    #1679), so NEVER_SHARED and the CC_BOX repo stay out even when listed by mistake, and a repo in ~/.cc/members (its name up
+    to the first --) stays out too: that host record, which cc-sandbox's `facing` reads too, never a marker in the repo,
+    which a member commit can delete.
+    FAILS CLOSED: any error, the stamp query's included, removes the copy rather than keeping one an earlier,
+    wider rule built."""
     d = os.path.join(libroot(), "shared")
     final = os.path.join(d, "index.sqlite")
-    md = os.path.join(H, ".cc", "members")
-    facing = sorted(os.listdir(md) if os.path.isdir(md) else ())
-    st = os.path.join(H, ".cc", "state", "")
-    keep = ("ws='' AND COALESCE(track, '')<>'perms' AND (skind='board'"
-            " OR (skind='journal' AND substr(path, 1, ?)=? AND path LIKE '%/progress.md'))"
-            f" AND substr(COALESCE(repo, ''), 1, instr(COALESCE(repo, '') || '--', '--') - 1) NOT IN ({','.join('?' * len(facing))})")
-    ka = (len(st), st, *facing)
-    stamp = "|".join(str(v) for v in c.execute(
-        f"SELECT COUNT(*), COALESCE(MAX(indexed_at), ''), TOTAL(mtime) FROM sources WHERE {keep}", ka).fetchone()) + "|" + ",".join(facing)
     try:
+        md = os.path.join(H, ".cc", "members")
+        facing = set(os.listdir(md) if os.path.isdir(md) else ())
+        env = {k: v for k, v in os.environ.items() if k not in ("CC_CONFIG", "CC_LIB_SHARED_BOARDS")} | {"HOME": H}   # the list from the file only: no env widens it
+        def conf(k):
+            return subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-config"), "get", k],
+                                  env=env, capture_output=True, text=True, timeout=30).stdout.split()
+        repos = sorted(set(conf("CC_LIB_SHARED_BOARDS")) - NEVER_SHARED - set(conf("CC_BOX")) - facing)
+        repos = [r for r in repos if r.split("--")[0] not in facing]   # the name up to its first --, as #1665 reads it
+        st = os.path.join(H, ".cc", "state", "")
+        keep = ("ws='' AND COALESCE(track, '')<>'perms' AND (skind='board'"
+                " OR (skind='journal' AND substr(path, 1, ?)=? AND path LIKE '%/progress.md'))"
+                f" AND COALESCE(repo, '') IN ({','.join('?' * len(repos))})")
+        ka = (len(st), st, *repos)
+        stamp = "|".join(str(v) for v in c.execute(
+            f"SELECT COUNT(*), COALESCE(MAX(indexed_at), ''), TOTAL(mtime) FROM sources WHERE {keep}", ka).fetchone()) + "|" + ",".join(repos)
         real_dirs(d)
         if os.path.islink(final) or (os.path.lexists(final) and not os.path.isfile(final)):
             raise OSError(f"{tilde(final)} is a link, not written through")
@@ -1384,8 +1402,11 @@ def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the 
         os.chmod(tmp, 0o600)
         os.rename(tmp, final)
         return dict(file=final, changed=True, refused="")
-    except (OSError, sqlite3.Error) as e:
-        return dict(file=final, changed=False, refused=str(e))
+    except Exception as e:   # fail closed: no copy beats a stale one
+        with contextlib.suppress(OSError):
+            if not os.path.islink(d):
+                os.remove(final)
+        return dict(file=final, changed=False, refused=f"{e}; the copy was removed")
 
 
 def rec_ids(r, rrepo, rows):
@@ -3307,6 +3328,13 @@ def selfcheck_workspaces(th, ok, run, w):
         mk(h)
     w("dev/r1/docs/owner-only.md", f"# owner\n\n## sec\n{K}-own-doc.\n")
     w(".cc/state/r1/t1/progress.md", f"## 2026-09-11T01:00Z first\n{K}-own-prog line.\n")
+    B = os.environ.get("CC_BOX") or "box1"   # the environment wins over the file, as in cc-config
+    w(".cc/config", f"CC_BOX={B}\nCC_LIB_SHARED_BOARDS=r1 {B} lessons career resume\n")   # r9 unnamed; the four never-shared named by mistake
+    U = "U" + K[1:]   # their own token, so the owner's asks for K below are not crowded
+    for r in ("r9", B, "lessons", "career", "resume"):
+        w(f".cc/boards/{r}.json", json.dumps({"repo": r, "path": os.path.join(th, "dev", r), "tracks": {
+            "t1": {"title": f"{r} row", "kind": "track", "status": "running", "notes": [{"ts": "2026-09-11T00:00:00Z", "msg": f"{U}-unshared-{r}-note"}]}}, "log": []}))
+        w(f".cc/state/{r}/t1/progress.md", f"## 2026-09-11T01:00Z first\n{U}-unshared-{r} line.\n")
     w(".local/bin/claude", "")
     os.chmod(os.path.join(th, ".local", "bin", "claude"), 0o755)
     w(".claude.json", "{}")
@@ -3386,6 +3414,37 @@ def selfcheck_workspaces(th, ok, run, w):
     n_ed = count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-own-prog, edited%'")
     ok("…rebuilt only when the owner's sources moved: a pass with nothing new keeps the file, an edited owner progress.md renames a new one in",
        i1 != -1 and i2 == i1 and ino() != i1 and n_ed == 1)
+    n_un = {r: count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{U}-unshared-{r}%'") for r in ("r9", B, "lessons", "career", "resume")}
+    n_agg = sqlite3.connect(dbpath()).execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{U}-unshared-%'").fetchone()[0]
+    ok("a board or progress.md of a repo CC_LIB_SHARED_BOARDS does not name (r9) never reaches the copy, though the aggregate holds it",
+       n_un["r9"] == 0 and n_own == 1 and n_agg >= 10)
+    ok("…nor do the control repo (CC_BOX), lessons, career and resume boards and journals, though the config names them by mistake",
+       all(n_un[r] == 0 for r in (B, "lessons", "career", "resume")))
+    bad = build_shared(sqlite3.connect(":memory:"))   # the stamp query fails: no sources table
+    ok("a failed rebuild, its stamp query included, removes the copy rather than keeping the old one (fails closed)",
+       i1 != -1 and bool(bad["refused"]) and not os.path.lexists(sh_file))
+    w(".cc/boards/dispatch.json", json.dumps({"repo": "dispatch", "path": os.path.join(th, "dev", "dispatch"), "tracks": {
+        "t1": {"title": "d row", "kind": "track", "status": "running", "notes": [{"ts": "2026-09-11T00:00:00Z", "msg": f"{U}-dispatch-note"}]}}, "log": []}))
+    run("index")
+    def shares(cfg, env=None):   # does the copy hold the dispatch board, the config file reading cfg (None: no line)?
+        w(".cc/config", f"CC_BOX={B}\n" + ("" if cfg is None else f"CC_LIB_SHARED_BOARDS={cfg}\n"))
+        if env is not None:
+            os.environ["CC_LIB_SHARED_BOARDS"] = env
+        try:
+            build_shared(sqlite3.connect(dbpath()))
+        finally:
+            os.environ.pop("CC_LIB_SHARED_BOARDS", None)
+        return count(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{U}-dispatch-note%'")
+    ok("the list unset, empty or naming only near-misses (dispatch-testbed, Dispatch) shares no board; named, it does",
+       [shares(None), shares(""), shares("dispatch-testbed Dispatch"), shares("dispatch")] == [0, 0, 0, 1])
+    ok("…and CC_LIB_SHARED_BOARDS in the environment never widens it: only the owner's config file is read",
+       shares(None, env="dispatch") == 0)
+    w(".cc/config", f"CC_BOX={B}\nCC_LIB_SHARED_BOARDS=r1 {B} lessons career resume\n")
+    os.remove(os.path.join(th, ".cc", "boards", "dispatch.json"))
+    for r in ("r9", B, "lessons", "career", "resume"):   # out of the way of the lessons cases
+        os.remove(os.path.join(th, ".cc", "boards", f"{r}.json"))
+        shutil.rmtree(os.path.join(th, ".cc", "state", r))
+    run("index")
     # ── inside a member's boundary, the production launch: shell, SQL and grep reach one file, its own ──
     r = member("wsa", probe)
     g = lambda k: re.search(rf"^{k}=(.*)$", r.stdout, re.M).group(1).strip() if re.search(rf"^{k}=(.*)$", r.stdout, re.M) else "?"

@@ -154,16 +154,30 @@ selfcheck(){
   ps_ decide repo "$id" decline no >/dev/null
   k "$(t test "$(decided "$lg" | grep -cxF -- "$id")" = 1 -a -z "$(sc open repo | grep "^$id ")" -a "$(ps_ decide repo "$id" grant no >/dev/null 2>&1; echo $?)" = 1)" "…and a decision after them counts, leaves open, and a second one is refused"
   # 5a'''. ON A LEDGER WITH NOTHING SIGNED YET (the review of #1728), an unsigned line on an ask filed after signing
-  #        landed neither hides it nor stops the seat; on one filed before it, the line is history and counts
-  #        (a non-ASCII sig goes first here, ahead of every signed line, where it once emptied counted() whole)
-  fresh; seat "echo fresh"; id=$(idof "echo fresh")
+  #        landed neither hides it nor stops the seat; one at the file's head, before any line stamped after signing
+  #        landed, is history and counts (a non-ASCII sig goes ahead of every signed line, where it once emptied
+  #        counted() whole)
+  fresh
+  jq -cn '{kind:"refusal", id:"rold0001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo old", reason:"r", key:"k"}' >> "$lg"
+  jq -cn '{kind:"decision", id:"rold0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+  k "$(t grep -qxF rold0001 <<<"$(decided "$lg")")" "an unsigned decision at the head of the ledger, before signing landed, still counts"
+  seat "echo fresh"; id=$(idof "echo fresh")
   jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", by:"perms", sig:"é"}' >> "$lg"
   jq -cn --arg id "$id" '{kind:"decision", id:$id, at:"x", decision:"grant", note:"n", by:"perms"}' >> "$lg"
   k "$(t grep -q "^$id " <<<"$(sc open repo)")" "with nothing signed yet, an unsigned decision line leaves its ask open"
   k "$(t test "$(ps_ decide repo "$id" decline no >/dev/null 2>&1; echo $?)" = 0)" "…and the seat can still decide it"
-  jq -cn '{kind:"refusal", id:"rold0001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo old", reason:"r", key:"k"}' >> "$lg"
-  jq -cn '{kind:"decision", id:"rold0001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
-  k "$(t grep -qxF rold0001 <<<"$(decided "$lg")")" "an unsigned decision on an ask filed before signing landed still counts"
+  # 5a''''. A PLANTED OLD .at IS NOT HISTORY (perms' read of #1728): an ask appended after the cut line with an old
+  #         .at, under the id a real ask will take, then an unsigned decision, leave the real ask open
+  jq -cn '{kind:"ask", id:"qplant01", at:"2026-10-01T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
+  jq -cn '{kind:"ask", id:"qplant01", at:"2026-10-21T00:00:00Z", repo:"repo", from:"orch", text:"t"}' >> "$lg"
+  jq -cn '{kind:"decision", id:"qplant01", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+  k "$(t test -z "$(decided "$lg" | grep -xF qplant01)" -a -n "$(sc open repo | grep '^qplant01 ')")" "an unsigned decision on an ask planted with an old .at past the cut line leaves the ask open"
+  #         …and a line stamped past the cut with no id is the boundary too (the review of #1743)
+  fresh
+  jq -cn '{kind:"note", at:"2026-10-21T00:00:00Z"}' >> "$lg"
+  jq -cn '{kind:"refusal", id:"rnoid001", at:"2026-10-01T00:00:00Z", repo:"repo", window:"repo", tool:"Bash", input:"echo x", reason:"r", key:"k"}' >> "$lg"
+  jq -cn '{kind:"decision", id:"rnoid001", at:"2026-10-01T01:00:00Z", decision:"grant", by:"perms"}' >> "$lg"
+  k "$(t test -z "$(decided "$lg" | grep -xF rnoid001)")" "an unsigned decision after an id-less line stamped past the cut does not count"
   # 5b. WHO MAY DECIDE (security read #2 of #904): only the permission seat, read from the processes. A caller with
   #     no flagged claude above it, one standing outside the perms dir, and one with a second claude above it are
   #     each refused, exit 2, nothing written, whatever CC_REFUSALS_WINDOW says
