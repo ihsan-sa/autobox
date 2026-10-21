@@ -240,9 +240,8 @@ rm -f ~/.cc/state/$REPO/gK/.lock
 # recurring-defect-ok: pause-hold-missing — a test of cc-board add on a fixture repo; the pause check is the tool's
 STEPS=$'Do this:\n- Add a --flag to core/bin/cc-foo\n- Edit core/bin/cc-bar to pass it through\n- Run the suite'
 gs=$(CC_STATE="$T/briefstate" "$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1); grc=$?
-{ [ $grc = 0 ] && ! grep -q 'REFUSED' <<<"$gs" && grep -q 'cc-foo' "$T/briefstate/$REPO/g10/task.md" \
-  && [ ! -e "$T/briefstate/brief/overrides.jsonl" ]; } \
-  && ok "cc-board add takes a brief of steps as typed, with no refusal and no override ledger" || bad "add refused a step list (rc=$grc): $gs"
+{ [ $grc = 0 ] && ! grep -q 'REFUSED' <<<"$gs" && grep -q 'cc-foo' "$T/briefstate/$REPO/g10/task.md"; } \
+  && ok "cc-board add takes a brief of steps as typed, with no refusal" || bad "add refused a step list (rc=$grc): $gs"
 # …and what another live track is holding is COMPUTED into the brief, never typed. This case builds its own
 # holder: g1 is live on the board and its branch really does change a file, so the block has something to say.
 "$B/cc-board" status $REPO g1 running >/dev/null

@@ -4235,6 +4235,32 @@ def run_selfcheck():
         check("a memo whose name a member planted as a link to an owner file is not read: cc-voice never runs, nothing "
               "is posted, and the memo falls back to an attachment (perms 10-20)",
               outVM == (None, None) and not ranVM and not saidVM and not os.path.exists(linkVM + ".txt"))
+        # …nor a hard link to an owner file at the memo's name, nor a racer flipping the name between absent and a link
+        # to an owner file while 200 memos are taken (perms' read of #1684, 10-20): cc-voice never runs on either.
+        hardVM, flipVM, stopVM, flipsVM = f"{tdVM}/files/hard.m4a", f"{tdVM}/files/flip.m4a", threading.Event(), []
+        os.link(victimVM, hardVM)
+        with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
+            outVM = dmVM.voice_pass(hardVM, "CV", "9.3", "myrepo")
+        check("a memo whose name a member planted as a hard link to an owner file is not read: cc-voice never runs, "
+              "nothing is posted, and the memo falls back to an attachment (perms 10-20)",
+              outVM == (None, None) and not ranVM and not saidVM)
+
+        def flipperVM():
+            while not stopVM.is_set():
+                os.symlink(victimVM, flipVM)
+                time.sleep(0.0005)
+                os.unlink(flipVM)
+                flipsVM.append(1)
+        threadVM = threading.Thread(target=flipperVM, daemon=True)
+        threadVM.start()
+        try:
+            with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
+                outsVM = [dmVM.voice_pass(flipVM, "CV", "9.3", "myrepo") for _ in range(200)]
+        finally:
+            stopVM.set(); threadVM.join(20)
+        check("a racer flipping a memo's name between absent and a link to an owner file while 200 memos are taken never "
+              "gets the owner file to cc-voice, and every memo falls back to an attachment (perms 10-20)",
+              flipsVM and set(outsVM) == {(None, None)} and not ranVM and not saidVM)
         # THE CHANNEL MUST NOT GO DEAF. on_event runs on this chat's own single-thread executor, so a transcription
         # taken inline would queue everything behind it for a minute — `!stop` and a `yes <id>` included. Held here
         # inside the transcriber, the memo is still in flight while the next typed message goes straight through.
@@ -11989,6 +12015,77 @@ def run_selfcheck():
               "mails are handed never gets an attachment or mail text into the owner dir (perms 10-20)",
               os.listdir(rcanary) == [] and rflips and os.path.isdir(lfiles) and not os.path.islink(lfiles))
         shutil.rmtree(rcanary, ignore_errors=True)
+        # …and at the attachment's own name (perms' read of #1684, 10-20): a dangling link, a hard link to an owner
+        # file, and a racer flipping the name between absent and a link to an owner file. None writes the owner file,
+        # and a turn that met one says the file was NOT saved.
+        odir = os.path.dirname(member_dir("mem"))
+        ocanary, odangle = f"{odir}/owner-canary", f"{odir}/owner-dangling"
+        with open(ocanary, "w") as fh:
+            fh.write("owner's own\n")
+
+        def nhand(mid, plant=None):
+            thanded.clear()
+            nmsg = mail_write(mid, to=["mem@box.example"], subject="s", text="t",
+                              attachments=[{"name": "x.pdf", "path": "x.pdf"}])
+            with open(f"{mdir}/inbox/{mid}/x.pdf", "wb") as fh:
+                fh.write(b"%PDF-1.4 bytes")
+            plant and plant(f"{lfiles}/{mid}-x.pdf")
+            with contextlib.redirect_stderr(io.StringIO()):
+                dmT.mail_hand(nmsg, MailPlaces(dmT).place("mem"), "1.0", "1.0",
+                              R.Decision(to=[], workspace="mem", rule="named"))
+            return thanded[0][1] if thanded else ""
+        ntext = nhand("D1", lambda n: os.symlink(odangle, n))
+        check("mail: a dangling link planted at an attachment's name creates nothing at its target, and the turn says "
+              "the file was NOT saved (perms 10-20)", not os.path.lexists(odangle) and "x.pdf (NOT saved)" in ntext)
+        ntext = nhand("H1", lambda n: os.link(ocanary, n))
+        check("mail: a hard link to an owner file planted at an attachment's name is not taken as the saved copy: the "
+              "owner file is untouched and the turn says the file was NOT saved (perms 10-20)",
+              open(ocanary).read() == "owner's own\n" and "x.pdf (NOT saved)" in ntext)
+        os.unlink(f"{lfiles}/H1-x.pdf")   # back to one link, so the racer below is not refused by st_nlink alone
+        # Each mail has its own name, so a turn whose member_new_file got no fd met the racer's link, never a copy an
+        # earlier turn saved, and every such turn must say NOT saved: stat for lstat there would say saved.
+        nstop, nflips, nname, nmet = threading.Event(), [], ["P0"], []
+        real_new_file = member_new_file
+
+        def nflip():
+            while not nstop.is_set():
+                n = f"{lfiles}/{nname[0]}-x.pdf"
+                with contextlib.suppress(FileExistsError):
+                    os.symlink(ocanary, n)                     # the name becomes a link to the owner file…
+                time.sleep(0.0005)
+                with contextlib.suppress(OSError):
+                    os.unlink(n)                               # …and is gone again, with any copy saved meanwhile
+                nflips.append(1)
+
+        def nturn(i):
+            got = []
+
+            def new_file(*a):
+                try:
+                    got.append(real_new_file(*a))
+                except OSError:
+                    got.append(None)
+                    raise
+                return got[-1]
+            nname[0] = f"P{i}"
+            globals()["member_new_file"] = new_file
+            try:
+                text = nhand(nname[0])
+            finally:
+                globals()["member_new_file"] = real_new_file
+            got and not isinstance(got[0], int) and nmet.append(text)
+        nthread = threading.Thread(target=nflip, daemon=True)
+        nthread.start()
+        try:
+            for i in range(200):
+                nturn(i)
+        finally:
+            nstop.set(); nthread.join(20)
+        check("mail: a racer flipping an attachment's own name between absent and a link to an owner file while 200 "
+              "mails are handed never writes the owner file, and every turn that met the link says NOT saved (perms "
+              "10-20)", open(ocanary).read() == "owner's own\n" and nflips and nmet
+              and all("x.pdf (NOT saved)" in t for t in nmet))
+        os.unlink(ocanary)
 
         # (f) THE DAEMON'S OWN DOOR, through on_event — the half mail_move cannot prove about itself. A move is
         # answered in its thread and the message STOPS there; anything else in that thread carries on to the
