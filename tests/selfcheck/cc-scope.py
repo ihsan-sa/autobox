@@ -102,7 +102,7 @@ def selfcheck():
         t("a long row with no side file says it predates it in show, and asking it again writes the file",
           "predates" in run_capture(["show", RL, ab]) and add(RL, bare) == (ab, True)
           and open(full_path(RL, ab)).read().strip() == bare)
-        short = "keep the digest short " * 35   # under the excerpt; the same words with commas run past it
+        short = "keep the digest short " * (EXCERPT // 22)   # under the excerpt; the same words with commas run past it
         asho, _ = add(RL, short)
         t("a short row re-asked in a longer spelling gets chars with its side file, so show names it",
           "chars" not in get(RL, asho) and add(RL, short.replace(" ", ", "))[1]
