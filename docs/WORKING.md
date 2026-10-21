@@ -33,6 +33,9 @@ may take on is this file's:
 Never blocked by any spend tier: answering the owner, a task he asked for, a landing already past its gates, or
 recording to a board — a finding, a raised- row, a backlog note. A spend-tier
 flip signals no running iteration — it finishes, and the next one asks. Read it: `cc-tier`, `cc digest`, Home.
+Never stop or start a unit for a tier: a unit that spends asks the tier itself (`ExecCondition=%h/bin/cc-tier allows
+<what>` in its file; `cc-units tiered` lists them), and one that spends nothing, like a LEARN pull that only files,
+runs at every tier. A hand stop on 10-18 outlived the tier by 2.5 days and cost two LEARN deadlines.
 
 ## the standard
 A session is a productive employee, not a task runner. It does not invent work — but when the

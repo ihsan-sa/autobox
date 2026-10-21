@@ -4,7 +4,7 @@
 # globals, as they did when the body sat there. SC2154/SC2034 are off because those globals live in bin/cc-tier.
 
 selfcheck(){
-  local n=0 f=0 rc out before   # T is NOT local: the EXIT trap that removes it fires outside this function
+  local n=0 f=0 rc out before cond   # T is NOT local: the EXIT trap that removes it fires outside this function
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
   # A HOME of its own: its own config (cc-config honours CC_CONFIG), its own boards and its own log — never this
@@ -103,6 +103,24 @@ selfcheck(){
   C allows sideways >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a question this file does not know is usage, not a verdict"
   C allows start alpha >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a row is <repo>/<row>; a bare repo is refused rather than read as one"
   k "$(grep -q '^The spend tier is moderate, since .*\. Work it finds itself' <<<"$(C line)" && echo 0 || echo 1)" "line: the tier, since when, and what it means"
+
+  # THE UNIT ASKS THE TIER (raised-hand-stopped-timers-stay-off): a declared unit's own ExecCondition, run as systemd
+  # runs it, skips under essential and runs again under autonomous, and `set` names it held then not, while a
+  # systemctl on PATH is never called: the tier stops and starts nothing.
+  mkdir -p "$T/units" "$T/home/bin" "$T/shim"; echo '{"units":[]}' > "$T/units.json"
+  printf '[Unit]\nDescription=fx: work the box found itself\n[Service]\nExecCondition=%%h/bin/cc-tier allows goals\nExecStart=/bin/true\n' > "$T/units/fx.service"
+  ln -s "$B/cc-tier" "$T/home/bin/cc-tier"
+  printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\n' "$T" > "$T/shim/systemctl"; chmod +x "$T/shim/systemctl"
+  U(){ PATH="$T/shim:$PATH" CC_UNITS_MANIFEST="$T/units.json" CC_UNITS_DIR="$T/units" CC_UNITS_OVERLAY="" C "$@"; }
+  cond="$(sed -n "s|^ExecCondition=%h|$T/home|p" "$T/units/fx.service")"
+  out=$(U set essential)
+  k "$(grep -q '^Held until the tier rises, then back on their own: fx: work the box found itself\.$' <<<"$out" && echo 0 || echo 1)" "set essential names the declared unit it now holds"
+  k "$(grep -q '^Findings and fixes the box would start itself stop reaching you' <<<"$out" && echo 0 || echo 1)" "…and what stops reaching the owner, not only what turns off"
+  HOME="$T/home" CC_CONFIG="$T/home/.cc/config" $cond 2>/dev/null; rc=$?; k "$([ $rc = 1 ] && echo 0 || echo 1)" "…and the unit's ExecCondition says skip under essential"
+  out=$(U set autonomous)
+  k "$(grep -q 'Held\|reaching you' <<<"$out" && echo 1 || echo 0)" "set autonomous holds nothing and loses nothing"
+  HOME="$T/home" CC_CONFIG="$T/home/.cc/config" $cond; rc=$?; k "$([ $rc = 0 ] && echo 0 || echo 1)" "…and the same unit runs again with no restart"
+  k "$([ ! -e "$T/systemctl.log" ] && echo 0 || echo 1)" "no flip called systemctl"
   echo "cc-tier selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
 }

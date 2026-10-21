@@ -4,7 +4,7 @@
 # globals, as they did when the body sat there. SC2154/SC2034 are off because those globals live in bin/cc-units.
 
 selfcheck(){
-  local n=0 f=0 u en st he re out d pa tok T dn runs
+  local n=0 f=0 u en st he re out d pa tok T dn runs X
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a check that PRINTS (jq -e) must not leak into the verdict
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }  # …and one that must NOT hold
@@ -244,6 +244,22 @@ J
     grep -q '^\[Install\]' "$UD/$u" 2>/dev/null || out="$out $u"
   done < <(rows)
   k "$(t test -z "$out")" "every required .service has an [Install] section —${out:- all do}"
+  # A UNIT ASKS THE TIER ITSELF (raised-hand-stopped-timers-stay-off). Every unit's `cc-tier allows <what>` names a
+  # word cc-tier knows: an unknown one exits 2, which systemd reads as a skip on every tick. Then a fixture unit dir
+  # with one declared unit: `tiered` finds it, and its own ExecCondition skips under essential and runs under
+  # autonomous, with a systemctl on PATH never called.
+  X=$(mktemp -d); C(){ HOME="$X/home" CC_CONFIG="$X/config" CC_TIER_STEER="$X/tier.txt" "$R/bin/cc-tier" "$@"; }
+  out=""; while IFS=$'\t' read -r u w _; do C allows "$w" >/dev/null 2>&1; [ $? = 2 ] && out="$out $u:$w"; done < <(tiered)
+  k "$(t test -z "$out")" "every unit that asks the tier asks a word it knows —${out:- all known}"
+  mkdir -p "$X/units" "$X/home/bin" "$X/shim"; ln -s "$R/bin/cc-tier" "$X/home/bin/cc-tier"
+  printf '[Unit]\nDescription=fx\n[Service]\nExecCondition=%%h/bin/cc-tier allows goals\nExecStart=/bin/true\n' > "$X/units/fx.service"
+  printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\n' "$X" > "$X/shim/systemctl"; chmod +x "$X/shim/systemctl"
+  k "$(t test "$(UD="$X/units" OV="" tiered)" = "fx.service	goals	fx")" "tiered lists the declared unit, its word and its description"
+  u="$(sed -n "s|^ExecCondition=%h|$X/home|p" "$X/units/fx.service")"
+  C set essential >/dev/null; k "$(nt env PATH="$X/shim:$PATH" HOME="$X/home" CC_CONFIG="$X/config" $u)" "under essential the unit's condition skips it"
+  C set autonomous >/dev/null; k "$(t env PATH="$X/shim:$PATH" HOME="$X/home" CC_CONFIG="$X/config" $u)" "…and under autonomous the same unit runs, with no restart"
+  k "$(t test ! -e "$X/systemctl.log")" "…and nothing called systemctl"
+  rm -rf "$X"
   # tmux-main's ExecCondition, run against a throwaway tmux server on its own socket dir (env -u TMUX, or tmux would
   # talk to the live server this session sits in). A "main" the unit does not own reads as up and skips the start
   # (2026-10-12: every deploy failed on "duplicate session: main"); no server, or only a "main2", still starts one.

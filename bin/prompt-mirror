@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""prompt-mirror — an editable copy of every prompt the box gives an agent, in one folder, synced both ways.
+"""prompt-mirror — an editable copy of every prompt the box gives an agent, in five folders, synced both ways.
 
   prompt-mirror sync        one pass each way (what the path unit runs, on a save in the mirror or a change in git)
   prompt-mirror list        each draft and the file it feeds, as the README says it
   prompt-mirror selfcheck   the sync both ways, on throwaway repositories
 
-THE MIRROR is ~/prompts (PROMPT_MIRROR moves it): one flat folder, one draft per prompt, named
-<repo>.<path with / as .>, and a README saying which file feeds which agent. Flat because a systemd path unit
-watches one directory and not a tree, so a save anywhere in it is seen. The prompts are found, not listed: in each
-git checkout under ~/dev (PROMPT_MIRROR_DEV), the tracked files named like a prompt (PATTERNS below), outside
-docs/ and tests/. A repo the box adds, and a prompt a PR adds, show up on the next pass. A member's workspace
+THE MIRROR is ~/prompts (PROMPT_MIRROR moves it): one draft per prompt, named <repo>.<path with / as .>, in one of
+five folders (FOLDERS below), and a README at the top saying which file feeds which agent and when git last changed
+it. 1-start-here holds the few prompts every agent of a kind reads (START_HERE), 2-hive and 3-box the rest of the
+hive's and of this box's own repo (the one CC_BOX names), 4-projects every other repo's, and 5-quiet those of a repo
+with no commit in QUIET_DAYS. Five folders and nothing deeper, because a systemd path unit watches one directory and
+not a tree: the unit carries a PathChanged line for each folder, and the selfcheck fails if its lines and FOLDERS
+disagree. The prompts are found, not listed: in each git checkout under ~/dev (PROMPT_MIRROR_DEV), the tracked
+files named like a prompt (PATTERNS below), outside docs/ and tests/. A repo the box adds, and a prompt a PR adds, show up on the next pass. A member's workspace
 (~/dev/<handle> with ~/.cc/members/<handle>, or its own .cc/member-workspace marker) is left out entirely, git
 included. Only a regular file reached through no link and at most MAX_BYTES (256 KiB) is read, so a link, a FIFO
 or a device at a prompt's path is skipped, and a PR never writes through a link the default branch carries.
 
-THE STATE is ~/prompts/.state/map.json: per draft, its source (repo, path), `base` (the source text the draft was
-last made from) and `sent` (the draft text last opened as a PR). Three rules, and nothing else decides:
+THE STATE is ~/prompts/.state/map.json: per draft, its source (repo, path), `dir` (the folder it is in), `base` (the
+source text the draft was last made from) and `sent` (the draft text last opened as a PR). Four rules, and nothing
+else decides:
   · git → mirror: a draft still equal to its base is unedited, so a source that moved replaces it (and the base).
     A draft that differs from its base is being edited and is NEVER written over by a change in git.
   · mirror → git: an edited draft that is not what was last sent opens (or updates) a PR: a branch
@@ -26,17 +30,24 @@ last made from) and `sent` (the draft text last opened as a PR). Three rules, an
     clash nothing is pushed and he is told how to start over. Either way the draft itself is never written.
   · landed: a sent draft whose edit git now carries (merging it onto the source changes nothing) becomes the
     source's text, others' changes included, and follows git again. Until then it is left exactly as he saved it.
-A draft deleted by hand comes back from git, which is also how an edit is dropped. A source that left git takes
+  · folders: a draft is made in its folder, and an unedited one moves when that changes (its repo went quiet). An
+    edited draft NEVER moves, so the file he has open stays put; its PR branch is named for the draft, not the
+    folder. The one exception is leaving the old flat mirror: an entry with no `dir` is at the top, and the first
+    pass moves it into its folder whatever it holds. A file at the top the state does not know is left alone.
+A draft not where its `dir` says (a pass killed after a move, before the state was saved) is looked for in every
+folder and at the top, and taken up where it is found. A draft deleted by hand comes back from git, which is also
+how an edit is dropped. A source that left git takes
 its draft with it unless the draft is edited, which is then left alone and never pushed. Passes repeat until one
 finds nothing to do, so a save made while a PR was being opened is not lost to the path unit's single trigger.
 """
-import fcntl, json, os, shutil, signal, stat, subprocess, sys, tempfile
+import fcntl, json, os, shutil, signal, socket, stat, subprocess, sys, tempfile, time
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 PATTERNS = ["*CLAUDE.md", "*-prompt.md", "prompts/*.md", "*/prompts/*.md", "*/agents/*.md", "*/self-review.md",
             ":(glob).dispatch/*.md"]   # the last: a repo's own hive briefs, which the hive reads before its own
+HIVE = "dispatch"
 REPO_PATTERNS = {   # prompts a repo names its own way: the hive's, which every lead and run starts from
-    "dispatch": ["philosophy.md", ":(glob)briefs/*.md", "host/improve.md", "judge/policy.md", "tribunal/rules.md",
+    HIVE: ["philosophy.md", ":(glob)briefs/*.md", "host/improve.md", "judge/policy.md", "tribunal/rules.md",
                  ":(glob)warden/control/*.md"],
 }
 SKIP = ("docs/", "tests/", "fixtures/")
@@ -70,21 +81,21 @@ def log(msg):
     print(f"prompt-mirror: {msg}", file=sys.stderr)
 
 
-def read(p):   # a regular file's text, or None: never through a link, never a FIFO or device, never past MAX_BYTES
+def read(p, cap=MAX_BYTES):   # a regular file's text, or None: never through a link, never a FIFO or device, never past cap
     try:
         fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:   # missing, or a link (ELOOP); O_NONBLOCK keeps a FIFO from waiting for a writer
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
             return None
         data = b""
-        while len(data) <= MAX_BYTES and (chunk := os.read(fd, MAX_BYTES + 1 - len(data))):
+        while len(data) <= cap and (chunk := os.read(fd, 1 << 16)):
             data += chunk
     finally:
         os.close(fd)
-    if len(data) > MAX_BYTES:
+    if len(data) > cap:
         return None
     try:
         return data.decode("utf-8")
@@ -173,12 +184,54 @@ FEEDS = {   # what a source feeds, by its path's tail; the README's second colum
     "warden/control/intake.md": "the Warden's intake judge" + WARDEN_LIVE,
     "warden/control/classify.md": "the Warden's action classifier" + WARDEN_LIVE,
 }
+START_HERE = {   # 1-start-here/: the few prompts every agent of a kind reads, by FEEDS key, and whose repo they are in
+    "home/CLAUDE.md": "box", "home/claude/CLAUDE.md": "box", "config/worker-prompt.md": "box",
+    "config/writing-prompt.md": "box", "config/dispatch-prompt.md": "box", "config/review-prompt.md": "box",
+    "philosophy.md": "hive",
+}
+QUIET_DAYS = 21   # 5-quiet/: a repo whose newest commit is older than this. Only where a draft is shown, nothing else
+FOLDERS = {   # the mirror's folders, in the README's order; the path unit has a PathChanged line for each
+    "1-start-here": "The few prompts every agent of a kind reads. Start here.",
+    "2-hive": "The rest of the hive's prompts.",
+    "3-box": "The rest of this box's own prompts.",
+    "4-projects": "Every other project's prompts.",
+    "5-quiet": f"Prompts of a project with no commit in {QUIET_DAYS // 7} weeks.",
+}
+
+
+def feed_key(path):   # the FEEDS tail a source matches, or None
+    return next((tail for tail in FEEDS if path == tail or path.endswith("/" + tail)), None)
+
+
+def box_name():   # this box's own repo is named for the box: CC_BOX (env, then ~/.cc/config), else the host's short name
+    r = subprocess.run([os.path.join(BIN, "cc-config"), "get", "CC_BOX", socket.gethostname().split(".")[0]],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def places(srcs):   # → {draft name: the folder it belongs in}
+    box, quiet = box_name(), set()
+    for repo, rd in {(r, d) for r, d, _ in srcs.values()}:
+        ct = git(rd, "log", "-1", "--format=%ct", check=False).stdout.strip()
+        if ct and time.time() - int(ct) > QUIET_DAYS * 86400:
+            quiet.add(repo)
+    out = {}
+    for name, (repo, _, path) in srcs.items():
+        kind = "hive" if repo == HIVE else "box" if repo == box else ""
+        if repo in quiet:
+            out[name] = "5-quiet"
+        elif not kind:
+            out[name] = "4-projects"
+        elif START_HERE.get(feed_key(path)) == kind:
+            out[name] = "1-start-here"
+        else:
+            out[name] = "2-hive" if kind == "hive" else "3-box"
+    return out
 
 
 def feeds(path):
-    for tail, what in FEEDS.items():
-        if path == tail or path.endswith("/" + tail):
-            return what
+    if (tail := feed_key(path)):
+        return FEEDS[tail]
     if path.startswith(".dispatch/"):
         return f"this repo's hive runs of that kind: used instead of the hive's briefs/{os.path.basename(path)}"
     if path == "CLAUDE.md":
@@ -200,16 +253,21 @@ You never touch git here.
 - If git changed the prompt while you were editing, the PR carries your edit onto the new text. If the two clash,
   no PR opens and Slack tells you so; your draft is left as you saved it. Delete it to get the current text back,
   then redo the edit.
+- The drafts are sorted into the folders below. One you have edited never moves; one you have not moves when its
+  folder changes, as when its project goes quiet.
 - This file is rewritten on every pass, so edits to it are lost.
-
-| draft | feeds | source |
-|---|---|---|
 """
 
 
-def readme(srcs):
-    rows = "".join(f"| {n} | {feeds(p)} | {r}: {p} |\n" for n, (r, _, p) in sorted(srcs.items()))
-    return README_HEAD + rows
+def readme(srcs, state):   # a heading per folder, its drafts where they are, each with the day git last changed it
+    out = README_HEAD
+    for d, what in FOLDERS.items():
+        names = sorted(n for n in srcs if state.get(n, {}).get("dir") == d)
+        out += f"\n## {d}\n\n{what}\n\n| draft | feeds | last changed | source |\n|---|---|---|---|\n" if names else ""
+        for n in names:
+            r, rd, p = srcs[n]
+            out += f"| {n} | {feeds(p)} | {git(rd, 'log', '-1', '--format=%cs', '--', p, check=False).stdout.strip()} | {r}: {p} |\n"
+    return out
 
 
 def default_branch(rd):
@@ -256,7 +314,9 @@ def open_pr(name, repo, rd, path, text):   # → the PR url; raises on any step 
                                cwd=wt, capture_output=True, text=True)
             if r.returncode:
                 raise RuntimeError(f"gh pr create: {r.stderr.strip()}")
-            url = r.stdout.strip().splitlines()[-1]
+            url = (r.stdout.strip().splitlines() or [""])[-1]
+            if not url:
+                raise RuntimeError("gh pr create printed no PR link")
     finally:
         git(rd, "worktree", "remove", "--force", wt, check=False)
     num = url.rstrip("/").rsplit("/", 1)[-1]
@@ -284,15 +344,21 @@ def merge3(ours, base, theirs):   # → (merged text, 0 or the number of clashes
     return m.stdout, m.returncode
 
 
-def one_pass(state, srcs):   # → True when it did anything (wrote a draft or opened a PR)
+def one_pass(state, srcs, where):   # → True when it did anything (wrote or moved a draft, or opened a PR)
     md, did = mirror_dir(), False
     for name in sorted(set(state) | set(srcs)):
-        dp, st = os.path.join(md, name), state.get(name)
+        st, draft = state.get(name), None
+        for d in (st.get("dir", ""), *FOLDERS, "") if st else (where[name],):   # no `dir`: the flat mirror's, at the top
+            if (draft := read(dp := os.path.join(md, d, name))) is not None:   # a pass cut short after a move saved no `dir`
+                if st and d:
+                    st["dir"] = d
+                elif st:
+                    st.pop("dir", None)
+                break
         src = None
         if name in srcs:
             repo, rd, path = srcs[name]
             src = read(os.path.join(rd, path))
-        draft = read(dp)
         if src is None:   # the source left git: its draft goes with it, unless it is being edited
             if st is not None and draft is not None and draft != st["base"]:
                 continue
@@ -300,9 +366,13 @@ def one_pass(state, srcs):   # → True when it did anything (wrote a draft or o
                 os.remove(dp); did = True
             state.pop(name, None)
             continue
-        if st is None or draft is None:   # new, or deleted by hand: made from git
-            write(dp, src); state[name] = {"repo": repo, "path": path, "base": src, "sent": src}; did = True
+        if st is None or draft is None:   # new, or deleted by hand: made from git, in its folder
+            write(os.path.join(md, where[name], name), src)
+            state[name] = {"repo": repo, "path": path, "dir": where[name], "base": src, "sent": src}; did = True
             continue
+        if st.get("dir") != where[name] and ("dir" not in st or draft == st["base"]):   # an edited draft moves only off the flat mirror
+            os.replace(dp, new := os.path.join(md, where[name], name))
+            dp = new; st["dir"] = where[name]; did = True
         if draft == st["base"]:   # unedited: follows git
             if src != draft:
                 write(dp, src); st.update(base=src, sent=src); did = True
@@ -334,18 +404,22 @@ def one_pass(state, srcs):   # → True when it did anything (wrote a draft or o
 
 def sync():
     md = mirror_dir()
-    os.makedirs(os.path.join(md, ".state"), exist_ok=True)
+    for d in (".state", *FOLDERS):
+        os.makedirs(os.path.join(md, d), exist_ok=True)
     with open(os.path.join(md, ".state", "lock"), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         sp = os.path.join(md, ".state", "map.json")
-        state = json.loads(read(sp) or "{}")
+        text = read(sp, sys.maxsize)   # no cap: every draft's text twice is far past MAX_BYTES on a real box
+        if text is None and os.path.lexists(sp):   # read as empty, every edit would be written over from git
+            raise SystemExit(f"prompt-mirror: {sp} is not a regular file it can read; nothing done")
+        state = json.loads(text) if text is not None else {}   # an empty or broken map raises: never read as no state
         for _ in range(10):
             srcs = sources()
-            busy = one_pass(state, srcs)
+            busy = one_pass(state, srcs, places(srcs))
             write(sp, json.dumps(state, indent=1))
             if not busy:
                 break
-        rd = readme(srcs)
+        rd = readme(srcs, state)
         if read(os.path.join(md, "README.md")) != rd:
             write(os.path.join(md, "README.md"), rd)
     return 0
@@ -355,12 +429,21 @@ W0 = "You are worker {track}.\nLine two.\nmiddle\nLine four.\n"
 WP, BP, CP = "core/config/worker-prompt.md", "core/templates/home/agents/builder.md", "CLAUDE.md"
 W, B, C = "box.core.config.worker-prompt.md", "box.core.templates.home.agents.builder.md", "box.CLAUDE.md"
 BR = "prompt-mirror/box.core.config.worker-prompt"
+OLD = "2020-01-01T00:00:00Z"   # a commit date far past QUIET_DAYS: a repo whose newest commit it is has gone quiet
 FAKES = {   # each logs its argv to $PM_CALLS; gh keeps one PR per branch under $PM_PRS
     "gh": 'echo "gh $*" >> "$PM_CALLS"\ncase "$1 $2" in "pr view") cat "$PM_PRS/$(echo "$3" | tr / _)" 2>/dev/null || exit 1;;\n'
-          '"pr create") n=$(ls "$PM_PRS" | wc -l); u="https://example.invalid/pull/$((n+7))"; echo "$u" > "$PM_PRS/$(echo "$6" | tr / _)"; echo "$u";; esac',
+          '"pr create") [ -n "$PM_GH_SILENT" ] && exit 0; n=$(ls "$PM_PRS" | wc -l); u="https://example.invalid/pull/$((n+7))"; echo "$u" > "$PM_PRS/$(echo "$6" | tr / _)"; echo "$u";; esac',
     "cc-land": 'echo "land $*" >> "$PM_CALLS"',
     "cc-notify": 'echo "notify $*" >> "$PM_CALLS"',
 }
+
+
+def commit_at(rd, date):   # what is staged, committed as made on `date`
+    os.environ["GIT_COMMITTER_DATE"] = date
+    try:
+        git(rd, "commit", "-qm", "dated")
+    finally:
+        del os.environ["GIT_COMMITTER_DATE"]
 
 
 class Fixture:   # one case's own world: a remote, the live checkout under dev/, the mirror, and its own call log
@@ -400,11 +483,37 @@ class Fixture:   # one case's own world: a remote, the live checkout under dev/,
     def land(self, p, text, msg="land"):   # a change merged in git: the live checkout moves with it
         self.put(p, text); self.commit(msg)
 
+    def path(self, name):   # where a draft is now: in one of the folders, else at the top (the README, a flat mirror's)
+        return next((p for d in FOLDERS if os.path.exists(p := f"{self.md}/{d}/{name}")), f"{self.md}/{name}")
+
+    def drafts(self):   # → {draft: its folder}
+        return {x: d for d in FOLDERS for x in os.listdir(f"{self.md}/{d}")}
+
     def draft(self, name):
-        return read(f"{self.md}/{name}")
+        return read(self.path(name))
 
     def save(self, name, text):
-        write(f"{self.md}/{name}", text)
+        write(self.path(name), text)
+
+    def flatten(self):   # the mirror as the flat code left it: every draft at the top, no `dir`; → that state
+        sp = f"{self.md}/.state/map.json"
+        flat = json.loads(read(sp, sys.maxsize))
+        for x, st in flat.items():
+            os.replace(f"{self.md}/{st.pop('dir')}/{x}", f"{self.md}/{x}")
+        write(sp, json.dumps(flat))
+        for d in FOLDERS:
+            os.rmdir(f"{self.md}/{d}")
+        return flat
+
+    def repo(self, name, files, date=None):   # another checkout under dev/, its one commit made on `date` if given
+        rd = f"{self.d}/dev/{name}"
+        subprocess.run(["git", "init", "-q", rd], check=True)
+        for p, text in files.items():
+            os.makedirs(os.path.dirname(f"{rd}/{p}"), exist_ok=True)
+            with open(f"{rd}/{p}", "w") as h:
+                h.write(text)
+        git(rd, "add", "-A")
+        commit_at(rd, date) if date else git(rd, "commit", "-qm", "i")
 
     def calls(self):
         return read(self.calls_f) or ""
@@ -430,7 +539,8 @@ def selfcheck():
     root = tempfile.mkdtemp(prefix="pm-sc-")
     try:
         os.environ.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
-                          GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+                          GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+                          CC_BOX="box")   # the fixture's repo is the box's own
         os.makedirs(f"{root}/fake")
         for name, body in FAKES.items():
             with open(f"{root}/fake/{name}", "w") as f:
@@ -440,15 +550,119 @@ def selfcheck():
         k = iter(range(100))
 
         f = Fixture(root, next(k))
-        t("the first pass mirrors each prompt, and no doc, no code",
-          sorted(x for x in os.listdir(f.md) if not x.startswith(".")), sorted([W, B, C, "README.md"]))
+        t("the first pass mirrors each prompt straight into its folder, and no doc, no code",
+          (f.drafts(), sorted(x for x in os.listdir(f.md) if not x.startswith("."))),
+          ({W: "1-start-here", B: "3-box", C: "3-box"}, sorted([*FOLDERS, "README.md"])))
         t("a draft is its source's text", f.draft(W), W0)
         rm = f.draft("README.md")
         t("the README says what each draft feeds, and from where",
           ("every headless worker (cc-loop)" in rm, f"| box: {BP} |" in rm), (True, True))
+        day = git(f.rd, "log", "-1", "--format=%cs").stdout.strip()
+        t("…under a heading per folder that has drafts, each with the day git last changed it",
+          (rm.index("## 1-start-here") < rm.index(f"| {W} |") < rm.index("## 3-box") < rm.index(f"| {B} |"),
+           f"| {W} | {feeds(WP)} | {day} | box: {WP} |" in rm, "## 5-quiet" in rm), (True, True, False))
         f.save("README.md", "mine\n"); sync()
         t("the README is the tool's: an edit to it is rewritten and proposes nothing",
           (f.draft("README.md") == rm, f.calls()), (True, ""))
+
+        ud = os.path.join(os.path.dirname(os.path.dirname(BIN)), "config", "systemd-user")
+        if os.path.isdir(ud):   # the overlay that installs the path unit (core alone ships none)
+            units = [read(os.path.join(ud, u)) or "" for u in os.listdir(ud) if u.endswith("prompt-mirror.path")]
+            t("the path unit watches each folder, and no other: a path unit sees one directory, not a tree",
+              [sorted(x.split("/", 2)[2] for x in u.splitlines() if x.startswith("PathChanged=%h/prompts/")) for u in units],
+              [sorted(FOLDERS)])
+
+        f = Fixture(root, next(k))
+        f.put("home/CLAUDE.md", "live\n"); f.put("core/templates/home/CLAUDE.md", "seed\n"); f.commit("homes")
+        f.repo("dispatch", {"philosophy.md": "rules\n", "briefs/talk.md": "lead\n"})
+        f.repo("other", {"CLAUDE.md": "theirs\n"})
+        f.repo("old", {"CLAUDE.md": "asleep\n"}, OLD)
+        sync()
+        want = {"box.home.CLAUDE.md": "1-start-here", W: "1-start-here", "dispatch.philosophy.md": "1-start-here",
+                "dispatch.briefs.talk.md": "2-hive", "box.core.templates.home.CLAUDE.md": "3-box", C: "3-box",
+                "other.CLAUDE.md": "4-projects", "old.CLAUDE.md": "5-quiet"}
+        t("each kind lands in its folder: start-here by name and repo, then the hive's, the box's, others', quiet ones",
+          {x: f.drafts().get(x) for x in want}, want)
+
+        f = Fixture(root, next(k))
+        mine = W0.replace("Line two.", "Line two, edited.")
+        f.save(W, mine); sync(); f.clear()   # an edited draft whose PR is open
+        sp = f"{f.md}/.state/map.json"
+        flat = f.flatten()
+        write(f"{f.md}/mine.md", "my notes\n")
+        sync()
+        t("migration: each draft of a flat mirror moves into its folder, the edited one too, its state only gaining `dir`",
+          (f.drafts(), f.draft(W), {x: {a: v for a, v in st.items() if a != "dir"} for x, st in json.loads(read(sp, sys.maxsize)).items()},
+           f.calls()), ({W: "1-start-here", B: "3-box", C: "3-box"}, mine, flat, ""))
+        t("…and a file at the top the state does not know is left alone", read(f"{f.md}/mine.md"), "my notes\n")
+        again = W0.replace("Line two.", "Line two, edited again.")
+        f.save(W, again); sync()
+        c = f.calls()
+        t("…the moved draft keeps its PR: a save in its folder updates the same branch, no second PR",
+          ("pr create" in c, "land queue box 7" in c, f.pushed(BR, WP)), (False, True, again))
+
+        f = Fixture(root, next(k))
+        f.flatten()
+        f.save(C, "my rules\n"); f.save(W, mine)   # two edited drafts, neither sent yet, at the top of a flat mirror
+        real = open_pr
+
+        def killed(*_):   # the pass dies here, right after moving C, as under systemd's kill: no state is saved
+            raise SystemExit(143)
+        globals()["open_pr"] = killed
+        try:
+            sync()
+        except SystemExit:
+            pass
+        finally:
+            globals()["open_pr"] = real
+        moved = f.drafts()
+        sync()
+        c = f.calls()
+        t("a pass killed right after moving an edited draft: the next finds it in its folder, keeps the edit, opens its PR",
+          (moved, f.drafts(), f.draft(C), f.draft(W), "--head prompt-mirror/box.CLAUDE --title" in c, f"--head {BR} --title" in c),
+          ({C: "3-box"}, {W: "1-start-here", B: "3-box", C: "3-box"}, "my rules\n", mine, True, True))
+
+        f = Fixture(root, next(k))
+        os.environ["PM_GH_SILENT"] = "1"
+        try:
+            f.save(W, mine); sync()
+        finally:
+            del os.environ["PM_GH_SILENT"]
+        c = f.calls()
+        t("gh printing no PR link is a failed attempt, not a crash: nothing queued, the draft as saved",
+          ("land queue" in c, f.draft(W)), (False, mine))
+        f.clear(); sync()
+        t("…and the next pass opens the PR", "land queue box 7" in f.calls(), True)
+
+        f = Fixture(root, next(k))
+        sp = f"{f.md}/.state/map.json"
+        os.replace(sp, f"{sp}.real"); os.symlink(f"{sp}.real", sp)
+        f.save(W, mine)
+        try:
+            sync(); stopped = False
+        except SystemExit:
+            stopped = True
+        t("a state file that is a link is not followed: the pass stops, the edit untouched, nothing proposed",
+          (stopped, f.draft(W), f.calls()), (True, mine, ""))
+        write(sp, "")   # replaces the link with an empty file
+        try:
+            sync(); stopped = False
+        except ValueError:
+            stopped = True
+        t("…and an empty one stops it too: read as no state, the edit would be written over from git",
+          (stopped, f.draft(W), f.calls()), (True, mine, ""))
+
+        f = Fixture(root, next(k))
+        f.save(W, mine); sync(); f.clear()
+        f.put("core/bin/tool", "code v2\n"); git(f.rd, "add", "-A"); commit_at(f.rd, OLD)   # the repo goes quiet
+        sync()
+        t("a repo gone quiet: its unedited drafts move to 5-quiet, the edited one stays put, and nothing is proposed",
+          (f.drafts(), f.draft(W), f.calls()), ({W: "1-start-here", B: "5-quiet", C: "5-quiet"}, mine, ""))
+        f.save(C, "my rules\n"); sync()
+        c = f.calls()
+        t("a save in a folder opens its PR, on a branch named for the draft and not its folder",
+          ("gh pr create --base main --head prompt-mirror/box.CLAUDE" in c, f.pushed("prompt-mirror/box.CLAUDE", CP)),
+          (True, "my rules\n"))
 
         f = Fixture(root, next(k))
         f.land(BP, "builder v2\n"); sync()
@@ -505,7 +719,7 @@ def selfcheck():
           ("gh pr create" in c, "clashes" in c and f"Delete {C}" in c, f.draft(C)), (False, True, "my rules\n"))
         f.clear(); sync()
         t("…once: the next pass says nothing", f.calls(), "")
-        os.remove(f"{f.md}/{C}"); sync()
+        os.remove(f.path(C)); sync()
         t("a draft deleted by hand comes back as git's text, proposing nothing", (f.draft(C), f.calls()), ("their rules\n", ""))
 
         f = Fixture(root, next(k))
@@ -514,7 +728,7 @@ def selfcheck():
         git(f.rd, "rm", "-q", BP, CP); f.commit("rm")
         sync()
         t("a prompt added in git appears", f.draft("box.core.templates.home.agents.new.md"), "new agent\n")
-        t("a prompt removed from git takes its unedited draft with it", os.path.exists(f"{f.md}/{B}"), False)
+        t("a prompt removed from git takes its unedited draft with it", os.path.exists(f.path(B)), False)
         t("…but an edited one stays, and is never pushed", (f.draft(C), "pr create" in f.calls()), ("kept edit\n", False))
 
         f = Fixture(root, next(k))
@@ -524,7 +738,7 @@ def selfcheck():
         os.remove(f"{f.rd}/{CP}"); os.symlink(secret, f"{f.rd}/{CP}")   # a tracked prompt turned into a link
         sync()
         t("a prompt whose file is a link is not followed: its draft goes, and the linked file's text is nowhere",
-          (os.path.exists(f"{f.md}/{C}"), any("s3cret" in (read(f"{f.md}/{x}") or "") for x in os.listdir(f.md))),
+          (os.path.exists(f.path(C)), any("s3cret" in (f.draft(x) or "") for x in [*f.drafts(), "README.md"])),
           (False, False))
 
         f = Fixture(root, next(k))
@@ -537,11 +751,19 @@ def selfcheck():
             hung = True
         finally:
             signal.alarm(0)
-        t("a FIFO at a prompt's path never hangs the pass, and is not mirrored", (hung, os.path.exists(f"{f.md}/{B}")), (False, False))
+        t("a FIFO at a prompt's path never hangs the pass, and is not mirrored", (hung, os.path.exists(f.path(B))), (False, False))
 
         f = Fixture(root, next(k))
         f.land(CP, "x" * (MAX_BYTES + 1)); sync()
-        t("a file over the size limit is not a prompt: no draft", os.path.exists(f"{f.md}/{C}"), False)
+        t("a file over the size limit is not a prompt: no draft", os.path.exists(f.path(C)), False)
+
+        f = Fixture(root, next(k))
+        f.land(CP, "x" * (MAX_BYTES // 2)); sync()   # its base and sent alone put the state past MAX_BYTES
+        mine = W0.replace("Line two.", "Line two, edited.")
+        f.save(W, mine); sync()
+        t("a state larger than MAX_BYTES is still read: a save opens its PR and is not written over from git",
+          (os.path.getsize(f"{f.md}/.state/map.json") > MAX_BYTES, f.draft(W), "land queue box 7" in f.calls()),
+          (True, mine, True))
 
         f = Fixture(root, next(k))
         os.makedirs(f"{f.d}/members/alice")
@@ -553,7 +775,7 @@ def selfcheck():
         git(f"{f.d}/dev/bob", "add", "-A"); git(f"{f.d}/dev/bob", "commit", "-qm", "b")
         sync()
         t("a member's workspace is left out entirely (by its record, or by its own marker)",
-          sorted(x for x in os.listdir(f.md) if x.startswith(("alice.", "bob."))), [])
+          sorted(x for x in f.drafts() if x.startswith(("alice.", "bob."))), [])
 
         f = Fixture(root, next(k))
         for repo, files in {".trash-old": {"CLAUDE.md": "old\n"},
@@ -561,17 +783,11 @@ def selfcheck():
                                          "briefs/notes/main.md": "notes\n", ".dispatch/drain.md": "drain\n",
                                          ".dispatch/notes/1.md": "a run's note\n", "README.md": "doc\n"},
                             "other": {"philosophy.md": "not the hive's\n"}}.items():
-            rd = f"{f.d}/dev/{repo}"
-            subprocess.run(["git", "init", "-q", rd], check=True)
-            for p, text in files.items():
-                os.makedirs(os.path.dirname(f"{rd}/{p}"), exist_ok=True)
-                with open(f"{rd}/{p}", "w") as h:
-                    h.write(text)
-            git(rd, "add", "-A"); git(rd, "commit", "-qm", "i")
+            f.repo(repo, files)
         sync()
         t("the hive's prompts are mirrored by name, and a repo's own hive briefs; a put-away dot dir, run notes and "
           "another repo's file of the same name are not",
-          sorted(x for x in os.listdir(f.md) if x not in ("README.md", ".state") and not x.startswith("box.")),
+          sorted(x for x in f.drafts() if not x.startswith("box.")),
           ["dispatch..dispatch.drain.md", "dispatch.briefs.talk.md", "dispatch.philosophy.md"])
         t("…and the README says what each feeds", ("every hive lead and run: the rules it starts from" in f.draft("README.md"),
           "used instead of the hive's briefs/drain.md" in f.draft("README.md")), (True, True))
