@@ -306,6 +306,9 @@ win_id(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null |
 # THE PANE PROCESS ITSELF COUNTS (2026-10-12). The walk named only descendants, so a seat the tower restored with
 # claude AS the pane process read as "runs no interactive claude" while it was live, and the architect missed a
 # relay of review findings for it. A wrapper (a python __runorch, a bash -c) is not claude and is walked through.
+# A PANE THAT RUNS A cc-loop HOLDS NO SESSION, whatever is named claude under it (2026-10-21). dispatch's agent/claude
+# is a bash script its own suite runs, so a worker testing it put a claude without -p under its loop's pane: the
+# drain typed at that static pane, called it wedged and killed the window, and the loop died of the HUP five times.
 claude_pids(){   # $1 = window id → every `claude` in that pane's tree, the pane process included. Also WHICH
                  # session is behind a screen: a pid that has changed is a different one, however alike the panes read.
   local pp
@@ -314,6 +317,7 @@ claude_pids(){   # $1 = window id → every `claude` in that pane's tree, the pa
     { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
     END { q[1] = root; n = 1                                   # breadth-first over the pane subtree
           for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
+          for (i = 1; i <= n; i++) if (name[q[i]] == "cc-loop") exit
           for (i = 1; i <= n; i++) if (name[q[i]] == "claude") print q[i] }'   # i = 1: the pane process too
 }
 
@@ -1423,7 +1427,8 @@ case "$*" in
   # with CC_FAKE_PROC under it. The perms window's claude is always 881235: CC_FAKE_PERMS only says whether the
   # window perms exists (the tmux stub), so a case that sets it to a word cannot also make up a pid out of it.
   *-eo*) printf '991234 1 %s\n%s 991234 %s\n' "${CC_FAKE_ROOT:-bash}" "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}"
-         printf '881234 1 bash\n881235 881234 claude\n';;
+         printf '881234 1 bash\n881235 881234 claude\n'
+         [ -n "${CC_FAKE_LOOP:-}" ] && printf '991236 991234 cc-loop\n';;               # the pane runs a worker's loop
   *comm=*) echo "${CC_FAKE_COMM:-cc-test}";;                                      # ps -o comm= -p $PPID
   *args=*) echo "${CC_FAKE_ARGS:-cc-test}";;                                      # ps -o args= -p $PPID
   *)     echo cc-test;;
@@ -1767,6 +1772,16 @@ $BUSY"; out=$(msg "hello mid-turn")
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c -e ' wedged$' "$T/keys")" = 2)" "the session that came back is typed what was pending"
   k "$(nt test -f "$SP")" "…and the spool is empty: nothing was lost by the restart"
+
+  # …BUT A LOOP'S WINDOW IS NEVER TYPED AT OR RESTARTED (2026-10-21): a claude without -p under a cc-loop's pane is
+  # something the worker runs (dispatch's agent/claude script), not a session, and the pane is static because the loop is.
+  reset; scr "$FREE"; mkdir -p "${SP%/*}"; printf '{"at":"2026-01-01T00:00:00Z","from":"x","text":"at a loop"}\n' > "$SP"
+  CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_LOOP=1 "$T/bin/cc-msg" --drain "$W"
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "a static pane under a live loop beside a claude without -p: the window is neither killed nor reopened"
+  k "$(nt grep -qF 'at a loop' "$T/keys")" "…and nothing is typed into the loop's pane"
+  CC_FAKE_LOOP=1 msg "to a loop" >/dev/null 2>&1; rc=$?
+  k "$(t test "$rc" = 1)" "…and a new message to it is refused (rc 1), as at any headless worker"
+  rm -f "$SP"
 
   # …and the reopen NEVER inherits the caller's terminal. `cc` reads `[ -t 0 ]`: given one it select-windows and
   # `exec tmux attach`, which draws on fd 0 whatever stdout and stderr are pointed at — so a person running
