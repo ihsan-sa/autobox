@@ -14,6 +14,11 @@
 #        REFUSED, exit 4, nothing run: --vram above the card's total memory. GAVE UP, exit 5, nothing run: still not
 #        enough free after --wait-max seconds (default 0, which waits as long as it takes). REFUSED too, exit 4: the
 #        queue's lock cannot be opened, as when a link sits at ~/.cc/gpu/lock (it is never followed).
+#        THE LOCK IS NOT TRUSTED BLINDLY: the job that takes it writes its pid and pid namespace into it. When it is
+#        busy and its holder is gone, is not a cc-gpu process, or named no pid, a fresh lock file is put in its place
+#        and the job queues on that; where it cannot be replaced (a sandbox, where the file is bound) the job is
+#        admitted without it. The holder is the one /proc/locks names, else the pid written in the lock; one written
+#        from another pid namespace cannot be checked and is waited for.
 #   cc-gpu ffmpeg -- <ffmpeg args...>
 #        an x264/x265 encode on the GPU when there is a card: `-c:v libx264` becomes h264_nvenc and `libx265` hevc_nvenc,
 #        `-crf N` becomes NVENC's constant quality (`-rc vbr -cq N -b:v 0`; a stream specifier on it is kept, so
@@ -27,7 +32,8 @@
 #        code of the last ffmpeg run. CC_GPU_FFMPEG names the ffmpeg.
 #   cc-gpu probe        exit 0 and one line (the card, its total and free MB) when a card is usable here; else exit 3
 #                       and the reason. A caller with a CPU path asks this first and falls back on 3.
-#   cc-gpu status       the card, then the last ten jobs of the log
+#   cc-gpu status       the card, then the last ten jobs of the log. Only a line of the shape `run` writes (those
+#                       eight fields, each of its type) is shown, re-encoded; any other line is counted as ignored.
 #   cc-gpu selfcheck    the rules above against a fake nvidia-smi, in a scratch dir; no card needed
 #   cc-gpu --help | -h  this header
 # NO CARD, exit 3, nothing run, for `run` and `probe` alike: nvidia-smi is missing, fails, or lists no GPU. The message
@@ -102,6 +108,54 @@ def log(rec):
         print(f"cc-gpu: could not write the log ({e}); the job itself ran", file=sys.stderr)
 
 
+def pidns():
+    return str(os.stat("/proc/self/ns/pid").st_ino)
+
+
+def holder(fd):
+    """Why the flock on `fd` is not to be trusted ("pid N, gone" / "pid N, not cc-gpu" / "a holder that named no pid"),
+    or None when its holder is a live cc-gpu or cannot be checked from here. /proc/locks names a live locker seen from
+    this pid namespace; one that died or sits in another namespace is hidden there, so then the pid cc-gpu wrote into
+    the lock on taking it is checked, when it was written from this namespace."""
+    st = os.fstat(fd)
+    key = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    try:
+        with open("/proc/locks") as f:
+            pid = next((l.split()[4] for l in f if l.split()[1:2] == ["FLOCK"] and l.split()[5:6] == [key]), None)
+        if pid is None:
+            claim = os.pread(fd, 64, 0).decode(errors="replace").split()
+            if len(claim) != 2 or not claim[0].isdigit():
+                return "a holder that named no pid"
+            if claim[1] != pidns():
+                return None
+            pid = claim[0]
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().decode(errors="replace").split("\0")
+    except FileNotFoundError:
+        return f"pid {pid}, gone"
+    except OSError:
+        return None
+    return None if any(os.path.basename(a) == "cc-gpu" for a in args[:3]) else f"pid {pid}, not cc-gpu"
+
+
+def job_line(l):
+    """The record of one log line when it has the shape `run` writes, else None."""
+    try:
+        r = json.loads(l)
+    except ValueError:
+        return None
+    types = {"ts": str, "name": str, "cmd": str, "vram_mb": int, "wait_s": (int, float), "run_s": (int, float),
+             "peak_vram_mb": int, "exit": int}
+    ok = (isinstance(r, dict) and r.keys() == types.keys()
+          and all(isinstance(r[k], t) and not isinstance(r[k], bool) for k, t in types.items())
+          and r["vram_mb"] > 0 and min(r["wait_s"], r["run_s"], r["peak_vram_mb"]) >= 0)
+    try:
+        ok = ok and time.strptime(r["ts"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        ok = False
+    return r if ok else None
+
+
 def run(argv):
     vram, name, wait_max, cmd = None, None, 0.0, []
     i = 0
@@ -129,17 +183,27 @@ def run(argv):
         return REFUSED
     t0 = time.time()
     os.makedirs(gdir(), mode=0o700, exist_ok=True)
+    lock = os.path.join(gdir(), "lock")
     try:
-        lk = opened(os.path.join(gdir(), "lock"), os.O_RDWR)
+        lk = opened(lock, os.O_RDWR)
     except OSError as e:   # ELOOP when a link sits at the lock: refused, never followed
-        print(f"cc-gpu: refused: cannot open the queue's lock {os.path.join(gdir(), 'lock')} ({e.strerror}); "
+        print(f"cc-gpu: refused: cannot open the queue's lock {lock} ({e.strerror}); "
               "if it is a link, remove it", file=sys.stderr)
         return REFUSED
     poll, settle = max(0.05, fnum("CC_GPU_POLL", 2)), max(0.0, fnum("CC_GPU_SETTLE", 10))
     while True:   # the lock first, so jobs are admitted in turn; then free VRAM, read while holding it
         try:
-            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(lk, 0); os.pwrite(lk, f"{os.getpid()} {pidns()}\n".encode(), 0); break
         except BlockingIOError:
+            why = holder(lk)
+            if why:   # "a lock held by a dead or foreign holder is taken back rather than trusted"
+                print(f"cc-gpu: the queue's lock is held by {why}; taking it back", file=sys.stderr)
+                try:
+                    os.close(opened(lock + ".new", os.O_RDWR)); os.replace(lock + ".new", lock)
+                    os.close(lk); lk = opened(lock, os.O_RDWR); continue
+                except OSError:   # a bound lock (a sandbox) cannot be replaced: admitted without it
+                    break
             if wait_max and time.time() - t0 > wait_max:
                 print(f"cc-gpu: gave up: the queue was still busy after {wait_max:g} s", file=sys.stderr); return GAVE_UP
             time.sleep(poll)
@@ -245,8 +309,11 @@ def status():
     rc = probe()
     try:
         with open(os.path.join(gdir(), "jobs.jsonl")) as f:
-            for l in f.readlines()[-10:]:
-                print(l.rstrip())
+            recs = [job_line(l) for l in f if l.strip()]
+        for r in [r for r in recs if r][-10:]:
+            print(json.dumps(r))
+        if None in recs:
+            print(f"cc-gpu: {recs.count(None)} line(s) of the log ignored: not the shape cc-gpu writes", file=sys.stderr)
     except OSError:
         print("cc-gpu: no jobs logged yet")
     return 0 if rc in (0, NO_GPU) else rc
@@ -330,6 +397,25 @@ def selfcheck():
         first.wait(timeout=30)
         r = go(["run", "--vram", "100", "--", "true"])
         t("…and is admitted once the window is over", r.returncode, 0)
+        # a lock held by something that is not a live cc-gpu job is taken back: each case in a queue dir of its own
+        # forged: a live locker that is not cc-gpu. stale: the locker named itself as cc-gpu does, then died, its child
+        # holding the lock on. hidden: the same, naming no pid. A dead locker is not in /proc/locks, so the last two
+        # are judged by what the lock says.
+        hold = ("import fcntl, os, sys, time\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\nfcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "if sys.argv[2] == 'stale': os.write(fd, b'%d %d' % (os.getpid(), os.stat('/proc/self/ns/pid').st_ino))\n"
+                "if sys.argv[2] != 'forged' and os.fork(): os._exit(0)\nopen(sys.argv[3], 'w').write(str(os.getpid())); time.sleep(30)\n")
+        for kind, says in (("forged", "not cc-gpu"), ("stale", "gone"), ("hidden", "named no pid")):
+            q = os.path.join(tmp, kind); os.makedirs(q); ready = os.path.join(q, "ready")
+            h = subprocess.Popen([sys.executable, "-c", hold, os.path.join(q, "lock"), kind, ready])
+            while not os.path.exists(ready) or not open(ready).read(): time.sleep(0.05)
+            if kind != "forged": h.wait()   # the pid that took the lock is gone; its child holds it on
+            r = go(["run", "--vram", "100", "--wait-max", "2", "--", "touch", os.path.join(q, "ran")], CC_GPU_DIR=q)
+            t(f"a {kind} lock (its holder {says}) is taken back: the job runs, and says so",
+              (r.returncode, os.path.exists(os.path.join(q, "ran")), says in r.stderr), (0, True, True))
+            r = go(["run", "--vram", "100", "--wait-max", "2", "--", "true"], CC_GPU_DIR=q)
+            t(f"…and the next job queues on the fresh lock without taking anything back",
+              (r.returncode, "taking it back" in r.stderr), (0, False))
+            os.kill(int(open(ready).read()), signal.SIGKILL); h.wait()
         # a link at the log is not written through
         os.remove(os.path.join(tmp, "q", "jobs.jsonl")); target = os.path.join(tmp, "elsewhere")
         open(target, "w").close(); os.symlink(target, os.path.join(tmp, "q", "jobs.jsonl"))
@@ -345,6 +431,18 @@ def selfcheck():
         r = go(["run", "--vram", "100", "--", "touch", mark + "3"])
         t("…and with the link gone the job runs", (r.returncode, os.path.exists(mark + "3")), (0, True))
         os.remove(os.path.join(tmp, "q", "jobs.jsonl"))   # the link above, so the cases below log again
+        # forged lines in the log: status shows only the lines of the shape run writes, and counts the rest
+        q = os.path.join(tmp, "forgedlog"); os.makedirs(q)
+        good = {"ts": "2026-10-21T12:00:00Z", "name": "enc", "cmd": "x", "vram_mb": 100, "wait_s": 0.1, "run_s": 1.0,
+                "peak_vram_mb": 0, "exit": 0}
+        with open(os.path.join(q, "jobs.jsonl"), "w") as f:
+            for x in (good, dict(good, pid=1), dict(good, exit=True), dict(good, ts="now"), dict(good, vram_mb=-1), [1]):
+                f.write(json.dumps(x) + "\n")
+            f.write("\x1b[2J not json\n")
+        r = go(["status"], CC_GPU_DIR=q)
+        t("forged log lines are ignored by status and counted: only the real job is shown",
+          ([l for l in r.stdout.splitlines() if l.startswith("{")], "6 line(s) of the log ignored" in r.stderr, "\x1b" in r.stdout),
+          ([json.dumps(good)], True, False))
         # ffmpeg: a fake that prints its args, so what cc-gpu turned them into is what the test reads; a card with room
         used(1000)
         fake = os.path.join(tmp, "ffmpeg")

@@ -8,6 +8,7 @@ PATH starts with a tmp bin of fakes (gh answering from a JSON file and squashing
 cc-config, cc-pause, cc-tier, cc-board, cc, cc-gh-token, systemd-run, systemctl, tmux). The units are stubs.
 """
 import contextlib
+import dataclasses
 import errno
 from concurrent import futures
 import io
@@ -3092,33 +3093,74 @@ class HostHold(Fixture):
         self.assertNotIn("perms-read", j.extra["why"])
         self.assertEqual(j.extra["host_hold"], j.head)   # review.requeue_held finds it by this when the LAND lands
 
-    def swept(self, **entry):
+    def swept(self, *entries, repo="", other=None, edit=None):
         """perms-d3, 10-20: a fresh perms seat writes its LAND into security-reads.json itself, with no `lander
-        record`; the tick's `landed` sweep re-queues the held job only for a LAND at its exact head and change."""
+        record`; the tick's `landed` sweep re-queues the held job only for a LAND at its exact head and change.
+        `entries` are demo's ledger, each over an entry at the job's repo, PR, head and change; `other`, when given,
+        is the ledger of the same held job in a second repo, "other"; `edit` changes demo's job first."""
         head, _, _ = self.lane(False)
         j = self.job()
-        with mock.patch.object(R, "PERMS_STATE", os.path.join(self.tmp, "perms-state")):
-            path = R.perms_reads_path("demo")
+        base = {"repo": "demo", "pr": 1, "head": head, "change": j.digest}
+
+        def ledger(r, es):
+            path = R.perms_reads_path(r)
             os.makedirs(os.path.dirname(path))
             with open(path, "w") as f:
-                json.dump([dict({"repo": "demo", "pr": 1, "head": head, "change": j.digest}, **entry)], f)
+                json.dump([dict(base, **{"repo": r, **e}) for e in es], f)
             os.chmod(path, 0o600)
-            lines = TK.sweep_landed()
-        return lines, [r for _, r in J.requests("demo")]
+        with mock.patch.object(R, "PERMS_STATE", os.path.join(self.tmp, "perms-state")):
+            ledger("demo", entries)
+            if other is not None:
+                ledger("other", other)
+                J.save(dataclasses.replace(j, repo="other"))
+            if edit:
+                edit(j)
+                J.save(j)
+            lines = TK.sweep_landed(repo)
+        return lines, [(r["repo"], r["pr"], r["who"]) for _, r in J.requests()]
 
     def test_a_land_written_into_perms_file_requeues_the_held_job(self):
-        lines, reqs = self.swept(verdict=T.LAND)
-        self.assertEqual([(r["pr"], r["who"]) for r in reqs], [(1, "perms")])
+        lines, reqs = self.swept({"verdict": T.LAND})
+        self.assertEqual(reqs, [("demo", 1, "perms")])
         self.assertIn("perms' LAND at", lines[0])
 
+    def test_an_entry_with_no_verdict_word_requeues_the_held_job(self):
+        self.assertEqual(self.swept({})[1], [("demo", 1, "perms")])
+
     def test_a_land_at_another_head_requeues_nothing(self):
-        self.assertEqual(self.swept(head="c" * 40), ([], []))
+        self.assertEqual(self.swept({"head": "c" * 40}), ([], []))
 
     def test_a_land_of_another_change_requeues_nothing(self):
-        self.assertEqual(self.swept(change="other"), ([], []))
+        self.assertEqual(self.swept({"change": "other"}), ([], []))
+
+    def test_a_land_on_another_pr_requeues_nothing(self):
+        self.assertEqual(self.swept({"pr": 2}), ([], []))
+
+    def test_a_land_on_another_repo_requeues_nothing(self):
+        self.assertEqual(self.swept({"repo": "other"}), ([], []))
 
     def test_a_fix_in_perms_file_requeues_nothing(self):
-        self.assertEqual(self.swept(verdict="FIX"), ([], []))
+        self.assertEqual(self.swept({"verdict": "FIX"}), ([], []))
+
+    def test_a_fix_after_a_land_requeues_nothing(self):
+        self.assertEqual(self.swept({"verdict": T.LAND}, {"verdict": "FIX"}), ([], []))
+
+    def test_a_job_not_in_query_requeues_nothing(self):
+        self.assertEqual(self.swept({}, edit=lambda j: setattr(j, "state", T.HANDBACK)), ([], []))
+
+    def test_a_job_with_no_host_hold_requeues_nothing(self):
+        self.assertEqual(self.swept({}, edit=lambda j: j.extra.pop("host_hold")), ([], []))
+
+    def test_the_repo_filter_sweeps_only_that_repo(self):
+        self.assertEqual(self.swept({}, other=[{}], repo="other")[1], [("other", 1, "perms")])
+
+    def test_a_bad_ledger_entry_is_said_and_the_other_repo_is_still_swept(self):
+        """Opus read of #1744: a `change` that is a list made perms_recorded raise, which ended the tick before any
+        lane ran."""
+        lines, reqs = self.swept({"change": ["x"]}, other=[{}])
+        self.assertEqual(reqs, [("other", 1, "perms")])
+        self.assertIn("[demo] PR #1: the landed sweep failed: TypeError", "\n".join(lines))
+        self.assertIn("landed: TypeError", self.log())
 
 
 class Review(Fixture):

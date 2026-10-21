@@ -1219,7 +1219,7 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
     a main-red fix: its box runs take the first claim on a slot (run's `first`). runners=True from the lane
     only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
     caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
-    rest run on the box only. main: {check: status} of main's own record on exactly base_tree (health.at), which
+    rest go where choose_where puts the lane's: one that may leave goes to a runner's cage while this box is full. main: {check: status} of main's own record on exactly base_tree (health.at), which
     judge() takes in place of a base run."""
     _STOP.event = cancel
     try:
@@ -1261,7 +1261,7 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         security = name == M.BUILTIN or any(M.match(list(m.policy.gate_first) + list(m.policy.security_review) +
                                                      list(SECURITY_PATHS), p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
-        where = "box" if caged else choose_where(c, member, box_only=box_only, runners=runners)
+        where = choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:
             where = "box"   # the laptop gave no answer once in this plan: do not wait out its timeout per check
         out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,

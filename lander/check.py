@@ -13,7 +13,7 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         does; --manifest FILE names another. --caged-only runs only the checks that run whole in the bwrap profile on
         this box: a host- or box-class check, or one that needs the network, a mount or another runner, is not run
         and is said as `deferred — runs at landing`, never as passed, and the last line says the green is not a full
-        one. cc-green's run for a fenced worker always passes it (the tree is one the worker wrote).
+        one. A check that may leave goes to a runner's cage while this box is full, on the lane's terms (run.judge). cc-green's run for a fenced worker always passes it (the tree is one the worker wrote).
 
     lander sweep [--repo DIR] [--rev REV] [--manifest FILE] [--only NAME]… [--sandbox] [--jobs N]
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
@@ -153,7 +153,7 @@ def cmd_check(argv):
         print(f"  fault    {f}")
     outs = RUN.run_plan(wt, m, plan, files, head_tree, base_tree, only=a["--only"] or None, record_reds=False,
                         quarantine_text=RUN.quarantine_text(wt, base), fallback=fb,
-                        **({"caged": True, "box_only": True} if caged else {}))
+                        caged=caged)
     return report(outs)
 
 

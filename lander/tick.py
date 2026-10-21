@@ -443,14 +443,19 @@ def sweep_landed(repo="") -> list:
     the job's change (review.perms_recorded, what the host check itself runs on), goes back in the lane however the
     LAND got there. perms-d3, 10-20: a fresh perms seat that `lander record` refuses writes security-reads.json
     itself, and #1724's job sat held until a seat queued it by hand. It reads only local files, so it runs every
-    tick."""
+    tick. A job whose ledger will not read (an entry perms_recorded raises on) is said and logged, as in
+    sweep_ended, and the sweep and the tick go on."""
     lines = []
     for p in sorted(glob.glob(f"{J.rest_dir()}/*.json")):
         j = J.load_path(p)
         h = j is not None and j.state == T.QUERY and (not repo or j.repo == repo) and j.extra.get("host_hold")
-        if h and R.perms_recorded(j.repo, j.pr, h, {j.digest}):
-            J.submit(j.repo, j.pr, who="perms")
-            lines.append(f"[{j.repo}] PR #{j.pr}: perms' LAND at {h[:12]} is in its ledger — queued again")
+        try:
+            if h and R.perms_recorded(j.repo, j.pr, h, {j.digest}):
+                J.submit(j.repo, j.pr, who="perms")
+                lines.append(f"[{j.repo}] PR #{j.pr}: perms' LAND at {h[:12]} is in its ledger — queued again")
+        except Exception as e:  # noqa: BLE001 — as sweep_ended: one bad ledger entry never stops every lane
+            E.log("tick-fault", j.repo, j.pr, f"landed: {type(e).__name__}: {e}")
+            lines.append(f"[{j.repo}] PR #{j.pr}: the landed sweep failed: {type(e).__name__}: {e}")
     return lines
 
 

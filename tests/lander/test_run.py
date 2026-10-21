@@ -3099,18 +3099,34 @@ class CheckCaged(Env):
         self.assertEqual(RUN.uncaged(dataclasses.replace(c, mounts=["~/x"])), "needs host mounts")
         self.assertEqual(RUN.uncaged(dataclasses.replace(c, where=["laptop"])), "runs only on laptop")
 
-    def test_a_caged_plan_never_leaves_the_box(self):
-        seen = []
+    def test_a_caged_plan_spills_to_a_runner_and_comes_back_when_it_refuses(self):
+        # 10-21: the box sat at load 40 with 36 caged greens queued for hours while the peer sat at load 3. A caged
+        # check that may leave goes to the runners' cage on the lane's terms; a refusal (busy, gone) runs it here
+        seen, answer = [], {}
 
         def runner(check, tree, where, **kw):
             seen.append(where)
-            return T.Result(check=check.name, tree=tree, status=T.PASSED, secs=0)
+            st = answer.get(where, T.PASSED)
+            return T.Result(check=check.name, tree=tree, status=st, secs=0, extra={"why": "runner busy"})
         c = T.Check(name="x", run="true", klass=T.HERMETIC, where=["laptop", "box"])
         m = M.Manifest(checks={"x": c})
-        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
-            RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False)
-            RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False, caged=True)
-        self.assertEqual(seen, ["laptop", "box"])
+        plan = lambda: RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False,
+                                    caged=True)["x"].status
+        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), \
+                mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
+            self.assertEqual((plan(), seen), (T.PASSED, ["laptop"]))
+            seen.clear()
+            answer["laptop"] = T.UNRUNNABLE
+            self.assertEqual((plan(), seen), (T.PASSED, ["laptop", "box"]))
+        seen.clear()
+        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), mock.patch.object(RUN, "spill", return_value=""):
+            self.assertEqual((plan(), seen), (T.PASSED, ["box"]))   # a box with room keeps it
+
+    def test_caged_only_lets_the_plan_spill(self):
+        with mock.patch.object(RUN, "run_plan", return_value={}) as rp:
+            self.check("--caged-only")
+        self.assertTrue(rp.call_args.kwargs["caged"])
+        self.assertFalse(rp.call_args.kwargs.get("box_only"))
 
 
 class Sweep(unittest.TestCase):
