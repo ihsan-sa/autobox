@@ -144,6 +144,8 @@
 #   CC_LOOP_HUNG_SECS how long a silent transcript means hung · CC_LOOP_HUNG_POLL how often it is looked at (60 s).
 # Env: CC_LOOP_TRIM=1 (cc-config key or the environment) drops OLD TOOL RESULTS from a worker's context — off by
 #      default, and off is byte-for-byte the run this loop always did. What it is and what it measured: trim_body.
+# Env: each iteration's claude runs in a user scope in worker.slice at CPUWeight/IOWeight 20, beside app.slice and
+#   lander.slice at 100 (WORKERS YIELD TO LANDINGS, below); CC_WORKER_SCOPE=0 or no user bus runs it at nice 19, loudly.
 # Env: every worker runs inside bwrap (cc-sandbox) — secrets, sockets, other tracks absent, network through an allow-list;
 #   CC_WORKER_SANDBOX=0 is the owner's off switch. A box where the fence cannot start runs no worker (`cc-sandbox probe`, before iter 1).
 # Env: WORKER_CLAUDE_CREDENTIALS (cc-config key) set and the fence on → the worker runs on that login when cc-sandbox takes
@@ -1707,6 +1709,44 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/sbx" FK_LINE="" FK_COMMIT=0 CC_WORKER_SANDBOX=0 "$lb/cc-loop" lp sbx --max-iter 1 --no-extend ) >/dev/null 2>&1
   t '…and with the sandbox off (CC_WORKER_SANDBOX=0), each of its Bash calls is handed a scope of its own' "$(cat "$d/lb.ns" 2>/dev/null)" "$lb/cc-nosignal-shell"
+  # ── WORKERS YIELD TO LANDINGS ── each case its own track and its own claude stub, which setsids a grandchild that
+  # writes its slice's cgroup and that slice's cpu.weight. Shims first (any box): the scope is asked for in worker.slice
+  # and the slice set to the low weight, CPU and IO, with a fresh unit name each launch; then off by CC_WORKER_SCOPE=0;
+  # then, where this box has a user bus, the real slice beside a lander.slice scope the case starts itself.
+  cat > "$lb/claude-cg" <<'CG'
+#!/bin/sh
+setsid sh -c '(c=$(sed -n "s/^0:://p" /proc/self/cgroup); echo "${c%/*} $(cat "/sys/fs/cgroup${c%/*}/cpu.weight" 2>/dev/null)" > "$FK_ST/cg.tmp"; echo "$(nice) $(ionice)" > "$FK_ST/ni"; mv "$FK_ST/cg.tmp" "$FK_ST/cg") &'
+n=0; while [ ! -s "$FK_ST/cg" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"did a step"}'
+CG
+  mkdir -p "$d/srb"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' "$d/sr.argv" > "$d/srb/systemd-run"
+  printf '#!/bin/sh\nprintf "systemctl %%s\\n" "$*" >> "%s"\n' "$d/sr.argv" > "$d/srb/systemctl"
+  chmod +x "$lb/claude-cg" "$d/srb/systemd-run" "$d/srb/systemctl"
+  wsc(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
+    git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    ( env -i PATH="$2" HOME="$lh" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} CC_CLAUDE="$lb/claude-cg" CC_LAND="$lb/cc-land" \
+        CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" CC_WORKER_SCOPE="$3" "$lb/cc-loop" lp "$1" --max-iter 1 --no-extend ) >/dev/null 2>&1; }
+  wsc ws "$d/srb:/usr/bin:/bin" 1
+  t "a worker's claude is started in a scope of its own in worker.slice, the slice set to CPU and IO weight 20, and its setsid grandchild ran" \
+    "$(grep -c -- "--scope --quiet --collect --slice=worker.slice --unit=cc-worker-lp-ws-[0-9]*-1-[0-9]* -- sh -c .* env CC_ROLE=worker" "$d/sr.argv")/$(grep -c "^systemctl --user set-property --runtime worker.slice CPUWeight=20 IOWeight=20$" "$d/sr.argv")/$([ -s "$lh/.cc/state/lp/ws/cg" ] && echo ran)" 1/1/ran
+  : > "$d/sr.argv"; wsc wo "$d/srb:/usr/bin:/bin" 0
+  t '…and with CC_WORKER_SCOPE=0 it is not, but its setsid grandchild runs at nice 19 and IO 7, and loop.log warns' \
+    "$(grep -c . "$d/sr.argv")/$(cat "$lh/.cc/state/lp/wo/ni")/$(grep -c 'WARNING: worker runs unscoped (CC_WORKER_SCOPE=0)' "$lh/.cc/state/lp/wo/loop.log")" "0/19 best-effort: prio 7/1"
+  printf '#!/bin/sh\nexit 1\n' > "$d/srb/systemd-run"; wsc wf "$d/srb:/usr/bin:/bin" 1
+  t '…and where there is no user bus, claude still runs, at nice 19 and IO 7, and loop.log warns' \
+    "$(cat "$lh/.cc/state/lp/wf/ni")/$(grep -c 'WARNING: worker runs unscoped (no user systemd bus)' "$lh/.cc/state/lp/wf/loop.log")" "19 best-effort: prio 7/1"
+  printf '#!/bin/sh\ncase "$*" in *" -- echo ok") echo ok; exit 0;; esac\necho "Failed to start transient scope unit" >&2; exit 1\n' > "$d/srb/systemd-run"; wsc wr "$d/srb:/usr/bin:/bin" 1
+  t '…and where the probe passes but the scoped launch fails before claude starts, the same iteration runs it at nice 19 and IO 7, and loop.log warns' \
+    "$(cat "$lh/.cc/state/lp/wr/ni")/$(grep -c 'WARNING: worker runs unscoped (the scoped launch failed before claude started, rc 1: Failed to start transient scope unit)' "$lh/.cc/state/lp/wr/loop.log")" "19 best-effort: prio 7/1"
+  printf '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; "$@"; exit 1\n' > "$d/srb/systemd-run"; wsc wn "$d/srb:/usr/bin:/bin" 1
+  t '…but a scoped launch that fails after claude started is not run again' "$(grep -c 'scoped launch failed' "$lh/.cc/state/lp/wn/loop.log")/$([ -s "$lh/.cc/state/lp/wn/cg" ] && echo ran)" 0/ran
+  if timeout 10 systemd-run --user --scope --quiet --collect -- true </dev/null >/dev/null 2>&1; then
+    wsc wl /usr/bin:/bin 1
+    ls=$(systemd-run --user --scope --quiet --collect --slice=lander.slice -- sh -c 'c=$(sed -n "s/^0:://p" /proc/self/cgroup); echo "${c%/*} $(cat "/sys/fs/cgroup${c%/*}/cpu.weight")"' 2>/dev/null)
+    read -r wp ww < "$lh/.cc/state/lp/wl/cg" 2>/dev/null; lp=${ls% *}; lw=${ls##* }
+    t "live: the worker's setsid grandchild sits in worker.slice at weight 20, a sibling of lander.slice at a higher one" \
+      "${wp##*/} $ww/$([ -n "$wp" ] && [ "${wp%/*}" = "${lp%/*}" ] && echo siblings)/$([ "${lw:-0}" -gt 20 ] 2>/dev/null && echo below)" "worker.slice 20/siblings/below"
+  else echo "cc-loop selfcheck: no user systemd bus here, so the live worker-weight case did not run" >&2; fi
   # ── WHOSE LIMIT ── with WORKER_CLAUDE_CREDENTIALS set, the limit stamp and model record follow the login cc-sandbox
   # says the launch will use (its stub answers worker-cred from FK_CRED), not the key: the workers' file, then the
   # box's, which is what a missing, expired or refused workers' login falls back to. The key alone moves nothing.
@@ -2589,6 +2629,37 @@ SP=$(sp_worker "$base") || stop 2 "no worker prompt" "cc-loop cannot read the wo
 # iterations. `probe` also passes where the fence is off by the owner's switch or behind a member boundary.
 fw=$("$BIN/cc-sandbox" probe 2>&1) || stop 2 "cannot get the fence" "the worker sandbox cannot start on this box, so no worker does: ${fw:-cc-sandbox probe gave no reason}"
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
+# WORKERS YIELD TO LANDINGS (2026-10-21: a worker's 16 python3 hogs ran 30 min beside every landing check as equals).
+# Each iteration's claude starts in a transient user scope of its own in worker.slice, which sits beside app.slice
+# (the sessions) and lander.slice (every lander check, cc-green's included) and has CPUWeight and IOWeight
+# WORKER_WEIGHT. A weight only ranks siblings, so it is set on the slice: a scope at 20 inside app.slice still got
+# app.slice's equal share against lander.slice (lander review of #1816). No dash in the name, since systemd reads a
+# dash as nesting (cc-worker.slice would sit in cc.slice, at 100). A cgroup holds every child, setsid and double fork
+# included, and none can leave it without the user bus, which the fence hides; nice would not hold, because nice ranks
+# only within one cgroup, and it is inherited into the cc-green run an unfenced worker starts. A weight caps nothing:
+# alone on the box a worker gets all of it. The slice's weight is a runtime drop-in (set-property --runtime), gone at
+# the user manager's restart, so wscope sets it again at every launch rather than once. cc-green's ask (green_kick)
+# is started by this loop, outside the scope.
+# wscope probes at each launch, so a bus gone mid-run costs no iteration. Where no scope can be had (no user bus, the
+# probe or the weight refused, or CC_WORKER_SCOPE=0), claude still runs, but at nice 19 and best-effort IO priority 7
+# (not the idle class, which can starve it) inside the loop's own cgroup, and loop.log says why with a WARNING, so no
+# path runs a worker at the landing checks' weight. That fallback is weaker than the slice: nice ranks only within one
+# cgroup, so it yields to the sessions beside it but not to lander.slice. The probe must see its command run, so a
+# fixture's systemd-run stub that only records a start (e2e
+# step-limit) is no bus (2026-10-21: it swallowed claude). The unit name carries a per-launch nonce, since a
+# usage-limit rerun keeps $i and a scope the last run left behind would refuse the name. If systemd-run still fails
+# after a good probe, the scope's first act is to write $out.go, so a failure with no .go never started claude, and the
+# same iteration runs it in the nice fallback; a claude that started is never run twice.
+# Brief: "everything a worker loop starts ... runs at a lower CPU and IO weight than the lander's lanes and checks".
+WORKER_WEIGHT=20
+wscope(){ local why
+  if [ "${CC_WORKER_SCOPE:-1}" != 1 ]; then why="CC_WORKER_SCOPE=0"
+  elif [ "$(timeout 10 systemd-run --user --scope --quiet --collect --slice=worker.slice -- echo ok </dev/null 2>/dev/null)" != ok ]; then why="no user systemd bus"
+  elif ! timeout 10 systemctl --user set-property --runtime worker.slice "CPUWeight=$WORKER_WEIGHT" "IOWeight=$WORKER_WEIGHT" </dev/null >/dev/null 2>&1; then why="worker.slice refused its weight"
+  else SCOPE=(systemd-run --user --scope --quiet --collect --slice=worker.slice --unit="cc-worker-$repo-$track-$$-$i-$RANDOM$RANDOM" -- sh -c ': > "$0" && exec "$@"' "$out.go"); return; fi
+  wnice "$why"; }
+wnice(){ SCOPE=(nice -n 19 ionice -c 2 -n 7)
+  log "WARNING: worker runs unscoped ($1), at nice 19 and best-effort IO 7 in the loop's own cgroup, which does not rank it below lander.slice"; }
 i=0; errs=0; spent=0
 barren=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway notice's memory: this track measured against itself
 lastm=""; lastwhy=""; lastasked=""   # what the previous iteration ran on, the outage that had moved it there
@@ -2639,9 +2710,13 @@ while [ $i -lt "$MAXI" ]; do
   # a caller's prefix.
   SPENV=(); [ "${CC_WORKER_SANDBOX:-}" = 0 ] && [ -z "${CLAUDE_CODE_SHELL_PREFIX:-}" ] && SPENV=("CLAUDE_CODE_SHELL_PREFIX=$BIN/cc-nosignal-shell")
   GAENV=(); inside_boundary || GAENV=("CC_GREEN_ASK=$ST/green.ask" "CC_DOCS_ASK=$ST/docs.ask")   # where a fenced `cc-green start` (green_kick) and `cc-docs file` (docs_kick) ask
-  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # no wall clock: hung_watch kills it only when its transcript stops growing; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
+  wscope; rm -f "$out.go"
+  while :; do
+  ( cd "$WT" && exec "${SCOPE[@]}" env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # no wall clock: hung_watch kills it only when its transcript stops growing; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
   child=$!; rm -f "$out.hung"; hung_watch "$out.hung" "$out.blind" & hw=$!
   wait "$child"; rc=$?; kill "$hw" 2>/dev/null; wait "$hw" 2>/dev/null; child=""
+  [ "$rc" != 0 ] && [ "${SCOPE[0]}" = systemd-run ] && [ ! -e "$out.go" ] || break   # .go: the scope ran its command, so claude started and is never run twice
+  wnice "the scoped launch failed before claude started, rc $rc: $(tail -n 1 "$out.err" 2>/dev/null)"; done; rm -f "$out.go"
   hungs=""; [ -s "$out.hung" ] && { hungs=$(cat "$out.hung"); rc=124; }   # killed as hung: the code `timeout` gave, so every reader of rc=124 still holds
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
