@@ -65,7 +65,7 @@
 
 Routing: #<repo> → its planning session, a reply in a track's 🧵 thread in #<repo> → that track's session (a legacy #<repo>--<track> channel routes the same), DMs and #box → the box's own Remote-Control session.
 Two lanes per project: #<repo> is for the owner (questions, decisions), #<repo>-updates carries what is automated or long; a reply stays on the lane it was asked on.
-A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge base, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody. The owner's ask there for a filed document ("001-0004", "the pitch") comes back as a signed-in link to it in the library, never the PDF itself.
+A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one generic agent with a worker's tools, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody. The owner's ask there for a filed document ("001-0004", "the pitch") comes back as a signed-in link to it in the library, never the PDF itself.
 #approvals and #alerts keep their own jobs; a sub-orch or track channel isn't split, it inherits its parent's lanes.
 A sub-orchestrator gets its own channel (~/.cc/slack/orchs.json): "@alias" in the repo channel reaches it, "@main"/"@other" hands the thread back.
 Override routing in ~/.cc/slack/routes.json.
@@ -6521,7 +6521,7 @@ class Daemon:
                 self.say(chat, "not paired with this box — ask the owner to add you to the project's channel", thread)
             log(f"drop: DM from {user}, who is not the owner")
             return
-        text = self.clean(text)
+        text, shared = self.clean(text), ""
         if ev.get("attachments"):                       # a shared message carries its content in attachments[], not text
             shared = self.clean(fold_attachments(text, ev["attachments"]))
             if shared:
@@ -6560,7 +6560,8 @@ class Daemon:
             return
         askr = ask_lane(self.chan_name(chat)) if ctype != "im" else None
         if askr:   # #<repo>-ask: the question lane. cc-ask answers from the record; no session is looked for or started
-            return self.ask_start(askr, text, chat, thread, ts, is_owner) if text.strip() else None   # a bare file is no question
+            member = None if is_owner else next((h for h, m in load_members().items() if (m or {}).get("uid") == user), None)
+            return self.ask_start(askr, text, chat, thread, ts, is_owner, member, bool(shared)) if text.strip() else None   # a bare file is no question
         m = PERM_RE.match(text)
         if m:
             allow = m.group(1).lower().startswith("y")
@@ -6697,33 +6698,43 @@ class Daemon:
                 "target": target, "lane": lane_of(name, target)}
         return self.hand_off(target, text, meta, chat, thread, ts, self.chan_alias(chat))
 
-    def ask_start(self, repo, text, chat, thread, ts, owner=False):
+    def ask_start(self, repo, text, chat, thread, ts, owner=False, member=None, shared=False):
         """A question in #<repo>-ask: 👀 at once, then cc-ask on a thread of its own (a read of the record takes seconds
         to tens of seconds and on_event runs on this chat's single executor), and what it prints goes back in the
         thread. Nothing here reaches a session: no deliver, no autostart, no dir, no mark."""
         react(self.cfg, chat, ts, "eyes")
-        threading.Thread(target=self._safe, args=(self.ask_soon, repo, text, chat, thread, ts, owner), daemon=True).start()
+        threading.Thread(target=self._safe, args=(self.ask_soon, repo, text, chat, thread, ts, owner, member, shared), daemon=True).start()
         return None
 
-    def ask_soon(self, repo, text, chat, thread, ts, owner=False):
+    def ask_soon(self, repo, text, chat, thread, ts, owner=False, member=None, shared=False):
         """The question, off the executor. A follow-up carries the thread so far (its last few messages, who said each)
         on cc-ask's stdin; the reply is cc-ask's stdout, posted as it is. No reply (exit 1, a timeout, a crash) is ONE
         line in the thread naming why and where to ask instead: a 👀 with nothing after it is a failure the owner cannot see.
         The owner's question may be for a document (cc-ask --documents; the whole register is his): a reply naming a
         filed PDF (ask_file) goes up as that file with the reply as its comment. Anyone else in the lane gets no
-        lookup, because a member may only ever reach that member's own documents and nothing here says whose they are."""
-        ctx = ""
+        lookup, because a member may only ever reach that member's own documents and nothing here says whose they are.
+        A member's question names that member (`member`, their members.json handle), and cc-ask runs its agent inside
+        that member's cc-sandbox; an asker who is neither gets cc-ask's one-line refusal. The owner's follow-up in a
+        thread where anyone else has written carries --mixed, and cc-ask answers it with the read-only reader; so does
+        his question with a shared or unfurled message folded in (`shared`), whoever wrote that message."""
+        ctx, mixed = "", owner and shared
         if thread != ts:
             try:
-                msgs = replies_tail(self.cfg, chat, thread, ASK_CONTEXT + 1)
+                msgs = [m for m in replies_tail(self.cfg, chat, thread, 0) if m.get("ts") != ts]
             except Exception:
                 msgs = []
             ctx = "\n".join(f"- {'box' if self.is_ours(m) else self.user_name(m.get('user'))}: "
                             f"{' '.join(self.clean(m.get('text') or '').split())[:600]}"
-                            for m in msgs if m.get("ts") != ts)
+                            for m in msgs[-ASK_CONTEXT:])
+            # the owner's ask runs on the host at his tier, so a thread holding anyone else's words (a member's reply,
+            # another bot's) gets cc-ask's read-only reader instead (--mixed): their words never steer a host agent
+            # stricter than is_ours: a bot post with no user is ours only once our bot_id is known and matches
+            ours = lambda m: (bool(self.bot_user) and m.get("user") == self.bot_user
+                              or bool(self.bot_id) and m.get("bot_id") == self.bot_id)
+            mixed = mixed or owner and any(not ours(m) and m.get("user") != self.cfg.get("SLACK_OWNER_ID") for m in msgs)
         out, why = "", ""
         try:
-            p = EFFECTS.run([f"{BIN}/cc-ask", "answer"] + (["--documents"] if owner else []) + [repo, text], input=ctx, capture_output=True, text=True,
+            p = EFFECTS.run([f"{BIN}/cc-ask", "answer"] + (["--documents"] + (["--mixed"] if mixed else []) if owner else ["--member", member] if member else []) + [repo, text], input=ctx, capture_output=True, text=True,
                             timeout=ASK_TIMEOUT)
             out = (p.stdout or "").strip()
             why = ((p.stderr or "").strip().splitlines() or [f"cc-ask exit {p.returncode}"])[-1]
