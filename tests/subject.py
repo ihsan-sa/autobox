@@ -1261,6 +1261,8 @@ def case_copy_backoff(m):
     (src / "big").write_bytes(os.urandom(2 << 20))
     a = m.start(h, ask, cap, spawn=False)
     runs = dict(m.runs_of(h))
+    # spawn=False cannot leave a run copying, so A is started last and its t0 moved before B's. Starting A first would
+    # not exercise the skip of a `starting` run.
     a_run = max(runs, key=lambda r: float(runs[r]["t0"]))   # the copy that just failed; A started before B
     state(a_run, t0=float(runs[b["run"]]["t0"]) - 1e-6)
     c = m.start(h, ask, cap, spawn=False)

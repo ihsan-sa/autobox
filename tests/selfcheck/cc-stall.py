@@ -310,7 +310,8 @@ def selfcheck():
     os.environ.pop("CC_STALL_TIER")
 
     # 15 a permission dialog standing DECLINE_S gets one Esc (No) and one cc-msg quoting it; never before, never under
-    # tier stop, never without --apply, and an unknown dialog with no "No, and tell Claude" never
+    # tier stop, never without --apply, never once the pane has changed since the capture, and an unknown dialog with no
+    # "No, and tell Claude" never
     os.environ["CC_STALL_TIER"] = tsub
     passes = (1000, 1000 + DECLINE_S - 1, 1000 + DECLINE_S, 1000 + DECLINE_S + 120, 1000 + DECLINE_S + 240)
     dead_fresh(); t = Fake(); w = t.add("perms", ASKED)
@@ -340,6 +341,12 @@ def selfcheck():
         for s in passes:
             run(t, True, s)
     k(t.keys == [] and sent() == [], "an unknown dialog that is no permission dialog gets no Esc")
+    dead_fresh(); t = Fake(); t.add("perms", ASKED)
+    t.screen = lambda wid, seq=[ASKED] * 3 + [READY]: seq.pop(0) if len(seq) > 1 else seq[0]
+    with q:
+        for s in passes[:3]:
+            run(t, True, s)
+    k(t.keys == [] and sent() == [], f"a dialog answered between the capture and the press gets no Esc: {t.keys}")
     os.environ.pop("CC_STALL_TIER")
 
     print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
