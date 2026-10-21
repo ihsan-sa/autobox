@@ -18,6 +18,7 @@ if HERE not in sys.path:
 
 import test_lane as TL  # noqa: E402
 import test_run as TR  # noqa: E402
+from lander import events as E  # noqa: E402
 from lander import gh as GH  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
@@ -171,8 +172,10 @@ class CIGate(TL.Fixture):
         self.assertEqual(self.box().get("merges", []), [])
 
     def test_a_spent_rate_limit_keeps_its_job_and_lands_after_the_reset(self):
+        reset = int(time.time()) + 3000
         self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
-        self.set_box(checks_denied="gh: API rate limit exceeded for user ID 1. (HTTP 403)")
+        self.set_box(checks_denied="gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+                     rate_limit={"remaining": 0, "reset": reset})
         J.submit("demo", 1)
         self.land()
         for _ in range(L.CI_UNREADS + 2):   # more spent reads than an unreadable CI is allowed before a query
@@ -180,11 +183,46 @@ class CIGate(TL.Fixture):
             j = self.again()
             self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.MERGEABLE))
             self.assertIn(GH.SPENT, j.extra["why"])
+            self.assertEqual(j.extra["not_before"], E.stamp(reset))   # held until GitHub's own reset, no longer
             self.assertNotIn("ci_unread", j.extra)
-        self.set_box(checks_denied="")   # the quota resets
+        self.set_box(checks_denied="", rate_limit=None)   # the quota resets
         os.unlink(GH.backoff_path())
         self.again()
         self.assertEqual(len(self.box()["merges"]), 1)
+
+    def test_a_member_tokens_spent_quota_holds_its_job_not_every_lane(self):
+        # Opus read of #1799: a member lane's spent installation quota wrote the shared backoff, and while it stands
+        # the tick skips every lane and handed watch on the box
+        reset = int(time.time()) + 3000
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
+        self.set_box(checks_denied="gh: API rate limit exceeded for installation ID 1. (HTTP 403)",
+                     rate_limit={"remaining": 0, "reset": reset})
+        J.submit("demo", 1)
+        init = L.Lane.__init__
+
+        def member(lane, *a, **kw):
+            init(lane, *a, **kw)
+            lane.token = "member-token"
+        with mock.patch.object(L.Lane, "__init__", member):
+            self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra["not_before"]), (T.HELD, E.stamp(reset)))   # its own job waits the hour
+        self.assertIn(GH.SPENT, j.extra["why"])
+        self.assertEqual(GH.backoff(), 0)   # what tick reads before every lane: another repo's lane still ticks
+
+    def test_rate_limit_words_with_the_quota_left_become_a_query(self):
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
+        self.set_box(checks_denied="gh: rate limit, or so a proxy says (HTTP 403)")   # rate_limit: 5000 left
+        J.submit("demo", 1)
+        self.land()
+        for n in range(1, L.CI_UNREADS + 1):
+            j = self.job()
+            self.assertEqual((j.state, j.extra["ci_unread"]["n"]), (T.HELD, n))
+            self.assertNotIn(GH.SPENT, j.extra["why"])
+            os.unlink(GH.backoff_path())
+            j = self.again()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn("rate limit, or so a proxy says", j.extra["why"])
 
     def test_a_readable_ci_clears_the_unread_count(self):
         self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
@@ -531,16 +569,35 @@ class RestFacts(unittest.TestCase):
                 self.assertFalse(any(c[:1] != ["api"] for c in calls))   # no `gh pr view`: no GraphQL
 
     def test_a_spent_rate_limit_is_said_with_its_reset(self):
-        limit = json.dumps({"resources": {"core": {"remaining": 4815, "reset": 1}, "graphql": {"remaining": 0, "reset": 1792444560}}})
+        reset = int(time.time()) + 3000
+        limit = json.dumps({"resources": {"core": {"remaining": 4815, "reset": 1}, "graphql": {"remaining": 0, "reset": reset}}})
         for fields, ask in (("state", "api repos/o/r/pulls/7"), ("comments", self.COMMENTS)):
             _, p = self.run_gh({ask: (1, "", "GraphQL: API rate limit already exceeded for user ID 1."), "api rate_limit": limit})
             with self.subTest(fields=fields), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
                 self.assertEqual(GH.pr_facts("/x", 7, fields),
-                                 (None, "GitHub's API rate limit for this login is spent until 21:16Z"))
+                                 (None, f"{GH.SPENT} until " + time.strftime("%H:%MZ", time.gmtime(reset))))
+                self.assertEqual((GH.RESETS[None], GH.backoff()), (reset, 0))   # GraphQL's hour holds the job only
+        said = "gh: API rate limit exceeded for user ID 1. (HTTP 403)"
+        for limit in (json.dumps({"resources": {"core": {"remaining": 12, "reset": 1}}}), (1, "", "HTTP 502")):
+            _, p = self.run_gh({"api repos/o/r/pulls/7": (1, "", said), "api rate_limit": limit})
+            with self.subTest(limit=limit), p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+                # the quota left, or rate_limit itself unread: gh's words alone are not a spent quota
+                self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, said))
         _, p = self.run_gh({"api repos/o/r/pulls/7": (1, "", "HTTP 502: bad gateway")})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):   # any other failure keeps gh's own words
             self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, "HTTP 502: bad gateway"))
 
+
+    def test_a_spent_reset_already_past_backs_off_a_minute(self):
+        # Opus read of #1799: a reset in the past (clock skew) wrote a backoff already over, and every lane asked
+        # GitHub against the spent quota each tick
+        limit = json.dumps({"resources": {"core": {"remaining": 0, "reset": int(time.time()) - 600}}})
+        self.addCleanup(os.unlink, GH.backoff_path())
+        _, p = self.run_gh({"api repos/o/r/pulls/7": (1, "", "gh: API rate limit exceeded (HTTP 403)"), "api rate_limit": limit})
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertIn(GH.SPENT, GH.pr_facts("/x", 7, "state")[1])
+        self.assertGreaterEqual(GH.backoff(), GH.BACKOFF_MIN - 1)
+        self.assertGreaterEqual(GH.RESETS[None], time.time() + GH.BACKOFF_MIN - 1)
 
 class Cause(unittest.TestCase):
     def test_internalerror_names_the_exception_and_the_file(self):

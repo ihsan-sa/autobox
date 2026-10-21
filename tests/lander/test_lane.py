@@ -84,6 +84,8 @@ if me == "gh":
         rest = (files, sha, what)
     if a[:2] == ["api", "user"]:   # gh.viewer: the box's own login
         out(0, "box")
+    if a[:2] == ["api", "rate_limit"]:   # gh.spent: the core quota the box sets, else a full one
+        out(0, json.dumps({"resources": {"core": box.get("rate_limit") or {"remaining": 5000, "reset": 0}}}))
     rcom = re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments(\?per_page=100)?", a[2] if a[1:2] == ["--paginate"]
                         else a[1]) if a[:1] == ["api"] and len(a) > 2 else None
     if rcom:   # an issue's comments over REST: listed (gh.comments, after its -q) or one posted (gh.comment)

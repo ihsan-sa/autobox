@@ -359,6 +359,14 @@ class Board(Protocol):
         """U3, lander/board.py. Marks the job's board row done once it has merged."""
 
 
+def closable(row) -> bool:
+    """The CLOSES RULES (lander/board.py), shared with lane.BoardRules for a lander with no board unit: a row (dict)
+    not merged/done, not held by a person and not live on a track with no mark."""
+    if not isinstance(row, dict) or row.get("status") in ("merged", "done") or row.get("held"):
+        return False
+    return not (row.get("status") in ("running", "review") and not str(row.get("agent") or "").strip())
+
+
 class Deploy(Protocol):
     def request(self, repo: str, sha: str, targets: list) -> None:
         """U3, lander/deploy.py. Asks for merged main at exactly `sha` to go to `targets`. It happens only after

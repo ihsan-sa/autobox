@@ -43,6 +43,7 @@ import os
 import re
 
 from lander import cards as C
+from lander import types as T
 
 CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)"
                        r"[A-Za-z0-9][A-Za-z0-9_-]*)*)")
@@ -134,17 +135,10 @@ def close(job):
     return "; ".join([line] + tail + ([asked] if asked else []))
 
 
-def closable(row):
-    """The CLOSES RULES: a row (dict) not merged/done, not held by a person and not live on a track with no mark."""
-    if not isinstance(row, dict) or row.get("status") in ("merged", "done") or row.get("held"):
-        return False
-    return not (row.get("status") in ("running", "review") and not str(row.get("agent") or "").strip())
-
-
 def _close(job, project, track):
     tracks = rows(project)
     track = track or next((r for r in closes(job.extra.get("body", ""))   # a row carrying another PR is not this one's
-                           if closable(tracks.get(r)) and not tracks[r].get("pr")), "")
+                           if T.closable(tracks.get(r)) and not tracks[r].get("pr")), "")
     if not track:
         return "board: this PR is no board row's"
     row = tracks.get(track)
@@ -172,7 +166,7 @@ def _close(job, project, track):
                 unknown.append(r)
             continue
         mark = str(cur.get("agent") or "").strip()
-        if not closable(cur):
+        if not T.closable(cur):
             held.append(r)
             continue
         rc, out = C.sh([b, "status", project, r, "done"], timeout=60)

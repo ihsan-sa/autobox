@@ -29,7 +29,8 @@
         gating or deploying it.
 
 BACKOFF (B3). A failure that looks like GitHub or the network being down — rc != 0, no JSON on stdout, and text
-matching BACKOFF_RE — records <LANDQ>/lanes/gh.backoff {until, fails}: 1 minute, doubling per failure up to 30.
+matching BACKOFF_RE (but not a member token's or GraphQL's rate limit) — records <LANDQ>/lanes/gh.backoff
+{until, fails}: 1 minute, doubling per failure up to 30; the box login's spent REST quota sets it to its reset (spent).
 backoff() is the seconds left; any gh success clears it. The lane and the tick skip gh work while it runs.
 """
 from __future__ import annotations
@@ -100,7 +101,9 @@ def gh(argv, root, token=None, timeout=120, note=True, stdin=None):
         rc, out, err = 124, "", "gh timed out"
     except OSError as e:
         rc, out, err = 127, "", f"gh would not run: {e}"
-    if note:   # spent()'s own ask leaves the backoff its failure set
+    # spent()'s own ask leaves the backoff its failure set; a member token's or GraphQL's spent quota is not the box
+    # login's REST hour every lane runs on, so it holds its own job (spent), not every lane
+    if note and not ("rate limit" in err.lower() and (token or "graphql" in err.lower())):
         _note(rc, out, err)
     return rc, out, err
 
@@ -222,20 +225,32 @@ def rollup(runs, statuses) -> list:
 
 
 SPENT = "GitHub's API rate limit for this login is spent"
+RESETS = {}   # token -> the end of the hold spent() last found for it, which the lane holds the job until
 
 
 def spent(root, text, token=None) -> str:
-    """One plain line when gh's failure is GitHub's rate limit, naming when it resets; else ""."""
+    """One plain line when gh's failure says rate limit and GET rate_limit (free) shows the quota it names (GraphQL
+    when its words say so, else core REST) at 0, naming when it resets; RESETS[token] is then that reset, or a minute
+    on when it is already past (clock skew). Only the box login's REST quota (token None, core) sets the shared backoff
+    every lane and the tick wait on; a member's quota or GraphQL's holds just its job (Opus read of #1799). Else "":
+    text that only says rate limit, or a rate_limit that will not answer, is gh's own failure, counted like any other
+    (perms' read of #1769: the words alone held a job forever)."""
     if "rate limit" not in (text or "").lower():
         return ""
+    kind = "graphql" if "graphql" in text.lower() else "core"
     rc, out, _ = gh(["api", "rate_limit"], root, token, 30, note=False)
     try:
-        res = json.loads(out).get("resources") if not rc else {}
-        at = min(int(r["reset"]) for r in (res or {}).values() if isinstance(r, dict) and r.get("remaining") == 0)
-        when = " until " + time.strftime("%H:%MZ", time.gmtime(at))
+        r = json.loads(out)["resources"][kind]
+        if r["remaining"] != 0:   # "if the quota is NOT spent, the 'rate limit' text was something else"
+            return ""
+        at = RESETS[token] = max(int(r["reset"]), time.time() + BACKOFF_MIN)
     except (ValueError, TypeError, KeyError, AttributeError):
-        when = ""
-    return f"{SPENT}{when}"
+        return ""
+    if token is None and kind == "core":
+        from lander import jobs as J
+        with contextlib.suppress(OSError):
+            J.write_atomic(backoff_path(), {"until": at, "fails": 0})
+    return f"{SPENT} until " + time.strftime("%H:%MZ", time.gmtime(at))
 
 
 def pr_facts(root, pr, fields, token=None, timeout=120):
