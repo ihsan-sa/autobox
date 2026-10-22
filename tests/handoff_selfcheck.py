@@ -43,6 +43,7 @@ def run_selfcheck():
             return any(i == wid and n not in dead for n, i in wins.items())
 
         held = set()                                # window ids a headless `claude -p` holds: worker_held()'s answer
+        limited = set()                             # window ids whose pane shows a usage limit: cc-limit record's answer
 
         def worker_held(wid):
             return wid in held
@@ -97,6 +98,8 @@ def run_selfcheck():
 
         def run(argv, wait=True):
             msgs.append(list(argv))
+            if argv[0].endswith("cc-limit"):      # `record <wid> <window>`: is that pane sitting on a usage limit?
+                return argv[2] in limited
             if argv[0].endswith("cc-slack") and argv[1:2] == ["accept-dialog"]:
                 tui["asked"][argv[2]] = time.time()
             if argv[0].endswith("cc-msg"):        # the keyboard: keys reach whatever is in FRONT of the pane, so
@@ -1317,7 +1320,7 @@ def run_selfcheck():
         rr = read("s2")
         rr["deadline"] = time.time() - 1
         write(rr)
-        ok("an overdue overlap that never reached --ready expires",
+        ok("an overdue overlap that never reached --ready, with no usage limit in either pane, expires as it always did",
            sweep() == 0 and read("s2") is None and "s2~next" not in wins)
         ok("...with no notice to the owner: nothing is broken that the seat cannot restart itself",
            sum(1 for m in msgs if m and m[0] == "notify") == told)
@@ -1331,6 +1334,61 @@ def run_selfcheck():
         wins["s2-moved"] = wins.pop("s2~next")           # the successor's window no longer carries its name
         ok("an expiry finds the successor by the id the record names when its name is gone",
            sweep() == 0 and read("s2") is None and rr["successor"]["tmux"] not in wins.values())
+
+        # A LIMIT THE BOX CAN SEE HOLDS THE OVERLAP (2026-10-22: dispatch's ran out under the session limit, no cutover).
+        wins["s9"] = "@s9"
+        start("s9")
+        rr = read("s9"); rr["deadline"] = time.time() - 1; write(rr)
+        reset = int(time.time()) + 3600
+        limited.add(rr["successor"]["tmux"])
+        os.makedirs(STATE, exist_ok=True)
+        was9 = os.environ.get("CC_LIMIT_RECORD")
+        lim9 = os.environ["CC_LIMIT_RECORD"] = os.path.join(STATE, "limit-interrupted-s9")   # its own, whatever the run exports
+        with open(lim9, "w") as fh:
+            fh.write("%%7\ts9~next\t%d\t%d\t\n" % (reset, reset - 600))
+        ok("an overdue overlap whose successor's pane sits on a usage limit is held to the reset plus a grace, not expired",
+           sweep() == 0 and read("s9")["deadline"] == reset + 600 and read("s9")["limit_held"] == reset
+           and "s9~next" in wins and read("s9")["live"] == "predecessor")
+        ok("...and the next sweep, past its normal window but inside the hold, leaves it alone",
+           sweep() == 0 and read("s9") is not None and "s9~next" in wins)
+        limited.clear()
+        os.remove(lim9)
+        rr = read("s9"); rr["limit_held"] = time.time() - 1; write(rr)       # the limit has reset
+        n9 = len(msgs)
+        ok("once the reset passes, the successor gets its opening prompt again and the overlap stays open",
+           sweep() == 0 and any(a[-3:] == ["--kick", "s9", rr["id"]] for a in msgs[n9:])
+           and "limit_held" not in read("s9") and read("s9")["live"] == "predecessor")
+        os.environ["CC_HANDOFF"] = rr["id"]
+        ok("...and the successor cuts over", ready("s9") == 0 and read("s9")["live"] == "successor")
+        os.environ.pop("CC_HANDOFF", None)
+        os.environ.pop("CC_LIMIT_RECORD") if was9 is None else os.environ.update(CC_LIMIT_RECORD=was9)
+        clear("s9"); [wins.pop(k, None) for k in ("s9", "s9~next", "s9~old")]
+
+        # A CUTOVER COMMITTING MID-SWEEP KEEPS THE SUCCESSOR (review of #1868): neither new write may put back the
+        # predecessor-owned copy the sweep read before --ready committed.
+        def cut(t):
+            os.environ["CC_HANDOFF"] = read(t)["id"]
+            ready(t)
+            os.environ.pop("CC_HANDOFF", None)
+        _lu, _ra = globals()["limit_until"], globals()["read_all"]
+        wins["sh"] = "@sh"
+        start("sh")
+        rr = read("sh"); rr["deadline"] = time.time() - 1; write(rr)
+        globals()["limit_until"] = lambda rec: cut("sh") or int(time.time()) + 3600   # --ready lands while limits are read
+        ok("a cutover committed while the sweep reads the limit stays cut over: the hold is dropped",
+           sweep() == 0 and read("sh")["live"] == "successor" and "limit_held" not in read("sh"))
+        globals()["limit_until"] = _lu
+        clear("sh"); [wins.pop(k, None) for k in ("sh", "sh~next", "sh~old")]
+        wins["sr"] = "@sr"
+        start("sr")
+        rr = read("sr"); rr["limit_held"] = time.time() - 1; write(rr)
+        globals()["read_all"] = lambda: [_ra(), cut("sr")][0]                         # --ready lands after the sweep's first read
+        nr = len(msgs)
+        ok("a cutover committed after the sweep's first read stays cut over: the resume is dropped, no second kickoff",
+           sweep() == 0 and read("sr")["live"] == "successor"
+           and not any(a[-3:-1] == ["--kick", "sr"] for a in msgs[nr:]))
+        globals()["read_all"] = _ra
+        clear("sr"); [wins.pop(k, None) for k in ("sr", "sr~next", "sr~old")]
 
         # A SUCCESSOR THAT DIES mid-overlap, inside its deadline: its own fixture, both the kept and the expired case.
         wins["s7"] = "@s7"

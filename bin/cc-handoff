@@ -72,7 +72,10 @@ on the successor; the owner is not told), and finalizes a record whose predecess
 gated by the record of its own success. A cut-over record that no `--retire` is finishing (it holds a lock per target
 while it runs) gets one from the sweep: the one --ready starts can die with the successor's Bash call, and a predecessor
 told to stay for subagents that had all reported then held the record, and the live seat's next hand-off, for the
-stay's whole hour (2026-10-03).
+stay's whole hour (2026-10-03). An overlap that runs out while either side's pane sits on a usage limit with a
+reset cc-limit can read is HELD, not expired: its deadline moves to the reset plus CC_HANDOFF_LIMIT_GRACE (10 min),
+the predecessor stays live, and once the reset passes the successor gets its opening prompt again (2026-10-22: a
+dispatch handoff ran out under the session limit with no cutover). A limit nobody can read expires it as before.
 
 ROTATION. A seat past CC_CONTEXT_ROTATE_TOKENS (cc-context's second line, 200k, above the 150k hand-off
 line the Stop hook nags at) is handed off by the box whether or not it acts on the nag: five course seats sat
@@ -294,6 +297,26 @@ def write(rec):
         json.dump(rec, f)
     os.replace(tmp, p)
     return rec
+
+
+def rec_lock(target):
+    """--ready's commit holds this, and so does every sweep write to a record --ready may be committing (pred_write)."""
+    os.makedirs(HANDOFF, exist_ok=True)
+    fh = open(os.path.join(HANDOFF, slug(target) + ".rec.lock"), "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def pred_write(rec, change):
+    """A sweep's change to a record the PREDECESSOR still owns, made to a fresh read under --ready's lock and dropped
+    (None) when the id or the owner changed since the sweep read it: a stale predecessor-owned copy written over a
+    cutover would hand the seat back and gate the live successor."""
+    with rec_lock(rec["target"]):
+        cur = read(rec["target"])
+        if not cur or cur["id"] != rec["id"] or live_side(cur) != "predecessor":
+            return None
+        change(cur)
+        return write(cur)
 
 
 def brief_path(target):
@@ -1333,7 +1356,8 @@ def ready(target=None, forced=False):
     rec["cutover"] = time.time()
     staying = f"the predecessor is staying for {len(held)} subagent(s)" if held else "the predecessor is retiring"
     ledger(rec, "overlap-forced" if forced else "overlap-cutover", extra=v2_cutover(rec))
-    write(rec)
+    with rec_lock(target):
+        write(rec)
     derive(rec, first)
     tell_slack(target)                             # after the names move: the successor is live, so it is delivered to
     print(f"cc-handoff: {target} — the successor is live; " + (f"{staying} ({', '.join(held[:6])}), then retires"
@@ -1653,6 +1677,22 @@ def expire(rec, why):
     run([os.path.join(BIN, "cc-msg"), target, line])
     journal(target, line)
     print(f"cc-handoff: {target} — the overlap expired without a cutover ({why}); the predecessor carries on and was told")
+
+
+def limit_until(rec):
+    """When the usage limit sitting in either side's pane resets (epoch), or 0 when none can be read. cc-limit
+    `record` is the box's one reader of that notice (it also arms its own nudge at the reset), and its file says
+    when. On 2026-10-22 dispatch's overlap ran out while the account sat at its session limit, and the successor,
+    which could not run --ready, was killed with no cutover."""
+    seen = {s.get("window") for s in (rec.get("successor") or {}, rec.get("predecessor") or {})
+            if s.get("tmux") and run([os.path.join(BIN, "cc-limit"), "record", s["tmux"], s.get("window", "")])}
+    try:
+        with open(os.environ.get("CC_LIMIT_RECORD") or os.path.join(STATE, "limit-interrupted")) as f:
+            rows = [l.rstrip("\n").split("\t") for l in f]
+    except OSError:
+        return 0
+    return max([int(r[2]) for r in rows if len(r) > 2 and r[1] in seen and r[2].isdigit()
+                and int(r[2]) > time.time()], default=0)
 
 
 def finalize(rec, why):
@@ -2143,6 +2183,9 @@ def sweep(rotate_too=False):
       an overlap that never reached --ready is past its deadline (plus the grace), or its successor's session is
         gone two sweeps apart -> it expires (expire): the owner is not told, but the predecessor is, in its pane
         and its journal, because it is waiting on a successor that will never come.
+        One past its deadline while a usage limit sits in either pane (limit_until) is held to the reset plus
+        a grace instead, and its successor kicked again once that reset passes; both writes go through pred_write, so a
+        cutover that lands meanwhile wins.
       a cut-over predecessor STILL ALIVE past drain+grace -> ended here, then finalized (one told to STAY for
         its subagents is past nothing until that stay ends or its cap runs out: drain_start). The --retire that
         should have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
@@ -2192,10 +2235,22 @@ def sweep(rotate_too=False):
             if lk:
                 lk.close()                         # the child takes it; a second one started meanwhile just exits
                 run([os.path.realpath(__file__), "--retire", target], wait=False)
+        elif live_side(rec) == "predecessor" and now >= rec.get("limit_held", now + 1):
+            rec = pred_write(rec, lambda r: r.pop("limit_held", None))   # it has reset: the successor's first turn again
+            if not rec:
+                continue
+            ledger(rec, "overlap-resumed")
+            run([os.path.realpath(__file__), "--kick", target, rec["id"]], wait=False)
         elif live_side(rec) == "predecessor" and now > rec.get("deadline", 0) + grace:
             rec = read(target)                     # the DECIDING read: a --ready committing after the loop copied
             if not rec or live_side(rec) != "predecessor" or now <= rec.get("deadline", 0) + grace:
                 continue                           # this record means the kill below would hit the LIVE successor
+            until = limit_until(rec)
+            if until:                              # held, not expired: the predecessor stays live until it resets
+                rec = pred_write(rec, lambda r: r.update(limit_held=until, deadline=until + cfg("CC_HANDOFF_LIMIT_GRACE", 600)))
+                if rec:
+                    ledger(rec, "overlap-held", "usage limit until " + time.strftime("%H:%MZ", time.gmtime(until)))
+                continue
             expire(rec, "the overlap window passed with no --ready")
         elif live_side(rec) == "predecessor" and now - (rec.get("started") or 0) > grace:
             # A SUCCESSOR THAT DIED before --ready: its window closed, or its session exited to a bare shell. Two
