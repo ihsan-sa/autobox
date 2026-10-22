@@ -5,8 +5,9 @@ stands (`place <i> in the lane`, its stage) and edits it when its place or stage
 those posts and edits are capped box-wide (EDITS_PER_MIN), wait out a Slack 429 (Retry-After, at most
 EDIT_BACKOFF_MAX), and skip a card cc-slack will not edit; a last edit held when its lane ended goes on a later tick
 (left_held, tick.retry_cards);
-`waited(job, secs, now)` files one planner request when the tick finds the oldest due job past WAIT_FLAG_SECS, at
-most one per repo (per member, across its lanes) per WAIT_FLAG_SECS; `held(repo, now)` notes a box hold, from which that age counts.
+`waited(job, secs, now)` files one planner request (another box repo's goes into its own seat) when the tick finds
+the oldest due job past WAIT_FLAG_SECS, at most one per repo (per member, across its lanes) per WAIT_FLAG_SECS;
+`held(repo, now)` notes a box hold, from which that age counts.
 `landed(job)` turns the PR's #approvals card to landed and says the merge where someone is listening;
 `stopped(job, why, route)` says a job left the lane and who picks it up; `behind(job, why)` says the lane updated a
 BEHIND PR's branch, where a stop goes, and puts it into the repo's session once. Where it goes (where()):
@@ -627,7 +628,9 @@ def waited(job, secs, now=None):
     per WAIT_FLAG_SECS (cards/waited.json), whichever job it names: a queue whose oldest job keeps changing, as a member
     closing a PR on every tick, wakes the planning seat once an hour, not once a tick (perms' read, 10-13). A member's
     lanes (`<h>--<row>`, one per board row) share one cap, keyed `member:<h>`: perms' read, 10-13, "six rows meant six
-    wake-ups at once". A repo name has no ":", so no member key can be a box repo's.
+    wake-ups at once". A repo name has no ":", so no member key can be a box repo's. Another box repo's job goes to
+    that repo's own seat through cc-broker (tell_own_seat), not planning: on 10-22 two dispatch PRs moving through a
+    40-job queue each woke the planning seat, which could only ask dispatch; a broker that refuses it files the request.
     -> True when it was said now."""
     t = int(now if now is not None else time.time())
     pid = producer_id(job, "waited")
@@ -639,8 +642,11 @@ def waited(job, secs, now=None):
         return False
     text = (f"[{job.repo}] PR #{job.pr} has waited {secs // 60} min in the landing queue, the oldest job due there "
             f"({STAGE_WORDS.get(job.state, job.state)}). Nothing stopped it; the lane has not landed it yet.")
-    rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", pid, "-t", f"{job.repo} landing", text],
-               timeout=60, **box_hand())
+    if own_seat(job, "planning") and tell_own_seat(job, text):
+        rc = 0
+    else:
+        rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", pid, "-t", f"{job.repo} landing", text],
+                   timeout=60, **box_hand())
     log("waited", job.repo, job.pr, mins=secs // 60, rc=rc)
     if rc != 0:   # not taken: left unmarked, so the next tick tries again (Opus read, 10-13)
         return False

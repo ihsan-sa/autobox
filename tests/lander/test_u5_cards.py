@@ -883,11 +883,29 @@ class QueuedCards(Stubbed):
         box = T.Job(repo="h", pr=9, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q})
         self.assertTrue(C.waited(box, 3601, now=now))   # a box repo named like the handle keeps its own cap
         self.assertTrue(C.waited(rows[1], 3601, now=now + 3600))
-        self.assertEqual(len(self.argvs("cc-notify")), 3)
+        self.assertEqual(len(self.argvs("cc-notify")), 2)
+        self.assertEqual(len(self.argvs("cc-broker inject")), 1)   # the box repo's goes to its own seat
 
     def test_a_job_that_waited_says_nothing_stopped_it(self):
         self.assertEqual(len(self.flag(self.jobs((7, Q, T.QUEUED)), 3601)), 1)
         self.assertIn("Nothing stopped it", " ".join(self.argvs("cc-notify")[0]))
+
+    def test_another_repos_wait_goes_to_its_own_seat_not_planning(self):
+        """Row raised-queue-wait-alerts-wake-the-wrong-seat: 10-22, two dispatch PRs moving normally through a 40-job
+        queue each woke the planning seat, which could only ask dispatch."""
+        now = E.epoch_of(Q) + 3601
+        job = T.Job(repo="dispatch", pr=7, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q})
+        self.assertTrue(C.waited(job, 3601, now=now))
+        self.assertEqual([a[:6] for a in self.argvs("cc-broker inject")],
+                         [["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch"]])
+        self.assertIn("Nothing stopped it", self.argvs("cc-broker inject")[0][-1])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        # a broker that will not take it files the planner request after all
+        self.answer({"cc-broker": [1, "refused"]})
+        late = T.Job(repo="dispatch", pr=8, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q})
+        self.assertTrue(C.waited(late, 3601, now=now + 3600))
+        self.assertEqual([a[:4] for a in self.argvs("cc-notify")],
+                         [["cc-notify", "--ask", "--id", f"land:dispatch:8:waited@{Q}"]])
 
     def test_retry_keeps_a_card_say_added_while_it_posted(self):
         # perms' read, 10-13: pending.json had no lock, so retry() wrote back a copy without say()'s new card

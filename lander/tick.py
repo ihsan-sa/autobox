@@ -785,8 +785,8 @@ def flag_waited(repos, cards, now=None) -> list:
             if t - since <= C.WAIT_FLAG_SECS:
                 continue
             if cards.waited(job, t - at, now=t):
-                lines.append(f"[{r}] PR #{job.pr} has waited {(t - at) // 60} min in the queue; "
-                             f"the planning seat is told")
+                seat = f"{r}'s own seat" if cards.own_seat(job, "planning") else "the planning seat"
+                lines.append(f"[{r}] PR #{job.pr} has waited {(t - at) // 60} min in the queue; {seat} is told")
         except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
             E.log("tick-fault", r, None, f"waited: {type(e).__name__}: {e}")
     return lines
