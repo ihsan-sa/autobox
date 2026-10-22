@@ -1882,6 +1882,15 @@ echo https://github.com/o/site/pull/7
            rc == 0 and [x["name"] for x in b.get("attachments", [])] == ["board-F_Cu.gbr", "board.drl"]
            and all(x.get("carried_from") == "A" for x in b["attachments"])
            and "001-0001-B carries 2 supporting file(s) from A" in o)
+        board("a1m", d1)
+        mdb = os.path.join(t, "a1m-board.md")
+        with open(mdb, "w") as f:
+            f.write("# Board\n\n![drill](board.drl)\n")
+        rc, o = run("file", mdb, "--project", "Boards", "--title", "Board")
+        b = load()["documents"]["001-0001"]["revisions"][1]
+        ok("a new Markdown revision carries the one before's files too, which its images may name",
+           rc == 0 and b.get("file") is None and [x["name"] for x in b.get("attachments", [])] == ["board.drl"]
+           and b["attachments"][0].get("carried_from") == "A")
         g2 = blob("v2/board-F_Cu.gbr", b"G04 top v2*\n")
         board("a1c", g1, d1)
         run("file", pb, "--project", "Boards", "--title", "Board")
