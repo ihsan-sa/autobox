@@ -67,9 +67,10 @@ LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, 
 case only when the base names none either and both print a failure count, the head's no higher); a check the base does not define, or whose run file the base lacks, has no
 base run and its red is the diff's — except a check the base defines whose run file is on neither tree, which is not
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
-load, on either tree, gets ONE diagnostic rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
-whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded,
-a check that guards a security path or that the change touches, whose first red stands; green the second time passes
+load (A.loaded() at either end, or starved(): a box run whose wall time was STARVED times its CPU time while a load
+average stood at the box's cores), on either tree, gets ONE diagnostic rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded
+(or loaded by starved() alone short of its cap: a PR's own check sets its ratio with a sleep), a check that guards a security path or that the change touches, whose first red stands; green the second time passes
 with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
 red line matches a live quarantine row passes with a `quarantined` note — never for a check that guards a security
 path, and never when the change touches the check itself; what is left is `failed`, and goes to the failures ledger
@@ -133,6 +134,7 @@ SECRET_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", 
 SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 TAIL = 40
+STARVED = 1.5   # starved(): wall time this many times the CPU time
 LOG_KEEP, LOG_DAYS = 200, 7   # a red's kept log (keep_log): at most this many, none older than this many days
 BLOCKED = "blocked-by-main"
 # run_plan(caged=True), `lander check --caged-only`: a check that would run anywhere but the default bwrap on this box
@@ -409,6 +411,12 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
         pass
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
     return rc, time.monotonic() - t0, cpu, capped
+
+
+def starved(secs: float, cpu: float) -> bool:
+    """The run went short of CPU: wall time at least STARVED times its CPU time while a load average (1, 5 or 15
+    minutes, read at its end) stood at the box's cores or above. A crash on a calm box is never starved."""
+    return secs >= STARVED * cpu and max(os.getloadavg()) >= (os.cpu_count() or 1)
 
 
 def read_log(log: str, limit: int = 400_000) -> str:
@@ -941,7 +949,13 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
             # the write end is execute's from here: it closes it once the run has it (pipe keeps only the read end)
             rc, secs, cpu, capped = execute(argv, wd, env, check.cap, log, stdin,
                                             keep=(pipe.pop(),) if pipe else ())
-            loaded = loaded or A.loaded()   # under load at either end of the run
+            # under load at either end of the run, or starved through it (dispatch #1504, 10-21: 1421 s for 774 s of
+            # CPU at load 32.7, four timeouts, and neither end's PSI saw it)
+            # A PR's own check sets its wall-to-CPU ratio (a sleep is enough), so a red loaded by that alone
+            # and short of its cap is `starved`: judge() reruns it only for a check that is not security or touched
+            pressed = loaded or A.loaded()
+            hungry = kind == "box" and starved(secs, cpu)
+            loaded, thin = pressed or hungry, hungry and not pressed and not capped
         said = None
         if pipe:   # each fd is closed once: another thread's run may take its number next
             said = read_started(pipe[0])
@@ -964,7 +978,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
                         load=os.getloadavg()[0], runner=f"{where}:{how}:{scope}",
                         cases=[{"name": ln[:200], "status": T.FAILED} for ln in red_lines(text)[:50]]
                         if st == T.FAILED else [],
-                        extra={"why": why, "rc": rc, "loaded": loaded, "alone": alone,
+                        extra={"why": why, "rc": rc, "loaded": loaded, "starved": thin, "alone": alone,
                                "tail": text.splitlines()[-TAIL:], **kept, **started})
     except Unrunnable as e:
         return T.Result(check=check.name, tree=tree_sha, status=T.UNRUNNABLE, secs=0.0, load=os.getloadavg()[0],
@@ -1102,7 +1116,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     # 10-12: host-env reds were 27 handbacks): only a red that repeats is the PR's. The unloaded rerun follows
     # quarantine's rule, "never on security checks or on a PR touching the check" (security read, 10-12: a race in
     # auth code caught half the time would pass 3 times in 4)
-    loaded = bool(r.extra.get("loaded"))
+    loaded = bool(r.extra.get("loaded")) and not (r.extra.get("starved") and (security or touched))
     if loaded or (not security and not touched):
         r2 = go(head_tree, alone=loaded)
         out.results.append(r2)

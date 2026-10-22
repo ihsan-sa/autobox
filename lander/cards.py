@@ -55,6 +55,7 @@ import socket
 import stat
 import subprocess
 import time
+import zlib
 
 from lander import types as T
 
@@ -790,9 +791,10 @@ def stopped(job, why, route):
                      the planning seat decides: the stop is said where a stop is said and a planner request
                      (`cc-notify --ask`) is filed, never a page to the owner; only "query" also wakes the repo's
                      session, because "planning" and "lander-self" are the planning seat's own, and an inject on top of
-                     the request would wake it twice. A "query" or "planning" stop in another repo (own_seat) is that
+                     the request would wake it twice. A stop on any of the three in another repo (own_seat) is that
                      repo's seat's instead: it goes to it through cc-broker as source `lander` (no planner request,
-                     no second inject), and only a broker that refuses it files the planner request after all
+                     no second inject), and only a broker that refuses it files the planner request after all. The
+                     request goes once per PR and reason (stop_id), not once per queueing: a fix push re-queues it
         owner        a protected head the owner has not 👍'd, found in the lane: said once in the thread or routed,
                      then the 🔐 card (say_protected_stop)
         door         the queue call's own refusal at the protected door: only the 🔐 card (say_protected_door)
@@ -816,10 +818,9 @@ def stopped(job, why, route):
     known = route in ("seat",) + QUERY_ROUTES or route.startswith("#")
     if not known and not job.extra.get("chat"):
         args = ["--route", route]
-    held = lambda kind: f"land:{job.repo}:{job.pr}:{kind}@{head_reason(job, text)}"
-    said = post(job, "stopped", text, args, held("stopped"))
+    said = post(job, "stopped", text, args, f"land:{job.repo}:{job.pr}:stopped@{head_reason(job, text)}")
     if (not tell_own_seat(job, text)) if mine else route in QUERY_ROUTES:   # a refused hand-off still reaches planning
-        sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", held("query"), "-t", f"{job.repo} landing",
+        sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", stop_id(job, "query", why), "-t", f"{job.repo} landing",
             text], timeout=60, **box_hand())
     if not job.member and not mine and route in ("seat", "query"):
         sent = read_json(_sent_path(), []) or []
@@ -841,10 +842,16 @@ def control_repo():
 
 
 def own_seat(job, route):
-    """A "query" or "planning" stop that is its repo's own seat's to settle, not the planning seat's: a box repo (no
-    member) other than the control repo. On 10-16 about 15 dispatch PRs no row owned stopped one by one over 30 min,
-    each a planner request the planning seat could only forward to the repo that runs dispatch."""
-    return route in ("query", "planning") and not job.member and job.repo != control_repo()
+    """A "query", "planning" or "lander-self" stop that is its repo's own seat's to settle, not the planning seat's: a
+    box repo (no member) other than the control repo. On 10-16 about 15 dispatch PRs no row owned stopped one by one
+    over 30 min, each a planner request the planning seat could only forward to the repo that runs dispatch; on
+    10-20/21 a dispatch lander-self PR woke the control seat three times while dispatch's seat already had it."""
+    return route in QUERY_ROUTES and not job.member and job.repo != control_repo()
+
+
+def stop_id(job, kind, why):
+    """`land:<repo>:<pr>:<kind>:<crc of why>`: one id for the same PR stopped for the same reason, whenever queued."""
+    return f"land:{job.repo}:{job.pr}:{kind}:{zlib.crc32(why.encode()):08x}"
 
 
 def head_reason(job, text):

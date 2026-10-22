@@ -219,7 +219,8 @@ class Routes(Stubbed):
             post = self.argvs("cc-slack post")[-1]
             self.assertEqual(post[:5], ["cc-slack", "post", "--route", f"[demo] PR #{10 + i} stopped", "--id"])
             ask = self.argvs("cc-notify")[-1]
-            self.assertEqual(ask[:6], ["cc-notify", "--ask", "--id", f"land:demo:{10 + i}:query@{C.head_reason(j, ask[-1])}", "-t",
+            self.assertEqual(ask[:6], ["cc-notify", "--ask", "--id",
+                                       C.stop_id(j, "query", "the review budget for this change is spent"), "-t",
                                        "demo landing"])
             self.assertEqual(ask[-1], post[-1])
             self.assertIsNone(self.calls("cc-notify")[-1]["role"])
@@ -231,22 +232,33 @@ class Routes(Stubbed):
     def test_another_repos_stop_goes_to_its_own_seat_not_planning(self):
         """Row raised-dispatch-landing-asks-flood-planning: 15 dispatch stops were 15 planner requests."""
         why = "no row owns it, so no round runs for it: merge main into it by hand (a.py)"
-        for i, route in enumerate(("planning", "query")):
+        for i, route in enumerate(("planning", "query", "lander-self")):
             C.stopped(T.Job(repo="dispatch", pr=20 + i, extra={"queued_at": Q}), why, route)
             C.stopped(T.Job(repo="dispatch", pr=20 + i, extra={"queued_at": Q}), why, route)   # told once
         text = f"[dispatch] PR #20: NOT merged ❌ — {why}. It is dispatch's own seat's to settle."
         self.assertEqual(self.argvs("cc-slack post")[0][-1], text)
         self.assertEqual([a[:6] + a[-1:] for a in self.argvs("cc-broker inject")], [
             ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text],
-            ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text.replace("#20", "#21")]])
+            ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text.replace("#20", "#21")],
+            ["cc-broker", "inject", "--no-start", "--source", "lander", "dispatch", text.replace("#20", "#22")]])
         self.assertEqual(self.argvs("cc-notify"), [])
         self.assertEqual(self.argvs("cc-slack inject"), [])   # no second wake on top of the broker's
-        # lander-self stays the planning seat's, and so does a member's stop
-        C.stopped(T.Job(repo="dispatch", pr=22, extra={"queued_at": Q}), why, "lander-self")
-        C.stopped(T.Job(repo="h--t", pr=23, member="h", extra={"queued_at": Q}), why, "planning")
-        self.assertEqual([a[3].rsplit("@", 1)[0] for a in self.argvs("cc-notify")],
-                         ["land:dispatch:22:query", "land:h--t:23:query"])
-        self.assertEqual(len(self.argvs("cc-broker inject")), 2)
+        # a member's stop stays the planning seat's
+        m = T.Job(repo="h--t", pr=23, member="h", extra={"queued_at": Q})
+        C.stopped(m, why, "planning")
+        self.assertEqual([a[3] for a in self.argvs("cc-notify")], [C.stop_id(m, "query", why)])
+        self.assertEqual(len(self.argvs("cc-broker inject")), 3)
+
+    def test_a_requeued_lander_self_stop_is_told_to_its_own_seat_once(self):
+        """Dispatch #1502's lander-self stop filed a planner request
+        on the control repo at each fix push or cc done, three wakes on 10-20/21, while dispatch's seat already had it."""
+        why = "it changes the lander itself — lander-self lands it"
+        for at in (Q, "2026-10-21T00:10:00Z", "2026-10-21T01:20:00Z"):   # each push re-queues it
+            C.stopped(T.Job(repo="dispatch", pr=1502, extra={"queued_at": at}), why, "lander-self")
+        self.assertEqual([a[5] for a in self.argvs("cc-broker inject")], ["dispatch"])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        C.stopped(T.Job(repo="dispatch", pr=1502, extra={"queued_at": Q}), "a check is red", "query")
+        self.assertEqual(len(self.argvs("cc-broker inject")), 2)   # a new reason is said
 
     def test_a_held_pr_tells_its_seat_once_per_head_and_reason(self):
         """10-21: a PR held for perms' read, queued again each lane pass at the same head, woke the lessons seat each
@@ -272,7 +284,9 @@ class Routes(Stubbed):
     def test_a_stop_the_broker_refuses_still_reaches_planning(self):
         self.answer({"cc-broker inject": [1, "broker down"]})
         C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
-        self.assertEqual([a[3].rsplit("@", 1)[0] for a in self.argvs("cc-notify")], ["land:dispatch:30:query"])
+        self.assertEqual([a[:4] for a in self.argvs("cc-notify")],
+                         [["cc-notify", "--ask", "--id", C.stop_id(T.Job(repo="dispatch", pr=30), "query",
+                                                                   "a check is red")]])
         self.answer({})
         C.stopped(T.Job(repo="dispatch", pr=30, extra={"queued_at": Q}), "a check is red", "planning")
         self.assertEqual(len(self.argvs("cc-broker inject")), 2)   # not marked told: the next stop tries it again

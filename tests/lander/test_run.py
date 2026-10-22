@@ -879,6 +879,32 @@ class Tree(Env):
             self.assertEqual(CK.cmd_sweep(["--repo", nowhere]), CK.EXIT_USAGE)
         self.assertIn("in no checkout the host made", err.getvalue())
 
+    def starved_run(self, secs, cpu, load):
+        """A box check that fails after `secs` of wall time and `cpu` of CPU, its run ending at load `load` on 20
+        cores, with no PSI pressure at either end."""
+        def execute(argv, cwd, env, cap, log, stdin=None, keep=()):
+            for fd in keep:
+                os.write(fd, S.STARTED)
+                os.close(fd)
+            return 1, secs, cpu, False
+        with mock.patch.object(RUN, "execute", execute), mock.patch.object(A, "loaded", return_value=False), \
+                mock.patch("os.getloadavg", return_value=(load, load, load)), \
+                mock.patch("os.cpu_count", return_value=20):
+            r = self.run_(chk(run="false"))
+        self.assertEqual(r.status, T.FAILED)
+        self.assertEqual(r.extra["starved"], r.extra["loaded"])   # no PSI and no cap: loaded by starved() alone
+        return r.extra["loaded"]
+
+    def test_a_run_starved_under_load_is_loaded(self):
+        # dispatch #1504, 10-21: four timeouts, 1421 s of wall time for 774 s of CPU at load 32.7
+        self.assertTrue(self.starved_run(1421.0, 774.0, 32.7))
+
+    def test_a_crash_on_a_calm_box_is_not_loaded(self):
+        self.assertFalse(self.starved_run(1421.0, 774.0, 3.0))
+
+    def test_a_run_that_kept_its_cpu_under_load_is_not_loaded(self):
+        self.assertFalse(self.starved_run(800.0, 774.0, 32.7))
+
 
 class Pinned(Env):
     """perms' read of #1425: the guard's differential ran the PR's own guard-replay.sh and guard-probe.jsonl, so a PR
@@ -2767,6 +2793,28 @@ class Judge(unittest.TestCase):
         self.assertEqual(o.status, T.FAILED)                       # a race in auth code is the PR's at its first red
         self.assertEqual(n[0], 1)
         rec.assert_called_once()
+
+    def test_a_starved_red_opens_no_rerun_for_a_security_check(self):
+        """Security read, 10-21: a security check red for 60 s on 1 s of CPU at load 25, then green, PASSED as
+        "red under load": the PR's own check sets that ratio with a sleep, so starved alone reruns ordinary checks only."""
+        def runner(extra):
+            n = [0]
+
+            def run(check, tree, where, alone=False, **kw):
+                n[0] += tree == self.H
+                st = T.FAILED if (tree == self.H and n[0] == 1) else T.PASSED
+                return T.Result(check=check.name, tree=tree, status=st, extra={"why": st, **extra})
+            return run, n
+        thin = {"loaded": True, "starved": True}
+        for sec, touched in ((True, False), (False, True)):
+            run, n = runner(thin)
+            o = RUN.judge(chk(), self.H, self.B, runner=run, security=sec, touched=touched)
+            self.assertEqual((o.status, n[0]), (T.FAILED, 1))
+        run, n = runner(thin)
+        o = RUN.judge(chk(), self.H, self.B, runner=run)
+        self.assertEqual((o.status, o.note, n[0]), (T.PASSED, "flaky: red under load, green alone", 2))
+        run, n = runner({"loaded": True, "starved": False})   # PSI, or a starved run that hit its cap
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, security=True).status, T.PASSED)
 
     def test_a_check_the_pr_touches_is_never_rerun_so_a_flaky_red_stands(self):
         run, n = self.red_then_green()
