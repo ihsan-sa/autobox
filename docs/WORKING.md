@@ -209,6 +209,12 @@ cc-model and nowhere else — when models change, change cc-model.
 Done means: the new branches have selfcheck cases, the whole suite is green, and anything a daemon
 or timer runs was seen doing it once for real after deploy.
 
+A GitHub workflow a session writes bills the owner's minutes on a private repo (macOS 10x, Windows 2x), so its
+defaults are: `ubuntu-latest` only on `push` and `pull_request`; `push` limited to the default branch, so a PR runs
+once and not twice; a `concurrency` group keyed on the ref with `cancel-in-progress: true`; and macOS or Windows jobs
+only on release tags or `workflow_dispatch`. Widen one only when the brief asks for it. A workflow that runs on every
+bot commit is a cost too: run the check locally or on the merge instead.
+
 A member's code only ever runs inside its sandbox. To rerun a member workspace's checks by hand, use
 `cc-sandbox member <handle> [<track>] -- <cmd>`; cc-guard refuses a host session running a file under `~/dev/<handle>`
 or `~/.cc/worktrees/<handle>`, or make/npm/pytest and the like pointed there, because there it runs as the owner.

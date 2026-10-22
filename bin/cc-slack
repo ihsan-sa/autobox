@@ -4,7 +4,7 @@
   cc-slack daemon [--no-slack]        the box's one Slack connection (Socket Mode) + local router on ~/.cc/slack/sock; user unit cc-slackd (`cc slack on|off`); no tokens or --no-slack = local router only.
   cc-slack channel [<target>]         stdio MCP channel server, one per session (claude spawns it); target defaults from the session cwd: ~/dev/<repo>→<repo>, a track worktree (.cc/track)→<repo>/<track>, ~/dev or ~→box.
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if from Slack (tests/scripts); `<repo>@<alias>` is that orch's own session, never started for it; a repo with no channel and no live session that CC_PROJECT_CHILDREN puts under a parent reaches the parent's session instead, the text opening `[<repo>]`.
-  cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] [--keep] [--ask|--no-ask] "text" post as the bot (cc-notify uses --route; a channel-less child's title goes to its CC_PROJECT_CHILDREN parent's channel, the text opening `[<child>]` unless it names it; --route with --major stays on the title's main lane, #<repo>, never a track's thread or the -updates lane). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel ('#name', a bare name or its id) hands it to that session (Daemon.wake) — from a process no session owns, a service or a shell, as role=bot, and never into the -updates lane or back to a track's own loop — --route never does; one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with 🔒 and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code), and an ask he owes an answer (`!needs`) unless --no-ask; --ask makes any post such an ask (cc-notify --owner's DM) — and lands only in #<repo> or #approvals: #alerts moves to the control repo's channel, an orch's channel to its repo's, a -updates, -threads or `--` lane to its base repo's, one stderr line says where. A post for another session (no --mention, and a -c into its channel, a text opening `<#…>` or 🤖, or a -threads lane) opens with 🤖 and still wakes that session. --keep is accepted and changes nothing (the engagement hold it lifted is gone).
+  cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] [--keep] [--ask|--no-ask] [--no-move] "text" post as the bot (cc-notify uses --route; a channel-less child's title goes to its CC_PROJECT_CHILDREN parent's channel, the text opening `[<child>]` unless it names it; --route with --major stays on the title's main lane, #<repo>, never a track's thread or the -updates lane). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel ('#name', a bare name or its id) hands it to that session (Daemon.wake) — from a process no session owns, a service or a shell, as role=bot, and never into the -updates lane or back to a track's own loop — --route never does; one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with 🔒 and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code), and an ask he owes an answer (`!needs`) unless --no-ask; --ask makes any post such an ask (cc-notify --owner's DM) — and lands only in #<repo> or #approvals: #alerts moves to the control repo's channel, an orch's channel to its repo's, a -updates, -threads or `--` lane to its base repo's, one stderr line says where. A post for another session (no --mention, and a -c into its channel, a text opening `<#…>` or 🤖, or a -threads lane) opens with 🤖 and still wakes that session. --keep is accepted and changes nothing (the engagement hold it lifted is gone). --no-move refuses (exit 1) a post whose channel is archived, where without it the post moves to that channel's new home.
   cc-slack sent <PRODUCER-ID>         did Slack accept that id? prints its ts (exit 0), or exit 1 if not yet; an unknown flag is always exit 2, never text.
   cc-slack live-id <SUBJECT>          the producer id of the one live ask about SUBJECT: the newest <SUBJECT>@<stamp> on file while it is under 12 h old, else a fresh one (cc-notify --live).
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot (a PDF goes as its library link, and one not yet filed is refused); --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
@@ -1250,10 +1250,10 @@ def find_accepted(cfg, pid, chat, thread, text, since, decision=False):
             return m.get("ts")
     return None
 
-def submit(cfg, pid, chat, text, thread=None, username=None, ts=None, decision=False, ask=None):
+def submit(cfg, pid, chat, text, thread=None, username=None, ts=None, decision=False, ask=None, stay=False):
     """post() under a producer id: one eventual post, never a duplicate. Returns (n_chunks, ts, how): `sent`, `already`,
     `found` or `unsent` (no token/local, intent stands). A refused post or unaskable Slack raises with the intent
-    standing. The id's lock makes a second producer wait and read `accepted`."""
+    standing, as does an archived channel when `stay`. The id's lock makes a second producer wait and read `accepted`."""
     if not pid:
         raise ValueError("submit: a producer id is required")
     os.makedirs(SENT_DIR, exist_ok=True)
@@ -1279,7 +1279,7 @@ def submit(cfg, pid, chat, text, thread=None, username=None, ts=None, decision=F
                 rec["chat"] = rchat; sent_write(pid, rec)
             # look where the record says first, a retired channel included: a post Slack took there is found, never re-sent
             found = find_accepted(cfg, pid, rchat, rthread, text, rec.get("intent"), decision=decision)
-            home = None if found or rchat not in load_retired() else retired_home(cfg, rchat, decision)
+            home = None if found or stay or rchat not in load_retired() else retired_home(cfg, rchat, decision)
             if home:                                 # not there, and its channel was retired since: the intent moves, top level
                 if not rec.get("moved_from"):        # its first move: the note names the channel it was meant for
                     rec.update(moved_from=rchat, moved_name=home[1], moved_thread=bool(rthread))
@@ -1292,7 +1292,7 @@ def submit(cfg, pid, chat, text, thread=None, username=None, ts=None, decision=F
                 return 0, found, "found"
         landed = {}
         n, first = post(cfg, chat, text, thread, username=username, ts=ts, meta=pid, decision=decision, ask=ask,
-                        landed=landed)
+                        rerouted=stay, landed=landed)
         if not first:
             return n, first, "unsent"
         if landed.get("rerouted"):                   # post() found it archived and said it elsewhere: the record follows
@@ -1328,7 +1328,8 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
     `ask`: does the post wait on his answer; True for `cc-notify --owner`, None reads it off the 🔒 head (owner_asked).
     `mail` taps the mail door; `ts` picks the reply medium (a mail-origin reply goes back by mail). The outbox line is
     written once Slack accepts, else `post-failed`. An archived channel is recorded as retired and the post goes once to
-    its retired_home; a caller keeping ts with a channel passes `landed`, filled with {chat, name, rerouted}."""
+    its retired_home, unless `rerouted` (a post already moved, or a caller that refuses the move), which raises;
+    a caller keeping ts with a channel passes `landed`, filled with {chat, name, rerouted}."""
     if not decision:
         text = owner_marks_off(cfg, text)
     body = text                      # what the caller said: the mail door gets this, never the decision head below
@@ -10377,7 +10378,7 @@ def sender_name(chat=None):
 def cmd_post(argv):
     cfg = load_cfg()
     chan = thread = route = ts = pid = rtrack = None
-    mention = major = False
+    mention = major = stay = False
     ask = None                                       # None: an ask iff it opens with his 🔒 head (owner_asked)
     args = []
     i = 0
@@ -10390,6 +10391,8 @@ def cmd_post(argv):
             ask = argv[i] == "--ask"; i += 1
         elif argv[i] in ("--major", "--main"):
             major = True; i += 1
+        elif argv[i] == "--no-move":   # an archived channel refuses the post instead of moving it to its new home
+            stay = True; i += 1
         elif argv[i] in ("-c", "--thread", "--ts", "--route", "--id") and i + 1 >= len(argv):
             print(f"cc-slack post: {argv[i]} needs a value", file=sys.stderr); return 2
         elif argv[i] == "-c":
@@ -10405,7 +10408,7 @@ def cmd_post(argv):
         elif post_flag(argv[i]):
             # a flag this command does not know is an error, not text to post — else it goes out word for word.
             print(f"cc-slack post: unknown option {argv[i]} — cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] "
-                  f"[--route TITLE] [--id PRODUCER-ID] [--mention] [--major] [--keep] [--ask|--no-ask] \"text\" (a file goes with post --file PATH --to CHANNEL)",
+                  f"[--route TITLE] [--id PRODUCER-ID] [--mention] [--major] [--keep] [--ask|--no-ask] [--no-move] \"text\" (a file goes with post --file PATH --to CHANNEL)",
                   file=sys.stderr); return 2
         else:
             args.append(argv[i]); i += 1
@@ -10497,7 +10500,8 @@ def cmd_post(argv):
     missed = unresolved_mentions(cfg, text, chan, decision=mention)
     if pid:
         try:
-            n, posted_ts, how = submit(cfg, pid, chan, text, thread, username=uname, ts=ts, decision=mention, ask=ask)
+            n, posted_ts, how = submit(cfg, pid, chan, text, thread, username=uname, ts=ts, decision=mention, ask=ask,
+                                     stay=stay)
         except Exception as e:
             print(f"cc-slack post: {pid} not sent ({e.__class__.__name__}: {str(e)[:160]}) — the intent stands, the "
                   f"same --id sends it once", file=sys.stderr); return 1
@@ -10506,7 +10510,7 @@ def cmd_post(argv):
             print(f"cc-slack: {pid} already sent as {posted_ts} — nothing posted", file=sys.stderr); return 0
     else:
         try:
-            n, posted_ts = post(cfg, chan, text, thread, username=uname, ts=ts, decision=mention, ask=ask)
+            n, posted_ts = post(cfg, chan, text, thread, username=uname, ts=ts, decision=mention, ask=ask, rerouted=stay)
         except Exception as e:
             print(f"cc-slack post: not sent ({e.__class__.__name__}: {str(e)[:160]})", file=sys.stderr); return 1
     print(posted_ts or "")

@@ -7713,6 +7713,26 @@ def run_selfcheck():
               "log lane's ts — never the archived id with a ts from another channel",
               howR4d == "sent" and tsR4d == "9.1" and recR4d["chat"] == "CLOG" and recR4d["thread"] is None
               and recR4d["moved_from"] == "CARCH" and recR4d["ts"] == "9.1")
+        # R4e — a caller that refuses the move (`post --no-move`, stay): an archived channel raises, fresh or retried,
+        # and nothing goes to the log lane
+        sentR.clear()
+        errR4e = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(2):
+                try:
+                    submit(cfgR, "lib:x:5", "CARCH", "library feedback", stay=True)
+                except RuntimeError as e:
+                    errR4e.append(str(e))
+            postedR4e = []
+            globals()["post"] = lambda cfg, chat, text, thread=None, **kw: postedR4e.append(kw.get("rerouted")) or (1, "1.0")
+            globals()["load_cfg"] = lambda: dict(cfgR)
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_post(["-c", "CARCH", "--no-move", "a"]); cmd_post(["-c", "CARCH", "b"])
+            globals()["post"], globals()["load_cfg"] = _postR, _lcR
+        check("R4e --no-move: a post to an archived channel is refused, on its first send and on a retry, never moved to "
+              "the log lane; a post without it still may move",
+              errR4e == ["is_archived", "is_archived"] and [c for c, _, _ in sentR] == ["CARCH", "CARCH"]
+              and not sent_record("lib:x:5").get("accepted") and postedR4e == [True, False])
         # R5 — --route with no twin → the log lane, labelled; a member's twin is still its own
         postedR5 = []
         globals()["post"] = lambda cfg, chat, text, thread=None, **kw: postedR5.append((chat, text)) or (1, "1.0")
