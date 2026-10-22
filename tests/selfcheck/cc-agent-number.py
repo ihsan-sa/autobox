@@ -72,5 +72,10 @@ def selfcheck():
         got = run(member, SESSION="s", win="w", wt=d, repo="r", track="t", LOOPN="2")
         check("cc --go for a member's workspace takes the number on the host and puts it in the loop's window",
               " member r t -- cc-loop r t --max-iter 2 --agent-no a99" in got and "CC_AGENT_NO" not in got, got)
+    chk = src("cc-loop", '--agent-no must be')
+    got = [subprocess.run(["bash", "-c", chk + "echo ok"], env=dict(os.environ, AGENTNO=v), capture_output=True, text=True)
+           for v in ("a12", "12", "a1;x")]
+    check("cc-loop accepts --agent-no a12 and refuses 12 and a1;x with exit 2 before any work",
+          [(r.returncode, r.stdout) for r in got] == [(0, "ok\n"), (2, ""), (2, "")], got)
     print(f"cc-agent-number selfcheck: {n - f} passed, {f} failed")
     return 1 if f else 0

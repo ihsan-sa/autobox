@@ -4588,7 +4588,7 @@ def run_selfcheck():
     try:
         os._exit = lambda code: exitsD.append(code)
         with contextlib.redirect_stderr(errD):
-            dmD.unstick(time.time())
+            dmD.unstick_handlers(time.time())
             dmD.watchdog(True, None, nowD, "")
     finally:
         os._exit = realExitD
@@ -4603,6 +4603,12 @@ def run_selfcheck():
     hangD.set()                                              # the abandoned handler and the one behind it end, leaving the new stamp alone
     for exD in list(dmD.execs.values()):
         exD.shutdown(wait=True)
+    # -- a method defined twice in Daemon: the later def replaces the earlier, so every call in the old shape raises ------
+    import ast
+    daemonD = next(n for n in ast.parse(open(__file__).read()).body if isinstance(n, ast.ClassDef) and n.name == "Daemon")
+    defsD = [n.name for n in daemonD.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    check("Daemon defines each method once (a second unstick() once shadowed the first, so every 30 s tick raised and the "
+          "handoff, landing and orch sweeps behind it never ran)", sorted({d for d in defsD if defsD.count(d) > 1}) == [])
     # -- sending a FILE: the `file` tool and cc-slack post --file share upload_file(); the bounds are the whole point ----
     upd = tempfile.mkdtemp(prefix="cc-slack-upload-")        # under /tmp, which IS an allowed root
     real_cwd_u = os.getcwd(); os.chdir(upd)

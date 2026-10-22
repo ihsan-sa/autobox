@@ -1440,6 +1440,13 @@ def run():
     k(router.redact_links("https://t.example/r?u=https%3A%2F%2Fpiazza.com%2Fc%3Fcid%3D9%26token%3DSEK3%26x%3D1")
       == "https://t.example/r?u=https%3A%2F%2Fpiazza.com%2Fc%3Fcid%3D9%26token%3D[redacted]%26x%3D1",
       "…and when it sits percent-encoded inside a redirect's query, the rest of that query kept")
+    for name in ("token1", "key2", "password1", "api_key_2", "x_token", "secret_v2", "sig3"):
+        k(router.redact_links(f"https://app.example/a?u=me&{name}=SEK4&x=1")
+          == f"https://app.example/a?u=me&{name}=[redacted]&x=1",
+          f"…and when its secret's name carries a digit, prefix or suffix, as {name}=")
+    for name in ("keyword", "author"):
+        k(router.redact_links(f"https://app.example/a?{name}=SEK5") == f"https://app.example/a?{name}=SEK5",
+          f"…while {name}=, a word that only contains a secret word's letters, stays")
     plain = "https://example.com/search?keyword=mail&amp;author=me&page=2&q=caf%C3%A9%26tea#top"
     k(router.redact_links(plain) == plain,
       "…while an ordinary link posts unchanged, a name like keyword= or author= and its own encoded parts included")
