@@ -427,18 +427,18 @@ def newest_reads(entries, repo, pr):
     return out
 
 
-def perms_recorded(repo, pr, head, digests) -> bool:
-    """True when perms' newest entry for exactly this repo, PR and head (newest_reads) is a LAND at one of
-    `digests`: what a security path merges on (_security_unread, lane.landed_at), a host check runs on
+def perms_recorded(repo, pr, head, digests):
+    """perms' newest entry for exactly this repo, PR and head (newest_reads) when it is a LAND at one of `digests`,
+    else None: what a security path merges on (_security_unread, lane.landed_at), a host check runs on
     (lane.Lane.host_unread) and is released on (release.remote_rules). An entry with no `verdict` is a LAND, as in
     carried_from; a FIX or DO-NOT-LAND is not one, and one recorded after a LAND at that head takes it back. An
     empty digest is no digest (Opus read of #1564: a job with no reviewer unit has digest "", which an entry with
     an empty change would match)."""
     digests = {d for d in digests or () if d}
     if not (head and digests):
-        return False
+        return None
     e = newest_reads(perms_reads(repo)[0], repo, pr).get(head)
-    return e is not None and e.get("change") in digests and e.get("verdict", T.LAND) == T.LAND
+    return e if e is not None and e.get("change") in digests and e.get("verdict", T.LAND) == T.LAND else None
 
 
 def security_globs(root, base, repo):
@@ -1682,8 +1682,9 @@ def _security_open(job, comments):
     later HANDBACK marker is its only word), and a time either side does not give (E.epoch_of 0) leaves it standing."""
     from lander import events as E
     sec = open_security(comments, job.head)
-    if sec and perms_recorded(job.repo, job.pr, job.head, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
-        land = E.epoch_of(newest_reads(perms_reads(job.repo)[0], job.repo, job.pr)[job.head].get("at"))
+    land = sec and perms_recorded(job.repo, job.pr, job.head, keys(job, diff_of(root_of(job), job.base_sha, job.head)))
+    if land:
+        land = E.epoch_of(land.get("at"))   # the entry whose verdict was checked: one read of the ledger
         back = E.epoch_of(sec.extra.get("at"))
         if back and land and back < land:
             return None
@@ -2449,9 +2450,10 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
             return f"perms holds PR #{pr} at {head[:12]} for its security read", True
         return (f"perms held PR #{pr} at {head[:12]} for its security read and none started within "
                 f"{HOLD_WINDOW // 60} minutes: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
-    if state == "done" and at.get("verdict") == T.HANDBACK_VERDICT and perms_recorded(repo, pr, head, [digest]):
+    land = state == "done" and at.get("verdict") == T.HANDBACK_VERDICT and perms_recorded(repo, pr, head, [digest])
+    if land:
         from lander import events as E
-        land = E.epoch_of(newest_reads(perms_reads(repo)[0], repo, pr)[head].get("at"))
+        land = E.epoch_of(land.get("at"))   # the entry whose verdict was checked: one read of the ledger
         back = E.epoch_of(at.get("finished"))
         # brief (#1842): "a security-reads LAND at the same head, recorded at a later second than the reader file's
         # finish time, clear[s] that reader file's HANDBACK"; "An unparseable time clears nothing."
@@ -2491,10 +2493,12 @@ def adoptable(job):
     return e, ""
 
 
-def grant(job, read, model, verdict=T.LAND):
+def grant(job, read, model, verdict=T.LAND, refresh=True):
     """Append perms' ledger entry (perms_recorded's form) for perms' `verdict` (LAND, or a word that holds) of the
     job's head, `read` naming the read it rests on, whole or not at all: a 0600 file swapped in by rename, in a seat
-    dir reached through no symlink. Callers check perms_seat_caller() first. -> why not, or ''."""
+    dir reached through no symlink. When that head's newest entry already says `verdict` at the job's change, only
+    its `at` moves to now, unless not `refresh` (perms-adopt: re-adopting an old read must not clear a HANDBACK
+    posted after it). Callers check perms_seat_caller() first. -> why not, or ''."""
     path = perms_reads_path(job.repo)
     seat = os.path.dirname(path)
     if not (SHA40.fullmatch(job.head or "") and job.digest):
@@ -2512,12 +2516,16 @@ def grant(job, read, model, verdict=T.LAND):
                 return f"perms' ledger will not read ({why}); nothing written over it"
             last = newest_reads(have, job.repo, job.pr).get(job.head) or {}
             if last.get("change") == job.digest and last.get("verdict", T.LAND) == verdict:
-                return ""   # already the newest; a LAND after a FIX at this head is appended, so it stands
-            rec = {"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest, "verdict": verdict,
-                   "read": read, "model": model, "at": C.now()}
+                # already the newest: its time moves, so a repeat LAND clears a reader's newer HANDBACK (perms_reading)
+                if not refresh:
+                    return ""
+                last["at"] = C.now()
+            else:   # a LAND after a FIX at this head is appended, so it stands
+                have.append({"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest,
+                             "verdict": verdict, "read": read, "model": model, "at": C.now()})
             fd, tmp = tempfile.mkstemp(dir=seat, prefix=".", suffix=".tmp")   # 0600
             with os.fdopen(fd, "w") as f:
-                json.dump(have + [rec], f, indent=1)
+                json.dump(have, f, indent=1)
             os.replace(tmp, path)
             tmp = None
     except OSError as e:
@@ -2686,7 +2694,7 @@ def cmd_perms_adopt(argv):
         print(f"lander perms-adopt: PR #{pr} is merged; there is nothing to grant")
         return 1
     e, why = adoptable(job)
-    why = why or grant(job, read_name(job.pr, job.head), e.get("model", ""))
+    why = why or grant(job, read_name(job.pr, job.head), e.get("model", ""), refresh=False)
     if why:
         print(f"lander perms-adopt: {why}; nothing granted")
         return 1

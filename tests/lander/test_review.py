@@ -2321,7 +2321,7 @@ class TestSecurityPaths(Case):
         with mock.patch.object(R, "box_owner", return_value=""):
             for repo, counts in (("owner/demo", False), ("demo", True), ("/demo", False)):
                 self.reads([self.rec(j, repo=repo)])
-                self.assertEqual(R.perms_recorded(j.repo, j.pr, j.head, [j.digest]), counts, repo)
+                self.assertEqual(bool(R.perms_recorded(j.repo, j.pr, j.head, [j.digest])), counts, repo)
 
     def test_delta_files_on_a_real_repo_names_the_authors_change_only(self):
         # read of #1317: every other case fakes delta_files; this one runs it on git
@@ -2399,6 +2399,16 @@ class TestSecurityPaths(Case):
                              T.HANDBACK_VERDICT, back_at)
             self.assertIsNotNone(R.standing(j, comments=[back]), back_at)
             self.assertIn("a security HANDBACK", R.would_read(j, [back])[1], back_at)
+
+    def test_the_handback_clear_takes_at_from_the_entry_perms_recorded_checked(self):
+        """Opus read at f3ee2813: a second ledger read could find a FIX appended since, or no entry (KeyError)."""
+        self.box(claude=claude_says("LAND"))
+        j = self.sec_job(self.PATHS[0])
+        back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head=j.head, by="perms-security-read",
+                            at="2026-10-20T11:00:00Z")
+        self.reads([])
+        with mock.patch.object(R, "perms_recorded", return_value=self.rec(j, at="2026-10-20T12:00:00Z")):
+            self.assertIsNone(R._security_open(j, [back]))
 
     def test_a_ledger_land_at_an_old_head_or_only_carried_leaves_the_handback(self):
         back = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")
@@ -2658,14 +2668,15 @@ class TestPermsReads(Case):
 
     # #1842 (10-22): perms recorded LAND in its ledger 48 s after its reader handed the same head back, and the lane
     # still stopped on the reader's HANDBACK until perms moved the file by hand
-    def handback_then_ledger(self, finished, at, head=HEAD):
+    def handback_then_ledger(self, finished, at, head=HEAD, change=None, digest=None, then=()):
         R.write_read("demo", self.entry(verdict="HANDBACK", finished=finished))
         path = R.perms_reads_path("demo")
+        land = {"repo": "demo", "pr": 7, "head": head, "change": R.change_digest(DIFF) if change is None else change,
+                "verdict": "LAND", "at": at}
         with open(path, "w") as f:
-            json.dump([{"repo": "demo", "pr": 7, "head": head, "change": R.change_digest(DIFF), "verdict": "LAND",
-                        "at": at}], f)
+            json.dump([land] + [dict(land, **e) for e in then], f)
         os.chmod(path, 0o600)
-        return R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))
+        return R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF) if digest is None else digest)
 
     def test_a_later_ledger_land_at_the_head_clears_the_readers_handback(self):
         self.assertEqual(self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z"), ("", False))
@@ -2677,6 +2688,36 @@ class TestPermsReads(Case):
     def test_a_ledger_land_at_another_head_leaves_the_readers_handback_standing(self):
         self.assertIn("says HANDBACK",
                       self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z", head="c" * 40)[0])
+
+    # follow-ups to #1847's security reads
+    def test_a_ledger_land_at_another_or_an_empty_change_leaves_the_readers_handback_standing(self):
+        for change, digest in (("f" * 64, None), ("", None), ("", "")):
+            self.assertIn("says HANDBACK", self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z",
+                                                                     change=change, digest=digest)[0], change)
+
+    def test_a_fix_after_the_ledger_land_leaves_the_readers_handback_standing(self):
+        self.assertIn("says HANDBACK", self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z",
+                                                                 then=[{"verdict": "FIX", "at": "2026-10-22T08:04:00Z"}])[0])
+
+    def test_a_repeat_ledger_land_after_the_readers_handback_clears_it(self):
+        import types
+        self.assertIn("says HANDBACK", self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:01:00Z")[0])
+        job = types.SimpleNamespace(repo="demo", pr=7, head=HEAD, digest=R.change_digest(DIFF))
+        self.assertEqual(R.grant(job, "perms", "perms"), "")
+        self.assertEqual(len(self.ledger()), 1)   # the same LAND again: its time moves, nothing appended
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))
+
+    def test_re_adopting_an_old_land_read_leaves_its_time_and_the_handback(self):
+        """Opus read at f3ee2813: only perms' record refreshes `at`; re-adopting the read it finished before a
+        reader's HANDBACK must not clear that HANDBACK."""
+        R.write_read("demo", self.entry())
+        self.assertEqual(self.adopt(), 0)
+        path = R.perms_reads_path("demo")
+        old = [dict(self.ledger()[0], at="2026-10-22T08:01:00Z")]
+        with open(path, "w") as f:
+            json.dump(old, f)
+        self.assertEqual(self.adopt(), 0)
+        self.assertEqual(self.ledger(), old)
 
     def test_an_unparseable_time_leaves_the_readers_handback_standing(self):
         for finished, at in (("08:02:31", "2026-10-22T08:03:19Z"), ("2026-10-22T08:02:31Z", "soon"),
