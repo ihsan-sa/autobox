@@ -411,10 +411,12 @@ runner_missing(){   # the needs this machine lacks, space-separated, or nothing
 # trailing `net` (its manifest's net = true, which a PR cannot grant itself: manifest.py self_widening) keeps the
 # machine's network; a whole suite never does. A check that needed the network and was not given it goes red here,
 # and a laptop red is said again on the box (run.py), so a missing opt-in costs box time, never a wrong verdict.
+# NO HOMES: /home and /root are empty in the cage, whatever their modes, so a job on the peer (where workers' runs
+# spill, #1789) reads no account's files; only the directories named are bound back.
 # cage_argv [--net] DIR… sets CG to the bwrap prefix; the command follows it.
 cage_argv(){
   local net=""; [ "${1:-}" != --net ] || { net=1; shift; }
-  CG=(bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp)
+  CG=(bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp --tmpfs /home --tmpfs /root)
   # the network cut, /run goes too: a socket there (a VPN daemon's, the system bus) is still reached through the
   # read-only root, and no job without the network needs one; nothing under it is bound back
   if [ -n "$net" ]; then [ ! -d /run/user ] || CG+=(--tmpfs /run/user); else CG+=(--unshare-net --tmpfs /run); fi
@@ -668,11 +670,14 @@ blender_bin(){ command -v "${CC_SUITES_BLENDER:-blender}" 2>/dev/null; }   # CC_
 # path (2026-10-01, the laptop: OptiX error 7804 without it; 7805 with it while the Windows driver ships no Linux
 # OptiX behind that loader, so CUDA renders). Read-only already, so it opens nothing. CC_SUITES_WSL_LIB: the selfcheck.
 gpu_env(){ local d=${CC_SUITES_WSL_LIB:-/usr/lib/wsl/lib}; GE=(); [ ! -d "$d" ] || GE=(LD_LIBRARY_PATH="$d"); }
-# THE CAGE for Blender: cage_argv's without --net (so no network, only lo, and an empty /run), and WSL's GPU device
-# node, the one thing added. The NVIDIA libraries it needs are under /usr/lib/wsl, already read-only.
+# THE CAGE for Blender: cage_argv's without --net (so no network, only lo, and an empty /run), WSL's GPU device
+# node, and Blender's own directory read-only, which is already so unless it sits under a home. The NVIDIA libraries
+# it needs are under /usr/lib/wsl, already read-only. render_cage BLENDER DIR…
 render_cage(){
-  cage_argv "$@"
-  [ ! -e /dev/dxg ] || CG=("${CG[@]:0:${#CG[@]}-1}" --dev-bind /dev/dxg /dev/dxg --)
+  local bd; bd=$(dirname "$1"); shift
+  cage_argv "$@"; CG=("${CG[@]:0:${#CG[@]}-1}" --ro-bind "$bd" "$bd")
+  [ ! -e /dev/dxg ] || CG+=(--dev-bind /dev/dxg /dev/dxg)
+  CG+=(--)
 }
 runner_render(){
   local tree=${1:-} cap=${2:-} s=${3:-} e=${4:-} scene=${5:-} why slot j t rc bl n bytes tsz
@@ -699,7 +704,7 @@ runner_render(){
   [ -f "$j/tree/$scene" ] && [ ! -L "$j/tree/$scene" ] || { echo "cc-suite-runner: no scene $scene in the tree — refused"; return 1; }
   local -a pre=(timeout -k 10 "$cap" nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
-  render_cage "$j"; gpu_env
+  render_cage "$bl" "$j"; gpu_env
   ( cd "$j/tree" && ulimit -f $((RENDER_MAX_BYTES / 1024 + 1)) && exec setsid env -i HOME="$j/home" USER="${USER:-$(id -un)}" PATH=/usr/local/bin:/usr/bin:/bin \
       LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_RENDER_OUT="$j/out" CC_RENDER_START="${s#-}" CC_RENDER_END="${e#-}" \
       CC_RENDER_DEVICE=GPU "${GE[@]}" "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio --python-exit-code 1 \
@@ -736,7 +741,7 @@ runner_gpu(){
   trap 'rc=$?; [ -z "$w" ] || rm -rf "$w"; exit $rc' EXIT
   local -a pre=(timeout -k 5 90 nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
-  render_cage "$j"; gpu_env
+  render_cage "$bl" "$j"; gpu_env
   dev=$(cd "$j" && setsid env -i HOME="$j" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb TMPDIR="$j" \
     CC_RENDER_DEVICE=GPU CC_RENDER_PROBE=1 "${GE[@]}" "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio \
     --python-expr "$RENDER_PY" </dev/null 2>&1 | sed -n 's/^cc-render: device //p' | head -1 | LC_ALL=C tr -c ' -~\n' '?')

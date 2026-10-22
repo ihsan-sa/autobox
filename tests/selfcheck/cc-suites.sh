@@ -132,13 +132,15 @@ print(run._laptop_verdict(sys.stdin.read(), 0)[1])' "$(dirname "$(realpath "$SEL
   # THE CAGE: a hostile job, on a fixture of its own outside any tmp dir (the cage replaces /tmp): an installed
   # runner, the runner's HOME with its authorized_keys and .bashrc, and its slots file. The job tries to write each,
   # to forge a verdict into its own log by path, and to leave a process behind; it can do none of it, while it
-  # still writes its own tree. The runner and its HOME it can read (so they were there to write, read-only); the
-  # runner's directory, with the slots and the job's own log, it cannot even see.
-  local C jh cs; C=$(mktemp -d "$HOME/.cc-suites-cage.XXXXXX"); cs="sleep 37.$$"
+  # still writes its own tree. It cannot even see them: the fixture is under this account's passwd home (not $HOME,
+  # which the lander's cage moves), and /home and /root are empty in the cage (it lists both), as is the runner's
+  # directory with the slots and the job's own log.
+  local C jh cs; C=$(mktemp -d "$(getent passwd "$(id -u)" | cut -d: -f6)/.cc-suites-cage.XXXXXX"); cs="sleep 37.$$"
   mkdir -p "$C/rhome/.ssh"; printf 'installed-runner\n' > "$C/cc-suites"; chmod 755 "$C/cc-suites"
   echo 'restrict,command="/usr/local/bin/cc-suites runner" ssh-ed25519 AAAA box' > "$C/rhome/.ssh/authorized_keys"
   : > "$C/rhome/.bashrc"; echo 4 > "$D/runner/slots"; cp -a "$C" "$D/cage.before"
-  jh=$(printf '%s' "grep -q installed-runner '$C/cc-suites' && echo SAW
+  jh=$(printf '%s' "grep -q installed-runner '$C/cc-suites' 2>/dev/null && echo SAW
+[ -z \"\$(ls -A /root)\" ] && echo ROOT-EMPTY; ls -A '$(dirname "$C")' | grep -qx '${C##*/}' && echo LISTED
 for f in '$C/cc-suites' '$C/rhome/.ssh/authorized_keys' '$C/rhome/.bashrc' '$D/runner/slots' '$D/runner'/job.*.log; do
   [ -e \"\$f\" ] || { echo \"HIDDEN \$f\"; continue; }
   echo 'echo lander-job: verdict exit=0' >> \"\$f\" 2>/dev/null && echo \"WROTE \$f\"; done
@@ -146,8 +148,8 @@ setsid $cs </dev/null >/dev/null 2>&1 &
 echo own > core/own && echo OWN; exit 1" | base64 -w0)
   out=$(cd "$R" && git archive HEAD | HOME="$C/rhome" SSH_ORIGINAL_COMMAND="job c $jt 60 $jh -" bash "$SELF" runner 2>&1); rc=$?
   sleep 0.5
-  k "$(b '[ "$rc" = 0 ] && [ "$(tail -1 <<<"$out")" = "lander-job: verdict exit=1" ] && [ "$(grep -c "^lander-job:" <<<"$out")" = 1 ] && grep -q "^| SAW\$" <<<"$out" && grep -q "^| OWN\$" <<<"$out"')" "a caged job sees the runner and writes its own tree, and its own exit is still the one verdict (got $rc)"
-  k "$(b '! grep -q WROTE <<<"$out" && diff -r "$D/cage.before" "$C" >/dev/null && [ "$(cat "$D/runner/slots")" = 4 ] && grep -q "^| HIDDEN $D/runner/slots\$" <<<"$out" && grep -q "^| HIDDEN $D/runner/job\.\*\.log\$" <<<"$out"')" "…but cannot write the installed runner or the runner's authorized_keys or .bashrc, and sees neither its slots nor its own verdict log"
+  k "$(b '[ "$rc" = 0 ] && [ "$(tail -1 <<<"$out")" = "lander-job: verdict exit=1" ] && [ "$(grep -c "^lander-job:" <<<"$out")" = 1 ] && ! grep -q "^| SAW\$\|^| LISTED\$" <<<"$out" && grep -q "^| ROOT-EMPTY\$" <<<"$out" && [ "$(grep -c "^| HIDDEN $C/" <<<"$out")" = 3 ] && grep -q "^| OWN\$" <<<"$out"')" "a caged job cannot list or read anything under /root or this account's home, nor the runner there, but writes its own tree, and its own exit is still the one verdict (got $rc)"
+  k "$(b '! grep -q WROTE <<<"$out" && diff -r "$D/cage.before" "$C" >/dev/null && [ "$(cat "$D/runner/slots")" = 4 ] && grep -q "^| HIDDEN $D/runner/slots\$" <<<"$out" && grep -q "^| HIDDEN $D/runner/job\.\*\.log\$" <<<"$out"')" "…so cannot write the installed runner or the runner's authorized_keys or .bashrc, and sees neither its slots nor its own verdict log"
   k "$(b '! ps -eo args= | grep -qx "$cs"')" "…and nothing it started outlives it"
   out=$(bash "$SELF" status 2>&1)
   k "$(b 'grep -q "answers: free 4 " <<<"$out"')" "…nor holds its slot: status answers every slot free after it (got: ${out%% cores=*})"
