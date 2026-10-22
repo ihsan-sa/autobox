@@ -24,6 +24,7 @@
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo>-updates when the repo has that lane, else #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
   cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people. No -updates twin is made (only a member's join makes one): a routine line with no twin of its own goes to the box's one log lane, #<box>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
+  cc-slack fetch <file id> | <channel> <ts>   from a member workspace's session, fetch a file posted earlier in its own Slack workspace (by id, or every file on that message) into its files dir; only from a channel that routes to it.
   cc-slack escalate --notice [--file P] [--id ID] -t "<h>/<track> <kind>" "text"   from inside a member boundary: a worker's END LINE or its Slack deliverable — posted by the host into the track's thread (the file with it, under the text) and one `loop:` line to the control seat; never a request or a page. --id posts it once (the ledger keeps it under the workspace's name); the seat's line goes every time. cc-notify (a plain call titled with the track) and cc-loop use it. Without --notice, `escalate` is cc-notify's --ask relay, and one titled `<h>/<track> …` (cc-loop's stop) also hands that workspace's own seat a `loop:` line.
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
@@ -5037,7 +5038,7 @@ class Daemon:
         return {"ok": True, "name": display_name(seat[0], seat[1]), "own": own,
                 "seat": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
 
-    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject", "channels")
+    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs", "subject", "channels", "fetch")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover", "move")
 
     PUBLIC_READS = ("history", "thread")   # the member verbs the owner socket serves too, on a public channel only (public_read)
@@ -5087,6 +5088,8 @@ class Daemon:
                 pass                    # names no channel: cc-subject starts the run for this socket's workspace (run_subject)
             elif verb == "channels":
                 pass                    # names no channel: lists this socket's workspace's own (member_channels)
+            elif verb == "fetch":
+                pass                    # a file id or a channel: member_fetch checks either against this socket's workspace's routes
             elif verb in self.MEMBER_VERBS:
                 chat = self.member_mirror_chat(member, str(first[verb]))
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
@@ -5215,6 +5218,48 @@ class Daemon:
         kept[h] = (time.time(), text)
         return text
 
+    def member_fetch(self, h, what, ts=""):
+        """`cc-slack fetch <file id>` or `cc-slack fetch <channel> <ts>` inside a boundary: a file posted in the
+        workspace's own Slack workspace, downloaded out here with that workspace's token into its files dir
+        (fetch_files), since a session is handed only the files on a message that woke it. Only a file shared into a
+        channel that routes to `h` (member_chat by id, over files.info's channels/groups/shares) is fetched: never one
+        of the box's main workspace, another member's, or a DM."""
+        mine = [ws for ws, w in WS["extra"].items() if w.get("member") == h]
+        if not mine:
+            return {"ok": False, "error": f"{h} has no Slack workspace of its own, and the box's main workspace is not fetched from"}
+        try:
+            if ts:
+                chat = self.member_mirror_chat(h, what)
+                if not member_chat(h, chat, ""):
+                    return {"ok": False, "error": f"{what} is not a channel of {h}'s workspace that routes to it"}
+                mine = [chat_workspace(chat)]
+                msgs = api("conversations.replies", WS["extra"][mine[0]]["bot"], channel=chat, ts=ts).get("messages") or []
+                ids = [f.get("id") for m in msgs if m.get("ts") == ts for f in m.get("files") or () if isinstance(f, dict)]
+                if not ids:
+                    return {"ok": False, "error": f"no file on message {ts} in {what}"}
+            else:
+                ids = [what]
+            infos = []
+            for fid in ids:
+                info = None
+                for ws in mine:
+                    with contextlib.suppress(Exception):
+                        info = api("files.info", WS["extra"][ws]["bot"], file=fid)["file"]; break
+                if not info:
+                    return {"ok": False, "error": f"{fid} is not a file {h}'s workspace can see"}
+                shares = info.get("shares") or {}
+                chans = (info.get("channels") or []) + (info.get("groups") or []) + [c for k in ("public", "private") for c in shares.get(k) or {}]
+                if not any(member_chat(h, c, "") for c in chans):
+                    return {"ok": False, "error": f"{fid} is not shared into a channel that routes to {h}"}
+                infos.append({**info, "_ws": ws})
+        except Exception as e:
+            return {"ok": False, "error": f"Slack did not answer ({e})"}
+        got = {id(f): p for f, p in self.fetch_files(infos, member=h, pairs=True)}
+        lines = [f"{flat_name(f.get('name'))}: " + (member_files_inside(h, got[id(f)]) if id(f) in got else
+                 f"not saved ({f.get('_why') or 'the download failed'})") for f in infos]
+        log(f"fetch {h}: {what[:24]} {ts} saved {len(got)}/{len(infos)}")
+        return {"ok": bool(got), "text" if got else "error": "\n".join(lines)}
+
     def member_verb(self, h, first, verb):
         """The scoped Slack calls a boundary cannot make itself (no token inside). `verb` is the one refuse_reason
         authorised — never re-derived here, or a second key in the payload would run instead. Returns the response."""
@@ -5235,6 +5280,8 @@ class Daemon:
             return self.relay_ask(h, str(first[verb] or ""), str(first.get("text") or ""))
         if verb == "channels":
             return {"ok": True, "text": self.member_channels(h)}
+        if verb == "fetch":
+            return self.member_fetch(h, str(first[verb] or ""), str(first.get("ts") or ""))
         chat = self.member_mirror_chat(h, str(first[verb])); target = str(first.get("target") or h)
         if chat.startswith("#") and not member_chat_ok(h, chat[1:]):
             # refuse_reason passed it as a mirror channel, and it is not one now (a route changed between the two):
@@ -7721,10 +7768,10 @@ class Daemon:
             if not (url and tok):
                 continue
             if f.get("mode") == "external":
-                log(f"file skipped ({f.get('name')}): external link, not a Slack upload"); continue
+                f["_why"] = "an external link, not a Slack upload"; log(f"file skipped ({f.get('name')}): {f['_why']}"); continue
             host = urllib.parse.urlparse(url).hostname or ""
             if not (host == "slack.com" or host.endswith(".slack.com")):   # the token must never travel to a foreign host
-                log(f"file skipped ({f.get('name')}): url_private host {host!r} is not Slack"); continue
+                f["_why"] = f"its url host {host!r} is not Slack"; log(f"file skipped ({f.get('name')}): {f['_why']}"); continue
             fid = re.sub(r"[^A-Za-z0-9]+", "", str(f.get("id") or "F"))[:24] or "F"
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f.get("name") or "file")[:80]
             path = f"{fdir}/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{fid}-{safe}"
@@ -12391,6 +12438,15 @@ def main(argv):
                               "value": args[2] if args[0] == "config" else ""}, timeout=60)
         except Exception as e:
             print(f"the Slack daemon did not answer ({e.__class__.__name__}) — no card was raised", file=sys.stderr); return 1
+        print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
+        return 0 if r.get("ok") else 1
+    elif cmd == "fetch":     # member boundary: the daemon downloads with the workspace's token, which never enters the boundary
+        if len(rest) not in (1, 2):
+            print("cc-slack fetch <file id> | <channel> <ts>", file=sys.stderr); return 2
+        try:
+            r = sock_request({"fetch": rest[0], "ts": rest[1] if len(rest) == 2 else ""}, timeout=600)
+        except Exception as e:
+            print(f"the workspace's Slack link did not answer ({e.__class__.__name__}) — nothing was fetched", file=sys.stderr); return 1
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
         return 0 if r.get("ok") else 1
     elif cmd == "status":

@@ -10830,6 +10830,65 @@ def run_selfcheck():
           not [k for k in kF if k.startswith("_")] and kF["id"] == "F0FORGEDWS1"
           and "_ws" not in kA and "_x" not in kA and kA["id"] == "F0FORGEDWS2"
           and "_ws" not in kI and kI["id"] == "F0FORGEDWS3")
+    # -- A MEMBER FETCHES A FILE FROM ITS OWN WORKSPACE (cc-slack fetch; brief member-fetches-a-file-from-its-workspace)
+    #    A session is handed only the files on a message that woke it. Each case builds its own daemon, two bound
+    #    workspaces (mem's and other's), their routes and their files, and asserts what was saved AND what was asked.
+    def fetch_case(h, what, ts=""):
+        dmFx = Daemon(use_slack=False); dmFx.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-main"}
+        dmFx.prune_files = lambda: None
+        saved, asked = [], []
+        dmFx.save_file = lambda f, url, path: saved.append((f["id"], f.get("_ws"), path))
+        url = lambda fid: f"https://files.slack.com/files-pri/{fid}/x.xlsx"
+        files = {"xoxb-m": {"F0RUG00001": {"id": "F0RUG00001", "name": "rugs.xlsx", "url_private": url("F0RUG00001"), "channels": ["CRUG"]},
+                            "F0RUG00002": {"id": "F0RUG00002", "name": "b.png", "url_private": url("F0RUG00002"), "shares": {"private": {"CRUG": []}}},
+                            "F0UNR00001": {"id": "F0UNR00001", "name": "u.png", "url_private": url("F0UNR00001"), "groups": ["CUNR"]},
+                            "F0BAD00001": {"id": "F0BAD00001", "name": "bad.png", "url_private": "https://evil.example/x", "channels": ["CRUG"]}},
+                 "xoxb-o": {"F0OTH00001": {"id": "F0OTH00001", "name": "o.png", "url_private": url("F0OTH00001"), "channels": ["COTH"]}}}
+        def apiFx(method, token, **kw):
+            asked.append((method, token))
+            if method == "conversations.replies":
+                return {"ok": True, "messages": [{"ts": "1.1"}, {"ts": kw["ts"], "files": [{"id": "F0RUG00001"}, {"id": "F0RUG00002"}]}]}
+            f = (files.get(token) or {}).get(kw.get("file"))
+            if not f:
+                raise RuntimeError("files.info: file_not_found")
+            return {"ok": True, "file": dict(f)}
+        keep = {k: globals()[k] for k in ("api", "load_routes", "chat_workspace")}, dict(WS["extra"])
+        try:
+            WS["extra"].clear()
+            WS["extra"].update({"wsm": {"bot": "xoxb-m", "member": "mem", "mirror": True},
+                                "wso": {"bot": "xoxb-o", "member": "other", "mirror": True}})
+            globals().update(api=apiFx, load_routes=lambda: {"CRUG": "mem", "COTH": "other"},
+                             chat_workspace=lambda c: {"CRUG": "wsm", "CUNR": "wsm", "COTH": "wso"}.get(c, ""))
+            r = dmFx.member_fetch(h, what, ts)
+        finally:
+            globals().update(keep[0]); WS["extra"].clear(); WS["extra"].update(keep[1])
+        return r, saved, asked
+    rId, sId, _ = fetch_case("mem", "F0RUG00001")
+    check("FETCH: a member fetches a file of its own workspace by id — saved into its own files dir with that "
+          "workspace's token, and told the path its session sees",
+          rId.get("ok") and [(i, w) for i, w, _ in sId] == [("F0RUG00001", "wsm")]
+          and sId[0][2].startswith(f"{member_dir('mem')}/files/") and f"{HOME}/.cc/slack/files/" in rId.get("text", ""))
+    rTs, sTs, aTs = fetch_case("mem", "CRUG", "1.2")
+    check("FETCH: by channel and ts, every file on that message is fetched (one shared through `shares`) and no other",
+          rTs.get("ok") and [i for i, _, _ in sTs] == ["F0RUG00001", "F0RUG00002"]
+          and ("conversations.replies", "xoxb-m") in aTs)
+    rO, sO, aO = fetch_case("mem", "F0OTH00001")
+    check("FETCH: a file of another member's workspace is refused and never downloaded — only mem's own token asked",
+          not rO.get("ok") and "can see" in rO.get("error", "") and sO == [] and {t for _, t in aO} == {"xoxb-m"})
+    rN = fetch_case("nows", "F0RUG00001")
+    check("FETCH: a member with no Slack workspace of its own (the box's main workspace) is refused before any call",
+          not rN[0].get("ok") and "main workspace" in rN[0].get("error", "") and rN[1:] == ([], []))
+    rU, sU, aU = fetch_case("mem", "CUNR", "1.2")
+    rU2, sU2, _ = fetch_case("mem", "F0UNR00001")
+    check("FETCH: an unrouted channel of its own workspace is refused, by channel+ts before any call and by id once "
+          "files.info shows the file is only there",
+          not rU.get("ok") and "routes to it" in rU.get("error", "") and sU == [] and aU == []
+          and not rU2.get("ok") and "routes to mem" in rU2.get("error", "") and sU2 == [])
+    rB, sB, _ = fetch_case("mem", "F0BAD00001")
+    check("FETCH: a file whose url is not Slack's is refused and says why; the token never goes there",
+          not rB.get("ok") and "not Slack" in rB.get("error", "") and sB == [])
+    check("FETCH: the main socket refuses it: fetch is a member-socket verb",
+          Daemon(use_slack=False).refuse_reason({"fetch": "F0RUG00001"}, None, (0, os.getuid(), None)) == "fetch is a member-socket verb")
 
     # ── THE OWNER'S 👍 RUNS A CARD'S COMMAND (cc-notify --approval --run; the brief an-owner-thumbs-up-runs-the-
     # approved-command). Each case below builds its own card: a record on disk, the card and its reactions in a fake
