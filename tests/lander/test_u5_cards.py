@@ -759,6 +759,79 @@ class QueuedCards(Stubbed):
             self.assertTrue(C.positions("demo", self.jobs((7, Q, T.HELD))))
         self.assertEqual(self.argvs("cc-slack post")[-1][5], f"land:demo:7:queued@{Q}#1122")
 
+    def test_an_edit_that_timed_out_is_tried_again_and_never_reposted(self):
+        """Security read of #1827: a timeout may come after Slack made the edit, and a repost then says it twice. Only
+        Slack's own refusal (message_not_found and the like) posts the words afresh."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [124, "cc-slack: timed out after 120s"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.HELD))))
+        self.assertEqual(len(self.argvs("cc-slack post")), 1)          # no fresh card
+        self.answer({})
+        self.assertTrue(C.positions("demo", self.jobs((7, Q, T.HELD))))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "1.7"])   # the edit went on a later pass
+        self.answer({"cc-slack edit": [1, "cc-slack edit: chat.update: message_not_found"]})
+        with mock.patch.object(C.time, "time", return_value=2000.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertEqual(self.argvs("cc-slack post")[-1][5], f"land:demo:7:queued@{Q}#2000")
+
+    def test_a_record_whose_to_is_not_a_cards_shape_is_dropped_and_never_replayed(self):
+        """Security read of #1827: a record's `to` goes into cc-slack's argv, so it is read back only in the shape
+        queued_where() writes."""
+        rec = {"repo": "demo", "pr": 7, "place": 1, "state": T.QUEUED, "card": f"land:demo:7:queued@{Q}"}
+        bad = dict(rec, to=["--route", "x", "--file", "/etc/passwd"])
+        good = dict(rec, pr=8, card=f"land:demo:8:queued@{Q}", to=["-c", "C9", "--thread", "5.5"])
+        C.write_json(C._queued_path("demo"), {f"land:demo:7:queued@{Q}": bad, f"land:demo:8:queued@{Q}": good})
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q, "1.8")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            C.positions("demo", [])
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.8"])          # PR #7's record is gone unread
+        self.assertEqual([a[2:6] for a in self.argvs("cc-slack post")], [["-c", "C9", "--thread", "5.5"]])
+        self.assertEqual(C.read_json(C._queued_path("demo"), {}), {})
+        with open(os.path.join(self.tmp, "land", "queue.log")) as f:
+            self.assertIn(f"land:demo:7:queued@{Q}", f.read())
+
+    def test_a_lasting_failure_like_missing_scope_reposts_once_and_is_never_re_armed(self):
+        """Security read of #1844: an error that is not a timeout or Slack failing to answer was kept for a later pass,
+        so a card whose PR left took a box-wide slot on every tick, for good. It goes back to one repost."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: chat.update: missing_scope (needed chat:write)"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertTrue(C.positions("demo", []))
+        self.assertEqual(self.argvs("cc-slack post")[-1][5], f"land:demo:7:queued@{Q}#1000")   # one repost
+        self.assertFalse(C.left_held("demo"))                                                # nothing for the tick
+        self.assertTrue(C.positions("demo", []))
+        self.assertEqual((len(self.argvs("cc-slack edit")), len(self.argvs("cc-slack post"))), (1, 2))
+
+    def test_a_record_whose_to_holds_a_flag_or_control_character_or_whose_pr_is_not_a_number_is_dropped(self):
+        """Security read of #1844: where_ok checked which flags a `to` holds, not their values."""
+        rec = {"repo": "demo", "place": 1, "state": T.QUEUED, "to": ["-c", "C9"]}
+        said = {f"land:demo:{n}:queued@{Q}": dict(rec, pr=n, to=to) for n, to in
+                ((7, ["-c", "--file"]), (8, ["--route", "x\ny"]), (9, ["-c", "C9", "--thread", "-1"]))}
+        said[f"land:demo:6:queued@{Q}"] = dict(rec, pr="6 <!channel>")
+        C.write_json(C._queued_path("demo"), said)
+        for n in (6, 7, 8, 9):
+            self.ledger(n, Q, f"1.{n}")
+        C.positions("demo", [])
+        self.assertEqual(self.argvs("cc-slack"), [])
+        self.assertEqual(C.read_json(C._queued_path("demo"), {}), {})
+
+    def test_a_refused_last_edit_with_no_to_is_logged_as_dropped(self):
+        """A record from before `to` was kept has nowhere to repost its last words: they go, but the log says so."""
+        C.write_json(C._queued_path("demo"), {f"land:demo:7:queued@{Q}": {"repo": "demo", "pr": 7, "place": 1,
+                                                                          "state": T.QUEUED}})
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        self.assertTrue(C.positions("demo", []))
+        self.assertEqual(self.argvs("cc-slack post"), [])
+        self.assertEqual(C.read_json(C._queued_path("demo"), {}), {})
+        with open(os.path.join(self.tmp, "land", "queue.log")) as f:
+            self.assertIn("no `to` to post the last words into", f.read())
+
     def test_new_cards_are_posted_under_the_same_cap_and_a_held_post_goes_on_a_later_pass(self):
         """Opus read of #1275: posts skipped the per-minute cap that edits kept."""
         with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1000.0):

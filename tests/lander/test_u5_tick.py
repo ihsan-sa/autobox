@@ -458,6 +458,19 @@ class Tick(unittest.TestCase):
         self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "rev-parse", "main"), tip)
         self.assertTrue(self.said("the revert did not happen"))
 
+    def test_a_revert_with_no_pinned_url_tells_the_planning_seat_once_per_breaker(self):
+        """Brief of #1827, item 1: a revert the lander cannot push for want of a pin was said only as a failed revert,
+        and nobody was asked to pin it."""
+        self.put({"app/x": "a\n"}, "one line")
+        bad = self.put({"app/x": "2\n"}, "breaks it (#7)")
+        with mock.patch.object(G, "remote_url", return_value=""):
+            self.assertEqual(TP.revert("demo", self.root, "main", bad, "smoke failed"), "")
+            TP.revert("demo", self.root, "main", bad, "smoke failed")
+        asks = [c for c in self.calls if c[:2] == ["cc-notify", "--ask"]]
+        self.assertEqual([a[3] for a in asks], [f"land:demo:pin@{bad[:12]}"])
+        self.assertIn(f"main stays red: the revert of commit {bad[:12]} waits until the lander is pinned for demo",
+                      asks[0][-1])
+
     def test_a_merge_commit_is_not_reverted(self):
         self.git(self.work, "checkout", "-q", "-b", "side")
         with open(os.path.join(self.work, "app", "y"), "w") as f:

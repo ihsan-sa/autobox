@@ -1036,9 +1036,12 @@ class Lane:
             job.extra["deferred"] = True
         J.move(job, T.HELD, why)
         self.say(f"PR #{job.pr} held: {why}")
-        if pin:
-            with contextlib.suppress(UnitFault):
-                self.call("cards", "pin_hold", job, why)
+        if pin:   # on a thread of its own: cc-notify may take its 60 s, and the lane lock is held here
+            threading.Thread(target=self.tell_pin, args=(job, why), name="pin").start()
+
+    def tell_pin(self, job, why):
+        with contextlib.suppress(UnitFault):
+            self.call("cards", "pin_hold", job, why)
 
     def unhold(self, job):
         target, why = job.extra.get("held_from", T.QUEUED), "retry after hold"

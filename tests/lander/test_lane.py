@@ -5092,7 +5092,7 @@ class Starving(Fixture):
         self.assertEqual(sorted(self.merged_order()), [1, 2])           # and the re-queue had its turn
 
     def test_only_a_hold_a_pin_clears_asks_the_cards_unit_to_tell_the_planning_seat(self):
-        """10-21: hive-lite PR 8 held 4 h on a missing pin, and nobody heard. The hold is flagged where git raised it
+        """10-21: a box repo's PR held 4 h on a missing pin, and nobody heard. The hold is flagged where git raised it
         (G.Unpinned), never by its words: a CI context a branch names after them wakes nobody (security read of #1827)."""
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
@@ -5108,7 +5108,34 @@ class Starving(Fixture):
         with mock.patch.object(lane, "queued", side_effect=G.Unpinned(why)):
             lane.step(job)
         self.assertEqual(job.state, T.HELD)
+        for t in [t for t in threading.enumerate() if t.name == "pin"]:
+            t.join(10)
         self.assertEqual([(c[0], c[2]) for c in cards.calls], [("pin_hold", why)])
+
+    def test_a_slow_pin_request_never_holds_the_lane(self):
+        """Security read of #1827: cc-notify runs up to 60 s, and the lane lock is held where a hold is made, so the
+        planning seat's request goes on a thread of its own."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        go, said = threading.Event(), []
+
+        class SlowPin(Rec):
+            def pin_hold(self, job, why):
+                go.wait(10)
+                said.append(why)
+
+        lane = L.Lane("demo", self.units(cards=SlowPin()))
+        job = self.job(1)
+        job.state = T.QUEUED
+        with mock.patch.object(lane, "queued", side_effect=G.Unpinned("no pin")):
+            lane.step(job)
+        self.assertEqual((job.state, said), (T.HELD, []))   # the hold is made while the request still waits
+        go.set()
+        for t in [t for t in threading.enumerate() if t.name == "pin"]:
+            t.join(10)
+        self.assertEqual(said, ["no pin"])
 
     def test_a_hold_leaves_the_queued_mark_and_a_requeue_moves_it(self):
         """queued_mark is what only a re-queue or a new head changes. A hold (reap's took holds a job whose check was

@@ -211,7 +211,8 @@ def revert(repo, root, base, sha, why):
     the revert commit holds and a hook would run as the lander. The revert is made in a borrowed() repo, which reads
     only the checkout's objects: the tree is `merge-tree --write-tree --merge-base=<sha> <tip> <sha>^` (what `git
     revert` merges), the commit git's own revert message on the tip, and the push goes from there to the lander's own
-    URL. A merge commit is refused, as `git revert` without -m refuses it."""
+    URL. A merge commit is refused, as `git revert` without -m refuses it. One that failed while the lander holds no
+    URL for the checkout also asks the planning seat for the pin (cards.pin_hold), once per breaker."""
     done = C.state("tip", f"{repo}.reverted")
     seen = C.read_json(done, []) or []
     if sha in seen:
@@ -236,6 +237,9 @@ def revert(repo, root, base, sha, why):
                 f"({why}), but the revert did not happen — {said}. {base} is red until a person reverts {sha[:12]} "
                 f"or fixes it.")
         C.log("revert-failed", repo, pr or "tip", sha=sha[:12], why=said[:160])
+        if not G.remote_url(root):   # only a pin clears it (the tip is not read without one either): the planning
+            # seat hears once per breaker, as for a lane hold
+            C.pin_hold(T.Job(repo=repo, pr=pr, head=sha), said, f"{base} stays red: the revert of {what} waits")
     if pr:
         GH.comment(root, pr, text)
         job = T.Job(repo=repo, pr=pr, extra={"queued_at": sha[:12]})
