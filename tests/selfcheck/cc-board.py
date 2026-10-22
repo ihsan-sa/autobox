@@ -727,6 +727,10 @@ def selfcheck():
         r1, r2 = run("status", "lk", "t1", "running"), run("get", "lk", "t1", "status")
         ok("a pipe planted there is refused the same way, and neither the save nor the read hangs on it",
            r1.returncode == 1 and "refused" in r1.stderr and r2.returncode == 1 and "refused" in r2.stderr)
+        os.remove(f"{mb}/lk.json"); open(f"{mb}/lk.json", "w").close(); os.truncate(f"{mb}/lk.json", 4 << 30)
+        r1 = run("get", "lk", "t1", "status")
+        ok("a sparse 4 GiB board (no disk to its member) is read only to the cap and refused over 64 MiB, exit 1",
+           r1.returncode == 1 and "over 64 MiB — refused" in r1.stderr)
         os.remove(f"{mb}/lk.json"); os.replace(f"{mb}/lk.real", f"{mb}/lk.json")
         os.symlink(victim, f"{mb}/lk.json.tmp")
         r1 = run("status", "lk", "t1", "running")

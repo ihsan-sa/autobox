@@ -151,6 +151,12 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               ~/.cc/slack/history/<target>/<chat>/<YYYY-MM>.jsonl (cc-slack-history: every message, bots' and the
               box's own too) is read the same way, and a message it holds is not read again from the archive
   board       rows (kind event, span rows/<name>), notes (kind note), log items (kind event)
+  coverage    <project>/COVERS.md — what the project covers and relies on, one record per heading (kind document),
+              titled `coverage lines of <repo>: <heading>`; `ask --object <repo>` shows them under its own route
+  change notes ~/.cc/state/<repo>/change-notes.jsonl (cc-board-dream writes a box project's from its merged rows) and
+              the dispatch loop's $DISPATCH_STATE/change-notes.jsonl (~/.local/state/dispatch, owner-only): one record
+              per merge (kind event), titled `changed in <repo>: <PR title>`; `ask --object <repo>` lists the newest.
+              A member's are its workspace's, as its board is; nothing of the box's is ever in a member's file
   landing     ~/.cc/state/land/root/<repo>-<pr>.json (the review tally, kind finding), land/<repo>-<pr>.json (the
               job, kind event), land/queue.log (one event per line)
   failures    ~/.cc/failures/<scope>.jsonl (cc-failures' ledger: one record per line, kind finding, the cluster as its
@@ -174,8 +180,8 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               is read, the newest by mtime, a tie going to the worktree — a seat writes there and merges at
               milestones, so a search that saw only the primary would miss the current state.
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
-  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board and the landing queue (UNCAPPED),
-  which are read whole at any size.
+  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board and the landing queue (BIG),
+  which are read up to 64 MiB, cc-board's own cap.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
@@ -194,7 +200,9 @@ import math
 import os
 import re
 import resource
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -207,9 +215,11 @@ HITS = 8               # search hits shown per page
 FTS_DEADLINE = 2.0     # seconds, one index operation
 RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
 MAX_SOURCE = 4 << 20   # a registered file over this is unreadable, not read
-# …except these, read whole at any size: a busy repo's board passed 4 MiB in 2026-10 and every row, note and log item
+# …except these, read up to BOARD_CAP: a busy repo's board passed 4 MiB in 2026-10 and every row, note and log item
 # on it dropped out of the index, and the landing queue only grows. Both are re-read at record grain, so size costs a parse.
-UNCAPPED = ("board", "land-queue")
+# A member's board is its own file, so a sparse 4 GiB one costs it nothing: every board read stops at BOARD_CAP + 1.
+BIG = ("board", "land-queue")
+BOARD_CAP = 64 << 20   # cc-board's READ_CAP
 NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint chat
 # kind fit per need: "a decision outranks a journal opinion about it"; a state record outranks prose for `current`
 FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0, "chat": 0},
@@ -346,7 +356,7 @@ def ws_of(skind, repo):
     docs — the trees its boundary binds read-write — carry its id. Everything else is the owner's ('' here) and is
     never written into a workspace's file: the box's own repos, the home guides, memory, and every landing record
     and the queue, which the host produced and a member never held (unknown or mixed ownership is owner-only)."""
-    if skind in ("board", "journal", "doc", "slack") and WS.get(repo):   # slack: the archive dir is named after the route's target
+    if skind in ("board", "journal", "doc", "slack", "covers", "change-notes") and WS.get(repo):   # slack: the archive dir is named after the route's target
         return WS[repo]
     return ""
 
@@ -464,17 +474,62 @@ def ts_num(ts):
     return 0
 
 
+def open_regular(path):
+    """A binary file object on path, opened O_NONBLOCK and refused unless fstat says a regular file: a FIFO a member
+    puts at its board or a source neither blocks the reader nor is read."""
+    f = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb")
+    if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        f.close()
+        raise ValueError("not a regular file")
+    return f
+
+
+def board_file(path):
+    """board_of() on the board at path, read through open_regular and refused (ValueError) over BOARD_CAP."""
+    with open_regular(path) as f:
+        raw = f.read(BOARD_CAP + 1)
+    if len(raw) > BOARD_CAP:
+        raise ValueError(f"over {BOARD_CAP >> 20} MiB")
+    return board_of(raw)
+
+
+def board_of(text):
+    """A board's JSON, or ValueError unless it is shaped like one. A member writes its own board, so what parses is
+    untrusted: a [1], a 7 or {"tracks": [1]} is skipped by the reader instead of stopping the index for every board.
+    Its tracks always come back a dict; a row that isn't one is each reader's to skip."""
+    try:
+        d = json.loads(text)
+    except RecursionError:   # [ nested past the parser's stack
+        raise ValueError("nested too deep to parse") from None
+    if not (isinstance(d, dict) and isinstance(d.get("tracks") or {}, dict) and isinstance(d.get("log") or [], list)
+            and isinstance(d.get("path") or "", str)):
+        raise ValueError("not shaped like a board")
+    d["tracks"] = d.get("tracks") or {}
+    return d
+
+
+def board_rows(reg):
+    """The row names on every board in reg, for telling a row's journal from a stray one."""
+    rows = set()
+    for p, skind, repo, track in reg:
+        if skind == "board" and not excluded(p):
+            try:
+                rows.update(board_file(p)["tracks"])
+            except (OSError, ValueError):
+                pass
+    return rows
+
+
 # ── the registry: which files are knowledge, read from the boards and nothing else ────────────────────────────
 def boards():
-    """repo -> (board path, project path). A board that does not parse is skipped here and named by index()."""
+    """repo -> (board path, project path). A board that does not parse, or is not shaped like one, is skipped here and named by index()."""
     out = {}
     for p in sorted(glob.glob(os.path.join(H, ".cc", "boards", "*.json"))):
         name = os.path.basename(p)[:-5]
         if name.startswith("_"):
             continue
         try:
-            with open(p) as f:
-                d = json.load(f)
+            d = board_file(p)
         except (OSError, ValueError):
             out[name] = (p, "")
             continue
@@ -520,6 +575,7 @@ def registry():
             add(p, "perms-log", repo, "perms")
         for p in sorted(glob.glob(os.path.join(st, "*", "*.md"))):   # every other .md in a track's dir: pr-body, slack-post, notes
             add(p, "doc", repo, os.path.basename(os.path.dirname(p)))
+        add(os.path.join(st, "change-notes.jsonl"), "change-notes", repo)
         for p in sorted(glob.glob(os.path.join(st, "*.md"))):
             b = os.path.basename(p)[:-3]
             if b.endswith("-handoff") or b.endswith("-handover"):
@@ -527,6 +583,7 @@ def registry():
             else:
                 add(p, "doc", repo)
         if proj and os.path.isdir(proj):
+            add(os.path.join(proj, "COVERS.md"), "covers", repo)
             # REPO_SOURCES, "over the project path and each live course-seat worktree, worktree first": the trees are
             # every worktree under ~/.cc/worktrees/<repo>/ and then the primary; of the copies of one relative path
             # the newest by mtime is read (a tie goes to the worktree, first in the order) and the others are not —
@@ -586,6 +643,9 @@ def registry():
     for p in sorted(glob.glob(os.path.join(fl, "reports", "*.md"))):
         add(p, "doc")
     add(os.path.join(H, ".cc", "documents", "register.json"), "docs")   # cc-docs' register: a document by number or title
+    # the dispatch loop's change notes: repo '' makes the source the owner's, whatever repo a line names (ws_of)
+    add(os.path.join(os.environ.get("DISPATCH_STATE") or os.path.join(H, ".local", "state", "dispatch"), "change-notes.jsonl"),
+        "change-notes")
     return srcs
 
 
@@ -730,26 +790,27 @@ def mtime_iso(path):
 
 
 def parse_board(path, text, repo):
-    d = json.loads(text)
+    d = board_of(text)
+    sv = lambda v: v if isinstance(v, str) else ""   # a member's row, note or log entry: a stamp or a row name that isn't text is none
     recs = []
-    for name, row in (d.get("tracks") or {}).items():
+    for name, row in d["tracks"].items():
         if not isinstance(row, dict):
             continue
         facts = " ".join(f"{k}={row.get(k)}" for k in ("status", "kind", "pr", "branch", "updated", "created",
                                                        "agent", "held_by", "held") if row.get(k) not in (None, "", False))
-        recs.append(dict(kind="event", title=f"row {name}: {row.get('title', '')}", ts=row.get("updated") or row.get("created") or "",
+        recs.append(dict(kind="event", title=f"row {name}: {row.get('title', '')}", ts=sv(row.get("updated")) or sv(row.get("created")),
                          text=f"row {name}: {row.get('title', '')}\n{facts}", span=f"rows/{name}", part=0, track=name,
                          extra_ids={name}))
         for i, n in enumerate(row.get("notes") or []):
             if not isinstance(n, dict):
                 continue
-            recs.append(dict(kind="note", title=f"note {name}", ts=n.get("ts", ""), text=f"note {n.get('ts', '')} {name}: {n.get('msg', '')}",
+            recs.append(dict(kind="note", title=f"note {name}", ts=sv(n.get("ts")), text=f"note {n.get('ts', '')} {name}: {n.get('msg', '')}",
                              span=f"notes/{name}/{i}", part=0, track=name, extra_ids={name}))
     for i, e in enumerate(d.get("log") or []):
         if not isinstance(e, dict):
             continue
-        tr = e.get("track", "")
-        recs.append(dict(kind="event", title=f"log {tr}", ts=e.get("ts", ""), text=f"log {e.get('ts', '')} {tr}: {e.get('msg', '')}",
+        tr = sv(e.get("track"))
+        recs.append(dict(kind="event", title=f"log {tr}", ts=sv(e.get("ts")), text=f"log {e.get('ts', '')} {tr}: {e.get('msg', '')}",
                          span=f"log/{i}", part=0, track=tr, extra_ids={tr} if tr else set()))
     return recs
 
@@ -933,6 +994,25 @@ def parse_failures(path, text, repo):
     return recs
 
 
+def parse_notes(text, repo):
+    """A change-notes.jsonl, one merge a line ({at, repo, pr, title, note}, dispatch's format): one event each, under the
+    file's repo; only the dispatch loop's file (repo '') files a line under the repo it names, its last path part."""
+    recs = []
+    for i, l in enumerate(text.split("\n")):
+        try:
+            d = json.loads(l)
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(d.get("at") or 0)))
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            continue
+        r = repo or str(d.get("repo") or "").rsplit("/", 1)[-1]
+        pr = str(d.get("pr") or "")
+        n = pr.rstrip("/").rsplit("/", 1)[-1]
+        recs.append(dict(kind="event", title=f"changed in {r}: {d.get('title', '')}", ts=at, repo=r, span=f"L{i + 1}", part=0,
+                         track="", text=f"change note {r} PR {pr} merged {at}: {d.get('title', '')}\n{str(d.get('note', ''))[:600]}",
+                         extra_ids={f"#{n}", f"{r}#{n}"} if n.isdigit() else set()))
+    return recs
+
+
 def parse_slack(path, text):
     """One record per inbound Slack message (kind note): the daemon's archive line carries ts, thread_ts, chat, channel,
     user, role, target, text. The chat id, the message ts and its thread's ts go in the id column, so `ask --object`
@@ -1034,11 +1114,28 @@ def parse_chatlog(path, text, track):
     return recs
 
 
+def member_tree(path, h):
+    """A member's source is read only from inside that member's own trees: a link there (COVERS.md, a state .md) could
+    point at an owner file and put its text in the member's index, so the path's realpath must stay in them. The roots
+    are fixed directories no member can redirect; of ~/.cc/members/<h> only board/ counts, the one part its sandbox
+    writes, so its board (a link into it, or a plain file in ~/.cc/boards) resolves inside and a board it relinks to an
+    owner file does not. parse() passes the path of the file it has open, never the
+    name it opened, so a member swapping the name for a link between the check and the read gains nothing."""
+    roots = [os.path.join(H, *b, h) for b in ((".cc", "state"), ("dev",), (".cc", "worktrees"),
+                                               (".cc", "slack", "archive"), (".cc", "slack", "history"))]
+    rp = os.path.realpath(path)
+    return rp == os.path.join(os.path.realpath(os.path.join(H, ".cc", "boards")), h + ".json") \
+        or any(rp.startswith(r + "/") for r in map(os.path.realpath, roots + [os.path.join(H, ".cc", "members", h, "board")]))
+
+
 def parse(path, skind, repo, track, rows):
-    with open(path, "rb") as f:
-        raw = f.read() if skind in UNCAPPED else f.read(MAX_SOURCE + 1)
-    if skind not in UNCAPPED and len(raw) > MAX_SOURCE:
-        raise ValueError("over 4 MiB")
+    with open_regular(path) as f:   # a FIFO swapped in after add()'s isfile neither blocks nor is read
+        if ws_of(skind, repo) and not member_tree(os.readlink(f"/proc/self/fd/{f.fileno()}"), repo):
+            raise ValueError("a member's source that leaves its own tree")
+        cap = BOARD_CAP if skind in BIG else MAX_SOURCE
+        raw = f.read(cap + 1)
+    if len(raw) > cap:
+        raise ValueError(f"over {cap >> 20} MiB")
     text = raw.decode("utf-8", "replace")
     if skind in ("journal", "doc", "memory"):
         return parse_md(path, text, skind, repo, track, rows)
@@ -1068,6 +1165,13 @@ def parse(path, skind, repo, track, rows):
         return parse_docs(path, text)
     if skind == "results":
         return parse_results(path, text, repo)
+    if skind == "covers":
+        recs = parse_md(path, text, "doc", repo, track, rows)
+        for r in recs:
+            r["title"] = f"coverage lines of {repo}: {r['title']}"
+        return recs
+    if skind == "change-notes":
+        return parse_notes(text, repo)
     return []
 
 
@@ -1439,7 +1543,7 @@ def index_source(c, path, skind, repo, track, rows):
     sid = hashlib.sha1(path.encode()).hexdigest()[:8]
     try:
         recs = parse(path, skind, repo, track, rows)
-    except (OSError, ValueError, UnicodeError) as e:
+    except Exception as e:   # one source that doesn't parse, whatever it raises, stops no other
         c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, ws) VALUES (?,?,?,?,?,?,?,?,?) "
                   "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
                   "status=excluded.status, ws=excluded.ws", (path, skind, repo, track, size, mtime, now_iso(), f"unreadable: {e}", ws_of(skind, repo)))
@@ -1522,14 +1626,7 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
     t0 = time.monotonic()
     reg = registry() if reg is None else reg
     known = {p: (s, m) for p, s, m in c.execute("SELECT path, size, mtime FROM sources")}
-    rows = set()
-    for p, skind, repo, track in reg:
-        if skind == "board" and not excluded(p):
-            try:
-                with open(p) as f:
-                    rows.update((json.load(f).get("tracks") or {}).keys())
-            except (OSError, ValueError):
-                pass
+    rows = board_rows(reg)
     out = dict(indexed=0, pending=[], unreadable=[], excluded=[], removed=0, refused=0)
     todo = []
     # QUARANTINE: the register and the queue are shared files a mark changes the reading of, not the bytes of —
@@ -1942,6 +2039,12 @@ def ask(argv):
                     break
             if not found and repos:
                 notes.append("  journal: none at " + ", ".join(tilde(t) for r in repos for t in resolve_journal(r, key)[1]))
+            for lbl, sk in (("coverage lines (COVERS.md)", "covers"), ("change notes, newest first", "change-notes")):
+                rs = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
+                               "FROM records r JOIN sources s ON s.id=r.source_id WHERE s.skind=? AND r.repo=? "
+                               "ORDER BY " + ("r.pos" if sk == "covers" else "r.ts DESC") + " LIMIT ?", (sk, key, HITS)).fetchall()
+                if rs:   # the object is a project: what it covers, and what changed in it
+                    sections.append((lbl, rs))
             if not rows:
                 notes.append(f"  board row: none named {key}" + (f" in {orepo}" if orepo else f" (boards: {', '.join(sorted(boards())) or 'none'})"))
         elif kind == "path":
@@ -2132,14 +2235,7 @@ def touch(paths):
         by_path = {p: (p, sk, r, t) for p, sk, r, t in reg}
         c = db()
         known = {p: (sz, m) for p, sz, m in c.execute("SELECT path, size, mtime FROM sources")}
-        rows = set()
-        for p, skind, repo, track in reg:
-            if skind == "board" and not excluded(p):
-                try:
-                    with open(p) as f:
-                        rows.update((json.load(f).get("tracks") or {}).keys())
-                except (OSError, ValueError):
-                    pass
+        rows = board_rows(reg)
     except Exception as e:   # the index cannot be opened at all: every path named is a miss
         for p in paths:
             miss(os.path.abspath(os.path.expanduser(p)), f"index: {e}")
@@ -2287,8 +2383,7 @@ def cold(argv):
     closed = {}   # repo -> {row: status}
     for repo, (bp, _) in boards().items():
         try:
-            with open(bp) as f:
-                tr = json.load(f).get("tracks") or {}
+            tr = board_file(bp)["tracks"]
         except (OSError, ValueError):
             continue
         closed[repo] = {k: v.get("status") for k, v in tr.items() if isinstance(v, dict) and v.get("status") in CLOSED}
@@ -2946,6 +3041,7 @@ def selfcheck():
         selfcheck_workspaces(th, ok, run, w)
         selfcheck_lessons(th, ok, run, w)
         selfcheck_docs(th, ok, run, w)
+        selfcheck_covers(th, ok, run, w)
         selfcheck_run_notes(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
         selfcheck_sources(th, ok, run, w)
@@ -3659,6 +3755,170 @@ def selfcheck_docs(th, ok, run, w):
     ok("docs: a filed document is found by its number", "001-0004-B_quokka-field-explanation.pdf" in o)
     rc, o = run("ask", "--need", "history", "wombat never filed")
     ok("docs: a document with no filed revision is not a record", "001-0005" not in o)
+
+
+def selfcheck_covers(th, ok, run, w):
+    """A project's COVERS.md and change notes: found by `ask --object <repo>` and by their words. A member's stay in its
+    own workspace's file, and nothing of the box's reaches it, a dispatch-loop line naming the member included."""
+    os.environ.pop("DISPATCH_STATE", None)
+    t = int(time.time())
+    w("dev/r1/COVERS.md", "# r1\n\n## Covers\n\n- shows every message between agents\n\n## Relies on\n\n- the hive's send kinds\n")
+    w(".cc/state/r1/change-notes.jsonl", json.dumps({"at": t - 3600, "repo": "r1", "pr": "https://x/r1/pull/41",
+                                                     "title": "the dashboard draws asks", "note": "Asks get a lane."}) + "\n")
+    w(".local/state/dispatch/change-notes.jsonl", "".join(json.dumps(d) + "\n" for d in (
+        {"at": t - 60, "repo": "o/r1", "pr": "https://x/d/pull/7", "title": "quokkasend kind", "note": "a box note"},
+        {"at": t - 60, "repo": "o/wsc", "pr": "https://x/d/pull/8", "title": "t", "note": "quokkaboxleak"})))
+    w(".cc/boards/wsc.json", json.dumps({"repo": "wsc", "tracks": {}, "log": []}))
+    w("dev/wsc/.cc/member-workspace", "")
+    w("dev/wsc/COVERS.md", "## Covers\n\n- quokkamemberline\n")
+    w(".cc/state/wsc/change-notes.jsonl", json.dumps({"at": t, "repo": "r1", "pr": "https://x/wsc/pull/2", "title": "m",
+                                                      "note": "quokkamembernote"}) + "\n")
+    w(".cc/boards/wsd.json", json.dumps({"repo": "wsd", "tracks": {}, "log": []}))
+    w("dev/wsd/.cc/member-workspace", "")
+    w("dev/wsd/README.md", "the member's own quokkawsdown\n")
+    w("dev/r1/docs/owner-a.md", "# a\n\nquokkaownercovers\n")
+    w("dev/r1/docs/owner-b.md", "# b\n\nquokkaownerstate\n")
+    os.symlink(os.path.join(th, "dev", "r1", "docs", "owner-a.md"), os.path.join(th, "dev", "wsd", "COVERS.md"))
+    os.makedirs(os.path.join(th, ".cc", "state", "wsd", "t1"))
+    os.symlink(os.path.join(th, "dev", "r1", "docs", "owner-b.md"), os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md"))
+    run("index")
+    rc, o = run("ask", "--object", "r1", "--need", "history")
+    ok("covers: `ask --object <repo>` gives its coverage lines and its change notes, newest first",
+       "ROUTE coverage lines (COVERS.md)" in o and "shows every message between agents" in o and "the hive's send kinds" in o
+       and "ROUTE change notes, newest first" in o and 0 < o.find("quokkasend") < o.find("the dashboard draws asks")
+       and "quokkamembernote" not in o)
+    rc, o = run("ask", "--need", "history", "message between agents")
+    ok("covers: a coverage question finds the line, titled for its project", "coverage lines of r1: Covers" in o)
+    rc, o = run("ask", "--need", "history", "changed in r1")
+    ok("covers: 'what changed in r1' finds its change notes", "changed in r1: the dashboard draws asks" in o)
+    cw = sqlite3.connect(f"file:{os.path.join(th, '.cc', 'library', 'ws', ws_id('wsc'), 'index.sqlite')}?mode=ro&immutable=1", uri=True)
+    texts = " ".join(x[0] for x in cw.execute("SELECT text FROM records"))
+    cw.close()
+    ok("covers: a member's lines and notes are in its own file, and no box line or note is, the one naming it included",
+       "quokkamemberline" in texts and "quokkamembernote" in texts and "between agents" not in texts
+       and "quokkasend" not in texts and "quokkaboxleak" not in texts)
+    cw = sqlite3.connect(f"file:{os.path.join(th, '.cc', 'library', 'ws', ws_id('wsd'), 'index.sqlite')}?mode=ro&immutable=1", uri=True)
+    texts = " ".join(x[0] for x in cw.execute("SELECT text FROM records"))
+    cw.close()
+    ok("covers: a member's COVERS.md linked to an owner file puts none of its text in the member's file",
+       "quokkawsdown" in texts and "quokkaownercovers" not in texts)
+    ok("covers: a member's state .md linked to an owner file puts none of its text in the member's file",
+       "quokkawsdown" in texts and "quokkaownerstate" not in texts)
+    # the name a member swaps between a file and a link (or a FIFO) after add()'s isfile: parse() checks what it has open
+    registry()
+
+    def hung(*_):
+        raise TimeoutError("hung")
+    signal.signal(signal.SIGALRM, hung)   # a hang fails the one case instead of killing the run
+
+    def refused(fn, *args):
+        signal.alarm(10)
+        try:
+            fn(*args)
+            return ""
+        except ValueError as e:
+            return str(e)
+        except TimeoutError:
+            return ""
+        finally:
+            signal.alarm(0)
+    fifo = os.path.join(th, ".cc", "state", "wsd", "t1", "fifo.md")
+    os.mkfifo(fifo)
+    for label, p in (("a link to an owner file", os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md")), ("a FIFO", fifo)):
+        ok(f"covers: a member's source swapped for {label} after the isfile check is refused at the read, without hanging",
+           refused(parse, p, "doc", "wsd", "t1", {}))
+    os.remove(fifo)
+    owner_a = os.path.join(th, "dev", "r1", "docs", "owner-a.md")
+    bdir = os.path.join(th, ".cc", "members", "wsd", "board")
+    os.makedirs(bdir)
+    os.makedirs(os.path.join(th, ".cc", "members", "wsd", "subjects"))
+    bj, mb = os.path.join(th, ".cc", "boards", "wsd.json"), os.path.join(bdir, "wsd.json")
+    os.rename(bj, mb)
+    os.symlink(mb, bj)
+    ok("covers: a member's board, a link into its board dir, is read", not refused(parse, bj, "board", "wsd", "", {}))
+    os.remove(mb)
+    os.symlink(owner_a, mb)
+    ok("covers: a member's board relinked to an owner file neither reads it nor lets its COVERS.md link there",
+       refused(parse, bj, "board", "wsd", "", {}) and not member_tree(owner_a, "wsd"))
+    sub = os.path.join(th, ".cc", "members", "wsd", "subjects", "s.md")
+    w(".cc/members/wsd/subjects/s.md", "quokkahostside\n")
+    os.remove(os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md"))
+    os.symlink(sub, os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md"))
+    ok("covers: a member's link into its host-side members dir outside board/ is refused",
+       refused(parse, os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md"), "doc", "wsd", "t1", {}))
+    os.remove(mb)
+    os.mkfifo(mb)
+    signal.alarm(10)
+    try:
+        got = boards()["wsd"][1] == "" and board_rows(registry()) is not None
+    except TimeoutError:
+        got = False
+    signal.alarm(0)
+    ok("covers: a FIFO at a member's board is refused without hanging the registry", got)
+    signal.alarm(10)
+    try:
+        with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
+            cold(["--cold", "1"])
+        got = True
+    except TimeoutError:
+        got = False
+    signal.alarm(0)
+    ok("covers: a FIFO at a member's board doesn't hang index --cold", got)
+    # a member's board that parses to the wrong shape: every reader skips it (or its row) and none of them stops
+    for text in ("[1]", "7", '{"tracks": [1]}', '{"tracks": {"r": "x"}}', '{"tracks": {}, "path": [1]}'):
+        os.remove(mb)
+        w(".cc/members/wsd/board/wsd.json", text)
+        try:
+            with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
+                cold(["--cold", "1"])
+            refused(parse, bj, "board", "wsd", "", {})
+            got = isinstance(boards()["wsd"][1], str) and board_rows(registry()) is not None
+        except Exception:
+            got = False
+        ok(f"covers: a member's board of {text} stops none of boards(), the board rows, index --cold and its parse", got)
+    # a board nested past the parser's stack, or whose row, note or log entry holds a list where text goes, as a
+    # member's board and as a box board: index and ask still finish, and another project's lines are still found
+    deep = "[" * 200000
+    for label, text in (("nested 200,000 deep", deep), ("nested 200,000 deep in a row", '{"tracks": {"r": ' + deep + "]" * 200000 + "}}"),
+                        ("a log entry whose track is [1]", '{"tracks": {}, "log": [{"track": [1], "ts": "t", "msg": "m"}]}'),
+                        ("a row updated [1]", '{"tracks": {"r": {"title": "t", "updated": [1]}}}'),
+                        ("a note stamped [1]", '{"tracks": {"r": {"title": "t", "notes": [{"ts": [1], "msg": "m"}]}}}')):
+        for whose, rel in (("a member's", ".cc/members/wsd/board/wsd.json"), ("a box", ".cc/boards/rbad.json")):
+            w(rel, text)
+            try:
+                with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
+                    cold(["--cold", "1"])
+                run("index")
+                got = "shows every message between agents" in run("ask", "--need", "history", "shows every message between agents")[1]
+            except Exception:
+                got = False
+            ok(f"covers: {whose} board of {label} stops neither index, ask nor index --cold", got)
+            os.remove(os.path.join(th, rel))
+    # a sparse 4 GiB board costs its member no disk: every board read stops at BOARD_CAP + 1, refuses it, and goes on
+    for whose, rel in (("a member's", ".cc/members/wsd/board/wsd.json"), ("a box", ".cc/boards/rbad.json")):
+        w(rel, "")
+        os.truncate(os.path.join(th, rel), 4 << 30)
+        try:
+            board_file(os.path.join(th, rel))
+            why = ""
+        except ValueError as e:
+            why = str(e)
+        try:
+            with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
+                cold(["--cold", "1"])
+            run("index")
+            got = "shows every message between agents" in run("ask", "--need", "history", "shows every message between agents")[1]
+        except Exception:
+            got = False
+        ok(f"covers: {whose} sparse 4 GiB board is refused over 64 MiB, and index, ask and index --cold finish",
+           got and why == "over 64 MiB")
+        os.remove(os.path.join(th, rel))
+    w(".cc/members/wsd/board/wsd.json", "{}")
+    os.remove(mb)
+    os.remove(bj)
+    w(".cc/boards/wsd.json", json.dumps({"repo": "wsd", "tracks": {}, "log": []}))
+    os.remove(os.path.join(th, "dev", "wsd", "COVERS.md"))   # a later case reads COVERAGE's first two unreadable sources
+    os.remove(os.path.join(th, ".cc", "state", "wsd", "t1", "notes.md"))
 
 
 def selfcheck_quarantine(ok, run):

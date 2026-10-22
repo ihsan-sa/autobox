@@ -42,6 +42,20 @@ action's done and the board's log shows no transition of it since, and takes the
 brief under the brief's own lock, only while it is still there word for word, leaving the in-flight block alone. Nothing
 in the ledger is ever rewritten.
 
+CHANGE NOTES (owner, 2026-10-22: "this should prob be part of the knowledge base and consolidation right"). After the
+boards, a run with no --repo tells the lead of each project a merge touches. A box project's merge lands through
+cc-land, which writes no note, so a row merged in the last day with a PR gets one line in ~/.cc/state/<repo>/change-notes.jsonl
+(dispatch's format: at, repo, pr, title, and the first paragraph of its pr-body.md as the note), once per PR. The
+day's notes from those files and the dispatch loop's ($DISPATCH_STATE, ~/.local/state/dispatch) go one at a time
+through dispatch's matcher (BOARD_DREAM_MATCHER, else ~/dev/dispatch/covers/covers.py) against every OTHER box
+project's COVERS.md; each touched lead (the seat window named for the repo) gets one cc-msg a night listing its notes
+and why (each note one line: control characters a space, cut near 200 characters at a word), and <state>/told.jsonl
+keeps a receipt per message sent and a line per note once every lead it touches got it, so a failed send tries again
+and no told note is matched twice; a told.jsonl line that isn't JSON is logged and skipped. The matcher runs from an
+empty directory. No matcher on disk is a log line and no message. A member workspace (~/.cc/members/<h>, or
+.cc/member-workspace in its tree) is out on both sides: its lines are never matched, its notes never read, and it is
+never told. Dry lists who would be told and writes nothing.
+
 DRY BY DEFAULT. `run` writes only the plan: <state>/<day>/<repo>.md for a person, and <repo>.json for `score`. `run
 --live` writes the board. The timer runs --live and is installed OFF (units.json enable=owner): the seat switches it on
 after it has read a dry report.
@@ -57,7 +71,7 @@ pair it could not ask about is left alone and counted.
                                                or more of the plan's candidate rows is one group
   cc-board-dream selfcheck                     fixtures, a fake claude and a fixture board of its own; never a live board
 State: BOARD_DREAM_STATE, else ~/.cc/state/board-dream. Briefs: cc-board's (CC_STATE). Model binary: CC_CLAUDE.
-BOARD_DREAM_SIM and BOARD_DREAM_MAX_PAIRS override SIM and MAX_PAIRS.
+BOARD_DREAM_SIM and BOARD_DREAM_MAX_PAIRS override SIM and MAX_PAIRS; BOARD_DREAM_MSG the cc-msg a lead is told through.
 """
 import copy
 import datetime
@@ -136,6 +150,23 @@ def brief_of(repo, name, cap=20000):
     bounds what similarity and the prompts read; a fold moves the whole brief (cap=None), its last lines included."""
     B = board_mod()
     return B.human(read_text(B.tpath(repo, name), cap)).strip()
+
+
+def read_board(repo):
+    """The board as this pass may touch it, None when there is none. A member writes its own board, so what parses is
+    untrusted: any shape this pass would trip on ([1], 7, a row that is a string, a title that is a list) is a
+    ValueError, and every caller skips the board with a note and goes on to the next."""
+    B = board_mod()
+    d = B.read(B.bpath(repo))
+    if not d or isinstance(d, dict) and "tracks" not in d:
+        return None
+    s = lambda x, *ks: all(x.get(k) is None or isinstance(x[k], str) for k in ks)
+    if not (isinstance(d, dict) and isinstance(d["tracks"], dict) and isinstance(d.get("log", []), list)
+            and s(d, "path", "default_branch")
+            and all(isinstance(t, dict) and isinstance(t.get("notes") or [], list) and s(t, "kind", "status", "title", "created")
+                    for t in d["tracks"].values())):
+        raise ValueError(f"{repo}'s board is not shaped like a board; skipped")
+    return d
 
 
 def by_dream(t):
@@ -288,7 +319,7 @@ def evidence(repo, board, cands, texts):
                 ev[r]["closes"].append(m)
         for n in cands:
             if n != m and re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", body):
-                ev[n]["named"].append(f"merged row {m}: {t.get('title', '')[:100]}")
+                ev[n]["named"].append(f"merged row {m}: {(t.get('title') or '')[:100]}")
     if not ref:
         return ev
     files = set(git(path, "ls-tree", "-r", "--name-only", ref).splitlines())
@@ -411,9 +442,8 @@ def groups_of(verdicts, tracks):
 # ------------------------------------------------------------------------------------------------- the plan
 
 def plan_board(repo, model, log):
-    B = board_mod()
-    board = B.read(B.bpath(repo))
-    if not board or not isinstance(board.get("tracks"), dict):
+    board = read_board(repo)
+    if board is None:
         return None
     tracks, now_s = board["tracks"], time.time()
     skipped = {}
@@ -428,7 +458,7 @@ def plan_board(repo, model, log):
     for n in cands:
         t = tracks[n]
         b = brief_of(repo, n)
-        notes = "\n".join(x.get("msg", "") for x in (t.get("notes") or [])[-6:] if isinstance(x, dict))
+        notes = "\n".join(str(x.get("msg", "")) for x in (t.get("notes") or [])[-6:] if isinstance(x, dict))
         texts[n] = f"{t.get('title', '')}\n{b or notes}"
     ev = evidence(repo, board, cands, texts)
     p = {"repo": repo, "made": now(), "candidates": sorted(cands), "skipped": skipped,
@@ -553,7 +583,7 @@ def fold_text(repo, child, t, lid):
     """The block a fold appends. Its heading carries the action's id, so each fold's block is its own text: a retry
     of a fold whose append failed adds a block of its own, and undo takes out only the block of the action undone."""
     body = (brief_of(repo, child, cap=None)
-            or "\n".join(x.get("msg", "") for x in (t.get("notes") or []) if isinstance(x, dict)))
+            or "\n".join(str(x.get("msg", "")) for x in (t.get("notes") or []) if isinstance(x, dict)))
     return (f"## Folded in by cc-board-dream, {now()[:10]}: {child} <!-- cc-board-dream {lid} -->\n"
             f"{t.get('title', '')}\n\n{body.strip()}\n")
 
@@ -571,7 +601,7 @@ def apply(p, log):
         begun = False
         try:
             with B.Lock(repo):
-                d = B.read(B.bpath(repo))
+                d = read_board(repo)
                 t = (d or {}).get("tracks", {}).get(row)
                 pt = (d or {}).get("tracks", {}).get(parent) if parent else None
                 why = "gone from the board" if t is None else eligible(t, row, repo, time.time())
@@ -595,7 +625,7 @@ def apply(p, log):
                 d.setdefault("log", []).append({"ts": now(), "track": row, "msg": "status -> done", "by": lid})
                 B._save(repo, d)
             ledger_add(repo, {"action": "applied", "of": lid, "ts": now(), "repo": repo})
-        except (OSError, B.Refused) as e:
+        except (OSError, ValueError, B.Refused) as e:
             if not begun:
                 log(f"{repo}: stopped before {act} {row}, nothing of it written: {e}")
                 break
@@ -660,7 +690,7 @@ def cmd_undo(lid):
     said = []
     with B.Lock(repo):
         ledger_add(repo, {"id": uid, "ts": now(), "repo": repo, "action": "undo", "of": lid})
-        d = B.read(B.bpath(repo))
+        d = read_board(repo)
         t = (d or {}).get("tracks", {}).get(row)
         why = moved_since(d or {}, row, lid, t)
         if not why:
@@ -727,6 +757,142 @@ def cmd_score(plan_path, hand_path):
         print(x)
 
 
+# ------------------------------------------------------------------------------------------------- change notes
+
+def member(repo):
+    h = os.path.expanduser("~")
+    return os.path.isdir(os.path.join(h, ".cc", "members", repo)) or os.path.isfile(os.path.join(h, "dev", repo, ".cc", "member-workspace"))
+
+
+def read_notes(path):
+    out = []
+    for line in read_text(path, None).splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and isinstance(d.get("at"), (int, float)):
+            out.append(d)
+    return out
+
+
+def box_notes(repo, board, have, now_s):
+    """The notes of the rows merged in the last day whose PR has none yet."""
+    B, out = board_mod(), []
+    for n, t in sorted(board["tracks"].items()):
+        pr, at = str(t.get("pr") or ""), stamp(t.get("updated"))
+        if t.get("status") != "merged" or not pr or pr in have or not at or now_s - at > 86400:
+            continue
+        body = B.human(read_text(os.path.join(B.STATE, repo, n, "pr-body.md"))).strip()
+        out.append({"at": int(at), "repo": repo, "pr": pr, "title": t.get("title") or n,
+                    "note": (body.split("\n\n", 1)[0] if body else t.get("title") or n)[:600]})
+    return out
+
+
+def one_line(s, cap=200):
+    """A note's text as one cc-msg line: every control character (C0, DEL, C1) a space, so a \\r can't submit early
+    nor an escape reach the TUI, and cut at a word near cap so one note stays readable."""
+    s = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(s))
+    return s if len(s) <= cap else s[:cap].rsplit(" ", 1)[0] + "…"
+
+
+def tell_leads(live, log):
+    B, now_s = board_mod(), time.time()
+    covers, notes = {}, []
+    for repo in B.boards():
+        if member(repo):
+            continue
+        try:
+            board = read_board(repo)
+            if board is None:
+                continue
+            path = os.path.join(B.STATE, repo, "change-notes.jsonl")
+            old = read_notes(path)
+            new = box_notes(repo, board, {str(d.get("pr")) for d in old}, now_s)
+        except Exception:                 # a board is untrusted: whatever it raises skips that board alone
+            log(f"change notes: {repo}'s board doesn't read; skipped")
+            continue
+        cp = os.path.join(board.get("path") or "/nonexistent", "COVERS.md")
+        if os.path.isfile(cp):
+            covers[repo] = cp
+        if live and new:
+            with open(path, "a") as f:
+                f.writelines(json.dumps(d) + "\n" for d in new)
+        notes += old + new
+    notes += read_notes(os.path.join(os.environ.get("DISPATCH_STATE") or os.path.expanduser("~/.local/state/dispatch"),
+                                     "change-notes.jsonl"))
+    told = {x["note"] for x in ledger_of("told.jsonl", log) if "note" in x}
+    todo = {}
+    for d in notes:
+        name = str(d.get("repo") or "").rsplit("/", 1)[-1]
+        key = f"{name} {d.get('pr', '')}"
+        # the brief: "A member's lines and notes never reach another workspace or the box's matcher run"
+        if name and not member(name) and now_s - d["at"] <= 86400 and key not in told:
+            todo[key] = (name, d)
+    if not todo:
+        return
+    matcher = conf("BOARD_DREAM_MATCHER", os.path.expanduser("~/dev/dispatch/covers/covers.py"))
+    if not os.path.isfile(matcher):
+        log(f"change notes: {len(todo)} untold, but no matcher at {matcher}; nobody told")
+        return
+    touched, matched = {}, []
+    for key, (name, d) in todo.items():
+        # the matcher calls a model on a worker-written note: it runs from an empty directory, so no project's settings
+        # or CLAUDE.md load; turning its model's tools off is dispatch's covers.py's to do
+        with tempfile.TemporaryDirectory(prefix="cc-board-dream.") as tmp:
+            note = os.path.join(tmp, "note.json")
+            with open(note, "w") as f:
+                json.dump(d, f)
+            os.makedirs(os.path.join(tmp, "cwd"))
+            try:
+                p = subprocess.run([sys.executable, "-I", matcher, note] + [f"{r}={c}" for r, c in covers.items() if r != name],
+                                   capture_output=True, text=True, timeout=CALL_TIMEOUT, cwd=os.path.join(tmp, "cwd"))
+            except subprocess.TimeoutExpired:
+                p = None
+        if not p or p.returncode != 0:
+            log(f"change notes: the matcher failed on {key}: {(p.stderr if p else 'timeout').strip()[:200]}")
+            continue
+        for line in p.stdout.splitlines():
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(m, dict) and m.get("project") in covers and m["project"] != name:
+                touched.setdefault(m["project"], []).append((key, one_line(f"{name} {d.get('pr', '')} \"{d.get('title', '')}\": {m.get('why', '')}")))
+        matched.append(key)
+    failed = set()
+    for lead, items in sorted(touched.items()):
+        text = (f"Change notes from the nightly consolidation that touch {lead}'s COVERS.md: " + "; ".join(t for _, t in items)
+                + ". Whether to act is yours. If one isn't yours, or a miss got past, edit the lines in your COVERS.md.")
+        if not live:
+            log(f"change notes: would tell {lead}: {text}")
+            continue
+        p = subprocess.run([conf("BOARD_DREAM_MSG", os.path.join(BIN, "cc-msg")), lead, text], capture_output=True, text=True, timeout=120)
+        ledger_put("told.jsonl", {"at": now(), "lead": lead, "notes": [k for k, _ in items], "rc": p.returncode,
+                                  "out": (p.stdout + p.stderr).strip()[:200]})
+        log(f"change notes: told {lead} of {len(items)} (cc-msg rc {p.returncode})")
+        if p.returncode:
+            failed |= {k for k, _ in items}
+    for key in matched if live else ():   # a note is told once every lead it touches got it; a failed send tries again
+        if key not in failed:
+            ledger_put("told.jsonl", {"at": now(), "note": key})
+
+
+def ledger_of(name, log):
+    out = []
+    for x in filter(str.strip, read_text(state(name), None).splitlines()):
+        try:
+            out.append(json.loads(x))
+        except ValueError:
+            log(f"{name}: skipped a line that isn't JSON: {x[:80]}")
+    return out
+
+
+def ledger_put(name, entry):
+    with open(state(name), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 # ------------------------------------------------------------------------------------------------- run
 
 def cmd_run(argv):
@@ -745,24 +911,28 @@ def cmd_run(argv):
         with open(state("nights.log"), "a") as f:
             f.write(f"{now()} {'live' if live else 'dry'} {line}\n")
 
+    failed = 0
     for repo in ([only] if only else B.boards()):
         try:
             p = plan_board(repo, model, log)
-        except B.Refused as e:
+            if p is None:
+                continue
+            for lid in interrupted(repo, ledger()):
+                log(f"{repo}: action {lid} did not finish; `cc-board-dream undo {lid}` takes back what it wrote")
+            with open(state(day, repo + ".json"), "w") as f:
+                json.dump(p, f, indent=1)
+            with open(state(day, repo + ".md"), "w") as f:
+                f.write(report(p))
+            if live:
+                apply(p, log)
+        except Exception as e:   # one board that doesn't read, whatever it raises, stops no other, but the run fails
             log(f"{repo}: {e}")
-            continue
-        if p is None:
-            continue
-        for lid in interrupted(repo, ledger()):
-            log(f"{repo}: action {lid} did not finish; `cc-board-dream undo {lid}` takes back what it wrote")
-        with open(state(day, repo + ".json"), "w") as f:
-            json.dump(p, f, indent=1)
-        with open(state(day, repo + ".md"), "w") as f:
-            f.write(report(p))
-        if live:
-            apply(p, log)
-    log(f"night: {model.calls} model calls, ${model.cost:.3f}; plans in {state(day)}")
-    return 0
+            failed += 1
+    if not only:
+        tell_leads(live, log)
+    log(f"night: {model.calls} model calls, ${model.cost:.3f}; plans in {state(day)}"
+        + (f"; {failed} board(s) failed" if failed else ""))
+    return 1 if failed else 0
 
 
 # ------------------------------------------------------------------------------------------------- selfcheck
