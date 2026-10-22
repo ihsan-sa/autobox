@@ -3909,11 +3909,49 @@ class Tick(Fixture):
             self.assertEqual(unstamped, ["--unit=lander-tick-demo", "--unit=lander-tick-other"])
             self.assertTrue(all(c[-3:] == ["--repo", re.sub(r"-\d+$", "", c[3].split("lander-tick-")[1]), "--rearm"]
                                 for c in arms))
-            self.set_box(calls=[], timers="Sun 2026-09-27 lander-tick-demo-1790000000.timer "
-                                          "lander-tick-demo-1790000000.service")
+            soon = int(time.time()) + 100   # a timer named for when it fires, before demo's 300 s
+            self.set_box(calls=[], timers=f"Sun 2026-09-27 lander-tick-demo-{soon}.timer "
+                                          f"lander-tick-demo-{soon}.service")
             TK.cmd_tick(["--rearm"])
         arms = [c for c in self.box()["calls"] if c[0] == "systemd-run"]
         self.assertEqual([re.sub(r"-\d+$", "", c[3]) for c in arms], ["--unit=lander-tick-other"])
+
+    def test_a_wall_hold_is_read_again_when_its_time_passes_with_no_hand_queue(self):
+        """10-22: the lane held six hive-lite PRs on a review usage wall "asked again at 05:10:19Z", repair pushes gave
+        three of them new heads during the hold, and nothing read them again for 4 h until a seat queued them by hand.
+        The lane that holds must arm the tick its hold waits for, a later timer is no wait for an earlier hold, and a
+        hold that runs out while a lane runs is followed up."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        until = E.stamp(time.time() + 900)
+        wall = V(T.INCOMPLETE, tokens=0, until=until, why="Fable: resets 1am NY")
+        rv = Reviewer(wall, V(T.LAND))
+        units = self.units(planner=Planner(paid=True), reviewer=rv)
+        arms = lambda: [c for c in self.box()["calls"] if c[0] == "systemd-run"]   # noqa: E731
+        with mock.patch.object(L, "load_units", lambda: units), contextlib.redirect_stdout(io.StringIO()):
+            L.cmd_lane(["demo"])   # a lane no tick ran: a lane switch's, or `tick --detach`'s
+            j = self.job()
+            self.assertEqual((j.state, j.extra["deferred"], j.extra["not_before"]), (T.HELD, True, until))
+            self.assertEqual(len(arms()), 1)                              # the lane armed its own wake-up
+            fires = int(arms()[0][3].rsplit("-", 1)[1])
+            self.assertTrue(0 <= fires - E.epoch_of(until) <= 3)          # …named for when it fires, just past the until
+            later = f"lander-tick-demo-{fires + 3600}.timer"
+            self.set_box(calls=[], timers=later)
+            TK.rearm(["demo"])
+            self.assertEqual(len(arms()), 1)                              # a timer firing later does not stand for it
+            self.set_box(calls=[], timers=arms()[0][3].split("=")[1] + ".timer")
+            TK.rearm(["demo"])
+            self.assertEqual(arms(), [])                                  # its own timer does
+            new = self.push("track/row-1", {"a/x": "m\n"}, fresh=False)   # a repair push during the hold
+            j.extra["not_before"] = E.stamp(time.time() - 1)              # the until passes
+            J.save(j)
+            with mock.patch.object(J, "running", lambda r: 4242):
+                self.assertEqual(TK.waits("demo"), [TK.TICK_SECS])        # met by a running lane: followed up
+            TK.cmd_tick(["--repo", "demo", "--rearm"])                   # the timer's tick
+        j = self.job()
+        self.assertEqual((j.state, j.head), (T.DEPLOY_PENDING, new))      # read again at its new head
+        self.assertEqual([c[0] for c in rv.calls], ["review", "review"])
+        self.assertEqual(J.requests("demo"), [])                          # nobody queued it
 
 
 class Branches(Fixture):

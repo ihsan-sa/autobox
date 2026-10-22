@@ -78,9 +78,12 @@
   backoff   while the GitHub backoff runs (gh.py) no gh work is done: said once, lanes and watches wait.
   rearm     every tick (--rearm is accepted and adds nothing): ONE transient timer per repo that still waits on
             something — a job held with a not_before, a wanted tip run, a requested deploy, a deploy-pending job
-            while the tip is not red, or an owed main health pass (health.pending). `systemd-run --user --on-active=<secs> --unit=lander-tick-<repo>-<epoch>
-            <core/bin/lander> tick --repo <repo> --rearm`, skipped when the user manager's list-timers shows an
-            active lander-tick-<repo>-* timer. No unit files are written, and nothing depends on a caller ticking.
+            while the tip is not red, an owed main health pass (health.pending), or a hold that ran out while a lane
+            runs (TICK_SECS: that lane may end without it). `systemd-run --user --on-active=<secs>
+            --unit=lander-tick-<repo>-<epoch it fires> <core/bin/lander> tick --repo <repo> --rearm`, skipped when
+            the user manager's list-timers shows a lander-tick-<repo>-* timer firing from now to then. A lane run
+            outside a tick (`lander lane`: a lane switch's, `tick --detach`'s) rearms its repo as it ends. No unit
+            files are written, and nothing depends on a caller ticking.
             A repo with no checkout (repo_root is not a directory) is never armed, so a gone repo's timer dies.
             $LANDER_SYSTEMD_RUN and $LANDER_SYSTEMCTL replace the two binaries (the tests' fakes).
 """
@@ -509,17 +512,22 @@ def unit_name(repo) -> str:
     return "lander-tick-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", repo)
 
 
-def armed(out, unit) -> bool:
-    """Whether list-timers names an active timer of this repo's: `<unit>-<epoch>.timer`."""
-    return re.search(rf"(?:^|\s){re.escape(unit)}-\d+\.timer(?:\s|$)", out, re.M) is not None
+def armed(out, unit, by) -> bool:
+    """Whether list-timers names a timer of this repo's that fires between now and `by`: `<unit>-<epoch>.timer`, the
+    epoch when it fires. One firing later is no wait for `by`, and one whose time has passed (the timer of the tick
+    running now) is none at all (10-22: a wall hold sat 4 h)."""
+    now, pat = time.time(), rf"(?:^|\s){re.escape(unit)}-(\d+)\.timer(?:\s|$)"
+    return any(now - 1 <= int(e) <= by for e in re.findall(pat, out, re.M))
 
 
 def waits(repo) -> list:
     """Seconds until each thing the repo still waits on wants a tick; [] when nothing does. A tip that is red waits
     on a person (or the next merge, whose lane kicks the tip itself), not on a clock."""
     jobs = J.lane_jobs(repo)
-    out = [J.not_before_left(j) for j in jobs if j.state == T.HELD and j.extra.get("not_before")]
-    out = [w for w in out if w > 0]
+    held = [J.not_before_left(j) for j in jobs if j.state == T.HELD and j.extra.get("not_before")]
+    out = [w for w in held if w > 0]
+    if 0 in held and J.running(repo):   # a hold ran out while a lane runs: a lane that ends without it is followed up
+        out.append(TICK_SECS)
     req = C.read_json(D.req_path(repo)) or {}
     requested = any((st or {}).get("state") == "requested" for st in (req.get("targets") or {}).values())
     pending = any(j.state in (T.DEPLOY_PENDING, T.DEPLOYED) for j in jobs)
@@ -551,12 +559,13 @@ def rearm(repos) -> list:
         unit = unit_name(repo)
         # Active timers only (no --all): the one that fired this tick has elapsed and is not a wait.
         rc, out, _ = L.run([sysctl, "--user", "list-timers", "--no-legend", f"{unit}-*.timer"], timeout=30)
-        if rc == 0 and armed(out, unit):
-            continue
         secs = min(left) + 1
-        # A stamp in the name: this tick may be running inside the unit the last timer started, and systemd-run
-        # refuses a name that is still loaded.
-        rc, out, err = L.run([sysrun, "--user", f"--on-active={secs}", f"--unit={unit}-{int(time.time())}", lander,
+        at = int(time.time()) + secs
+        if rc == 0 and armed(out, unit, at):
+            continue
+        # When it fires, in the name: this tick may be running inside the unit the last timer started, and
+        # systemd-run refuses a name that is still loaded.
+        rc, out, err = L.run([sysrun, "--user", f"--on-active={secs}", f"--unit={unit}-{at}", lander,
                               "tick", "--repo", repo, "--rearm"], timeout=30)
         lines.append(f"[{repo}] tick armed in {secs}s ({unit})" if rc == 0
                      else f"[{repo}] the tick timer would not arm: {GH.last(err or out)}")

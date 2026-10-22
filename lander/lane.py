@@ -3,7 +3,8 @@ merge (one at a time) and its tree proof.
 
     lander queue <repo|h--t> <pr> [--chat C --ts T --who W --approved-by UID --no-start --light]
     lander queue --task <repo> <row>
-    lander lane <repo>          run the repo's lane in the foreground (what `queue` and `tick` start)
+    lander lane <repo>          run the repo's lane in the foreground (what `queue` and `tick` start), then arm
+                                the repo's tick (tick.rearm) for the holds it left
 
 QUEUE is the door (the old cc-land's cmd_queue). It checks the shape; for a member project (`<h>--<t>`) it refuses
 the workspace itself and needs the granted token, a repository the board row names under the owner's own account,
@@ -2070,7 +2071,9 @@ def queue_task(argv):
 def cmd_lane(argv):
     if len(argv) != 1 or not J.REPO_RE.fullmatch(argv[0]):
         return refuse("lane takes one repo name")
-    for ln in Lane(argv[0]).run():
+    from lander import tick   # tick imports this module
+    # a lane no tick ran inline (a lane switch's, `tick --detach`'s) arms the tick its holds wait for, as a tick does
+    for ln in Lane(argv[0]).run() + tick.rearm([argv[0]]):
         print(ln)
     return 0
 
