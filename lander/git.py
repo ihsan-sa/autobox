@@ -79,6 +79,11 @@ class GitError(Exception):
     """A git call that had to answer and did not."""
 
 
+class Unpinned(GitError):
+    """remote() found no pinned URL: only a `lander-self promote` clears it, so the hold tells the planning seat
+    (Lane.hold pin=, cards.pin_hold). Flagged by type, never by the words of a hold's reason, which a branch can write."""
+
+
 def git(root, *args, check=False, env=None, timeout=300, input=None) -> R:
     e = dict(os.environ, **env) if env else None
     try:
@@ -139,7 +144,7 @@ def rewritten(root, url) -> bool:
 def remote(root) -> str:
     url = remote_url(root)
     if not url:
-        raise GitError(f"the lander holds no remote URL for {root}; `lander-self promote` pins one")
+        raise Unpinned(f"the lander holds no remote URL for {root}; `lander-self promote` pins one")
     return url
 
 

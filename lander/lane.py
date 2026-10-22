@@ -875,7 +875,7 @@ class Lane:
                     self.laptop_down = time.time()   # it gave no answer: the box takes the next ones for a while
                 self.took(job, f, outs)
             except (UnitFault, G.GitError) as e:
-                self.hold(job, str(e), kind="box")
+                self.hold(job, str(e), kind="box", pin=isinstance(e, G.Unpinned))
         if done:
             self.wake()
 
@@ -1010,13 +1010,14 @@ class Lane:
         try:
             steps[job.state](job)
         except (UnitFault, G.GitError) as e:
-            self.hold(job, str(e), kind="box")
+            self.hold(job, str(e), kind="box", pin=isinstance(e, G.Unpinned))
 
     # -- leaving the lane --
-    def hold(self, job, why, kind="pr", secs=HOLD_SECS, until=0, then=None, deferred=False):
+    def hold(self, job, why, kind="pr", secs=HOLD_SECS, until=0, then=None, deferred=False, pin=False):
         """kind "pr": a push mends it (a new queue starts fresh); "box": time mends it (a new queue joins it).
         until: an epoch to wait for instead of secs (a usage limit's reset). then: the state to go back to (default
-        the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`."""
+        the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`. pin: only a
+        pin clears it (G.Unpinned), so the planning seat is told (cards.pin_hold)."""
         if job.state == T.HELD:
             return
         # perms, 10-13: "after a handback or a main-red hold, the job's other checks keep running for nothing"
@@ -1034,6 +1035,9 @@ class Lane:
             job.extra["deferred"] = True
         J.move(job, T.HELD, why)
         self.say(f"PR #{job.pr} held: {why}")
+        if pin:
+            with contextlib.suppress(UnitFault):
+                self.call("cards", "pin_hold", job, why)
 
     def unhold(self, job):
         target, why = job.extra.get("held_from", T.QUEUED), "retry after hold"

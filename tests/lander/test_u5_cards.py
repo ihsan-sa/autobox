@@ -698,19 +698,66 @@ class QueuedCards(Stubbed):
             self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
         self.assertEqual(C.read_json(C._edits_path(), {})["until"], 1000.0 + C.EDIT_BACKOFF)
 
-    def test_a_card_cc_slack_will_not_edit_is_skipped_and_never_tried_again(self):
-        """#1188, #1272: "refusing — not a message this bot posted" was retried."""
-        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+    def test_a_card_cc_slack_will_not_edit_is_posted_afresh_and_later_edits_go_to_the_new_card(self):
+        """10-21: "refusing — not a message this bot posted" dropped a hold's card, and nobody heard of the hold."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
         self.ledger(7, Q, "1.7")
-        self.ledger(8, Q2, "1.8")
         self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
-        self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING), (8, Q2, T.QUEUED))))
-        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7"])
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.HELD))))
+        fresh = self.argvs("cc-slack post")[-1]
+        self.assertEqual(fresh[-3:], ["--id", f"land:demo:7:queued@{Q}#1000", "[demo] PR #7 is queued to land: "
+                                      "place 1 in the lane, held, it is tried again later."])
+        self.assertEqual(fresh[2:4], ["--route", "[demo] PR #7 queued"])
+        d = os.path.join(os.environ["CC_SLACK_DIR"], "sent")
+        with open(os.path.join(d, f"land:demo:7:queued@{Q}#1000.json"), "w") as f:
+            json.dump({"chat": "C1", "ts": "2.7", "accepted": True}, f)
         self.answer({})
-        C.positions("demo", self.jobs((7, Q, T.MERGEABLE), (8, Q2, T.CHECKING)))
-        C.positions("demo", self.jobs((8, Q2, T.CHECKING)))   # PR #7 leaves: no last edit either
-        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "1.8", "1.8"])   # PR #8's still go
-        self.assertEqual(list(C.read_json(C._queued_path("demo"), {})), [f"land:demo:8:queued@{Q2}"])
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "2.7"])
+
+    def test_a_last_edit_cc_slack_will_not_make_is_posted_where_the_card_went(self):
+        """Opus read of #1827: the job leaves while cc-slack refuses the edit, and the last words go to `to`."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.DEPLOY_PENDING))))
+        self.assertEqual(self.argvs("cc-slack post")[-1], [
+            "cc-slack", "post", "--route", "[demo] PR #7 queued", "--id", f"land:demo:7:queued@{Q}#1000",
+            "[demo] PR #7 has left the landing queue: merged."])
+        self.assertEqual(C.read_json(C._queued_path("demo"), {}), {})
+
+    def test_a_card_gets_one_repost_and_one_refused_too_is_never_tried_again(self):
+        """Opus read of #1827: a lasting refusal posted a new card on every change."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            C.positions("demo", self.jobs((7, Q, T.HELD)))
+        d = os.path.join(os.environ["CC_SLACK_DIR"], "sent")
+        with open(os.path.join(d, f"land:demo:7:queued@{Q}#1000.json"), "w") as f:
+            json.dump({"chat": "C1", "ts": "2.7", "accepted": True}, f)
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))      # the repost is refused too: marked, no third card
+        C.positions("demo", self.jobs((7, Q, T.CHECKING)))    # never tried again
+        C.positions("demo", self.jobs())                      # nor when it leaves
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "2.7"])
+        self.assertEqual(len(self.argvs("cc-slack post")), 2)
+
+    def test_a_repost_takes_a_slot_under_the_cap_and_waits_for_a_later_pass(self):
+        """Opus read of #1827: _repost went outside the per-minute cap."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: refusing — not a message this bot posted"]})
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.HELD))))   # the edit took the minute's slot
+        self.assertEqual(len(self.argvs("cc-slack post")), 1)
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1061.0):
+            C.positions("demo", self.jobs((7, Q, T.HELD)))
+        self.assertEqual(len(self.argvs("cc-slack post")), 1)   # the next minute's slot went to the edit again
+        with mock.patch.object(C.time, "time", return_value=1122.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.HELD))))
+        self.assertEqual(self.argvs("cc-slack post")[-1][5], f"land:demo:7:queued@{Q}#1122")
 
     def test_new_cards_are_posted_under_the_same_cap_and_a_held_post_goes_on_a_later_pass(self):
         """Opus read of #1275: posts skipped the per-minute cap that edits kept."""
@@ -972,6 +1019,40 @@ class QueuedCards(Stubbed):
         self.assertEqual(self.argvs("cc-notify"), [])
         self.assertEqual(self.flag([held, rest, young], 4201), ["[demo] PR #8 has waited 60 min in the queue; the "
                                                                 "planning seat is told"])
+
+
+class PinHold(Stubbed):
+    """Brief 10-21: a hold only a pin clears files a request to the planning seat naming the fix, once per repo and
+    head, not every retry."""
+
+    def test_a_pin_hold_files_one_request_per_head(self):
+        why = "the lander holds no remote URL for /x; `lander-self promote` pins one"
+        job = T.Job(repo="demo", pr=8, head="a" * 40, extra={"queued_at": Q})
+        self.assertTrue(C.pin_hold(job, why))
+        self.assertFalse(C.pin_hold(job, why))                           # the retry's hold says nothing again
+        sent = self.argvs("cc-notify")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1:4], ["--ask", "--id", f"land:demo:pin@{'a' * 12}"])
+        self.assertIn("PR #8", sent[0][-1])
+        self.assertIn("lander-self promote", sent[0][-1])
+        job.head = "b" * 40
+        self.assertTrue(C.pin_hold(job, why))                            # a new head is said once more
+
+    def test_the_reason_goes_in_without_control_characters_and_cut(self):
+        """Security read of #1827: a reason can carry text the branch wrote."""
+        job = T.Job(repo="demo", pr=8, head="a" * 40, extra={"queued_at": Q})
+        C.pin_hold(job, "line\nbreak\x1b[31m" + "x" * 400)
+        text = self.argvs("cc-notify")[0][-1]
+        self.assertIn("line break [31m", text)
+        self.assertNotIn("x" * 200, text)
+        self.assertIn("x" * 180, text)
+
+    def test_a_refused_pin_request_is_tried_at_the_next_hold(self):
+        job = T.Job(repo="demo", pr=8, head="a" * 40, extra={"queued_at": Q})
+        self.answer({"cc-notify": [1, "no"]})
+        self.assertFalse(C.pin_hold(job, "needs a `lander-self promote`"))
+        self.answer({})
+        self.assertTrue(C.pin_hold(job, "needs a `lander-self promote`"))
 
 
 class MainRedAlert(Stubbed):

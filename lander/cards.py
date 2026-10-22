@@ -3,8 +3,9 @@
 A CARD is one message about one job. `positions(repo, jobs)` gives each job in the queue one card saying where it
 stands (`place <i> in the lane`, its stage) and edits it when its place or stage changes, then once more when it leaves;
 those posts and edits are capped box-wide (EDITS_PER_MIN), wait out a Slack 429 (Retry-After, at most
-EDIT_BACKOFF_MAX), and skip a card cc-slack will not edit; a last edit held when its lane ended goes on a later tick
-(left_held, tick.retry_cards);
+EDIT_BACKOFF_MAX), and a card cc-slack will not edit is posted afresh; a last edit held when its lane ended goes on a
+later tick (left_held, tick.retry_cards); `pin_hold(job, why)` files one planner request for a hold only a
+`lander-self promote` clears;
 `waited(job, secs, now)` files one planner request (another box repo's goes into its own seat) when the tick finds
 the oldest due job past WAIT_FLAG_SECS, at most one per repo (per member, across its lanes) per WAIT_FLAG_SECS;
 `held(repo, now)` notes a box hold, from which that age counts.
@@ -445,7 +446,6 @@ def ledger(pid):
 EDITS_PER_MIN = 12    # queued-card posts and edits a minute, box-wide across every lane (10-13: ~10/min drew 429s)
 EDIT_BACKOFF = 60     # seconds every card edit waits after a 429 that names no Retry-After
 EDIT_BACKOFF_MAX = 300   # a longer Retry-After is cut to this: a misread number never silences the cards for hours
-NOT_OURS = "not a message this bot posted"
 
 
 def _edits_path():
@@ -504,8 +504,9 @@ def _back_off(out, now):
 def _edit(pid, text, repo, pr):
     """Rewrite the card posted under `pid`. -> "done" when it is edited or has nothing to edit (not out yet: pending a
     retry, or held by cc-slack's engagement gate); "later" when the cap or a 429's back-off holds it, so the caller
-    keeps it for the next pass; "skip" when cc-slack refuses it as not this bot's (#1188, #1272), which no retry
-    changes, so it is never tried again; any other failure is logged and not retried."""
+    keeps it for the next pass; "post" when cc-slack would not edit it (refused as not this bot's, as every card in a
+    track's thread was until 10-21, or any other failure), so the caller posts the words as a fresh card rather than
+    drop them (10-21: a hold's card was never edited, and nobody heard of a PR held 4 h)."""
     chat, ts = ledger(pid)
     if not ts:
         return "done"
@@ -516,14 +517,22 @@ def _edit(pid, text, repo, pr):
     if rc == 0:
         return "done"
     why = out.strip()[-120:].replace("\n", " ")
-    if NOT_OURS in out:
-        log("unsaid", repo, pr, id=pid, edit="skipped", why=why)
-        return "skip"
     if "Error 429" in out or "ratelimited" in out:   # cc-slack edit prints "HTTP Error 429: Too Many Requests"
         log("unsaid", repo, pr, id=pid, edit="later", backoff=_back_off(out, now), why=why)
         return "later"
-    log("unsaid", repo, pr, id=pid, edit="yes", why=why)
-    return "done"
+    log("unsaid", repo, pr, id=pid, edit="post", why=why)
+    return "post"
+
+
+def _repost(pid, text, to, repo, pr):
+    """Post `text` as a fresh card in place of the one under `pid` that would not be edited, under a new id
+    (`<pid>#<secs>`), into `to`, the card's queued_where. It takes a slot under the same cap as an edit. -> the new
+    id, which later edits go to, or "" when the cap holds it for a later pass."""
+    if not _edit_slot(time.time()):
+        return ""
+    new = f"{pid.partition('#')[0]}#{int(time.time())}"
+    say(new, [slack(), "post", *to, "--id", new, text], repo, pr)
+    return new
 
 
 def positions(repo, jobs):
@@ -533,10 +542,12 @@ def positions(repo, jobs):
     `land:<repo>:<pr>:queued@<queued_at>` (queued_where) and edited in place (`cc-slack edit`) only when its place or
     stage changes (10-13: a card that also counted the lane was edited for every PR that joined behind it, and the
     edits drew Slack 429s). A card whose job left the queue gets one last edit saying how, and its record goes.
-    Edits go through _edit: one the box-wide cap or a 429 holds stays unrecorded and goes on a later pass; a card
-    cc-slack refuses as not this bot's is marked and never edited again. A new card's post takes a slot under the
-    same cap and back-off (Opus read of #1275: posts skipped the cap), and one held is posted on a later pass. A
-    last edit held keeps its words (`left`) in the record; a lane that ends with one held leaves it to the tick
+    Edits go through _edit: one the box-wide cap or a 429 holds stays unrecorded and goes on a later pass; one cc-slack
+    will not make is posted as a fresh card (_repost) where the record says the card went (`to`), and the record keeps
+    the new card's id (`card`) for the next edit. A card gets one repost, under the same cap: one whose repost is refused
+    too is marked and never edited again, so a lasting refusal never posts a card a change. A new card's post takes a
+    slot under the same cap and back-off (Opus read of #1275: posts skipped the cap), and one held is posted on a
+    later pass. A last edit held keeps its words (`left`) in the record; a lane that ends with one held leaves it to the tick
     (left_held). cards/queued-<repo>.json keeps each card's
     place and stage, so a queue that has not moved sends nothing; it is read and written under the repo's
     own cards lock (lanes/<repo>.cards), so a lane's cards thread still running after its lane lock went (CARDS_WAIT
@@ -566,24 +577,34 @@ def _positions(repo, jobs, J):
             continue
         text = (f"[{job.repo}] PR #{job.pr} is queued to land: place {i} in the lane, "
                 f"{STAGE_WORDS.get(job.state, job.state)}.")
+        card, to = (last or {}).get("card") or pid, queued_where(job)
         if last:
-            how = "skip" if last.get("noedit") else _edit(pid, text, job.repo, job.pr)
+            how = "skip" if last.get("noedit") else _edit(card, text, job.repo, job.pr)
+            if how == "post" and card != pid:   # its repost would not be edited either: one fresh card, not one a change
+                how = "skip"
+            elif how == "post":
+                card = _repost(card, text, to, job.repo, job.pr)
+                how = "post" if card else "later"
         else:
             how = "post" if _edit_slot(time.time()) else "later"
         if how == "later":
             later = True
             continue
-        if how == "post":
-            post(job, "queued", text, queued_where(job))
+        if how == "post" and not last:
+            post(job, "queued", text, to)
         said[pid], moved = {"repo": job.repo, "pr": job.pr, "place": i, "state": job.state,
-                            **({"noedit": True} if how == "skip" else {})}, True
+                            "card": card, "to": to, **({"noedit": True} if how == "skip" else {})}, True
     state_of = {producer_id(j, "queued"): j.state for j in jobs}
     for pid, last in list(said.items()):
         if last.get("repo") != repo or pid in mine:
             continue
         left = LEFT_WORDS.get(state_of.get(pid)) or last.get("left") or "out of the lane"
-        if not last.get("noedit") and _edit(pid, f"[{repo}] PR #{last.get('pr')} has left the landing queue: {left}.",
-                                            repo, last.get("pr")) == "later":
+        text = f"[{repo}] PR #{last.get('pr')} has left the landing queue: {left}."
+        card = last.get("card") or pid
+        how = "skip" if last.get("noedit") else _edit(card, text, repo, last.get("pr"))
+        if how == "post" and last.get("to") and card == pid and not _repost(card, text, last["to"], repo, last.get("pr")):
+            how = "later"   # one repost a card, as above, under the cap
+        if how == "later":
             later, moved = True, moved or last.get("left") != left
             last["left"] = left   # the job may be gone from the list by the next pass
             continue
@@ -685,6 +706,29 @@ def main_red(job, secs, now=None):
         d = read_json(_waited_path(), {}) or {}
         d.setdefault(key, {})["said"] = t
         write_json(_waited_path(), d)
+    return True
+
+
+def pin_hold(job, why):
+    """A HOLD ONLY A PIN CLEARS REACHES THE PLANNING SEAT, as main_red does (10-21: hive-lite PR 8 sat held 4 h on
+    "the lander holds no remote URL … `lander-self promote` pins one", and nobody heard). Lane.hold asks it for a hold
+    flagged where it was raised (G.Unpinned), never for one whose words merely say so: a hold's reason can carry text
+    the branch wrote (a CI context, a path), so `why` goes in stripped of control characters and cut to 200; it files one planner request (`cc-notify --ask` from box_hand) naming the fix, once per
+    repo and head (brief: "once per repo and head, not every retry"): its id `land:<repo>:pin@<head>` goes into
+    cards/sent.json once cc-notify took it, so the hold every retry makes again is not said again; one refused is
+    tried at the next hold. -> True when it was said now."""
+    pid = f"land:{job.repo}:pin@{(job.head or '')[:12]}"
+    if pid in (read_json(_sent_path(), []) or []):
+        return False
+    why = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", why)[:200]
+    text = (f"[{job.repo}] PR #{job.pr} is held until the lander is pinned for {job.repo}: {why}. The fix is a "
+            f"`lander-self promote` that pins it; the lane tries the PR again on its own after that.")
+    rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", pid, "-t", f"{job.repo} landing", text],
+               timeout=60, **box_hand())
+    log("pin-hold-alert", job.repo, job.pr, rc=rc)
+    if rc != 0:
+        return False
+    mark_sent(pid)
     return True
 
 

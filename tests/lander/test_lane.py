@@ -5053,6 +5053,25 @@ class Starving(Fixture):
         self.assertEqual(self.job(1).extra.get("queued_at"), requeued[0])   # in the stamp it ended under
         self.assertEqual(sorted(self.merged_order()), [1, 2])           # and the re-queue had its turn
 
+    def test_only_a_hold_a_pin_clears_asks_the_cards_unit_to_tell_the_planning_seat(self):
+        """10-21: hive-lite PR 8 held 4 h on a missing pin, and nobody heard. The hold is flagged where git raised it
+        (G.Unpinned), never by its words: a CI context a branch names after them wakes nobody (security read of #1827)."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        cards = Rec()
+        lane = L.Lane("demo", self.units(cards=cards))
+        lane.hold(self.job(1), "check `no remote URL — run lander-self promote` is red")
+        self.assertEqual(cards.calls, [])
+        job = self.job(1)
+        job.state = T.QUEUED
+        why = "the lander holds no remote URL for /r; `lander-self promote` pins one"
+        with mock.patch.object(lane, "queued", side_effect=G.Unpinned(why)):
+            lane.step(job)
+        self.assertEqual(job.state, T.HELD)
+        self.assertEqual([(c[0], c[2]) for c in cards.calls], [("pin_hold", why)])
+
     def test_a_hold_leaves_the_queued_mark_and_a_requeue_moves_it(self):
         """queued_mark is what only a re-queue or a new head changes. A hold (reap's took holds a job whose check was
         red on main, or could not run; a turn holds a draft) appends to the job's history but is no re-queue: a mark

@@ -3767,6 +3767,36 @@ def run_selfcheck():
         globals()["api"] = real_api
     check("own_message: the bot's SIGNED posts (bot_id, no user) are its own — edit/unsay work on them; another bot's do not — M6",
           mine6 and not theirs6)
+    def om_thread(method, token, **kw):   # history holds only the parent (100.1); the reply 500.9 is in replies
+        if method == "conversations.history":
+            return {"messages": [{"ts": "100.1", "bot_id": "B01"}]}
+        if method == "conversations.replies":
+            return {"messages": [{"ts": "100.1", "bot_id": "B01"}, {"ts": "500.9", "bot_id": "B01"}]}
+        return {"user_id": "UBOT", "bot_id": "B01"}
+    try:
+        globals()["api"] = om_thread
+        reply6 = own_message({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "500.9")
+        gone6 = own_message({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "500.8")
+    finally:
+        globals()["api"] = real_api
+    check("own_message: the bot's reply in a thread (absent from conversations.history) is its own; a ts in neither is not — 10-21",
+          reply6 and not gone6)
+    def om_ws(method, token, **kw):   # a member workspace's bot is B02; auth.test on the default token says B01
+        if method == "conversations.history":
+            return {"messages": [{"ts": "100.1", "bot_id": "B02"}]}
+        return {"user_id": "UBOT", "bot_id": "B02" if token == "xoxb-ws2" else "B01"}
+    saved_ws, real_cw = dict(WS), globals()["chat_workspace"]
+    try:
+        globals()["api"] = om_ws
+        globals()["chat_workspace"] = lambda c: "ws2" if c == "C2" else ""
+        WS.update(bot="xoxb-test", extra={"ws2": {"bot": "xoxb-ws2", "member": "m"}})
+        member6 = own_message({"SLACK_BOT_TOKEN": "xoxb-test"}, "C2", "100.1")
+        default6 = own_message({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "100.1")
+    finally:
+        globals()["api"], globals()["chat_workspace"] = real_api, real_cw
+        WS.clear(); WS.update(saved_ws)
+    check("own_message: a member workspace's post is matched against that workspace's bot (auth.test on its token) — #1827",
+          member6 and not default6)
     dmM7 = Daemon(use_slack=False)
     got7 = []; dmM7.deliver = lambda target, payload, autostart=True, alias=None: got7.append(payload) or "delivered"
     a7, b7 = socket.socketpair()
