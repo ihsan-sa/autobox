@@ -3542,6 +3542,10 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   # is a path that does not exist, so a box that has the real one still runs the cases above it as written
   run(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="${2:-$fh/refresher}" WORKER_CLAUDE_CREDENTIALS="$1" CC_SANDBOX_TEST_REFRESH_FLAG="${RF:-$fh/no-flag}" \
     CC_SANDBOX_TEST_REFRESH_UID="${RU:-0}" WORKER_CLAUDE_LOGIN_COPY="${RC:-}" "$SELF" r "${3:-t}" -- sh -c "$probe" 2>&1; }
+  # holders/proxies of the store's lock, as "n/m": -ef is a builtin stat of each fd, so a box with tens of thousands of
+  # fds open costs a second, not the readlink fork per fd that took ~110 s (10-22); a process gone mid-scan is skipped
+  lockers(){ local p f c n=0 m=0; for p in /proc/[0-9]*; do for f in "$p"/fd/*; do [ "$f" -ef "$1" ] || continue
+    n=$((n + 1)); c=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline"); [[ "$c" == *' serve --socket '* ]] && m=$((m + 1)); break; done; done; echo "$n/$m"; }
   rwsrc(){ local k=0; while [ "$k" -lt "${#B[@]}" ]; do   # the host paths a bwrap argument list binds READ-WRITE, one a line
     case "${B[k]}" in --bind|--bind-try) printf '%s\n' "${B[k+1]}"; k=$((k+3));; --bind-fd) readlink "/proc/self/fd/${B[k+1]}"; k=$((k+3));; *) k=$((k+1));; esac; done; }
   out=$(run "$wf")
@@ -3610,12 +3614,11 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   # worker runs the lock's holders are read from /proc, the egress proxy alone, as the host refresher's live case does.
   # The sleep still running is what lets the case fail; it is killed after, since it holds the refresh lock too.
   printf '#!/bin/sh\nsleep 300 </dev/null >/dev/null 2>&1 &\necho $! > %s/stray\nexec %s "$@"\n' "$fh" "$fh/refresher" > "$fh/strayrefresher"; chmod +x "$fh/strayrefresher"
-  local sd="$fh/.cc/state/r/t" spid sk=0 shp sh; rm -f "$sd/seen" "$sd/go"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
+  local sd="$fh/.cc/state/r/t" spid sk=0 sh; rm -f "$sd/seen" "$sd/go"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
   probe='echo up > '"$sd/seen"'; i=0; while [ ! -e '"$sd/go"' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; echo tok=$(jq -r ".claudeAiOauth.accessToken" ~/.claude/.credentials.json)' \
     run "$wf" "$fh/strayrefresher" > "$fh/stray.out" & spid=$!
   while [ ! -s "$sd/seen" ] && [ $sk -lt 600 ] && kill -0 "$spid" 2>/dev/null; do sleep 0.1; sk=$((sk + 1)); done
-  shp=$(for f in /proc/[0-9]*/fd/*; do [ "$(readlink "$f" 2>/dev/null)" = "$fh/.cc/sandbox/r/t/refstore.lock" ] && echo "${f%/fd/*}"; done | sort -u)
-  sh="$(grep -c . <<<"$shp")/$(for p in $shp; do tr '\0' ' ' < "$p/cmdline"; echo; done | grep -c ' serve --socket ')"
+  sh=$(lockers "$fh/.cc/sandbox/r/t/refstore.lock")
   sh="$sh/$(kill -0 "$(cat "$fh/stray" 2>/dev/null)" 2>/dev/null && echo alive || echo gone)"
   : > "$sd/go"; wait "$spid"; out=$(cat "$fh/stray.out"); kill "$(cat "$fh/stray" 2>/dev/null)" 2>/dev/null
   t "workers' login: a child the refresh leaves running never holds the store's lock — the egress proxy alone does while the worker runs" \
@@ -3714,8 +3717,7 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
     echo w=$( (: > ~/.cc/worker-login/x) 2>/dev/null && echo wrote || echo ro); echo ls=$(ls -A ~/.cc/worker-login | paste -sd, -)'
   fresh; rm -f "$fh/.cc/state/r/t/seen"; probe="$lp" RF="$fl" RU="$me" RC="$cf" run "$wf" > "$fh/live.out" & local lpid=$! k=0
   while [ ! -s "$fh/.cc/state/r/t/seen" ] && [ $k -lt 600 ] && kill -0 "$lpid" 2>/dev/null; do sleep 0.1; k=$((k + 1)); done
-  local lk="$fh/.cc/sandbox/r/t/refstore.lock" hp; hp=$(for f in /proc/[0-9]*/fd/*; do [ "$(readlink "$f" 2>/dev/null)" = "$lk" ] && echo "${f%/fd/*}"; done | sort -u)
-  echo "$(grep -c . <<<"$hp")/$(for p in $hp; do tr '\0' ' ' < "$p/cmdline"; echo; done | grep -c ' serve --socket ')" > "$fh/live.holders"
+  lockers "$fh/.cc/sandbox/r/t/refstore.lock" > "$fh/live.holders"
   jq '.claudeAiOauth.accessToken = "copy-renewed" | .claudeAiOauth.refreshToken = "renewed-refresh"' "$cf" > "$fh/dl/.n" && chmod 640 "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; wait "$lpid"; out=$(cat "$fh/live.out")
   t "host refresher: a renewal while the worker runs → it reads the new token, still with no refresh token, though the renewed copy carries one" "$(g tok)/$(g tok2)/$(g rt)" copy-access/copy-renewed/false
   t "host refresher: …and the copy's directory is ro inside, holding the copy and nothing of the host's beside it" "$(g w)/$(g ls)" ro/claude-login.json
