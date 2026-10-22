@@ -3455,5 +3455,13 @@ def stat_mode(path):
     return os.stat(path).st_mode & 0o777
 
 
+class JobOfSaysWhy(unittest.TestCase):
+    def test_a_pr_it_cannot_read_names_gh_s_reason(self):
+        """lander record refused a LAND with 'cannot read PR #1835', hiding the spent quota gh.pr_facts had named."""
+        why = "GitHub's API rate limit for this login is spent until 16:48Z"
+        with mock.patch.object(R, "root_of", return_value="/x"), mock.patch.object(GH, "pr_facts", return_value=(None, why)):
+            self.assertEqual(R._job_of("demo", 1835), (None, f"cannot read PR #1835 of demo from GitHub: {why}"))
+
+
 if __name__ == "__main__":
     unittest.main()

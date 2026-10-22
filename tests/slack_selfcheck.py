@@ -12283,6 +12283,24 @@ def run_selfcheck():
         check("mail: …while a sender the key does not name is handed with its words, as before",
               len(thanded) == 1 and "SUBJECT-WORDS" in thanded[0][1] and "BODY-WORDS" in thanded[0][1]
               and "text_path" not in thanded[0][2])
+        thanded.clear()
+        # 2026-10-22: a forwarded Piazza digest posted the owner's secret links into two channels
+        digest = ("Piazza digest https://piazza.com/class/c1/post/9?cid=9&token=SEK1 "
+                  "https://piazza.com/remove/SEK2 https://piazza.com/link_accounts/SEK3 "
+                  "https://piazza.com/unsubscribe/SEK4 and https://example.com/docs/a?page=2")
+        mail_write("T5", to=["mem@box.example"], text=digest)
+        with open(f"{mdir}/inbox/T5/message.json", "rb") as fh:
+            stored = fh.read()
+        dmT.take_mail("T5")
+        tseen = " ".join(h[1] for h in thanded) + " ".join(str(s) for s in tsaid)
+        with open(f"{mdir}/inbox/T5/message.json", "rb") as fh:
+            after = fh.read()
+        check("mail: a digest's secret links (token=, remove/, link_accounts/, unsubscribe/) reach Slack blanked, "
+              "with the host and path kept",
+              len(thanded) == 1 and not any(f"SEK{i}" in tseen for i in range(1, 5))
+              and "https://piazza.com/remove/[redacted]" in thanded[0][1] and "&token=[redacted]" in thanded[0][1])
+        check("mail: …an ordinary link posts unchanged", "https://example.com/docs/a?page=2" in thanded[0][1])
+        check("mail: …and the stored copy is byte-identical, secrets and all", after == stored and b"SEK4" in after)
         tsaid.clear(); thanded.clear()
         dmT.cfg["MAIL_NO_TEXT"] = ""
         dmT.cfg["MAIL_PIN"] = "friend@allowed.example=#box"

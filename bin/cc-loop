@@ -85,7 +85,7 @@
 # design (a push, gh, the board, cc-green, the masked checkout, `cc`) on a head this loop has just pushed to origin is
 # answered in the journal — a `- cc-loop:` line and `STATUS: RESUMED` — and the loop carries on, once per run; the worker
 # prompt says the same up front (sandbox_block). Any other BLOCKED, or that one again, stops as below.
-# Exit: 0 done, or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
+# Exit: 0 done, or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed (a spent GitHub quota it names is waited out and retried first, at most 3 rounds of an hour each): no PR, board `blocked` (the session hears it)
 #     | 5 errors | 6 a --no-extend bound reached with nothing committed | 10 every model on the chain refused
 #     (7 and 9 are retired: a capped iteration and a runaway no longer stop a loop)
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
@@ -537,6 +537,19 @@ head_pushed(){   # → 0 when the worktree's HEAD IS origin's track/<track>, the
   # an ancestor: a branch someone else moved on origin is cc-checkpoint's own refused-lease BLOCKED, and stands.
   local h o; h=$(git -C "$WT" rev-parse -q --verify HEAD 2>/dev/null) || return 1
   o=$(git -C "$WT" rev-parse -q --verify "refs/remotes/origin/track/$track" 2>/dev/null) || return 1; [ "$h" = "$o" ]; }
+# A SPENT GITHUB QUOTA IS WAITED OUT, NOT STOPPED ON (raised-cc-done-gives-up-on-spent-rate-limit): four finished
+# workers ended "no PR created" at 16:4xZ on 2026-10-22 because the box login's REST hour was spent, and each sat until
+# a seat ran cc done by hand. cc done's failure already names the reset (gh_said), so the loop sleeps past it and asks again.
+quota_wait(){   # $1 cc done's output → 0 once past the reset its final cc: line names; 1 when it names none, or after 3 rounds
+  # BOUNDED AND STOPPABLE (security read of #1871): at most 3 rounds of at most GitHub's hour and a minute each, then the
+  # caller's stop 4 tells a seat; the sleep runs in the background so the TERM/HUP traps fire during it, not after.
+  local hm s; qrounds=$((${qrounds:-0} + 1)); [ "$qrounds" -le 3 ] || return 1
+  hm=$(grep '^cc: ' <<<"$1" | tail -1 | grep -o 'rate limit for this login is spent until [0-9][0-9]:[0-9][0-9]Z') || return 1
+  hm=${hm##* until }; s=$(( $(date -u -d "${hm%Z}" +%s) - $(date +%s) ))
+  [ "$s" -lt -43200 ] && s=$((s + 86400))   # the reset falls after midnight
+  [ "$s" -gt 0 ] || s=0; [ "$s" -le 3600 ] || s=3600
+  log "GitHub's quota is spent until $hm: cc done again after it"; "$BOARD" note "$repo" "$track" "finished; GitHub's quota is spent until $hm, so cc done runs again then" >/dev/null 2>&1
+  sleep $((s + 60)) & wait $!; }
 inside_boundary(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`: this loop runs inside a workspace's boundary
 complete_task(){   # → the completion receipt on stdout (the JSON delivery_end reads); the rest goes to $LOG
   # INSIDE A MEMBER WORKSPACE'S BOUNDARY there is no lander: ~/.cc/lander is not bound, so `cc-land queue --task`
@@ -2395,6 +2408,25 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
     stop 4 "finished, but opened no PR" "cc done failed: nowhere to push" ) >/dev/null 2>&1
   t 'inside a member boundary stop 4 asks nobody and files nothing: the host finishes it' \
     "$(wc -c < "$d/st.n")|$(grep -c "the stop is the host's" "$d/dt.log")" "0|1"
+  # A SPENT GITHUB QUOTA IS WAITED OUT (quota_wait): a cc done that names the reset sleeps past it; any other failure does not wait.
+  QWF=$(sed -n '/^quota_wait(){/,/^  sleep /p' "$0"); QWM="cc: open PR lookup failed: GitHub's API rate limit for this login is spent until"
+  qw(){ ( log(){ :; }; sleep(){ echo "$1"; }; BOARD=true; eval "$QWF"
+          quota_wait "$QWM $(date -u -d "@$(( $(date +%s) + $1 ))" +%H:%MZ) — no PR created"; echo "rc=$?" ); }
+  qs=$(qw 600 | head -1); t "a cc done that names the quota's reset sleeps until a minute past it" "$([ "$qs" -gt 590 ] && [ "$qs" -le 660 ] && echo ok)" ok
+  t '…a reset a minute gone sleeps just the minute' "$(qw -90 | tr '\n' ' ')" "60 rc=0 "
+  t '…and any other cc done failure does not wait' "$( ( log(){ :; }; sleep(){ echo slept; }; eval "$QWF"; quota_wait "cc: open PR lookup failed: HTTP 502"; echo "rc=$?" ) )" "rc=1"
+  t '…nor one whose final cc: line is another failure, though a reset is named earlier' "$( ( log(){ :; }; sleep(){ echo slept; }; eval "$QWF"
+    quota_wait "$(printf '%s\n' "${QWM#cc: } 12:00Z" "cc: push failed: HTTP 502")"; echo "rc=$?" ) )" "rc=1"
+  # now is faked (date +%s) so the clock the suite runs at does not matter
+  qn(){ ( log(){ :; }; sleep(){ echo "$1"; }; date(){ if [ "$1" = +%s ]; then command date -u -d "$QN" +%s; else command date "$@"; fi; }
+          BOARD=true; eval "$QWF"; for r in "$@"; do quota_wait "$QWM $r — no PR created"; echo "rc=$?"; done ) | tr '\n' ' '; }
+  t '…a reset past midnight is the next day, not a day gone' "$(QN=23:55 qn 00:10Z)" "960 rc=0 "
+  t '…a reset hours off is clamped to an hour and a minute' "$(QN=12:00 qn 20:00Z)" "3660 rc=0 "
+  t '…and after 3 rounds it stops waiting, so stop 4 tells a seat' "$(QN=12:00 qn 12:00Z 12:00Z 12:00Z 12:00Z)" "60 rc=0 60 rc=0 60 rc=0 rc=1 "
+  ( set -m; trap 'echo trapped > "$d/qw.t"; exit 0' TERM; log(){ :; }; date(){ if [ "$1" = +%s ]; then command date -u -d 12:00 +%s; else command date "$@"; fi; }
+    BOARD=true; eval "$QWF"; quota_wait "$QWM 12:00Z"; echo slept > "$d/qw.t" ) >/dev/null 2>&1 & qp=$!
+  qt0=$(date +%s); sleep 1; kill -TERM "$qp"; wait "$qp"
+  t '…and a TERM during the wait is handled then, not after the sleep' "$(cat "$d/qw.t")|$(( $(date +%s) - qt0 < 10 ))" "trapped|1"
   # A SIGNAL NEVER ENDS THE LOOP SILENTLY (raised-a-killed-iteration-ends-its-loop-silently). Kept: TERM while an iteration
   # runs aborts that iteration and the loop goes on. Reported: HUP, or TERM between iterations, ends it through stop().
   # Suppressed: the stop() when `cc` holds the track's lock, re-dispatching over this loop.
@@ -2779,7 +2811,8 @@ while [ $i -lt "$MAXI" ]; do
       log "DONE"
       # the command that finishes it by hand. Inside a member's boundary there is no lander and nothing to push to
       # but the workspace's origin, so it is the HOST's `cc done` (review of #965), never one typed in there.
-      rec=$(complete_task); retry="cc-land queue --task $repo $track"; redo="cc done $repo $track"
+      rec=$(complete_task); while [ "$(delivery_end "$rec")" = failed ] && quota_wait "cc: $(jq -r '[.errors[]?.message] | last // ""' <<<"$rec")"; do rec=$(complete_task); done
+      retry="cc-land queue --task $repo $track"; redo="cc done $repo $track"
       inside_boundary && { retry="cc done $repo $track on the host"; redo=$retry; }
       printf '%s\n' "$rec" >> "$LOG"
       case "$(delivery_end "$rec")" in
@@ -2795,7 +2828,8 @@ while [ $i -lt "$MAXI" ]; do
       done_card "$(jq -r '.pr_url // ""' <<<"$rec")" "$(jq -r '.landing.message // ""' <<<"$rec")"
       exit 0
     else
-      log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
+      log "DONE"   # dout captured, never `| tail -1`: the pipe dropped the status
+      while dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?; [ "$drc" != 0 ] && [ "$drc" != 7 ] && quota_wait "$dout"; do :; done
       printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
       # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
       # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).

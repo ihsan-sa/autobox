@@ -112,7 +112,8 @@ autocompletes, so `move <#C0123|notes>` is that same form as it arrives from a p
 THE BODY, WHICHEVER PART CARRIED IT. receiver.py stores a text/plain body as `text` and an inline text/html one
 as `html`, both as they were written, and a mail from a client that sends only HTML has nothing in the first.
 body_text() is the one place that answers "the body, as text" for both: `text` as it arrived, or the HTML with
-its tags stripped. Nothing renders, opens or fetches the HTML — here or anywhere in this door.
+its tags stripped. Nothing renders, opens or fetches the HTML — here or anywhere in this door. It also blanks
+the secret part of a link (redact_links); the stored copy keeps it, for the lessons ingest that reads the store.
 """
 import email.utils
 import fcntl
@@ -666,12 +667,23 @@ def html_links(html):
     return [u for u in (unescape(m.group(1).strip("\"'")).strip() for m in HTML_HREF.finditer(html or "")) if u]
 
 
+# A link's secret part: what follows a Piazza-style remove/, link_accounts/ or unsubscribe/ path, and the value of
+# any query parameter named like a token or key. On 2026-10-22 a forwarded digest posted the owner's own ones into
+# two channels. The host and the rest of the path stay, so the link still says where it goes.
+SECRET_PATH = re.compile(r"(/(?:remove|link_accounts|unsubscribe)/)[^\s<>\"'?#|]+", re.I)
+SECRET_PARAM = re.compile(r"([?&][\w.-]*(?:token|key)[\w.-]*=)[^\s<>\"'&#|]+", re.I)
+
+
+def redact_links(s):
+    return SECRET_PARAM.sub(r"\1[redacted]", SECRET_PATH.sub(r"\1[redacted]", s))
+
+
 def body_text(msg):
-    """The mail's body as text, whichever part carried it: `text` exactly as it arrived, or, for a mail that has
-    none, the stripped derivation of `html` above. One place, so the mirror line, the session's copy of the mail
-    and the vetting read all see the same body."""
+    """The mail's body as text, whichever part carried it: `text` as it arrived, or, for a mail that has
+    none, the stripped derivation of `html` above, with its secret links blanked (redact_links). One place, so the
+    mirror line, the session's copy of the mail and the vetting read all see the same body."""
     t = msg.get("text") or ""
-    return t if t.strip() else html_text(msg.get("html") or "")
+    return redact_links(t if t.strip() else html_text(msg.get("html") or ""))
 
 
 # ---------------------------------------------------------------- the mirror line

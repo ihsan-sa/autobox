@@ -2095,9 +2095,9 @@ def _job_of(repo, pr):
     """A Job for a PR as GitHub has it now: head, base, digest. -> (job, facts) or (None, why)."""
     job = T.Job(repo=repo, pr=pr)
     root = root_of(job)
-    facts = pr_view(root, pr, "headRefOid,baseRefName,comments,state,files,headRefName")
-    if not facts:
-        return None, f"cannot read PR #{pr} of {repo} from GitHub"
+    facts, why = GH.pr_facts(root, pr, "headRefOid,baseRefName,comments,state,files,headRefName")
+    if not facts:   # gh.pr_facts' own why: a spent quota names its reset (lander record hid it, 2026-10-22)
+        return None, f"cannot read PR #{pr} of {repo} from GitHub: {why}"
     base = facts.get("baseRefName") or "main"
     from lander import deploy as D
     from lander import git as G
