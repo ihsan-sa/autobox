@@ -9505,6 +9505,7 @@ def run_selfcheck():
         ran_esc_bob = ranMS[n_esc_trk:]
         # dispatch --say: a member seat's `cc <h> <track> --say` runs on the host, where --go reads the same windows and loops
         n_say = len(ranMS)
+        real_tm = track_missing; globals()["track_missing"] = lambda t: t != "alice/todo"   # the host's worktrees, faked
         r_say = ms_req({"dispatch": "alice/todo", "opts": ["--say", "--brief", "fix the PR"]})
         r_say_bob = ms_req({"dispatch": "bob/todo", "opts": ["--say", "--brief", "fix the PR"]})
         r_say_opt = ms_req({"dispatch": "alice/todo", "opts": ["--say", "--loop", "2", "--brief", "x"]})
@@ -9512,9 +9513,11 @@ def run_selfcheck():
         ran_say = ranMS[n_say:]
         # …and what reaches the prompt starts with the box's prefix, never a character the member chose, with no control characters
         n_say_tui = len(ranMS)
-        for t in ("!rm -rf ~", "#remember this", "/clear", "ok\x1b!id\x7f\nnext"):
+        for t in ("!rm -rf ~", "#remember this", "/clear", "ok\x1b!id\x7f\nnext", "a\x9b2Jb\x85c"):
             ms_req({"dispatch": "alice/todo", "opts": ["--say", "--brief", t]})
         ran_say_tui = [c[-1] for c in ranMS[n_say_tui:]]
+        n_say_none = len(ranMS); r_say_none = ms_req({"dispatch": "alice/nosuch", "opts": ["--say", "--brief", "hi"]})
+        ran_say_none = ranMS[n_say_none:]; globals()["track_missing"] = real_tm
         # escalate + notice: A TRACK'S OWN END LINE (a-finished-worker-reaches-its-thread). A member's DONE crossed as an
         # escalation on 2026-09-20 and reached the owner's DM, the project thread nothing. Its own fixture: alice/pna has a
         # thread (TRACKS), the upload is stubbed, and the file lives under the workspace's tree.
@@ -10329,7 +10332,10 @@ def run_selfcheck():
     check("MEMBER socket: dispatch --say text reaches the pane's prompt behind a fixed prefix with control characters gone, "
           "so a leading !, # or / (bash mode, memory, a slash command) or an ESC that clears the box never acts as the owner",
           ran_say_tui == ["[--say from alice] !rm -rf ~", "[--say from alice] #remember this", "[--say from alice] /clear",
-                          "[--say from alice] ok !id next"])
+                          "[--say from alice] ok !id next", "[--say from alice] a 2Jb c"])
+    check("MEMBER socket: dispatch --say to a track that doesn't exist is refused in one line and runs nothing, so cc's "
+          "ensure_track never creates a worktree and board row on the host for it",
+          r_say_none.get("ok") is False and ran_say_none == [] and "no track nosuch" in r_say_none.get("error", ""))
     check("SOCKET: exactly ONE recognised verb per request, on both sockets — a payload was authorised on the verb the "
           "scope check found and then executed on a second key beside it ({hello: alice, reply: D0…} posted into a DM, "
           "{hello: alice, dispatch: bob/todo} ran a worker in another workspace). Two verbs, or none, is refused whole "
