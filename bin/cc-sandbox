@@ -3569,10 +3569,15 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   # is a path that does not exist, so a box that has the real one still runs the cases above it as written
   run(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_CLAUDE="${2:-$fh/refresher}" WORKER_CLAUDE_CREDENTIALS="$1" CC_SANDBOX_TEST_REFRESH_FLAG="${RF:-$fh/no-flag}" \
     CC_SANDBOX_TEST_REFRESH_UID="${RU:-0}" WORKER_CLAUDE_LOGIN_COPY="${RC:-}" "$SELF" r "${3:-t}" -- sh -c "$probe" 2>&1; }
-  # holders/proxies of the store's lock, as "n/m": -ef is a builtin stat of each fd, so a box with tens of thousands of
-  # fds open costs a second, not the readlink fork per fd that took ~110 s (10-22); a process gone mid-scan is skipped
-  lockers(){ local p f c n=0 m=0; for p in /proc/[0-9]*; do for f in "$p"/fd/*; do [ "$f" -ef "$1" ] || continue
-    n=$((n + 1)); c=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline"); [[ "$c" == *' serve --socket '* ]] && m=$((m + 1)); break; done; done; echo "$n/$m"; }
+  # holders/proxies of the store's lock, as "n/m". Only this shell's own session is looked into: everything the cases start
+  # is in it, and a box with tens of thousands of fds in other sessions costs one stat read a process, not a scan of each
+  # fd (that took ~110 s on 10-22, and the walk of every process's fds still raced the probe's limit); -ef is a builtin
+  # stat, and a process gone mid-scan is skipped
+  sess(){ local s; s=$(<"/proc/$1/stat") 2>/dev/null || return 1; s=${s##*) }; s=${s#* * * }; echo "${s%% *}"; }   # a pid's session id
+  lockers(){ local p f c n=0 m=0 sid; sid=$(sess $$)
+    for p in /proc/[0-9]*; do [ "$(sess "${p#/proc/}")" = "$sid" ] || continue
+      for f in "$p"/fd/*; do [ "$f" -ef "$1" ] || continue
+      n=$((n + 1)); c=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline"); [[ "$c" == *' serve --socket '* ]] && m=$((m + 1)); break; done; done; echo "$n/$m"; }
   rwsrc(){ local k=0; while [ "$k" -lt "${#B[@]}" ]; do   # the host paths a bwrap argument list binds READ-WRITE, one a line
     case "${B[k]}" in --bind|--bind-try) printf '%s\n' "${B[k+1]}"; k=$((k+3));; --bind-fd) readlink "/proc/self/fd/${B[k+1]}"; k=$((k+3));; *) k=$((k+1));; esac; done; }
   out=$(run "$wf")
@@ -3650,6 +3655,12 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   : > "$sd/go"; wait "$spid"; out=$(cat "$fh/stray.out"); kill "$(cat "$fh/stray" 2>/dev/null)" 2>/dev/null
   t "workers' login: a child the refresh leaves running never holds the store's lock — the egress proxy alone does while the worker runs" \
     "$sh/$(g tok)" 1/1/alive/wk-fresh
+  # A PROCESS WITH HUNDREDS OF FDS OPEN does not slow the holders scan out of its limit nor count as a holder: a helper holds
+  # 400 descriptors on a file that is not the lock, and the scan of the lock (nothing holds it) answers 0/0 in seconds.
+  bash -c 'for ((i = 10; i < 410; i++)); do eval "exec $i</dev/null"; done; sleep 30' & local xp=$! t0=$SECONDS; sleep 0.5
+  t "workers' login: the holders scan with a helper holding 400 fds open → 0/0, well inside its limit" \
+    "$(lockers "$fh/.cc/sandbox/r/t/refstore.lock")/$((SECONDS - t0 < 20 ? 1 : 0))" 0/0/1
+  kill "$xp" 2>/dev/null; wait "$xp" 2>/dev/null
   # THE KEY'S SHAPE (an allow-list): ~/.claude-<name>/.credentials.json and nothing else; each other shape is one line
   # and the box's login. The near-expiry token in each proves no refresh ran from the refused dir either.
   rm -f "$fh/refreshed"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))

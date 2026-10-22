@@ -549,9 +549,10 @@ quota_wait(){   # $1 cc done's output → 0 once past the reset its final cc: li
   hm=$(grep '^cc: ' <<<"$1" | tail -1 | grep -o 'rate limit for this login is spent until [0-9][0-9]:[0-9][0-9]Z') || return 1
   hm=${hm##* until }; s=$(( $(date -u -d "${hm%Z}" +%s) - $(date +%s) ))
   [ "$s" -lt -43200 ] && s=$((s + 86400))   # the reset falls after midnight
+  [ "$s" -ge 43200 ] && s=$((s - 86400))   # …or the clock has passed midnight since a reset just before it
   [ "$s" -gt 0 ] || s=0; [ "$s" -le 3600 ] || s=3600
   log "GitHub's quota is spent until $hm: cc done again after it"; "$BOARD" note "$repo" "$track" "finished; GitHub's quota is spent until $hm, so cc done runs again then" >/dev/null 2>&1
-  sleep $((s + 60)) & wait $!; }
+  sleep $((s + 60)) & qsleep=$!; wait $qsleep; qsleep=; }
 inside_boundary(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`: this loop runs inside a workspace's boundary
 complete_task(){   # → the completion receipt on stdout (the JSON delivery_end reads); the rest goes to $LOG
   # INSIDE A MEMBER WORKSPACE'S BOUNDARY there is no lander: ~/.cc/lander is not bound, so `cc-land queue --task`
@@ -2429,6 +2430,13 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
     BOARD=true; eval "$QWF"; quota_wait "$QWM 12:00Z"; echo slept > "$d/qw.t" ) >/dev/null 2>&1 & qp=$!
   qt0=$(date +%s); sleep 1; kill -TERM "$qp"; wait "$qp"
   t '…and a TERM during the wait is handled then, not after the sleep' "$(cat "$d/qw.t")|$(( $(date +%s) - qt0 < 10 ))" "trapped|1"
+  t '…a reset just before midnight, read just after it, is gone: the minute, not an hour' "$(QN=00:30 qn 23:59Z)" "60 rc=0 "
+  # the loop's own EXIT trap ends the wait's sleep, so a TERM leaves no orphan holding the loop's fds
+  QX=$(grep -m1 "^trap '.*' EXIT" "$0" | sed "s/^trap '//; s/' EXIT.*//")
+  # shellcheck disable=SC2064
+  ( say_io(){ :; }; trap "$QX" EXIT; log(){ :; }; date(){ if [ "$1" = +%s ]; then command date -u -d 12:00 +%s; else command date "$@"; fi; }
+    BOARD=true; eval "$QWF"; me=$BASHPID; ( sleep 1; kill -TERM $me ) & trap "exit 0" TERM; quota_wait "$QWM 13:00Z" ) >/dev/null 2>&1
+  t '…and the sleep it ran in the background does not outlive a TERM' "$(pgrep -f '^sleep 3660$' | wc -l)" "0"
   # A SIGNAL NEVER ENDS THE LOOP SILENTLY (raised-a-killed-iteration-ends-its-loop-silently). Kept: TERM while an iteration
   # runs aborts that iteration and the loop goes on. Reported: HUP, or TERM between iterations, ends it through stop().
   # Suppressed: the stop() when `cc` holds the track's lock, re-dispatching over this loop.
@@ -2545,7 +2553,7 @@ CC_AGENT_NO=${AGENTNO:-$("$BIN/cc-agent-number" next worker "$repo/$track" $$ 2>
 [ -n "$CC_AGENT_NO" ] && "$BOARD" set "$repo" "$track" agent_no "$CC_AGENT_NO" >/dev/null 2>&1
 orch_record; dispatch_receipt; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
 pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
-trap 'say_io pidrm "$ST" $$' EXIT   # only a loop.pid that is still this loop's, and never through a link (say_io)
+trap '[ -n "${qsleep:-}" ] && kill "$qsleep" 2>/dev/null; say_io pidrm "$ST" $$' EXIT   # a quota wait's sleep ends with the loop; only a loop.pid that is still this loop's, and never through a link (say_io)
 [ -e "$ST/stop" ] && { rm -f "$ST/stop"; log "a stop file from before this dispatch was cleared — re-dispatching overrides it"; }
 set -m   # each iteration runs in its own process group, so one kill takes claude AND everything it spawned
 child=""
