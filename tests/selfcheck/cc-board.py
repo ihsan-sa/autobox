@@ -349,6 +349,10 @@ def selfcheck():
         ok("`show` prints a session row after the tracks, indented, with no status icon; a track row as before",
            "  ↳ \033[1msess9\033[0m [session]  a course session" in sh and "  · \033[1mt1\033[0m [queued]" in sh
            and sh.index("[queued]") < sh.index("[session]"))
+        run("add", "r", "numbered", "a numbered worker", ""); run("set", "r", "numbered", "agent_no", "a9")
+        shn = run("show", "r").stdout
+        ok("`show` prints a row's agent number beside its name, and a row with none as before",
+           "\033[1mnumbered\033[0m a9 [queued]" in shn and "\033[1mt1\033[0m [queued]" in shn)
         # THE TASK IDENTITY ON THE ROW (bin/cc-task). It is read off the row's own state dir at render time, so
         # there is nothing on the board to get out of step with it — and a row without a record is byte-identical
         # to what it printed before this existed, which is what "preserve legacy rows" has to mean.

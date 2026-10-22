@@ -668,10 +668,15 @@ def html_links(html):
 
 
 # A link's secret part: what follows a Piazza-style remove/, link_accounts/ or unsubscribe/ path, and the value of
-# any query parameter named like a token or key. On 2026-10-22 a forwarded digest posted the owner's own ones into
-# two channels. The host and the rest of the path stay, so the link still says where it goes.
+# any query parameter named like a credential (token, key, auth, secret, password, session, signature, sig, otp,
+# code; any prefix, but only a plural, `id` or a separated suffix, so `keyword=` and `author=` stay), whether its
+# `?`, `&` and `=` are written plain, as HTML entities (`&amp;`, `&#38;`) or percent-encoded (`%3F`, `%26`, `%3D`,
+# a link inside a redirect's query). On 2026-10-22 a forwarded digest posted the owner's own ones into two channels. The host and the rest of the path stay, so the link still says where it goes.
 SECRET_PATH = re.compile(r"(/(?:remove|link_accounts|unsubscribe)/)[^\s<>\"'?#|]+", re.I)
-SECRET_PARAM = re.compile(r"([?&][\w.-]*(?:token|key)[\w.-]*=)[^\s<>\"'&#|]+", re.I)
+SECRET_PARAM = re.compile(r"((?:[?&]|&(?:amp|#0*38|#x0*26);|%3F|%26)"
+                          r"[\w.-]*(?:token|key|auth|authorization|secret|password|passwd|pwd|session|signature|sig|otp|code)"
+                          r"(?:s|id|[_.-][\w.-]*)?"
+                          r"(?:=|%3D))(?:(?!%26)[^\s<>\"'&#|])+", re.I)
 
 
 def redact_links(s):

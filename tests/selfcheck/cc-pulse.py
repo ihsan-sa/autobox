@@ -33,17 +33,18 @@ def selfcheck():
         os.chmod(f"{tmp}/bin/{n}", 0o755)
     proc = f"{tmp}/proc"
 
-    def fake(pid, comm, argv, cwd=None, start="100"):
+    def fake(pid, comm, argv, cwd=None, start="100", env=b""):
         d = f"{proc}/{pid}"
         os.makedirs(d)
         open(f"{d}/comm", "w").write(comm + "\n")
         open(f"{d}/cmdline", "wb").write("\0".join(argv).encode() + b"\0")
         open(f"{d}/stat", "w").write(f"{pid} ({comm}) S " + " ".join(["0"] * 18) + f" {start} 0 0\n")
+        open(f"{d}/environ", "wb").write(env)
         if cwd:
             os.symlink(cwd, f"{d}/cwd")
-    fake(30, "claude", ["claude", "-p"], cwd=f"{tmp}/wt/r/w1")       # a headless worker in its worktree
+    fake(30, "claude", ["claude", "-p"], cwd=f"{tmp}/wt/r/w1", env=b"HOME=/h\0CC_AGENT_NO=a7\0")       # a headless worker in its worktree
     fake(40, "bash", ["bash", "/x/cc-loop", "r", "sent"])           # a worker loop between turns
-    fake(50, "claude", ["claude"], cwd=f"{tmp}/dev/r")              # the repo's seat
+    fake(50, "claude", ["claude"], cwd=f"{tmp}/dev/r", env=b"CC_AGENT_NO=a\xff8\0")            # the repo's seat
     fake(51, "claude", ["claude"], cwd=f"{tmp}/dev/mem")            # a member's session
     fake(52, "claude", ["claude"], cwd=f"{tmp}/dev/r", start="999") # a pid reused by another process
     fake(10, "node", ["node"])
@@ -137,6 +138,9 @@ def selfcheck():
          and same_process(proc, "30", {"procStart": " 100 "}) and not same_process(proc, "30", {"procStart": "101"}))
     case("a record with no procStart and no time of its own is not live", not same_process(proc, "53", {}))
     case("sessions are attention first: waiting, then busy, then idle", ids == ["53", "30", "50"])
+    nos = {s["id"]: s["agent_no"] for s in ss}
+    case("a session carries the number its spawner set, a non-UTF-8 one is shown replaced, and none is None",
+         nos.get("30") == "a7" and nos.get("50") == "a\ufffd8" and nos.get("53") is None)
     case("a member's session is counted, never listed", smem == 1 and "51" not in ids)
     s30 = next(s for s in ss if s["id"] == "30")
     case("a session carries its repo, track, context % and tmux window",

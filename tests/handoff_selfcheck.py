@@ -30,6 +30,7 @@ def run_selfcheck():
         HANDOFF = os.path.join(d, "handoff")
         RECORDS = os.path.join(d, "context")
         STATE = os.path.join(d, "state")               # derive/retire touch spool dirs under it: never the real one
+        os.environ["CC_STATE"] = STATE                 # ...and cc-agent-number's ledger, which a successor's number is taken from
         # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
         wins, msgs, dead, me, tcalls, panes = {"r1": "@1"}, [], set(), [""], [], {}
 
@@ -207,6 +208,29 @@ def run_selfcheck():
            rc_rec and f" {rc_rec['id']} " in made[0][-1] and rc_rec["successor"]["session_id"] in made[0][-1])
         clear("rc")
         wins.pop("rc", None); wins.pop("rc" + NEXT, None)
+        # A SUCCESSOR GETS A NEW NUMBER (cc-agent-number), never its predecessor's: the predecessor took one when it
+        # started, the overlap takes the next, writes it in the record and hands it to the successor's window.
+        wins["an"] = "@78"
+        pred = subprocess.run([os.path.join(BIN, "cc-agent-number"), "next", "run", "an", "0"], capture_output=True, text=True).stdout.strip()
+        n0 = len(tcalls)
+        an_rc, an_rec = start("an"), read("an")
+        made = [a for a in tcalls[n0:] if a[0] == "new-window" and "an" + NEXT in a]
+        no = (an_rec or {}).get("successor", {}).get("agent_no") or ""
+        ok(f"an overlap gives the successor a new number ({no}, its predecessor's was {pred}), kept in the handoff "
+           "record and handed to the successor's window as CC_AGENT_NO",
+           an_rc == 0 and pred.startswith("a") and no.startswith("a") and int(no[1:]) > int(pred[1:])
+           and len(made) == 1 and f"CC_AGENT_NO={no} " in made[0][-1])
+        clear("an")
+        wins.pop("an", None); wins.pop("an" + NEXT, None)
+        # NO NUMBER TOOL (a bin without cc-agent-number): the take is "" and the handoff carries on without a number.
+        _bin = BIN
+        globals()["BIN"] = os.path.join(d, "no-bin")
+        try:
+            gone = agent_no("an")
+        except OSError as e:
+            gone = e
+        globals()["BIN"] = _bin
+        ok("a missing number tool gives the successor no number, and the handoff goes on", gone == "")
         ov = os.environ.get("CC_HANDOFF_OVERLAP")
         os.environ["CC_HANDOFF_OVERLAP"] = "0"           # unread: the overlap is the only handoff, no switch gates it
         ok("an overlap starts on a live window — and no config switch gates it (CC_HANDOFF_OVERLAP is unread)",

@@ -188,7 +188,6 @@ import stat
 import subprocess
 import tempfile
 import time
-import types
 import unicodedata
 
 from lander import cards as C
@@ -440,16 +439,24 @@ def perms_recorded(repo, pr, head, digests):
     (lane.Lane.host_unread) and is released on (release.remote_rules). An entry with no `verdict` is a LAND, as in
     carried_from; a FIX or DO-NOT-LAND is not one, and one recorded after a LAND at that head takes it back. An
     empty digest is no digest (Opus read of #1564: a job with no reviewer unit has digest "", which an entry with
-    an empty change would match). A delta LAND (one with `since`) stands only while its `since` is still a LAND
-    head (land_heads()): a FIX perms records later at that old head takes it back too (perms' read of #1859)."""
+    an empty change would match). A delta LAND (one with `since`) stands only while its `since` does (stands())."""
     digests = {d for d in digests or () if d}
     if not (head and digests):
         return None
-    e = newest_reads(perms_reads(repo)[0], repo, pr).get(head)
-    if e is None or e.get("change") not in digests or e.get("verdict", T.LAND) != T.LAND:
-        return None
-    since = e.get("since")
-    return e if not since or since in land_heads(types.SimpleNamespace(repo=repo, pr=pr, head=head)) else None
+    newest = newest_reads(perms_reads(repo)[0], repo, pr)
+    e = newest.get(head)
+    return e if e is not None and e.get("change") in digests and stands(newest, head) else None
+
+
+def stands(newest, head, seen=()):
+    """True when `head`'s newest entry (of newest_reads()) is a LAND and, for a delta LAND, the head its `since` names
+    stands too: a FIX perms records later at a head a delta LAND rests on takes it back (perms' read of #1859), and
+    one at any other head takes back no more than it would from a whole LAND (Opus read of #1859). A loop of
+    `since`s stands nowhere."""
+    e = newest.get(head)
+    if e is None or e.get("verdict", T.LAND) != T.LAND or head in seen:
+        return False
+    return not e.get("since") or stands(newest, e["since"], (*seen, head))
 
 
 def security_globs(root, base, repo):
@@ -2361,8 +2368,8 @@ def cmd_will_review(argv):
 # writes all carry `since`, and adopt checks that LAND again (perms' answer of 10-22).
 # The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge). It holds (box) while a
 # read of the PR runs at any head, or for a read's run window (HOLD_WINDOW) while perms' `perms-hold` stub stands at
-# its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change, or a
-# HANDBACK at the head that perms' ledger LAND at it was recorded after) is a query for the planning seat, which is where a read that died with no verdict surfaces.
+# its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change, or
+# perms' ledger LAND at the head over any read there that did not finish, or over a HANDBACK there it was recorded after) is a query for the planning seat, which is where a read that died with no verdict surfaces.
 
 PERMS_READ_DIR = "reads"
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -2501,6 +2508,15 @@ def held_since(e):
     return (datetime.datetime.now(datetime.timezone.utc) - at.replace(tzinfo=datetime.timezone.utc)).total_seconds()
 
 
+def landed_after(repo, pr, head, digest, e, field) -> bool:
+    """True when perms' ledger LAND at `head` and `digest` (perms_recorded) was recorded at a later second than read
+    `e`'s `field` time; a time either side does not give is False."""
+    from lander import events as E
+    land = perms_recorded(repo, pr, head, [digest])
+    back, then = E.epoch_of(e.get(field)), land and E.epoch_of(land.get("at"))
+    return bool(back and then and back < then)
+
+
 def perms_reading(repo, pr, head, digest="", carried="") -> tuple:
     """-> (why, wait): why the lane must not merge PR `pr` at `head` on account of perms' own reads, or ("", False).
     dispatch#1296 merged on the lane's own read while perms' read of it ran (10-19), and #1298 had to go to draft by
@@ -2513,7 +2529,11 @@ def perms_reading(repo, pr, head, digest="", carried="") -> tuple:
     is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase),
     and so does one at `carried`, the head same_change() found (or a call that finds it, run only here: it runs git).
     A HANDBACK at `head` is cleared by perms' ledger LAND at `head` and its change (perms_recorded) recorded a later
-    second than the read finished; a time either side does not give clears nothing (#1842)."""
+    second than the read finished; a time either side does not give clears nothing (#1842). That ledger LAND also
+    clears a read at `head` that died, failed or went stale, or a stale hold, that started before it, and reads of
+    older heads alone when the newest is not done or finished before it (#1840: a read that died at an older head
+    held a PR perms had already LANDed at its live head; Opus read of #1874: one that finished after the LAND with
+    DO-NOT-LAND still holds)."""
     d, why = read_dir(repo)
     if not d:
         return ("", False) if reads_absent(repo) else (f"perms' reads dir will not read ({why})", False)
@@ -2539,8 +2559,12 @@ def perms_reading(repo, pr, head, digest="", carried="") -> tuple:
         if e.get("state") == "done" and e.get("verdict") == T.LAND and (digest and e.get("change") == digest
                                                                        or carried and h == (carried() if callable(carried) else carried)):
             return "", False
+        if (perms_recorded(repo, pr, head, [digest]) if e.get("state") != "done"   # #1840: a dead read of fc867af0
+                else landed_after(repo, pr, head, digest, e, "finished")):        # outranked the LAND at a2421229
+            return "", False
         since = f" --since {h}" if e.get("state") == "done" and e.get("verdict") == T.LAND else ""
-        return (f"perms read PR #{pr} at {h[:12]} ({e.get('verdict') or e.get('state') or 'no verdict'}) and has no "
+        said = "died with no verdict" if e.get("state") == "running" else e.get("state") or "no verdict"
+        return (f"perms read PR #{pr} at {h[:12]} ({e.get('verdict') or said}) and has no "
                 f"read of its head {head[:12]}: perms runs `lander perms-read {repo} {pr}{since}`, then queue it "
                 f"again"), False
     state = at.get("state")
@@ -2550,17 +2574,16 @@ def perms_reading(repo, pr, head, digest="", carried="") -> tuple:
         age = held_since(at)
         if age is not None and 0 <= age <= HOLD_WINDOW:
             return f"perms holds PR #{pr} at {head[:12]} for its security read", True
+    if state != "done" and landed_after(repo, pr, head, digest, at, "started"):   # one that died before the LAND
+        return "", False
+    if state == "held":
         return (f"perms held PR #{pr} at {head[:12]} for its security read and none started within "
                 f"{HOLD_WINDOW // 60} minutes: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
-    land = state == "done" and at.get("verdict") == T.HANDBACK_VERDICT and perms_recorded(repo, pr, head, [digest])
-    if land:
-        from lander import events as E
-        land = E.epoch_of(land.get("at"))   # the entry whose verdict was checked: one read of the ledger
-        back = E.epoch_of(at.get("finished"))
-        # brief (#1842): "a security-reads LAND at the same head, recorded at a later second than the reader file's
-        # finish time, clear[s] that reader file's HANDBACK"; "An unparseable time clears nothing."
-        if back and land and back < land:
-            return "", False
+    # brief (#1842): "a security-reads LAND at the same head, recorded at a later second than the reader file's
+    # finish time, clear[s] that reader file's HANDBACK"; "An unparseable time clears nothing."
+    if state == "done" and at.get("verdict") == T.HANDBACK_VERDICT and landed_after(repo, pr, head, digest, at,
+                                                                                    "finished"):
+        return "", False
     if state == "done":
         return f"perms' security read of PR #{pr} at {head[:12]} says {at.get('verdict') or 'nothing'}", False
     said = "died with no verdict" if state == "running" else f"is {state or 'unfinished'}"

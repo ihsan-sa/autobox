@@ -3582,6 +3582,7 @@ if stanza "cc-started (a launched session is confirmed to be running, or the own
 # this box's and pages nobody. The three startup shapes the owner has seen (a popup, a first message that never
 # landed, a login screen) are each driven end to end there.
 chk cc-started
+chk cc-agent-number   # the box's one agent sequence: agents started at once get different numbers, a restart carries on
 
 fi
 if stanza "what the snapshot's four readers do with it (waiting vs the clock, and without it)"; then

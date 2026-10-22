@@ -2215,6 +2215,20 @@ class TestSecurityPaths(Case):
         self.reads([self.rec(j, since=self.OLD)])   # no LAND at its since at all
         self.assertIsNone(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
 
+    def test_a_delta_land_stands_over_a_fix_at_another_head(self):
+        """Opus read of #1859: every non-LAND entry of the PR took a delta LAND back; now only its since chain's do."""
+        j = self.sec_job(self.PATHS[0])
+        old = self.rec(j, head=self.OLD, change="0" * 16)
+        self.reads([old, self.rec(j, since=self.OLD), self.rec(j, head="c" * 40, verdict="FIX")])
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        older = self.rec(j, head="b" * 40, change="1" * 16)
+        self.reads([older, dict(old, since="b" * 40), self.rec(j, since=self.OLD)])   # a chain of delta LANDs
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        self.reads([older, dict(old, since="b" * 40), self.rec(j, since=self.OLD), dict(older, verdict="FIX")])
+        self.assertIsNone(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))   # a FIX at the chain's root
+        self.reads([dict(old, since=j.head), self.rec(j, since=self.OLD)])   # a loop rests on no whole read
+        self.assertIsNone(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+
     def test_an_empty_digest_is_never_perms_recorded(self):
         """Opus read of #1564: with no reviewer unit job.digest is "", so an entry with an empty change counted."""
         j = self.sec_job(self.PATHS[0])
@@ -2362,6 +2376,19 @@ class TestSecurityPaths(Case):
         self.reads([self.rec(j, head=old, change="0" * 16)])
         with mock.patch("lander.tick.default_base", lambda root, slug: ("main", main)):
             self.assertEqual(R.same_change(j), old)   # the same PR on main at its tip still carries
+
+    def test_no_default_branch_read_carries_nothing(self):
+        """Perms' read of #1859: when tick.default_base reads nothing ("", ""), on_default fails and nothing carries."""
+        git, commit, root, old, main = self.remerge_repo("1\n2\n3\n4\n5\n", "1\n2\nA\n4\n5\n", "M\n2\n3\n4\n5\n")
+        git("checkout", "-q", old)
+        git("merge", "-q", "--no-edit", main)
+        j = self.sec_job(self.PATHS[0])
+        j.head, j.base_sha = git("rev-parse", "HEAD"), main
+        j.extra.update(root=root, base_ref="main")
+        self.reads([self.rec(j, head=old, change="0" * 16)])
+        self.assertTrue(R.remerges(root, main, old, j.head))   # what would carry
+        with mock.patch("lander.tick.default_base", lambda root, slug: ("", "")):
+            self.assertEqual(R.same_change(j), "")
 
     def test_an_old_land_perms_took_back_never_carries_on_its_lines(self):
         j = self.carry(self.PATHS)
@@ -2855,6 +2882,67 @@ class TestPermsReads(Case):
         os.utime(os.path.join(self.seat, "reads", f"7-{self.OLD}.json"), (1, 1))   # the LAND is the older read
         self.assertIn("(HANDBACK) and has no read of its head",
                       R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+
+    # #1840 (10-22): a read that died at an older head held the PR though perms' ledger had its LAND at the live head
+    def ledger_land(self, **kw):
+        path = R.perms_reads_path("demo")
+        with open(path, "w") as f:
+            json.dump([dict({"repo": "demo", "pr": 7, "head": HEAD, "change": R.change_digest(DIFF),
+                             "at": "2026-10-22T10:00:00Z"}, **kw)], f)
+        os.chmod(path, 0o600)
+
+    def dead(self, head):
+        R.write_read("demo", self.entry(head=head, state="running", pid=os.getpid(), pid_start="0", verdict=None,
+                                        started="2026-10-22T09:00:00Z"))
+
+    def test_a_ledger_land_at_the_head_clears_a_dead_read_of_an_older_head(self):
+        self.dead(self.OLD)
+        why, wait = R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))
+        self.assertIn("(died with no verdict) and has no read of its head", why)   # never "running"
+        self.assertFalse(wait)
+        self.ledger_land(change="f" * 64)   # another change's LAND clears nothing
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+        self.ledger_land(verdict="FIX")
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+        self.ledger_land()
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))
+
+    def test_a_ledger_land_at_the_head_clears_a_dead_read_of_the_head(self):
+        self.dead(HEAD)
+        self.assertIn("died with no verdict", R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+        self.ledger_land()
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))
+        R.write_read("demo", self.entry(state="held", started="2026-01-01T00:00:00Z", verdict=None))   # a stale hold
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))
+
+    # Opus read of #1874: the clear compared no times, so a read that finished after the LAND was outranked by it
+    def test_an_older_heads_finished_read_holds_only_when_it_finished_after_the_ledger_land(self):
+        self.ledger_land()
+        for verdict in ("DO-NOT-LAND", "FIX"):
+            for finished, held in (("2026-10-22T11:00:00Z", True), ("2026-10-22T10:00:00Z", True),
+                                   ("2026-10-22T09:00:00Z", False), ("soon", True)):
+                R.write_read("demo", self.entry(head=self.OLD, verdict=verdict, finished=finished))
+                why = R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0]
+                self.assertEqual(f"({verdict}) and has no read of its head" in why, held, (verdict, finished))
+                self.assertEqual(why == "", not held, (verdict, finished))
+
+    def test_a_failed_or_stale_read_at_the_head_clears_only_when_it_started_before_the_ledger_land(self):
+        self.ledger_land()
+        for state in ("failed", "stale"):
+            for started, held in (("2026-10-22T09:00:00Z", False), ("2026-10-22T11:00:00Z", True),
+                                  ("soon", True), (None, True)):
+                R.write_read("demo", self.entry(state=state, verdict=None, started=started, why="a flaw"))
+                why = R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0]
+                self.assertEqual(why != "", held, (state, started))
+        R.write_read("demo", self.entry(state="failed", verdict=None, started="2026-10-22T09:00:00Z"))
+        self.ledger_land(at="soon")   # a LAND whose own time will not parse clears nothing
+        self.assertNotEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0], "")
+
+    def test_a_ledger_land_at_the_head_still_waits_on_a_live_read(self):
+        self.ledger_land()
+        R.write_read("demo", self.entry(head=self.OLD, state="running", pid=os.getpid(),
+                                        pid_start=R.started_at(os.getpid()), verdict=None))
+        self.assertTrue(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[1])
 
     # #1842 (10-22): perms recorded LAND in its ledger 48 s after its reader handed the same head back, and the lane
     # still stopped on the reader's HANDBACK until perms moved the file by hand

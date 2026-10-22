@@ -18,8 +18,9 @@ def selfcheck():
     global STATE
     home = tempfile.mkdtemp(prefix="cc-subagent-bound-selfcheck-")
     state0, env0 = STATE, {k: os.environ.pop(k, None) for k in
-                           ("CC_SUBAGENT_SAVE_TOKENS", "CC_CONFIG")}
+                           ("CC_SUBAGENT_SAVE_TOKENS", "CC_CONFIG", "CC_STATE")}
     STATE = os.path.join(home, "state")
+    os.environ["CC_STATE"] = STATE                                 # number()'s cc-agent-number ledger: never the box's own
     os.environ["CC_CONFIG"] = os.path.join(home, "config")        # an empty config: the box's own must not move a line
     open(os.environ["CC_CONFIG"], "w").close()
     proj = os.path.join(home, "projects", "-dev-x")
@@ -215,7 +216,7 @@ def selfcheck():
         with open(os.environ["CC_CONFIG"], "w") as fh:
             fh.write("CC_SUBAGENT_SAVE_TOKENS=40000\nSLACK_OTHER=x\n")
         calls, real_run = [], subprocess.run
-        subprocess.run = lambda cmd, *a, **k: (calls.append(cmd), real_run(cmd, *a, **k))[1]
+        subprocess.run = lambda cmd, *a, **k: ("cc-config" in str(cmd) and calls.append(cmd), real_run(cmd, *a, **k))[1]   # number()'s calls are not these
         try:
             sub("s13", "a13", [asst(35000)])
             ok("config: under the file's 40k runs", run(payload("s13", "a13"))[1] is None)
@@ -249,6 +250,16 @@ def selfcheck():
         os.utime(os.path.join(STATE, "old-z.json"), (old, old))
         run(payload("s14", "a14"))
         ok("prune: an agent's later calls do not sweep", os.path.exists(os.path.join(STATE, "old-z.json")))
+
+        # 15. a subagent's number: its first call takes one from the box's sequence (cc-agent-number), its later calls
+        # none, and a second subagent the next one
+        sub("s15", "a15", [asst(1000)]); sub("s15", "a15b", [asst(1000)])
+        run(payload("s15", "a15")); run(payload("s15", "a15")); run(payload("s15", "a15b"))
+        nos = [open(os.path.join(STATE, f"s15-{a}.json.no")).read().strip() for a in ("a15", "a15b")]
+        with open(os.path.join(STATE, "agent-numbers.jsonl")) as fh:
+            mine = [json.loads(l)["id"] for l in fh if json.loads(l)["name"].endswith(("/a15", "/a15b"))]
+        ok("number: a subagent takes one number on its first call, none after, and the next subagent the next",
+           all(n.startswith("a") for n in nos) and nos[0] != nos[1] and sorted(mine) == sorted(nos))
     finally:
         STATE = state0
         for k, v in env0.items():

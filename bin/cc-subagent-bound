@@ -32,7 +32,10 @@ model call is made, and any error decides nothing: a hook that cannot read its i
 record the save, leaves the call alone. The figure costs one cc-config call at most per hook, and only when the
 environment does not set it.
 
-PRUNING. Each subagent leaves <session>-<agent>.json.lock in the state dir, and one that got the save order also
+NUMBER. A subagent's first call takes it the next number of the box's agent sequence (number()), kept in
+<session>-<agent>.json.no, so the box's ledger counts every subagent it saw spawn.
+
+PRUNING. Each subagent leaves <session>-<agent>.json.lock and .json.no in the state dir, and one that got the save order also
 leaves .json.saved and .json (the save's record). A hook that creates a new lock first deletes the files there
 older than PRUNE_DAYS (7): no subagent runs that long, and a missing record only means a fresh save order.
 
@@ -137,6 +140,24 @@ def transcript_of(p):
     return os.path.join(base[:-len(".jsonl")], "subagents", f"agent-{p['agent_id']}.jsonl")
 
 
+def number(sid, agent):
+    """The subagent's number from the box's agent sequence (cc-agent-number), taken on its first call. The O_EXCL
+    create of <session>-<agent>.json.no claims it, so parallel first calls take one number between them, and the file
+    keeps it; the ledger names the subagent <its spawner's number>/<agent id>. Any error takes none."""
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        fd = os.open(os.path.join(STATE, f"{sid}-{agent}.json.no"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-agent-number"), "next", "subagent",
+                            f"{os.environ.get('CC_AGENT_NO') or sid}/{agent}", "0"], capture_output=True, text=True, timeout=10)
+        os.write(fd, r.stdout.encode())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    os.close(fd)
+
+
 def prune():
     """Delete the state dir's files older than PRUNE_DAYS; any error leaves that file."""
     cut = time.time() - PRUNE_DAYS * 86400
@@ -145,7 +166,7 @@ def prune():
     except OSError:
         return
     for n in names:
-        if not n.endswith((".json", ".json.lock", ".json.saved")):
+        if not n.endswith((".json", ".json.lock", ".json.saved", ".json.no")):
             continue
         f = os.path.join(STATE, n)
         try:
@@ -171,6 +192,8 @@ def hook(raw):
     agent = p.get("agent_id")
     if not (isinstance(agent, str) and AGENT_RE.match(agent)):
         return 0                              # a session's own call: seats have cc-context, workers cc-loop
+    sid = p.get("session_id") if isinstance(p.get("session_id"), str) and AGENT_RE.match(p["session_id"]) else "-"
+    number(sid, agent)
     save = cfg("CC_SUBAGENT_SAVE_TOKENS", 90000)
     if save <= 0:
         return 0
@@ -181,7 +204,6 @@ def hook(raw):
         used = None
     if used is None:
         return 0
-    sid = p.get("session_id") if isinstance(p.get("session_id"), str) and AGENT_RE.match(p["session_id"]) else "-"
     mark = os.path.join(STATE, f"{sid}-{agent}.json")
     # ONE HOOK AT A TIME PER AGENT (review of #1319): parallel tool calls fire their PreToolUse hooks together, and two
     # that both read no record would both issue the one-time save refusal. The read, the check and the write are held

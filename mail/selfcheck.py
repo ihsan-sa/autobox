@@ -1431,6 +1431,18 @@ def run():
       and router.body_text({"text": "typed"}) == "typed" and router.body_text({}) == "",
       "…so the body is `text` exactly as it arrived, and only a mail that has none falls back to the stripped "
       "HTML: a text+html mail is untouched by any of this")
+    # 2026-10-22, after #1876: perms' read found secret links that still posted whole.
+    k(router.redact_links("https://piazza.com/class/c1?cid=9&amp;token=SEK1&#38;x=1") ==
+      "https://piazza.com/class/c1?cid=9&amp;token=[redacted]&#38;x=1",
+      "a secret link redacts when a text part carries its `&token=` entity-encoded, as `&amp;token=`")
+    k(router.redact_links("https://app.example/login?u=me&auth=SEK2") == "https://app.example/login?u=me&auth=[redacted]",
+      "…and when its secret is named auth= rather than token= or key=")
+    k(router.redact_links("https://t.example/r?u=https%3A%2F%2Fpiazza.com%2Fc%3Fcid%3D9%26token%3DSEK3%26x%3D1")
+      == "https://t.example/r?u=https%3A%2F%2Fpiazza.com%2Fc%3Fcid%3D9%26token%3D[redacted]%26x%3D1",
+      "…and when it sits percent-encoded inside a redirect's query, the rest of that query kept")
+    plain = "https://example.com/search?keyword=mail&amp;author=me&page=2&q=caf%C3%A9%26tea#top"
+    k(router.redact_links(plain) == plain,
+      "…while an ordinary link posts unchanged, a name like keyword= or author= and its own encoded parts included")
     line = router.mirror_line({"from": "a@b", "subject": "s", "text": "", "html": "<p>html only</p>"})
     k(line.endswith(" · html only_") and "(no text)" not in line and "<p>" not in line,
       "…and the mirror line of an HTML-only mail shows that text rather than `(no text)`, with no tag of the "
