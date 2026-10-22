@@ -461,6 +461,15 @@ branch_warn(){   # $1 the track's own git dir → nothing bound and nothing deci
 # lost while it waits: the commits are loose objects in the shared store from the moment they are written, `git gc`
 # leaves a loose object alone for two weeks, and the worktree's own logs/HEAD names them for longer than that.
 rstore(){ printf '%s' "$H/.cc/sandbox/$1/$2/refstore"; }   # beside the settings copy, and for the same reason: ~/.cc/sandbox is under no bind, so the source is not reachable from inside
+# ONE HAND ON A STORE AT A TIME. The store IS the live worker's refs/heads/track, so a fold (its `rm -f` of the branch
+# file) or a reseed (`rm -rf` of the store) while that worker runs takes the file out from under it: git falls back to
+# the ro packed-refs, and the branch reads as rewound to where `cc` cut it, or unborn, with the work only staged. Three
+# workers stopped BLOCKED on that in a day (raised-sandbox-fold-deletes-live-branch, 2026-10-21). So `build` takes a
+# lock on <store>.lock before it seeds, and the EGRESS PROXY holds it for as long as the sandbox lives: launch starts
+# the proxy with the descriptor and execs bwrap with it closed, so no descriptor of it reaches the session (the
+# descriptor case), and the proxy dies with bwrap (cc-egress --parent, PR_SET_PDEATHSIG). A twin launch refuses there,
+# and `reconcile` folds only under the same lock. The proxy goes a moment after bwrap, so both wait 3 s for it: far
+# less than any worker runs. rs_seed has no other caller than `build`, so it only ever runs under the lock.
 rs_fold(){   # $1 repo · $2 track → the private branch file becomes the host's ref, or it does not and this says why
   # THE REF NAME IS THE CONSTANT $NSD/<track> FROM ARGV AND NOTHING ELSE. Not the worktree's HEAD, not a name found in
   # the store: both live in trees the worker writes, and branch_warn is the note on what happened the one time a mount
@@ -623,7 +632,10 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # …AND THE BRANCH NAMESPACE IS THIS TRACK'S OWN COPY OF IT, not the host's directory (rstore, above). The DEST is the
   # constant $NSD, never a name anything inside supplies; the SOURCE is under ~/.cc/sandbox, which no bind here reaches,
   # so it needs no pin — a name a worker cannot reach is not a name it can swap.
-  rs=$(rstore "$1" "$2"); rs_seed "$1" "$2" || { echo "cc-sandbox: could not build $1/$2's own branch namespace under $rs — nothing was bound and nothing started." >&2; exit 2; }
+  # …HELD FOR AS LONG AS THIS SANDBOX LIVES (ONE HAND ON A STORE AT A TIME, beside rstore).
+  rs=$(rstore "$1" "$2"); : >> "$rs.lock" || { echo "cc-sandbox: could not create $rs.lock, the lock that keeps a second hand off $1/$2's branch store — nothing was bound and nothing started." >&2; exit 2; }
+  exec {RSL}<"$rs.lock" && flock -w 3 "$RSL" || { echo "cc-sandbox: a sandbox for $1/$2 is still running, and this launch would fold and reseed the branch store it is using — nothing was bound and nothing started. Launch again once it has ended." >&2; exit 2; }
+  rs_seed "$1" "$2" || { echo "cc-sandbox: could not build $1/$2's own branch namespace under $rs — nothing was bound and nothing started." >&2; exit 2; }
   B+=(--bind "$rs/refs" "$dev/.git/$NSD" --bind "$rs/logs" "$dev/.git/logs/$NSD")
   branch_warn "$gd"   # AFTER the binds and changing none of them: a diagnostic, never an input
   honest_view "$1" "$2"   # the masked checkout says it is masked, and `cc` is never the C compiler (honest_view)
@@ -857,7 +869,7 @@ launch(){   # $1 repo · $2 track · the rest is the command
   local eg al ep; eg=$(egress_dir "$repo" "$track")
   mkdir -p "$eg" && chmod 700 "$eg" && rm -f "$eg/sock"
   al=$("$BIN/cc-config" get CC_EGRESS_ALLOW 2>/dev/null)
-  "$EGRESS" serve --socket "$eg/sock" --log "$eg/log" --parent $$ ${al:+--allow "$al"} </dev/null >/dev/null 2>>"$eg/log" & ep=$!
+  "$EGRESS" serve --socket "$eg/sock" --log "$eg/log" --parent $$ ${al:+--allow "$al"} </dev/null >/dev/null 2>>"$eg/log" & ep=$!   # it holds the store's lock (ONE HAND ON A STORE AT A TIME), so bwrap below gets that closed
   # 15 s, as long as the selfcheck gives a python start at load 100+; a proxy that has already died ends the wait at once
   local k=0; while [ ! -S "$eg/sock" ] && [ $k -lt 150 ] && kill -0 "$ep" 2>/dev/null; do sleep 0.1; k=$((k + 1)); done
   [ -S "$eg/sock" ] || { echo "cc-sandbox: the egress proxy for $repo/$track did not start (see $eg/log) — nothing was started, because the worker's only network is through it." >&2; exit 2; }
@@ -875,7 +887,7 @@ launch(){   # $1 repo · $2 track · the rest is the command
     gt=$(head -n1 -- "${gt:-/var/lib/dispatch-login-workers/gh-read.token}" 2>/dev/null | tr -d '\r\n'); fi
   [ -n "$gt" ] && export GH_TOKEN="$gt" GH_CONFIG_DIR=/nonexistent/gh
   pins_unlinked   # last, right before exec: a pinned file git renamed over during the launch goes in as data
-  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" "${ca[@]}" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" "${ca[@]}" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" {RSL}<&- \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <([ -n "$live" ] || jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
 launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES FOR ITSELF, and the only one that needs
@@ -4112,6 +4124,25 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     "1/0000000000000000000000000000000000000001/$(git -C "$dev" rev-parse refs/heads/track/t)"
   grep -q STARTED <<<"$out2" || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out2:-nothing at all}"   # why a launch never started; FAIL in the line so a gate log, which keeps only FAIL and ✗ lines, keeps it
   rm -rf "$rsd".unfolded.*
+  # A SECOND HAND ON A LIVE STORE (ONE HAND ON A STORE AT A TIME). Without the lock this went: the worker commits
+  # inside, the host folds (rm -f of the branch file the worker's bind shows) and a twin launch reseeds, and the worker's next read of its
+  # own branch is the host's old one again, its work only staged — the shape three dispatch workers stopped BLOCKED on.
+  # Here both run while the worker waits, and both refuse; once it ends, the fold puts its commit on the host's branch.
+  # Take the flock out of `build` and the first case reads 0/0/0/1/<what packed-refs holds>/<the worker's commit>.
+  local lv lp lr lrc k=0
+  rm -f "$st/committed" "$st/go"; hd=$(git -C "$dev" rev-parse refs/heads/track/t)
+  ( CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'git -c user.name=t -c user.email=t@t commit -q --allow-empty -m live && git rev-parse HEAD > '"$st"'/committed
+      k=0; while [ ! -e '"$st"'/go ] && [ $k -lt 600 ]; do sleep 0.1; k=$((k+1)); done; git rev-parse -q --verify HEAD || echo unborn' > "$st/live.out" 2>&1 ) & lp=$!
+  while [ ! -s "$st/committed" ] && [ $k -lt 600 ] && kill -0 "$lp" 2>/dev/null; do sleep 0.1; k=$((k+1)); done
+  lv=$(cat "$st/committed" 2>/dev/null)
+  out2=$("$SELF" reconcile "$r" t 2>&1); rc=$?
+  lr=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo STARTED' 2>&1); lrc=$?
+  touch "$st/go"; wait "$lp"
+  t 'while a sandbox for the track runs, the fold and a twin launch both refuse, and the worker'"'"'s branch stays on its own commit' \
+    "$rc/$(grep -c 'still running' <<<"$out2")/$lrc/$(grep -c STARTED <<<"$lr")/$(tail -1 "$st/live.out")/$(git -C "$dev" rev-parse refs/heads/track/t)" \
+    "1/1/2/0/${lv:-no commit made inside}/$hd"
+  "$SELF" reconcile "$r" t 2>/dev/null
+  t '…and once it has ended, the fold puts that commit on the host'"'"'s branch' "$(git -C "$dev" rev-parse refs/heads/track/t)" "${lv:-no commit made inside}"
   # A WORKER ON A MEMBER-FACING REPO asks the owner's records alone (shared_lib_bind, cc-lib build_shared, an
   # ALLOWLIST since perms-38's read of #1665): a member workspace's board note, planted and indexed here, answers a
   # worker on an owner repo and not one on a repo a member talks to. Of the owner's records only an owner repo's board,
@@ -4393,6 +4424,8 @@ case "${1:-}" in selfcheck) if [ -n "${2:-}" ]; then selfcheck_section "$2"; eli
   __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge — the MEMBER shape: the v2 profile (cc-member-v2) has no owner marker yet
   probe) fence_off && exit 0; why=$(fence_why) || { echo "$why" >&2; exit 2; }; exit 0;;   # cc-loop, before iteration 1
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
+             l="$(rstore "$2" "$3").lock"; [ ! -e "$l" ] || { exec {RSL}<"$l" && flock -w 3 "$RSL"; } \
+               || { echo "cc-sandbox: a sandbox for $2/$3 is still running, so its branch was not folded and its store was not touched — the next launch folds it." >&2; exit 1; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   # cc-loop, before every iteration: the login the launch will run on. With the fence off the command runs as given,
   # on the box's own login, so that is the answer, and the key is not read at all.
