@@ -37,7 +37,7 @@
 #                                           In the host refresher's mode, its copy or nothing and exit 2 (THE HOST REFRESHER'S MODE).
 #   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
 #                                           — always in a HOME of its own (selfcheck_home); it refuses the account's real one
-#   cc-sandbox selfcheck <section>         one section that builds its own fixture HOME (hwde, toolchains), alone; a section that builds none, or runs no case, fails
+#   cc-sandbox selfcheck <section>         one section that builds its own fixture HOME (hwde, toolchains, workercred), alone; a section that builds none, or runs no case, fails
 #   cc-sandbox --help | -h                  this header, exit 0
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
@@ -469,8 +469,9 @@ rstore(){ printf '%s' "$H/.cc/sandbox/$1/$2/refstore"; }   # beside the settings
 # the proxy with the descriptor and execs bwrap with it closed, so no descriptor of it reaches the session (the
 # descriptor case), and the proxy dies with bwrap (cc-egress --parent, PR_SET_PDEATHSIG). NO OTHER PROCESS HOLDS IT:
 # login_mirror's watcher is forked after the lock is taken and closes it, because it sees bwrap gone only on its next
-# poll, and on a loaded box that outlived reconcile's wait and parked the store for nothing. A twin launch refuses
-# there, and `reconcile` folds only under the same lock, creating the file first so a track's first fold takes it too.
+# poll, and on a loaded box that outlived reconcile's wait and parked the store for nothing; worker_cred's refresh
+# subshell closes it too, so a child the refresh leaves behind holds nothing. Both close it only when it is open. A twin
+# launch refuses there, and `reconcile` folds only under the same lock, creating the file first so a track's first fold takes it too.
 # The proxy goes a moment after bwrap, so both wait 3 s for it: far less than any worker runs. rs_seed has no other caller than `build`, so it only ever runs under the lock.
 rs_fold(){   # $1 repo · $2 track → the private branch file becomes the host's ref, or it does not and this says why
   # THE REF NAME IS THE CONSTANT $NSD/<track> FROM ARGV AND NOTHING ELSE. Not the worktree's HEAD, not a name found in
@@ -728,10 +729,11 @@ login_mirror(){   # $1 the host refresher's copy (refresher_copy passed it) → 
   last=$(stat -c '%i %s %y' -- "$src" 2>/dev/null) && login_strip "$src" "$m" || { rm -rf "$m"; return 1; }
   # The watcher's own pid is read into w here, not in the loop's $(…): there $BASHPID names that substitution's
   # subshell, whose parent is the watcher and never $p, so the watcher quit and removed the dir before bwrap bound it.
-  ( trap 'rm -rf "$m"' EXIT; w=$BASHPID
+  ( [ -z "${RSL:-}" ] || exec {RSL}<&-   # never a holder of the store's lock (ONE HAND ON A STORE AT A TIME); unset if no build opened it
+    trap 'rm -rf "$m"' EXIT; w=$BASHPID
     while [ "$(awk '{print $4}' "/proc/$w/stat" 2>/dev/null)" = "$p" ]; do sleep 1
       s=$(stat -c '%i %s %y' -- "$src" 2>/dev/null) || continue
-      [ "$s" = "$last" ] || { login_strip "$src" "$m" && last=$s; }; done ) </dev/null >/dev/null 2>&1 {RSL}<&- &   # never a holder of the store's lock (ONE HAND ON A STORE AT A TIME)
+      [ "$s" = "$last" ] || { login_strip "$src" "$m" && last=$s; }; done ) </dev/null >/dev/null 2>&1 &
   LM=$m; }
 egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
 cred_left(){ local e; e=$(cred_exp "$1"); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
@@ -818,6 +820,7 @@ worker_cred(){   # → the credentials file a WORKER's stripped copy is made fro
   # is a project setting, and its hooks would run here with the host's rights.
   if cred_usable "$w" && [ "$(cred_left "$w")" -lt 3900 ]; then
     ( umask 077; cwd=""   # the dir is 0700 (above); the lock and temp files this makes in it are 0600
+      [ -z "${RSL:-}" ] || exec {RSL}<&-   # a child claude leaves behind never holds the store's lock (login_mirror); unset under `worker-cred`
       exec 9>"$d/.cc-worker-refresh.lock" && flock -w 150 9 || exit 0
       [ "$(cred_left "$w")" -lt 3900 ] || exit 0   # another launch refreshed it while this one waited
       jset(){ local tf; tf=$(mktemp "$d/.credentials.json.cc-tmp-XXXXXX") && jq "$@" "$w" > "$tf" && mv -f "$tf" "$w" || { rm -f "$tf"; return 1; }; }   # a temp of its own, never a fixed name
@@ -3402,7 +3405,7 @@ selfcheck_section(){   # $1 a section name (`cc-sandbox selfcheck hwde`) → tha
   local p=$((n - bad))
   [ $rc = 0 ] && [ $n -gt 0 ] || { bad=$((bad+1)); echo "FAIL $1: the section returned $rc after $n cases — its fixture was not built, so this is no pass"; }
   printf 'cc-sandbox selfcheck %s: %s passed, %s failed\n' "$1" "$p" "$bad"; [ "$bad" = 0 ]; }
-SELFCHECK_ALONE="hwde toolchains"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
+SELFCHECK_ALONE="hwde toolchains workercred"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
 selfcheck_gpu(){   # THE CARD (gpu_bind), in a HOME of its own. The bind list and the no-card host are driven on a fixture
   # dir of plain files standing in for /dev, so they run on every host; the launch cases run where the host has a card,
   # and on one without it they prove a worker sees no /dev/nvidia* and the host's ~/.cc/gpu is never made.
@@ -3564,6 +3567,20 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   run "$wf" "$fh/slowrefresher" t2 > "$fh/a.out" & out=$(run "$wf" "$fh/slowrefresher"); wait
   t "workers' login: two launches at once → one refresh, and both run on the fresh token" \
     "$(grep -c . "$fh/refreshed")/$(g tok)/$(out=$(cat "$fh/a.out"); g tok)" 1/wk-fresh/wk-fresh
+  # A CHILD THE REFRESH LEAVES BEHIND never holds the store's lock: the stand-in leaves a sleep running, and while the
+  # worker runs the lock's holders are read from /proc, the egress proxy alone, as the host refresher's live case does.
+  # The sleep still running is what lets the case fail; it is killed after, since it holds the refresh lock too.
+  printf '#!/bin/sh\nsleep 300 </dev/null >/dev/null 2>&1 &\necho $! > %s/stray\nexec %s "$@"\n' "$fh" "$fh/refresher" > "$fh/strayrefresher"; chmod +x "$fh/strayrefresher"
+  local sd="$fh/.cc/state/r/t" spid sk=0 shp sh; rm -f "$sd/seen" "$sd/go"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
+  probe='echo up > '"$sd/seen"'; i=0; while [ ! -e '"$sd/go"' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; echo tok=$(jq -r ".claudeAiOauth.accessToken" ~/.claude/.credentials.json)' \
+    run "$wf" "$fh/strayrefresher" > "$fh/stray.out" & spid=$!
+  while [ ! -s "$sd/seen" ] && [ $sk -lt 600 ] && kill -0 "$spid" 2>/dev/null; do sleep 0.1; sk=$((sk + 1)); done
+  shp=$(for f in /proc/[0-9]*/fd/*; do [ "$(readlink "$f" 2>/dev/null)" = "$fh/.cc/sandbox/r/t/refstore.lock" ] && echo "${f%/fd/*}"; done | sort -u)
+  sh="$(grep -c . <<<"$shp")/$(for p in $shp; do tr '\0' ' ' < "$p/cmdline"; echo; done | grep -c ' serve --socket ')"
+  sh="$sh/$(kill -0 "$(cat "$fh/stray" 2>/dev/null)" 2>/dev/null && echo alive || echo gone)"
+  : > "$sd/go"; wait "$spid"; out=$(cat "$fh/stray.out"); kill "$(cat "$fh/stray" 2>/dev/null)" 2>/dev/null
+  t "workers' login: a child the refresh leaves running never holds the store's lock — the egress proxy alone does while the worker runs" \
+    "$sh/$(g tok)" 1/1/alive/wk-fresh
   # THE KEY'S SHAPE (an allow-list): ~/.claude-<name>/.credentials.json and nothing else; each other shape is one line
   # and the box's login. The near-expiry token in each proves no refresh ran from the refused dir either.
   rm -f "$fh/refreshed"; wk wk-old $(( ($(date +%s) + 600) * 1000 ))
