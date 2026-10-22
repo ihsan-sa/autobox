@@ -17,7 +17,7 @@ held across a fetch or the merge's critical section, never across a check or a r
                                              the merged tree's new objects are copied into the checkout for the run)
     read_verified(root, rev, path)           a file's bytes at a commit or tree, or None; read VERIFIED
     paths_in(root, rev, paths)               which of the paths are in rev's tree; read VERIFIED
-    has_workflows(root, rev)                 rev's tree has a GitHub Actions workflow; read VERIFIED
+    has_workflows(root, rev)                 rev's GitHub Actions workflow files ([] for none); read VERIFIED
     sealed(root, *revs)           a scratch repo holding only the revs, fetched from the checkout (see SEALED)
     pr_changed(root, base, head)  `diff --name-only --no-renames -z` from the merge-base of base and head to head,
                                   each path as it is, both found sealed
@@ -451,13 +451,15 @@ def files_in(root, rev) -> dict:
         return out
 
 
-def has_workflows(root, rev) -> bool:
-    """rev's tree has a GitHub Actions workflow (a .yml or .yaml file in .github/workflows); read VERIFIED."""
+def has_workflows(root, rev) -> list:
+    """rev's GitHub Actions workflows: the paths of the .yml or .yaml files in .github/workflows, [] for none; read
+    VERIFIED. GitHub may have disabled any of them (gh.workflows_on)."""
     with Objects(root) as o:
         e = o.entry(o.tree(rev), ".github/workflows")
         if e is None or e[0] != b"40000":
-            return False
-        return any(n.endswith((b".yml", b".yaml")) and m != b"40000" for n, (m, _) in o.entries(e[1]).items())
+            return []
+        return [".github/workflows/" + n.decode("utf-8", "replace") for n, (m, _) in o.entries(e[1]).items()
+                if n.endswith((b".yml", b".yaml")) and m != b"40000"]
 
 
 # git on a worktree someone else wrote (`lander check` on a fenced worker's tree): no git runs with GIT_DIR its admin

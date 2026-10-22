@@ -15,6 +15,8 @@
         took it, and none is still running; their run ids go into the caller's `runs` list, never parsed from
         detail), "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
         (unreadable). The lane merges on green or none only.
+    workflows_on(root, paths) -> bool: any of the base tree's workflow `paths` is one GitHub lists as active; the tree's
+        own answer (any paths at all) when GitHub cannot be read. Cached per repo for WORKFLOWS_TTL.
     rerun(root, run_id) -> (ok, text): `gh run rerun <run_id> --failed [-R <slug>]`, which reruns the cancelled jobs.
     behind(root, pr) -> bool: GitHub's mergeStateStatus is BEHIND (strict branch protection: the PR's branch must hold
         the base's tip before it merges); False when gh would not answer.
@@ -413,6 +415,30 @@ def ci_state(root, pr, pin, token=None, workflows=False, runs=None):
     if pending:
         return "pending", "still running: " + ", ".join(pending)
     return "green", f"{len(rows)} check(s) passed"
+
+
+WORKFLOWS_TTL = 300
+_WORKFLOWS = {}   # slug -> (when, {path: state}) as actions/workflows last answered there
+
+
+def workflows_on(root, paths, token=None) -> bool:
+    """Any of `paths` (the base tree's workflow files) is a workflow GitHub runs: actions/workflows lists its path as
+    active (2026-10-21: dispatch's only workflow, disabled_manually since 10-15 but still in the tree, held every PR
+    CI_REGISTER_WAITS for runs that never came). GitHub unreadable is the tree's answer, any paths at all, so an outage
+    never skips real CI. One read per repo per WORKFLOWS_TTL, so a queue of PRs asks once."""
+    if not paths:
+        return False
+    s = slug(root)
+    hit = _WORKFLOWS.get(s)
+    if not hit or time.time() - hit[0] > WORKFLOWS_TTL:
+        j = api_json(root, f"repos/{s}/actions/workflows?per_page=100", token) if s else None
+        rows = j.get("workflows") if isinstance(j, dict) else None
+        if not isinstance(rows, list):   # "if that API call fails, fall back to today's tree-only answer"
+            return True
+        hit = _WORKFLOWS[s] = (time.time(), {r.get("path"): r.get("state") for r in rows if isinstance(r, dict)})
+    # a path GitHub doesn't list (added inside the TTL, past page 1, or a name it spells differently) still counts:
+    # only a workflow GitHub names as off skips the wait
+    return any(hit[1].get(p, "active") == "active" for p in paths)
 
 
 STARVED_RE = re.compile(r"not acquired by Runner", re.I)

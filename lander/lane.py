@@ -1623,13 +1623,14 @@ class Lane:
         """True when GitHub's CI lets the merge go: green, or no CI at all ("a repo with no CI configured lands as it
         does today"). "the lander never merges a head whose GitHub CI is red or still running" (2026-10-02: website
         #27-29 and #64-68 merged and deployed on a red build): red hands it back, running holds it. An empty check
-        list on a base with workflows waits CI_REGISTER_WAITS for GitHub to register the runs, then lands as no CI
-        (workflows that never run on a PR). Unreadable holds, and the CI_UNREADS+1th at one head is a query: a token
-        that reads the PR but not its checks would otherwise hold it every sweep, silently. A spent rate limit is never
-        counted (2026-10-21: three PRs became queries over a spent hour and sat two hours past its reset) and waits
+        list on a base with workflows GitHub runs (GH.workflows_on: one disabled there is no CI) waits
+        CI_REGISTER_WAITS for GitHub to register the runs, then lands as no CI (workflows that never run on a PR).
+        Unreadable holds, and the CI_UNREADS+1th at one head is a query: a token that reads the PR but not its checks
+        would otherwise hold it every sweep, silently. A spent rate limit is never counted (2026-10-21: three PRs
+        became queries over a spent hour and sat two hours past its reset) and waits
         for its reset; "rate limit" in gh's words with the quota left is counted like any unread (GH.spent)."""
         try:
-            workflows = G.has_workflows(self.root, job.base_sha)
+            workflows = GH.workflows_on(self.root, G.has_workflows(self.root, job.base_sha), self.token)
         except G.GitError:
             workflows = True   # a base that cannot be read is not evidence of no CI: wait for checks to show
         runs = []   # the starved cancels' run ids, as ci_state verified them; never read back out of detail

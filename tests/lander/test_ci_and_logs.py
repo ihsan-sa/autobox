@@ -152,6 +152,46 @@ class CIGate(TL.Fixture):
         self.assertEqual(len(self.box()["merges"]), 1)
         self.assertNotIn("ci_wait", self.job().extra)
 
+    def test_workflows_github_has_disabled_are_no_ci(self):
+        self.with_workflows()
+        self.set_box(workflows=[{"path": ".github/workflows/ci.yml", "state": "disabled_manually"}])
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[])
+        self.pr(2, {"a/y": "n\n"}, statusCheckRollup=[])
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        self.land()
+        self.land()
+        self.assertEqual(len(self.box()["merges"]), 2)   # no wait for runs that never come
+        self.assertEqual(sum("/actions/workflows?" in " ".join(c) for c in self.box()["calls"]), 1)   # cached
+
+    def test_one_active_workflow_beside_a_disabled_one_waits(self):
+        self.push("main", {".github/workflows/ci.yml": "on: pull_request\n",
+                           ".github/workflows/old.yaml": "on: pull_request\n"}, fresh=False)
+        self.set_box(workflows=[{"path": ".github/workflows/old.yaml", "state": "disabled_manually"},
+                                {"path": ".github/workflows/ci.yml", "state": "active"}])
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[])
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.box().get("merges", []), [])
+        self.assertIn("no check has registered yet", self.job().extra["why"])
+
+    def test_a_workflow_github_does_not_list_still_waits(self):
+        self.with_workflows()   # the tree's ci.yml, which GitHub's answer leaves out (added within the cache's TTL)
+        self.set_box(workflows=[{"path": ".github/workflows/old.yaml", "state": "disabled_manually"}])
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[])
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.box().get("merges", []), [])
+        self.assertIn("no check has registered yet", self.job().extra["why"])
+
+    def test_workflows_unreadable_on_github_count_as_the_tree_says(self):
+        self.with_workflows()   # the fake has no "workflows": actions/workflows answers HTTP 502
+        self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[])
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.box().get("merges", []), [])
+        self.assertIn("no check has registered yet", self.job().extra["why"])
+
     def test_unreadable_ci_holds_then_becomes_a_query(self):
         head = self.pr(1, {"a/x": "n\n"}, statusCheckRollup=[run_("test")])
         self.set_box(checks_denied="HTTP 403: Resource not accessible by personal access token")

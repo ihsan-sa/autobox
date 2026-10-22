@@ -216,6 +216,8 @@ if me == "gh":
     if a[:1] == ["api"] and ("/actions/jobs/" in a[1] or "/check-runs/" in a[1]):   # one job, one check run
         got = box.get("jobs" if "/actions/jobs/" in a[1] else "check_runs", {}).get(a[1].split("/")[-1])
         out(0, json.dumps(got)) if got is not None else out(1, "", "gh: Not Found (HTTP 404)")
+    if a[:1] == ["api"] and "/actions/workflows?" in a[1]:   # gh.workflows_on: box["workflows"], else GitHub is down
+        out(0, json.dumps({"workflows": box["workflows"]})) if "workflows" in box else out(1, "", "HTTP 502")
     if a[:2] == ["run", "rerun"]:   # a rerun GitHub accepts; after_rerun is every PR's rollup from then on
         box.setdefault("reruns", []).append(a[2])
         for pr in prs.values():
@@ -459,6 +461,9 @@ class Fixture(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.dict(GH._VIEWER, clear=True)   # each case's gh says its own login
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.dict(GH._WORKFLOWS, clear=True)   # each case's GitHub lists its own workflows
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(L, "spawn_tick", lambda repo: (True, "test"))
