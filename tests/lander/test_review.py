@@ -2656,6 +2656,33 @@ class TestPermsReads(Case):
         self.assertIn("(HANDBACK) and has no read of its head",
                       R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
 
+    # #1842 (10-22): perms recorded LAND in its ledger 48 s after its reader handed the same head back, and the lane
+    # still stopped on the reader's HANDBACK until perms moved the file by hand
+    def handback_then_ledger(self, finished, at, head=HEAD):
+        R.write_read("demo", self.entry(verdict="HANDBACK", finished=finished))
+        path = R.perms_reads_path("demo")
+        with open(path, "w") as f:
+            json.dump([{"repo": "demo", "pr": 7, "head": head, "change": R.change_digest(DIFF), "verdict": "LAND",
+                        "at": at}], f)
+        os.chmod(path, 0o600)
+        return R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))
+
+    def test_a_later_ledger_land_at_the_head_clears_the_readers_handback(self):
+        self.assertEqual(self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z"), ("", False))
+
+    def test_an_earlier_ledger_land_leaves_the_readers_handback_standing(self):
+        for at in ("2026-10-22T08:01:00Z", "2026-10-22T08:02:31Z"):   # before, and the same second
+            self.assertIn("says HANDBACK", self.handback_then_ledger("2026-10-22T08:02:31Z", at)[0], at)
+
+    def test_a_ledger_land_at_another_head_leaves_the_readers_handback_standing(self):
+        self.assertIn("says HANDBACK",
+                      self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:03:19Z", head="c" * 40)[0])
+
+    def test_an_unparseable_time_leaves_the_readers_handback_standing(self):
+        for finished, at in (("08:02:31", "2026-10-22T08:03:19Z"), ("2026-10-22T08:02:31Z", "soon"),
+                             (None, "2026-10-22T08:03:19Z")):
+            self.assertIn("says HANDBACK", self.handback_then_ledger(finished, at)[0], (finished, at))
+
     def test_hole_2_a_failed_stale_or_dead_read_at_the_head_is_a_query(self):
         for state, extra, said in (("failed", {"why": "boom"}, 'is failed ("boom")'), ("stale", {}, "is stale"),
                                    ("running", {"pid": 2 ** 22 + 1}, "died with no verdict")):

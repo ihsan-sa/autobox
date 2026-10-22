@@ -2262,8 +2262,8 @@ def cmd_will_review(argv):
 #   and whatever `perms-reads` prints from a file is quoted, control characters spelled out (quoted()).
 # The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge). It holds (box) while a
 # read of the PR runs at any head, or for a read's run window (HOLD_WINDOW) while perms' `perms-hold` stub stands at
-# its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change) is a
-# query for the planning seat, which is where a read that died with no verdict surfaces.
+# its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change, or a
+# HANDBACK at the head that perms' ledger LAND at it was recorded after) is a query for the planning seat, which is where a read that died with no verdict surfaces.
 
 PERMS_READ_DIR = "reads"
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -2411,7 +2411,9 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
     perms' to act on, and the lane makes it a query (perms' read of #1525, 10-19: each of these let a merge through):
     a finished read at `head` that is not a LAND; one at `head` that failed, went stale or died with no verdict; reads
     of older heads and none at `head` (a push after perms' HANDBACK); a read file that will not load; a reads dir that
-    is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase)."""
+    is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase).
+    A HANDBACK at `head` is cleared by perms' ledger LAND at `head` and its change (perms_recorded) recorded a later
+    second than the read finished; a time either side does not give clears nothing (#1842)."""
     d, why = read_dir(repo)
     if not d:
         return ("", False) if reads_absent(repo) else (f"perms' reads dir will not read ({why})", False)
@@ -2447,6 +2449,14 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
             return f"perms holds PR #{pr} at {head[:12]} for its security read", True
         return (f"perms held PR #{pr} at {head[:12]} for its security read and none started within "
                 f"{HOLD_WINDOW // 60} minutes: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
+    if state == "done" and at.get("verdict") == T.HANDBACK_VERDICT and perms_recorded(repo, pr, head, [digest]):
+        from lander import events as E
+        land = E.epoch_of(newest_reads(perms_reads(repo)[0], repo, pr)[head].get("at"))
+        back = E.epoch_of(at.get("finished"))
+        # brief (#1842): "a security-reads LAND at the same head, recorded at a later second than the reader file's
+        # finish time, clear[s] that reader file's HANDBACK"; "An unparseable time clears nothing."
+        if back and land and back < land:
+            return "", False
     if state == "done":
         return f"perms' security read of PR #{pr} at {head[:12]} says {at.get('verdict') or 'nothing'}", False
     said = "died with no verdict" if state == "running" else f"is {state or 'unfinished'}"
