@@ -182,7 +182,7 @@
 #   (cc-loop), and a worker must not re-point its hooksPath or its remotes, nor write a hook the host would run. Every
 #   source in a tree this list hands the worker rw is bound BY DESCRIPTOR and not by name (see `pin`, and the paragraph
 #   in `build`) ·
-#   ~/.cc/state/<repo>/<track> · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
+#   ~/.cc/state/<repo>/<track> · ~/.npm · ~/.cache (a member-facing repo's own, ~/.cc/caches/<repo>: facing) · /tmp · a private ~/.claude with settings ro, this cwd's
 #   transcripts and the repo's memory rw (an empty one on a member-facing repo: facing), nothing else of it · a COPY of ~/.claude.json with every other project's history
 #   and the MCP servers stripped (Slack stops loading: workers do not post).
 # INSIDE ro: ~/.cc/boards, and each ~/.cc/members/*/board under it (a member's board is a link into one — board_dir). A worker
@@ -519,9 +519,13 @@ rs_seed(){   # $1 repo · $2 track → a private $NSD holding this track's own r
   [ -f "$dev/.git/logs/$NSD/$2" ] && cp "$dev/.git/logs/$NSD/$2" "$rs/logs/$2"   # its own reflog, so an amend inside has something to walk back to
   return 0; }
 build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
-  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd rs cw ks
+  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd rs cw ks cn cc
   proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
-  mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
+  # A MEMBER-FACING REPO'S BUILD CACHES ARE ITS OWN (~/.cc/caches/<repo>, under no bind, seen AS ~/.npm and ~/.cache): a
+  # worker building member-pushed code writes GOCACHE, pip and npm entries that a worker on another repo would trust and
+  # build from, and it would read the owner repos' caches too. Owner repos keep the shared pair, as before.
+  cn="$H/.npm" cc="$H/.cache"; facing "$1" && cn="$H/.cc/caches/$1/npm" cc="$H/.cc/caches/$1/cache"
+  mkdir -p "$proj" "$mem" "$cn" "$cc" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
      --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
@@ -644,7 +648,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   honest_view "$1" "$2"   # the masked checkout says it is masked, and `cc` is never the C compiler (honest_view)
   pinq --bind "$st"; pinq --bind "$proj"
   if facing "$1"; then B+=(--dir "$mem"); else pinq --bind "$mem"; fi   # a member-facing repo's worker gets an empty memory dir, not the owner's notes (facing)
-  B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
+  B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$cn" "$H/.npm" --bind "$cc" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
      --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv CC_TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN
      --unsetenv CC_SANDBOX_TEST_DELAY --unsetenv CC_SANDBOX_TEST_REFRESH_FLAG --unsetenv CC_SANDBOX_TEST_REFRESH_UID --setenv TMPDIR /tmp --chdir "$wt")   # the host's TMPDIR ($H/.cc/tmp) is under the tmpfs $H: scratch stays in this sandbox's own /tmp
@@ -3332,6 +3336,29 @@ selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its
     sudo -n chown "$(id -u):$(id -g)" "$tc" 2>/dev/null
   fi
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_caches(){   # BUILD CACHES (build), in a HOME of its own: a worker on a member-facing repo writes a GOCACHE, pip and
+  # npm entry, and a worker on another repo, or a second member-facing one, sees none of them; owner repos still share theirs.
+  local fh r probe
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxca-XXXXXX") || return 1; chmod 700 "$fh"
+  mkdir -p "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" || return 1
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  for r in mf mf2 ownr ownr2; do
+    mkdir -p "$fh/dev/$r" "$fh/.cc/worktrees/$r" || return 1
+    git -C "$fh/dev/$r" init -q -b main && git -C "$fh/dev/$r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+      && git -C "$fh/dev/$r" worktree add -q -b track/t "$fh/.cc/worktrees/$r/t" >/dev/null 2>&1 || return 1
+  done
+  mkdir -p "$fh/.cc/members/mf" "$fh/dev/mf2/.cc"; : > "$fh/dev/mf2/.cc/member-facing"   # one by the host's record, one by the marker
+  # $1 write: plant one GOCACHE, pip and npm entry · read: print 1 or 0 for each of the three
+  probe='for p in .cache/go-build/ab/planted .cache/pip/planted .npm/_cacache/planted; do
+    if [ "$1" = write ]; then mkdir -p "$(dirname ~/$p)" && echo x > ~/$p && printf 1; else [ -e ~/$p ] && printf 1 || printf 0; fi; done; echo'
+  w(){ env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" "$1" t -- sh -c "$probe" _ "$2" 2>/dev/null | tail -1; }
+  x(){ rm -rf "${fh:?}/.cache" "${fh:?}/.npm" "${fh:?}/.cc/caches"; w "$1" write; }   # every case starts from no cache at all, then $1 writes
+  t 'caches: entries a member-facing worker wrote are there for its next worker, and not for an owner repo'"'"'s' "$(x mf)/$(w mf read)/$(w ownr read)" 111/111/000
+  t 'caches: …they sit under ~/.cc/caches/<repo>, and nothing reaches the shared ~/.cache or ~/.npm' \
+    "$(x mf)/$(find "$fh/.cc/caches/mf" -name planted | wc -l)/$(find "$fh/.cache" "$fh/.npm" -name planted | wc -l)" 111/3/0
+  t 'caches: …nor are they there for a second member-facing repo, marked in its checkout alone' "$(x mf)/$(w mf2 read)" 111/000
+  t 'caches: owner repos still share theirs, and a member-facing worker sees none of them' "$(x ownr)/$(w ownr2 read)/$(w mf read)" 111/111/000
+  rm -rf "${fh:?}"; }
 selfcheck_hwde(){   # the hwde toolchain (hwde_bind), in a HOME of its own: ~/.local/kicad10, hwde-tools and hwde-venv bound
   # ro into a boards worker, where kicad-cli runs and no dir can be written; into a repo that names hwde the same way;
   # into any other repo's worker not at all; a missing dir said in one line, an unsafe one refused in one line; a venv
@@ -3444,7 +3471,7 @@ selfcheck_section(){   # $1 a section name (`cc-sandbox selfcheck hwde`) → tha
   local p=$((n - bad))
   [ $rc = 0 ] && [ $n -gt 0 ] || { bad=$((bad+1)); echo "FAIL $1: the section returned $rc after $n cases — its fixture was not built, so this is no pass"; }
   printf 'cc-sandbox selfcheck %s: %s passed, %s failed\n' "$1" "$p" "$bad"; [ "$bad" = 0 ]; }
-SELFCHECK_ALONE="go hwde toolchains workercred"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
+SELFCHECK_ALONE="caches go hwde toolchains workercred"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
 selfcheck_gpu(){   # THE CARD (gpu_bind), in a HOME of its own. The bind list and the no-card host are driven on a fixture
   # dir of plain files standing in for /dev, so they run on every host; the launch cases run where the host has a card,
   # and on one without it they prove a worker sees no /dev/nvidia* and the host's ~/.cc/gpu is never made.
@@ -4430,7 +4457,7 @@ print(" ".join(m for m in "ownnote owndoc ownprog leakmem leakseat leakarch leak
   out="$(env HOME="$out" CC_SANDBOX_SELFCHECK_HOME="$out" "$SELF" selfcheck 2>&1; echo "rc=$?")|$(env CC_SANDBOX_SELFCHECK_HOME="$H/x" "$SELF" selfcheck 2>&1; echo "rc=$?")"
   t 'selfcheck refuses the real HOME, and a marker that is not HOME, in one line each' \
     "$(grep -c '^cc-sandbox selfcheck: refused: ' <<<"${out//|/$'\n'}")/$(grep -o 'rc=[0-9]*' <<<"$out" | tr '\n' ' ')" '2/rc=1 rc=1 '
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_go; selfcheck_hwde; selfcheck_cfgwt; selfcheck_gpu; selfcheck_workercred; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_go; selfcheck_caches; selfcheck_hwde; selfcheck_cfgwt; selfcheck_gpu; selfcheck_workercred; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip. Where no pid namespace of
   # its own here can hold the sandboxes its cases start, they run unnested over the host's /proc and print an
   # UNNESTED line saying why (tests/member_v2.py, own_pidns). That reason goes on this tally's last line.
