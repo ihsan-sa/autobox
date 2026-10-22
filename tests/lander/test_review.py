@@ -2204,6 +2204,17 @@ class TestSecurityPaths(Case):
         self.reads([self.rec(j), self.rec(j, pr=8, verdict="FIX"), self.rec(j, head="c" * 40, verdict="FIX")])
         self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))   # another PR's or head's FIX does not
 
+    def test_a_delta_land_falls_with_a_fix_at_its_since(self):
+        """Perms' read of #1859: a FIX recorded at the old head a delta LAND rests on takes that LAND back."""
+        j = self.sec_job(self.PATHS[0])
+        old = self.rec(j, head=self.OLD, change="0" * 16)
+        self.reads([old, self.rec(j, since=self.OLD)])
+        self.assertTrue(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        self.reads([old, self.rec(j, since=self.OLD), dict(old, verdict="FIX")])
+        self.assertIsNone(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+        self.reads([self.rec(j, since=self.OLD)])   # no LAND at its since at all
+        self.assertIsNone(R.perms_recorded(j.repo, j.pr, j.head, {j.digest}))
+
     def test_an_empty_digest_is_never_perms_recorded(self):
         """Opus read of #1564: with no reviewer unit job.digest is "", so an entry with an empty change counted."""
         j = self.sec_job(self.PATHS[0])
@@ -2229,11 +2240,137 @@ class TestSecurityPaths(Case):
         self.fake = self.box(claude=claude_says("LAND"))
         j = self.sec_job(self.PATHS[0])
         self.reads([entry or self.rec(j, head=self.OLD, change="0" * 16)])
-        real = (R.security_globs, R.delta_files)
-        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
+        real = (R.security_globs, R.delta_files, R.remerges, R.on_default)
+        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1]),
+                                 setattr(R, "remerges", real[2]), setattr(R, "on_default", real[3])))
+        R.on_default = lambda job: True   # the real check is test_a_retargeted_pr_*
         R.security_globs = lambda root, base, repo: list(self.PATHS)
         R.delta_files = lambda root, base, old, new: list(delta) if old == self.OLD and new == j.head else None
+        # same_change: no old head remerges to this one unless a test says so (the real git is test_remerges_*)
+        self.same = set()
+        R.remerges = lambda root, base, old, new: old in self.same and new == j.head
         return j
+
+    # the remerge carry (same_change): perms' LAND of an older head carries, whatever paths the delta touches, when
+    # git's own merge of that head onto this one's merge-base gives this head's tree
+
+    def queue_log(self):
+        with open(os.path.join(os.environ["CC_LAND_STATE"], "queue.log")) as f:
+            return f.read()
+
+    def test_an_identical_change_carries_and_says_so_with_both_heads(self):
+        j = self.carry(self.PATHS)   # the delta touches security paths, so only the remerge carry can carry it
+        self.same = {self.OLD}
+        self.assertEqual(R.carried_from(j), self.OLD)
+        self.assertEqual(R.same_change(j), self.OLD)
+        self.assertIn(f"perms-carry demo#7 read={self.OLD} head={HEAD} why=clean-remerge", self.queue_log())
+        self.assertEqual(R.review(j, comments=[]).extra.get("carried_from"), self.OLD)
+
+    def test_a_head_that_does_not_merge_clean_carries_nothing(self):
+        j = self.carry(self.PATHS)
+        self.same = {self.OLD}
+        with mock.patch.object(R, "merges_clean", lambda *a: False):
+            self.assertEqual(R.same_change(j), "")
+        self.assertNotIn("perms-carry", self.queue_log() if os.path.exists(os.path.join(
+            os.environ["CC_LAND_STATE"], "queue.log")) else "")
+
+    def test_no_remerge_still_holds(self):
+        j = self.carry(self.PATHS)
+        self.assertEqual((R.same_change(j), R.carried_from(j)), ("", ""))
+        self.blocked(j, [], self.PATHS[0])
+
+    def remerge_repo(self, base_text, old_text, main_text):
+        """A real repo: base, the PR's old head on it, and main moved on from base. -> (git, commit, base, old, main)."""
+        C.sh = self.real_sh
+        root = self.tmp
+        os.rmdir(os.path.join(root, ".git"))
+
+        def git(*argv):
+            return subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t", *argv],
+                                  check=True, capture_output=True).stdout.decode().strip()
+
+        def commit(text):
+            with open(os.path.join(root, "x.py"), "wb") as f:
+                f.write(text.encode())
+            git("add", "x.py")
+            git("commit", "-qm", "c")
+            return git("rev-parse", "HEAD")
+        git("init", "-q", "-b", "main")
+        base = commit(base_text)
+        old = commit(old_text)
+        git("checkout", "-q", base)
+        main = commit(main_text)
+        git("checkout", "-q", old)
+        return git, commit, root, old, main
+
+    def test_remerges_a_context_only_merge_of_main(self):
+        git, commit, root, old, main = self.remerge_repo("1\n2\n3\n4\n5\n", "1\n2\nA\n4\n5\n", "M\n2\n3\n4\n5\n")
+        git("merge", "-q", "--no-edit", main)   # main changed a context line of the PR's hunk
+        new = git("rev-parse", "HEAD")
+        self.assertNotEqual(R.change_digest(R.diff_of(root, main, old)), R.change_digest(R.diff_of(root, main, new)))
+        self.assertTrue(R.remerges(root, main, old, new))
+
+    def test_a_line_moved_within_a_file_does_not_remerge(self):
+        """Planning's read of 10-22: `return True` moved from one function to another kept the +/- lines."""
+        text = "def is_owner():\n    return u.admin\n\ndef debug_enabled():\n    return env.debug\n\n# end\n"
+        git, commit, root, old, main = self.remerge_repo(
+            text, text.replace("    return env", "    return True\n    return env"), text.replace("# end", "# end of file"))
+        git("merge", "-q", "--no-commit", main)   # the same added line, now under is_owner()
+        new = commit(text.replace("    return u", "    return True\n    return u").replace("# end", "# end of file"))
+        self.assertFalse(R.remerges(root, main, old, new))
+
+    def test_a_change_after_a_form_feed_or_cr_does_not_remerge(self):
+        """Planning's read of 10-22: splitlines() broke at \f and \r, so code after one read as context."""
+        for sep in ("\f", "\r"):
+            git, commit, root, old, main = self.remerge_repo("a\nb\nc\nd\n", f"a{sep}ok\nb\nc\nd\n", "a\nb\nc\nD\n")
+            git("merge", "-q", "--no-commit", main)
+            new = commit(f"a{sep}evil\nb\nc\nD\n")
+            self.assertFalse(R.remerges(root, main, old, new), repr(sep))
+            shutil.rmtree(self.tmp)
+            os.makedirs(os.path.join(self.tmp, ".git"))
+
+    def test_a_conflicted_old_head_does_not_remerge(self):
+        git, commit, root, old, main = self.remerge_repo("1\n2\n", "A\n2\n", "B\n2\n")
+        git("checkout", "-q", main)
+        self.assertFalse(R.remerges(root, main, old, main))
+
+    def test_a_retargeted_pr_carries_nothing_off_the_default_branch(self):
+        """Perms' read of #1859: a LANDed PR retargeted onto a worker's branch holding an unread file remerged clean
+        there, and the carry let that file reach the host checks. Only main at its fetched tip carries."""
+        git, commit, root, old, main = self.remerge_repo("1\n2\n3\n4\n5\n", "1\n2\nA\n4\n5\n", "M\n2\n3\n4\n5\n")
+        git("checkout", "-q", "-b", "worker", main)
+        with open(os.path.join(root, "unread.py"), "w") as f:
+            f.write("import os\n")
+        git("add", "unread.py")
+        git("commit", "-qm", "w")
+        worker = git("rev-parse", "HEAD")
+        git("checkout", "-q", old)
+        git("merge", "-q", "--no-edit", worker)
+        new = git("rev-parse", "HEAD")
+        j = self.sec_job(self.PATHS[0])
+        j.head, j.base_sha = new, worker
+        j.extra.update(root=root, base_ref="worker")
+        self.reads([self.rec(j, head=old, change="0" * 16)])
+        self.assertTrue(R.remerges(root, worker, old, new))   # what carried before the check
+        with mock.patch("lander.tick.default_base", lambda root, slug: ("main", main)):
+            self.assertEqual(R.same_change(j), "")
+            j.extra["base_ref"] = "main"   # named main, yet its base_sha is the worker's tip
+            self.assertEqual(R.same_change(j), "")
+        git("checkout", "-q", old)
+        git("merge", "-q", "--no-edit", main)
+        j.head, j.base_sha = git("rev-parse", "HEAD"), main
+        self.reads([self.rec(j, head=old, change="0" * 16)])
+        with mock.patch("lander.tick.default_base", lambda root, slug: ("main", main)):
+            self.assertEqual(R.same_change(j), old)   # the same PR on main at its tip still carries
+
+    def test_an_old_land_perms_took_back_never_carries_on_its_lines(self):
+        j = self.carry(self.PATHS)
+        self.same = {self.OLD}
+        old = self.rec(j, head=self.OLD, change="0" * 16)
+        self.reads([old, self.rec(j, head="c" * 40, verdict="HANDBACK")])   # a later non-LAND of the PR
+        self.assertEqual(R.same_change(j), "")
+        self.reads([old, self.rec(j, verdict="FIX")])   # this head's own FIX
+        self.assertEqual(R.same_change(j), "")
 
     def test_a_perms_land_carries_to_a_head_whose_delta_touches_no_security_path(self):
         j = self.carry(["x.py", "docs/notes.md"])
@@ -2349,11 +2486,53 @@ class TestSecurityPaths(Case):
         self.assertEqual(R.delta_files(root, base, old, old), [])
         self.assertIsNone(R.delta_files(root, base, "f" * 40, new))   # an old head that is gone
 
+    def test_the_delta_read_shows_a_change_slipped_into_a_merge_of_main(self):
+        """perms' answer of 10-22: the delta carries the hand resolution, the old head auto-merged onto the new
+        merge-base and diffed against the new head, which is where a resolution hides a change."""
+        C.sh = self.real_sh
+        root = self.tmp
+        os.rmdir(os.path.join(root, ".git"))
+
+        def git(*argv):
+            return subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t", *argv],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        def commit(text):
+            with open(os.path.join(root, "x.py"), "w") as f:
+                f.write(text)
+            git("add", "x.py")
+            git("commit", "-qm", "c")
+            return git("rev-parse", "HEAD")
+        git("init", "-q", "-b", "main")
+        base = commit("1\n2\n3\n4\n5\n")
+        old = commit("A\n2\n3\n4\n5\n")
+        git("checkout", "-q", base)
+        main = commit("1\n2\n3\n4\nE\n")
+        git("checkout", "-q", old)
+        git("merge", "-q", "--no-edit", main)
+        clean = git("rev-parse", "HEAD")
+        rc, d = R.delta_text(root, main, old, clean)
+        self.assertEqual(rc, 0)
+        self.assertIn(R.RESOLVED + "(none", d)
+        self.assertTrue(R.merges_clean(root, main, clean))
+        git("checkout", "-q", old)
+        git("merge", "-q", "--no-commit", main)
+        slipped = commit("A\nevil\n3\n4\nE\n")   # the merge commit also changes a line nobody read
+        rc, d = R.delta_text(root, main, old, slipped)
+        self.assertEqual(rc, 0)
+        self.assertIn("+evil", d.split(R.RESOLVED)[1])
+        git("checkout", "-q", main)
+        clash = commit("Z\n2\n3\n4\nE\n")
+        self.assertFalse(R.merges_clean(root, clash, old))   # both change line 1
+
     def test_a_record_that_does_not_match_or_is_not_perms_own_file_clears_nothing(self):
         box = self.box(claude=claude_says("LAND"))
         path = self.PATHS[0]
         j = self.sec_job(path)
         opus = self.comment("LAND", j.digest, by="opus")
+        p = mock.patch.object(R, "diff_of", lambda root, base, head: DIFF + f"+{head}\n")   # each head its own lines
+        p.start()
+        self.addCleanup(p.stop)
         for entries in ([self.rec(j, head="c" * 40)], [self.rec(j, change="0dd")], [self.rec(j, pr=8)],
                         [self.rec(j, repo="other")], [self.rec(j, pr="7")], {"x": self.rec(j)}, []):
             self.reads(entries)
@@ -2657,7 +2836,18 @@ class TestPermsReads(Case):
         R.write_read("demo", self.entry(head=self.OLD))
         self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))   # a rebase
         self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, "f" * 64)[0])   # a new change
+        self.assertIn(f"perms-read demo 7 --since {self.OLD}`", R.perms_reading("demo", 7, HEAD, "f" * 64)[0])
         self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD)[0])   # no change known: no carry
+
+    def test_an_older_land_the_own_lines_carry_found_lets_it_go(self):
+        R.write_read("demo", self.entry(head=self.OLD, change="0" * 16))
+        self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF), self.OLD), ("", False))
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF), "c" * 40)[0])
+        self.assertIn("has no read of its head", R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF))[0])
+        R.write_read("demo", self.entry(head="c" * 40, verdict="HANDBACK"))
+        os.utime(os.path.join(self.seat, "reads", f"7-{self.OLD}.json"), (1, 1))   # a newer HANDBACK still stands
+        self.assertIn("(HANDBACK) and has no read of its head",
+                      R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF), self.OLD)[0])
 
     def test_hole_1_a_handback_after_an_older_land_at_the_same_change_stands(self):
         R.write_read("demo", self.entry(head=self.OLD))
@@ -2706,6 +2896,15 @@ class TestPermsReads(Case):
         self.assertEqual(R.grant(job, "perms", "perms"), "")
         self.assertEqual(len(self.ledger()), 1)   # the same LAND again: its time moves, nothing appended
         self.assertEqual(R.perms_reading("demo", 7, HEAD, R.change_digest(DIFF)), ("", False))
+
+    def test_a_repeat_ledger_land_keeps_since_as_its_own_read_says(self):
+        """Planning's read of 10-22: #1857's bump-at path keeps `since`: a delta LAND says it, a whole one clears it."""
+        import types
+        self.handback_then_ledger("2026-10-22T08:02:31Z", "2026-10-22T08:01:00Z")
+        job = types.SimpleNamespace(repo="demo", pr=7, head=HEAD, digest=R.change_digest(DIFF))
+        for since in ("a" * 40, "", "b" * 40):
+            self.assertEqual(R.grant(job, "perms", "perms", since=since), "")
+            self.assertEqual((len(self.ledger()), self.ledger()[0].get("since", "")), (1, since))
 
     def test_re_adopting_an_old_land_read_leaves_its_time_and_the_handback(self):
         """Opus read at f3ee2813: only perms' record refreshes `at`; re-adopting the read it finished before a
@@ -2989,6 +3188,9 @@ class TestPermsReads(Case):
         self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
         R.security_globs = lambda root, base, repo: ["bin-private/**"]
         R.delta_files = lambda root, base, old, new: ["bin-private/x"] if old == HEAD else ["x.py"]
+        p = mock.patch.object(R, "diff_of", lambda root, base, head: DIFF + f"+{head}\n")   # each head its own lines
+        p.start()
+        self.addCleanup(p.stop)
         job = T.Job(repo="demo", pr=7, head=later, base_sha=BASE, digest=R.change_digest(DIFF),
                     extra={"root": self.tmp})
         self.assertEqual(self.record_as(True, "LAND", "--by", "perms", "--head", self.OLD, head=self.OLD)[0], 0)
@@ -3107,6 +3309,61 @@ class TestPermsReads(Case):
             os.unlink(os.path.join(self.seat, "reads", f"7-{HEAD}.json"))
             self.assertEqual(R.cmd_perms_read(["demo", "7"]), 1)       # only the perms seat starts one
             self.assertEqual(popen.call_count, 2)
+
+    # the delta read (perms' answer of 10-22): only from a LAND at the exact old head that still carries, onto a head
+    # that merges clean; its LAND, adopted, clears the new head and the ledger names both heads
+    def test_a_delta_read_starts_only_from_a_carrying_land_on_a_clean_merge(self):
+        self.box(**{"gh pr view": self.facts()})
+        with mock.patch.object(R.subprocess, "Popen", return_value=mock.Mock(pid=4242)) as popen:
+            self.assertEqual(R.cmd_perms_read(["demo", "7", "--since", self.OLD[:12]]), 2)   # a full head only
+            self.assertEqual(R.cmd_perms_read(["demo", "7", "--since", self.OLD]), 1)   # no LAND at it
+            R.write_read("demo", self.entry(head=self.OLD))   # a read file is not the ledger: still none
+            self.assertEqual(R.cmd_perms_read(["demo", "7", "--since", self.OLD]), 1)
+            os.unlink(os.path.join(self.seat, "reads", f"7-{self.OLD}.json"))
+            land = {"repo": "demo", "pr": 7, "head": self.OLD, "change": "0" * 16, "verdict": "LAND"}
+            for after in ([dict(land, head="c" * 40, verdict="FIX")], []):
+                with open(R.perms_reads_path("demo"), "w") as f:
+                    json.dump([land, *after], f)
+                os.chmod(R.perms_reads_path("demo"), 0o600)
+                with mock.patch.object(R, "merges_clean", lambda *a: False):
+                    self.assertEqual(R.cmd_perms_read(["demo", "7", "--since", self.OLD]), 1, after)
+            self.assertEqual(popen.call_count, 0)
+            self.assertEqual(R.cmd_perms_read(["demo", "7", "--since", self.OLD]), 0)   # the fake merge is clean
+            self.assertEqual(R.load_read("demo", 7, HEAD)[0]["since"], self.OLD)
+
+    def test_a_delta_read_reads_only_the_delta_and_its_land_clears_the_head(self):
+        box = self.box(**{"gh pr view": self.facts(), "claude": claude_says("LAND", [])})
+        R.RUN_WAIT, real = 1, R.RUN_WAIT
+        self.addCleanup(setattr, R, "RUN_WAIT", real)
+        R.write_read("demo", self.entry(state="running", pid=os.getpid(), verdict=None, since=self.OLD))
+        with mock.patch.object(R, "delta_text", return_value=(0, "+only-this-line\n")) as delta:
+            self.assertEqual(R._perms_run("demo", 7, HEAD), 0)
+        self.assertEqual(delta.call_args.args[2:], (self.OLD, HEAD))
+        self.assertIn(f"LANDed this PR at {self.OLD}", box.called("claude")[0]["input"])
+        self.assertIn("+only-this-line", box.called("claude")[0]["input"])
+        land = {"repo": "demo", "pr": 7, "head": self.OLD, "change": "0" * 16, "verdict": "LAND"}
+        for ledger in ([], [land, dict(land, head="c" * 40, verdict="FIX")]):   # the old LAND gone or taken back
+            with open(R.perms_reads_path("demo"), "w") as f:
+                json.dump(ledger, f)
+            os.chmod(R.perms_reads_path("demo"), 0o600)
+            self.assertEqual(self.adopt(), 1, ledger)
+            self.assertFalse(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+        with open(R.perms_reads_path("demo"), "w") as f:
+            json.dump([land], f)
+        self.assertEqual(self.adopt(), 0)
+        self.assertTrue(R.perms_recorded("demo", 7, HEAD, {R.change_digest(DIFF)}))
+        self.assertEqual((self.ledger()[-1]["head"], self.ledger()[-1]["since"]), (HEAD, self.OLD))
+        with open(os.path.join(os.environ["CC_LAND_STATE"], "queue.log")) as f:
+            self.assertIn(f"head={HEAD} change=", f.read())
+
+    def test_a_delta_that_will_not_diff_fails_the_read(self):
+        self.box(**{"gh pr view": self.facts(), "claude": claude_says("LAND", [])})
+        R.RUN_WAIT, real = 1, R.RUN_WAIT
+        self.addCleanup(setattr, R, "RUN_WAIT", real)
+        R.write_read("demo", self.entry(state="running", pid=os.getpid(), verdict=None, since=self.OLD))
+        with mock.patch.object(R, "delta_text", return_value=(128, "fatal: bad object")):
+            self.assertEqual(R._perms_run("demo", 7, HEAD), 0)
+        self.assertEqual(R.load_read("demo", 7, HEAD)[0]["state"], "failed")
 
     def test_the_detached_run_reads_and_writes_its_verdict(self):
         box = self.box(**{"gh pr view": self.facts(), "claude": claude_says("HANDBACK", [

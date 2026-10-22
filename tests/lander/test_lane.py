@@ -3082,6 +3082,18 @@ class HostHold(Fixture):
         self.assertEqual({(a[0], a[1], a[2]) for a in asked}, {("demo", 1, head)})
         self.assertEqual(asked[0][3], {j.digest})   # the exact change digest, never a carried one
 
+    def test_an_older_land_with_the_same_own_lines_runs_the_host_check(self):
+        """A merge of main that moved only context (review.same_change) keeps perms' LAND of the older head."""
+        with mock.patch.object(R, "same_change", lambda job, olds=None: "a" * 40):
+            _, rv, _ = self.lane(False)
+        self.assertEqual(sorted(c[0] for c in rv.calls), ["on-host", "unit"])
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+
+    def test_an_older_land_whose_lines_differ_asks_perms_for_the_delta_read(self):
+        with mock.patch.object(R, "land_heads", lambda job: ["a" * 40]):
+            self.lane(False)
+        self.assertIn(f"lander perms-read demo 1 --since {'a' * 40}", self.job().extra["why"])
+
     def test_with_perms_reading_the_head_the_job_is_held_not_queried(self):
         _, rv, _ = self.lane(False, reading=("perms' security read of PR #1 at x is still running", True))
         self.assertEqual([c[0] for c in rv.calls], ["unit"])
@@ -5504,7 +5516,7 @@ class PermsReading(Fixture):
         from lander import review as R
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
-        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: ("perms' read of PR #1 is still running", True)):
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest, carried="": ("perms' read of PR #1 is still running", True)):
             _, lines = self.land()
         j = self.job()
         self.assertEqual((j.state, j.extra.get("hold")), (T.HELD, "box"), lines)
@@ -5515,7 +5527,7 @@ class PermsReading(Fixture):
         from lander import review as R
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
-        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: ("", False)):
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest, carried="": ("", False)):
             _, lines = self.land()
         self.assertEqual(self.job().state, T.DEPLOY_PENDING, lines)
 
@@ -5524,7 +5536,7 @@ class PermsReading(Fixture):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
         asked = []
-        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest: asked.append(digest) or (
+        with mock.patch.object(R, "perms_reading", lambda repo, pr, head, digest, carried="": asked.append(digest) or (
                 "perms' security read of PR #1 died with no verdict", False)):
             _, lines = self.land()
         j = self.job()

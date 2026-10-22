@@ -108,7 +108,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              a member's on "member:<h>" — skipping those already in results, and those the job's own store
              holds a pass of on this very tree from this release (`stage … reused gate= tree=`). A check the box
              runs on the host itself (manifest.on_host; not on a member's lane) runs only once perms' file records a
-             security LAND at exactly this head and digest (review.perms_recorded, no carry; host_unread): the rest
+             security LAND at exactly this head and digest (review.perms_recorded), or at an older head this head is a clean
+             remerge of on the default branch (review.same_change; no other carry; host_unread): the rest
              of the plan runs first, and when only these are left the job is held (box) while perms' read of the PR
              runs (review.perms_reading), else a query "planning" naming them (host_hold; perms' LAND on #1561,
              10-20: a worker that edits a host check's run file selects it, and its head ran as the box's user
@@ -1394,7 +1395,8 @@ class Lane:
 
     def host_unread(self, job, m, todo) -> list:
         """The checks of `todo` the box runs on the host itself (MF.on_host) while perms' file records no security
-        LAND at exactly this head and digest (review.perms_recorded; no carry from an older head), else []. Such a
+        LAND at exactly this head and digest (review.perms_recorded), or at an older head this head is a clean remerge
+        of on the default branch at its tip (review.same_change; no other carry), else []. Such a
         check runs the head's code as the box's user, outside the bwrap profile, and a head is code a worker wrote
         (perms' LAND on #1561, 10-20: a worker that edits a host check's run file selects that check, so the head ran
         on the host before any read). A member's lane runs every check in the member's sandbox: none is held."""
@@ -1404,7 +1406,7 @@ class Lane:
         if not names:
             return []
         from lander import review as R
-        return [] if R.perms_recorded(job.repo, job.pr, job.head, {job.digest}) else names
+        return [] if R.perms_recorded(job.repo, job.pr, job.head, {job.digest}) or R.same_change(job) else names
 
     def host_hold(self, job, held):
         """Every other check of the plan has passed and `held` (host_unread) is left: held (box) while perms' read of
@@ -1421,8 +1423,10 @@ class Lane:
             return self.hold(job, f"{why}: {reading}", kind="box")
         at, _ = R.load_read(job.repo, job.pr, job.head)
         verb = "perms-adopt" if at and at.get("state") == "done" and at.get("verdict") == T.LAND else "perms-read"
+        olds = R.land_heads(job) if verb == "perms-read" else []
+        since = f" --since {olds[-1]}" if olds else ""   # perms reads only the change since its last LAND
         job.extra["host_hold"] = job.head
-        return self.query(job, f"{why} (lander {verb} {job.repo} {job.pr})"
+        return self.query(job, f"{why} (lander {verb} {job.repo} {job.pr}{since})"
                                + (f": {reading}" if reading else ""), "planning")
 
     def handed_back(self, job):
@@ -1618,7 +1622,7 @@ class Lane:
             # security read finished" — so a read perms has going holds the merge, and one that ended short of a
             # LAND is a query (perms' read of #1525: a dead read held silently)
             from lander import review as R
-            reading, wait = R.perms_reading(job.repo, job.pr, job.head, job.digest)
+            reading, wait = R.perms_reading(job.repo, job.pr, job.head, job.digest, lambda: R.same_change(job))
             if reading and wait:
                 return self.hold(job, reading, kind="box")
             if reading:

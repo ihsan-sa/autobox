@@ -99,7 +99,8 @@ def on_host(c: T.Check) -> bool:
     the box (run.py), as the laptop's cage already runs it: a PR head is code a worker wrote, and a worker reads the
     web, issue text and members' asks, so the head never runs as the box's user before a read (perms' reviewer,
     10-19: selfcheck-cc-lib ran a head's cc-lib on the host). These run on the host only after perms' security LAND
-    is recorded at that exact head: the lane holds them till then (lane.Lane.host_unread; perms' LAND on #1561)."""
+    is recorded at that exact head, or at an older head this one is a clean remerge of: the lane holds them till
+    then (lane.Lane.host_unread; perms' LAND on #1561)."""
     return c.klass == T.BOX or (c.klass == T.HOST and (c.bare or "laptop" not in c.where))
 
 

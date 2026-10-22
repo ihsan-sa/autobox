@@ -9,6 +9,9 @@
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
     lander perms-read <repo> <pr>    perms only: start its security read of the PR's head in a session of its own, so
                                      a hand-off of the perms window does not end it ("perms' own reads", below)
+    lander perms-read <repo> <pr> --since <old head>
+                                     the same read of only the change since `old`, a head perms' ledger LANDs that
+                                     still carries (land_heads), when the head merges clean onto main: delta_text()
     lander perms-hold <repo> <pr>    perms only: hold the PR's merge at its head until perms' read of it says LAND
     lander perms-reads <repo> [<pr>] perms' read files, running and done, newest first
     lander perms-adopt <repo> <pr>   perms only: put its finished LAND read in its ledger, only when that read is of
@@ -155,7 +158,10 @@ manifest that will not load carries nothing. The LAND then names the old head in
 for a fresh read. A LAND older than any non-LAND entry of the PR carries nothing, whatever head that entry names,
 and a later LAND at that entry's head does not bring it back: here every entry counts, not only each head's newest.
 Only review(), delta_review() and would_read() carry; perms_recorded() itself, and so
-lane.landed_at() and release, still want the head exact.
+lane.landed_at() and release, still want the head exact. A record carries also when git's own merge of the old head onto this
+head's merge-base gives this head's tree exactly and this head merges clean onto main (same_change(), remerges(),
+merges_clean()), so a merge of main that moved only context keeps perms' read; this carry alone also lets a host check run (lane.Lane.host_unread) and
+the merge go past perms_reading(). Each such carry is a `perms-carry` line in queue.log naming both heads.
 `lander record ... --by perms` or `--by perms-*` is refused unless the calling Claude session works in the perms
 seat (perms_seat_caller()). The marker itself is only a comment and clears nothing; the ledger entry the perms
 seat's LAND appends is what clears the path.
@@ -182,6 +188,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import types
 import unicodedata
 
 from lander import cards as C
@@ -433,12 +440,16 @@ def perms_recorded(repo, pr, head, digests):
     (lane.Lane.host_unread) and is released on (release.remote_rules). An entry with no `verdict` is a LAND, as in
     carried_from; a FIX or DO-NOT-LAND is not one, and one recorded after a LAND at that head takes it back. An
     empty digest is no digest (Opus read of #1564: a job with no reviewer unit has digest "", which an entry with
-    an empty change would match)."""
+    an empty change would match). A delta LAND (one with `since`) stands only while its `since` is still a LAND
+    head (land_heads()): a FIX perms records later at that old head takes it back too (perms' read of #1859)."""
     digests = {d for d in digests or () if d}
     if not (head and digests):
         return None
     e = newest_reads(perms_reads(repo)[0], repo, pr).get(head)
-    return e if e is not None and e.get("change") in digests and e.get("verdict", T.LAND) == T.LAND else None
+    if e is None or e.get("change") not in digests or e.get("verdict", T.LAND) != T.LAND:
+        return None
+    since = e.get("since")
+    return e if not since or since in land_heads(types.SimpleNamespace(repo=repo, pr=pr, head=head)) else None
 
 
 def security_globs(root, base, repo):
@@ -489,11 +500,35 @@ def carried_from(job):
     took back: a HANDBACK recorded with no --head is written at the head the PR had then, which need not be the one
     perms read (perms' read of #1624: LAND at X, the branch moved to Y, a HANDBACK written at Y, and X's LAND still
     carried to a later head), and a fresh LAND of Y is a read of Y, not of X (Opus read of #1628: with only each
-    head's newest entry read, a LAND recorded at Y over that DO-NOT-LAND brought X's LAND back)."""
+    head's newest entry read, a LAND recorded at Y over that DO-NOT-LAND brought X's LAND back). Whatever the delta
+    touches, an old head whose own change is this head's (same_change: a merge of main moved only context) carries."""
+    olds = land_heads(job)
+    if not (olds and job.head):
+        return ""
+    root = root_of(job)
+    globs = security_globs(root, job.base_sha, job.repo)
+    if globs is None:
+        return same_change(job, olds)
+    from lander import manifest as M
+    paths = list(job.plan.extra.get("security") or []) if job.plan else []
+    for old in reversed(olds):
+        files = delta_files(root, job.base_sha, old, job.head)
+        if files is None or any(M.match(globs, f) for f in files):
+            continue
+        was = old_globs(root, job.base_sha, old, job.repo) if paths else []
+        if was is not None and all(M.match(was, p) for p in paths):
+            return old
+    return same_change(job, olds)
+
+
+def land_heads(job):
+    """The earlier heads of this PR whose perms LAND may carry to job.head, oldest first, by carried_from()'s rules
+    (its doc): each head's newest entry a LAND, none older than any non-LAND entry of the PR, and none when this
+    head's own newest entry is not a LAND."""
     entries, key = perms_reads(job.repo)[0], repo_key(job.repo)
     newest = newest_reads(entries, job.repo, job.pr)
     if job.head in newest and newest[job.head].get("verdict", T.LAND) != T.LAND:
-        return ""
+        return []
     olds = []
     for e in entries:   # every entry, in the order perms appended them, not only each head's newest
         h = e.get("head")
@@ -503,20 +538,48 @@ def carried_from(job):
             olds = []
         elif re.fullmatch(r"[0-9a-f]{40}", h) and h != job.head:
             olds = [o for o in olds if o != h] + [h]
-    if not (olds and job.head):
+    return olds
+
+
+def remerges(root, base, old, new):
+    """True when git's own merge of `old` onto `new`'s merge-base with `base` (`git merge-tree --write-tree`, in
+    blind(), no hand edit) is clean and gives `new`'s tree exactly: then `new` is `old`'s change on a newer main and
+    nothing else, wherever the context around it moved. A conflict, a hand edit or a line moved within a file
+    gives another tree (planning's read of 10-22)."""
+    with blind(root, base, old, new) as (got, run):
+        if run is None:
+            return False
+        b, o, n = got[1]
+        rc, mn = run("merge-base", b, n)
+        rc, t = (rc, "") if rc else run("merge-tree", "--write-tree", mn.strip(), o)
+        rc2, nt = run("rev-parse", n + "^{tree}")
+        return rc == 0 == rc2 and bool(t.split()) and t.split()[0] == nt.strip()
+
+
+def on_default(job):
+    """True when the PR's base is the repo's default branch and job.base_sha is the tip a fresh fetch of it reads
+    (tick.default_base). Perms' read of #1859: a LANDed PR retargeted onto a worker's branch remerged clean there,
+    and the carry let that branch's unread file reach the host checks."""
+    from lander import tick as K
+    root = root_of(job)
+    name, tip = K.default_base(root, GH.slug(root))
+    return bool(name) and job.extra.get("base_ref") == name and job.base_sha == tip
+
+
+def same_change(job, olds=None):
+    """The earlier head (of land_heads(), or `olds`) that this head is only a clean remerge of (remerges()), or "".
+    Dispatch's holds of 10-20..22: 8 of 39 were a merge of main that changed only context lines, which change_digest
+    hashes. Only onto a head that merges clean onto the base (merges_clean, perms' answer of 10-22), and only onto
+    the repo's default branch at its fetched tip (on_default); each carry is logged with both full heads."""
+    olds = land_heads(job) if olds is None else olds
+    if not (olds and job.head and on_default(job)):
         return ""
     root = root_of(job)
-    globs = security_globs(root, job.base_sha, job.repo)
-    if globs is None:
-        return ""
-    from lander import manifest as M
-    paths = list(job.plan.extra.get("security") or []) if job.plan else []
     for old in reversed(olds):
-        files = delta_files(root, job.base_sha, old, job.head)
-        if files is None or any(M.match(globs, f) for f in files):
-            continue
-        was = old_globs(root, job.base_sha, old, job.repo) if paths else []
-        if was is not None and all(M.match(was, p) for p in paths):
+        if remerges(root, job.base_sha, old, job.head):
+            if not merges_clean(root, job.base_sha, job.head):
+                return ""
+            C.log("perms-carry", job.repo, job.pr, read=old, head=job.head, why="clean-remerge")
             return old
     return ""
 
@@ -1283,6 +1346,38 @@ def interdiff(root, base, old, new, timeout=300):
     if rc or not rebased:
         return rc, d
     return 0, REBASED + (d or "(no change: the rebase alone moved this head)\n")
+
+
+RESOLVED = ("\n(and the hand resolution: the old head auto-merged onto this head's merge-base with main, diffed"
+            " against this head, so whatever a conflict resolution or a merge of main changed shows here)\n")
+
+
+def delta_text(root, base, old, new, timeout=300):
+    """What `lander perms-read --since <old>` reads -> (rc, text): interdiff() of the two heads, then the hand
+    resolution, as perms checks one by hand (perms' answer of 10-22): `git merge-tree` of the old head onto the new
+    head's merge-base with `base`, that tree diffed whole against the new head, so no path drops out. All in blind()."""
+    rc, d = interdiff(root, base, old, new, timeout=timeout)
+    if rc:
+        return rc, d
+    with blind(root, base, old, new) as (got, run):
+        if run is None:
+            return got
+        b, o, n = got[1]
+        rc, mn = run("merge-base", b, n)
+        if rc:
+            return rc, mn
+        rc, out = run("merge-tree", "--write-tree", mn.strip(), o, timeout=timeout)
+        if rc not in (0, 1) or not out.split():   # 1 is a conflict: its tree holds the markers, and that is read too
+            return rc or 1, out
+        rc, r = run("diff", *PLAIN_DIFF, "--full-index", "--no-renames", out.split()[0], n, timeout=timeout)
+    return rc, (r if rc else d + RESOLVED + (r or "(none: the new head is the old one merged onto main)\n"))
+
+
+def merges_clean(root, base, head):
+    """True when `head` merges onto `base` with no conflict (`git merge-tree`, in blind()): perms' carry and delta
+    read hold only for such a head (perms' answer of 10-22)."""
+    with blind(root, base, head) as (got, run):
+        return run is not None and run("merge-tree", "--write-tree", *got[1])[0] == 0
 
 
 def heads_diff(root, base, old, new, *opts, mains=False, timeout=300):
@@ -2261,6 +2356,9 @@ def cmd_will_review(argv):
 #      stale file names another head and is never the one found; any file must still match the live head and change.
 #   A running read is alive only while its pid is still the process it started (alive(): the start time matches),
 #   and whatever `perms-reads` prints from a file is quoted, control characters spelled out (quoted()).
+# `perms-read --since <old>` reads only delta_text() from a head whose ledger LAND still carries (land_heads(), so
+# never past a FIX) onto a head that merges clean (merges_clean()); the stub, the read and the ledger entry adopt
+# writes all carry `since`, and adopt checks that LAND again (perms' answer of 10-22).
 # The lane waits on these files (perms_reading, asked by lane.mergeable just before the merge). It holds (box) while a
 # read of the PR runs at any head, or for a read's run window (HOLD_WINDOW) while perms' `perms-hold` stub stands at
 # its head, so perms can claim a PR before its read starts. Anything else short of a finished LAND at the head (or an older head's at the same change, or a
@@ -2403,7 +2501,7 @@ def held_since(e):
     return (datetime.datetime.now(datetime.timezone.utc) - at.replace(tzinfo=datetime.timezone.utc)).total_seconds()
 
 
-def perms_reading(repo, pr, head, digest="") -> tuple:
+def perms_reading(repo, pr, head, digest="", carried="") -> tuple:
     """-> (why, wait): why the lane must not merge PR `pr` at `head` on account of perms' own reads, or ("", False).
     dispatch#1296 merged on the lane's own read while perms' read of it ran (10-19), and #1298 had to go to draft by
     hand to wait for one. `wait` is True only when time mends it: a read of the PR at any head still running (its
@@ -2412,7 +2510,8 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
     perms' to act on, and the lane makes it a query (perms' read of #1525, 10-19: each of these let a merge through):
     a finished read at `head` that is not a LAND; one at `head` that failed, went stale or died with no verdict; reads
     of older heads and none at `head` (a push after perms' HANDBACK); a read file that will not load; a reads dir that
-    is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase).
+    is there but will not read. With none at `head`, the newest read's LAND at the same change counts as one (a rebase),
+    and so does one at `carried`, the head same_change() found (or a call that finds it, run only here: it runs git).
     A HANDBACK at `head` is cleared by perms' ledger LAND at `head` and its change (perms_recorded) recorded a later
     second than the read finished; a time either side does not give clears nothing (#1842)."""
     d, why = read_dir(repo)
@@ -2437,10 +2536,13 @@ def perms_reading(repo, pr, head, digest="") -> tuple:
         if not old:
             return "", False
         h, e = old[0]   # the newest: a HANDBACK after an older LAND at this change still stands
-        if digest and e.get("state") == "done" and e.get("verdict") == T.LAND and e.get("change") == digest:
+        if e.get("state") == "done" and e.get("verdict") == T.LAND and (digest and e.get("change") == digest
+                                                                       or carried and h == (carried() if callable(carried) else carried)):
             return "", False
+        since = f" --since {h}" if e.get("state") == "done" and e.get("verdict") == T.LAND else ""
         return (f"perms read PR #{pr} at {h[:12]} ({e.get('verdict') or e.get('state') or 'no verdict'}) and has no "
-                f"read of its head {head[:12]}: perms runs `lander perms-read {repo} {pr}`, then queue it again"), False
+                f"read of its head {head[:12]}: perms runs `lander perms-read {repo} {pr}{since}`, then queue it "
+                f"again"), False
     state = at.get("state")
     if state == "done" and at.get("verdict") == T.LAND:
         return "", False
@@ -2490,10 +2592,13 @@ def adoptable(job):
     if e.get("model") not in readers():
         return None, (f"the read at {at} was by {quoted(e.get('model'))}, which is not one of the readers "
                       f"({', '.join(readers())})")
+    if e.get("since") and e["since"] not in land_heads(job):
+        return None, (f"the read at {at} read only the change since {str(e['since'])[:12]}, and perms' LAND there no "
+                      f"longer carries; read it whole")
     return e, ""
 
 
-def grant(job, read, model, verdict=T.LAND, refresh=True):
+def grant(job, read, model, verdict=T.LAND, since="", refresh=True):
     """Append perms' ledger entry (perms_recorded's form) for perms' `verdict` (LAND, or a word that holds) of the
     job's head, `read` naming the read it rests on, whole or not at all: a 0600 file swapped in by rename, in a seat
     dir reached through no symlink. When that head's newest entry already says `verdict` at the job's change, only
@@ -2520,9 +2625,12 @@ def grant(job, read, model, verdict=T.LAND, refresh=True):
                 if not refresh:
                     return ""
                 last["at"] = C.now()
+                last.pop("since", None)
+                last.update({"since": since} if since else {})
             else:   # a LAND after a FIX at this head is appended, so it stands
                 have.append({"repo": job.repo, "pr": job.pr, "head": job.head, "change": job.digest,
-                             "verdict": verdict, "read": read, "model": model, "at": C.now()})
+                             "verdict": verdict, "read": read, "model": model, "at": C.now(),
+                             **({"since": since} if since else {})})
             fd, tmp = tempfile.mkstemp(dir=seat, prefix=".", suffix=".tmp")   # 0600
             with os.fdopen(fd, "w") as f:
                 json.dump(have, f, indent=1)
@@ -2572,6 +2680,12 @@ def _perms_run(repo, pr, head):
         if job.head != head:
             return done(state="stale", why=f"PR #{pr} moved to {job.head[:12]} before the read began")
         diff = diff_of(root_of(job), job.base_sha, job.head)
+        if e.get("since"):
+            rc, delta = delta_text(root_of(job), job.base_sha, e["since"], job.head)
+            if rc:
+                return done(state="failed", why=f"the delta since {e['since'][:12]} will not diff: {delta[:200]}")
+            diff = (f"(perms' security read LANDed this PR at {e['since']}: below is only what changed since that "
+                    f"head, which is all this read covers)\n" + delta)
         v, usd, why = ask(read_text(job, "security.md", diff, {}), repo, pr, job.digest, model)
     except Exception as x:  # noqa: BLE001 — any failure is written down, so the successor sees it and no one waits
         return done(state="failed", why=f"{type(x).__name__}: {x}")
@@ -2582,11 +2696,14 @@ def _perms_run(repo, pr, head):
 
 
 def cmd_perms_read(argv):
-    """perms-read <repo> <pr>: start perms' security read of the PR's head apart from the perms window (the section
-    above), or say why none starts. Perms seat only."""
+    """perms-read <repo> <pr> [--since <old head>]: start perms' security read of the PR's head apart from the perms
+    window (the section above), or say why none starts. Perms seat only. With --since it reads only delta_text() from
+    `old`, which must hold perms' LAND (land_heads()) and the head merge clean onto main (perms' answer of 10-22); its
+    LAND, adopted, clears the head as a whole read would."""
     run = len(argv) == 4 and argv[2] == "--run"
-    if not (len(argv) == 2 or run) or not REPO_RE.match(argv[0]) or not argv[1].isdigit():
-        print("usage: lander perms-read <repo> <pr>")
+    since = argv[3] if len(argv) == 4 and argv[2] == "--since" else ""
+    if not (len(argv) == 2 or run or SHA40.fullmatch(since)) or not REPO_RE.match(argv[0]) or not argv[1].isdigit():
+        print("usage: lander perms-read <repo> <pr> [--since <40-hex head perms LANDed>]")
         return 2
     repo, pr = argv[0], int(argv[1])
     if run:
@@ -2606,17 +2723,26 @@ def cmd_perms_read(argv):
         said = f" ({quoted(e.get('verdict'))})" if e.get("state") == "done" else ""
         print(f"lander perms-read: the read of PR #{pr} at {job.head[:12]} is {e['state']}{said}; nothing started")
         return 0
+    if since and since not in land_heads(job):
+        print(f"lander perms-read: perms' ledger holds no LAND at {since[:12]} that carries to {job.head[:12]}; "
+              f"read it whole (no --since)")
+        return 1
+    if since and not merges_clean(root_of(job), job.base_sha, job.head):
+        print(f"lander perms-read: PR #{pr} at {job.head[:12]} does not merge clean onto main; read it whole")
+        return 1
     p = subprocess.Popen([sys.executable, "-P", CLI, "perms-read", repo, str(pr), "--run", job.head], cwd="/",
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     path, why = write_read(repo, {"repo": repo, "pr": pr, "head": job.head, "base": job.base_sha,
                                   "change": job.digest, "state": "running", "pid": p.pid,
-                                  "pid_start": started_at(p.pid), "model": readers()[0], "started": C.now()})
+                                  "pid_start": started_at(p.pid), "model": readers()[0], "started": C.now(),
+                                  **({"since": since} if since else {})})
     if not path:
         p.kill()
         print(f"lander perms-read: {why}; nothing started")
         return 1
-    print(f"lander perms-read: reading PR #{pr} at {job.head[:12]} (pid {p.pid}); the verdict goes to {path}")
+    print(f"lander perms-read: reading PR #{pr} at {job.head[:12]}" + (f" since {since[:12]}" if since else "")
+          + f" (pid {p.pid}); the verdict goes to {path}")
     return 0
 
 
@@ -2694,11 +2820,13 @@ def cmd_perms_adopt(argv):
         print(f"lander perms-adopt: PR #{pr} is merged; there is nothing to grant")
         return 1
     e, why = adoptable(job)
-    why = why or grant(job, read_name(job.pr, job.head), e.get("model", ""), refresh=False)
+    why = why or grant(job, read_name(job.pr, job.head), e.get("model", ""), since=e.get("since", ""),
+                       refresh=False)
     if why:
         print(f"lander perms-adopt: {why}; nothing granted")
         return 1
-    C.log("perms-adopt", repo, pr, head=job.head[:12], change=job.digest[:12])
+    C.log("perms-adopt", repo, pr, head=job.head if e.get("since") else job.head[:12], change=job.digest[:12],
+          **({"since": e["since"]} if e.get("since") else {}))
     print(f"lander perms-adopt: perms' LAND of PR #{pr} at {job.head[:12]} is in its ledger")
     requeue_held(job, facts)
     return 0
