@@ -426,12 +426,15 @@ def _queued_path(repo):
 def queued_where(job):
     """Where a queued card goes: the chat the landing was asked from, a member's `#<h>-updates`, the track's thread,
     else the queue call's own --route title or `[<repo>] PR #<n> queued`."""
+    to = []
     if job.extra.get("chat"):
-        return ["-c", job.extra["chat"]] + (["--thread", job.extra["ts"]] if job.extra.get("ts") else [])
-    if job.member:
-        return ["-c", f"#{job.member}-updates"]
-    tt = track_thread(job)
-    return ["--route", f"{tt} queued" if tt else job.extra.get("route") or f"[{job.repo}] PR #{job.pr} queued"]
+        to = ["-c", job.extra["chat"]] + (["--thread", job.extra["ts"]] if job.extra.get("ts") else [])
+    elif job.member:
+        to = ["-c", f"#{job.member}-updates"]
+    if not where_ok(to):   # a chat where_ok would drop on read-back is never written: the default route instead
+        tt = track_thread(job)
+        to = ["--route", f"{tt} queued" if tt else job.extra.get("route") or f"[{job.repo}] PR #{job.pr} queued"]
+    return to
 
 
 def where_ok(to) -> bool:
@@ -440,7 +443,7 @@ def where_ok(to) -> bool:
     never replayed."""
     return (isinstance(to, list) and len(to) % 2 == 0 and all(isinstance(a, str) and a for a in to)
             and to[::2] in (["-c"], ["-c", "--thread"], ["--route"])
-            and not any(v.startswith("-") or re.search(r"[\x00-\x1f\x7f]", v) for v in to[1::2]))
+            and not any(v.startswith("-") or re.search(r"[\x00-\x1f\x7f-\x9f]", v) for v in to[1::2]))
 
 
 def ledger(pid):

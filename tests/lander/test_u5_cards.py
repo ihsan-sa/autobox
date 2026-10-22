@@ -820,6 +820,23 @@ class QueuedCards(Stubbed):
         self.assertEqual(self.argvs("cc-slack"), [])
         self.assertEqual(C.read_json(C._queued_path("demo"), {}), {})
 
+    def test_a_bad_chat_on_a_job_gets_the_default_route_and_costs_no_edit_slot_on_later_passes(self):
+        """Planning read of #1844: a chat starting with '-' or holding a newline was written, dropped on read-back and
+        rebuilt on every pass. A C1 control (U+0085) in a `to` is dropped on read-back too."""
+        for chat in ("-x", "C9\nx", "C9\x85"):
+            os.path.exists(C._queued_path("demo")) and os.unlink(C._queued_path("demo"))
+            jobs = self.jobs((7, Q, T.QUEUED))
+            jobs[0].extra["chat"] = chat
+            self.assertEqual(C.queued_where(jobs[0]), ["--route", "[demo] PR #7 queued"])
+            C.positions("demo", jobs)
+            self.assertEqual(C.read_json(C._queued_path("demo"), {})[f"land:demo:7:queued@{Q}"]["to"],
+                             ["--route", "[demo] PR #7 queued"])
+            n = len(self.argvs("cc-slack"))
+            for _ in range(3):
+                C.positions("demo", jobs)
+            self.assertEqual(len(self.argvs("cc-slack")), n)   # nothing dropped and rebuilt: no later pass took a slot
+        self.assertFalse(C.where_ok(["-c", "C9\x85"]))
+
     def test_a_refused_last_edit_with_no_to_is_logged_as_dropped(self):
         """A record from before `to` was kept has nowhere to repost its last words: they go, but the log says so."""
         C.write_json(C._queued_path("demo"), {f"land:demo:7:queued@{Q}": {"repo": "demo", "pr": 7, "place": 1,
