@@ -467,9 +467,11 @@ rstore(){ printf '%s' "$H/.cc/sandbox/$1/$2/refstore"; }   # beside the settings
 # workers stopped BLOCKED on that in a day (raised-sandbox-fold-deletes-live-branch, 2026-10-21). So `build` takes a
 # lock on <store>.lock before it seeds, and the EGRESS PROXY holds it for as long as the sandbox lives: launch starts
 # the proxy with the descriptor and execs bwrap with it closed, so no descriptor of it reaches the session (the
-# descriptor case), and the proxy dies with bwrap (cc-egress --parent, PR_SET_PDEATHSIG). A twin launch refuses there,
-# and `reconcile` folds only under the same lock. The proxy goes a moment after bwrap, so both wait 3 s for it: far
-# less than any worker runs. rs_seed has no other caller than `build`, so it only ever runs under the lock.
+# descriptor case), and the proxy dies with bwrap (cc-egress --parent, PR_SET_PDEATHSIG). NO OTHER PROCESS HOLDS IT:
+# login_mirror's watcher is forked after the lock is taken and closes it, because it sees bwrap gone only on its next
+# poll, and on a loaded box that outlived reconcile's wait and parked the store for nothing. A twin launch refuses
+# there, and `reconcile` folds only under the same lock, creating the file first so a track's first fold takes it too.
+# The proxy goes a moment after bwrap, so both wait 3 s for it: far less than any worker runs. rs_seed has no other caller than `build`, so it only ever runs under the lock.
 rs_fold(){   # $1 repo · $2 track → the private branch file becomes the host's ref, or it does not and this says why
   # THE REF NAME IS THE CONSTANT $NSD/<track> FROM ARGV AND NOTHING ELSE. Not the worktree's HEAD, not a name found in
   # the store: both live in trees the worker writes, and branch_warn is the note on what happened the one time a mount
@@ -729,7 +731,7 @@ login_mirror(){   # $1 the host refresher's copy (refresher_copy passed it) → 
   ( trap 'rm -rf "$m"' EXIT; w=$BASHPID
     while [ "$(awk '{print $4}' "/proc/$w/stat" 2>/dev/null)" = "$p" ]; do sleep 1
       s=$(stat -c '%i %s %y' -- "$src" 2>/dev/null) || continue
-      [ "$s" = "$last" ] || { login_strip "$src" "$m" && last=$s; }; done ) </dev/null >/dev/null 2>&1 &
+      [ "$s" = "$last" ] || { login_strip "$src" "$m" && last=$s; }; done ) </dev/null >/dev/null 2>&1 {RSL}<&- &   # never a holder of the store's lock (ONE HAND ON A STORE AT A TIME)
   LM=$m; }
 egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
 cred_left(){ local e; e=$(cred_exp "$1"); echo $(( ${e:-0} / 1000 - $(date +%s) )); }   # $1 a credentials file → seconds its access token has left (negative = expired)
@@ -3656,9 +3658,12 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
     echo w=$( (: > ~/.cc/worker-login/x) 2>/dev/null && echo wrote || echo ro); echo ls=$(ls -A ~/.cc/worker-login | paste -sd, -)'
   fresh; rm -f "$fh/.cc/state/r/t/seen"; probe="$lp" RF="$fl" RU="$me" RC="$cf" run "$wf" > "$fh/live.out" & local lpid=$! k=0
   while [ ! -s "$fh/.cc/state/r/t/seen" ] && [ $k -lt 600 ] && kill -0 "$lpid" 2>/dev/null; do sleep 0.1; k=$((k + 1)); done
+  local lk="$fh/.cc/sandbox/r/t/refstore.lock" hp; hp=$(for f in /proc/[0-9]*/fd/*; do [ "$(readlink "$f" 2>/dev/null)" = "$lk" ] && echo "${f%/fd/*}"; done | sort -u)
+  echo "$(grep -c . <<<"$hp")/$(for p in $hp; do tr '\0' ' ' < "$p/cmdline"; echo; done | grep -c ' serve --socket ')" > "$fh/live.holders"
   jq '.claudeAiOauth.accessToken = "copy-renewed" | .claudeAiOauth.refreshToken = "renewed-refresh"' "$cf" > "$fh/dl/.n" && chmod 640 "$fh/dl/.n" && mv -f "$fh/dl/.n" "$cf"; wait "$lpid"; out=$(cat "$fh/live.out")
   t "host refresher: a renewal while the worker runs → it reads the new token, still with no refresh token, though the renewed copy carries one" "$(g tok)/$(g tok2)/$(g rt)" copy-access/copy-renewed/false
   t "host refresher: …and the copy's directory is ro inside, holding the copy and nothing of the host's beside it" "$(g w)/$(g ls)" ro/claude-login.json
+  t "host refresher: …and while it ran the egress proxy alone held the store's lock, never the mirror's watcher" "$(cat "$fh/live.holders")" 1/1
   if [ "$(stat -c %u /etc/passwd 2>/dev/null)" = 0 ]; then   # where root is mapped: a real root-owned file, no RU
     fresh; out=$(RF=/etc/passwd RC="$cf" run "$wf")
     t "host refresher: a flag that IS root's (here /etc/passwd), with no owner override → the copy, no refresh" \
@@ -4425,8 +4430,9 @@ case "${1:-}" in selfcheck) if [ -n "${2:-}" ]; then selfcheck_section "$2"; eli
   __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge — the MEMBER shape: the v2 profile (cc-member-v2) has no owner marker yet
   probe) fence_off && exit 0; why=$(fence_why) || { echo "$why" >&2; exit 2; }; exit 0;;   # cc-loop, before iteration 1
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
-             l="$(rstore "$2" "$3").lock"; [ ! -e "$l" ] || { exec {RSL}<"$l" && flock -w 3 "$RSL"; } \
-               || { echo "cc-sandbox: a sandbox for $2/$3 is still running, so its branch was not folded and its store was not touched — the next launch folds it." >&2; exit 1; }
+             l="$(rstore "$2" "$3").lock"; [ -d "${l%/*}" ] || exit 0   # no sandbox dir for this track, so no store to fold
+             { : >> "$l" && exec {RSL}<"$l"; } || { echo "cc-sandbox: could not open $l, the lock on $2/$3's branch store, so its branch was not folded and its store was not touched." >&2; exit 1; }
+             flock -w 3 "$RSL" || { echo "cc-sandbox: a sandbox for $2/$3 is still running, so its branch was not folded and its store was not touched — the next launch folds it." >&2; exit 1; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   # cc-loop, before every iteration: the login the launch will run on. With the fence off the command runs as given,
   # on the box's own login, so that is the answer, and the key is not read at all.
