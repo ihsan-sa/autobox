@@ -136,7 +136,9 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   briefs/docs ~/.cc/state/<repo>/*.md (goals, backlog, packets), <track>/*.md (task.md, pr-body.md, …), perms/*.md
               (a permission session's brief and ledger), every <project>/**/*.md (a dot-directory and node_modules
               are not walked; a path a REPO_SOURCES pattern placed is read at that skind only), ~/*.md (the home
-              guides) — one record per heading (kind document; a heading that says "decision" is kind decision)
+              guides) — one record per heading (kind document; a heading that says "decision" is kind decision,
+              except a hive run's note — a hive-notes/ file, or a heading marked "run note, not the owner's
+              words" — which is never a decision and never in a --need decision answer)
   perms log   ~/.cc/state/<repo>/perms/*.jsonl (cc-refusals' ledger): one record per line, a decision kind decision,
               any other line an event, its id an exact id
   memory      ~/.claude/projects/*/memory/*.md — one record per file (type feedback → decision, else note); MEMORY.md and
@@ -705,11 +707,19 @@ def parse_md(path, text, skind, repo, track, rows):
             last_ts = d
         ts = d or last_ts or mtime_iso(path)
         kind = base
-        if base == "document" and re.search(r"decision|decided|rule", title, re.I):
+        if base == "document" and re.search(r"decision|decided|rule", title, re.I) and not run_note(path, title):
             kind = "decision"
         for i, s in enumerate(spans(body)):
             recs.append(dict(kind=kind, title=title, ts=ts, text=s, span=f"L{a + 1}-{b}", part=i, track=track))
     return recs
+
+
+RUN_NOTE = re.compile(r"run note, not the owner['’]s words", re.I)
+
+
+def run_note(path, title):
+    """A hive run's own note (dispatch-kb's hive-notes/, or a heading carrying its mark): never the owner's decision."""
+    return f"{os.sep}hive-notes{os.sep}" in path or bool(RUN_NOTE.search(title or ""))
 
 
 def mtime_iso(path):
@@ -1626,6 +1636,8 @@ def search(c, query, repo, need, object_ids, limit=40, leads=None):
     now = time.time()
     ranked = []
     for h in hits:
+        if need == "decision" and run_note(h[12], h[6]):
+            continue
         rid_ids = set(x[0] for x in c.execute("SELECT id FROM rids WHERE record_id=?", (h[0],)))
         exact = 0 if (object_ids and rid_ids & object_ids) else 1
         fit = FIT.get(need, {}).get(h[2], 0)
@@ -1981,7 +1993,7 @@ def ask(argv):
         used += len(l.encode()) + 1
     routed += live_ok
     for label, rs in sections:
-        rs = [r for r in rs if r and r[1] not in shown_rids]
+        rs = [r for r in rs if r and r[1] not in shown_rids and not (need == "decision" and run_note(r[12], r[6]))]
         if not rs:
             continue
         line = f"ROUTE {label} ({len(rs)})"
@@ -2934,6 +2946,7 @@ def selfcheck():
         selfcheck_workspaces(th, ok, run, w)
         selfcheck_lessons(th, ok, run, w)
         selfcheck_docs(th, ok, run, w)
+        selfcheck_run_notes(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
         selfcheck_sources(th, ok, run, w)
         selfcheck_ranking(th, ok, run, w)
@@ -3607,6 +3620,27 @@ def selfcheck_workspaces(th, ok, run, w):
        and "scope=index.sqlite" in so)
     rc, o = run("ask", "--need", "history", f"{K}-wsa-journal")
     ok("…and the owner's aggregate now names it ws=wsz, with no record left under the old handle", " ws=wsz" in o and " ws=wsa" not in o)
+
+
+def selfcheck_run_notes(th, ok, run, w):
+    """A hive run's note is never the owner's decision: a hive-notes heading saying decision, with the mark and
+    without it, and a marked heading in any other file, are left out of a --need decision answer, while a real
+    decision next to them is still cited."""
+    w(".cc/state/r1/hive-notes/notes.md", "# hive notes\n\n## decision: wombat burrows face north (run note, not the owner's words)\n"
+      "wombat burrows face north, said a run.\n\n## decision: wombat burrows face south\nwombat burrows face south, said a run.\n")
+    w(".cc/state/r1/wombat.md", "# wombat\n\n## decision: wombat burrows face east\nwombat burrows face east, he said.\n\n"
+      "## decision: wombat burrows face west (run note, not the owner's words)\nwombat burrows face west, said a run.\n")
+    run("index")
+    c = db()
+    kinds = dict(c.execute("SELECT title, kind FROM records WHERE title LIKE 'decision: wombat%'").fetchall())
+    ok("run notes: a hive-notes heading saying decision is a document, the real one a decision",
+       kinds.get("decision: wombat burrows face north (run note, not the owner's words)") == "document"
+       and kinds.get("decision: wombat burrows face south") == "document" and kinds.get("decision: wombat burrows face east") == "decision"
+       and kinds.get("decision: wombat burrows face west (run note, not the owner's words)") == "document")
+    rc, o = run("ask", "--need", "decision", "wombat burrows face")
+    ok("run notes: --need decision cites the real decision and neither run note", "face east" in o and not re.search("north|south|west", o))
+    rc, o = run("ask", "--need", "history", "wombat burrows face")
+    ok("run notes: --need history still finds them", all(x in o for x in ("north", "south", "west")))
 
 
 def selfcheck_docs(th, ok, run, w):
