@@ -8151,7 +8151,7 @@ def run_selfcheck():
               and [t for c, t in saidP if c == "CASK"] == ["*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_"] * 2
               + ["no answer this time (cc-ask: no reply — Budget of $0.25 exceeded) — ask again, or ask in #myrepo",
                  f"no answer this time (no answer in {ASK_TIMEOUT} s) — ask again, or ask in #myrepo"]
-              + ["*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_"] * 6)
+              + ["*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_"] * 7)
         check("ask_soon: a member's question names that member to cc-ask (--member, so its agent runs in their sandbox), "
               "the owner's carries --documents, and an asker who is neither carries no flag",
               cmdsA[4:6] == [["answer", "--member", "m1"], ["answer", "--documents"]] and cmdsA[0] == ["answer"])
@@ -9503,6 +9503,18 @@ def run_selfcheck():
         ran_esc_trk = ranMS[n_esc_trk:]; n_esc_trk = len(ranMS)
         r_esc_bob = ms_req({"escalate": "bob/pna was refused", "text": "not alice's track"})
         ran_esc_bob = ranMS[n_esc_trk:]
+        # dispatch --say: a member seat's `cc <h> <track> --say` runs on the host, where --go reads the same windows and loops
+        n_say = len(ranMS)
+        r_say = ms_req({"dispatch": "alice/todo", "opts": ["--say", "--brief", "fix the PR"]})
+        r_say_bob = ms_req({"dispatch": "bob/todo", "opts": ["--say", "--brief", "fix the PR"]})
+        r_say_opt = ms_req({"dispatch": "alice/todo", "opts": ["--say", "--loop", "2", "--brief", "x"]})
+        r_say_rep = ms_req({"dispatch": "alice/todo", "opts": ["--say", "--repair", "--brief", "x"]}); r_say_empty = ms_req({"dispatch": "alice/todo", "opts": ["--say"]})
+        ran_say = ranMS[n_say:]
+        # …and what reaches the prompt starts with the box's prefix, never a character the member chose, with no control characters
+        n_say_tui = len(ranMS)
+        for t in ("!rm -rf ~", "#remember this", "/clear", "ok\x1b!id\x7f\nnext"):
+            ms_req({"dispatch": "alice/todo", "opts": ["--say", "--brief", t]})
+        ran_say_tui = [c[-1] for c in ranMS[n_say_tui:]]
         # escalate + notice: A TRACK'S OWN END LINE (a-finished-worker-reaches-its-thread). A member's DONE crossed as an
         # escalation on 2026-09-20 and reached the owner's DM, the project thread nothing. Its own fixture: alice/pna has a
         # thread (TRACKS), the upload is stubbed, and the file lives under the workspace's tree.
@@ -10308,6 +10320,16 @@ def run_selfcheck():
           "option left without its value are refused before anything runs",
           r_disp.get("ok") and ran_disp == [[f"{BIN}/cc", "alice", "todo", "--go", "FIX:\n- drop x", "--loop", "2", "--budget", "5", "--repair"]]
           and all(r.get("ok") is False for r in (r_disp_bob, r_disp_main, r_disp_bad, r_disp_inj, r_disp_rep_bad)))
+    check("MEMBER socket: dispatch --say runs `cc alice todo --say <text>` on the HOST, where --go reads the same tmux "
+          "window and loop (inside the boundary --say saw no session that --go had just called live); another workspace's "
+          "track, an option riding along, a --repair and a --say with no text are refused before anything runs",
+          r_say.get("ok") and ran_say == [[f"{BIN}/cc", "alice", "todo", "--say", "[--say from alice] fix the PR"]]
+          and all(r.get("ok") is False for r in (r_say_bob, r_say_opt, r_say_rep, r_say_empty))
+          and "outside workspace" in r_say_bob.get("error", ""))
+    check("MEMBER socket: dispatch --say text reaches the pane's prompt behind a fixed prefix with control characters gone, "
+          "so a leading !, # or / (bash mode, memory, a slash command) or an ESC that clears the box never acts as the owner",
+          ran_say_tui == ["[--say from alice] !rm -rf ~", "[--say from alice] #remember this", "[--say from alice] /clear",
+                          "[--say from alice] ok !id next"])
     check("SOCKET: exactly ONE recognised verb per request, on both sockets — a payload was authorised on the verb the "
           "scope check found and then executed on a second key beside it ({hello: alice, reply: D0…} posted into a DM, "
           "{hello: alice, dispatch: bob/todo} ran a worker in another workspace). Two verbs, or none, is refused whole "
@@ -10869,7 +10891,7 @@ def run_selfcheck():
         saved, asked = [], []
         dmFx.save_file = lambda f, url, path: saved.append((f["id"], f.get("_ws"), path))
         url = lambda fid: f"https://files.slack.com/files-pri/{fid}/x.xlsx"
-        files = {"xoxb-m": {"F0RUG00001": {"id": "F0RUG00001", "name": "rugs.xlsx", "url_private": url("F0RUG00001"), "channels": ["CRUG"]},
+        files = {"xoxb-m": {"F0RUG00001": {"id": "F0RUG00001", "name": "rugs.xlsx", "url_private": url("F0RUG00001"), "channels": ["CRUG"], "size": 5},
                             "F0RUG00002": {"id": "F0RUG00002", "name": "b.png", "url_private": url("F0RUG00002"), "shares": {"private": {"CRUG": []}}},
                             "F0UNR00001": {"id": "F0UNR00001", "name": "u.png", "url_private": url("F0UNR00001"), "groups": ["CUNR"]},
                             "F0BAD00001": {"id": "F0BAD00001", "name": "bad.png", "url_private": "https://evil.example/x", "channels": ["CRUG"]}},
@@ -10917,6 +10939,51 @@ def run_selfcheck():
     rB, sB, _ = fetch_case("mem", "F0BAD00001")
     check("FETCH: a file whose url is not Slack's is refused and says why; the token never goes there",
           not rB.get("ok") and "not Slack" in rB.get("error", "") and sB == [])
+    real_dirFd = globals()["DIR"]
+    with tempfile.TemporaryDirectory() as tdFd:
+        try:
+            globals()["DIR"] = tdFd
+            os.makedirs(f"{tdFd}/member/mem/files")
+            have = f"{tdFd}/member/mem/files/20261001T000000Z-F0RUG00001-rugs.xlsx"
+            with open(have, "w") as fh:
+                fh.write("12345")
+            rD, sD, _ = fetch_case("mem", "F0RUG00001")
+            with open(have, "w") as fh:
+                fh.write("1234")
+            rD2, sD2, _ = fetch_case("mem", "F0RUG00001")
+        finally:
+            globals()["DIR"] = real_dirFd
+    check("FETCH: a repeat fetch of a file id already saved at its size downloads nothing and returns the saved path; "
+          "a changed size downloads it again (perms' follow-up on #1835: a loop cannot fill the disk)",
+          rD.get("ok") and sD == [] and "20261001T000000Z-F0RUG00001-rugs.xlsx" in rD.get("text", "")
+          and rD2.get("ok") and [i for i, _, _ in sD2] == ["F0RUG00001"])
+    real_dirPr = globals()["DIR"]
+    with tempfile.TemporaryDirectory() as tdPr:
+        old = time.time() - 31 * 86400
+        for d in ("files", "member/mem/files", "outside"):
+            os.makedirs(f"{tdPr}/{d}")
+        def plant(path, aged=True):
+            with open(path, "w") as fh:
+                fh.write("x")
+            if aged:
+                os.utime(path, (old, old))
+        for path in ("files/old", "member/mem/files/old", "outside/old", "outside/viadir"):
+            plant(f"{tdPr}/{path}")
+        plant(f"{tdPr}/member/mem/files/fresh", aged=False)
+        os.symlink(f"{tdPr}/outside/old", f"{tdPr}/member/mem/files/link")
+        os.utime(f"{tdPr}/member/mem/files/link", (old, old), follow_symlinks=False)
+        os.makedirs(f"{tdPr}/member/evil")
+        os.symlink(f"{tdPr}/outside", f"{tdPr}/member/evil/files")
+        try:
+            globals()["DIR"] = tdPr
+            Daemon(use_slack=False).prune_files()
+        finally:
+            globals()["DIR"] = real_dirPr
+        leftPr = {p for p in ("files/old", "member/mem/files/old", "member/mem/files/fresh", "member/mem/files/link",
+                              "outside/old", "outside/viadir") if os.path.lexists(f"{tdPr}/{p}")}
+    check("FETCH: prune_files drops an old member file like the box's own and keeps a fresh one, and touches nothing "
+          "outside a member files dir: a planted link is left (its target too) and a files dir that is a link is refused",
+          leftPr == {"member/mem/files/fresh", "member/mem/files/link", "outside/old", "outside/viadir"})
     check("FETCH: the main socket refuses it: fetch is a member-socket verb",
           Daemon(use_slack=False).refuse_reason({"fetch": "F0RUG00001"}, None, (0, os.getuid(), None)) == "fetch is a member-socket verb")
 
@@ -12037,11 +12104,11 @@ def run_selfcheck():
         dmA.take_mail("L2")
         rootF = msaid[0][3]
         msaid.clear(); mhanded.clear()
-        real_save, real_apiF, deleted, fails = R.save_conv, globals()["api"], [], [1]
+        real_save, real_apiF, deleted, save_fails = R.save_conv, globals()["api"], [], [1]
 
         def save_once_fails(rec):
-            if fails:
-                fails.pop()
+            if save_fails:
+                save_fails.pop()
                 raise OSError("disk full")
             return real_save(rec)
 
@@ -12070,7 +12137,7 @@ def run_selfcheck():
         msaid.clear(); mhanded.clear()
         dmA.take_mail("L3")
         rootF2 = msaid[0][3]
-        msaid.clear(); mhanded.clear(); deleted.clear(); fails[:] = [1, 1]
+        msaid.clear(); mhanded.clear(); deleted.clear(); save_fails[:] = [1, 1]
         R.save_conv, globals()["api"] = save_once_fails, api_deletes
         try:
             failOut2 = dmA.member_verb("mem", {"reply": "C-MEM", "thread_ts": rootF2, "text": "move #mem--api"}, "reply")
@@ -12078,7 +12145,7 @@ def run_selfcheck():
             R.save_conv, globals()["api"] = real_save, real_apiF
         check("mail: a move whose save AND rollback save both fail leaves its card up, hands nothing, and says in "
               "the old thread that the record could not be put back (perms' read of #1729)",
-              failOut2.get("ok") is True and deleted == [] and fails == [] and mhanded == []
+              failOut2.get("ok") is True and deleted == [] and save_fails == [] and mhanded == []
               and [(c, t) for c, t, _, _ in msaid] == [("C-API", None), ("C-MEM", rootF2)]
               and "nor put its record back, so I left its card there" in msaid[-1][2])
         msaid.clear(); mhanded.clear()

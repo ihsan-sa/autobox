@@ -2452,6 +2452,17 @@ def member_files_inside(handle, path):
     out = f"{member_dir(handle)}/files/"
     return f"{HOME}/.cc/slack/files/{path[len(out):]}" if path.startswith(out) else path
 
+def saved_copy(fdir, f):
+    """A plain file fetch_files already saved in fdir (<stamp>-<id>-<name>) for f's id at f's size, or None, so the
+    same file fetched in a loop is downloaded once. A link is never taken for a copy (lstat)."""
+    fid = re.sub(r"[^A-Za-z0-9]+", "", str(f.get("id") or "F"))[:24] or "F"
+    with contextlib.suppress(OSError):
+        for e in os.scandir(fdir):
+            if e.name.split("-", 2)[1:2] == [fid] and e.is_file(follow_symlinks=False) \
+                    and e.stat(follow_symlinks=False).st_size == int(f.get("size") or -1):
+                return e.path
+    return None
+
 def member_chat_ok(handle, name):
     """Is a channel NAME one of the workspace's own: #<h>, #<h>--<x>, or the -updates lane of either? A DM never is."""
     n = (name or "").lstrip("#").lower()
@@ -5223,7 +5234,8 @@ class Daemon:
         workspace's own Slack workspace, downloaded out here with that workspace's token into its files dir
         (fetch_files), since a session is handed only the files on a message that woke it. Only a file shared into a
         channel that routes to `h` (member_chat by id, over files.info's channels/groups/shares) is fetched: never one
-        of the box's main workspace, another member's, or a DM."""
+        of the box's main workspace, another member's, or a DM. A file already saved at its size is not downloaded
+        again (saved_copy), and prune_files ages out a member's files like the box's own, so a loop can't fill the disk."""
         mine = [ws for ws, w in WS["extra"].items() if w.get("member") == h]
         if not mine:
             return {"ok": False, "error": f"{h} has no Slack workspace of its own, and the box's main workspace is not fetched from"}
@@ -5254,7 +5266,8 @@ class Daemon:
                 infos.append({**info, "_ws": ws})
         except Exception as e:
             return {"ok": False, "error": f"Slack did not answer ({e})"}
-        got = {id(f): p for f, p in self.fetch_files(infos, member=h, pairs=True)}
+        got = {id(f): p for f in infos if (p := saved_copy(f"{member_dir(h)}/files", f))}   # fetched before: no download
+        got.update((id(f), p) for f, p in self.fetch_files([f for f in infos if id(f) not in got], member=h, pairs=True))
         lines = [f"{flat_name(f.get('name'))}: " + (member_files_inside(h, got[id(f)]) if id(f) in got else
                  f"not saved ({f.get('_why') or 'the download failed'})") for f in infos]
         log(f"fetch {h}: {what[:24]} {ts} saved {len(got)}/{len(infos)}")
@@ -5420,6 +5433,19 @@ class Daemon:
             # --repair takes no value: the way back into the workspace's own row whose PR is out for landing (cc)
             repair = ["--repair"] if "--repair" in opts else []
             opts = [o for o in opts if o != "--repair"]
+            # --say (with --brief as its text) is `cc <h> <track> --say` out here, where --go reads the same tmux window and
+            # loop: inside, the boundary has no tmux, so --go found the member's live session and --say found none
+            # (raised-repair-and-say-contradict-on-a-member-row). Text only, so nothing else may ride along.
+            if "--say" in opts:
+                # The text is typed into a pane's prompt (cc-msg --turn), where a leading "!", "#" or "/" runs a command and an
+                # ESC clears the box first: so control characters go and a fixed prefix is the first thing the TUI sees.
+                brief = re.sub(r"[\x00-\x1f\x7f]+", " ", brief).strip()
+                if opts != ["--say"] or repair or not brief:
+                    return {"ok": False, "error": "dispatch --say takes its text as --brief and no other option"}
+                r = EFFECTS.run([f"{BIN}/cc", repo, track, "--say", f"[--say from {h}] {brief}"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
+                out = ((r.stdout or "") + (r.stderr or "")).strip()[-1500:]
+                log(f"dispatch {h}: say {repo}/{track} rc={r.returncode}")
+                return {"ok": True, "text": out} if r.returncode == 0 else {"ok": False, "error": out or f"cc exited {r.returncode}"}
             ok_opt = {"--loop": r"[0-9]{1,3}", "--budget": r"[0-9]+([.][0-9]+)?", "--turns": r"[0-9]{1,4}",
                       "--model": r"[A-Za-z0-9._-]{1,60}", "--effort": r"[a-z]{1,10}"}
             if len(opts) % 2 or any(opts[i] not in ok_opt or not re.fullmatch(ok_opt[opts[i]], opts[i + 1]) for i in range(0, len(opts), 2)):
@@ -7880,15 +7906,29 @@ class Daemon:
         return said, echo
 
     def prune_files(self):
-        """Attachments are a cache, not an archive: drop anything in ~/.cc/slack/files older than 30 days."""
-        cutoff = time.time() - 30 * 86400
-        try:
-            for name in os.listdir(f"{DIR}/files"):
-                path = f"{DIR}/files/{name}"
-                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
-                    os.unlink(path)
-        except Exception as e:
-            log(f"file prune failed: {e!r}")
+        """Attachments are a cache, not an archive: drop anything older than 30 days in ~/.cc/slack/files and in each
+        member's files dir. A member can plant links in its own tree, so each dir is opened down from DIR one O_NOFOLLOW
+        step at a time and only a plain file (lstat under that dir's fd) is unlinked: no link is ever followed."""
+        cutoff, members = time.time() - 30 * 86400, []
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        with contextlib.suppress(OSError):
+            members = os.listdir(f"{DIR}/member")
+        for parts in [("files",)] + [("member", h, "files") for h in members]:
+            fd = os.open(DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                for p in parts:
+                    fd, up = os.open(p, flags, dir_fd=fd), fd
+                    os.close(up)
+                for name in os.listdir(fd):
+                    st = os.lstat(name, dir_fd=fd)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        os.unlink(name, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log(f"file prune of {'/'.join(parts)} failed: {e!r}")
+            finally:
+                os.close(fd)
 
     def on_reaction(self, ev):
         """Three jobs, and a fourth: the owner's 📌 bookmarks a thread (on_revisit), a :+1: in #approvals squash-merges that PR
@@ -12349,7 +12389,7 @@ def main(argv):
         print(r.get("result") or r.get("error")); return 0 if r.get("ok") else 1
     elif cmd == "dispatch":   # inside a member boundary: `cc <h> <track> --go` (or `cc <h> --orch <alias>`) asks the host to run it (Daemon.member_verb)
         if not rest:
-            print("cc-slack dispatch <handle>/<track> [--loop N] [--budget USD] [--model M] [--turns N] [--effort E] [--repair] [--brief TEXT] | <handle>@<alias> [--brief TEXT]", file=sys.stderr); return 2
+            print("cc-slack dispatch <handle>/<track> --say --brief TEXT | <handle>/<track> [--loop N] [--budget USD] [--model M] [--turns N] [--effort E] [--repair] [--brief TEXT] | <handle>@<alias> [--brief TEXT]", file=sys.stderr); return 2
         try:
             r = sock_request({"dispatch": rest[0], "opts": rest[1:]}, timeout=200)
         except Exception as e:
