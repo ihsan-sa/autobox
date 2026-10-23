@@ -2188,13 +2188,7 @@ def perms_seat_caller(pid=None, proc="/proc", state=None, versions=None):
     the environment's: the released lander runs outside ~/dev, and a CC_BOX of /tmp/x would make /tmp/x/perms the
     seat (#1886 security read). It must be a bare name, so a perms-named dir under another repo's state never passes."""
     seat = claude_ancestor(pid, proc, versions)
-    dev = os.path.join(C.PASSWD_HOME, "dev") + os.sep
-    box = C.BIN[len(dev):].split(os.sep)[0] if C.BIN.startswith(dev) else ""
-    try:
-        with open(C.REVIEWER_CONFIG) as f:            box = box or next((v.strip().strip("'\"") for k, _, v in (ln.strip().partition("=") for ln in f)
-                               if k in ("CC_BOX", "export CC_BOX")), "")
-    except OSError:
-        pass
+    box = C.box_name()
     if seat is None or not re.fullmatch(r"[A-Za-z0-9._-]+", box) or box in (".", ".."):
         return False
     try:

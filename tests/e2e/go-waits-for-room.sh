@@ -117,11 +117,12 @@ CC_WORKER_CAP=0 "$B/cc-room" check >/dev/null 2>&1; rq0=$?
 CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "" >"$T/rq1.out" 2>&1; rq1=$?
 for _ in $(seq 1 20); do grep -q 'cc-room: '"$REPO"'/rq1 queued' ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null && break; sleep 0.5; done
 { [ "$rq0" = 1 ] && [ "$rq1" = 0 ] && grep -q 'worker queued, not started: [0-9]* worker loops are running and the cap is 0' "$T/rq1.out" \
-  && ! grep -q 'worker started' "$T/rq1.out" && [ -n "$(wins "$REPO/rq1")" ] \
+  && ! grep -q 'worker started' "$T/rq1.out" && grep -qF "\`cc-room bump $REPO/rq1\` moves it to the head" "$T/rq1.out" && [ -n "$(wins "$REPO/rq1")" ] \
   && grep -q "cc-room: $REPO/rq1 queued" ~/.cc/state/$REPO/rq1/loop.log \
   && ! ls ~/.cc/state/$REPO/rq1/runs/*.json >/dev/null 2>&1; } \
-  && ok "no room: --go says 'worker queued' and why, its window waits in cc-room admit, and no iteration runs" \
+  && ok "no room: --go says 'worker queued' and why and how to bump it, its window waits in cc-room admit, and no iteration runs" \
   || bad "queued --go: check rc=$rq0 go rc=$rq1 '$(cat "$T/rq1.out")' log: $(tail -2 ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null | tr '\n' ' ')"
+# recurring-defect-ok: pause-hold-missing — a fake-home test of the queue; the pause hold is cc's, tested in its own case
 # A QUEUED LAUNCH IS HONEST ABOUT ITSELF: the row says queued, not running; a second --go and a --say reach its brief
 # without touching its place in the queue; and a window whose wait died is reported and replaced, not called live.
 rqw=$(wins "$REPO/rq1")

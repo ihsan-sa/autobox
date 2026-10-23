@@ -2021,6 +2021,23 @@ class TestRecord(Case):
             self.reviewer(CC_BOX=conf)
             self.assertEqual(R.perms_seat_caller(), passes, (env, conf, cwd))
 
+    def test_a_copy_under_the_passwd_dev_names_the_box_by_its_path(self):
+        """A lander running from ~/dev/<box>/core/bin takes the box from that path, over the config's CC_BOX and the
+        environment's: the box's own seat passes and the one the config or environment names is refused."""
+        self.addCleanup(setattr, R, "claude_ancestor", R.claude_ancestor)
+        R.claude_ancestor = lambda *a, **kw: os.getpid()
+        self.addCleanup(setattr, C, "BIN", C.BIN)
+        self.addCleanup(os.chdir, os.getcwd())
+        self.addCleanup(os.environ.pop, "CC_BOX", None)
+        C.BIN = os.path.join(C.PASSWD_HOME, "dev", "demo", "core", "bin")
+        os.environ["CC_BOX"] = "dispatch"
+        self.reviewer(CC_BOX="other")
+        for box, passes in (("demo", True), ("other", False), ("dispatch", False)):
+            seat = os.path.join(R.PERMS_STATE, box, "perms")
+            os.makedirs(seat, exist_ok=True)
+            os.chdir(seat)
+            self.assertEqual(R.perms_seat_caller(), passes, box)
+
     def test_a_renamed_shell_in_the_perms_seat_is_refused(self):
         """Perms, 10-13: "accept a process as the perms seat only when /proc/<pid>/exe resolves under
         ~/.local/share/claude/versions/ AND its comm is claude". A real /bin/sh copied to a file named `claude` runs

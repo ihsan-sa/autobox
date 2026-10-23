@@ -118,6 +118,11 @@ tar -C "$B/.." --exclude=./ccbox/env --exclude=__pycache__ -cf - . | tar -C "$IR
 inst(){ ( cd "$IH" && env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }   # XDG too: the installer writes global git config, and a fixture reads nobody's but its own
 inst && ok "install.sh runs clean on a blank HOME (--no-services)" || bad "install.sh failed on a blank HOME: $(tail -3 "$T/install.log" | tr '\n' ' ')"
 [ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-reconcile")" = "$IR/bin/cc-reconcile" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
+# the lander reads the box's name from the config alone, so install writes it there, and keeps one already set
+cfgbox(){ env -u CC_BOX HOME="$IH" "$IR/bin/cc-config" get CC_BOX; }
+[ "$(cfgbox)" = testbox ] && ok "install writes CC_BOX into a config that has none" || bad "install left CC_BOX out of ~/.cc/config: '$(cfgbox)'"
+HOME="$IH" "$IR/bin/cc-config" set CC_BOX kept; inst
+[ "$(cfgbox)" = kept ] && ok "install keeps the config's own CC_BOX over the environment's" || bad "install rewrote the config's CC_BOX to '$(cfgbox)'"
 # the prune is scoped to what this tree linked: a stale link of its own (target left the tree) goes, a dangling
 # link someone ELSE put in ~/bin stays — install.sh used to delete every dangling link in ~/bin, whoever made it
 ln -s "$IR/bin/retired-script" "$IH/bin/retired-script"; ln -s "$T/never-ours" "$IH/bin/foreign"

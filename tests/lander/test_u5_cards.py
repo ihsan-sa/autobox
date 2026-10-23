@@ -60,13 +60,15 @@ class Stubbed(unittest.TestCase):
                           U5_STUB_LOG=self.log, U5_STUB_ANSWERS=self.answers_path,
                           CC_LAND_STATE=os.path.join(self.tmp, "land"), CC_BOARDS=os.path.join(self.tmp, "boards"),
                           CC_SLACK_DIR=os.path.join(self.tmp, "slack"), CC_CONFIG=os.path.join(self.tmp, "config"),
-                          CC_LANDER_STATE=os.path.join(self.tmp, "land"), CC_ROLE="track",
-                          CC_BOX="demo")   # demo is the control repo: its stops are the planning seat's
+                          CC_LANDER_STATE=os.path.join(self.tmp, "land"), CC_ROLE="track")
         # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
         for name, val in (("PASSWD_HOME", self.home), ("REVIEWER_CONFIG", os.path.join(self.home, ".cc", "config"))):
             p = mock.patch.object(C, name, val)
             p.start()
             self.addCleanup(p.stop)
+        os.makedirs(os.path.join(self.home, ".cc"))
+        with open(C.REVIEWER_CONFIG, "w") as f:
+            f.write("CC_BOX=demo\n")   # demo is the control repo: its stops are the planning seat's
         self.answer({})
 
     def tearDown(self):

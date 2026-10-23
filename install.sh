@@ -5,7 +5,8 @@
 #   ./install.sh --no-services    link only — no systemctl/sudo (tests run this in a throwaway HOME)
 #   ./install.sh --join <peer>    install, then record that this box is to join <peer> (a skeleton: it writes
 #                                 ~/.cc/peer/join and prints what is left; no key, no network, no message yet)
-# The box's name is CC_BOX (environment, then ~/.cc/config), else `hostname -s`; nothing here names a real box.
+# The box's name is CC_BOX (environment, then ~/.cc/config), else `hostname -s`, and a config without CC_BOX gets
+# it written in; nothing here names a real box.
 # A box may keep this tree as `core/` inside a private repo — the "overlay" — and then the installer also links
 # the overlay's home/*.md and bin-private/*, uses its config/etc, and lays its config/claude-settings.json over
 # the default when it writes a first ~/.claude/settings.json. A bare clone of autobox has no overlay.
@@ -29,6 +30,8 @@ fi
 
 mkdir -p ~/bin ~/.cc/{boards,worktrees,state,slack} ~/.config/systemd/user ~/.config/environment.d ~/dev
 [ -d ~/.cc/tmp ] || mkdir -m 700 ~/.cc/tmp   # TMPDIR for every unit and session (config/environment.d/cc-tmp.conf): made before anything reads it
+# the lander names the box (and so the perms seat) from the config alone, never the environment: write the name in
+env -u CC_BOX "$R/bin/cc-config" get CC_BOX >/dev/null || "$R/bin/cc-config" set CC_BOX "$box"
 
 # link <src> <dest> — like `ln -sfn`, except a REAL file/dir in the way is kept as <dest>.bak instead of clobbered.
 link() {

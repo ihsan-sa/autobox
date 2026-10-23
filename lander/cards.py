@@ -130,7 +130,8 @@ def kept_env(env, **fixed):
 
 
 def reviewer_key(key):
-    return key.startswith("CC_LAND_REVIEW") or key in ("CC_CLAUDE", "CC_CODEX")
+    """A key read from REVIEWER_CONFIG alone: the reviewer's, and CC_BOX, which names the perms seat (box_name)."""
+    return key.startswith("CC_LAND_REVIEW") or key in ("CC_CLAUDE", "CC_CODEX", "CC_BOX")
 
 
 def conf(key, default=""):
@@ -846,13 +847,17 @@ def stopped(job, why, route):
     return said
 
 
-def control_repo():
-    """The box's control repo, the one its planning seat runs in, by cc's ctl_repo rule (cc-notify's CTL too): the repo
-    this copy lives in under ~/dev, else CC_BOX, else the short hostname."""
+def box_name():
+    """The box's name from nothing a caller sets: the repo this copy lives in under the passwd ~/dev, else CC_BOX in
+    the passwd home's config (reviewer_key), else ''. Never the environment's (#1886 security read)."""
     dev = os.path.join(PASSWD_HOME, "dev") + os.sep
-    if BIN.startswith(dev):
-        return BIN[len(dev):].split(os.sep)[0]
-    return conf("CC_BOX") or socket.gethostname().split(".")[0]
+    return BIN[len(dev):].split(os.sep)[0] if BIN.startswith(dev) else conf("CC_BOX")
+
+
+def control_repo():
+    """The box's control repo, the one its planning seat runs in, by cc's ctl_repo rule (cc-notify's CTL too):
+    box_name(), else the short hostname."""
+    return box_name() or socket.gethostname().split(".")[0]
 
 
 def own_seat(job, route):
