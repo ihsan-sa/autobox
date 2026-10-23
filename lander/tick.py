@@ -580,13 +580,15 @@ def rearm(repos) -> list:
 
 def known_repos(repo="") -> list:
     """Every repo this box tracks: a board names it, <repo>.applied says it was deployed, a job says it lands.
-    Member projects never deploy."""
+    Member projects never deploy, and neither does a member's own workspace board: ~/dev/<h> holds clones of several
+    of the member's repos, so its main may follow none of them and its origin's main never fast-forward it (one such
+    board failed every deploy for five days, 2026-10-18 to 10-23). Its projects land as <h>--<repo>, with no deploy."""
     if repo:
-        return [repo] if "--" not in repo else []
+        return [repo] if "--" not in repo and not M.workspace(repo) else []
     names = {os.path.basename(x)[:-len(".json")] for x in glob.glob(os.path.join(J.boards(), "*.json"))}
     names |= {os.path.basename(x)[:-len(".applied")] for x in glob.glob(C.state("*.applied"))}
     names |= set(J.all_repos())
-    return sorted(n for n in names if J.REPO_RE.fullmatch(n) and "--" not in n)
+    return sorted(n for n in names if J.REPO_RE.fullmatch(n) and "--" not in n and not M.workspace(n))
 
 
 def due_catchup(repo) -> bool:

@@ -1854,8 +1854,9 @@ class Lane:
         once("board", "board", "close", job)
         once("card", "cards", "landed", job)
         once("tip", "tip", "kick", job.repo)
-        if self.member or job.extra.get("tip") == "unvalidated":
-            J.move(job, T.DONE, why="a member project never deploys" if self.member else "the tip is unvalidated")
+        member = self.member or M.workspace(self.repo)   # a member's bare workspace board deploys nothing either
+        if member or job.extra.get("tip") == "unvalidated":
+            J.move(job, T.DONE, why="a member project never deploys" if member else "the tip is unvalidated")
             return E.log("done", job.repo, job.pr, rc=0)
         if not job.extra.get("tip_sha"):
             base = job.extra.get("base_ref") or ""

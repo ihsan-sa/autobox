@@ -1264,6 +1264,16 @@ class Members(Fixture):
         self.assertEqual(L.M.route(j), "#alice")
         self.assertEqual(M.route(T.Job(repo="demo", pr=1)), "")
 
+    def test_a_members_bare_workspace_board_lands_without_deploy(self):
+        # ~/dev/<h> holds several of the member's clones, so its origin's main may never fast-forward its main
+        os.makedirs(f"{self.home}/.cc/members/demo")
+        open(f"{self.home}/.cc/members/demo/member-workspace", "w").close()
+        self.pr(1, {"a/x": "m\n"})
+        J.submit("demo", 1)
+        u, _ = self.land()
+        self.assertEqual(self.job(1).state, T.DONE)
+        self.assertEqual(u["deploy"].calls, [])
+
 
 class Compiled(Fixture):
     """Perms, after #1298: "EVERY lane refuses __pycache__, .pyc, .pyo, .so, .pyd and NUL-bearing blobs under core/

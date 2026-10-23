@@ -180,6 +180,20 @@ class Tick(unittest.TestCase):
         self.tick()                                                               # idempotent: nothing again
         self.assertEqual(self.installs(), [sha])
 
+    def test_a_members_workspace_board_is_never_tip_run_or_deployed(self):
+        # ~/dev/<h> is several of the member's clones under one board: its main follows no origin, so a tip run and
+        # a deploy there could only fail. The marker counts, and so does the host's record with the marker deleted.
+        for name in ("demo", "alice", "bob", "carol"):
+            open(os.path.join(self.tmp, "boards", f"{name}.json"), "w").close()
+        os.makedirs(os.path.join(self.tmp, "dev", "alice", ".cc"))
+        open(os.path.join(self.tmp, "dev", "alice", ".cc", "member-workspace"), "w").close()
+        for h, rec in (("bob", "credentials.json"), ("carol", "member-workspace")):
+            os.makedirs(os.path.join(self.tmp, "members", h))
+            open(os.path.join(self.tmp, "members", h, rec), "w").close()
+        self.assertEqual(TK.known_repos(), ["demo"])
+        # a PR on the bare board runs `tick --repo <h>`, which must not bring the tip run back
+        self.assertEqual([TK.known_repos(n) for n in ("demo", "alice", "bob", "carol")], [["demo"], [], [], []])
+
     def test_main_healths_checks_take_the_first_claim_and_the_nightly_sweeps_do_not(self):
         # brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot"
         from lander import nightly as N

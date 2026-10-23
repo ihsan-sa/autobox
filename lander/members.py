@@ -106,6 +106,14 @@ def member_of(repo):
     return "", ""
 
 
+def workspace(h) -> bool:
+    """~/dev/<h> is a member's whole workspace: its marker there, or the host's own record (cc's member_workspace),
+    which no bind reaches, so a member who deletes the marker is still one."""
+    return any(os.path.exists(p) for p in (f"{J.dev()}/{h}/.cc/member-workspace",
+                                           f"{J.members_dir()}/{h}/member-workspace",
+                                           f"{J.members_dir()}/{h}/credentials.json"))
+
+
 def _under(path, globs) -> bool:
     for g in globs:
         if g.endswith("/**"):
