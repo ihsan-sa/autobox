@@ -53,7 +53,7 @@
 #             'Closes <row>[, <row>][ and <row>]' in the body closes those board rows when the PR lands)
 # Slack post: ~/.cc/state/<repo>/<track>/slack-post.md (`thread` or #channel on line 1, `file: <path>` optional, text below; the loop posts it once at DONE)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch); a head that
-#             push could not send is left in ~/.cc/push-owed/<repo>/<track> for the host's sweep to push (push_host).
+#             push could not send is left in ~/.cc/push-owed/<repo>/<track> for the host's sweep to push, and said on the row (push_host).
 # Self-review: templates/self-review.md — the six kinds of finding the landing review keeps stopping PRs for. The worker
 #             prompt carries its six headings (selfrev_block, inlined because a sandboxed worker has core/bin bound and
 #             not core/templates), and the worker reads its own `git diff origin/<base>` against them before STATUS: DONE.
@@ -902,19 +902,30 @@ loop_live(){ say_io live "$1"; }   # $1 the state dir → 0 while a cc-loop for 
 # THE HOST'S PUSH AFTER AN ITERATION, AND WHAT A FAILED ONE LEAVES. Inside the sandbox the Stop hook commits with no
 # credential, so this is the only push a worker's commit gets, and it used to end `|| true`. A rebase round is one
 # iteration, so #1239's merge of main sat committed on the box for two rounds while the queue kept the old conflicting
-# head (2026-10-13). A head it could not push is now logged and left in ~/.cc/push-owed/<repo>/<track>, which the
+# head (2026-10-13). A head it could not push is now logged, noted on the row and handed to the dispatching seat (retried until it lands), and left in ~/.cc/push-owed/<repo>/<track>, which the
 # host's 5-minute sweep (cc-checkpoint --sweep) pushes once this loop is gone; the next push that lands clears it. A
 # refused lease (rc 2/3) is not owed: --push has told the board and the journal, and a retry would change nothing.
 push_host(){
   inside_boundary && return 0   # a member workspace's loop has no credential for --push by design: the host's sweep pushes its heads
-  local out rc head ow="$HOME/.cc/push-owed/$repo/$track"
+  local out rc head why ow="$HOME/.cc/push-owed/$repo/$track"
   out=$(cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push 2>&1); rc=$?
   head=$(git -C "$WT" rev-parse -q --verify HEAD 2>/dev/null)
   if [ "$rc" = 0 ]; then rm -f "$ow"; return 0; fi
-  log "push of ${head:0:12} failed (rc=$rc): $(tail -1 <<<"$out" | sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1#g' | cut -c1-200)"   # cc-checkpoint's no_userinfo: a remote url can carry a token
+  why=$(tail -1 <<<"$out" | sed -E 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]*@#\1#g' | cut -c1-200)   # cc-checkpoint's no_userinfo: a remote url can carry a token
+  log "push of ${head:0:12} failed (rc=$rc): $why"
   if [ "$rc" = 2 ] || [ "$rc" = 3 ]; then rm -f "$ow"; return 0; fi
-  [ -n "$head" ] && [ "$(cut -d' ' -f1 "$ow" 2>/dev/null)" != "$head" ] || return 0   # already owed at this head: the sweep's line about it stands
-  mkdir -p "${ow%/*}" && printf '%s\n' "$head" > "$ow"
+  [ -n "$head" ] || return 0
+  # The owed file is the head and nothing else (the sweep and `rm` of it know no more); that THIS loop has told the seat of
+  # it is $push_noted, a shell variable, so a head owed by an earlier loop is told again here, once. Not a file under $ST:
+  # the worker can write there, and a link it planted would have had the host write the head through it (round 3, #1892).
+  [ "$(cat "$ow" 2>/dev/null)" = "$head" ] || { mkdir -p "${ow%/*}" && printf '%s\n' "$head" > "$ow"; }
+  [ "${push_noted:-}" = "$head" ] && return 0
+  # …and the seat hears it, once per head: a loop.log line alone is how 900a58f0 went unseen (2026-10-19)
+  local msg="the host's push of ${head:0:7} failed, so origin has not got it; the next iteration, or the 5-minute sweep once the loop ends, tries again — $why" nout
+  if ! nout=$("$BIN/cc-board" note "$repo" "$track" "$msg" 2>&1); then log "the board note for the failed push of ${head:0:12} was lost: $(tail -1 <<<"$nout" | cut -c1-200)"
+  # a seat the broker cannot wake gets it as a request (stop()'s own fallback); only a line somebody holds counts as told
+  elif tell_planner "$(planner_line 'host push failed' "$msg")" || stop_unheard "host push failed" "$msg"; then push_noted=$head
+  else log "the failed push of ${head:0:12} reached no seat: it is on the board row only"; fi
   return 0; }
 say_take(){ say_io take "$1"; }    # $1 the state dir → the spooled messages as one block on stdout (none: rc 1), moved to say.read
 inbox_hook(){   # $1 the state dir. PostToolUse: stdin is the hook's JSON (unread); stdout gives the model its messages
@@ -2466,10 +2477,47 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   # Its own fixture: a one-commit repo for $WT and a stub cc-checkpoint answering the rc in $d/ph/rc.
   mkdir -p "$d/ph/bin" "$d/ph/home"; git init -q "$d/ph/wt"; git -C "$d/ph/wt" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
   printf '#!/usr/bin/env bash\necho "cannot reach origin" >&2\nexit "$(cat %s)"\n' "$d/ph/rc" > "$d/ph/bin/cc-checkpoint"; chmod +x "$d/ph/bin/cc-checkpoint"
-  # log() is the main body's, defined after selfcheck runs, so ph brings its own
-  ph(){ echo "$1" > "$d/ph/rc"; ( HOME="$d/ph/home" BIN="$d/ph/bin" WT="$d/ph/wt" LOG="$d/ph/log" repo=r track=tk HG=(); log(){ printf '%s\n' "$*" >> "$LOG"; }; push_host 2>/dev/null ); cat "$d/ph/home/.cc/push-owed/r/tk" 2>/dev/null; }
+  # log() is the main body's, defined after selfcheck runs, so ph brings its own. $push_noted lives in the loop's shell, so
+  # ph carries it from call to call in $d/ph/noted, and removing that file is a new loop. phr runs the real seat helpers.
+  ph(){ echo "$1" > "$d/ph/rc"; ( HOME="$d/ph/home" BIN="$d/ph/bin" WT="$d/ph/wt" ST="$d/ph/st" LOG="$d/ph/log" repo=r track=tk HG=(); push_noted=$(cat "$d/ph/noted" 2>/dev/null); log(){ printf '%s\n' "$*" >> "$LOG"; }; planner_line(){ printf '%s: %s\n' "$repo/$track" "$2"; }; tell_planner(){ [ ! -e "$LOG.brokerdown" ] || return 1; printf '%s\n' "$1" >> "$LOG.told"; }; stop_unheard(){ [ ! -e "$LOG.reqdown" ] || return 1; printf '%s\n' "$2" >> "$LOG.req"; }; push_host 2>/dev/null; printf '%s' "${push_noted:-}" > "$d/ph/noted" ); cat "$d/ph/home/.cc/push-owed/r/tk" 2>/dev/null; }
+  phr(){ echo 1 > "$d/ph/rc"; ( HOME="$d/ph/home" BIN="$d/ph/bin" WT="$d/ph/wt" ST="$d/ph/st" LOG="$d/ph/log" repo=r track=tk HG=() ORCH_KEY=""; push_noted=""; log(){ printf '%s\n' "$*" >> "$LOG"; }; push_host 2>/dev/null ); }
   local phh; phh=$(git -C "$d/ph/wt" rev-parse HEAD)
   t 'push_host: a failed push leaves the head owed to the host sweep, and the log says why' "$(ph 1)|$(grep -c 'failed (rc=1): cannot reach origin' "$d/ph/log")" "$phh|1"
+  printf '#!/usr/bin/env bash\necho "$*" >> %s\n' "$d/ph/notes" > "$d/ph/bin/cc-board"; chmod +x "$d/ph/bin/cc-board"
+  rm -rf "$d/ph/home/.cc/push-owed" "$d/ph/noted"; mkdir -p "$d/ph/st"; ph 1 >/dev/null; ph 1 >/dev/null
+  t '…and the row is told once per head, not once per failed iteration' "$(grep -c "note r tk the host's push of ${phh:0:7} failed.*cannot reach origin" "$d/ph/notes")" 1
+  t '…and the dispatching seat is handed the same line once' "$(grep -c "^r/tk: the host's push of ${phh:0:7} failed" "$d/ph/log.told")" 1
+  # a note that fails is lost out loud and retried by the next failed push of the same head, then not repeated
+  printf '#!/usr/bin/env bash\n[ -e %s ] || { touch %s; echo "board is down" >&2; exit 1; }\necho "$*" >> %s\n' "$d/ph/ok" "$d/ph/ok" "$d/ph/notes2" > "$d/ph/bin/cc-board"
+  rm -rf "$d/ph/home/.cc/push-owed" "$d/ph/ok" "$d/ph/noted"; : > "$d/ph/log"; rm -f "$d/ph/log.told"
+  t '…a note that fails leaves the head owed but not noted, and the log says it was lost' "$(ph 1)|$(grep -c 'note for the failed push of .* was lost: board is down' "$d/ph/log")|$(ls "$d/ph/log.told" 2>/dev/null | wc -l)" "$phh|1|0"
+  t '…the next failed push of that head retries the note' "$(ph 1)|$(grep -c 'push of' "$d/ph/notes2")|$(grep -c . "$d/ph/log.told")" "$phh|1|1"
+  ph 1 >/dev/null
+  t '…and once delivered it is not sent again' "$(grep -c 'push of' "$d/ph/notes2")" 1
+  # a head owed by an earlier loop (the owed file has it, this loop has told nobody) is told once in the new one
+  rm -rf "$d/ph/notes2" "$d/ph/log.told" "$d/ph/noted"
+  t '…a head owed by an earlier loop is told once when it fails again in a new one' "$(ph 1)|$(ph 1 >/dev/null; grep -c 'push of' "$d/ph/notes2")|$(grep -c . "$d/ph/log.told")" "$phh|1|1"
+  # an owed file from before #1892 read '<head> noted': it is told, and rewritten as the head the sweep reads
+  rm -rf "$d/ph/notes2" "$d/ph/log.told" "$d/ph/noted"; echo "$phh noted" > "$d/ph/home/.cc/push-owed/r/tk"
+  t '…an owed file in the old <head> noted form is told and rewritten as the head alone' "$(ph 1)|$(grep -c 'push of' "$d/ph/notes2")" "$phh|1"
+  # the mark is never a file the worker can reach: a link planted at its old path in the state dir is left unwritten
+  rm -rf "$d/ph/notes2" "$d/ph/log.told" "$d/ph/noted"; echo keep > "$d/ph/victim"; ln -sfn "$d/ph/victim" "$d/ph/st/push-noted"
+  t '…a link a worker plants at $ST/push-noted is not written through when the seat is told' "$(ph 1 >/dev/null; grep -c . "$d/ph/log.told")|$(cat "$d/ph/victim")" "1|keep"
+  rm -f "$d/ph/st/push-noted"
+  # the broker is down: the seat still gets the line, as a request; and with no request filed either, the head is not marked told
+  rm -rf "$d/ph/notes2" "$d/ph/log.told" "$d/ph/noted"; touch "$d/ph/log.brokerdown"
+  t '…a seat the broker cannot wake gets it as a request' "$(ph 1 >/dev/null; grep -c "push of" "$d/ph/log.req")|$(cat "$d/ph/noted")" "1|$phh"
+  rm -rf "$d/ph/noted" "$d/ph/log.req"; : > "$d/ph/log"; touch "$d/ph/log.reqdown"; ph 1 >/dev/null; ph 1 >/dev/null
+  t '…and a line nobody holds is not marked told, so the next failed push tells again' "$(wc -c < "$d/ph/noted")|$(grep -c 'reached no seat' "$d/ph/log")" "0|2"
+  rm -f "$d/ph/log.brokerdown" "$d/ph/log.reqdown"
+  # the real tell_planner, planner_line and stop_unheard, with only cc-broker and cc-notify stubbed: the call shapes stop() uses
+  printf '#!/usr/bin/env bash\necho "$*" >> %s\n[ ! -e %s ]\n' "$d/ph/broker" "$d/ph/brokerdown" > "$d/ph/bin/cc-broker"
+  printf '#!/usr/bin/env bash\necho "$*" >> %s\n' "$d/ph/notify" > "$d/ph/bin/cc-notify"; chmod +x "$d/ph/bin/cc-broker" "$d/ph/bin/cc-notify"
+  phr
+  t '…the real helpers hand cc-broker the planner line for the repo seat' "$(grep -c "^inject --no-start --source loop r loop: r/tk host push failed — the host's push of ${phh:0:7} failed" "$d/ph/broker")" 1
+  touch "$d/ph/brokerdown"; phr
+  t '…and with the broker down cc-notify files it as the seat'"'"'s request' "$(grep -c "^--ask --id stop:r/tk:[0-9TZ]* -t r/tk host push failed the host's push of ${phh:0:7}" "$d/ph/notify")" 1
+  rm -f "$d/ph/bin/cc-broker" "$d/ph/bin/cc-notify"
   t '…a push that lands owes nothing' "$(ph 0)" ""
   t '…nor does a refused lease, which --push has already said' "$(ph 1 >/dev/null; ph 2)" ""
   printf '#!/usr/bin/env bash\necho "fatal: unable to access https://x-access-token:SECRETTOK@github.com/o/r.git/" >&2\nexit 1\n' > "$d/ph/bin/cc-checkpoint"
