@@ -8981,6 +8981,7 @@ def run_selfcheck():
         os.makedirs(f"{BOX_STATE}/house"); os.makedirs(f"{BOX_STATE}/hank")
         state_own = state_taken("hank")
         state_rot = state_taken("rotation")   # cc-rotation's proposals, which `cc-rotation archive` acts on as the owner
+        state_rgh = state_taken("reconcile-gh")   # cc-reconcile's kept GitHub answers, which drive branch deletes
         check("member: `owner` is reserved as a handle — mail_move takes lead='owner' to mean a host session, so a "
               "workspace called that would move the owner's mail threads as its own (perms' read of #1729)",
               "box's own names" in reserved_name("owner", routes={}) and "box's own names" in reserved_name("Owner", routes={}))
@@ -9152,6 +9153,9 @@ def run_selfcheck():
           "provisioned workspace keeps its own", coll["UROOM"] == "refused" and coll["UHOUSE"] == "refused"
           and state_own == "" and "house" not in os.listdir(DEV) and "room" not in os.listdir(DEV)
           and "rotation" not in os.listdir(BOX_STATE) and "box keeps its own state" in state_rot)
+    check("a handle `reconcile-gh` is REFUSED before its dir exists: a member bound to it could plant the kept GitHub "
+          "answers cc-reconcile's sweep reads (perms' read of #1912)",
+          "reconcile-gh" not in os.listdir(BOX_STATE) and "box keeps its own state" in state_rgh)
     check("`cc-slack member add <@u>` is the same join by hand — it creates the pair and the workspace, and running "
           "it again changes nothing", rc_cli == 0 and rc_cli2 == 0
           and made_cli == sorted(after_coll[0] + ["erin", "erin-updates"]) and made_cli2 == made_cli)

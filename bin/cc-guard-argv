@@ -81,7 +81,8 @@ Rules for both gated roles:
   or interpreter code importing lander                                                             -> never
 - cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX|CC_BOX; cc-settings apply|grant -> never
   (set|unset with any key not spelt out: computed, a glob, from xargs or find -exec; a subcommand not spelt out; cc-config
-  run by path, through a shell or source, or as a copy or link (by its bytes, or a cp/ln/install in the same line); set|unset
+  run by path, through a shell or source, or as a copy or link (by its bytes, or a cp/ln/install in the same line), or its text
+  (`cat`, `sed -n p`) fed to a shell by a pipe, a here-string or `-c "$(…)"`, which runs with the shell's arguments; set|unset
   after a script path it can't read (`$C`, `$(which cc-config)`, a file this line makes, stdin from cc-config) or a computed verb) -> never
 - write fence: a redirect target or the destination of cp mv ln install rsync tee dd(of=) sed -i perl -i truncate rm
   rmdir unlink shred touch mkdir chmod chown curl -o wget -O find -delete, or git -C <dir> (or the cwd) with a verb
@@ -826,15 +827,21 @@ class Guard:
             if r['op'] in ('<<', '<<-', '<<<'): out.append(r['body'] if r['op'] != '<<<' else r['w'].v)
             elif r['op'] == '<' and r['w'].subs: out += ['\n'.join(g.data(x) for x in g.script(t, cwd, '<()', depth + 1)) for t in r['w'].subs]
             elif r['op'] == '<' and not r['w'].dyn and g.absp(r['w'].v, cwd) in g.written: out.append(g.written[g.absp(r['w'].v, cwd)])
+            if r['op'] == '<<<' and r['w'].subs: out += ['\n'.join(g.data(x) for x in g.script(t, cwd, '$()', depth + 1)) for t in r['w'].subs]   # `<<< "$(cat f)"`: what it prints
         return out
 
-    def fed(g, subs, cwd, via, depth):   # what a <( ) prints, read as the script a shell or `source` runs
+    def fed(g, subs, cwd, via, depth, *argv):   # what a <( ) prints, read as the script a shell or `source` runs with argv
         out = []
         for sub in subs:
-            rs = g.script(sub, cwd, '<()', depth + 1)
-            try: out += g.script('\n'.join(g.data(r) for r in rs), cwd, via, depth + 1)
+            t = '\n'.join(g.data(r) for r in g.script(sub, cwd, '<()', depth + 1))
+            for A in argv: out += g.fedtool(t, A, cwd, via, depth)
+            try: out += g.script(t, cwd, via, depth + 1)
             except ParseError: pass
         return out
+
+    def fedtool(g, t, args, cwd, via, depth):   # a shell fed a gated tool's own text (`cat ~/bin/cc-config | bash -s set K v`)
+        t = t.strip()   # runs that tool with the shell's own arguments
+        return g.script(' '.join(shlex.quote(x) for x in [t] + args), cwd, via, depth + 1) if t in TOOLS else []
 
     def bypath(g, b, a, cwd, depth):   # a[0] is the script file an interpreter or shell runs: one of TOOLS runs as that tool
         if b in SHELLS and g.absp(a[0], cwd) in g.written: return g.script(g.written[g.absp(a[0], cwd)], cwd, b + ' script', depth + 1)
@@ -867,16 +874,20 @@ class Guard:
             if a[k:k + 1] == ['--']: k += 1
             if c:   # `sh -n -c '…'` only parses the string
                 if k < len(a) and not nx: out += g.script(a[k], cwd, b + ' -c', depth + 1)
-                if k + 1 < len(ws) and ws[k + 1].subs and not nx: out += g.fed(ws[k + 1].subs, cwd, b + ' -c', depth)   # bash -c "$(…)"
+                if k + 1 < len(ws) and ws[k + 1].subs and not nx:   # bash -c "$(…)" $0 ARGS: the text runs with ARGS
+                    out += g.fed(ws[k + 1].subs, cwd, b + ' -c', depth, a[k + 2:])
             elif k < len(a) and not s and (not fdof(a[k]) or ws[k + 1].subs):   # `bash core/bin/cc-publish`: a script file that IS one of the gated tools runs as it
                 if not nx: out += g.bypath(b, a[k:], cwd, depth)   # (`bash -n` only parses it)
-                if not nx and ws[k + 1].subs: out += g.fed(ws[k + 1].subs, cwd, b + ' <()', depth)   # `sh <(…)`: what it prints is the script
+                if not nx and ws[k + 1].subs: out += g.fed(ws[k + 1].subs, cwd, b + ' <()', depth, a[k + 1:])   # `sh <(…)`: what it prints is the script
             else:   # `bash < <(echo 'docker run ..')`, `bash /dev/fd/3 3<<<'…'`: what that descriptor holds is the script
                 fd = fdof(a[k]) if k < len(a) and not s else '0'
+                rest = a[k:] if s or k >= len(a) else a[k + 1:]   # the shell's own arguments
                 if fd == '0' and any(r['op'] == '<' and g.iscfg(r['w'].v, cwd) for r in R['redirs']):   # `bash -s set K v < cc-config`
-                    out += g.bypath(b, [CFG] + a[k:], cwd, depth)
-                for t in g.feed(R['redirs'], fd, cwd, depth): out += g.script(t, cwd, 'stdin>' + b, depth + 1)
+                    out += g.bypath(b, [CFG] + rest, cwd, depth)
+                for t in g.feed(R['redirs'], fd, cwd, depth):
+                    out += g.fedtool(t, rest, cwd, 'stdin>' + b, depth) + g.script(t, cwd, 'stdin>' + b, depth + 1)
                 if fd == '0' and ctx[1]['pipe'] is not None:
+                    out += g.fedtool(g.produced(ctx), rest, cwd, 'pipe>' + b, depth)
                     try: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
                     except ParseError: pass
         elif b == 'script':   # script -c CMD / -qc CMD / --command[=]CMD runs CMD in a shell
@@ -970,7 +981,7 @@ class Guard:
                     try: out += g.script(t.strip().strip('|'), cwd, b + ' code', depth + 1)
                     except ParseError: del g.out[n0:]
         elif b in ('source', '.') and a:   # `. ~/bin/cc-config set K v` runs that tool with those words, as `bash` does
-            if ws[1].subs: out += g.fed(ws[1].subs, cwd, 'source', depth)
+            if ws[1].subs: out += g.fed(ws[1].subs, cwd, 'source', depth, a[1:])
             out += g.bypath(b, a, cwd, depth)
         elif b == 'find':
             k = 1
@@ -1918,11 +1929,19 @@ def selfcheck():
                     'C=~/bin/cc-config; . "$C" set CC_BOX x', 'env $C set CC_BOX x', '$C unset CC_CLAUDE',
                     'bash ~/bin/cc-$N set CC_BOX x', 'bash -s set CC_BOX x < ~/bin/cc-config',
                     'cat ~/bin/cc-config > q; ./q set CC_BOX x', 'rsync ~/bin/cc-config q; ./q set CC_BOX x',
-                    'dd if=/x/cc-config of=q; ./q set CC_BOX x')],
+                    'dd if=/x/cc-config of=q; ./q set CC_BOX x',
+                    # …and cc-config's text fed to a shell: a pipe, a here-string (its bytes or a $( )), a -c "$( )"
+                    'cat ~/bin/cc-config | bash -s set CC_BOX x', 'bash -s set CC_BOX x <<< "$(cat ~/bin/cc-config)"',
+                    'bash -s set CC_BOX x <<< ' + shlex.quote((CFGB or b'').decode()), 'bash -c "$(cat ~/bin/cc-config)" _ set CC_BOX x',
+                    'bash -c "$(cat ~/bin/cc-config)" set CC_BOX x',
+                    # an edited copy beats the byte match (an accepted limit): the write fence on ~/.cc/config is what stops it
+                    'echo CC_BOX=x >> ~/.cc/config', 'sed -i /CC_BOX/d ~/.cc/config', 'cp q ~/.cc/config')],
                 *[('worker', 'track/x', c, False) for c in (
                     'bash ~/bin/cc-config get CC_BOX', '~/bin/cc-config set FOO x', 'source ~/.bashrc',
                     'bash $(which cc-config) set FOO x', 'bash $(which cc-config) get CC_BOX', '$C set FOO x',
-                    'bash -s get CC_BOX < ~/bin/cc-config', 'bash $S arg',
+                    'bash -s get CC_BOX < ~/bin/cc-config', 'bash $S arg', 'cat ~/bin/cc-config | bash -s set FOO x',
+                    'cat ~/bin/cc-config | bash -s get CC_BOX', 'bash -s get CC_BOX <<< "$(cat ~/bin/cc-config)"',
+                    'bash -c "$(cat ~/bin/cc-config)" _ get CC_BOX',
                     'cc-config get $K', 'cc-config set FOO x', 'cc-config set FOO "$V"', 'cc-config set FOO $(date)', 'cc-config list')]]:
             cwd = repo(branch, branch != 'main') if branch else H + '/dev/alice'
             env = dict(base, GUARD_ROLE=role, GUARD_CWD=cwd, GUARD_ROOT=cwd, GUARD_MWS='alice' if role == 'member' else '')

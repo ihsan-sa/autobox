@@ -2246,6 +2246,26 @@ def selfcheck():
            batch == {} and alone == "OPEN" and len(calls) == 3 and "If-None-Match" not in calls[2])
     finally:
         restore(); shutil.rmtree(tp, ignore_errors=True)
+    # A PLANTED COPY DELETES NO BRANCH: the sweep's lists (pr_states, merged_heads, branch_prs) drive a track-branch
+    # delete and a worktree removal, so a merge only a kept page shows reads as unknown (perms' read of #1912). Own
+    # fixture: every list path holds a planted merged page with an ETag, and every conditional GET is a 304.
+    ts = tempfile.mkdtemp(prefix="cc-reconcile-plant-sweep-")
+    try:
+        scratch(ts, dict(NOOP, gh='printf "HTTP/2.0 304 Not Modified\\r\\n\\r\\n"; exit 1'))
+        os.makedirs(f"{ts}/dev/zz"); os.makedirs(f"{STATE}/reconcile-gh")
+        merged = {"number": 12, "state": "closed", "merged_at": "2026-10-23T00:00:00Z", "head": {"ref": "track/x", "sha": "abc"}}
+        for path in ("repos/{owner}/{repo}/pulls?state=all&per_page=100&page=1",
+                     "repos/{owner}/{repo}/pulls?state=closed&per_page=100&page=1",
+                     "repos/{owner}/{repo}/pulls?head={owner}:track/x&state=all&per_page=10"):
+            json.dump({"etag": 'W/"e1"', "body": [merged]},
+                      open(f"{STATE}/reconcile-gh/{hashlib.sha1(f'{DEV}/zz {path}'.encode()).hexdigest()}.json", "w"))
+        swept = pr_states("zz"), merged_heads("zz"), branch_prs("zz", "track/x")
+        ok("PLANT: a merge only a kept page shows is unknown to the sweep, so it deletes no branch and removes no "
+           "worktree on it", swept == ({"track/x": ("?", 0.0, "abc")}, [], [(12, "?", 0.0, 0.0)])
+           and branch_verdict({"board": "done", "kind": "track", "pr": swept[0]["track/x"][0], "head": "abc",
+                               "tip": "abc", "dirty": False})[0] == "report")
+    finally:
+        restore(); shutil.rmtree(ts, ignore_errors=True)
     # (b) the tick wakes an idle seat once for a startable row, not again for the same state, never for a channel repo
     tb = tempfile.mkdtemp(prefix="cc-reconcile-wake-")
     try:
