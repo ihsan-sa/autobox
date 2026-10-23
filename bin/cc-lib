@@ -80,7 +80,7 @@ boundary reads one file, its own workspace's, and can reach no other.
   cc-lib quarantine [<handle>]
         Mark a member workspace QUARANTINED (below): writes the host-side marker ~/.cc/members/<handle>/quarantined and
         says so; with no handle, lists the marked ones. Refused inside a member's boundary, for a handle that is not a
-        member workspace (no ~/dev/<h>/.cc/member-workspace) and where a link sits at the marker's name. The next
+        member workspace (neither ~/.cc/members/<h>/member-workspace nor ~/dev/<h>/.cc/member-workspace) and where a link sits at the marker's name. The next
         `index` drops every record the workspace already had. Lifting it is a person's act: delete the marker.
   cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
   cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it), the workspace cases launched
@@ -180,8 +180,8 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               is read, the newest by mtime, a tie going to the worktree — a seat writes there and merges at
               milestones, so a search that saw only the primary would miss the current state.
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
-  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board and the landing queue (BIG),
-  which are read up to 64 MiB, cc-board's own cap.
+  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board, read up to 64 MiB (cc-board's
+  own cap; a member's up to 8 MiB), and the landing queue, which only the box writes and is read from its newest 64 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
@@ -215,11 +215,12 @@ HITS = 8               # search hits shown per page
 FTS_DEADLINE = 2.0     # seconds, one index operation
 RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
 MAX_SOURCE = 4 << 20   # a registered file over this is unreadable, not read
-# …except these, read up to BOARD_CAP: a busy repo's board passed 4 MiB in 2026-10 and every row, note and log item
-# on it dropped out of the index, and the landing queue only grows. Both are re-read at record grain, so size costs a parse.
-# A member's board is its own file, so a sparse 4 GiB one costs it nothing: every board read stops at BOARD_CAP + 1.
-BIG = ("board", "land-queue")
+# …except a board, read up to BOARD_CAP: a busy repo's board passed 4 MiB in 2026-10 and every row, note and log item
+# on it dropped out of the index. A member's board is its own file, so a sparse 4 GiB one costs it nothing: every board
+# read stops at its cap + 1, and a member's cap is lower, as a 64 MiB board of empty lists takes 1.7 GB to parse.
+# The landing queue only grows and only the box writes it: its newest BOARD_CAP is read and nothing is refused.
 BOARD_CAP = 64 << 20   # cc-board's READ_CAP
+MEMBER_BOARD_CAP = 8 << 20   # a member's board was at most 250 KB in 2026-10
 NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint chat
 # kind fit per need: "a decision outranks a journal opinion about it"; a state record outranks prose for `current`
 FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0, "chat": 0},
@@ -340,13 +341,21 @@ def ws_id(handle, mint=False):
     return v if WSID.match(v) else None
 
 
+def member(h):
+    """Whether board h is a member workspace's: the host's own record ~/.cc/members/<h>/member-workspace (cc-sandbox
+    convert writes it where no bind reaches) or the marker cc-sandbox launches on. A bare ~/.cc/members/<h> is not one:
+    box boards keep a member-facing file there. cc-board-dream and quarantine ask this too, so no board is a member's
+    to one reader and the box's to the other."""
+    return any(os.path.isfile(os.path.join(H, *d, "member-workspace")) for d in ((".cc", "members", h), ("dev", h, ".cc")))
+
+
 def workspaces():
-    """handle -> id for every member workspace the host knows: a board of its own and the marker cc-sandbox launches
-    on (<workspace>/.cc/member-workspace). A session can strike only ITSELF off (the marker is in its own tree, and
-    without it its next launch is refused too); nothing it writes puts another handle here or moves a record across."""
+    """handle -> id for every member workspace the host knows: a board of its own that member() says is a member's.
+    A session can strike only ITSELF off, and only with no ~/.cc/members/<h> (the marker is in its own tree, and without
+    it its next launch is refused too); nothing it writes puts another handle here or moves a record across."""
     out = {}
     for repo in boards():
-        if os.path.isfile(os.path.join(H, "dev", repo, ".cc", "member-workspace")):
+        if member(repo):
             out[repo] = ws_id(repo, mint=True)   # None = refused, kept so index() can name it
     return out
 
@@ -475,9 +484,9 @@ def ts_num(ts):
 
 
 def open_regular(path):
-    """A binary file object on path, opened O_NONBLOCK and refused unless fstat says a regular file: a FIFO a member
+    """A binary file object on path, opened O_NONBLOCK|O_NOCTTY and refused unless fstat says a regular file: a FIFO a member
     puts at its board or a source neither blocks the reader nor is read."""
-    f = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb")
+    f = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY), "rb")
     if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
         f.close()
         raise ValueError("not a regular file")
@@ -485,12 +494,31 @@ def open_regular(path):
 
 
 def board_file(path):
-    """board_of() on the board at path, read through open_regular and refused (ValueError) over BOARD_CAP."""
+    """board_of() on the board at path, read through open_regular and refused (ValueError) over its cap."""
     with open_regular(path) as f:
-        raw = f.read(BOARD_CAP + 1)
-    if len(raw) > BOARD_CAP:
-        raise ValueError(f"over {BOARD_CAP >> 20} MiB")
-    return board_of(raw)
+        return board_in(f, path)
+
+
+BOARDS = {}   # (dev, inode, size, mtime, cap) -> a parsed board, or why it isn't one
+
+
+def board_in(f, path):
+    """board_file() on f, the board at path already open: parsed once per process, as registry, workspaces, board_rows
+    and parse all read every board, and refused over MEMBER_BOARD_CAP for a member's, BOARD_CAP for the box's."""
+    s = os.fstat(f.fileno())
+    cap = MEMBER_BOARD_CAP if member(os.path.basename(path)[:-5]) else BOARD_CAP
+    k = (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, cap)   # the cap too: a member's link to the box's board refuses only itself
+    if k not in BOARDS:
+        raw = f.read(cap + 1)
+        try:
+            if len(raw) > cap:
+                raise ValueError(f"over {cap >> 20} MiB")
+            BOARDS[k] = board_of(raw)
+        except ValueError as e:
+            BOARDS[k] = str(e)
+    if isinstance(BOARDS[k], str):
+        raise ValueError(BOARDS[k])
+    return BOARDS[k]
 
 
 def board_of(text):
@@ -789,8 +817,7 @@ def mtime_iso(path):
         return ""
 
 
-def parse_board(path, text, repo):
-    d = board_of(text)
+def parse_board(path, d, repo):
     sv = lambda v: v if isinstance(v, str) else ""   # a member's row, note or log entry: a stamp or a row name that isn't text is none
     recs = []
     for name, row in d["tracks"].items():
@@ -1132,10 +1159,16 @@ def parse(path, skind, repo, track, rows):
     with open_regular(path) as f:   # a FIFO swapped in after add()'s isfile neither blocks nor is read
         if ws_of(skind, repo) and not member_tree(os.readlink(f"/proc/self/fd/{f.fileno()}"), repo):
             raise ValueError("a member's source that leaves its own tree")
-        cap = BOARD_CAP if skind in BIG else MAX_SOURCE
-        raw = f.read(cap + 1)
-    if len(raw) > cap:
-        raise ValueError(f"over {cap >> 20} MiB")
+        if skind == "board":
+            return parse_board(path, board_in(f, path), repo)
+        if skind == "land-queue":   # its newest BOARD_CAP, from the first whole line in it
+            off = max(0, os.fstat(f.fileno()).st_size - BOARD_CAP)
+            f.seek(off)
+            text = f.read(BOARD_CAP).decode("utf-8", "replace")
+            return parse_queue(path, text.split("\n", 1)[-1] if off else text)
+        raw = f.read(MAX_SOURCE + 1)
+    if len(raw) > MAX_SOURCE:
+        raise ValueError(f"over {MAX_SOURCE >> 20} MiB")
     text = raw.decode("utf-8", "replace")
     if skind in ("journal", "doc", "memory"):
         return parse_md(path, text, skind, repo, track, rows)
@@ -1149,12 +1182,8 @@ def parse(path, skind, repo, track, rows):
         return parse_chat(path, text, track)
     if skind == "chatlog":
         return parse_chatlog(path, text, track)
-    if skind == "board":
-        return parse_board(path, text, repo)
     if skind in ("land-root", "land-job"):
         return parse_land(path, text, skind, repo)
-    if skind == "land-queue":
-        return parse_queue(path, text)
     if skind == "failures":
         return parse_failures(path, text, repo)
     if skind == "perms-log":
@@ -2356,8 +2385,8 @@ def quarantine(argv):
         print("quarantined: " + (", ".join(q) if q else "none"))
         return 0
     h = argv[0]
-    if not re.match(r"^[a-z0-9][a-z0-9-]{0,63}$", h) or not os.path.isfile(os.path.join(H, "dev", h, ".cc", "member-workspace")):
-        print(f"cc-lib quarantine: {h[:64]!r} is not a member workspace (no ~/dev/<h>/.cc/member-workspace) — nothing marked", file=sys.stderr)
+    if not re.match(r"^[a-z0-9][a-z0-9-]{0,63}$", h) or not member(h):
+        print(f"cc-lib quarantine: {h[:64]!r} is not a member workspace (no member-workspace record or marker) — nothing marked", file=sys.stderr)
         return 2
     m = os.path.join(H, ".cc", "members", h, QUAR_MARK)
     if os.path.islink(m) or (os.path.lexists(m) and not os.path.isfile(m)):
@@ -3894,25 +3923,78 @@ def selfcheck_covers(th, ok, run, w):
                 got = False
             ok(f"covers: {whose} board of {label} stops neither index, ask nor index --cold", got)
             os.remove(os.path.join(th, rel))
-    # a sparse 4 GiB board costs its member no disk: every board read stops at BOARD_CAP + 1, refuses it, and goes on
-    for whose, rel in (("a member's", ".cc/members/wsd/board/wsd.json"), ("a box", ".cc/boards/rbad.json")):
+    # a sparse 4 GiB board costs its member no disk: every board read stops at its cap + 1, refuses it, and goes on. The
+    # reads run with 768 MiB of address space to spare, so one that read the board whole would fail here, not finish.
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    for whose, rel, cap in (("a member's", ".cc/members/wsd/board/wsd.json", 8), ("a box", ".cc/boards/rbad.json", 64)):
         w(rel, "")
         os.truncate(os.path.join(th, rel), 4 << 30)
+        vm = int(re.search(r"^VmSize:\s+(\d+)", open("/proc/self/status").read(), re.M).group(1)) << 10
+        resource.setrlimit(resource.RLIMIT_AS, (vm + (768 << 20), hard))
         try:
-            board_file(os.path.join(th, rel))
-            why = ""
-        except ValueError as e:
-            why = str(e)
-        try:
+            try:
+                board_file(os.path.join(th, rel))
+                why = ""
+            except ValueError as e:
+                why = str(e)
             with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn):
                 cold(["--cold", "1"])
             run("index")
             got = "shows every message between agents" in run("ask", "--need", "history", "shows every message between agents")[1]
         except Exception:
-            got = False
-        ok(f"covers: {whose} sparse 4 GiB board is refused over 64 MiB, and index, ask and index --cold finish",
-           got and why == "over 64 MiB")
+            got = why = False
+        finally:
+            resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+        ok(f"covers: {whose} sparse 4 GiB board is refused over {cap} MiB, and index, ask and index --cold finish with "
+           "768 MiB to spare", got and why == f"over {cap} MiB")
         os.remove(os.path.join(th, rel))
+    # one index parses each board once, however many readers want it (registry, workspaces, board_rows, parse)
+    parsed, real = [], board_of
+    globals()["board_of"] = lambda t: parsed.append(1) or real(t)
+    try:
+        BOARDS.clear()
+        run("index")
+    finally:
+        globals()["board_of"] = real
+    inodes = {os.stat(p).st_ino for p in glob.glob(os.path.join(th, ".cc", "boards", "*.json"))
+              if os.path.exists(p) and not os.path.basename(p).startswith("_")}
+    ok(f"covers: one index parses each of the {len(inodes)} boards once", len(parsed) == len(inodes))
+    # the host's record ~/.cc/members/<h>/member-workspace with no marker in the member's tree is a member's board all
+    # the same, as cc-board-dream says; a ~/.cc/members/<h> holding only a member-facing file (a box board's) is not
+    w(".cc/boards/wsm.json", json.dumps({"repo": "wsm", "tracks": {}, "log": []}))
+    w(".cc/members/wsm/member-facing", "")
+    ok("covers: a board whose ~/.cc/members/<h> holds only member-facing is the box's, and no workspace id is written",
+       "wsm" not in workspaces() and not os.path.exists(os.path.join(th, ".cc", "members", "wsm", "workspace-id")))
+    w(".cc/members/wsm/member-workspace", "")
+    ok("covers: a board with ~/.cc/members/<h>/member-workspace and no marker is a member workspace's", "wsm" in workspaces())
+    # a member's board linked to the box's: refused under the member's cap, the box's own board still read under its own
+    bb = os.path.join(th, ".cc", "boards", "wsl.json")
+    w(".cc/members/wsl/member-workspace", "")
+    w(".cc/boards/zbox.json", json.dumps({"repo": "zbox", "tracks": {}, "log": []}))
+    big = os.path.join(th, ".cc", "boards", "zbox.json")
+    with open(big, "r+b") as f:
+        f.seek(0, 2)
+        f.write(b" " * (MEMBER_BOARD_CAP + 1))
+    os.symlink(big, bb)
+    BOARDS.clear()
+    try:
+        board_file(bb)
+        refused = False
+    except ValueError as e:
+        refused = str(e) == f"over {MEMBER_BOARD_CAP >> 20} MiB"
+    try:
+        box = board_file(big).get("repo") == "zbox"
+    except ValueError:
+        box = False
+    ok("covers: a member's board linked to a box board past the member cap refuses only the member's read", refused and box)
+    os.remove(bb)
+    os.remove(big)
+    os.remove(os.path.join(th, ".cc", "members", "wsl", "member-workspace"))
+    os.rmdir(os.path.join(th, ".cc", "members", "wsl"))
+    for x in os.listdir(os.path.join(th, ".cc", "members", "wsm")):
+        os.remove(os.path.join(th, ".cc", "members", "wsm", x))
+    os.rmdir(os.path.join(th, ".cc", "members", "wsm"))
+    os.remove(os.path.join(th, ".cc", "boards", "wsm.json"))
     w(".cc/members/wsd/board/wsd.json", "{}")
     os.remove(mb)
     os.remove(bj)
@@ -3981,6 +4063,10 @@ def selfcheck_quarantine(ok, run):
         rc, o = run("quarantine", "nosuch")
         ok("quarantine: a handle that is not a member workspace is refused and nothing is marked",
            rc == 2 and not os.path.exists(os.path.join(th, ".cc", "members", "nosuch", QUAR_MARK)))
+        w(".cc/members/fundx/member-facing", "")
+        rc, o = run("quarantine", "fundx")
+        ok("quarantine: a box board whose ~/.cc/members/<h> holds only member-facing is refused and nothing is marked",
+           rc == 2 and not os.path.exists(os.path.join(th, ".cc", "members", "fundx", QUAR_MARK)))
         os.makedirs(os.path.join(th, ".cc", "members", "wsk"), exist_ok=True)
         os.symlink(os.path.join(th, "elsewhere"), os.path.join(th, ".cc", "members", "wsk", QUAR_MARK))
         rc, o = run("quarantine", "wsk")
@@ -4076,7 +4162,7 @@ def selfcheck_perms(th, ok, run, w):
 
 
 def selfcheck_sources(th, ok, run, w):
-    """What the 2026-10-12 coverage sample found missing: a board and the landing queue over 4 MiB are read whole (any
+    """What the 2026-10-12 coverage sample found missing: a board and the landing queue over 4 MiB are read (any
     other source over it stays unreadable), every .md in a track's state dir and in the project tree is a doc (not one in
     node_modules or a dot-directory), and --need current names a probe with the object filled in. Its own repo `cov`."""
     def outcome(out):
@@ -4107,7 +4193,7 @@ def selfcheck_sources(th, ok, run, w):
     ok("…while a journal over 4 MiB is still unreadable, named so in COVERAGE",
        "CAPYBARA-BIGJOURNAL " not in o and "progress.md (unreadable: over 4 MiB)" in o and jbig in srcs)
     rc, o = run("ask", "--object", "cov#77", "--need", "history")
-    ok("the landing queue over 4 MiB is read whole: its line for cov#77 is a landing event",
+    ok("the landing queue over 4 MiB is read: its line for cov#77 is a landing event",
        "ROUTE landing events" in o and "CAPYBARA-QUEUE" in o and "PROBE" not in o)
     rc, o = run("ask", "--object", "cov#77", "--need", "current", "did it land")
     ok("--need current on a PR: the object's routes still answer, and the PROBE line carries its number",
@@ -4121,6 +4207,17 @@ def selfcheck_sources(th, ok, run, w):
     ok("…but not one a level under a track dir, in node_modules or in a dot-directory",
        not any(p.endswith(("sub/deeper.md", "node_modules/pkg/README.md", ".hidden/x.md")) for p in srcs)
        and os.path.join(proj, "src", "notes", "plan.md") in srcs)
+    # past BOARD_CAP the queue is read from its newest 64 MiB: its first line is left out, its last still found
+    with open(qp, "w") as f:
+        f.write("2026-10-12T00:30:00Z\tcov#76 CAPYBARA-OLDQUEUE\n")
+    os.truncate(qp, BOARD_CAP + 4096)
+    with open(qp, "a") as f:
+        f.write("\n2026-10-12T02:00:00Z\tcov#78 CAPYBARA-NEWQUEUE NOT merged\n")
+    run("index")
+    rc, o = run("ask", "--object", "cov#78", "--need", "history")
+    rc, o2 = run("ask", "--object", "cov#76", "--need", "history")
+    ok("the landing queue past 64 MiB is never unreadable: its newest line is found, its oldest (64 MiB back) left out",
+       "CAPYBARA-NEWQUEUE" in o and "CAPYBARA-OLDQUEUE" not in o2 and "queue.log (unreadable" not in o + o2)
     os.remove(os.path.join(th, ".cc", "boards", "cov.json"))
     if keep_q is None:
         os.remove(qp)
