@@ -57,7 +57,7 @@ WHAT TO DO:
 ANSWER with the JSON object the schema asks for and nothing else:
 - `verdict` — `LAND` when every prior blocker is resolved or moot and there is no new one, else `HANDBACK`.
 - `resolved`, `moot`, `unresolved` — the prior blockers' numbers, as strings.
-- `blocking` — the NEW blockers only, same fields as the first read: `kind`, `where`, `what`, `input`, `fix`.
+- `blocking` — the NEW blockers only, same fields as the first read: `kind`, `severity`, `where`, `what`, `input`, `fix`.
 - `advisory` — `where`, `what`.
 
 <<<prior

@@ -252,19 +252,31 @@ def _answer_requests(job):
     return "; ".join(parts)
 
 
-def followup(job, verdict):
-    """One row for a LAND's advisory findings, once per PR. -> a line, "" when there was nothing to file."""
+def followup(job, verdict, fresh=False):
+    """One row for a LAND's advisory findings, once per PR. -> a line, "" when there was nothing to file or the add
+    failed. A light FIX's row (review._buy files it before the LAND is posted, fresh) is labelled as demoted blockers
+    and named per head; fresh, a row that already exists is "" (security and Opus reads of #1922: an earlier head's
+    row, or one planted ahead, would let this head merge with its own findings filed nowhere)."""
     if verdict is None or not verdict.advisory:
         return ""
-    project, row = project_of(job), f"review-followup-pr{job.pr}"
+    light = (verdict.extra or {}).get("light_fix")
+    project, row = project_of(job), f"review-followup-pr{job.pr}" + (f"-{job.head[:7]}" if light else "")
     b = tool("cc-board")
     rc, out = C.sh([b, "get", project, row, "status"], timeout=60)
     if rc == 0 and out.strip():
-        return f"its review findings are already board row {row}"
+        return "" if fresh else f"its review findings are already board row {row}"
     said = "\n".join(f"{i}. {a}" for i, a in enumerate(verdict.advisory, 1))
-    brief = (f"GOAL: the review's non-blocking findings on {what(job)} are answered on main. WHY: the landing review "
-             f"said LAND with advice that blocks nothing, so the PR landed and the advice came here.\nFINDINGS:\n{said}")
-    rc, out = C.sh([b, "add", project, row, f"review follow-up for PR #{job.pr}", brief], timeout=60)
+    if light:
+        title = f"demoted FIX findings for PR #{job.pr}"
+        brief = (f"GOAL: the landing review's FIX findings on {what(job)} are fixed on main. WHY: the review handed it "
+                 f"back for findings all below high on a light-path lane, so they were demoted to this row and the PR "
+                 f"merges once CI is green. They are blockers that were waived, not advice.\nFINDINGS:\n{said}")
+    else:
+        title = f"review follow-up for PR #{job.pr}"
+        brief = (f"GOAL: the review's non-blocking findings on {what(job)} are answered on main. WHY: the landing "
+                 f"review said LAND with advice that blocks nothing, so the PR landed and the advice came here."
+                 f"\nFINDINGS:\n{said}")
+    rc, out = C.sh([b, "add", project, row, title, brief], timeout=60)
     if rc:
         C.log("followup-failed", job.repo, job.pr, why=out.strip()[-160:].replace("\n", " "))
         return ""

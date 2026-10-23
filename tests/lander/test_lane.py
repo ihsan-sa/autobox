@@ -2895,6 +2895,22 @@ class AtOnce(Fixture):
                 self.assertNotIn(T.CHECKING, [h["state"] for h in j.history][3:])   # it never went back
                 self.assertEqual(self.merged_order(), [1])
 
+    def test_a_light_fix_with_no_ci_is_handed_back(self):
+        # security read of #1922: a PR that drops its own CI trigger lands as "no CI"; a demoted FIX needs CI that ran
+        for light in (True, False):
+            with self.subTest(light=light):
+                self.setUp()
+                self.pr(1, {"a/x": "n\n"})
+                J.submit("demo", 1)
+                saved = T.Verdict(verdict=T.LAND, digest="d", extra={"light_fix": True} if light else {})
+                with mock.patch.object(R, "saved", lambda digest: saved):
+                    _, lines = self.land()
+                self.assertEqual(self.merged_order(), [] if light else [1], lines)
+                if light:
+                    self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
+                else:
+                    self.assertEqual((self.job().state, self.job().extra.get("ci")), (T.DEPLOY_PENDING, "none"))
+
     def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
         with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to
             json.dump({"tracks": {"row-1": {"status": "review"}}}, f)
@@ -3233,6 +3249,22 @@ class Review(Fixture):
         self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.LAND)))
         j = self.job()
         self.assertEqual((j.state, j.reads_used), (T.DEPLOY_PENDING, 1))
+
+    def test_a_head_pushed_while_it_checked_is_not_read(self):
+        """hive#67 on 10-23: a worker pushed twice while its PR waited, and the lane bought a full read of each
+        superseded head (07:09Z and 07:11Z) before the one it merged. The live head is read before a read is bought."""
+        self.pr(1, {"a/x": "one\n"})
+        J.submit("demo", 1)
+        rv = Reviewer(V(T.LAND), V(T.LAND))
+        rv.digest_of = lambda root, base, head: head
+        new = []
+        pushed = lambda name, n: n == 1 and new.append(self.pr(1, {"a/x": "two\n"}))
+        with mock.patch.object(L, "RECHECK_SECS", 3600):
+            self.land(planner=Planner(paid=True), reviewer=rv, runner=Runner(hook=pushed))
+        j = self.job()
+        self.assertEqual([c[0] for c in rv.calls], ["review"])
+        self.assertEqual((j.state, j.head), (T.DEPLOY_PENDING, new[0]))
+        self.assertIn("before its read", json.dumps(j.history))
 
     def test_a_handback_standing_from_an_earlier_head_is_read_again_off_the_paid_paths(self):
         """#1064: a seat's security HANDBACK at one head, a new head on no paid path -> read again, never merged unread."""
@@ -4588,8 +4620,8 @@ class Parallel(Fixture):
     def reads_lane(self, member=""):
         """A lane with #1 and #2 checking at their own digests, and a pool whose reads end only when the test ends
         them. -> (lane, #1, #2, [the futures of the reads submitted])."""
+        heads = {n: self.pr(n, {f"f/{n}": "n\n"}) for n in (1, 2)}
         for n in (1, 2):
-            self.pr(n, {f"f/{n}": "n\n"})
             J.submit("demo", n)
         with J.lane_lock("demo"):
             J.drain("demo")
@@ -4603,8 +4635,9 @@ class Parallel(Fixture):
                 return submitted[-1]
         lane.pool = Pool()
         one, two = self.job(1), self.job(2)
-        for j in (one, two):
-            j.state, j.digest = T.CHECKING, f"{j.pr}" * 40
+        for j in (one, two):   # at the head origin has, so review()'s look at the live head lets the read start
+            j.state, j.digest, j.head = T.CHECKING, f"{j.pr}" * 40, heads[j.pr]
+            j.extra["branch"] = f"track/row-{j.pr}"
         return lane, one, two, submitted
 
     def test_a_read_whose_job_left_checking_holds_its_place_until_it_ends(self):

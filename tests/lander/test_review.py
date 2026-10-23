@@ -3,6 +3,7 @@
 Every case builds its own state dir and its own fake box (FakeBox swaps cards.sh); nothing reaches git, gh, claude
 or Slack. Run: python3 -m unittest discover -s core/tests/lander -p 'test_review.py'
 """
+import dataclasses
 import contextlib
 import io
 import json
@@ -21,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from lander import cards as C  # noqa: E402
 from lander import review as R  # noqa: E402
 from lander import gh as GH  # noqa: E402
+from lander import manifest as M  # noqa: E402
 from lander import types as T  # noqa: E402
 
 def gh_via_sh(argv, root, token=None, timeout=120, note=True, stdin=None):
@@ -1406,6 +1408,103 @@ check.sh: 0 failed
 ## Notes
 not part of the Tested section
 """
+
+
+class TestLightFix(Case):
+    """The light FIX (autobox2, 10-23): on an opted-in lane a first read's below-high blockers merge as follow-ups."""
+
+    def setUp(self):
+        super().setUp()
+        self.reviewer(CC_LAND_REVIEW_LIGHT_FIX="other demo")
+        self.tree = {"tests/LANDING-security.toml": 'paths = ["bin-private/door"]\n'}   # the base's files
+        p = mock.patch.object(M, "read_at", lambda root, rev, path: self.tree.get(path))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def blocker(self, severity="medium", kind="correctness"):
+        return dict({"kind": kind, "where": "x.py:2", "what": "off by one", "input": "n=0", "fix": "start at 1"},
+                    **({"severity": severity} if severity else {}))
+
+    def read(self, *blocking, job=None, comments=(), board=(0, "")):
+        # recurring-defect-ok: pause-hold-missing — a fake cc-board in a unit test; the pause hold is the lane's (U1)
+        box = self.box(claude=claude_says("HANDBACK" if blocking else "LAND", blocking=blocking),
+                       **{"cc-board add": board})
+        return R.review(job or self.job(), comments=list(comments)), box
+
+    def test_a_land_lands_as_today(self):
+        v, box = self.read()
+        self.assertEqual((v.verdict, v.advisory, v.extra.get("light_fix")), (T.LAND, [], None))
+
+    def test_a_below_high_fix_lands_with_its_blockers_as_the_follow_up(self):
+        v, box = self.read(self.blocker("medium"), self.blocker("low"))
+        self.assertEqual((v.verdict, v.blocking, v.extra.get("light_fix")), (T.LAND, [], True))
+        self.assertEqual(len(v.advisory), 2)
+        self.assertIn("[correctness] (medium) x.py:2", v.advisory[0])
+        self.assertIn("verdict=LAND", box.called("gh pr comment")[0]["input"])
+        add = box.called("cc-board add")[0]["argv"]   # filed before the LAND is posted, labelled as waived blockers
+        self.assertLess(box.calls.index(box.called("cc-board add")[0]), box.calls.index(box.called("gh pr comment")[0]))
+        self.assertEqual(add[2:5], ["demo", f"review-followup-pr7-{HEAD[:7]}", "demoted FIX findings for PR #7"])
+        self.assertIn("(medium) x.py:2", add[5])
+
+    def test_a_follow_up_row_that_will_not_file_keeps_the_full_path(self):
+        v, box = self.read(self.blocker("low"), board=(1, "board locked"))
+        self.assertEqual((v.verdict, v.extra.get("light_fix")), (T.HANDBACK_VERDICT, None))
+        self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
+
+    def test_a_follow_up_row_that_already_exists_is_not_filed(self):
+        # security and Opus reads of #1922 at 86d3395: head A's row (or one planted ahead) let head B merge with its
+        # own findings filed nowhere; only an add this read made counts
+        self.box(claude=claude_says("HANDBACK", blocking=[self.blocker("low")]),
+                 **{"cc-board get": (0, "review")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.extra.get("light_fix")), (T.HANDBACK_VERDICT, None))
+
+    def test_a_base_with_no_security_list_keeps_the_full_path(self):
+        # a888's read of #1922: hive-standalone-build ships no LANDING-security.toml, so its sandbox edits plan as
+        # ordinary code; with no list (or an empty one) the light path cannot tell, and refuses
+        for tree in ({}, {"tests/LANDING-security.toml": "paths = []\n"}):
+            self.tree = tree
+            v, box = self.read(self.blocker("low"))
+            self.assertEqual((v.verdict, box.called("cc-board add")), (T.HANDBACK_VERDICT, []), tree)
+
+    def test_the_opt_in_names_the_owner_too(self):
+        v, _ = self.read(self.blocker("low"), job=dataclasses.replace(self.job(), repo="else/demo"))
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)   # "demo" is the box owner's demo, not else/demo
+        self.reviewer(CC_LAND_REVIEW_LIGHT_FIX="else/demo")
+        v, _ = self.read(self.blocker("low"), job=dataclasses.replace(self.job(), repo="else/demo"))
+        self.assertEqual(v.verdict, T.LAND)
+
+    def test_a_high_or_unnamed_severity_keeps_the_full_path(self):
+        for b in (self.blocker("high"), self.blocker(None)):
+            v, _ = self.read(self.blocker("low"), b)
+            self.assertEqual((v.verdict, v.extra.get("light_fix")), (T.HANDBACK_VERDICT, None), b)
+
+    def test_a_security_blocker_or_a_security_path_keeps_the_full_path(self):
+        v, _ = self.read(self.blocker("low", kind="security"))
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        j = self.job()
+        j.files, j.plan.extra["security"] = ["bin-private/door"], ["bin-private/door"]
+        self.box(claude=claude_says("HANDBACK", blocking=[self.blocker("low")]))
+        self.assertEqual(R._buy(j, "review.md", DIFF, {}, light=True).verdict, T.HANDBACK_VERDICT)
+
+    def test_a_change_to_github_keeps_the_full_path(self):
+        # security read of #1922: the hive's CI runs from the PR's own head, so a PR can switch off what it merges on
+        v, box = self.read(self.blocker("low"), job=dataclasses.replace(self.job(), files=["x.py", ".github/ci.yml"]))
+        self.assertEqual((v.verdict, box.called("cc-board add")), (T.HANDBACK_VERDICT, []))
+
+    def test_a_lane_that_has_not_opted_in_keeps_the_full_path(self):
+        self.reviewer(CC_LAND_REVIEW_LIGHT_FIX=None)
+        v, _ = self.read(self.blocker("low"))
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        os.environ["CC_LAND_REVIEW_LIGHT_FIX"] = "demo"   # only the passwd home's config opts a lane in
+        self.addCleanup(os.environ.pop, "CC_LAND_REVIEW_LIGHT_FIX", None)
+        self.assertEqual(self.read(self.blocker("low"))[0].verdict, T.HANDBACK_VERDICT)
+
+    def test_a_standing_handback_keeps_its_fix_rounds(self):
+        old = self.comment("HANDBACK", "f" * 64, rows=["1. [correctness] (high) x.py:1 — bad"], head="e" * 40)
+        self.box(claude=claude_says("HANDBACK", blocking=[self.blocker("low")]))
+        v = R.review(self.job(), comments=[old])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT, v.extra)
 
 
 class TestTestedSection(Case):

@@ -170,7 +170,19 @@ the merge go past perms_reading(). Each such carry is a `perms-carry` line in qu
 seat (perms_seat_caller()). The marker itself is only a comment and clears nothing; the ledger entry the perms
 seat's LAND appends is what clears the path.
 
-A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup).
+A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup); a light FIX files
+its own per head, review-followup-pr<N>-<head7>, and only an add made by that read counts as filed.
+
+THE LIGHT FIX (autobox2, 10-23: the hive lane takes the owner's 10-13 light path, one read then merge). Each blocker
+carries a severity (SEVERITIES; one that names none is high). On a repo named in CC_LAND_REVIEW_LIGHT_FIX (the
+passwd home's config, owner/name or a bare name the box owner's, default empty: every lane off), a FIRST read (no
+HANDBACK standing on the PR) that hands back only for blockers below high and none of kind security, on a plan with
+no security path of a base that names some (light_lane()), files those blockers as a board row labelled demoted FIX
+findings (board.followup) and only then is recorded as a LAND with them as its advisory findings, extra light_fix; the
+lane merges it once CI is green, and hands it back when no CI ran (Lane.ci_green). Every reader must be a LAND or
+such a handback. A high or unnamed severity, a security blocker or security path, a change to .github/, a base with
+no tests/LANDING-security.toml, a row that will not file, a carried blocker, a delta read, and a lane that has not
+opted in keep the full path.
 
 PAUSE. The lane asks cc-pause and cc-tier before it calls review() (U1 owns that hold, per the design); nothing
 here runs for a paused project. recurring-defect-ok: pause-hold-missing — the lane (U1) holds a paused repo before any U3 call
@@ -210,6 +222,8 @@ MARK_RE = re.compile(rf"\A\s*<!-- {re.escape(MARK)} v2 change=([0-9a-f]+)((?: [^
 FINDING_ROW = re.compile(r"^\d+\. ")
 OTHER_ROW = re.compile(r"^\d+\. \[other\] ")
 
+SEVERITIES = ["high", "medium", "low"]   # a blocker that names none is high
+LIGHT = ("medium", "low")
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["verdict", "blocking", "advisory"],
@@ -217,7 +231,8 @@ SCHEMA = {
         "verdict": {"enum": ["LAND", "HANDBACK"]},
         "blocking": {"type": "array", "maxItems": 10, "items": {
             "type": "object", "required": ["kind", "where", "what", "input", "fix"],
-            "properties": {"kind": {"enum": ["correctness", "security", "scope"]}, "where": {"type": "string"},
+            "properties": {"kind": {"enum": ["correctness", "security", "scope"]}, "severity": {"enum": SEVERITIES},
+                           "where": {"type": "string"},
                            "what": {"type": "string"}, "input": {"type": "string"}, "fix": {"type": "string"}}}},
         "advisory": {"type": "array", "maxItems": 10, "items": {
             "type": "object", "required": ["where", "what"],
@@ -280,7 +295,9 @@ def marker(v: T.Verdict, base, head, by):
                                                    if r.get("stood_in_for") else "")
             for r in (v.extra or {}).get("readers") or []]
     return "\n".join([head_, f"**lander review** — `{head[:12]}`, read by `{v.model or by}`", "",
-                      f"**VERDICT: {v.verdict}**", ""] + (said + [""] if said else []) + (rows or ["No findings."]))
+                      f"**VERDICT: {v.verdict}**", ""] + (said + [""] if said else [])
+                     + (["Light path: every blocker is below high, so they go to a follow-up row.", ""]
+                        if (v.extra or {}).get("light_fix") else []) + (rows or ["No findings."]))
 
 
 def imported(body):
@@ -683,13 +700,17 @@ def parse(answer, digest, model="", tokens=0):
     unresolved = [str(x) for x in j.get("unresolved") or []]
     moot = [str(x) for x in j.get("moot") or [] if str(x) not in unresolved]
     verdict = j["verdict"]
+    # LIGHT FIX: every blocker below high and none a security one, and no earlier blocker left open
+    light = all(isinstance(f, dict) and f.get("severity") in LIGHT and f.get("kind") != "security"
+                for f in j.get("blocking") or []) and not unresolved
     if verdict == T.HANDBACK_VERDICT and not blocking and not unresolved:
         return None
     if verdict == T.LAND and blocking:   # a blocker is a blocker whatever the verdict word says
         verdict = T.HANDBACK_VERDICT
     return T.Verdict(verdict=verdict, digest=digest, blocking=blocking, advisory=advisory, model=model,
                      tokens=int(tokens or 0), resolved=[str(x) for x in j.get("resolved") or []] + moot,
-                     unresolved=unresolved, extra={"moot": moot} if moot else {})
+                     unresolved=unresolved,
+                     extra=dict({"moot": moot} if moot else {}, **({"light": True} if light else {})))
 
 
 def pinned(v, prior):
@@ -748,7 +769,7 @@ def carried(v, prior):
 def _row(f, hard):
     if not isinstance(f, dict):
         return str(f)
-    s = f"[{f.get('kind', 'other')}] " if hard else ""
+    s = f"[{f.get('kind', 'other')}] " + (f"({f['severity']}) " if f.get("severity") else "") if hard else ""
     s += f"{f.get('where') or '(nowhere named)'} — {f.get('what') or ''}"
     if hard and f.get("input"):
         s += f" (input: {f['input']})"
@@ -1862,7 +1883,7 @@ def review(job, comments=None):
         return delta_review(job, prior, comments=comments, diff=diff)
     if not (job.plan and job.plan.paid) and not (prior and prior.verdict == T.HANDBACK_VERDICT):
         return T.Verdict(verdict=T.LAND, digest=job.digest, extra={"read": "none"})
-    return _buy(job, "review.md", diff, {})
+    return _buy(job, "review.md", diff, {}, light=not prior or prior.verdict != T.HANDBACK_VERDICT)
 
 
 def standing(job, comments=None):
@@ -2047,7 +2068,24 @@ def read_text(job, template, diff, more):
                   BODY=body_of(got if isinstance(got, dict) else None), **more)
 
 
-def _buy(job, template, diff, more, prior=None):
+def light_lane(job):
+    """True when the job's repo opts in to the light FIX (CC_LAND_REVIEW_LIGHT_FIX: repos as owner/name, a bare name
+    the box owner's, read from the passwd home's config only, default none), its base names security paths (a repo
+    with no LANDING-security.toml cannot tell a sandbox change from any other, so it keeps the full path) and its plan
+    touches none of them, nor .github/. At merge the lane refuses its LAND again when no CI ran (Lane.ci_green)."""
+    if (repo_key(job.repo) not in {repo_key(r) for r in C.conf("CC_LAND_REVIEW_LIGHT_FIX", "").split()}
+            or job.plan is None or job.plan.extra.get("security")):
+        return False
+    if not security_globs(root_of(job), job.base_sha, job.repo):
+        C.log("light-refused", job.repo, job.pr, why="the base names no security paths (tests/LANDING-security.toml)")
+        return False
+    if any(f.startswith(".github/") for f in job.files):   # its CI runs from the PR's own head
+        C.log("light-refused", job.repo, job.pr, why="it changes .github/, where the CI it would merge on is defined")
+        return False
+    return True
+
+
+def _buy(job, template, diff, more, prior=None, light=False):
     repo, pr = job.repo, job.pr
     lim_rc, lim = C.sh([os.path.join(BIN, "cc-limit"), "status"], timeout=60)
     if lim_rc == 0:
@@ -2095,13 +2133,24 @@ def _buy(job, template, diff, more, prior=None):
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)
     v = combined(reads)
+    if (light and v.verdict == T.HANDBACK_VERDICT and light_lane(job)
+            and all(x.verdict == T.LAND or x.extra.get("light") for _, x in reads)):
+        # brief, 10-23: "A FIX whose findings are all below high merges once CI is green, and each finding becomes a
+        # follow-up row" — the lane's ci_green() holds the merge. The row is filed now, before the LAND is posted, so
+        # a board write that fails keeps the HANDBACK (security read of #1922: filed after the merge, it could vanish)
+        import dataclasses
+        from lander import board as B
+        lv = dataclasses.replace(v, verdict=T.LAND, blocking=[], advisory=v.blocking + v.advisory,
+                                 extra=dict(v.extra, light_fix=True))
+        v = lv if B.followup(job, lv, fresh=True) else v
     charge(repo, pr, reviews=1, silent=None)
     with contextlib.suppress(OSError):
         os.unlink(partial(job.digest, template))
     v.extra["head"] = job.head
     posted = post(root, pr, marker(v, job.base_sha, job.head, v.model))
     C.write_json(C.state("reviews", f"{job.digest}.json"), dict(v.to_dict(), repo=repo, pr=pr, posted=posted))
-    C.log("stage", repo, pr, verdict=v.verdict, digest=job.digest[:12], usd=f"{usd:.2f}")
+    C.log("stage", repo, pr, verdict=v.verdict, digest=job.digest[:12], usd=f"{usd:.2f}",
+          **({"light": 1} if v.extra.get("light_fix") else {}))
     if v.verdict == T.HANDBACK_VERDICT:   # a seat's LAND recorded at this head while the read ran stands (recorded())
         now = (pr_view(root, pr) or {}).get("comments") or []
         land = recorded(now, keys(job, diff), job.head)

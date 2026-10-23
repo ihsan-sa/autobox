@@ -58,7 +58,9 @@ blocker because it matters to you; promote it only when you can write its input 
 
 ANSWER with the JSON object the schema asks for and nothing else:
 - `verdict` — `LAND` when there is no blocker, `HANDBACK` when there is at least one.
-- `blocking` — one object per blocker: `kind` (`correctness`, `security` or `scope`), `where` (`<path>:<line>`),
+- `blocking` — one object per blocker: `kind` (`correctness`, `security` or `scope`), `severity` (`high` when the
+  wrong outcome breaks main or a caller, loses or leaks data, or reaches outside the repo; `medium` or `low` when it
+  stays inside the change's own feature and a follow-up fixes it), `where` (`<path>:<line>`),
   `what` (what is wrong, one sentence), `input` (the input, state or quoted brief line that shows it), `fix` (what
   the author does about it). Ten at most.
 - `advisory` — one object per advisory finding: `where`, `what`. Ten at most; leave out anything you would phrase

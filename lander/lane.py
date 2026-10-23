@@ -115,7 +115,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              runs (review.perms_reading), else a query "planning" naming them (host_hold; perms' LAND on #1561,
              10-20: a worker that edits a host check's run file selects it, and its head ran as the box's user
              before any read). RE-READ: every RECHECK_SECS while it
-             checks, and at its next turn after an `again` request, the job reads the PR's state and head; not OPEN or
+             checks, at its next turn after an `again` request, and before its review read is bought (hive#67, 10-23: 2
+             full reads of heads a push had replaced), the job reads the PR's state and origin's head; not OPEN or
              a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
              back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so no check
              runs on for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
@@ -160,7 +161,7 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
-             the CI_UNREADS+1th at one head a query "planning", but a spent rate limit (GitHub's rate_limit at 0) is held uncounted until its reset; green or no CI at all -> on. Perms reading the PR
+             the CI_UNREADS+1th at one head a query "planning", but a spent rate limit (GitHub's rate_limit at 0) is held uncounted until its reset; green or no CI at all -> on, but a light FIX (review.light_lane) with no CI is handed back. Perms reading the PR
              (review.perms_reading: its read of any head still running, or its perms-hold stub at this head) ->
              held (box), so a read perms started or claimed is waited on; any other read of the PR short of a LAND
              at this head (or an older head's LAND at this change), or perms' reads that will not read -> query
@@ -930,10 +931,12 @@ class Lane:
         return job.state == T.CHECKING and (bool(job.extra.get("reread"))
                                             or time.time() - E.epoch_of(job.extra.get("read_at")) >= RECHECK_SECS)
 
-    def reread(self, job) -> bool:
-        """Read a checking job's PR state and head. True when the job has left checking: the PR merged, closed or
-        has a new head, so its checks in flight are stopped and it is queued again (queued() ends or restarts it).
-        An unreadable PR, or a GitHub backoff, leaves it checking and reads again in RECHECK_SECS."""
+    def reread(self, job, when="while it was checking") -> bool:
+        """Read a checking job's PR state and head (origin's own, as pr_head: headRefOid lags a push). True when the
+        job has left checking: the PR merged, closed or has a new head, so its checks in flight are stopped and it is
+        queued again (queued() ends or restarts it). An unreadable PR, or a GitHub backoff, leaves it checking and
+        reads again in RECHECK_SECS. review() asks it too before it buys a read (hive#67, 10-23: two full reads of
+        heads a push had already replaced)."""
         # "A job whose PR already merged must finish as done and unpark its chain. A new head pushed mid-check must
         # cancel the old check." (brief, 2026-10-06)
         job.extra.pop("reread", None)
@@ -942,13 +945,14 @@ class Lane:
         if facts is None:
             J.save(job)
             return False
-        state, head = facts.get("state") or "", facts.get("headRefOid") or ""
+        state = facts.get("state") or ""
+        head = G.remote_head(self.root, job.extra.get("branch") or "", env=self.genv) or facts.get("headRefOid") or ""
         if state == "OPEN" and (not head or head == job.head):
             J.save(job)
             return False
         self.stop_checks(job)
         why = f"the PR is {state.lower() or 'not open'}" if state != "OPEN" else f"the head moved to {head[:12]}"
-        J.move(job, T.QUEUED, why=why + " while it was checking")
+        J.move(job, T.QUEUED, why=f"{why} {when}")
         self.say(f"PR #{job.pr}: {why}; its checks in flight are stopped")
         return True
 
@@ -1565,6 +1569,8 @@ class Lane:
             if len(self.reading) + len(self.dropped) >= self.review_slots:
                 self.waiting.add(job.key)   # it goes on when a read ends and frees its place
                 return False
+            if self.reread(job, "before its read"):   # a superseded head is never bought a read
+                return False
             fn = ("delta_review", job, pv) if pv else ("review", job)
             self.reading[job.key] = Reading(self.pool.submit(self.call, "reviewer", *fn), job.digest)
             self.waiting.add(job.key)
@@ -1639,10 +1645,15 @@ class Lane:
                 return
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
+            from lander import review as R
+            if job.extra.get("ci") == "none" and (getattr(R.saved(job.digest), "extra", None) or {}).get("light_fix"):
+                # security read of #1922: a PR that drops its own CI trigger lands as "no CI", and a demoted FIX
+                # would merge with no test at all; with no CI the light path keeps the HANDBACK
+                return self.handback(job, f"its read was a FIX the light path demoted, and no GitHub CI ran at "
+                                          f"{job.head[:12]}, so it needs a full fix round")
             # row, 10-19: "the landing lane merged dispatch#1296 on its own one review read ... before perms'
             # security read finished" — so a read perms has going holds the merge, and one that ended short of a
             # LAND is a query (perms' read of #1525: a dead read held silently)
-            from lander import review as R
             reading, wait = R.perms_reading(job.repo, job.pr, job.head, job.digest, lambda: R.same_change(job))
             if reading and wait:
                 return self.hold(job, reading, kind="box")
@@ -1685,6 +1696,7 @@ class Lane:
                 return False
         if state in ("green", "none"):
             job.extra.pop("ci_wait", None)
+            job.extra["ci"] = state   # a light FIX merges only on CI that ran (mergeable)
             return True
         if state == "starved" and self.count(job, "ci_starved") <= STARVED_RERUNS:
             # "A GitHub runner-not-acquired cancel must rerun, not hand back" (2026-10-05: #80, #93-95 handed back
