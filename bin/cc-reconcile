@@ -182,7 +182,7 @@ so is one GitHub could not be asked about. The writer never changes the pass: se
 
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
-import atexit, calendar, datetime, glob, json, os, re, shutil, stat, subprocess, sys, tempfile, time, urllib.parse, zoneinfo
+import atexit, calendar, contextlib, datetime, glob, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, urllib.parse, zoneinfo
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy
@@ -691,15 +691,40 @@ def pull_path(url):
 def rest(repo, path, timeout=20):
     """`gh api <path>` (a GET) from the repo's checkout, parsed; None when GitHub could not be asked. REST, not GraphQL:
     the box's login runs out of its GraphQL hour while REST still has quota (2026-10-19). The exit code is read before
-    stdout: on a refusal gh prints GitHub's error JSON there, and that is never an answer."""
+    stdout: on a refusal gh prints GitHub's error JSON there, and that is never an answer.
+    CONDITIONAL: the last answer and its ETag are kept per checkout and path, and the GET carries If-None-Match, so an
+    unchanged answer is a 304 that costs no quota. The login spent its whole REST hour in about 45 min, every hour,
+    and the lander stalled each time (2026-10-23). Every read still asks, so a kept copy is only ever what GitHub
+    just said is current, and it is replaced by rename, never written through a planted link (perms' read of #1898)."""
     cwd = f"{DEV}/{repo}"
-    p = sh("gh", "api", path, cwd=cwd if os.path.isdir(cwd) else None, timeout=timeout)
-    if p is None or p.returncode:
+    f = f"{STATE}/reconcile-gh/{hashlib.sha1(f'{cwd} {path}'.encode()).hexdigest()}.json"
+    try:
+        kept = json.load(open(f))
+    except Exception:
+        kept = {}
+    tag = ["-H", f"If-None-Match: {kept['etag']}"] if kept.get("etag") else []
+    p = sh("gh", "api", "-i", *tag, path, cwd=cwd if os.path.isdir(cwd) else None, timeout=timeout)
+    if p is None:
+        return None
+    head, _, out = (p.stdout.replace("\r\n", "\n").partition("\n\n") if p.stdout.startswith("HTTP/")
+                    else ("", "", p.stdout))   # -i's headers, which a selfcheck's fake gh leaves out
+    if tag and re.match(r"HTTP/\S+ 304", head):
+        return kept.get("body")
+    if p.returncode:
         return None
     try:
-        return json.loads(p.stdout or "null")
+        got = json.loads(out or "null")
     except Exception:
         return None
+    m = re.search(r"^etag: *(.+?)\s*$", head, re.I | re.M)
+    if m:
+        with contextlib.suppress(OSError):
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(f))
+            with os.fdopen(fd, "w") as w:
+                json.dump({"etag": m.group(1), "body": got}, w)
+            os.replace(tmp, f)
+    return got
 
 
 def rest_pull(repo, url, timeout=20):

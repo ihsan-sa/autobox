@@ -10082,6 +10082,81 @@ def run_selfcheck():
           and all(r.get("ok") is False for r in (r_dm, r_bob, r_my, r_status, r_orch, r_mpost, r_arch, r_mperm))
           and "not one of alice's channels" in r_dm.get("error", "") and "not a member verb" in r_status.get("error", "")
           and "not a member verb" in r_mperm.get("error", ""))
+    # ---- ONE ASK, ONE ANSWER (raised-a-member-ask-answered-twice). On 2026-10-23 a member's thread ask was typed into a
+    # project session by cc-msg and read again by the seat a plan change woke, and the thread got two files. Every route
+    # ends in member_verb, so the first session whose file posts holds the ask; each case has its own daemon.
+    os.makedirs(f"{DEV}/dana/.cc", exist_ok=True); open(f"{DEV}/dana/{MEMBER_MARKER}", "w").close()
+    open(f"{DEV}/dana/invoice.pdf", "w").write("x")
+    postedTK, upTK = [], []
+    real_post_tk, real_react_tk, real_up_tk, real_api_tk = post, react, upload_file, api
+    globals()["post"] = lambda cfg, chat, text, thread=None, **kw: postedTK.append(text) or (1, "8.9")
+    globals()["react"] = lambda *a, **k: True
+    globals()["upload_file"] = lambda cfg, path, chat, thread, **kw: (upTK.append(kw.get("comment")), upTK[-1] != "fails" and ("F1", chat))[1] or (None, None)
+    def tk_daemon(live, ask="8.1"):
+        d = Daemon(use_slack=False); d.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_OWNER_ID": "UOWNER"}
+        if ask:
+            d.asks[("CDANA", "8.0")] = ask                    # the daemon saw the member's ask in thread 8.0
+        for t in live:
+            d.subs[t].append(object())                        # a session with a live link
+        return d
+    def tk_reply(d, target, text):
+        return d.member_verb("dana", {"reply": "CDANA", "thread_ts": "8.0", "text": text, "target": target}, "reply")
+    def tk_file(d, target, text):
+        return d.member_verb("dana", {"file": "CDANA", "thread_ts": "8.0", "path": f"{DEV}/dana/invoice.pdf",
+                                      "text": text, "target": target}, "file")
+    try:
+        dmTK = tk_daemon(["dana/pna-cad", "dana"])
+        tk_on = tk_reply(dmTK, "dana", "on it, handing to pna-cad")
+        tk_first = tk_file(dmTK, "dana/pna-cad", "here is the invoice")
+        tk_second = tk_file(dmTK, "dana", "here is the invoice too")
+        tk_text = tk_reply(dmTK, "dana", "and the totals")
+        tk_fix = tk_file(dmTK, "dana/pna-cad", "correction: the SQM total")
+        check("ONE ASK, ONE ANSWER: two sessions handed the same thread ask by two routes — a bare 'on it' holds nothing, the "
+              "first file answers, the second session's file and reply are not posted and name the taker, who can still correct itself",
+              tk_on.get("ok") and tk_first.get("ok") and tk_fix.get("ok") and not tk_second.get("ok") and not tk_text.get("ok")
+              and "dana/pna-cad already answered" in tk_second.get("error", "") and "dana/pna-cad already answered" in tk_text.get("error", "")
+              and postedTK == ["on it, handing to pna-cad"] and upTK == ["here is the invoice", "correction: the SQM total"])
+        postedTK.clear(); upTK.clear()
+        dmTKd = tk_daemon(["dana"])                           # the taker's link is gone: its session died
+        tk_dead1 = tk_file(dmTKd, "dana/pna-cad", "half an invoice")
+        tk_dead2 = tk_file(dmTKd, "dana", "here is the invoice")
+        check("ONE ASK, ONE ANSWER: a taker whose session died holds nothing — the next session's file is posted",
+              tk_dead1.get("ok") and tk_dead2.get("ok") and upTK == ["half an invoice", "here is the invoice"])
+        upTK.clear()
+        dmTKf = tk_daemon(["dana/pna-cad", "dana"])
+        tk_fail = tk_file(dmTKf, "dana/pna-cad", "fails")
+        tk_after = tk_file(dmTKf, "dana", "here is the invoice")
+        check("ONE ASK, ONE ANSWER: a file that never posted gives the claim back — the other session's file is posted",
+              "NOT sent" in tk_fail.get("text", "") and tk_after.get("ok") and "sent" in tk_after.get("text", "")
+              and upTK == ["fails", "here is the invoice"] and dmTKf.takers[("CDANA", "8.0")] == ("8.1", "dana"))
+        upTK.clear()
+        dmTKn = tk_daemon(["dana/pna-cad", "dana"], ask=None)   # a bot-started thread (mail, a track): no human ask seen
+        tk_n1, tk_n2 = tk_file(dmTKn, "dana/pna-cad", "one"), tk_file(dmTKn, "dana", "two")
+        check("ONE ASK, ONE ANSWER: a thread with no human ask the daemon saw holds nothing — both sessions' files post",
+              tk_n1.get("ok") and tk_n2.get("ok") and upTK == ["one", "two"] and not dmTKn.takers)
+        upTK.clear()
+        dmTKe = tk_daemon(["dana/pna-cad", "dana"], ask=None)
+        dmTKe.route = lambda chat, ctype: "dana"; dmTKe.deliver = lambda *a, **k: None
+        dmTKe.names["CDANA"], dmTKe.users["UDANA"] = "dana", ("Dana", "dana")   # no Slack lookups from a case
+        def tk_says(ts):   # the thread lookups on_event makes past the recording line read an empty thread, not Slack
+            globals()["api"] = lambda *a, **k: {"ok": True, "messages": []}
+            try:
+                dmTKe.on_event({"type": "message", "channel": "CDANA", "ts": ts, "thread_ts": "8.0", "user": "UDANA", "text": "an Excel list please"})
+            finally:
+                globals()["api"] = real_api_tk
+        tk_says("8.1")
+        tk_e1 = tk_file(dmTKe, "dana/pna-cad", "the list")
+        tk_e2 = tk_file(dmTKe, "dana", "the list again")
+        tk_says("8.2")                                        # the member's follow-up is a new ask
+        tk_e3 = tk_file(dmTKe, "dana", "the follow-up's list")
+        check("ONE ASK, ONE ANSWER: on_event records the member's message as the thread's ask, and her follow-up is a new "
+              "ask a second session may answer",
+              dmTKe.asks.get(("CDANA", "8.0")) == "8.2" and tk_e1.get("ok") and not tk_e2.get("ok") and tk_e3.get("ok")
+              and upTK == ["the list", "the follow-up's list"])
+    finally:
+        globals()["post"], globals()["react"], globals()["upload_file"] = real_post_tk, real_react_tk, real_up_tk
+        subprocess.run(["rm", "-rf", f"{DEV}/dana"])
+
     # ---- A MEMBER'S REFUSAL IS THE BOX'S QUERY, NOT A LINE IN HER CHANNEL (member_verb reply → record_refusal_query).
     # Owner, 2026-09-04: a member session's refusals "should just be routed to you instead" — the queries session;
     # "nothing in the member's channel". One member channel carried ~10 🔐 "I cannot do that…" lines on 2026-09-17/18, each

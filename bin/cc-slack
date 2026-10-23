@@ -4669,6 +4669,8 @@ class Daemon:
         self.thread_owner = {}                              # (chat, thread_ts) -> alias|None (None = main); routing cache
         self.known_aliases = collections.defaultdict(set)   # target -> {alias, ...} ever subscribed (daemon lifetime)
         self.mentioned = collections.OrderedDict()           # (chat, ts, target, alias) route_mentions already handed a post
+        self.asks, self.takers = {}, {}                      # (chat, thread) -> its newest human message · -> (that ask, the session whose file answered it)
+        self.ask_lock = threading.Lock()                     # ask_holder's check-and-take: per-connection threads answer at once
         self.revisit = load_revisit()                        # "<chat>:<root_ts>" -> the owner's 📌 (on_revisit): a bookmark, never a mark
         self.home_links, self.home_cards = {}, {}           # "<chat>:<ts>" -> (permalink, when) · "repo#n" -> its #approvals card's permalink
         self.edit_seen = collections.OrderedDict()          # (chat, ts, subtype) already handled — dedupes duplicate edit/delete events
@@ -5277,6 +5279,25 @@ class Daemon:
         log(f"fetch {h}: {what[:24]} {ts} saved {len(got)}/{len(infos)}")
         return {"ok": bool(got), "text" if got else "error": "\n".join(lines)}
 
+    def ask_holder(self, key, target, take=False):
+        """ONE ASK, ONE ANSWER (raised-a-member-ask-answered-twice): on 2026-10-23 a member's two thread asks each went to
+        two sessions, one typed in by cc-msg after an un-park and one read by the seat a plan change woke, and each thread
+        got two answers, both files. Every route ends in a member session's reply or file through here, so here is the
+        claim, keyed on the thread's newest human message (on_event): the first FILE that posts holds it, since that is
+        the deliverable, and a text line ("on it", a hand-over note) holds nothing. Another session's reply or file gets
+        the refusal back while the holder still has a live link; a new message is a new ask, and a dead holder holds
+        nothing. A thread the daemon saw no human message in has no ask, so nothing is held there."""
+        with self.ask_lock:
+            ask, held = self.asks.get(key), self.takers.get(key)
+            if ask is None:
+                return None
+            if held and held[0] == ask and held[1] != target and self.subs.get(held[1]):
+                return {"ok": False, "error": f"not sent — {held[1]} already answered this ask in the thread and is still "
+                                              "running; say so to whoever handed it to you instead of answering it again"}
+            if take and held != (ask, target):
+                self.takers[key] = (ask, target)
+                return True                                  # this call took it: the caller gives it back if its post fails
+
     def member_verb(self, h, first, verb):
         """The scoped Slack calls a boundary cannot make itself (no token inside). `verb` is the one refuse_reason
         authorised — never re-derived here, or a second key in the payload would run instead. Returns the response."""
@@ -5308,6 +5329,10 @@ class Daemon:
             chat = resolve_channel(self.cfg, chat[1:]) or chat
         if workspace_of(target) != h:
             target = h
+        ask = (chat, str(first.get("thread_ts") or ""))
+        held = verb in ("reply", "file") and self.ask_holder(ask, target)
+        if held:
+            return held
         if verb == "reply":
             text = str(first.get("text") or ""); thread = first.get("thread_ts") or None; ts = first.get("ts") or ""
             # THE WORKSPACE PLACES ITS OWN MAIL (owner, 2026-10-20: a restriction stays only where its harm leaves the
@@ -5386,7 +5411,10 @@ class Daemon:
             except (OSError, UploadRefused) as e:
                 log(f"file {h}: {path} refused: {e}")
                 return {"ok": False, "error": f"{first.get('path')} is not a regular file the box can read under the workspace — nothing sent"}
+            took, fid = self.ask_holder(ask, target, take=True), None   # taken here, under the lock, and given back below unless it posted
             try:   # the mail door, when the thread answers a mail, is handed the checked name and opens it once itself
+                if isinstance(took, dict):
+                    return took
                 fid, _ = upload_file(self.cfg, f"/proc/self/fd/{fd}", chat, first.get("thread_ts") or None,
                                      comment=(no_broadcast(str(first.get("text") or "")) if chat in self.member_mirrors(h).values() else first.get("text")) or None,
                                      title=first.get("title") or None, ts=str(first.get("ts") or "") or None, name=os.path.basename(path),
@@ -5395,6 +5423,9 @@ class Daemon:
                 return {"ok": False, "error": f"not sent — {e}"[:400]}
             finally:
                 os.close(fd)
+                if not fid and took is True:
+                    with self.ask_lock:
+                        self.takers.pop(ask, None)
             if first.get("ts"):
                 react(self.cfg, chat, str(first["ts"]), "eyes", remove=True)
             if not fid:
@@ -6704,6 +6735,8 @@ class Daemon:
                                "in ~/.cc/slack/routes.json.", thread)
             return
         ws = workspace_of(target)
+        if ws:
+            self.asks[(chat, thread)] = ts                  # the ask a member session's file in this thread answers (ask_holder)
         if ws and NEW_PROJECT_RE.match(text or ""):   # a boundary can't make its own channels; the daemon does it here
             react(self.cfg, chat, ts, "eyes")
             return self.member_channel(ws, target, text, chat, thread, ts, user, is_owner)

@@ -2551,11 +2551,11 @@ printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://g
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "protected path: learn-fetch/foo.py"; exit 1\n' "$T" > "$T/landrefuse"; chmod +x "$T/landrefuse"
 : > "$T/land.calls"
 o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND="$T/landrefuse")
-{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^not queued: PR #77 — " <<<"$o8f" \
+{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^not queued: PR #77 — protected path: learn-fetch/foo.py$" <<<"$o8f" \
   && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
   && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
   && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \
-  && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' — and asks cc-land to queue it, whose refusal raises that card (P8f)" \
+  && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' — and asks cc-land to queue it, whose refusal raises that card and is the not-queued line's why (P8f)" \
   || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going. Capped

@@ -2063,7 +2063,7 @@ def selfcheck():
        and hold_prs("starts when #11 lands: same file core/bin/cc-slack; then a builder", "me", {"me": {}})[1] == "")
     th_ = tempfile.mkdtemp(prefix="cc-reconcile-holds-")
     try:
-        scratch(th_, dict(NOOP, gh=f'n=${{2##*/}}; echo "$n" >> {th_}/gh.log; case "$n" in 11) echo \'{pulled("MERGED")}\';; '
+        scratch(th_, dict(NOOP, gh=f'for p; do :; done; n=${{p##*/}}; echo "$n" >> {th_}/gh.log; case "$n" in 11) echo \'{pulled("MERGED")}\';; '
                                     f'12) echo \'{pulled("OPEN")}\';; 13) echo \'{pulled("CLOSED")}\';; esac'))
         cbh = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
         cbh("init", "rh", f"{th_}/dev/rh", "main")
@@ -2111,9 +2111,9 @@ def selfcheck():
                  "own": [{"number": 6, "state": "open", "merged_at": None}]}
         for k, v in lists.items():
             json.dump(v, open(f"{tq}/{k}.json", "w"))
-        scratch(tq, dict(NOOP, gh=f'echo "$*" >> {tq}/gh.log; [ -f {tq}/lists ] && case "$2" in '
+        scratch(tq, dict(NOOP, gh=f'echo "$*" >> {tq}/gh.log; for p; do :; done; [ -f {tq}/lists ] && case "$p" in '
                                   f'*/o/zz/pulls\\?*) cat {tq}/zz.json; exit 0;; *pulls\\?*) cat {tq}/own.json; exit 0;; esac; '
-                                  f'case "$2" in */pulls/*) echo "$2" >> {tq}/view.log;; esac; exit 1'))
+                                  f'case "$p" in */pulls/*) echo "$p" >> {tq}/view.log;; esac; exit 1'))
         os.makedirs(f"{tq}/dev/zz")
         json.dump({"repo": "zz", "tracks": {
             "a": {"status": "review", "pr": "https://github.com/o/zz/pull/5", "updated": old},
@@ -2190,6 +2190,32 @@ def selfcheck():
            and len(open(f"{tq}/view.log").read().split()) == 1)
     finally:
         restore(); shutil.rmtree(tq, ignore_errors=True)
+    # CONDITIONAL GETS: the login spent its REST hour in ~45 min, every hour (2026-10-23). A kept ETag goes out as
+    # If-None-Match and a 304 (free) answers with the kept copy, which is replaced by rename, never written through a
+    # planted link (perms' read of #1898). Own fixture: a gh that answers 200 with an ETag, or 304 to any conditional GET.
+    te = tempfile.mkdtemp(prefix="cc-reconcile-etag-")
+    try:
+        scratch(te, dict(NOOP, gh=f'echo "$*" >> {te}/gh.log; for p; do :; done; case "$*" in *If-None-Match*) '
+                                  f'printf "HTTP/2.0 304 Not Modified\\r\\n\\r\\n"; exit 1;; esac; '
+                                  f'case "$p" in *pulls/9) m=\\"2026-10-23T00:00:00Z\\";; *) m=null;; esac; '
+                                  f'printf "HTTP/2.0 200 OK\\r\\nEtag: W/\\"e1\\"\\r\\n\\r\\n{{\\"merged_at\\": $m}}"'))
+        os.makedirs(f"{te}/dev/zz")
+        first, again = rest("zz", "repos/o/zz/pulls/8"), rest("zz", "repos/o/zz/pulls/8")
+        calls = open(f"{te}/gh.log").read().splitlines()
+        ok("ETAG: the first GET is plain and keeps the answer; the next carries its ETag, and GitHub's 304 is "
+           "answered with the kept copy",
+           first == again == {"merged_at": None} and len(calls) == 2 and "If-None-Match" not in calls[0]
+           and 'If-None-Match: W/"e1"' in calls[1])
+        kf = f"{STATE}/reconcile-gh/{hashlib.sha1(f'{DEV}/zz repos/o/zz/pulls/9'.encode()).hexdigest()}.json"
+        open(f"{te}/target", "w").write("mine\n")
+        os.symlink(f"{te}/target", kf)
+        m1, m2 = rest("zz", "repos/o/zz/pulls/9"), rest("zz", "repos/o/zz/pulls/9")
+        ok("…a merged pull is asked again too (a 304 is free), and a link planted where its copy goes is replaced, "
+           "never written through",
+           m1 == m2 == {"merged_at": "2026-10-23T00:00:00Z"} and len(open(f"{te}/gh.log").read().splitlines()) == 4
+           and not os.path.islink(kf) and open(f"{te}/target").read() == "mine\n")
+    finally:
+        restore(); shutil.rmtree(te, ignore_errors=True)
     # (b) the tick wakes an idle seat once for a startable row, not again for the same state, never for a channel repo
     tb = tempfile.mkdtemp(prefix="cc-reconcile-wake-")
     try:

@@ -431,6 +431,9 @@ def git_pr_files(root, pr, token=None, genv=None):
         return None
 
 
+UNLISTED = "gh could not list the PR's files"
+
+
 def protected_hit(repo, root, pr, token=None, genv=None):
     rules = protected_rules(repo)
     if rules == []:
@@ -439,7 +442,7 @@ def protected_hit(repo, root, pr, token=None, genv=None):
         return first_hit([], None)
     files = GH.pr_files(root, pr, token)
     if files is None:
-        return "?", "gh could not list the PR's files"
+        return "?", UNLISTED
     if len(files) >= GH_PR_FILES:
         files = git_pr_files(root, pr, token, genv)
         if files is None:
@@ -1995,6 +1998,11 @@ def cmd_queue(argv):
     root = J.repo_root(repo)
     token = M.gh_token(handle, repo) if handle else None
     hit, approved_head = protected_hit(repo, root, pr, token, genv), ""
+    if hit and hit[1] == UNLISTED and not owner_approved(approved_by):
+        # a spent REST hour (or any gh failure) refused the PR with a 🔐 card it never needed, and nothing queued it
+        # after the reset (2026-10-23); the lane's door asks again at every head from git's own list, so it queues
+        print(f"lander: {UNLISTED} — the lane checks its paths against the protected ones at the head it plans")
+        hit = None
     if hit and not owner_approved(approved_by):
         E.log("refused", repo, pr, f"protected:{hit[0]}")
         cards = load_units().get("cards")

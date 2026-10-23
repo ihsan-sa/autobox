@@ -3698,6 +3698,22 @@ class Door(Fixture):
         self.assertEqual([c[0] for c in rv.calls], ["review"])
         self.assertEqual(self.box().get("merges", []), [])
 
+    def test_files_gh_cannot_list_queue_and_the_door_asks_at_the_head(self):
+        """A spent REST hour refused #1890 with a 🔐 card nothing needed, and nothing queued it after the reset
+        (2026-10-23): it queues with no card, and the lane's door still stops a protected path from git's list."""
+        self.pr(1, {"a/x": "n\n"})
+        cards = Rec()
+        with mock.patch.object(L, "load_units", lambda: {"cards": cards}), \
+                mock.patch.object(GH, "pr_files", lambda *a: None):
+            rc, out, err = self.queue("demo", "1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(L.UNLISTED, out)
+        self.assertEqual(cards.calls, [])
+        self.assertNotIn("refused", self.log())
+        self.land()
+        self.assertEqual(self.job().state, T.QUERY)
+        self.assertIn("no 👍 of the owner's queued it", self.job().extra["why"])
+
     def test_unreadable_config_fails_closed(self):
         self.set_box(config={"SLACK_OWNER_ID": "UOWNER", "CC_PROTECTED_PATHS_demo": False})
         self.pr(1, {"b/y": "n\n"})
