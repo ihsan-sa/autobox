@@ -123,6 +123,12 @@ cfgbox(){ env -u CC_BOX HOME="$IH" "$IR/bin/cc-config" get CC_BOX; }
 [ "$(cfgbox)" = testbox ] && ok "install writes CC_BOX into a config that has none" || bad "install left CC_BOX out of ~/.cc/config: '$(cfgbox)'"
 HOME="$IH" "$IR/bin/cc-config" set CC_BOX kept; inst
 [ "$(cfgbox)" = kept ] && ok "install keeps the config's own CC_BOX over the environment's" || bad "install rewrote the config's CC_BOX to '$(cfgbox)'"
+# with CC_BOX in neither the config nor the environment, install stops and saves no name: it never guesses the hostname
+NB="$T/blank-noname"; mkdir -p "$NB"; ( cd "$NB" && env -u CC_BOX HOME="$NB" XDG_CONFIG_HOME="$NB/.config" USER=tester GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$NB.log" 2>&1; nrc=$?
+{ [ $nrc = 2 ] && grep -q 'this box has no name' "$NB.log" && [ ! -e "$NB/.cc/config" ]; } && ok "install on a blank HOME with no CC_BOX stops and saves no name" || bad "no CC_BOX anywhere: rc=$nrc, config: $(cat "$NB/.cc/config" 2>/dev/null), log=$(tail -2 "$NB.log" | tr '\n' ' ')"
+# …and it writes the name to ~/.cc/config, the file the lander reads, even when CC_CONFIG names another
+CB="$T/blank-ccconfig"; mkdir -p "$CB"; ( cd "$CB" && env HOME="$CB" XDG_CONFIG_HOME="$CB/.config" USER=tester CC_BOX=testbox CC_CONFIG="$T/elsewhere.config" GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$CB.log" 2>&1
+{ grep -qx 'CC_BOX=testbox' "$CB/.cc/config" && ! grep -qs '^CC_BOX=' "$T/elsewhere.config"; } && ok "install writes CC_BOX into ~/.cc/config, not the file CC_CONFIG names" || bad "CC_CONFIG install: ~/.cc/config: $(cat "$CB/.cc/config" 2>/dev/null), elsewhere: $(cat "$T/elsewhere.config" 2>/dev/null)"
 # the prune is scoped to what this tree linked: a stale link of its own (target left the tree) goes, a dangling
 # link someone ELSE put in ~/bin stays — install.sh used to delete every dangling link in ~/bin, whoever made it
 ln -s "$IR/bin/retired-script" "$IH/bin/retired-script"; ln -s "$T/never-ours" "$IH/bin/foreign"
@@ -231,8 +237,8 @@ OH="$T/overlay-home"; inst_as "$OH" testbox "$OV/core/install.sh"
 [ "$(readlink -f "$OH/BOX.md")" = "$OV/boxes/testbox/BOX.md" ] && ok "the overlay links boxes/testbox/BOX.md to ~/BOX.md on testbox, not otherbox's" || bad "~/BOX.md on testbox -> '$(readlink -f "$OH/BOX.md")' ($(tail -2 "$OH.log" | tr '\n' ' '))"
 NH="$T/overlay-newbox"; inst_as "$NH" thirdbox "$OV/core/install.sh"
 { [ ! -e "$NH/BOX.md" ] && [ ! -L "$NH/BOX.md" ] && grep -q 'no boxes/thirdbox/BOX.md' "$NH.log"; } && ok "…and a box with no folder there gets no ~/BOX.md, and the install says so" || bad "a box with no boxes/ entry: BOX.md $([ -L "$NH/BOX.md" ] && echo linked || echo absent), log=$(grep -c 'no boxes/' "$NH.log")"
-# the same HOME reinstalled under a box name with no entry must drop the link to the first box's facts, never keep it
-inst_as "$OH" thirdbox "$OV/core/install.sh"
+# the same HOME renamed in its config (which wins) to a box with no entry must drop the link to the first box's facts
+HOME="$OH" "$IR/bin/cc-config" set CC_BOX thirdbox; inst_as "$OH" thirdbox "$OV/core/install.sh"
 { [ ! -e "$OH/BOX.md" ] && [ ! -L "$OH/BOX.md" ] && grep -q 'no boxes/thirdbox/BOX.md' "$OH.log"; } && ok "…and testbox's HOME reinstalled as thirdbox (no entry) loses the link to testbox's facts" || bad "testbox -> thirdbox kept ~/BOX.md -> '$(readlink "$OH/BOX.md")' ($(tail -2 "$OH.log" | tr '\n' ' '))"
 FH="$T/owner-boxmd"; mkdir -p "$FH"; echo "the owner's own notes" > "$FH/BOX.md"; inst_as "$FH" thirdbox "$OV/core/install.sh"
 LH="$T/owner-boxlink"; mkdir -p "$LH"; echo "elsewhere" > "$T/elsewhere.md"; ln -s "$T/elsewhere.md" "$LH/BOX.md"; inst_as "$LH" thirdbox "$OV/core/install.sh"

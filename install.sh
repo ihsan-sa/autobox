@@ -5,8 +5,8 @@
 #   ./install.sh --no-services    link only — no systemctl/sudo (tests run this in a throwaway HOME)
 #   ./install.sh --join <peer>    install, then record that this box is to join <peer> (a skeleton: it writes
 #                                 ~/.cc/peer/join and prints what is left; no key, no network, no message yet)
-# The box's name is CC_BOX (environment, then ~/.cc/config), else `hostname -s`, and a config without CC_BOX gets
-# it written in; nothing here names a real box.
+# The box's name is CC_BOX from ~/.cc/config, else from the environment (then written into the config); with neither,
+# install stops. It never guesses one from the hostname, and nothing here names a real box.
 # A box may keep this tree as `core/` inside a private repo — the "overlay" — and then the installer also links
 # the overlay's home/*.md and bin-private/*, uses its config/etc, and lays its config/claude-settings.json over
 # the default when it writes a first ~/.claude/settings.json. A bare clone of autobox has no overlay.
@@ -21,17 +21,19 @@ while [ $# -gt 0 ]; do case "$1" in
   --join) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; join="$2"; shift ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac; shift; done
-box=$("$R/bin/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null) || true
-[ -n "$box" ] || { echo "install.sh: this box has no name: CC_BOX is empty or unset (environment, then ~/.cc/config) and hostname -s printed nothing; rerun with CC_BOX=<name>" >&2; exit 2; }
+# the lander names the box (and so the perms seat) from ~/.cc/config alone, never the environment or CC_CONFIG, so
+# the name is read from and written to that file
+boxcfg(){ env -u CC_BOX -u CC_CONFIG "$R/bin/cc-config" "$@"; }
+box=$(boxcfg get CC_BOX) || box=${CC_BOX:-}
+[ -n "$box" ] || { echo "install.sh: this box has no name: CC_BOX is in neither ~/.cc/config nor the environment; rerun with CC_BOX=<name>" >&2; exit 2; }
 if [ -n "$join" ]; then   # checked before anything is linked, so a bad name changes nothing
   [[ $join =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "install.sh: --join wants a box name ([a-z0-9-]), not '$join'" >&2; exit 2; }
-  [ "$join" != "$box" ] || { echo "install.sh: this box is $box — it cannot join itself (set CC_BOX if the hostname is wrong)" >&2; exit 2; }
+  [ "$join" != "$box" ] || { echo "install.sh: this box is $box — it cannot join itself (CC_BOX in ~/.cc/config names it)" >&2; exit 2; }
 fi
 
 mkdir -p ~/bin ~/.cc/{boards,worktrees,state,slack} ~/.config/systemd/user ~/.config/environment.d ~/dev
 [ -d ~/.cc/tmp ] || mkdir -m 700 ~/.cc/tmp   # TMPDIR for every unit and session (config/environment.d/cc-tmp.conf): made before anything reads it
-# the lander names the box (and so the perms seat) from the config alone, never the environment: write the name in
-env -u CC_BOX "$R/bin/cc-config" get CC_BOX >/dev/null || "$R/bin/cc-config" set CC_BOX "$box"
+boxcfg get CC_BOX >/dev/null || { boxcfg set CC_BOX "$box"; echo "wrote CC_BOX=$box into ~/.cc/config"; }
 
 # link <src> <dest> — like `ln -sfn`, except a REAL file/dir in the way is kept as <dest>.bak instead of clobbered.
 link() {

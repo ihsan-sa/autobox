@@ -26,7 +26,8 @@ A bare clone of autobox works too — it just has no overlay, so `install.sh` li
    These four files are the box's own memory: `CLAUDE.md` is what every Claude session on it reads first, so keep it
    short — the machine's specs, power and disk history belong in `<overlay>/docs/hardware.md`, which it links.
 2. **`~/.cc/config`** (mode 600, never committed) — `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_OWNER_ID`,
-   `SLACK_WEBHOOK`, `SLACK_CHANNEL`, `NTFY_TOPIC`, and `CC_BOX` if the box's name is not `hostname -s`.
+   `SLACK_WEBHOOK`, `SLACK_CHANNEL`, `NTFY_TOPIC`, and `CC_BOX`, the box's name: the first
+   `CC_BOX=<box> ./install.sh` writes it, and install stops on a box that has none rather than guess the hostname.
    `cc slack setup` and `cc-notify setup` write these for you.
 3. **Slack app** — create one from `core/slack/app-manifest.json` (replace the `<box>` placeholders in `display_information`
    and `bot_user`), install it to your workspace, then `cc slack setup --bot xoxb-… --app xapp-… --owner-email you@example.com`
