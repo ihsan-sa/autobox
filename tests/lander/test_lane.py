@@ -3700,19 +3700,31 @@ class Door(Fixture):
 
     def test_files_gh_cannot_list_queue_and_the_door_asks_at_the_head(self):
         """A spent REST hour refused #1890 with a 🔐 card nothing needed, and nothing queued it after the reset
-        (2026-10-23): it queues with no card, and the lane's door still stops a protected path from git's list."""
-        self.pr(1, {"a/x": "n\n"})
-        cards = Rec()
-        with mock.patch.object(L, "load_units", lambda: {"cards": cards}), \
-                mock.patch.object(GH, "pr_files", lambda *a: None):
-            rc, out, err = self.queue("demo", "1", "--no-start")
-        self.assertEqual(rc, 0, err)
-        self.assertIn(L.UNLISTED, out)
-        self.assertEqual(cards.calls, [])
-        self.assertNotIn("refused", self.log())
-        self.land()
-        self.assertEqual(self.job().state, T.QUERY)
-        self.assertIn("no 👍 of the owner's queued it", self.job().extra["why"])
+        (2026-10-23): it queues with no card. Perms' read of #1908: whatever GitHub's file list answers (an error, a
+        rate limit, a 304 for a cached body, an empty or a partial list), the lane's door still stops a protected
+        path from git's own list, and nothing merges."""
+        answers = {"error": (1, "", "gh: Server Error (HTTP 502)"),
+                   "rate limit": (1, "", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"),
+                   "cached": (1, "HTTP/2.0 304 Not Modified\n\n", ""),
+                   "empty": (0, "", ""), "partial": (0, "b/y\n", "")}
+        for name, said in answers.items():
+            with self.subTest(name):
+                self.doCleanups()   # each answer on a fixture of its own
+                self.setUp()
+                real, cards = GH.gh, Rec()
+                self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+                with mock.patch.object(L, "load_units", lambda: {"cards": cards}), \
+                        mock.patch.object(GH, "gh", lambda argv, *a, **k:
+                                          said if "pulls/1/files?" in " ".join(argv) else real(argv, *a, **k)):
+                    rc, out, err = self.queue("demo", "1", "--no-start")
+                    self.land()
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(L.UNLISTED in out, said[0] != 0)
+                self.assertEqual(cards.calls, [])
+                self.assertNotIn("refused", self.log())
+                self.assertEqual(self.job().state, T.QUERY)
+                self.assertIn("no 👍 of the owner's queued it", self.job().extra["why"])
+                self.assertEqual(self.box().get("merges", []), [])
 
     def test_unreadable_config_fails_closed(self):
         self.set_box(config={"SLACK_OWNER_ID": "UOWNER", "CC_PROTECTED_PATHS_demo": False})

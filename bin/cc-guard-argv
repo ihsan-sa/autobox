@@ -80,7 +80,9 @@ Rules for both gated roles:
   lander-self but status/selfcheck/help; core/lander/cli.py by its path (or ./cli.py inside it), python -m lander[.x],
   or interpreter code importing lander                                                             -> never
 - cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX|CC_BOX; cc-settings apply|grant -> never
-  (set|unset with any key not spelt out: computed, a glob, from xargs or find -exec; a computed subcommand) -> never
+  (set|unset with any key not spelt out: computed, a glob, from xargs or find -exec; a subcommand not spelt out; cc-config
+  run by path, through a shell or source, or as a copy or link (by its bytes, or a cp/ln/install in the same line); set|unset
+  after a script path it can't read (`$C`, `$(which cc-config)`, a file this line makes, stdin from cc-config) or a computed verb) -> never
 - write fence: a redirect target or the destination of cp mv ln install rsync tee dd(of=) sed -i perl -i truncate rm
   rmdir unlink shred touch mkdir chmod chown curl -o wget -O find -delete, or git -C <dir> (or the cwd) with a verb
   that writes the tree, landing (relative = after this command's own cd/pushd) in ~/dev/* (except GUARD_ROOT and
@@ -129,7 +131,7 @@ Member only:
 Not here (cc-guard keeps them, they need /proc or the tool input): tmux kill-server/kill-session, pattern kills,
 the member kill fence, the Write/Edit rules.
 """
-import fnmatch, glob, json, os, pwd, re, shlex, sys, tempfile
+import fnmatch, glob, json, os, pwd, re, shlex, shutil, sys, tempfile
 
 class ParseError(Exception):
     pass
@@ -274,6 +276,9 @@ GITW = {'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'mer
         'restore', 'revert', 'rm', 'stash', 'switch', 'worktree', 'submodule', 'update-ref', 'symbolic-ref', 'init', 'clone'}
 LAUNCHERS = {'claude', 'cc', 'cc-loop', 'cc-room', 'cc-handoff', 'npx', 'bunx', 'node', 'codex'}
 PWHOME = None   # the selfcheck's stand-in for the passwd home
+CFG = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'cc-config')   # cc-config by what it is, not its name
+try: CFGB = open(CFG, 'rb').read()
+except OSError: CFGB = None
 PROTKEY = re.compile(r'(CC_PROTECTED_PATHS_\w*|SLACK_OWNER_ID|CC_LAND_REVIEW\w*|CC_CLAUDE|CC_CODEX|CC_BOX)(=|$)')
 ASSIGN = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')
 BLOCKDEV = re.compile(r'/dev/(sd[a-z]|nvme\d|mmcblk\d|vd[a-z]|xvd[a-z]|hd[a-z]|md\d|dm-|mapper/|disk/|loop\d)')
@@ -292,7 +297,7 @@ GHCMD = {'agent-task', 'alias', 'api', 'attestation', 'auth', 'browse', 'cache',
          'ruleset', 'run', 'search', 'secret', 'ssh-key', 'status', 'variable', 'version', 'workflow'}
 GHPOST = {'comment', 'create', 'close', 'reopen', 'edit', 'review', 'merge', 'lock', 'unlock', 'delete', 'transfer'}
 # the verbs whose hard limits are keyed on their arguments: a `$X` / `$(..)` verb is judged as each of them
-CANDV = ('git', 'gh', 'systemctl', 'ip', 'cc', 'cc-slack', 'claude', 'lander-self', 'cc-handoff', 'cp')
+CANDV = ('git', 'gh', 'systemctl', 'ip', 'cc', 'cc-slack', 'claude', 'lander-self', 'cc-handoff', 'cp', 'cc-config')
 CCWORDS = {'--go', '__runperms', 'slack', 'board', 'done', 'rm', 'handoff'}
 IPOBJ = {'link', 'addr', 'address', 'route', 'rule', 'neigh', 'neighbour', 'tunnel', 'tuntap', 'netns', 'xfrm', 'maddress',
          'mroute', 'vrf', 'nexthop', 'token', 'ntable', 'l2tp', 'fou', 'macsec', 'mptcp', 'tcp_metrics', 'netconf', 'sr'}
@@ -517,6 +522,7 @@ class Guard:
         g.headmove = g.cddyn = g.bypass = False
         g._mp = None
         g.written, g.alias = {}, {}   # files this command writes (path -> text), and its aliases
+        g.cfgs = set()   # where this command copies or links cc-config to
         g.vsrc = {}   # a variable set from a substitution: its source text, read as a computed verb's words
         nt = env.get('GUARD_NEVER_TOUCH') or os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'config', 'never-touch.txt')
         g.nt = set()
@@ -574,6 +580,15 @@ class Guard:
 
     def absp(g, v, cwd):
         return os.path.normpath(v if v.startswith('/') else os.path.join(cwd, v))
+
+    def iscfg(g, v, cwd, sub=None):   # cc-config under any name: a link to it, a copy of its bytes, or a cp/ln/install target of
+        if not v: return False   # this line; a file not there to read (`$C`, `$(which cc-config)`, one this line makes) run with set|unset
+        p = g.absp(v, cwd)
+        if sub in ('set', 'unset') and not os.path.isfile(p): return True
+        if os.path.basename(p) == 'cc-config' or p in g.cfgs: return True
+        try: return os.path.realpath(p) == os.path.realpath(CFG) or (os.path.isfile(p) and os.path.getsize(p) == len(CFGB or b'')
+                                                                       and open(p, 'rb').read() == CFGB)
+        except OSError: return False
 
     def deglob(g, pat):   # a globbed verb is every command name it can match
         if g._names is None:
@@ -709,7 +724,8 @@ class Guard:
             for n, rest in ([] if m else g.vcands(w0.raw)):
                 out += g.expand([Word(n)] + [Word(x) for x in rest] + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx)
             return out
-        b0 = w0.v.rsplit('/', 1)[-1]
+        b0 = 'cc-config' if g.iscfg(w0.v if '/' in w0.v else shutil.which(w0.v) if not w0.glob else '', cwd,
+                                    ws[1].v if '/' in w0.v and ws[1:] else None) else w0.v.rsplit('/', 1)[-1]
         # a member's own file named like a wrapper (`~/dev/bob/nice make`) is that file, not the wrapper: unwrapping
         # would drop its path before memcode reads it
         mine = '/' in w0.v and g.mtrees and g.memtree(g.absp(w0.v, cwd))
@@ -822,7 +838,7 @@ class Guard:
 
     def bypath(g, b, a, cwd, depth):   # a[0] is the script file an interpreter or shell runs: one of TOOLS runs as that tool
         if b in SHELLS and g.absp(a[0], cwd) in g.written: return g.script(g.written[g.absp(a[0], cwd)], cwd, b + ' script', depth + 1)
-        t = 'lander' if landcli(a[0], cwd) else os.path.basename(a[0])
+        t = 'lander' if landcli(a[0], cwd) else 'cc-config' if g.iscfg(a[0], cwd, (a[1:2] or [None])[0]) else os.path.basename(a[0])
         ts = [x for x in g.deglob(t) if x in TOOLS] if re.search(r'[*?[]', t) else [t]   # `python3 core/bin/cc-tr[y]`
         return [r for t in ts if t in TOOLS for r in g.script(' '.join(shlex.quote(x) for x in [t] + a[1:]), cwd, b + ' script', depth + 1)]
 
@@ -830,6 +846,9 @@ class Guard:
         b, a, cwd, out = R['verb'], R['args'], R['cwd'], []
         for r in R['redirs']:   # `echo 'docker run x' > f; bash f`: what a shell or source later runs from f is this text (`2>` is not)
             if r['op'] in ('>', '>>', '>|') and r['fd'] in ('', '1') and not r['w'].dyn: g.written[g.absp(r['w'].v, cwd)] = g.data(R)
+        p = [x for x in a if not x.startswith('-')]
+        if b in ('cp', 'ln', 'install') and len(p) > 1 and any(g.iscfg(x, cwd) for x in p[:-1]):   # the copy runs as cc-config too
+            g.cfgs |= {g.absp(p[-1], cwd)} | {g.absp(p[-1] + '/' + os.path.basename(x), cwd) for x in p[:-1]}
         if b == 'tee' and ctx[1]['pipe'] is not None:   # `… | tee f; f 7`: f holds what was piped in
             for x in a:
                 if not x.startswith('-'): g.written[g.absp(x, cwd)] = g.produced(ctx)
@@ -854,6 +873,8 @@ class Guard:
                 if not nx and ws[k + 1].subs: out += g.fed(ws[k + 1].subs, cwd, b + ' <()', depth)   # `sh <(…)`: what it prints is the script
             else:   # `bash < <(echo 'docker run ..')`, `bash /dev/fd/3 3<<<'…'`: what that descriptor holds is the script
                 fd = fdof(a[k]) if k < len(a) and not s else '0'
+                if fd == '0' and any(r['op'] == '<' and g.iscfg(r['w'].v, cwd) for r in R['redirs']):   # `bash -s set K v < cc-config`
+                    out += g.bypath(b, [CFG] + a[k:], cwd, depth)
                 for t in g.feed(R['redirs'], fd, cwd, depth): out += g.script(t, cwd, 'stdin>' + b, depth + 1)
                 if fd == '0' and ctx[1]['pipe'] is not None:
                     try: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
@@ -948,8 +969,9 @@ class Guard:
                     n0 = len(g.out)
                     try: out += g.script(t.strip().strip('|'), cwd, b + ' code', depth + 1)
                     except ParseError: del g.out[n0:]
-        elif b in ('source', '.') and ws[1:2] and ws[1].subs:
-            out += g.fed(ws[1].subs, cwd, 'source', depth)
+        elif b in ('source', '.') and a:   # `. ~/bin/cc-config set K v` runs that tool with those words, as `bash` does
+            if ws[1].subs: out += g.fed(ws[1].subs, cwd, 'source', depth)
+            out += g.bypath(b, a, cwd, depth)
         elif b == 'find':
             k = 1
             while k < len(ws):
@@ -1325,6 +1347,7 @@ class Guard:
                 if cand == 'ip' and first not in IPOBJ: continue   # ip refuses any non-read; only its own objects say ip
                 if cand == 'gh' and first not in GHCMD: continue   # …and gh its own commands
                 if cand == 'lander-self' and first not in ('land', 'promote', 'rollback', 'pin'): continue   # …and its own verbs
+                if cand == 'cc-config' and first not in ('set', 'unset'): continue   # …and cc-config its set|unset
                 if cand == 'cc' and not (CCWORDS & set(a) or any(x.startswith('--go=') for x in a)): continue   # …and cc any other repo
                 r = g.rules(dict(R, verb=cand))
                 if r: return r[0], f'a command word this cannot read (a $ or a substitution) whose arguments, run by {cand}, are refused: {r[1]}'
@@ -1485,12 +1508,13 @@ class Guard:
         if v == 'cc-config' and mem: return 'never', "the box's config is not a member's to read or rewrite (cc-config)"
         if v == 'cc-config' and first in ('set', 'unset') and len(n) > 1 and PROTKEY.match(n[1]):
             return 'never', f'cc-config {first} {n[1].split("=")[0]}: a key the landing gate reads'
-        if v == 'cc-config':   # set|unset take a key spelt out: a computed, glob or handed-in key (xargs, find -exec) may be a
-            # held one, and a computed subcommand (a function's "$@") may be set (the Opus reads of #1901 and its repair)
+        if v == 'cc-config':   # the subcommand, and a set|unset key, spelt out as plain words: a computed, glob or handed-in one
+            # (xargs, find -exec) may be set or a held key, and a path, source or copy rebuilds `$K` as the literal `$K` (#1907's reads)
             sub, key = ([w for w in R['argw'] if not w.v.startswith('-')] + [None, None])[:2]
-            if (sub and sub.dyn) or (first in ('set', 'unset') and (not key or key.dyn or key.glob or '{' in key.v
-                                                                     or {'xargs', 'parallel', 'find -exec'} & set(R['via']))):
-                return 'never', f'cc-config {first}: spell the key out (a computed key may be one the landing gate reads)'
+            fed = {'xargs', 'parallel', 'find -exec'} & set(R['via'])
+            if (fed and not sub) or (sub and (sub.dyn or sub.glob or not re.fullmatch(r'[a-z]+', sub.v))) or (first in ('set', 'unset')
+                    and (not key or key.dyn or key.glob or fed or not re.fullmatch(r'[A-Za-z_]\w*', key.v))):
+                return 'never', f'cc-config {first}: spell the subcommand and key out (a computed key may be one the landing gate reads)'
         if v == 'cc-settings' and first in ('apply', 'grant'): return 'never', 'cc-settings rewrites the permission layer'
         # typing into a session's prompt is text arriving with a seat's authority (both roles); a plain post to the owner's
         # own channel reaches nobody outside, so only a member is held off it (a member's reach stays what it was)
@@ -1878,8 +1902,27 @@ def selfcheck():
                     r'find CC_BOX -exec cc-config set {} x \;', 'find CC_BOX -execdir cc-config set {} x +',
                     r'find CC_BOX -ok cc-config set {} x \;', 'find CC_BOX -exec cc-config unset {} +',
                     'xargs -I{} cc-config set {} x < keys', 'xargs -I K cc-config set K x < keys',
-                    'cc-config set {,CC_BOX} x')],
+                    'cc-config set {,CC_BOX} x',
+                    # cc-config run any other way than by its name: by path, through a shell or source, as a copy or link
+                    'source ~/bin/cc-config set CC_BOX x', '. ~/bin/cc-config unset SLACK_OWNER_ID', 'bash ~/bin/cc-config set $K x',
+                    '. ~/bin/cc-config set $K x', 'bash -- ~/bin/cc-config set CC_BO? x', 'env ~/bin/cc-config set CC_BOX x',
+                    'command ~/bin/cc-config set CC_BOX x', 'exec ~/bin/cc-config set CC_BOX x', 'C=~/bin/cc-config; $C set CC_BOX x',
+                    'cp ~/bin/cc-config q; ./q set CC_BOX x', 'ln -s ~/bin/cc-config /tmp/q; bash /tmp/q set CC_BOX x',
+                    # …and a subcommand that is a glob or handed in may be set
+                    'touch set; cc-config se? CC_BOX x', 'cc-config [s]et CC_BOX x', 'cc-config s* CC_BOX x',
+                    r'find set -exec cc-config {} CC_BOX x \;', 'xargs -I{} cc-config {} CC_BOX x < f', 'xargs cc-config < args',
+                    'xargs -a args cc-config',
+                    # …and a script path the guard can't read (computed, or a file this line makes), or a computed verb, with set|unset
+                    'bash $(which cc-config) set CC_BOX x', '. $(command -v cc-config) set CC_BOX x',
+                    'bash `which cc-config` unset SLACK_OWNER_ID', 'C=~/bin/cc-config; bash $C set CC_BOX x',
+                    'C=~/bin/cc-config; . "$C" set CC_BOX x', 'env $C set CC_BOX x', '$C unset CC_CLAUDE',
+                    'bash ~/bin/cc-$N set CC_BOX x', 'bash -s set CC_BOX x < ~/bin/cc-config',
+                    'cat ~/bin/cc-config > q; ./q set CC_BOX x', 'rsync ~/bin/cc-config q; ./q set CC_BOX x',
+                    'dd if=/x/cc-config of=q; ./q set CC_BOX x')],
                 *[('worker', 'track/x', c, False) for c in (
+                    'bash ~/bin/cc-config get CC_BOX', '~/bin/cc-config set FOO x', 'source ~/.bashrc',
+                    'bash $(which cc-config) set FOO x', 'bash $(which cc-config) get CC_BOX', '$C set FOO x',
+                    'bash -s get CC_BOX < ~/bin/cc-config', 'bash $S arg',
                     'cc-config get $K', 'cc-config set FOO x', 'cc-config set FOO "$V"', 'cc-config set FOO $(date)', 'cc-config list')]]:
             cwd = repo(branch, branch != 'main') if branch else H + '/dev/alice'
             env = dict(base, GUARD_ROLE=role, GUARD_CWD=cwd, GUARD_ROOT=cwd, GUARD_MWS='alice' if role == 'member' else '')
@@ -1961,6 +2004,14 @@ def selfcheck():
         if judge('cc-slack post -c boxy hi', base) is None: fail('case CC_BOX unreadable: a box named from a bad config')
         else: ok += 1
         os.remove(H + '/.cc/config')
+        with open(H + '/q', 'wb') as f: f.write(CFGB)   # cc-config copied or linked under another name is cc-config
+        os.symlink(CFG, H + '/l')
+        wenv = dict(base, GUARD_ROLE='worker', GUARD_CWD=H, GUARD_ROOT=H, GUARD_MWS='')
+        for cmd, refuse in ((f'{H}/q set CC_BOX x', True), (f'bash {H}/q unset CC_CLAUDE', True), (f'{H}/l set CC_BOX x', True),
+                            (f'. {H}/l set SLACK_OWNER_ID x', True), (f'{H}/q set FOO x', False), (f'{H}/l get CC_BOX', False)):
+            if (judge(cmd, wenv) is not None) != refuse: fail(f'case cc-config copy: {cmd!r} (want {"refuse" if refuse else "pass"})')
+            else: ok += 1
+        os.remove(H + '/q'); os.remove(H + '/l')
         PWHOME = None
         path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'tests', 'guard-replay.jsonl')
         skipped = 0
