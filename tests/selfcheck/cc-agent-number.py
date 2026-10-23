@@ -6,6 +6,7 @@ def selfcheck():
     import subprocess
     import tempfile
     n = f = 0
+    os.environ.pop("CC_AGENT_LEDGER", None)   # every case below names its own ledger by CC_STATE
 
     def check(name, cond, got=None):
         nonlocal n, f
@@ -48,6 +49,31 @@ def selfcheck():
             took = time.monotonic() - t
         check("a stuck lock holder costs a take its deadline, then it gives up and the caller starts without a number",
               r.stdout == "started\n" and LOCK_WAIT <= took < LOCK_WAIT + 3, (r.stdout, round(took, 1)))
+    with tempfile.TemporaryDirectory() as d:
+        env = {k: v for k, v in os.environ.items() if k != "CC_AGENT_NO"}
+        cli = lambda *a, no="": subprocess.run([__file__, *a], env=dict(env, CC_STATE=d, CC_AGENT_NO=no),
+                                               capture_output=True, text=True).stdout.strip()
+        got = [cli("next", "seat", "s", "0"), cli("bind", "s", "4242", no="a1"), cli("bind", "perms", "4343"),
+               cli("next", "seat", "t", "0"), cli("bind", "x", "4444", no='a1"}\n{"n": 900')]
+        with open(os.path.join(d, "agent-numbers.jsonl")) as fh:
+            recs = list(map(json.loads, fh))
+        pids = [(r.get("id"), r.get("pid"), "n" in r) for r in recs]
+        check("bind records claude's pid against the number its spawner took without spending one, a session "
+              "with no number takes a new one for its pid, and a CC_AGENT_NO not shaped a<digits> is not written",
+              got == ["a1", "a1", "a2", "a3", "a4"] and pids == [("a1", 0, True), ("a1", 4242, False),
+              ("a2", 4343, True), ("a3", 0, True), ("a4", 4444, True)], (got, pids))
+        cli("bind", "me", str(os.getpid()), no="a1")
+        with open(f"/proc/{os.getpid()}/stat") as fh:
+            mine = fh.read().rpartition(")")[2].split()[19]
+        with open(os.path.join(d, "agent-numbers.jsonl")) as fh:
+            last = json.loads(fh.read().splitlines()[-1])
+        check("bind records the process's start time beside its pid, so a reader can tell a reused pid",
+              last.get("start") == mine and recs[1].get("start") is None, (last, recs[1]))
+    with tempfile.TemporaryDirectory() as d:
+        r = subprocess.run([__file__, "next", "test", "t", "0"], capture_output=True, text=True,
+                           env=dict(os.environ, CC_STATE=f"{d}/state", CC_AGENT_LEDGER=f"{d}/scratch.jsonl"))
+        check("CC_AGENT_LEDGER moves the ledger, so a suite that sets it takes no number of the box's",
+              r.stdout == "a1\n" and os.path.exists(f"{d}/scratch.jsonl") and not os.path.exists(f"{d}/state"), r.stdout)
     # THE CALLERS' OWN LINES, read from the tools and run against a stub cc-agent-number that hands out a99, so the
     # case runs what ships, not a copy of it.
     bindir = os.path.dirname(os.path.realpath(__file__))

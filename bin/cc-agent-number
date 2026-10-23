@@ -2,6 +2,8 @@
 """cc-agent-number — the box's one agent sequence: every agent it starts takes the next number, and none repeats.
 
   cc-agent-number next <kind> <name> <pid>   take the next number and print it as a<N> (pid 0: not started yet)
+  cc-agent-number bind <name> <pid>          claude process <pid> carries $CC_AGENT_NO: record that pid against it, or
+                                             take it a new number (kind session) when it has none, and print it
   cc-agent-number selfcheck                  the cases in core/tests/selfcheck/cc-agent-number.py, on ledgers of their own
 
 The ledger, $CC_STATE/agent-numbers.jsonl (default ~/.cc/state), is the counter: one line per number taken,
@@ -11,11 +13,19 @@ n on file + 1, so a restart or crash carries on from the file, and a line a cras
 the next is appended. A take that can't get the lock in LOCK_WAIT seconds prints nothing and exits 1, so one stuck
 holder never hangs a start: its callers start the agent without a number. The "a" in front keeps these apart from
 the numbers any other agent runner on the box keeps for its own runs. A running agent finds its own as $CC_AGENT_NO,
-which the spawner sets and claude passes down to its hooks and tools (cc-pulse reads it from /proc/<pid>/environ for the dashboard).
-"""
-import fcntl, json, os, sys, time
+which the spawner sets and claude passes down to its hooks and tools.
 
-LEDGER = os.path.join(os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state"), "agent-numbers.jsonl")
+THE PID. A spawner takes the number before claude exists, so its line carries the spawner's pid (or 0). The
+session's first tool call (cc-subagent-bound's hook) runs `bind` with claude's own pid, which appends {"id", "pid",
+"start", "at"}, a line with no n that the count skips, and takes a number for a session no spawner numbered (perms, a
+launch nobody wrapped, or a $CC_AGENT_NO not shaped a<digits>). So the latest line naming a pid whose start time
+(/proc/<pid>/stat field 22) is the live process's is that process's number, and `cc-pulse --once --json` shows it as
+a session's agent_no when the process's environment has none. A $CC_AGENT_LEDGER moves the
+ledger; the suites set it, so no test takes a number of the box's.
+"""
+import fcntl, json, os, re, sys, time
+
+LEDGER = os.environ.get("CC_AGENT_LEDGER") or os.path.join(os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state"), "agent-numbers.jsonl")
 LOCK_WAIT = 3
 
 
@@ -27,7 +37,15 @@ def last_n(text):
     return n
 
 
-def take(kind, name, pid):
+def start(pid):
+    """The pid's start time (/proc/<pid>/stat field 22), so a reader can tell a reused pid from the one bound, or None."""
+    try:
+        return open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def take(kind, name, pid, no=None):
     os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
     with open(LEDGER, "a+") as f:
         end = time.monotonic() + LOCK_WAIT
@@ -38,10 +56,10 @@ def take(kind, name, pid):
                 time.sleep(0.05)
         f.seek(0); text = f.read(); n = last_n(text) + 1
         torn = "\n" if text and not text.endswith("\n") else ""   # close a line a crash cut short, or this one joins it
-        f.write(torn + json.dumps({"n": n, "id": f"a{n}", "kind": kind, "name": name, "pid": pid,
-                                   "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
+        rec = {"id": no, "pid": pid, "start": start(pid)} if no else {"n": n, "id": f"a{n}", "kind": kind, "name": name, "pid": pid}
+        f.write(torn + json.dumps(dict(rec, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))) + "\n")
         f.flush(); os.fsync(f.fileno())
-    return f"a{n}"
+    return rec["id"]
 
 
 def selfcheck():
@@ -57,8 +75,12 @@ def main(a):
         return selfcheck()
     if a[:1] == ["next"] and len(a) == 4:
         no = take(a[1], a[2], int(a[3]))
-        return print(no) or 0 if no else 1
-    print(__doc__.strip().split("\n\n")[1], file=sys.stderr); return 2
+    elif a[:1] == ["bind"] and len(a) == 3:
+        no = os.environ.get("CC_AGENT_NO", "")
+        no = take("session", a[1], int(a[2]), no if re.fullmatch(r"a[0-9]+", no) else None)
+    else:
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr); return 2
+    return print(no) or 0 if no else 1
 
 
 if __name__ == "__main__":

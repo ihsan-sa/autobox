@@ -21,7 +21,7 @@ def selfcheck():
     for k, v in {"CC_BOARDS": f"{tmp}/boards", "CC_STATE": f"{tmp}/state", "CC_LANDER_STATE": f"{tmp}/land",
                  "CC_WORKTREES": f"{tmp}/wt", "CC_SESSIONS": f"{tmp}/sessions", "CC_MEMBERS": f"{tmp}/members",
                  "CC_DEV": f"{tmp}/dev", "CC_PULSE": f"{tmp}/state/pulse.json",
-                 "CC_PULSE_SUITES": f"{tmp}/bin/suites"}.items():
+                 "CC_PULSE_SUITES": f"{tmp}/bin/suites", "CC_AGENT_LEDGER": f"{tmp}/state/agent-numbers.jsonl"}.items():
         os.environ[k] = v
     for d in ("boards", "state/r/w1", "state/statusline", "state/vitals", "land", "proc", "wt/r/w1", "bin",
               "sessions", "members/mem", "dev/r", "state/fund", "state/mem"):
@@ -141,6 +141,13 @@ def selfcheck():
     nos = {s["id"]: s["agent_no"] for s in ss}
     case("a session carries the number its spawner set, a non-UTF-8 one is shown replaced, and none is None",
          nos.get("30") == "a7" and nos.get("50") == "a\ufffd8" and nos.get("53") is None)
+    with open(f"{tmp}/state/agent-numbers.jsonl", "w") as fh:   # what cc-agent-number bind wrote for 53, and a stale 30
+        fh.write('{"id": "a3", "pid": 53}\n{"n": 9, "id": "a9", "pid": 30}\n{"id": "a4", "pid": 53, "start": "100"}\n'
+                 '{"id": "a5", "pid": 53, "start": "77"}\n')
+    nos = {s["id"]: s["agent_no"] for s in sessions(now, proc)[0]}
+    case("a session whose environment has no number shows the ledger's latest line for its pid, skipping one an "
+         "earlier holder of the pid wrote (another start time); its own env wins",
+         nos.get("53") == "a4" and nos.get("30") == "a7")
     case("a member's session is counted, never listed", smem == 1 and "51" not in ids)
     s30 = next(s for s in ss if s["id"] == "30")
     case("a session carries its repo, track, context % and tmux window",

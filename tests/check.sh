@@ -53,6 +53,7 @@ _gtrap "$_gt/clean" 0 && _gc=0 || _gc=$?
   || { echo "check.sh: the scratch-dir trap changes the exit status (stuck: 0->$_g0, 3->$_g3; clean: $_gc)"; chmod -R u+w "$_gt"; rm -rf "$_gt"; exit 1; }
 chmod -R u+w "$_gt"; rm -rf "$_gt"
 GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX")   # one scratch dir, one trap, both blocks
+export CC_AGENT_LEDGER="$GD/agent-numbers.jsonl"   # a selfcheck that starts a seat or loop takes its number here, never from the box's ledger
 # GD_TRAP is the trap's text, single-quoted where it is set, so $GD still expands when it fires.
 # shellcheck disable=SC2064
 trap "$GD_TRAP" EXIT

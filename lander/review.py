@@ -1253,7 +1253,8 @@ def ask(text, repo, pr, digest, model=None):
     run, cwd = scratch(repo, pr)
     env = dict(clean_env(), DISABLE_PROMPT_CACHING="1")   # one call: a cache write is paid and never read
     try:
-        rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=env)
+        rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=env, started=lambda pid: C.sh(
+            [os.path.join(BIN, "cc-agent-number"), "next", "review", f"{repo}#{pr}", str(pid)], timeout=10))
     finally:
         shutil.rmtree(run, ignore_errors=True)
     j, answer, cli = streamed(out)
@@ -2176,21 +2177,31 @@ def claude_ancestor(pid=None, proc="/proc", versions=None):
     return None
 
 
-def perms_seat_caller(repo, pid=None, proc="/proc", state=None, versions=None):
-    """True when the Claude session that called (claude_ancestor()) runs in the perms seat: its /proc/<pid>/cwd
-    resolves to <state>/<repo>/perms, state being PERMS_STATE at the passwd home unless a test passes one. Perms,
-    10-13: "lander record refuses --by perms-* unless the calling Claude ancestor ... has /proc/<pid>/cwd realpath ==
-    ~/.cc/state/<repo>/perms". Never $CC_STATE or $HOME, which a caller sets: a seat that set CC_STATE could start a
-    claude in a <CC_STATE>/<repo>/perms of its own and write perms' name."""
+def perms_seat_caller(pid=None, proc="/proc", state=None, versions=None):
+    """True when the Claude session that called (claude_ancestor()) runs in the box's one perms seat: its
+    /proc/<pid>/cwd resolves to <state>/<control repo>/perms, state being PERMS_STATE at the passwd home unless a test
+    passes one, whatever repo the PR is in (perms-read on dispatch 1849 was refused while this named the PR's repo).
+    Perms, 10-13: "lander record refuses --by perms-* unless the calling Claude ancestor ... has /proc/<pid>/cwd
+    realpath == ~/.cc/state/<repo>/perms". Never $CC_STATE or $HOME, which a caller sets: a seat that set CC_STATE
+    could start a claude in a <CC_STATE>/<repo>/perms of its own and write perms' name. The control repo is the one
+    this copy lives in under the passwd ~/dev, else CC_BOX in the passwd home's config (C.REVIEWER_CONFIG) and never
+    the environment's: the released lander runs outside ~/dev, and a CC_BOX of /tmp/x would make /tmp/x/perms the
+    seat (#1886 security read). It must be a bare name, so a perms-named dir under another repo's state never passes."""
     seat = claude_ancestor(pid, proc, versions)
-    if seat is None:
+    dev = os.path.join(C.PASSWD_HOME, "dev") + os.sep
+    box = C.BIN[len(dev):].split(os.sep)[0] if C.BIN.startswith(dev) else ""
+    try:
+        with open(C.REVIEWER_CONFIG) as f:            box = box or next((v.strip().strip("'\"") for k, _, v in (ln.strip().partition("=") for ln in f)
+                               if k in ("CC_BOX", "export CC_BOX")), "")
+    except OSError:
+        pass
+    if seat is None or not re.fullmatch(r"[A-Za-z0-9._-]+", box) or box in (".", ".."):
         return False
-    state = state or PERMS_STATE
     try:
         cwd = os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))
     except OSError:
         return False
-    return cwd == os.path.realpath(os.path.join(state, repo.rsplit("/", 1)[-1], "perms"))
+    return cwd == os.path.realpath(os.path.join(state or PERMS_STATE, box, "perms"))
 
 
 def cmd_record(argv):
@@ -2214,7 +2225,7 @@ def cmd_record(argv):
         return 2
     # perms, 10-13: "lander record refuses --by perms-* unless the calling Claude ancestor" runs in the perms seat;
     # a bare `perms` is its name too (#1523 was recorded --by perms)
-    seat = perms_seat_caller(args[0])
+    seat = perms_seat_caller()
     named = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]).lower()
     if (named == "perms" or named.startswith("perms-")) and not seat:
         print(f"lander record: --by {opts['by']} is perms' name, and this was not run from the perms seat; "
@@ -2731,7 +2742,7 @@ def cmd_perms_read(argv):
     repo, pr = argv[0], int(argv[1])
     if run:
         return _perms_run(repo, pr, argv[3])
-    if not perms_seat_caller(repo):
+    if not perms_seat_caller():
         print("lander perms-read: only the perms seat starts its reads; nothing started")
         return 1
     job, facts = _job_of(repo, pr)
@@ -2776,7 +2787,7 @@ def cmd_perms_hold(argv):
         print("usage: lander perms-hold <repo> <pr>")
         return 2
     repo, pr = argv[0], int(argv[1])
-    if not perms_seat_caller(repo):
+    if not perms_seat_caller():
         print("lander perms-hold: only the perms seat holds a PR for its read; nothing held")
         return 1
     job, facts = _job_of(repo, pr)
@@ -2832,7 +2843,7 @@ def cmd_perms_adopt(argv):
         print("usage: lander perms-adopt <repo> <pr>")
         return 2
     repo, pr = argv[0], int(argv[1])
-    if not perms_seat_caller(repo):
+    if not perms_seat_caller():
         print("lander perms-adopt: only the perms seat grants a merge; nothing granted")
         return 1
     job, facts = _job_of(repo, pr)

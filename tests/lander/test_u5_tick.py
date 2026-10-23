@@ -89,7 +89,7 @@ class Tick(unittest.TestCase):
         self.calls, self.policy, self.scope = [], "box", {"list": (0, "[]"), "deliver": (0, "")}
         real = C.sh
 
-        def sh(argv, cwd=None, input=None, timeout=300, env=None):
+        def sh(argv, cwd=None, input=None, timeout=300, env=None, started=None):
             tool = os.path.basename(argv[0])
             if tool in ("systemctl", "cc-units", "cc-scope", "cc-slack", "gh", "cc-notify"):
                 self.calls.append([tool] + list(argv[1:]))

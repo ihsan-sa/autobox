@@ -398,6 +398,7 @@ export CC_HANDOFF_NO_KICK=1   # ...and no --kick child at all: a fixture success
 # them). A case may still narrow one of these to its own subdir; what it may not do is leave one pointing at ~/.cc.
 # The check at the end of this file is what says whether this list is complete: a run's marker found in a box file.
 export CC_CTX_RECORDS="$T/ctx"                 # cc-handoff's ledger (state/context/handoffs.jsonl)
+export CC_AGENT_LEDGER="$T/agent-numbers.jsonl"   # cc-agent-number's ledger (state/agent-numbers.jsonl): a fixture seat or loop takes a number, never one of the box's
 export CC_STATUSLINE_DIR="$T/statusline"       # cc-context/cc-statusline per-session records
 export CC_GUARD_ASKS="$T/guard-asks"           # cc-guard's refusal spool (~/.cc/guard-asks)
 export CC_SCOPE_DIR="$T/scope"                 # cc-scope's ask ledger
@@ -4318,7 +4319,7 @@ cd ~ || exit 1
 #        A listing that names this run's folder alone still reads as a leak; the red line names file and line
 #        numbers, so the reader opens those lines instead of hunting.
 # BOX_PATHS is the mirror of the export block and is read beside it: a path added there is added here.
-BOX_PATHS="notify.log failures state/claude-limit state/handoff state/context state/statusline guard-asks scope state/limit-seen state/limit-interrupted state/limit-nudged state/limit-resumed slack"
+BOX_PATHS="notify.log failures state/claude-limit state/handoff state/context state/statusline guard-asks scope state/limit-seen state/limit-interrupted state/limit-nudged state/limit-resumed slack state/agent-numbers.jsonl"
 box_marked(){   # <root> → the files under it, changed since this run began, that name this run's fixtures
   find "$1" -path "$1/worktrees" -prune -o -path "$1/slack/files" -prune -o -path "$1/slack/member" -prune -o -path "$1/voice" -prune \
        -o -path "$1/toolchains" -prune -o -path "$1/tmp" -prune -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \

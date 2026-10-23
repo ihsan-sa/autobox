@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -110,6 +111,13 @@ class Sh(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("\ufffd", out)
         self.assertIn("ok", out)
+
+    def test_a_timeout_is_bounded_when_a_grandchild_holds_the_pipes(self):
+        """A PR's install.sh that leaves a child holding stdout still times out on time."""
+        t = time.monotonic()
+        rc, out = C.sh(["sh", "-c", "sleep infinity & sleep 30"], timeout=1)
+        self.assertEqual(rc, 124)
+        self.assertLess(time.monotonic() - t, 4)
 
 
 class Door(Stubbed):

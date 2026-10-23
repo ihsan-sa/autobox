@@ -18,7 +18,7 @@ def selfcheck():
     global STATE
     home = tempfile.mkdtemp(prefix="cc-subagent-bound-selfcheck-")
     state0, env0 = STATE, {k: os.environ.pop(k, None) for k in
-                           ("CC_SUBAGENT_SAVE_TOKENS", "CC_CONFIG", "CC_STATE")}
+                           ("CC_SUBAGENT_SAVE_TOKENS", "CC_CONFIG", "CC_STATE", "CC_AGENT_LEDGER", "CC_AGENT_NO")}
     STATE = os.path.join(home, "state")
     os.environ["CC_STATE"] = STATE                                 # number()'s cc-agent-number ledger: never the box's own
     os.environ["CC_CONFIG"] = os.path.join(home, "config")        # an empty config: the box's own must not move a line
@@ -260,6 +260,21 @@ def selfcheck():
             mine = [json.loads(l)["id"] for l in fh if json.loads(l)["name"].endswith(("/a15", "/a15b"))]
         ok("number: a subagent takes one number on its first call, none after, and the next subagent the next",
            all(n.startswith("a") for n in nos) and nos[0] != nos[1] and sorted(mine) == sorted(nos))
+
+        # 16. a session's own calls: the first binds its claude pid to the number its launcher gave it, once; a
+        # session no launcher numbered (CC_AGENT_NO unset) takes a new number for its pid
+        led = lambda: [json.loads(l) for l in open(os.path.join(STATE, "agent-numbers.jsonl"))]
+        was = len(led())                                          # earlier cases' sessions bound this pid too
+        os.environ["CC_AGENT_NO"] = "a7"
+        run(payload("s16")); run(payload("s16"))
+        os.environ.pop("CC_AGENT_NO")
+        run(payload("s16b"))
+        pid = claude_pid()
+        binds = [d for d in led()[was:] if d.get("pid") == pid]
+        ok("number: a session's first call records its claude pid against its number once, and an unnumbered "
+           "session takes a new one for its pid",
+           [d.get("id") for d in binds] == ["a7", binds[-1]["id"]] and "n" not in binds[0]
+           and binds[-1].get("kind") == "session" and binds[-1]["id"] not in ("a7", None))
     finally:
         STATE = state0
         for k, v in env0.items():

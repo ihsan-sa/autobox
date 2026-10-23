@@ -33,7 +33,9 @@ record the save, leaves the call alone. The figure costs one cc-config call at m
 environment does not set it.
 
 NUMBER. A subagent's first call takes it the next number of the box's agent sequence (number()), kept in
-<session>-<agent>.json.no, so the box's ledger counts every subagent it saw spawn.
+<session>-<agent>.json.no, so the box's ledger counts every subagent it saw spawn. A session's own first call runs
+`cc-agent-number bind` with its claude pid (kept in <session>-<pid>.json.no): the ledger then names the process that
+carries the number, and a session no launcher numbered takes one there.
 
 PRUNING. Each subagent leaves <session>-<agent>.json.lock and .json.no in the state dir, and one that got the save order also
 leaves .json.saved and .json (the save's record). A hook that creates a new lock first deletes the files there
@@ -140,22 +142,35 @@ def transcript_of(p):
     return os.path.join(base[:-len(".jsonl")], "subagents", f"agent-{p['agent_id']}.jsonl")
 
 
-def number(sid, agent):
-    """The subagent's number from the box's agent sequence (cc-agent-number), taken on its first call. The O_EXCL
-    create of <session>-<agent>.json.no claims it, so parallel first calls take one number between them, and the file
-    keeps it; the ledger names the subagent <its spawner's number>/<agent id>. Any error takes none."""
+def number(key, *argv):
+    """Run `cc-agent-number <argv>` once per key: the O_EXCL create of <key>.json.no claims it, so parallel first calls
+    take one number between them, and the file keeps it. Any error takes none."""
     try:
         os.makedirs(STATE, exist_ok=True)
-        fd = os.open(os.path.join(STATE, f"{sid}-{agent}.json.no"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = os.open(os.path.join(STATE, f"{key}.json.no"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except OSError:
         return
     try:
-        r = subprocess.run([os.path.join(BIN, "cc-agent-number"), "next", "subagent",
-                            f"{os.environ.get('CC_AGENT_NO') or sid}/{agent}", "0"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([os.path.join(BIN, "cc-agent-number"), *argv], capture_output=True, text=True, timeout=10)
         os.write(fd, r.stdout.encode())
     except (OSError, subprocess.SubprocessError):
         pass
     os.close(fd)
+
+
+def claude_pid():
+    """The claude process this hook runs under: the nearest ancestor called claude, else the parent."""
+    pid = os.getppid()
+    for _ in range(4):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() == "claude":
+                    return pid
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rpartition(")")[2].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return os.getppid()
 
 
 def prune():
@@ -190,10 +205,12 @@ def hook(raw):
     if not isinstance(p, dict):
         return 0
     agent = p.get("agent_id")
-    if not (isinstance(agent, str) and AGENT_RE.match(agent)):
-        return 0                              # a session's own call: seats have cc-context, workers cc-loop
     sid = p.get("session_id") if isinstance(p.get("session_id"), str) and AGENT_RE.match(p["session_id"]) else "-"
-    number(sid, agent)
+    if not (isinstance(agent, str) and AGENT_RE.match(agent)):
+        pid = claude_pid()                    # a session's own call: bind its claude pid to its number, once
+        number(f"{sid}-{pid}", "bind", os.path.basename(str(p.get("cwd") or "")) or sid, str(pid))
+        return 0                              # seats have cc-context, workers cc-loop
+    number(f"{sid}-{agent}", "next", "subagent", f"{os.environ.get('CC_AGENT_NO') or sid}/{agent}", "0")
     save = cfg("CC_SUBAGENT_SAVE_TOKENS", 90000)
     if save <= 0:
         return 0

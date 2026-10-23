@@ -38,7 +38,8 @@ WHAT IT READS — records the box already keeps, each re-parsed only when its mt
             (procStart; a record with none only when the pid is a claude started before the record was written);
             context % from $CC_STATE/statusline/<sessionId>.json, read on the 1 s tick and not watched (a busy
             session writes it several times a second); agent_no, the box's number for it (cc-agent-number), from the
-            CC_AGENT_NO in /proc/<pid>/environ.
+            CC_AGENT_NO in /proc/<pid>/environ, else the ledger's latest line for that pid ($CC_AGENT_LEDGER, default
+            $CC_STATE/agent-numbers.jsonl), which a session no launcher numbered got on its first tool call.
   workers   boards ($CC_BOARDS or ~/.cc/boards/<repo>.json, `_` boards skipped): rows marked running, not
             kind=session. One /proc pass a second: a `cc-loop <repo> <track>` argv, or a `claude` whose cwd is under
             the worktrees root ($CC_WORKTREES), makes that track LIVE; a row whose `agent` mark names a live pid is
@@ -327,9 +328,28 @@ def agent_no(proc, pid):
     return next((e[12:].decode("utf-8", "replace") for e in env if e.startswith(b"CC_AGENT_NO=") and e[12:]), None)
 
 
+def ledger_nos(proc):
+    """{pid: number} from the agent ledger, the latest line for each pid winning; {} when it cannot be read. A line
+    whose recorded start time is not the live process's was written for an earlier holder of a reused pid, and is
+    skipped."""
+    out = {}
+    try:
+        with open(env("CC_AGENT_LEDGER", f"{state_dir()}/agent-numbers.jsonl"), errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get("start") in (None, started(proc, d["pid"])):
+                        out[str(d["pid"])] = str(d["id"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 def sessions(now, proc="/proc"):
     """([session], member sessions) of every Claude session whose process is still the one that wrote its file."""
-    out, members = [], 0
+    out, members, nos = [], 0, ledger_nos(proc)
     for path in glob.glob(f"{sessions_dir()}/*.json"):
         pid = os.path.basename(path)[:-5]
         d = cached(path)
@@ -347,7 +367,7 @@ def sessions(now, proc="/proc"):
         out.append({"id": pid, "name": str(d.get("name") or pid)[:40], "repo": repo, "track": track,
                     "state": str(d.get("status") or "?"), "since_s": int(now - since) if since else None,
                     "ctx_pct": sl.get("pct") if isinstance(sl, dict) else None, "win": win,
-                    "agent_no": agent_no(proc, pid)})
+                    "agent_no": agent_no(proc, pid) or nos.get(pid)})
     out.sort(key=lambda s: (ORDER.get(s["state"], 2), s["since_s"] if s["since_s"] is not None else 1e12))
     return out, members
 

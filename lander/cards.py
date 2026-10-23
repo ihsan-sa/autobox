@@ -51,6 +51,7 @@ import json
 import os
 import pwd
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -65,14 +66,27 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
 
 # --- shared helpers ------------------------------------------------------------------------------------------------
 
-def sh(argv, cwd=None, input=None, timeout=300, env=None):
+def sh(argv, cwd=None, input=None, timeout=300, env=None, started=None):
     """Run argv; -> (rc, stdout+stderr). A missing tool, an argv too long or a timeout is rc 127 / 124 with the reason, never a raise.
     The output is decoded as it is, with no newline translation: text=True turns a lone \r into \n, and a \r in a
-    changed line then forges a `diff --git` header in the diff the review reads."""
+    changed line then forges a `diff --git` header in the diff the review reads. started(pid), when given, is called
+    with the child's pid once it runs. The child leads its own session, so a timeout kills its whole group: a grandchild
+    still holding stdout would otherwise keep the pipes open and the call unbounded."""
     try:
-        p = subprocess.run(argv, cwd=cwd, input=input.encode() if isinstance(input, str) else input,
-                           capture_output=True, timeout=timeout, env=env)
-        return p.returncode, (p.stdout or b"").decode(errors="replace") + (p.stderr or b"").decode(errors="replace")
+        with subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=env, start_new_session=True) as p:
+            if started:
+                started(p.pid)
+            try:
+                out, err = p.communicate(input.encode() if isinstance(input, str) else input, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait(timeout=5)
+                raise
+        return p.returncode, (out or b"").decode(errors="replace") + (err or b"").decode(errors="replace")
     except OSError as e:   # a missing tool, or an argv the kernel refuses (E2BIG)
         return 127, f"{type(e).__name__}: {e}"
     except subprocess.TimeoutExpired:

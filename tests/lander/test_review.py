@@ -51,8 +51,10 @@ class FakeBox:
             return f"{tool} {argv[1]}"
         return tool
 
-    def __call__(self, argv, cwd=None, input=None, timeout=300, env=None):
+    def __call__(self, argv, cwd=None, input=None, timeout=300, env=None, started=None):
         self.calls.append({"argv": list(argv), "cwd": cwd, "input": input, "env": env})
+        if started:
+            started(4242)   # the child's pid, as C.sh reports it once the child runs
         a = self.answers.get(self.key(argv), (1, ""))
         return a(argv) if callable(a) else a
 
@@ -476,6 +478,12 @@ class TestReview(Case):
         self.assertEqual((env["HOME"], env["CC_CONFIG_DENY"], env["PATH"]),
                          (C.PASSWD_HOME, os.path.realpath(C.REVIEWER_CONFIG), R.READ_PATH))
         self.assertEqual((env["LANG"], env["LC_ALL"]), ("C.UTF-8", "C.UTF-8"))   # the locale still passes
+
+    def test_a_read_takes_a_number_from_the_boxs_sequence_for_claudes_own_pid(self):
+        # the lander's reads are claude sessions too, and a reader matches a live one to its number by pid (#1846)
+        box = self.box(claude=claude_says("LAND"))
+        R.ask("text", "demo", 7, "d" * 64)
+        self.assertEqual([c["argv"][1:] for c in box.called("cc-agent-number")], [["next", "review", "demo#7", "4242"]])
 
     def test_the_landing_state_dir_falls_back_to_the_passwd_home_not_home(self):
         # the read count, spend and saved reads live there; a HOME of the caller's moved them (#847 delta read)
@@ -1890,6 +1898,7 @@ class TestRecord(Case):
         real = D.verified_tip
         D.verified_tip = lambda root, base: BASE
         self.addCleanup(setattr, D, "verified_tip", real)
+        self.reviewer(CC_BOX="demo")   # the box's control repo, whose state holds its one perms seat
 
     def facts(self, comments=(), head=HEAD):
         return (0, json.dumps({"headRefOid": head, "baseRefName": "main", "comments": list(comments),
@@ -1951,9 +1960,8 @@ class TestRecord(Case):
         state = os.environ["CC_STATE"]
         seat = os.path.join(state, "demo", "perms")
         versions = self.versions()
-        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat), state))
-        self.assertTrue(R.perms_seat_caller("owner/demo", 30, self.proc(seat), state))
-        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(versions, "1.0.0 (deleted)")),
+        self.assertTrue(R.perms_seat_caller(30, self.proc(seat), state))
+        self.assertTrue(R.perms_seat_caller(30, self.proc(seat, exe=os.path.join(versions, "1.0.0 (deleted)")),
                                             state))   # a seat whose binary an update has since removed
         for root in (self.proc(os.path.join(state, "demo", "planning")),
                      self.proc(os.path.join(state, "demo", "perms", "sub")),
@@ -1961,7 +1969,57 @@ class TestRecord(Case):
                      self.proc(seat, comm="node"),         # no claude above the caller
                      self.proc(seat, exe=os.path.join(self.tmp, "bin", "claude")),   # named claude, runs elsewhere
                      self.proc(seat, exe=versions + "-other/1.0.0")):              # beside versions, not under it
-            self.assertFalse(R.perms_seat_caller("demo", 30, root, state), root)
+            self.assertFalse(R.perms_seat_caller(30, root, state), root)
+
+    def test_the_one_perms_seat_starts_and_records_on_any_repo(self):
+        """The box has one perms seat, under the control repo's state (demo here). From it, perms-read and record
+        --by perms pass the seat check on another repo's PR (perms-read dispatch 1849 was refused, 10-22); a seat's
+        name under that other repo's state, or a planning dir, passes on no repo. This process stands in for the
+        claude, so its real /proc/self/cwd is what is read."""
+        self.box(**{"gh pr view": self.facts()})
+        self.addCleanup(setattr, R, "claude_ancestor", R.claude_ancestor)
+        R.claude_ancestor = lambda *a, **kw: os.getpid()
+        self.addCleanup(os.chdir, os.getcwd())
+        refused = ("only the perms seat starts its reads", "not run from the perms seat")
+        for cwd, seat in ((os.path.join(R.PERMS_STATE, "demo", "perms"), True),
+                          (os.path.join(R.PERMS_STATE, "dispatch", "perms"), False),
+                          (os.path.join(R.PERMS_STATE, "demo", "planning"), False)):
+            os.makedirs(cwd, exist_ok=True)
+            os.chdir(cwd)
+            for repo in ("dispatch", "demo"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    R.cmd_perms_read([repo, "7"])
+                    R.cmd_record([repo, "7", "LAND", "--by", "perms"])
+                self.assertEqual([w in out.getvalue() for w in refused], [not seat] * 2, (cwd, repo, out.getvalue()))
+
+    def test_the_box_name_comes_from_the_passwd_config_alone_and_is_bare(self):
+        """#1886 security read: the released lander runs outside ~/dev, so the box name came from CC_BOX in the
+        caller's environment, and an absolute one threw the state dir away. A worker in /tmp/x's planted perms (a
+        symlink to its own cwd) with CC_BOX=/tmp/x, or in dispatch's perms dir with CC_BOX=dispatch, is refused. A
+        config name with a slash or a dot-dot is refused even where its path resolves. Config demo in demo's seat
+        passes, the control. This copy is not under the (test's) passwd ~/dev, so nothing is stubbed but the claude."""
+        self.addCleanup(setattr, R, "claude_ancestor", R.claude_ancestor)
+        R.claude_ancestor = lambda *a, **kw: os.getpid()
+        self.addCleanup(os.chdir, os.getcwd())
+        self.addCleanup(os.environ.pop, "CC_BOX", None)
+        state = R.PERMS_STATE
+        own = os.path.join(self.tmp, "own")
+        planted = os.path.join(self.tmp, "x")
+        for d in (own, planted, os.path.join(state, "a", "b", "perms"), os.path.join(state, "demo", "perms"),
+                  os.path.join(state, "dispatch", "perms")):
+            os.makedirs(d, exist_ok=True)
+        os.symlink(own, os.path.join(planted, "perms"))
+        for env, conf, cwd, passes in ((planted, "demo", own, False),
+                                       ("dispatch", "demo", os.path.join(state, "dispatch", "perms"), False),
+                                       ("demo", "a/b", os.path.join(state, "a", "b", "perms"), False),
+                                       ("demo", "..", os.path.join(self.tmp, "perms"), False),
+                                       ("dispatch", "demo", os.path.join(state, "demo", "perms"), True)):
+            os.makedirs(cwd, exist_ok=True)
+            os.chdir(cwd)
+            os.environ["CC_BOX"] = env
+            self.reviewer(CC_BOX=conf)
+            self.assertEqual(R.perms_seat_caller(), passes, (env, conf, cwd))
 
     def test_a_renamed_shell_in_the_perms_seat_is_refused(self):
         """Perms, 10-13: "accept a process as the perms seat only when /proc/<pid>/exe resolves under
@@ -1980,7 +2038,7 @@ class TestRecord(Case):
             self.addCleanup(p.kill)
             with open(f"/proc/{p.pid}/comm") as f:
                 self.assertEqual(f.read().strip(), "claude")
-            self.assertEqual(R.perms_seat_caller("demo", p.pid, "/proc", state), passes, d)
+            self.assertEqual(R.perms_seat_caller(p.pid, "/proc", state), passes, d)
 
     def test_a_deleted_folder_replaced_by_a_symlink_to_versions_is_refused(self):
         """Perms, 10-13: realpath "resolves the path a second time through a filesystem the caller controls (a
@@ -1992,11 +2050,11 @@ class TestRecord(Case):
         os.makedirs(os.path.join(versions, "evil"))
         gone = os.path.join(self.tmp, "gone")
         os.symlink(versions, gone)   # the folder the binary ran from, now a symlink into versions
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil (deleted)")),
+        self.assertFalse(R.perms_seat_caller(30, self.proc(seat, exe=os.path.join(gone, "evil (deleted)")),
                                              state))
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil")), state))
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=versions + "/../gone/evil"), state))
-        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(versions, "evil")), state))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(seat, exe=os.path.join(gone, "evil")), state))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(seat, exe=versions + "/../gone/evil"), state))
+        self.assertTrue(R.perms_seat_caller(30, self.proc(seat, exe=os.path.join(versions, "evil")), state))
 
     def versions_file(self, text, mode=0o644):
         """A CLAUDE_VERSIONS_FILE of the test's own holding `text`, put back when it ends."""
@@ -2021,12 +2079,12 @@ class TestRecord(Case):
         R.ROOT_UID = os.getuid()
         self.versions_file(elsewhere + "\n")
         self.assertEqual(R.extra_versions_root(), elsewhere)
-        self.assertTrue(R.perms_seat_caller("demo", 30, root, state))
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=elsewhere + "-x/1.0.0"), state))
+        self.assertTrue(R.perms_seat_caller(30, root, state))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(seat, exe=elsewhere + "-x/1.0.0"), state))
         for mode in (0o664, 0o646):   # group- or world-writable: names no root
             self.versions_file(elsewhere + "\n", mode)
             self.assertIsNone(R.extra_versions_root(), oct(mode))
-            self.assertFalse(R.perms_seat_caller("demo", 30, root, state), oct(mode))
+            self.assertFalse(R.perms_seat_caller(30, root, state), oct(mode))
         self.versions_file("relative/dir\n")
         self.assertIsNone(R.extra_versions_root())
         link = os.path.join(self.tmp, "versions-link")
@@ -2035,7 +2093,7 @@ class TestRecord(Case):
         self.assertIsNone(R.extra_versions_root())
         R.CLAUDE_VERSIONS_FILE = os.path.join(self.tmp, "absent")
         self.assertIsNone(R.extra_versions_root())
-        self.assertFalse(R.perms_seat_caller("demo", 30, root, state))
+        self.assertFalse(R.perms_seat_caller(30, root, state))
 
     def test_a_versions_file_not_owned_by_root_is_refused(self):
         """The same file, owned by this uid and not by ROOT_UID (left at 0 here; or stubbed to another uid when the
@@ -2049,7 +2107,7 @@ class TestRecord(Case):
             R.ROOT_UID = 1
         self.versions_file(elsewhere + "\n")
         self.assertIsNone(R.extra_versions_root())
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(elsewhere, "1.0.0")), state))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(seat, exe=os.path.join(elsewhere, "1.0.0")), state))
         self.assertEqual(R.extra_versions_root(owner=os.getuid()), elsewhere)   # the control: owned as asked, it reads
 
     def test_a_cc_state_override_does_not_move_the_perms_seat(self):
@@ -2060,16 +2118,16 @@ class TestRecord(Case):
         os.environ["CC_STATE"] = fake
         with open(os.environ["CC_CONFIG"], "w") as f:
             f.write(f"CC_STATE={fake}\n")
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(os.path.join(fake, "demo", "perms"))))
-        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(os.path.join(R.PERMS_STATE, "demo", "perms"))))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(os.path.join(fake, "demo", "perms"))))
+        self.assertTrue(R.perms_seat_caller(30, self.proc(os.path.join(R.PERMS_STATE, "demo", "perms"))))
         del os.environ["CC_STATE"]   # the config's CC_STATE alone moves it no more than the environment's
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(os.path.join(fake, "demo", "perms"))))
+        self.assertFalse(R.perms_seat_caller(30, self.proc(os.path.join(fake, "demo", "perms"))))
 
     def test_record_refuses_a_perms_name_outside_the_perms_seat(self):
         box = self.box(**{"gh pr view": self.facts()})
         seat = [False]
         real = R.perms_seat_caller
-        R.perms_seat_caller = lambda repo, *a, **kw: seat[0]
+        R.perms_seat_caller = lambda *a, **kw: seat[0]
         self.addCleanup(setattr, R, "perms_seat_caller", real)
         for by in ("perms-security-read", "perms-anything", "Perms-Security-Read"):
             self.assertEqual(self.run_record("demo", "7", "LAND", "--by", by), 1, by)
@@ -2695,7 +2753,7 @@ class TestPermsReads(Case):
         from lander import deploy as D
         real = (D.verified_tip, R.perms_seat_caller)
         D.verified_tip = lambda root, base: BASE
-        R.perms_seat_caller = lambda repo, *a, **kw: True
+        R.perms_seat_caller = lambda *a, **kw: True
         self.addCleanup(lambda: (setattr(D, "verified_tip", real[0]), setattr(R, "perms_seat_caller", real[1])))
         self.seat = os.path.join(R.PERMS_STATE, "demo", "perms")
         os.makedirs(self.seat, mode=0o700)
@@ -3045,7 +3103,7 @@ class TestPermsReads(Case):
 
     def test_hole_3_only_the_perms_seat_holds(self):
         self.box(**{"gh pr view": self.facts()})
-        R.perms_seat_caller = lambda repo, *a, **kw: False
+        R.perms_seat_caller = lambda *a, **kw: False
         self.assertEqual(R.cmd_perms_hold(["demo", "7"]), 1)
         self.assertEqual(R.read_files("demo"), [])
 
@@ -3138,7 +3196,7 @@ class TestPermsReads(Case):
         self.assertEqual(self.ledger(), [])
 
     def adopt_as(self, seat):
-        R.perms_seat_caller = lambda repo, *a, **kw: seat
+        R.perms_seat_caller = lambda *a, **kw: seat
         return self.adopt()
 
     def test_3_adopt_never_writes_over_a_ledger_it_cannot_read(self):
@@ -3151,7 +3209,7 @@ class TestPermsReads(Case):
 
     # perms' hand read, recorded with `record` from its seat, is its ledger entry in the same step (#1523)
     def record_as(self, seat, *argv, head=HEAD, comments=()):
-        R.perms_seat_caller = lambda repo, *a, **kw: seat
+        R.perms_seat_caller = lambda *a, **kw: seat
         box = self.box(**{"gh pr view": self.facts(head=head, comments=comments)})
         return R.cmd_record(["demo", "7", *argv]), box
 
@@ -3186,7 +3244,7 @@ class TestPermsReads(Case):
     def test_a_land_already_marked_by_perms_is_put_in_its_ledger_on_a_second_record(self):
         """#1523's state: perms' LAND marker on the PR and no ledger entry. Recording it again writes the entry."""
         digest = R.change_digest(DIFF)
-        R.perms_seat_caller = lambda repo, *a, **kw: True
+        R.perms_seat_caller = lambda *a, **kw: True
         facts = json.loads(self.facts()[1])
         facts["comments"] = [self.comment("LAND", digest, by="perms")]
         box = self.box(**{"gh pr view": (0, json.dumps(facts))})
@@ -3393,7 +3451,7 @@ class TestPermsReads(Case):
             R.write_read("demo", self.entry(state="running", pid=None))   # died: it runs again
             self.assertEqual(R.cmd_perms_read(["demo", "7"]), 0)
             self.assertEqual(popen.call_count, 2)
-            R.perms_seat_caller = lambda repo, *a, **kw: False
+            R.perms_seat_caller = lambda *a, **kw: False
             os.unlink(os.path.join(self.seat, "reads", f"7-{HEAD}.json"))
             self.assertEqual(R.cmd_perms_read(["demo", "7"]), 1)       # only the perms seat starts one
             self.assertEqual(popen.call_count, 2)
