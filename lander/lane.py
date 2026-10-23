@@ -37,7 +37,8 @@ job until it rests (held until not_before, query, done, deploy-pending, handed b
 the list after each. CHECKS RUN IN PARALLEL, MERGES ONE AT A TIME (lander-redesign.tex, "Changes that don't overlap
 land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour PRs on a box at load 4.8 of 6 cores):
 a checking job hands its next check to the lane's pool and the lane goes on to other jobs, and so does a job whose
-review read is due (at most REVIEW_SLOTS reads at once): a read takes up to READ_TIMEOUT per reader, and while it ran on
+review read is due (at most LANDER_REVIEW_SLOTS reads at once, as cc-config reads it): a read takes up to READ_TIMEOUT
+per reader, and while it ran on
 the lane's thread no finished check was recorded and no free slot filled (10-13: 3 of 5 slots free for hours, 39 jobs
 checking). Its verdict is acted on at the job's next turn; everything else — the gh facts, planning, the look at a moved main
 and the merge — happens on the lane's own thread, so merges stay serial and pinned. Each pass hands the queue to
@@ -140,7 +141,7 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              reads_used+1 and a handback, however many reads came before (owner 10-16: no count of reads turns
              it into a query; review.py's dollar ceiling alerts instead); LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it. A read whose job leaves
-             checking (or its digest) mid-read keeps its REVIEW_SLOTS place until it ends, and is charged then.
+             checking (or its digest) mid-read keeps its review slot until it ends, and is charged then.
   mergeable  the head moved -> queued. main moved -> main_moved (brief, 10-13: "At merge time, re-check only when
              merge-tree finds a text conflict with current main, or main is red on a check the PR's plan includes.
              Otherwise merge on the verdict it already has."): merge-tree(main, head) conflicts -> CONFLICT below;
@@ -197,8 +198,9 @@ mark cleared, an unknown row named; a symlinked board file is refused.
 
 A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
 it runs from with what ~/.cc/lander/current names now (jobs.stale_release; a lander run from a checkout never
-switches). When they differ it starts nothing new — no job and no check — waits for the checks in flight and records
-them, lets the lane lock go, starts `lander lane <repo>` detached from the new release, logs `lane-switch` and
+switches). When they differ it starts nothing new — no job and no check — waits for the checks and review reads in
+flight and records them (a read's verdict is saved on its job, and a LAND carries to the new lane through landed_at;
+10-22: #23's read, dropped at two promotes, was bought again each time), lets the lane lock go, starts `lander lane <repo>` detached from the new release, logs `lane-switch` and
 returns. A check in flight finishes on the release it started on; a job partway through its checks keeps its results
 and goes on in the new lane. It starts the new lane rather than exec'ing itself because a lane may be running inside
 a `tick`, and an exec would drop that tick's tip and deploy pass.
@@ -302,9 +304,6 @@ WAIT_CAP = float(os.environ.get("LANDER_WAIT_CAP") or 86400)
 # brief, 10-13: "end the starvation of heavy plans". A heavy job queued this long ago counts as small, so it takes its
 # turn in arrival order beside the small ones (#943, 38 checks, ran none for 3 h behind small jobs)
 HEAVY_WAIT = float(os.environ.get("LANDER_HEAVY_WAIT") or 3600)
-# review reads the lane's pool runs at once (each up to review.READ_TIMEOUT per reader); a job past its checks waits for
-# a place like a check does. One keeps the reads, and their spend, as serial as when they ran on the lane's thread
-REVIEW_SLOTS = int(os.environ.get("LANDER_REVIEW_SLOTS") or 1)
 LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the laptop gave no answer
 CI_WAIT_SECS = 120       # a head whose GitHub CI is still running is looked at again this often…
 CI_WAITS = 30            # …this many times (an hour) before it is a query
@@ -619,7 +618,11 @@ class Lane:
         self.pool = None
         self.jobs = []           # the lane's jobs as this pass of the loop read them (spare_box)
         self.reading = {}        # job key -> Reading: each review read the lane has in the pool
-        self.dropped = []        # reads whose job moved on mid-read: they hold a REVIEW_SLOTS place until they end
+        self.dropped = []        # reads whose job moved on mid-read: they hold a review slot until they end
+        # review reads the lane's pool runs at once (each up to review.READ_TIMEOUT per reader); a job past its checks
+        # waits for a place like a check does. LANDER_REVIEW_SLOTS as cc-config reads it, else 1: read from the
+        # environment alone, a lane started without it ran one read at a time though ~/.cc/config set 3 (2026-10-22)
+        self.review_slots = A.config_slots("LANDER_REVIEW_SLOTS") or 1
         self.carding = None      # the thread posting the queued cards (cards_pass), at most one at a time
         self.carded = None       # what the queue looked like at the last cards pass that went through
 
@@ -651,7 +654,7 @@ class Lane:
                 self.waiting, self.refused, self.inflight = set(), set(), {}
                 # as wide as the cores, not today's K: the pool outlives a change of K, which takes no restart
                 width = max(A.slots(), os.cpu_count() or 1)
-                with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS + REVIEW_SLOTS,
+                with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS + self.review_slots,
                                                 thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
@@ -673,8 +676,18 @@ class Lane:
         while True:
             moved = J.stale_release()   # a promote since the last job: take nothing new on this release
             if moved:
-                while self.inflight:     # the checks in flight finish here and are recorded before the switch
+                # the checks and reads in flight finish here and are recorded before the switch: a read left behind
+                # was thrown away, and its job took a place in the next lane to read again (#23, 2026-10-22)
+                while self.inflight or not all(f.done() for f in self.pending_reads()):
                     self.reap(POLL)
+                jobs = J.lane_jobs(self.repo)
+                self.drop_reads(jobs)
+                for j in jobs:
+                    if j.key in self.reading:   # its verdict is saved; a LAND carries to the next lane (landed_at)
+                        try:
+                            self.review(j)
+                        except UnitFault as e:
+                            self.hold(j, str(e), kind="box")
                 return moved
             if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
                 self.reap(0)   # a finished check is recorded (its slot freed) even while queued jobs keep todo full
@@ -857,7 +870,8 @@ class Lane:
     def reap(self, wait):
         """Record each check the pool has finished (waiting up to `wait` seconds for the first) on the lane's thread;
         the job then goes on at its next turn."""
-        pending = [f.future for f in self.inflight.values()] + self.pending_reads()
+        # a read already done is not waited on: nothing marks it seen during a promote's wait, so it spun that loop
+        pending = [f.future for f in self.inflight.values()] + [f for f in self.pending_reads() if not f.done()]
         if not pending:
             return
         done, _ = futures.wait(pending, timeout=wait, return_when=futures.FIRST_COMPLETED)
@@ -889,7 +903,7 @@ class Lane:
     def drop_reads(self, jobs):
         """A read whose job has left checking or moved to another digest is dropped (its verdict is on the PR, so a
         later read at that digest finds it and buys none). Opus, 10-13: "Keep a dropped read counted until its future
-        is done, and charge it then": it keeps its REVIEW_SLOTS place while it runs, and a member pays for it at its
+        is done, and charge it then": it keeps its review slot while it runs, and a member pays for it at its
         end, so a push mid-read does not dodge the day's cap."""
         checking = {j.key: j.digest for j in jobs if j.state == T.CHECKING}
         for k, r in list(self.reading.items()):
@@ -1541,7 +1555,7 @@ class Lane:
             self.dropped.append(self.reading.pop(job.key))
             r = None
         if r is None:
-            if len(self.reading) + len(self.dropped) >= REVIEW_SLOTS:
+            if len(self.reading) + len(self.dropped) >= self.review_slots:
                 self.waiting.add(job.key)   # it goes on when a read ends and frees its place
                 return False
             fn = ("delta_review", job, pv) if pv else ("review", job)

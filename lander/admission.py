@@ -180,14 +180,14 @@ def host_slots(meminfo: str | None = None, cores: int | None = None) -> int:
     return max(1, k)
 
 
-def config_slots() -> int | None:
-    """LANDER_SLOTS as cc-config reads it, when it is a whole number of at least 1 (ASCII digits: '²' is a digit to
-    isdigit()), and no more than the box's cores (leading zeros dropped, and a number too long for int(), which
-    refuses past 4300 digits, taken as above them); None when it is unset, not such a number, or cc-config did not
-    answer."""
+def config_slots(name: str = "LANDER_SLOTS") -> int | None:
+    """`name` (LANDER_SLOTS, or the lane's LANDER_REVIEW_SLOTS) as cc-config reads it, when it is a whole number of at
+    least 1 (ASCII digits: '²' is a digit to isdigit()), and no more than the box's cores (leading zeros dropped, and a
+    number too long for int(), which refuses past 4300 digits, taken as above them); None when it is unset, not such
+    a number, or cc-config did not answer."""
     from lander import jobs as J   # here: jobs imports events, and admission is imported by the runner's every caller
     try:
-        p = subprocess.run([f"{J.bin_dir()}/cc-config", "get", "LANDER_SLOTS"], capture_output=True, text=True,
+        p = subprocess.run([f"{J.bin_dir()}/cc-config", "get", name], capture_output=True, text=True,
                            timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None

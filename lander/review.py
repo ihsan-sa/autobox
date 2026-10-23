@@ -109,8 +109,11 @@ Otherwise the lander buys one:
     Its Verdict carries extra stood_in_for (the limited reader) and stood_in_why (the limit text); the marker row
     says `<claude>`: VERDICT (stood in for `<reader>`, at its usage limit), its findings say "read by <claude> for
     <reader>", and the combined Verdict's extra stood_in lists each one, so the record shows the fallback. A stand-in that fails too is handled as that
-    failure (_silent), and a limit on a security path, or any other failure (a fault, a timeout, a wall), is held as
-    before: perms' read gates a security path.
+    failure (_silent). A reader that timed out on a PR's last read is not asked again: the same stand-in reads at
+    once (stood_in_why starts TIMED_OUT, the marker row says "timed out on its last read"), so one hung reader never
+    holds the slot a second time. C.sh kills the timed-out codex's whole process tree, and what codex printed before
+    the kill is kept in C.state("<repo>-<pr>.codex-timeout.log"). A limit or timeout on a security
+    path, or any other failure (a fault, a first timeout, a wall), is held as before: perms' read gates a security path.
 The read runs with its cwd in `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.review.<repo>.<pr>.<rand>`: that name is
 how cc-spend puts its cost on `<repo>/review`, and every read's cost is also added to the PR's spend file
 (root/<repo>-<pr>.json, `review_usd`, `reads`) that the old lander kept.
@@ -270,7 +273,9 @@ def marker(v: T.Verdict, base, head, by):
     rows += [f"{i}. [other] {a}" for i, a in enumerate(v.advisory, len(rows) + 1)]
     by = re.sub(r"[^A-Za-z0-9._@-]+", "-", by or "lander")
     head_ = f"<!-- {MARK} v2 change={v.digest} base={base[:12]} head={head[:12]} verdict={v.verdict} by={by} -->"
-    said = [f"- `{r['model']}`: {r['verdict']}" + (f" (stood in for `{r['stood_in_for']}`, at its usage limit)"
+    said = [f"- `{r['model']}`: {r['verdict']}" + (f" (stood in for `{r['stood_in_for']}`, "
+                                                   + ("timed out on its last read)" if r.get("timed_out")
+                                                      else "at its usage limit)")
                                                    if r.get("stood_in_for") else "")
             for r in (v.extra or {}).get("readers") or []]
     return "\n".join([head_, f"**lander review** — `{head[:12]}`, read by `{v.model or by}`", "",
@@ -908,20 +913,20 @@ def strict(schema):
 
 # Every codex feature that is a tool or reaches past the prompt (codex-cli 0.153.4, `codex features list`): with
 # them off the read has no shell, browser, plugin, skill, hook, image or sub-agent, so a diff that asks it to read
-# a file cannot get that file into the PR comment the verdict is posted as.
+# a file cannot get that file into the PR comment the verdict is posted as. unbounded_connection_retries is off too: on,
+# a 429 is retried with no word until READ_TIMEOUT, so a limit reads as a timeout (best guess for #23's 10-22 hang).
 CODEX_OFF = ("apps", "auth_elicitation", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
              "code_mode_host", "collaboration_modes", "computer_use", "goals", "hooks", "image_generation",
              "in_app_browser", "in_app_chat", "in_app_dictation", "in_app_local_automation", "mentions_v2",
              "multi_agent", "plugin_sharing", "plugins", "remote_plugin", "shell_snapshot", "shell_tool",
              "skill_mcp_dependency_install", "skill_search", "sleep_tool", "tool_call_mcp_elicitation",
              "tool_suggest", "unified_exec", "unified_exec_zsh_fork",
-             "view_image", "workspace_dependencies")
+             "unbounded_connection_retries", "view_image", "workspace_dependencies")
 # The ALLOWLIST: the features that may stay on in a read, none of them a tool. Anything else on — a feature a new
 # codex adds on by default — holds the read with a stop naming it, until someone puts it on one of these lists.
 CODEX_ON_OK = ("compaction_image_budget", "content_item_kinds", "enable_request_compression", "fast_mode",
                "guardian_approval", "in_app_updates", "item_ids", "personality", "remote_compaction_v2",
                "resize_all_images", "sqlite", "steer", "terminal_resize_reflow", "tui_app_server",
-               "unbounded_connection_retries",
                "tool_search_always_defer_mcp_tools")   # removed in 0.153.4 and --disable does not take; the read has
                                                        # no MCP server to defer (the user config is ignored)
 # A feature that is only another's back end, allowed on while the one it serves is off. `--disable unified_exec`
@@ -1056,6 +1061,9 @@ def ask_codex(text, repo, pr, digest, model):
         with open(schema, "w") as f:
             json.dump(strict(SCHEMA), f)
         rc, out = C.sh(argv + ["-"], cwd=cwd, input=text, timeout=READ_TIMEOUT, env=codex_env())
+        if rc == 124:   # what codex printed before the kill, kept for whoever reads why the read hung
+            with open(C.state(f"{repo}-{pr}.codex-timeout.log"), "w") as f:
+                f.write(out)
         usd = codex_usd(rc, out)
         try:
             with open(answer) as f:
@@ -1931,10 +1939,18 @@ def limit_until(text, now=None):
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def stand_in(job, model, why):
+TIMED_OUT = "no answer: rc=124"   # ask_codex()'s why for a read C.sh killed at READ_TIMEOUT
+
+
+def stand_in(job, model, why, j=None):
     """The claude model that reads in place of `model` after its read came back `why`, or "": only for a usage or
-    rate limit on a reader that is not claude's, on a plan that names no security path (the module doc)."""
-    if not why.startswith("limit") or is_claude(model) or not job.plan or job.plan.extra.get("security"):
+    rate limit, or a second timeout in a row at one head (`j`, the PR's spend file, holds the first: a timeout at an
+    earlier head never skips the read of a new one, Opus security read 10-23), on a reader that is not
+    claude's, on a plan that names no security path (the module doc)."""
+    was = (j or {}).get("silent") or {}
+    twice = why.startswith(TIMED_OUT) and was.get("reader") == model and was.get("why", "").startswith(TIMED_OUT) \
+        and was.get("head") == job.head
+    if not (why.startswith("limit") or twice) or is_claude(model) or not job.plan or job.plan.extra.get("security"):
         return ""
     sub = C.conf("CC_LAND_REVIEW_LIMIT_READER", "").strip() or next((m for m in readers() if is_claude(m)), "")
     return sub if sub and is_claude(sub) else ""
@@ -1958,7 +1974,8 @@ def combined(reads):
                   model="+".join(m for m, _ in reads), tokens=sum(x.tokens for _, x in reads),
                   resolved=[r for r in first.resolved if r not in unresolved], unresolved=unresolved)
     v.extra["readers"] = [dict({"model": m, "verdict": x.verdict},
-                               **({"stood_in_for": x.extra["stood_in_for"]} if x.extra.get("stood_in_for") else {}))
+                               **({"stood_in_for": x.extra["stood_in_for"]} if x.extra.get("stood_in_for") else {}),
+                               **({"timed_out": True} if x.extra.get("stood_in_why", "").startswith(TIMED_OUT) else {}))
                           for m, x in reads]
     if subs:
         v.extra["stood_in"] = subs
@@ -2047,12 +2064,16 @@ def _buy(job, template, diff, more, prior=None):
             was = T.Verdict.from_dict(kept[model])
             reads.append((was.model if was.extra.get("stood_in_for") else model, was))
             continue
-        v, cost, why = ask(text, repo, pr, job.digest, model)
-        if cost:
-            charge(repo, pr, review_usd=cost)
-            usd += cost
-            over_ceiling(repo, pr)
-        sub = stand_in(job, model, why) if v is None else ""
+        # it hung on this PR last time: its stand-in reads now, with no second full timeout on the slot
+        v, why = None, TIMED_OUT + " (last read)"
+        sub = stand_in(job, model, why, j)
+        if not sub:
+            v, cost, why = ask(text, repo, pr, job.digest, model)
+            if cost:
+                charge(repo, pr, review_usd=cost)
+                usd += cost
+                over_ceiling(repo, pr)
+            sub = stand_in(job, model, why, j) if v is None else ""
         if sub:
             C.log("stand-in", repo, pr, reader=model, by=sub, why=why[:120])
             v, cost, sub_why = ask(text, repo, pr, job.digest, sub)
@@ -2061,7 +2082,9 @@ def _buy(job, template, diff, more, prior=None):
                 usd += cost
                 over_ceiling(repo, pr)
             if v is None:
-                return _silent(job, j, sub, sub_why)
+                # a fault or no answer counts as the hung reader's own, so a second at this head holds the PR; a
+                # limit or a wall marks no reader, and names the one that hit it
+                return _silent(job, j, sub if sub_why.startswith(("limit", "wall")) else model, sub_why)
             v.extra.update(stood_in_for=model, stood_in_why=why[:300])
         if v is None:
             return _silent(job, j, model, why)

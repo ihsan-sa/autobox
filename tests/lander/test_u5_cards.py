@@ -8,6 +8,7 @@ python3 -m unittest discover -s core/tests/lander -t core/tests/lander -p 'test_
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -114,12 +115,56 @@ class Sh(unittest.TestCase):
         self.assertIn("\ufffd", out)
         self.assertIn("ok", out)
 
+    def test_a_timeout_keeps_what_was_printed_and_says_so_last(self):
+        # Opus read, 10-23: deploy keeps the last 200 characters, so a timed-out install.sh must end saying it
+        rc, out = C.sh(["sh", "-c", "echo before-the-kill; exec sleep 5"], timeout=1)
+        self.assertEqual((rc, out.splitlines()[-1]), (124, "sh: timed out after 1s"))
+        self.assertIn("before-the-kill", out)
+
+    def test_a_timeout_kills_a_grandchild_that_left_the_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid = os.path.join(d, "pid")
+            rc, _ = C.sh(["sh", "-c", f"setsid sleep 30 & echo $! > {pid}; wait"], timeout=1)
+            with open(pid) as f:
+                kid = int(f.read())
+        self.assertEqual(rc, 124)
+        time.sleep(0.2)
+        try:   # gone, or a zombie its new parent has not reaped yet
+            with open(f"/proc/{kid}/stat") as f:
+                self.assertEqual(f.read().rsplit(")", 1)[1].split()[0], "Z")
+        except FileNotFoundError:
+            pass
+
+    def test_a_timeout_kills_what_the_child_started(self):
+        # 10-23: #23's codex hung and nothing but its timeout could end it, so the timeout leaves none of it running
+        with tempfile.TemporaryDirectory() as d:
+            pid = os.path.join(d, "pid")
+            rc, _ = C.sh(["sh", "-c", f"sleep 30 & echo $! > {pid}; wait"], timeout=1)
+            with open(pid) as f:
+                kid = int(f.read())
+        self.assertEqual(rc, 124)
+        try:   # gone, or a zombie its new parent has not reaped yet
+            with open(f"/proc/{kid}/stat") as f:
+                self.assertEqual(f.read().rsplit(")", 1)[1].split()[0], "Z")
+        except FileNotFoundError:
+            pass
+
     def test_a_timeout_is_bounded_when_a_grandchild_holds_the_pipes(self):
         """A PR's install.sh that leaves a child holding stdout still times out on time."""
         t = time.monotonic()
         rc, out = C.sh(["sh", "-c", "sleep infinity & sleep 30"], timeout=1)
         self.assertEqual(rc, 124)
         self.assertLess(time.monotonic() - t, 4)
+
+    def test_a_timeout_whose_pipes_never_close_leaks_no_descriptor(self):
+        """Security read, 10-23: when even the read after the kill times out, a long-lived lane kept the pipes open."""
+        def hang(self, *a, **k):
+            raise subprocess.TimeoutExpired("sleep", 1)
+        before = len(os.listdir("/proc/self/fd"))
+        with mock.patch.object(subprocess.Popen, "communicate", hang):
+            for _ in range(3):
+                self.assertEqual(C.sh(["sleep", "30"], timeout=1)[0], 124)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
 class Door(Stubbed):
@@ -1237,6 +1282,104 @@ class MainRedAlert(Stubbed):
         for i, rec in enumerate(({"checks": ["e2e-cc-context"]}, {"checks": {"e2e-cc-context": "passed"}}, ["x"])):
             C.write_json(HL.path("demo"), rec)
             self.assertEqual(len(self.flag([self.held(7)], 3601 * (i + 1) + 1)), 1, rec)   # an hour apart: said each time
+
+
+class StalledLane(Stubbed):
+    """Owner, 10-22: 18 Hive PRs sat at review about 65 min with no state change, "should have been caught
+    automatically". The tick judges a lane against its own recent gaps, not a fixed timeout, and says it once."""
+
+    def history(self, gaps, burst=1, repo="demo", intake=(), other=()):
+        """A pass that moves a job on (a verdict) and `burst` - 1 lines more in the same second after each gap in
+        `gaps` (seconds), the last at Q; a new PR's lines at each of `intake` (seconds after Q); and passes for
+        another repo after each gap in `other`, long ago. One pass of a real lane logs several lines at once."""
+        os.makedirs(os.path.dirname(E.log_path()), exist_ok=True)
+
+        def passes(repo, gaps, end):
+            at = [end]
+            for g in reversed(gaps):
+                at.insert(0, at[0] - g)
+            return [f"{E.stamp(a)}\tstage {repo}#{i} {'checking' if b else 'verdict'}\n"
+                    for i, a in enumerate(at) for b in range(burst)]
+        with open(E.log_path(), "w") as f:
+            f.writelines(passes("other", other, E.epoch_of(Q) - 10 ** 7) + passes(repo, gaps, E.epoch_of(Q))
+                         + [f"{E.stamp(E.epoch_of(Q) + s)}\tstage {repo}#{900 + s} {w}\n"
+                            for s in intake for w in ("lane", "planned", "checking")])
+
+    def flag(self, secs_after_q, jobs=None, repo="demo"):
+        from lander import tick as TK
+        jobs = [T.Job(repo=repo, pr=7, state=T.CHECKING, stage=T.CHECKING, extra={"queued_at": Q})] \
+            if jobs is None else jobs
+        with mock.patch.object(TK.J, "lane_jobs", lambda r: jobs if r == repo else []), \
+                mock.patch.object(TK.GH, "backoff", lambda: 0):
+            return TK.flag_stalled([repo, "other"], C, now=E.epoch_of(Q) + secs_after_q)
+
+    def test_a_lane_quiet_far_past_its_own_gaps_is_said_once(self):
+        self.history([600] * 100)
+        self.assertEqual(self.flag(1800), [])                      # three times its p90 is not past it
+        self.assertEqual(self.flag(1801), ["[demo] the queue has not moved for 30 min; its seat is told"])
+        self.assertEqual(self.flag(7200), [])                      # the same stall is said once
+        sent = self.argvs("cc-notify")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("PR #7", sent[0][-1])
+
+    def test_a_bursty_lane_is_judged_by_its_gaps_between_passes(self):
+        # Opus read, 10-23: each pass logs many lines in one second, so the p90 of raw gaps was 0 and a tick 18 s
+        # after a gate line alarmed the seat. Uneven gaps between passes, as queue.log's: 20 s, 2 min, 20 min
+        self.history([20, 120, 1200, 120, 30] * 40, burst=6)   # 20 s and 30 s are one pass
+        self.assertEqual(self.flag(18), [])
+        self.assertEqual(self.flag(600), [])
+        self.assertEqual(self.flag(3 * 1200), [])
+        self.assertEqual(len(self.flag(3 * 1200 + 1)), 1)
+
+    def test_the_moment_a_usage_wall_lifts_is_not_a_stall(self):
+        # the lane sat quiet behind a box hold for hours; the tick that first finds it let go counts from there
+        self.history([600] * 100)
+        C.held("demo", E.epoch_of(Q) + 5 * 3600)
+        self.assertEqual(self.flag(5 * 3600 + 60), [])
+        unheld = T.Job(repo="demo", pr=7, state=T.CHECKING, stage=T.CHECKING,
+                       extra={"queued_at": Q, "unheld_at": E.stamp(E.epoch_of(Q) + 6 * 3600)})
+        self.assertEqual(self.flag(6 * 3600 + 60, jobs=[unheld]), [])
+        self.assertEqual(len(self.flag(6 * 3600 + 1801, jobs=[unheld])), 1)
+
+    def test_a_repo_hears_of_a_stall_at_most_hourly(self):
+        self.history([600] * 100)
+        self.assertEqual(len(self.flag(1801)), 1)
+        later = T.Job(repo="demo", pr=8, state=T.CHECKING, stage=T.CHECKING,
+                      extra={"queued_at": E.stamp(E.epoch_of(Q) + 60)})   # a new stall id: counts from its queuing
+        self.assertEqual(self.flag(1861 + 600, jobs=[later]), [])
+        self.assertEqual(len(self.flag(1801 + 3600, jobs=[later])), 1)
+        self.assertEqual(len(self.argvs("cc-notify")), 2)
+
+    def test_a_box_repos_stall_goes_to_its_own_seat_and_is_tried_again_when_not_taken(self):
+        self.history([600] * 100, repo="dispatch")
+        self.answer({"cc-broker inject": [1, "broker down"], "cc-notify": [1, "down"]})
+        self.assertEqual(self.flag(1801, repo="dispatch"), [])     # neither took it: not marked
+        self.answer({})
+        self.assertEqual(len(self.flag(1861, repo="dispatch")), 1)
+        self.assertEqual([a[5] for a in self.argvs("cc-broker inject")], ["dispatch", "dispatch"])
+        self.assertEqual(len(self.argvs("cc-notify")), 1)          # only the try the broker refused fell back
+
+    def test_new_prs_coming_in_are_not_movement(self):
+        # 10-22: PRs kept arriving through the Hive stall, each logging lane, planned and checking lines (20:34Z to
+        # 21:13Z), so the longest quiet spell was 23 min while nothing left review for 64 min
+        self.history([600] * 100, intake=range(300, 3600, 300))
+        self.assertEqual(self.flag(1800), [])
+        self.assertEqual(len(self.flag(1801)), 1)
+
+    def test_a_young_lane_is_judged_on_the_boxs_history(self):
+        # 10-22: the Hive lane started at 10:26Z and had too few gaps of its own at 20:12Z, so it was never judged
+        self.history([600] * 5, other=[600] * 100)
+        self.assertEqual(self.flag(1800), [])
+        self.assertEqual(len(self.flag(1801)), 1)
+
+    def test_a_lane_with_little_history_nothing_due_or_held_by_the_box_is_not_judged(self):
+        self.history([600] * 9, other=[600] * 10)   # 19 gaps on the whole box
+        self.assertEqual(self.flag(36000), [])
+        self.history([600] * 100)
+        self.assertEqual(self.flag(36000, jobs=[]), [])
+        with mock.patch.object(L, "paused", lambda target: True):   # the box holds it: the lane is not late
+            self.assertEqual(self.flag(36000), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
 
 
 if __name__ == "__main__":

@@ -1735,14 +1735,60 @@ class TestTwoReaders(Case):
         self.assertEqual(len(box.called("cc-notify --ask")), 1)
 
     def test_a_reader_silent_twice_at_one_head_is_a_stop_naming_it(self):
-        self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        self.box(claude=claude_says("LAND"), **{"codex exec": (1, "codex: connection reset")})
         self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)
         v = R.review(self.job(), comments=[])
         self.assertEqual((v.verdict, v.extra.get("host"), v.extra.get("reader")),
                          (T.INCOMPLETE, True, "gpt-astra-test"))
         self.assertIn("answered nothing twice", v.extra["why"])
-        self.assertIn("timed out", v.extra["why"])
+        self.assertIn("connection reset", v.extra["why"])
         self.assertEqual(R.reads_used("demo", 7), 0)
+
+    def test_a_reader_that_timed_out_is_stood_in_for_next_read_and_its_output_kept(self):
+        # hive-standalone-build#23 on 10-22: astra hung to READ_TIMEOUT twice and held the lane's one slot each time
+        hung = (124, "codex: timed out after 1200s\nstream error: reconnecting 4/inf")
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": hung})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, len(box.called("claude"))), (T.INCOMPLETE, 1))   # the first timeout: a retry
+        with open(C.state("demo-7.codex-timeout.log")) as f:
+            self.assertIn("reconnecting 4/inf", f.read())
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+claude-fable-test"))
+        self.assertEqual(len(box.called("codex exec")), 1)   # 10-23 01:13Z it hung again: so it is not asked again
+        self.assertTrue(v.extra["stood_in"][0]["why"].startswith(R.TIMED_OUT))
+        self.assertIn("(stood in for `gpt-astra-test`, timed out on its last read)", R.marker(v, "b" * 40, "h" * 40, "lander"))
+        j = self.job()
+        j.plan.extra["security"] = ["bin-private/door"]   # perms' read gates a security path: still no stand-in
+        self.assertEqual(R.stand_in(j, "gpt-astra-test", R.TIMED_OUT, {"silent": {"reader": "gpt-astra-test",
+                                                                                 "why": R.TIMED_OUT, "head": HEAD}}), "")
+
+    def test_a_stand_in_that_fails_too_holds_the_pr_at_the_next_failure(self):
+        # Opus read, 10-23: the stand-in's failure marked the PR with its own name, so the next read asked the hung
+        # reader again for a full timeout, and the two took turns at one head forever with nobody told
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)   # claude's own read is kept
+        box = self.box(claude=(124, "claude: timed out after 1200s"), **{"codex exec": (124, "codex: timed out")})
+        v = R.review(self.job(), comments=[])   # the stand-in times out too: the second failure at this head
+        self.assertEqual((v.verdict, v.extra.get("host")), (T.INCOMPLETE, True))
+        self.assertIn("answered nothing twice", v.extra["why"])
+        self.assertEqual(box.called("codex exec"), [])
+
+    def test_a_timeout_at_an_earlier_head_never_skips_the_read_of_a_new_one(self):
+        # Opus security read, 10-23: hang the reader once on a harmless head, push the real change, and only claude
+        # read it
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)
+        moved = self.job()
+        moved.head = "c" * 40
+        self.assertEqual(R.review(moved, comments=[]).verdict, T.INCOMPLETE)   # asked again, and timed out again
+        self.assertEqual(len(box.called("codex exec")), 2)
+
+    def test_a_timed_out_read_that_printed_a_usage_limit_is_stood_in_for_at_once(self):
+        hit = (124, "stream error: usage limit reached; try again later\ncodex: timed out after 1200s")
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": hit})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+claude-fable-test"))
+        self.assertEqual(len(box.called("codex exec")), 1)
 
     def test_a_handback_naming_no_blocker_is_retried_never_handed_back(self):
         # #919: a HANDBACK with nothing in it asks the author for a fix nobody can name

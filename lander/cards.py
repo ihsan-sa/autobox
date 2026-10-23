@@ -67,30 +67,53 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
 # --- shared helpers ------------------------------------------------------------------------------------------------
 
 def sh(argv, cwd=None, input=None, timeout=300, env=None, started=None):
-    """Run argv; -> (rc, stdout+stderr). A missing tool, an argv too long or a timeout is rc 127 / 124 with the reason, never a raise.
+    """Run argv; -> (rc, stdout+stderr). A missing tool, an argv too long or a timeout is rc 127 / 124 with the reason
+    (for a timeout, what it printed before the kill and then the reason, last, so a caller that keeps the tail still
+    says it timed out), never a raise.
     The output is decoded as it is, with no newline translation: text=True turns a lone \r into \n, and a \r in a
     changed line then forges a `diff --git` header in the diff the review reads. started(pid), when given, is called
-    with the child's pid once it runs. The child leads its own session, so a timeout kills its whole group: a grandchild
-    still holding stdout would otherwise keep the pipes open and the call unbounded."""
+    with the child's pid once it runs. The child leads its own session, so a timeout kills its whole group, and first
+    each descendant (one that called setsid has left the group): a grandchild still holding stdout would otherwise keep
+    the pipes open and the call unbounded, and a hung codex's own children kept running (10-23)."""
     try:
-        with subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env=env, start_new_session=True) as p:
-            if started:
-                started(p.pid)
-            try:
-                out, err = p.communicate(input.encode() if isinstance(input, str) else input, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                p.wait(timeout=5)
-                raise
-        return p.returncode, (out or b"").decode(errors="replace") + (err or b"").decode(errors="replace")
+        p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=env, start_new_session=True)
     except OSError as e:   # a missing tool, or an argv the kernel refuses (E2BIG)
         return 127, f"{type(e).__name__}: {e}"
-    except subprocess.TimeoutExpired:
-        return 124, f"{argv[0]}: timed out after {timeout}s"
+    if started:
+        started(p.pid)
+    text = lambda o, e: (o or b"").decode(errors="replace") + (e or b"").decode(errors="replace")  # noqa: E731
+    try:
+        out = text(*p.communicate(input.encode() if isinstance(input, str) else input, timeout))
+        return p.returncode, out
+    except subprocess.TimeoutExpired:   # the whole tree goes (codex's own children too), then what it printed
+        for kid in descendants(p.pid):
+            with contextlib.suppress(OSError):
+                os.kill(kid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.killpg(p.pid, signal.SIGKILL)
+        try:   # a descendant that slipped out of the group still holding the pipe never makes the timeout hang
+            said = text(*p.communicate(timeout=10))
+        except subprocess.TimeoutExpired:   # its pipes are closed here, so a long-lived lane leaks none
+            said = ""
+            for f in (p.stdin, p.stdout, p.stderr):
+                with contextlib.suppress(OSError):
+                    f.close()
+        return 124, said + f"\n{argv[0]}: timed out after {timeout}s"
+
+
+def descendants(pid):
+    """Every process under `pid`, by the parent links in /proc."""
+    kids = {}
+    for d in os.listdir("/proc"):
+        with contextlib.suppress(OSError, IndexError, ValueError):
+            with open(f"/proc/{d}/stat") as f:
+                kids.setdefault(int(f.read().rsplit(")", 1)[1].split()[1]), []).append(int(d))
+    out, todo = [], list(kids.get(pid, []))
+    while todo:
+        out.append(todo.pop())
+        todo += kids.get(out[-1], [])
+    return out
 
 
 def state(*parts):
@@ -748,6 +771,38 @@ def main_red(job, secs, now=None):
     log("main-red-alert", job.repo, job.pr, check=check, mins=secs // 60, fails=len(fails), rc=rc)
     if rc != 0:   # not taken: left unmarked, so the next tick tries again
         return False
+    with _sent_lock():
+        d = read_json(_waited_path(), {}) or {}
+        d.setdefault(key, {})["said"] = t
+        write_json(_waited_path(), d)
+    return True
+
+
+def stalled(job, secs, usual, since, now=None):
+    """A LANE WHOSE QUEUE HAS STOPPED MOVING (owner, 10-22: 18 Hive PRs sat at review about 65 min with no state change
+    and nobody heard; "should have been caught automatically"). tick.flag_stalled judges it against the lane's own
+    history; `job` is its oldest due job, `since` the stamp its quiet counts from. Said once per stall: its id
+    `land:<repo>:stalled@<since>` goes into cards/sent.json once taken, so only a new stall says it again. And at most
+    one per repo (a member's lanes share `member:<h>`) per WAIT_FLAG_SECS, as waited's (perms' read, 10-13), keyed
+    `stalled:<key>` in cards/waited.json. Told to the repo's own seat as waited's is (tell_own_seat), else a planner
+    request. -> True when it was said now."""
+    t = int(now if now is not None else time.time())
+    pid = f"land:{job.repo}:stalled@{since}"
+    key = f"stalled:{f'member:{job.member}' if job.member else job.repo}"
+    last = int(((read_json(_waited_path(), {}) or {}).get(key) or {}).get("said") or 0)
+    if pid in (read_json(_sent_path(), []) or []) or (last and t - last < WAIT_FLAG_SECS):
+        return False
+    text = (f"[{job.repo}] the landing queue has not moved for {secs // 60} min, where its gaps usually stay under "
+            f"{max(1, usual // 60)} min; PR #{job.pr} is the oldest job due ({STAGE_WORDS.get(job.state, job.state)}).")
+    if own_seat(job, "planning") and tell_own_seat(job, text):
+        rc = 0
+    else:
+        rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", pid, "-t", f"{job.repo} landing", text],
+                   timeout=60, **box_hand())
+    log("stalled", job.repo, job.pr, mins=secs // 60, usual=usual // 60, rc=rc)
+    if rc != 0:   # not taken: left unmarked, so the next tick tries again
+        return False
+    mark_sent(pid)
     with _sent_lock():
         d = read_json(_waited_path(), {}) or {}
         d.setdefault(key, {})["said"] = t

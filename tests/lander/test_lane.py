@@ -4621,6 +4621,58 @@ class Parallel(Fixture):
         lane.drop_reads([one, two])
         self.assertEqual(lane.pending_reads(), [])
 
+    def test_review_slots_come_from_cc_config(self):
+        # 2026-10-22: ~/.cc/config set LANDER_REVIEW_SLOTS=3, the lane read only its own environment and ran one read
+        self.set_box(config={"LANDER_REVIEW_SLOTS": "2"})
+        lane, one, two, submitted = self.reads_lane()
+        self.assertEqual(lane.review_slots, 2)
+        self.assertFalse(lane.review(one))
+        self.assertFalse(lane.review(two))
+        self.assertEqual(len(submitted), 2, "a second read waited though cc-config gives two places")
+
+    def test_a_read_that_ends_while_a_promote_waits_is_recorded(self):
+        # 2026-10-22: #23's read ended 20 min into a promote, the lane switched without it, and the next lane read again
+        lane, one, _, submitted = self.reads_lane()
+        for j in (one, _):
+            J.save(j)
+        lane.review(one)
+        land = T.Verdict(verdict=T.LAND, digest=one.digest, tokens=100, blocking=[], extra={})
+        threading.Timer(0.3, submitted[0].set_result, [land]).start()
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"):
+            self.assertEqual(lane.loop(set()), "/rel/new")
+        got = self.job(1)
+        self.assertEqual(got.extra["verdict"]["verdict"], T.LAND)
+        self.assertTrue(L.landed_at(got, got.extra["verdict"]), "the next lane would buy the read again")
+
+    def test_a_promote_sleeps_while_one_read_is_done_and_another_runs(self):
+        # Opus, 10-23: a finished read nobody marked seen made the promote's wait return at once, 963,786 passes a second
+        self.set_box(config={"LANDER_REVIEW_SLOTS": "2"})
+        lane, one, two, submitted = self.reads_lane()
+        for j in (one, two):
+            J.save(j)
+        lane.review(one)
+        lane.review(two)
+        land = T.Verdict(verdict=T.LAND, digest=one.digest, tokens=100, blocking=[], extra={})
+        submitted[0].set_result(land)
+        threading.Timer(0.5, submitted[1].set_result,
+                        [T.Verdict(verdict=T.LAND, digest=two.digest, tokens=100, blocking=[], extra={})]).start()
+        calls, real = [], lane.reap
+        lane.reap = lambda w: (calls.append(w), real(w))
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"):
+            self.assertEqual(lane.loop(set()), "/rel/new")
+        self.assertLess(len(calls), 20, "the promote's wait spun on the finished read")
+        self.assertEqual(self.job(1).extra["verdict"]["verdict"], T.LAND)
+        self.assertEqual(self.job(2).extra["verdict"]["verdict"], T.LAND)
+
+    def test_a_reviewer_fault_met_at_a_promote_holds_the_job(self):
+        lane, one, _, submitted = self.reads_lane()
+        J.save(one)
+        lane.review(one)
+        submitted[0].set_exception(L.UnitFault("review.read: TimeoutError"))
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"):
+            self.assertEqual(lane.loop(set()), "/rel/new")
+        self.assertEqual(self.job(1).state, T.HELD)
+
     def test_a_checking_job_with_no_box_check_keeps_the_slot_from_a_second_one(self):
         lane, me, (c,) = self.spare_lane(T.CHECKING)
         self.assertFalse(lane.spare_box(me))   # a check left and none on the box: it wants a box slot

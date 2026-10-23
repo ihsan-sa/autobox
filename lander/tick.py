@@ -50,6 +50,10 @@
             since=) began more than cards.WAIT_FLAG_SECS ago -> one planner request (cards.main_red) naming the
             check and main's failing cases, at most once an hour per repo and check, whichever PRs it holds. A
             hold main's own record (health) has since seen pass on main says nothing: main went green on it.
+  stalled   each repo with a due job whose lane has moved no job on (no verdict, hold, handback, query or merge
+            line) for over STALL_TIMES (3) times the p90 of its own last STALL_HISTORY (100) gaps between those, or
+            the box's when it has fewer than STALL_GAPS (20) -> one request to its seat (cards.stalled) per stall, at
+            most hourly per repo (owner, 10-22: a Hive queue sat 65 min unseen while new PRs kept coming in).
   cards     each repo (those above, and each with a queued-card record) with no lane running whose queued card
             waits on a last edit the box-wide cap or a Slack 429 held (cards.left_held): cards.positions on its queue, so the edit goes once a slot is free; the rearm
             step arms a tick for when it will be (cards.edit_wait). A running lane hands its queue over itself.
@@ -836,6 +840,83 @@ def flag_main_red(repos, cards, now=None) -> list:
     return lines
 
 
+STALL_HISTORY = 100  # a lane's last this many gaps between moves are its recent history
+STALL_GAPS = 20      # a lane with fewer is judged on the box's
+STALL_TIMES = 3      # a gap this many times its history's p90 is a stall
+STALL_PASS = 60      # moves this close to the one before are one pass of the lane, so no gap between them
+STALL_TAIL = 8 << 20   # bytes of queue.log's end read for that history
+STALL_MOVES = ("verdict", "held", "handback", "query", "merged")   # a job moving on, not one coming in
+
+
+def stage_times() -> dict:
+    """{repo: [(epoch, name) of each `stage` line, oldest first]} from queue.log's last STALL_TAIL bytes."""
+    try:
+        with open(E.log_path(), "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - STALL_TAIL))
+            text = f.read().decode(errors="replace")
+    except OSError:
+        return {}
+    out = {}
+    for at, r, name in re.findall(r"^(\S+)\tstage ([\w.-]+)#\S+ ([\w-]+)", text, re.M):
+        out.setdefault(r, []).append((E.epoch_of(at), name))
+    return out
+
+
+def move_gaps(lines) -> tuple:
+    """(gaps, last): the gaps between a lane's passes that moved a job on (STALL_MOVES, each within STALL_PASS of
+    the one before is one pass), each counted from the first line after the pass before, so a spell with nothing
+    in the lane is not history; and the epoch of its last such pass, or 0."""
+    gaps, last, start = [], 0, 0
+    for a, name in lines:
+        if name not in STALL_MOVES:
+            start = start or a
+        elif not last or a - last > STALL_PASS:
+            if last:
+                gaps.append(a - max(last, start))
+            last, start = a, 0
+        else:
+            last = a
+    return gaps, last
+
+
+def flag_stalled(repos, cards, now=None) -> list:
+    """A LANE WHOSE QUEUE HAS STOPPED MOVING (owner, 10-22: "should have been caught automatically", after 18 Hive PRs
+    sat at review about 65 min while a hung read held the lane's one slot). For each repo with a due job (Lane.due),
+    the time since it last moved a job on (move_gaps: a verdict, hold, handback, query or merge; new PRs kept coming
+    in through that stall, so intake is not movement) against its own last STALL_HISTORY gaps between moves, or the
+    box's when it has fewer than STALL_GAPS (a young lane): over STALL_TIMES times their p90 -> cards.stalled, said
+    once per stall and at most hourly per repo. Quiet counts from the latest of that move and when its oldest due job
+    became due (as flag_waited's age: queued, let go by a hold, or a box hold the tick last saw, so the moment a
+    usage wall lifts is not a stall). A lane that never moved a job, or whose oldest due job the box holds
+    (L.box_hold, as flag_waited), is not judged. `cards` is the installed cards unit; with none, or in a GitHub
+    backoff, nothing is flagged."""
+    lines, t = [], int(now if now is not None else time.time())
+    times = stage_times() if cards and repos and not GH.backoff() else {}
+    moves = {r: move_gaps(v) for r, v in times.items()}
+    box = [g for gaps, _ in moves.values() for g in gaps]
+    for r in repos if times else []:
+        try:
+            gaps, last = moves.get(r, ([], 0))
+            gaps = gaps[-STALL_HISTORY:] if len(gaps) >= STALL_GAPS else box
+            due = [j for j in J.lane_jobs(r) if L.Lane.due(j, t)]
+            if len(gaps) < STALL_GAPS or not last or not due:
+                continue
+            job = min(due, key=lambda j: j.extra.get("queued_at") or "")
+            since = max([last, int(cards.held_at(r) or 0)] + [E.epoch_of(job.extra.get(k) or "") or 0
+                                                             for k in ("queued_at", "unheld_at", "not_before")])
+            usual, idle = E.pctl(gaps, 90), t - since
+            if idle <= STALL_TIMES * usual:
+                continue
+            h, tr = M.member_of(r)
+            if L.box_hold(h if h and tr else r, job):   # paused or a tier stop: the box holds it, the lane is not late
+                continue
+            if cards.stalled(job, idle, usual, E.stamp(since), now=t):
+                lines.append(f"[{r}] the queue has not moved for {idle // 60} min; its seat is told")
+        except Exception as e:  # noqa: BLE001 — as flag_waited: one repo's fault is logged, never the tick's end
+            E.log("tick-fault", r, None, f"stalled: {type(e).__name__}: {e}")
+    return lines
+
+
 def carded_repos(repo="") -> list:
     """Each repo with a queued-card record (cards/queued-<repo>.json), or just `repo`: one whose queue emptied may have
     no job, board or .applied left to name it, and still wait on a held last edit."""
@@ -895,6 +976,7 @@ def cmd_tick(argv) -> int:
     units, known = L.load_units(), known_repos(repo)
     lines += flag_waited(repos, units.get("cards"))
     lines += flag_main_red(repos, units.get("cards"))
+    lines += flag_stalled(repos, units.get("cards"))
     retry_cards(list(dict.fromkeys(repos + known + carded_repos(repo))), units.get("cards"))
     for r in known:
         lines += tip_and_deploy(r, units)
