@@ -9,7 +9,9 @@
         REST_FIELDS, else through that GraphQL call; a spent rate limit is said with its reset (spent)
     get(root, path, token=None, timeout=120) -> (rc, body, stderr): `gh api <path>` (a GET), CONDITIONAL: the last
         answer and its ETag are kept under <LANDQ>/gh-etag, and the GET carries If-None-Match, so an unchanged answer
-        is a 304, which costs no quota and gives the kept body. Always asked, even for a merged pull: a repo made
+        is a 304, which costs no quota and gives the kept body while it says open; a closed or merged one is asked
+        again plainly, so a planted copy with a current ETag never settles a PR. The kept file is read only when it
+        is a regular file, never through a link or a FIFO. Always asked, even for a merged pull: a repo made
         again under its name has a new #1. As #1898's cc-reconcile rest(): the box spent its REST hour 15-25 min
         early, three times on 2026-10-23. prune_kept() drops kept answers a day old; the tick runs it.
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
@@ -48,6 +50,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 from urllib.parse import quote
@@ -457,19 +460,25 @@ JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
 def get(root, path, token=None, timeout=120):
     from lander import jobs as J
     f = f"{J.landq()}/gh-etag/{hashlib.sha1(path.encode()).hexdigest()}.json"
-    kept = J.read_json(f) or {}
-    body = kept.get("body")
-    tag = ["-H", f"If-None-Match: {kept['etag']}"] if kept.get("etag") and isinstance(body, dict) else []
+    kept = {}   # read as #1912's rest_kept does: a link, a FIFO or anything not a regular file is no copy
+    with contextlib.suppress(Exception), os.fdopen(os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as r:
+        kept = json.load(r) if stat.S_ISREG(os.fstat(r.fileno()).st_mode) else {}
+    body = kept.get("body") if isinstance(kept, dict) else None
+    tag = ["-H", f"If-None-Match: {kept['etag']}"] if isinstance(body, dict) and kept.get("etag") else []
     rc, out, err = gh(["api", path, "-i", *tag], root, token, timeout)
     head, _, out = out.replace("\r\n", "\n").partition("\n\n") if out.startswith("HTTP/") else ("", "", out)
     if tag and re.match(r"HTTP/\S+ 304", head):
-        rc, out, err = 0, json.dumps(body), ""
-        _note(0, out, err)   # gh exits 1 on a 304, which is a success
-    else:
-        m = re.search(r"^etag: *(.+?)\s*$", head, re.I | re.M)
-        with contextlib.suppress(ValueError, OSError):
-            if m and not rc:
-                J.write_atomic(f, {"etag": m.group(1), "body": json.loads(out)})
+        if body.get("state") == "open":
+            _note(0, "", "")   # gh exits 1 on a 304, which is a success
+            return 0, json.dumps(body), ""
+        # a closed or merged answer is final, and anyone who can write the kept file can give it a current ETag for
+        # GitHub's 304 to vouch for, so only GitHub's own body settles it
+        rc, out, err = gh(["api", path, "-i"], root, token, timeout)
+        head, _, out = out.replace("\r\n", "\n").partition("\n\n") if out.startswith("HTTP/") else ("", "", out)
+    m = re.search(r"^etag: *(.+?)\s*$", head, re.I | re.M)
+    with contextlib.suppress(ValueError, OSError):
+        if m and not rc:
+            J.write_atomic(f, {"etag": m.group(1), "body": json.loads(out)})
     return rc, out, err
 
 

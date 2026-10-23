@@ -6,11 +6,13 @@ gh is a counting fake on PATH that speaks REST with -i's headers; the watches an
 a temp dir. Run:
 python3 -m unittest discover -s core/tests/lander -t core/tests/lander -p 'test_tick_reads.py'
 """
+import hashlib
 import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -127,8 +129,44 @@ class TickReads(unittest.TestCase):
         self.change(path, state="closed", head="n" * 40, v=3)  # then closed
         self.assertEqual(GH.pr_facts(root, 1, "state")[0], {"state": "CLOSED"})
         self.reads()
-        self.assertEqual(GH.pr_facts(root, 1, "state")[0], {"state": "CLOSED"})   # the kept copy is the closed one
-        self.assertEqual(self.reads(), [(path, True)])
+        self.assertEqual(GH.pr_facts(root, 1, "state")[0], {"state": "CLOSED"})
+        self.assertEqual(self.reads(), [(path, True), (path, False)])   # a 304 on a closed copy is asked again plainly
+
+    def kept(self, path):
+        d = f"{J.landq()}/gh-etag"
+        os.makedirs(d, exist_ok=True)
+        return f"{d}/{hashlib.sha1(path.encode()).hexdigest()}.json"
+
+    def test_a_planted_merged_copy_with_a_current_etag_settles_nothing(self):
+        """perms' read of #1908: anyone who can write the kept file can give it the current ETag, and GitHub's 304
+        would then vouch for a merged body it never sent."""
+        root, path = os.path.join(self.tmp, "dev", "alpha"), "repos/o/alpha/pulls/1"
+        J.write_atomic(self.kept(path), {"etag": '"e-alpha-1-1"', "body": {"state": "closed", "merged_at": "x"}})
+        self.assertEqual(GH.pr_facts(root, 1, "state")[0], {"state": "OPEN"})
+        self.assertEqual(self.reads(), [(path, True), (path, False)])
+
+    def test_a_linked_kept_file_is_no_copy(self):
+        root, path = os.path.join(self.tmp, "dev", "alpha"), "repos/o/alpha/pulls/1"
+        planted = os.path.join(self.tmp, "planted.json")
+        J.write_atomic(planted, {"etag": '"e-alpha-1-1"', "body": {"state": "open", "head": {"sha": "p" * 40}}})
+        os.symlink(planted, self.kept(path))
+        self.assertEqual(GH.pr_facts(root, 1, "headRefOid")[0], {"headRefOid": "h" * 40})
+        self.assertEqual(self.reads(), [(path, False)])        # not read, so asked plainly
+
+    def test_a_fifo_kept_file_is_no_copy_and_no_hang(self):
+        root, path = os.path.join(self.tmp, "dev", "alpha"), "repos/o/alpha/pulls/1"
+        f = self.kept(path)
+        os.mkfifo(f)
+        got = []
+        t = threading.Thread(target=lambda: got.append(GH.pr_facts(root, 1, "state")[0]), daemon=True)
+        t.start()
+        t.join(10)
+        if t.is_alive():   # the read blocked on the pipe: let it go before failing
+            os.close(os.open(f, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(10)
+            self.fail("get() hung on a FIFO kept file")
+        self.assertEqual(got, [{"state": "OPEN"}])
+        self.assertEqual(self.reads(), [(path, False)])
 
     def test_an_error_replys_headers_set_no_backoff(self):
         rc, _, _ = GH.get(os.path.join(self.tmp, "dev", "alpha"), "repos/o/alpha/pulls/404")

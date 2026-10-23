@@ -191,6 +191,7 @@ PERM_SETTLE = 4.0                                            # seconds `cc-slack
 PERM_MAX = 400                                               # …and the table's hard ceiling, whatever the number of targets
 ASK_CAP, ASK_WINDOW = 5, 3600                                # 🙋 asks one member workspace may post in this window — more is a loop, not a question
 ASK_STALE, ASK_MAX = 3 * 24 * 3600, 200                     # an ask thread this old stops carrying replies; the table's ceiling
+ASKS_KEPT = 500                                               # threads whose newest ask ask_holder remembers; the oldest drops first, so a long-lived daemon stays small
 ASKS = "asks.json"                                           # {"<card ts>": {h, title, chat, at}}: open member asks, so a reply after a daemon restart still finds its way home
 GRANT_STALE, GRANT_MAX = 3 * 24 * 3600, 50                   # an unanswered grant card this old is dropped; the table's ceiling
 GRANTS = "grants.json"                                       # {"<id>": {target, kind, what, sha, why, chat, card, at}}: open grant cards, on disk across the restart a landing causes
@@ -4669,7 +4670,7 @@ class Daemon:
         self.thread_owner = {}                              # (chat, thread_ts) -> alias|None (None = main); routing cache
         self.known_aliases = collections.defaultdict(set)   # target -> {alias, ...} ever subscribed (daemon lifetime)
         self.mentioned = collections.OrderedDict()           # (chat, ts, target, alias) route_mentions already handed a post
-        self.asks, self.takers = {}, {}                      # (chat, thread) -> its newest human message · -> (that ask, the session whose file answered it)
+        self.asks, self.takers = collections.OrderedDict(), {}   # (chat, thread) -> its newest human message, newest thread last · -> (that ask, the link of the session whose file answered it)
         self.ask_lock = threading.Lock()                     # ask_holder's check-and-take: per-connection threads answer at once
         self.revisit = load_revisit()                        # "<chat>:<root_ts>" -> the owner's 📌 (on_revisit): a bookmark, never a mark
         self.home_links, self.home_cards = {}, {}           # "<chat>:<ts>" -> (permalink, when) · "repo#n" -> its #approvals card's permalink
@@ -5279,26 +5280,43 @@ class Daemon:
         log(f"fetch {h}: {what[:24]} {ts} saved {len(got)}/{len(infos)}")
         return {"ok": bool(got), "text" if got else "error": "\n".join(lines)}
 
-    def ask_holder(self, key, target, take=False):
+    def member_session(self, h, peer):
+        """The live link of h's session that made this call: its channel server sends the hello and every reply and file,
+        so the caller's kernel pid is the one its hello came from (never a pid it sent, nor the target it names — two
+        sessions may share a target, and one can name the other's). None when no live session of h's is the caller."""
+        with self.lock:
+            return next((c for v in self.subs.values() for c in v
+                         if peer and c.info.get("member") == h and c.info.get("peer") == peer[0]), None)
+
+    def note_ask(self, key, ts):
+        """The thread's newest human message is its ask (ask_holder); only the newest ASKS_KEPT threads are kept."""
+        with self.ask_lock:
+            self.asks[key] = ts; self.asks.move_to_end(key)
+            while len(self.asks) > ASKS_KEPT:
+                self.takers.pop(self.asks.popitem(last=False)[0], None)
+
+    def ask_holder(self, key, me, take=False):
         """ONE ASK, ONE ANSWER (raised-a-member-ask-answered-twice): on 2026-10-23 a member's two thread asks each went to
         two sessions, one typed in by cc-msg after an un-park and one read by the seat a plan change woke, and each thread
         got two answers, both files. Every route ends in a member session's reply or file through here, so here is the
         claim, keyed on the thread's newest human message (on_event): the first FILE that posts holds it, since that is
         the deliverable, and a text line ("on it", a hand-over note) holds nothing. Another session's reply or file gets
         the refusal back while the holder still has a live link; a new message is a new ask, and a dead holder holds
-        nothing. A thread the daemon saw no human message in has no ask, so nothing is held there."""
+        nothing. A thread the daemon saw no human message in has no ask, so nothing is held there. `me` is the caller's
+        own link (member_session), so the claim binds to the session that took it and the refusal names nobody; a
+        caller that is no live session of the workspace posts only while nobody holds the ask, and takes nothing."""
         with self.ask_lock:
             ask, held = self.asks.get(key), self.takers.get(key)
             if ask is None:
                 return None
-            if held and held[0] == ask and held[1] != target and self.subs.get(held[1]):
-                return {"ok": False, "error": f"not sent — {held[1]} already answered this ask in the thread and is still "
-                                              "running; say so to whoever handed it to you instead of answering it again"}
-            if take and held != (ask, target):
-                self.takers[key] = (ask, target)
+            if held and held[0] == ask and held[1] is not me and held[1] in self.subs.get(held[1].target, ()):
+                return {"ok": False, "error": "not sent — another session already answered this ask in the thread and is "
+                                              "still running; say so to whoever handed it to you instead of answering it again"}
+            if take and me and held != (ask, me):
+                self.takers[key] = (ask, me)
                 return True                                  # this call took it: the caller gives it back if its post fails
 
-    def member_verb(self, h, first, verb):
+    def member_verb(self, h, first, verb, peer=None):
         """The scoped Slack calls a boundary cannot make itself (no token inside). `verb` is the one refuse_reason
         authorised — never re-derived here, or a second key in the payload would run instead. Returns the response."""
         if verb == "project":   # a session asks, the daemon makes it: the boundary has no Slack token and must not
@@ -5330,7 +5348,8 @@ class Daemon:
         if workspace_of(target) != h:
             target = h
         ask = (chat, str(first.get("thread_ts") or ""))
-        held = verb in ("reply", "file") and self.ask_holder(ask, target)
+        me = verb in ("reply", "file") and self.member_session(h, peer)
+        held = verb in ("reply", "file") and self.ask_holder(ask, me)
         if held:
             return held
         if verb == "reply":
@@ -5411,7 +5430,7 @@ class Daemon:
             except (OSError, UploadRefused) as e:
                 log(f"file {h}: {path} refused: {e}")
                 return {"ok": False, "error": f"{first.get('path')} is not a regular file the box can read under the workspace — nothing sent"}
-            took, fid = self.ask_holder(ask, target, take=True), None   # taken here, under the lock, and given back below unless it posted
+            took, fid = self.ask_holder(ask, me, take=True), None   # taken here, under the lock, and given back below unless it posted
             try:   # the mail door, when the thread answers a mail, is handed the checked name and opens it once itself
                 if isinstance(took, dict):
                     return took
@@ -5728,7 +5747,7 @@ class Daemon:
             verb = self.verbs_of(first)[0]   # refuse_reason let exactly one through: THAT is what runs, not whatever key comes first below
             if member and verb in self.MEMBER_VERBS:
                 try:
-                    res = self.member_verb(member, first, verb)
+                    res = self.member_verb(member, first, verb, peer)
                 except Exception as e:
                     log(f"member {member} {verb}: {e!r}"); res = {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:200]}"}
                 c.sendall((json.dumps(res) + "\n").encode()); return
@@ -5742,7 +5761,7 @@ class Daemon:
                 target, alias = first["hello"], first.get("alias") or None
                 hid = first.get("handoff") or None       # a SIDE of an open handoff, not an alias: no join notice, not @-addressable
                 conn = Conn(c, target, {"pid": first.get("pid"), "since": time.time(), "alias": alias, "handoff": hid, "member": member,
-                                   "agent_no": first.get("agent_no") or None})
+                                   "peer": peer and peer[0], "agent_no": first.get("agent_no") or None})
                 stop = stopped() if self.queues.get(target) else False   # asked outside the lock: it is a subprocess
                 with self.lock:
                     self.subs[target].append(conn)
@@ -6736,7 +6755,7 @@ class Daemon:
             return
         ws = workspace_of(target)
         if ws:
-            self.asks[(chat, thread)] = ts                  # the ask a member session's file in this thread answers (ask_holder)
+            self.note_ask((chat, thread), ts)               # the ask a member session's file in this thread answers (ask_holder)
         if ws and NEW_PROJECT_RE.match(text or ""):   # a boundary can't make its own channels; the daemon does it here
             react(self.cfg, chat, ts, "eyes")
             return self.member_channel(ws, target, text, chat, thread, ts, user, is_owner)

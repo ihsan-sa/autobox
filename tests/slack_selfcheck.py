@@ -10096,14 +10096,16 @@ def run_selfcheck():
         d = Daemon(use_slack=False); d.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_OWNER_ID": "UOWNER"}
         if ask:
             d.asks[("CDANA", "8.0")] = ask                    # the daemon saw the member's ask in thread 8.0
-        for t in live:
-            d.subs[t].append(object())                        # a session with a live link
+        for t in live:                                        # a session with a live link, its channel server's pid as its hello came in
+            d.subs[t].append(Conn(None, t, {"member": "dana", "peer": TK_PID[t]}))
         return d
-    def tk_reply(d, target, text):
-        return d.member_verb("dana", {"reply": "CDANA", "thread_ts": "8.0", "text": text, "target": target}, "reply")
-    def tk_file(d, target, text):
+    TK_PID = {"dana/pna-cad": 11, "dana": 12}                 # the session named for each target, unless a case says otherwise
+    def tk_reply(d, target, text, pid=None):
+        return d.member_verb("dana", {"reply": "CDANA", "thread_ts": "8.0", "text": text, "target": target}, "reply",
+                             (pid or TK_PID[target], 0, None))
+    def tk_file(d, target, text, pid=None):
         return d.member_verb("dana", {"file": "CDANA", "thread_ts": "8.0", "path": f"{DEV}/dana/invoice.pdf",
-                                      "text": text, "target": target}, "file")
+                                      "text": text, "target": target}, "file", (pid or TK_PID[target], 0, None))
     try:
         dmTK = tk_daemon(["dana/pna-cad", "dana"])
         tk_on = tk_reply(dmTK, "dana", "on it, handing to pna-cad")
@@ -10112,13 +10114,14 @@ def run_selfcheck():
         tk_text = tk_reply(dmTK, "dana", "and the totals")
         tk_fix = tk_file(dmTK, "dana/pna-cad", "correction: the SQM total")
         check("ONE ASK, ONE ANSWER: two sessions handed the same thread ask by two routes — a bare 'on it' holds nothing, the "
-              "first file answers, the second session's file and reply are not posted and name the taker, who can still correct itself",
+              "first file answers, the second session's file and reply are not posted, and the taker can still correct itself",
               tk_on.get("ok") and tk_first.get("ok") and tk_fix.get("ok") and not tk_second.get("ok") and not tk_text.get("ok")
-              and "dana/pna-cad already answered" in tk_second.get("error", "") and "dana/pna-cad already answered" in tk_text.get("error", "")
+              and "already answered" in tk_second.get("error", "") and "already answered" in tk_text.get("error", "")
               and postedTK == ["on it, handing to pna-cad"] and upTK == ["here is the invoice", "correction: the SQM total"])
         postedTK.clear(); upTK.clear()
-        dmTKd = tk_daemon(["dana"])                           # the taker's link is gone: its session died
+        dmTKd = tk_daemon(["dana/pna-cad", "dana"])
         tk_dead1 = tk_file(dmTKd, "dana/pna-cad", "half an invoice")
+        dmTKd.subs["dana/pna-cad"].clear()                   # the taker's link is gone: its session died
         tk_dead2 = tk_file(dmTKd, "dana", "here is the invoice")
         check("ONE ASK, ONE ANSWER: a taker whose session died holds nothing — the next session's file is posted",
               tk_dead1.get("ok") and tk_dead2.get("ok") and upTK == ["half an invoice", "here is the invoice"])
@@ -10128,7 +10131,7 @@ def run_selfcheck():
         tk_after = tk_file(dmTKf, "dana", "here is the invoice")
         check("ONE ASK, ONE ANSWER: a file that never posted gives the claim back — the other session's file is posted",
               "NOT sent" in tk_fail.get("text", "") and tk_after.get("ok") and "sent" in tk_after.get("text", "")
-              and upTK == ["fails", "here is the invoice"] and dmTKf.takers[("CDANA", "8.0")] == ("8.1", "dana"))
+              and upTK == ["fails", "here is the invoice"] and dmTKf.takers[("CDANA", "8.0")] == ("8.1", dmTKf.subs["dana"][0]))
         upTK.clear()
         dmTKn = tk_daemon(["dana/pna-cad", "dana"], ask=None)   # a bot-started thread (mail, a track): no human ask seen
         tk_n1, tk_n2 = tk_file(dmTKn, "dana/pna-cad", "one"), tk_file(dmTKn, "dana", "two")
@@ -10153,6 +10156,34 @@ def run_selfcheck():
               "ask a second session may answer",
               dmTKe.asks.get(("CDANA", "8.0")) == "8.2" and tk_e1.get("ok") and not tk_e2.get("ok") and tk_e3.get("ok")
               and upTK == ["the list", "the follow-up's list"])
+        upTK.clear()
+        dmTKs = tk_daemon(["dana/pna-cad", "dana"])
+        tk_s1 = tk_file(dmTKs, "dana/pna-cad", "the list")
+        tk_s2 = tk_file(dmTKs, "dana/pna-cad", "the list again", pid=TK_PID["dana"])   # dana's session names pna-cad's target
+        check("ONE ASK, ONE ANSWER: the claim binds to the session that took it — another session naming the taker's target "
+              "as its own is still refused", tk_s1.get("ok") and not tk_s2.get("ok") and upTK == ["the list"])
+        upTK.clear()
+        dmTKw = tk_daemon(["dana/pna-cad", "dana"])
+        tk_w = (tk_file(dmTKw, "dana/pna-cad", "the list"), tk_reply(dmTKw, "dana", "me too"))[1]
+        check("ONE ASK, ONE ANSWER: the refusal says the ask is already being answered and names no session",
+              not tk_w.get("ok") and "another session already answered" in tk_w.get("error", "")
+              and "pna-cad" not in tk_w.get("error", ""))
+        upTK.clear()
+        dmTK2 = tk_daemon([])
+        dmTK2.subs["dana"] += [Conn(None, "dana", {"member": "dana", "peer": 21}), Conn(None, "dana", {"member": "dana", "peer": 22})]
+        tk_21, tk_22 = tk_file(dmTK2, "dana", "the list", pid=21), tk_file(dmTK2, "dana", "the list again", pid=22)
+        check("ONE ASK, ONE ANSWER: two sessions on the same target are told apart by their link — the second's file is refused",
+              tk_21.get("ok") and not tk_22.get("ok") and upTK == ["the list"])
+        real_kept_tk = ASKS_KEPT; globals()["ASKS_KEPT"] = 2
+        try:
+            dmTKb = tk_daemon([], ask=None)
+            dmTKb.note_ask(("C", "1.0"), "1.1"); dmTKb.takers[("C", "1.0")] = ("1.1", None)
+            dmTKb.note_ask(("C", "2.0"), "2.1"); dmTKb.takers[("C", "2.0")] = ("2.1", None); dmTKb.note_ask(("C", "1.0"), "1.2"); dmTKb.note_ask(("C", "3.0"), "3.1")
+        finally:
+            globals()["ASKS_KEPT"] = real_kept_tk
+        check("ONE ASK, ONE ANSWER: only the newest ASKS_KEPT threads' asks are kept — the quietest thread drops out with its "
+              "claim, and a new message in a thread makes it newest again",
+              list(dmTKb.asks) == [("C", "1.0"), ("C", "3.0")] and dmTKb.takers == {("C", "1.0"): ("1.1", None)})
     finally:
         globals()["post"], globals()["react"], globals()["upload_file"] = real_post_tk, real_react_tk, real_up_tk
         subprocess.run(["rm", "-rf", f"{DEV}/dana"])
