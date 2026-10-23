@@ -1468,11 +1468,27 @@ class TestLivePolicy(unittest.TestCase):
         for gate in ("core/lander/review.py", "core/lander/plan.py", "core/lander/check.py", "core/lander/lane.py",
                      "core/lander/sandbox.py", "core/lander/gh.py", "core/lander/records.py", "core/lander/cli.py",
                      "core/lander/board.py", "core/lander/scope.py", "core/lander/tick.py",
-                     "core/bin/lander-self", "tests/LANDING-policy.toml"):
+                     "core/lander/repair.py", "core/bin/lander-self", "tests/LANDING-policy.toml"):
             self.assertTrue(M.match(pol.lander, gate), gate)
-        for plain in ("core/lander/repair.py", "core/tests/lander/test_plan.py"):
+        for plain in ("core/tests/lander/test_plan.py",):
             self.assertFalse(M.match(pol.lander, plain), plain)
             self.assertTrue(M.match(pol.paid_review, plain), plain)
+
+    # core/lander modules that may stay off the lander list, each with the reason it can (none today).
+    NOT_LANDER = {}
+
+    def test_every_lander_module_is_on_the_list_or_a_stated_exception(self):
+        """perms' read of #1917: repair.py, which tick loads, was off the list. A new core/lander/*.py goes on the
+        list or into NOT_LANDER with its reason, never silently off both."""
+        if not os.path.exists(self.PATH):
+            self.skipTest("no overlay policy in this tree")
+        with open(self.PATH) as f:
+            pol, _ = M.parse_policy(f.read(), source="policy")
+        names = sorted(n for n in os.listdir(os.path.join(CORE, "lander")) if n.endswith(".py"))
+        self.assertIn("tick.py", names)
+        for n in names:
+            on = M.match(pol.lander, f"core/lander/{n}")
+            self.assertNotEqual(on, n in self.NOT_LANDER, f"core/lander/{n}: on the lander list xor in NOT_LANDER")
 
     # The text forms of a lander import, read anywhere in a file: a Python import statement at any depth, a
     # `python3 -c '...'` string in a shell tool or inside a Python one, importlib.import_module("lander.x").
