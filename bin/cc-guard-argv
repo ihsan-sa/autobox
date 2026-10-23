@@ -72,14 +72,14 @@ Rules for both gated roles:
   or argv a pipe hands it through xargs/parallel; the one POST open is gh api graphql -f query='query…' or '{…'
   naming no mutation or subscription                                                                     -> deny
 - a worker's cc-slack post -c/--to a channel that is not the box's own (#<box>, #<repo>, each's -threads and
-  -updates lanes; <repo> from the worktree's .cc/track)                                                  -> deny
+  -updates lanes; <box> from the passwd home's ~/dev or ~/.cc/config, <repo> from the worktree's path)  -> deny
 - bypass: a launch in a command whose text (quotes off) names dangerously-skip-permissions, bypassPermissions or
   --permission-mode bypass, or whose --settings JSON or file names bypassPermissions or is computed     -> never
 - cc __runperms; cc-handoff --perms-dir; cc-try on|off|check                                         -> never
 - landing: cc-land but `-h`/`--help`/`selfcheck` alone; lander but plan/check/will-review/times/selfcheck/help;
   lander-self but status/selfcheck/help; core/lander/cli.py by its path (or ./cli.py inside it), python -m lander[.x],
   or interpreter code importing lander                                                             -> never
-- cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX; cc-settings apply|grant -> never
+- cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX|CC_BOX; cc-settings apply|grant -> never
 - write fence: a redirect target or the destination of cp mv ln install rsync tee dd(of=) sed -i perl -i truncate rm
   rmdir unlink shred touch mkdir chmod chown curl -o wget -O find -delete, or git -C <dir> (or the cwd) with a verb
   that writes the tree, landing (relative = after this command's own cd/pushd) in ~/dev/* (except GUARD_ROOT and
@@ -128,7 +128,7 @@ Member only:
 Not here (cc-guard keeps them, they need /proc or the tool input): tmux kill-server/kill-session, pattern kills,
 the member kill fence, the Write/Edit rules.
 """
-import fnmatch, glob, json, os, re, shlex, sys, tempfile
+import fnmatch, glob, json, os, pwd, re, shlex, sys, tempfile
 
 class ParseError(Exception):
     pass
@@ -272,7 +272,8 @@ GATED = ROOTV | POWERV | FW | PART | NET | CONT | SHELLS | set(WRAP) | WRITEV | 
 GITW = {'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'merge', 'mv', 'pull', 'rebase', 'reset',
         'restore', 'revert', 'rm', 'stash', 'switch', 'worktree', 'submodule', 'update-ref', 'symbolic-ref', 'init', 'clone'}
 LAUNCHERS = {'claude', 'cc', 'cc-loop', 'cc-room', 'cc-handoff', 'npx', 'bunx', 'node', 'codex'}
-PROTKEY = re.compile(r'(CC_PROTECTED_PATHS_\w*|SLACK_OWNER_ID|CC_LAND_REVIEW\w*|CC_CLAUDE|CC_CODEX)(=|$)')
+PWHOME = None   # the selfcheck's stand-in for the passwd home
+PROTKEY = re.compile(r'(CC_PROTECTED_PATHS_\w*|SLACK_OWNER_ID|CC_LAND_REVIEW\w*|CC_CLAUDE|CC_CODEX|CC_BOX)(=|$)')
 ASSIGN = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')
 BLOCKDEV = re.compile(r'/dev/(sd[a-z]|nvme\d|mmcblk\d|vd[a-z]|xvd[a-z]|hd[a-z]|md\d|dm-|mapper/|disk/|loop\d)')
 DEPLOYV = {'vercel', 'netlify', 'fly', 'flyctl', 'heroku', 'kubectl', 'terraform', 'ansible', 'aws', 'gcloud', 'az'}
@@ -554,8 +555,16 @@ class Guard:
 
     def ownchans(g):   # the box's channels and this worktree's repo's, each with its -threads and -updates lanes. The
         # repo is read off the worktree's path (~/.cc/worktrees/<repo>/<track>), never its .cc/track, which the worker
-        # writes (perms' read of 9bf1d03b)
-        names = {g.env.get('CC_BOX', '').lower()}
+        # writes (perms' read of 9bf1d03b). The box is named as the lander's box_name does: the repo this copy lives in
+        # under ~/dev, else CC_BOX in ~/.cc/config, both off the passwd home: never the environment's CC_BOX or HOME,
+        # which a worker sets
+        home = PWHOME or pwd.getpwuid(os.getuid()).pw_dir
+        dev, here, conf = home + '/dev/', os.path.realpath(__file__), home + '/.cc/config'
+        box = here[len(dev):].split('/')[0] if here.startswith(dev) else ''
+        if not box and os.path.isfile(conf):   # a FIFO there would hang the hook
+            with open(conf) as f:
+                box = next((v.strip().strip('\'"') for k, _, v in (l.strip().partition('=') for l in f) if k in ('CC_BOX', 'export CC_BOX')), '')
+        names = {box.lower()}
         m = re.search(r'/\.cc/worktrees/([^/:]+)/', g.root.split(':')[0] + '/')
         if m: names.add(m.group(1).lower())
         return {n + s for n in names if n for s in ('', '-threads', '-updates')}
@@ -1748,6 +1757,7 @@ UNIT = [   # (command, verbs that must be seen, verbs that must not)
 ]
 
 def selfcheck():
+    global PWHOME
     ok = bad = 0
     def fail(msg):
         nonlocal bad; bad += 1; print('FAIL ' + msg)
@@ -1897,6 +1907,24 @@ def selfcheck():
             got = judge(cmd, dict(base, GH_CONFIG_DIR=W + "/ghc"))
             if (got is not None) != refuse: fail(f'case GH_CONFIG_DIR: {cmd!r} -> {got}')
             else: ok += 1
+        # the box's own channels come from ~/.cc/config, never a CC_BOX the worker's environment sets
+        # (and HOME), and a worker never rewrites CC_BOX there
+        PWHOME = H
+        with open(H + '/.cc/config', 'w') as f: f.write("export CC_BOX='boxy'\n")
+        for cmd, env, refuse in [('cc-slack post -c other hi', {'CC_BOX': 'other'}, True),
+                                 ('cc-slack post -c boxy-threads hi', {'CC_BOX': 'other'}, False),
+                                 ('cc-slack post -c boxy hi', {'HOME': '/tmp', 'GUARD_HOME': '/tmp'}, False),
+                                 ('cc-config set CC_BOX other', {}, True), ('nice cc-config set CC_BOX=other', {}, True),
+                                 ('env A=1 cc-config unset CC_BOX', {}, True), ('cc-config set CC_BOXY x', {}, False)]:
+            got = judge(cmd, dict(base, **env))
+            if (got is not None) != refuse: fail(f'case CC_BOX: {cmd!r} -> {got}')
+            else: ok += 1
+        os.remove(H + '/.cc/config')
+        os.mkfifo(H + '/.cc/config')   # a FIFO in the config's place is skipped, not opened
+        if judge('cc-slack post -c boxy hi', base) is None: fail('case CC_BOX fifo: a box named with no config')
+        else: ok += 1
+        os.remove(H + '/.cc/config')
+        PWHOME = None
         path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'tests', 'guard-replay.jsonl')
         skipped = 0
         with open(H + '/never-touch.txt', 'w') as f: f.write('# fixture\n192.0.2.10\n')
