@@ -7,6 +7,11 @@
     pr_facts(root, pr, fields) -> (dict, "") | (None, why)     `gh pr view --json <fields> [-R <slug>]`'s answer,
         over REST (GET repos/<slug>/pulls/<pr>, .../files, the head's check-runs and status) when every field is in
         REST_FIELDS, else through that GraphQL call; a spent rate limit is said with its reset (spent)
+    get(root, path, token=None, timeout=120) -> (rc, body, stderr): `gh api <path>` (a GET), CONDITIONAL: the last
+        answer and its ETag are kept under <LANDQ>/gh-etag, and the GET carries If-None-Match, so an unchanged answer
+        is a 304, which costs no quota and gives the kept body. Always asked, even for a merged pull: a repo made
+        again under its name has a new #1. As #1898's cc-reconcile rest(): the box spent its REST hour 15-25 min
+        early, three times on 2026-10-23. prune_kept() drops kept answers a day old; the tick runs it.
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
         ("", "") when gh would not answer — which is never read as "not merged".
@@ -38,6 +43,8 @@ backoff() is the seconds left; any gh success clears it. The lane and the tick s
 from __future__ import annotations
 
 import contextlib
+import glob
+import hashlib
 import json
 import os
 import re
@@ -73,6 +80,8 @@ def _note(rc: int, out: str, err: str) -> None:
         return
     # a JSON stdout is a body (a title may say "timeout"), so only stderr counts then: gh api still says a spent
     # quota or a 502 there with rc != 0 while stdout holds GitHub's error JSON
+    if out.startswith("HTTP/"):   # get()'s -i: a header such as "Connection:" is no failure, so only the body counts
+        out = out.replace("\r\n", "\n").partition("\n\n")[2]
     said = err if out.strip().startswith(("{", "[")) else out + "\n" + err
     if not BACKOFF_RE.search(said):
         return
@@ -261,7 +270,7 @@ def pr_facts(root, pr, fields, token=None, timeout=120):
     if s and want and set(want) <= REST_FIELDS and str(pr).isdigit():
         j = {}
         if set(want) - {"files", "comments"}:   # statusCheckRollup needs the head this GET names
-            rc, out, err = gh(["api", f"repos/{s}/pulls/{int(pr)}"], root, token, timeout)
+            rc, out, err = get(root, f"repos/{s}/pulls/{int(pr)}", token, timeout)
             try:
                 p = json.loads(out) if not rc else None
             except ValueError:
@@ -443,6 +452,35 @@ def workflows_on(root, paths, token=None) -> bool:
 
 STARVED_RE = re.compile(r"not acquired by Runner", re.I)
 JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+
+
+def get(root, path, token=None, timeout=120):
+    from lander import jobs as J
+    f = f"{J.landq()}/gh-etag/{hashlib.sha1(path.encode()).hexdigest()}.json"
+    kept = J.read_json(f) or {}
+    body = kept.get("body")
+    tag = ["-H", f"If-None-Match: {kept['etag']}"] if kept.get("etag") and isinstance(body, dict) else []
+    rc, out, err = gh(["api", path, "-i", *tag], root, token, timeout)
+    head, _, out = out.replace("\r\n", "\n").partition("\n\n") if out.startswith("HTTP/") else ("", "", out)
+    if tag and re.match(r"HTTP/\S+ 304", head):
+        rc, out, err = 0, json.dumps(body), ""
+        _note(0, out, err)   # gh exits 1 on a 304, which is a success
+    else:
+        m = re.search(r"^etag: *(.+?)\s*$", head, re.I | re.M)
+        with contextlib.suppress(ValueError, OSError):
+            if m and not rc:
+                J.write_atomic(f, {"etag": m.group(1), "body": json.loads(out)})
+    return rc, out, err
+
+
+def prune_kept(age=86400):
+    """Drop get()'s kept answers older than `age`: a PR that closed is never asked again, and one still open is asked
+    once more with a 200, then kept again."""
+    from lander import jobs as J
+    for f in glob.glob(f"{J.landq()}/gh-etag/*.json"):
+        with contextlib.suppress(OSError):
+            if time.time() - os.path.getmtime(f) > age:
+                os.unlink(f)
 
 
 def api_json(root, path, token=None):

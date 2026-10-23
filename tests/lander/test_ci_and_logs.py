@@ -424,6 +424,7 @@ class RestFacts(unittest.TestCase):
         calls = []
 
         def gh(argv, root, token=None, timeout=120, note=True):
+            argv = [a for a in argv if a != "-i"]   # gh.get asks with -i for the ETag; these fakes give no headers
             calls.append(argv)
             got = answers.get(" ".join(argv))
             return got if isinstance(got, tuple) else (0, got, "") if got is not None else (1, "", "HTTP 404")

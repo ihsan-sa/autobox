@@ -353,6 +353,18 @@ class Tick(unittest.TestCase):
         self.assertIn("--repo solo", tick())                   # held edit: retried, and a tick armed for it
         self.assertEqual(calls, ["solo"])
 
+    def test_any_tick_arms_a_repo_named_only_by_a_handed_watch(self):
+        """Opus read: each repo's tick sweeps only its own handed watches, and dispatch had 7 and no timer (10-23)."""
+        os.makedirs(J.repo_root("solo"))
+        J.write_atomic(f"{J.handed_dir()}/solo-3.json", {"repo": "solo", "pr": 3, "head": "h" * 40, "branch": "b",
+                                                         "until": E.stamp(9999999999)})
+        with mock.patch.object(TK, "tip_and_deploy", lambda repo, units: []), \
+                mock.patch.object(TK, "nightly", lambda repo, units: []), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(TK.cmd_tick(["--repo", "demo"]), 0)
+        with open(self.arms) as f:
+            self.assertIn("--repo solo", f.read())             # demo's tick armed solo's, which sweeps the watch
+
     def test_a_repo_whose_checkout_is_gone_arms_no_timer(self):
         # 10-02/03: a suite fixture's timer re-armed ~77 times a day for a repo its run had deleted
         D.record_applied("demo", self.first)

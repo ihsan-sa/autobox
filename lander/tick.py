@@ -2,11 +2,12 @@
 
   lanes     each repo with a job or an inbox request (or just R) whose lane is not running: run it here, or with
             --detach start `lander lane <repo>` detached. A lane already running re-reads the queue itself.
-  handed    each handed-back watch (handed/<repo>-<pr>.json): past `until` -> removed, `handed-end`; the PR merged
-            or closed -> removed, `handed-end`; the branch head moved (ls-remote, under the member's token for a
-            member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the inbox, `handed-pushed`,
-            removed. The prior verdict is not carried: the reviewer finds it among the box's own PR markers.
-            A job for the PR already on the queue ends the watch.
+  handed    each handed-back watch (handed/<repo>-<pr>.json; R's only, when named): past `until` -> removed,
+            `handed-end`; the PR merged or closed -> removed, `handed-end`; the branch head moved (ls-remote, under the
+            member's token for a member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the
+            inbox, `handed-pushed`, removed. The prior verdict is not carried: the reviewer finds it among the box's
+            own PR markers.
+            A job for the PR already on the queue ends the watch. Then gh.prune_kept() drops kept PR answers a day old.
   repairs   each job held on a conflict (repair.CONFLICT) that a rebase round was started for at its head (the
             repair record's head is the job's): the branch head moved (ls-remote; '' on any doubt does nothing) ->
             a request (who "repair push", chat/ts) to the inbox, which makes the held job fresh, and a `notify`
@@ -82,7 +83,8 @@
   backoff   while the GitHub backoff runs (gh.py) no gh work is done: said once, lanes and watches wait.
   rearm     every tick (--rearm is accepted and adds nothing): ONE transient timer per repo that still waits on
             something — a job held with a not_before, a wanted tip run, a requested deploy, a deploy-pending job
-            while the tip is not red, an owed main health pass (health.pending), or a hold that ran out while a lane
+            while the tip is not red, an owed main health pass (health.pending), a handed watch (TICK_SECS: only its
+            repo's tick sweeps it, and any tick arms every repo that has one), or a hold that ran out while a lane
             runs (TICK_SECS: that lane may end without it). `systemd-run --user --on-active=<secs>
             --unit=lander-tick-<repo>-<epoch it fires> <core/bin/lander> tick --repo <repo> --rearm`, skipped when
             the user manager's list-timers shows a lander-tick-<repo>-* timer firing from now to then. A lane run
@@ -124,11 +126,13 @@ STRAY_GRACE = 600            # a seat that queues its own PR in the same turn ge
 STRAY_MAX_AGE = 48 * 3600    # an older PR that nothing queued was left open on purpose
 
 
-def sweep_handed() -> list:
+def sweep_handed(only="") -> list:
     lines = []
     for p in sorted(glob.glob(f"{J.handed_dir()}/*.json")):
         w = J.read_json(p) or {}
         repo, pr = w.get("repo") or "", w.get("pr")
+        if only and repo != only:   # brief: "read each PR once per tick round across repos" (18 units read all)
+            continue
         if not (isinstance(pr, int) and J.REPO_RE.fullmatch(repo)) or os.path.basename(p) != f"{repo}-{pr}.json":
             with contextlib.suppress(OSError):
                 os.replace(p, p + ".unreadable")
@@ -538,6 +542,8 @@ def waits(repo) -> list:
     # HL.pending: a killed pass or a want a skipped tick left; health.TRIES bounds how long a pass stays owed
     if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))) \
             or HL.pending(repo):
+        out.append(TICK_SECS)
+    if glob.glob(f"{J.handed_dir()}/{repo}-*.json"):   # its handed watches: only its own tick sweeps them
         out.append(TICK_SECS)
     if C.left_held(repo):   # a held last card edit (retry_cards): a tick once the cap or the 429's back-off lets it go
         # …but a running lane hands it over itself and retry_cards skips it, so one TICK_SECS tick looks again after,
@@ -964,7 +970,8 @@ def cmd_tick(argv) -> int:
     if wait:
         lines.append(f"lander: GitHub backoff — {wait}s left; lanes and handed watches wait for it")
     else:
-        lines += sweep_handed()
+        lines += sweep_handed(repo)
+        GH.prune_kept()
         lines += sweep_repairs()
         lines += sweep_strays(known_repos(repo))
         lines += sweep_ended(repo)
@@ -983,7 +990,10 @@ def cmd_tick(argv) -> int:
     for r in known:
         lines += tip_and_deploy(r, units)
         lines += nightly(r, units)
-    lines += rearm(list(dict.fromkeys(repos + known + carded_repos(repo))))
+    # any tick arms a repo with handed watches, so one whose own timer had lapsed is swept again
+    handed = [(J.read_json(p) or {}).get("repo") or "" for p in glob.glob(f"{J.handed_dir()}/*.json")]
+    handed = [r for r in handed if J.REPO_RE.fullmatch(r)]
+    lines += rearm(list(dict.fromkeys(repos + known + carded_repos(repo) + handed)))
     for ln in lines:
         print(ln)
     return 0
