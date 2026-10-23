@@ -80,6 +80,7 @@ Rules for both gated roles:
   lander-self but status/selfcheck/help; core/lander/cli.py by its path (or ./cli.py inside it), python -m lander[.x],
   or interpreter code importing lander                                                             -> never
 - cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX|CC_BOX; cc-settings apply|grant -> never
+  (set|unset with any key not spelt out: computed, a glob, from xargs or find -exec; a computed subcommand) -> never
 - write fence: a redirect target or the destination of cp mv ln install rsync tee dd(of=) sed -i perl -i truncate rm
   rmdir unlink shred touch mkdir chmod chown curl -o wget -O find -delete, or git -C <dir> (or the cwd) with a verb
   that writes the tree, landing (relative = after this command's own cd/pushd) in ~/dev/* (except GUARD_ROOT and
@@ -562,8 +563,10 @@ class Guard:
         dev, here, conf = home + '/dev/', os.path.realpath(__file__), home + '/.cc/config'
         box = here[len(dev):].split('/')[0] if here.startswith(dev) else ''
         if not box and os.path.isfile(conf):   # a FIFO there would hang the hook
-            with open(conf) as f:
-                box = next((v.strip().strip('\'"') for k, _, v in (l.strip().partition('=') for l in f) if k in ('CC_BOX', 'export CC_BOX')), '')
+            try:
+                with open(conf) as f:
+                    box = next((v.strip().strip('\'"') for k, _, v in (l.strip().partition('=') for l in f) if k in ('CC_BOX', 'export CC_BOX')), '')
+            except (OSError, UnicodeDecodeError): pass   # unreadable or swapped: no box name, never a crash
         names = {box.lower()}
         m = re.search(r'/\.cc/worktrees/([^/:]+)/', g.root.split(':')[0] + '/')
         if m: names.add(m.group(1).lower())
@@ -642,7 +645,7 @@ class Guard:
                 for sub in subs_in(r['body']): g.script(sub, cwdl[0], '$()', depth + 1)
         ws = []
         for w in cur['words']:
-            ws += [w.like(x) for x in bexp(w.v)] if w.brace else [w]
+            ws += [w.like(x) for x in bexp(w.v) if x] if w.brace else [w]   # bash drops an empty result
         i = 0
         while i < len(ws) and not ws[i].q and ws[i].v in KW: i += 2 if ws[i].v == 'function' else 1
         assigns = []
@@ -1482,6 +1485,12 @@ class Guard:
         if v == 'cc-config' and mem: return 'never', "the box's config is not a member's to read or rewrite (cc-config)"
         if v == 'cc-config' and first in ('set', 'unset') and len(n) > 1 and PROTKEY.match(n[1]):
             return 'never', f'cc-config {first} {n[1].split("=")[0]}: a key the landing gate reads'
+        if v == 'cc-config':   # set|unset take a key spelt out: a computed, glob or handed-in key (xargs, find -exec) may be a
+            # held one, and a computed subcommand (a function's "$@") may be set (the Opus reads of #1901 and its repair)
+            sub, key = ([w for w in R['argw'] if not w.v.startswith('-')] + [None, None])[:2]
+            if (sub and sub.dyn) or (first in ('set', 'unset') and (not key or key.dyn or key.glob or '{' in key.v
+                                                                     or {'xargs', 'parallel', 'find -exec'} & set(R['via']))):
+                return 'never', f'cc-config {first}: spell the key out (a computed key may be one the landing gate reads)'
         if v == 'cc-settings' and first in ('apply', 'grant'): return 'never', 'cc-settings rewrites the permission layer'
         # typing into a session's prompt is text arriving with a seat's authority (both roles); a plain post to the owner's
         # own channel reaches nobody outside, so only a member is held off it (a member's reach stays what it was)
@@ -1847,7 +1856,31 @@ def selfcheck():
                 ('pf', None, 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json; cat ~/.claude-workers/.credentials.json', True),
                 ('pf', None, "cc-notify --run 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json' t", True),
                 ('pf', None, "cc-notify --approval --run 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json; jq . ~/.claude-workers/.credentials.json' t", True),
-                ('worker', 'track/x', 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json', True)]:
+                ('worker', 'track/x', 'cc-config set WORKER_CLAUDE_CREDENTIALS ~/.claude-workers/.credentials.json', True),
+                # a held key the command computes is refused like a spelt one (the Opus read of #1901); a non-held one passes
+                *[('worker', 'track/x', c, True) for c in (
+                    'cc-config set SLACK_OWNER_ID x', 'cc-config unset CC_CLAUDE', "cc-config set 'CC_CO''DEX' x",
+                    'K=SLACK_OWNER_ID; cc-config set $K x', 'cc-config set "$K" x', 'cc-config set $(echo CC_CLAUDE) x',
+                    'cc-config set `echo CC_CODEX` x', 'cc-config set ${K:-CC_CLAUDE} x', 'cc-config unset CC_CLAUDE$X',
+                    'touch CC_CLAUD; cc-config set CC_CLAU? x', 'cc-config set CC_LAND_REVIEW_[A-Z]* x', 'cc-config set CC_{CLAUDE,X} x',
+                    'f(){ cc-config "$@"; }; f set SLACK_OWNER_ID x', 'xargs cc-config set < keys.txt',
+                    'cc-config set $(echo CC_BOX) x', 'touch CC_BOX; cc-config set CC_BO? x', 'f(){ cc-config "$@"; }; f set CC_BOX x',
+                    # a computed key is refused whatever it holds (the repair's Opus read): no value is tracked
+                    'K=FOO; cc-config set $K x', 'cc-config set FOO_$K x', 'cc-config set CC_CLAUDEX$Y x', 'cc-config set FO? x',
+                    "K='SLACK_OWNER_ID x'; cc-config set $K", "K='SLACK_OWNER_ID '; cc-config set $K x",
+                    'K=FOO; cc-config set ${K/FOO/SLACK_OWNER_ID} x', 'K=FOO; cc-config set ${K:+CC_CLAUDE} x',
+                    'K=cc_claude; cc-config set ${K^^} x', 'K=XXCC_BOX; cc-config set ${K#XX} x', 'K=CC_BOXXX; cc-config set ${K%XX} x',
+                    'K=FOO; cc-config set ${K:0:0}CC_CLAUDE x', 'a=(CC_BOX); cc-config set $a x', 'a=(CC_BOX); cc-config set "${a[@]}" x',
+                    'a=(CC_BOX); cc-config set ${a[0]} x', 'K=SLACK_OWNER_ID; true || K=FOO; cc-config set $K x',
+                    'K=SLACK_OWNER_ID; (K=FOO); cc-config set $K x', 'K=SLACK_OWNER_ID; if false; then K=FOO; fi; cc-config set $K x',
+                    'K=SLACK_OWNER_ID; g(){ K=FOO; }; cc-config set $K x', 'K=SLACK_OWNER_ID; : $(K=FOO); cc-config set $K x',
+                    'K=SLACK_OWNER_ID; true | K=FOO; cc-config set $K x', 'K=$(echo FOO | sed s/FOO/SLACK_OWNER_ID/); cc-config set $K x',
+                    r'find CC_BOX -exec cc-config set {} x \;', 'find CC_BOX -execdir cc-config set {} x +',
+                    r'find CC_BOX -ok cc-config set {} x \;', 'find CC_BOX -exec cc-config unset {} +',
+                    'xargs -I{} cc-config set {} x < keys', 'xargs -I K cc-config set K x < keys',
+                    'cc-config set {,CC_BOX} x')],
+                *[('worker', 'track/x', c, False) for c in (
+                    'cc-config get $K', 'cc-config set FOO x', 'cc-config set FOO "$V"', 'cc-config set FOO $(date)', 'cc-config list')]]:
             cwd = repo(branch, branch != 'main') if branch else H + '/dev/alice'
             env = dict(base, GUARD_ROLE=role, GUARD_CWD=cwd, GUARD_ROOT=cwd, GUARD_MWS='alice' if role == 'member' else '')
             got = judge(cmd, env)
@@ -1922,6 +1955,10 @@ def selfcheck():
         os.remove(H + '/.cc/config')
         os.mkfifo(H + '/.cc/config')   # a FIFO in the config's place is skipped, not opened
         if judge('cc-slack post -c boxy hi', base) is None: fail('case CC_BOX fifo: a box named with no config')
+        else: ok += 1
+        os.remove(H + '/.cc/config')
+        with open(H + '/.cc/config', 'wb') as f: f.write(b"export CC_BOX='boxy'\xff\n")   # unreadable text names no box
+        if judge('cc-slack post -c boxy hi', base) is None: fail('case CC_BOX unreadable: a box named from a bad config')
         else: ok += 1
         os.remove(H + '/.cc/config')
         PWHOME = None
