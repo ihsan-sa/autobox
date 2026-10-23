@@ -10174,6 +10174,19 @@ def run_selfcheck():
         tk_21, tk_22 = tk_file(dmTK2, "dana", "the list", pid=21), tk_file(dmTK2, "dana", "the list again", pid=22)
         check("ONE ASK, ONE ANSWER: two sessions on the same target are told apart by their link — the second's file is refused",
               tk_21.get("ok") and not tk_22.get("ok") and upTK == ["the list"])
+        upTK.clear()
+        dmTKx = tk_daemon(["dana/pna-cad"])                   # pid 99 is no session of dana's: a script inside the boundary
+        tk_x1 = tk_file(dmTKx, "dana", "from a script", pid=99)
+        no_claim = not dmTKx.takers
+        tk_x2 = tk_file(dmTKx, "dana/pna-cad", "the list")
+        dmTKy = tk_daemon(["dana/pna-cad"])
+        tk_y1 = tk_file(dmTKy, "dana/pna-cad", "the list")
+        tk_y2 = tk_file(dmTKy, "dana", "from a script", pid=99)
+        check("ONE ASK, ONE ANSWER: a caller that is no live session posts while nobody holds the ask, is refused while a live "
+              "session holds it, and never takes the claim — a live session's later file still takes it",
+              tk_x1.get("ok") and no_claim and tk_x2.get("ok") and dmTKx.takers[("CDANA", "8.0")][1] is dmTKx.subs["dana/pna-cad"][0]
+              and tk_y1.get("ok") and not tk_y2.get("ok") and "already answered" in tk_y2.get("error", "")
+              and upTK == ["from a script", "the list", "the list"])
         real_kept_tk = ASKS_KEPT; globals()["ASKS_KEPT"] = 2
         try:
             dmTKb = tk_daemon([], ask=None)
