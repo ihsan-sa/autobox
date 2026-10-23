@@ -1062,7 +1062,7 @@ def ask_codex(text, repo, pr, digest, model):
             json.dump(strict(SCHEMA), f)
         rc, out = C.sh(argv + ["-"], cwd=cwd, input=text, timeout=READ_TIMEOUT, env=codex_env())
         if rc == 124:   # what codex printed before the kill, kept for whoever reads why the read hung
-            with open(C.state(f"{repo}-{pr}.codex-timeout.log"), "w") as f:
+            with contextlib.suppress(OSError), open(C.state(f"{repo}-{pr}.codex-timeout.log"), "w") as f:
                 f.write(out)
         usd = codex_usd(rc, out)
         try:

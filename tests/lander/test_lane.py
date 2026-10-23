@@ -4699,6 +4699,21 @@ class Parallel(Fixture):
             self.assertEqual(lane.loop(set()), "/rel/new")
         self.assertEqual(self.job(1).state, T.HELD)
 
+    def test_a_git_error_met_at_a_promote_holds_the_job_and_an_unpin_tells_the_seat(self):
+        # a read #1895 (10-23): a G.GitError escaped loop() and the lane exited without starting the new release's lane
+        lane, one, _, submitted = self.reads_lane()
+        J.save(one)
+        lane.review(one)
+        submitted[0].set_exception(G.Unpinned("no pin"))
+        pins = []
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"), \
+                mock.patch.object(lane, "tell_pin", lambda job, why: pins.append(why)):
+            self.assertEqual(lane.loop(set()), "/rel/new")
+            for t in [t for t in threading.enumerate() if t.name == "pin"]:
+                t.join(10)
+        got = self.job(1)
+        self.assertEqual((got.state, got.extra["hold"], pins), (T.HELD, "box", ["no pin"]))
+
     def test_a_checking_job_with_no_box_check_keeps_the_slot_from_a_second_one(self):
         lane, me, (c,) = self.spare_lane(T.CHECKING)
         self.assertFalse(lane.spare_box(me))   # a check left and none on the box: it wants a box slot

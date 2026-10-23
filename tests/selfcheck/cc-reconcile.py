@@ -2136,17 +2136,17 @@ def selfcheck():
            decide(F(status="review", pr="u", pr_state=got["a"], wt_exists=False, worked=True))[0][:2] == ("fix", "merged")
            and not any("worktree" in w for _, _, w in decide(F(status="review", pr="u", pr_state=got["b"],
                                                                  wt_exists=False, worked=True))))
-        real_rest, pages = rest, []
+        real_kept, pages = rest_kept, []
         def rest_pages(repo, path, timeout=20):   # page 1 full of newer PRs; the board's old PR 5 is on page 2
             pages.append(path)
             if path.endswith("&page=1"):
                 return [{"number": 1000 + i, "state": "open", "merged_at": None} for i in range(100)]
             return [{"number": 5, "state": "closed", "merged_at": "2026-09-20T00:00:00Z"}] if path.endswith("&page=2") else []
         try:
-            globals()["rest"] = rest_pages
+            globals()["rest_kept"] = lambda *a, **k: (rest_pages(*a, **k), False)
             paged = board_pr_states("zz", ["https://github.com/o/zz/pull/5", "https://github.com/o/zz/pull/1003"])
         finally:
-            globals()["rest"] = real_rest
+            globals()["rest_kept"] = real_kept
         ok("PR BATCH PAGES: a PR older than the 100 newest is read off the next page, not left to the "
            "capped one-at-a-time reads, and the paging stops once every PR the board names is seen",
            paged == {"https://github.com/o/zz/pull/5": "MERGED", "https://github.com/o/zz/pull/1003": "OPEN"}
@@ -2160,10 +2160,10 @@ def selfcheck():
         for names in (["1150", "99999"], ["1050"], ["1003", "99999"]):
             pages.clear()
             try:
-                globals()["rest"] = rest_deep
+                globals()["rest_kept"] = lambda *a, **k: (rest_deep(*a, **k), False)
                 deep[tuple(names)] = (board_pr_states("zz", names), len(pages))
             finally:
-                globals()["rest"] = real_rest
+                globals()["rest_kept"] = real_kept
         ok("…and a number the list goes by without showing (an issue's, a typo, one past the newest) stops the "
            "paging there, so it never reads the whole list on the core quota the lander needs (perms on #1547)",
            deep == {("1150", "99999"): ({}, 1), ("1050",): ({}, 2), ("1003", "99999"): ({"1003": "OPEN"}, 2)})
@@ -2174,12 +2174,12 @@ def selfcheck():
             return [{"number": n, "state": "open", "merged_at": None} for n in range(1200, 1100, -1)]
         pages.clear()
         try:
-            globals()["rest"] = rest_round
+            globals()["rest_kept"] = lambda *a, **k: (rest_round(*a, **k), False)
             round_ = board_pr_states("zz", ["1150", "5"])
         except RuntimeError:
             round_ = None
         finally:
-            globals()["rest"] = real_rest
+            globals()["rest_kept"] = real_kept
         ok("…and a page no lower than the one before (the list going round) stops the paging as a failed read: the PR "
            "it never reached is left to the one-at-a-time reads, never read as no PR",
            round_ == {"1150": "OPEN"} and len(pages) == 2)
@@ -2214,8 +2214,38 @@ def selfcheck():
            "never written through",
            m1 == m2 == {"merged_at": "2026-10-23T00:00:00Z"} and len(open(f"{te}/gh.log").read().splitlines()) == 4
            and not os.path.islink(kf) and open(f"{te}/target").read() == "mine\n")
+        def kept(path):
+            return f"{STATE}/reconcile-gh/{hashlib.sha1(f'{DEV}/zz {path}'.encode()).hexdigest()}.json"
+        os.makedirs(f"{STATE}/reconcile-gh", exist_ok=True); before = len(open(f"{te}/gh.log").read().splitlines())
+        os.mkfifo(kept("repos/o/zz/pulls/10"))
+        open(kept("repos/o/zz/pulls/11"), "w").write("[1]")
+        ok("…a FIFO planted where a copy is kept is never opened (it hung the read), and a copy that is not an object is "
+           "no copy: both GETs go out plain",
+           rest("zz", "repos/o/zz/pulls/10") == rest("zz", "repos/o/zz/pulls/11") == {"merged_at": None}
+           and not any("If-None-Match" in c for c in open(f"{te}/gh.log").read().splitlines()[before:]))
     finally:
         restore(); shutil.rmtree(te, ignore_errors=True)
+    # A PLANTED COPY CANNOT SETTLE A ROW: anyone who can write a kept copy can give it a current ETag, so a 304 would
+    # answer with its body. A merge from the kept copy is asked again plainly before a row settles on it (perms' read
+    # of #1898). Own fixture: GitHub says not merged, the planted copies say merged, and any conditional GET is a 304.
+    tp = tempfile.mkdtemp(prefix="cc-reconcile-plant-")
+    try:
+        scratch(tp, dict(NOOP, gh=f'echo "$*" >> {tp}/gh.log; case "$*" in *If-None-Match*) '
+                                  f'printf "HTTP/2.0 304 Not Modified\\r\\n\\r\\n"; exit 1;; esac; '
+                                  f'printf "HTTP/2.0 200 OK\\r\\n\\r\\n{{\\"state\\": \\"open\\", \\"merged_at\\": null}}"'))
+        os.makedirs(f"{tp}/dev/zz"); os.makedirs(f"{STATE}/reconcile-gh")
+        merged = {"number": 12, "state": "closed", "merged_at": "2026-10-23T00:00:00Z"}
+        for path, body in (("repos/{owner}/{repo}/pulls/12", merged),
+                           ("repos/{owner}/{repo}/pulls?state=all&sort=created&direction=desc&per_page=100&page=1", [merged])):
+            json.dump({"etag": 'W/"e1"', "body": body},
+                      open(f"{STATE}/reconcile-gh/{hashlib.sha1(f'{DEV}/zz {path}'.encode()).hexdigest()}.json", "w"))
+        batch, alone = board_pr_states("zz", ["12"]), pr_state("zz", "12")
+        calls = open(f"{tp}/gh.log").read().splitlines()
+        ok("PLANT: a merge a planted copy says, vouched for by a 304, settles no row: the board's list leaves it out and "
+           "the PR alone is asked again with a plain GET, whose answer stands",
+           batch == {} and alone == "OPEN" and len(calls) == 3 and "If-None-Match" not in calls[2])
+    finally:
+        restore(); shutil.rmtree(tp, ignore_errors=True)
     # (b) the tick wakes an idle seat once for a startable row, not again for the same state, never for a channel repo
     tb = tempfile.mkdtemp(prefix="cc-reconcile-wake-")
     try:

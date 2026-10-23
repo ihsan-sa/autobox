@@ -688,34 +688,43 @@ def pull_path(url):
     return f"repos/{{owner}}/{{repo}}/pulls/{m.group(1)}" if m else None
 
 
-def rest(repo, path, timeout=20):
+def rest(repo, path, timeout=20, fresh=False):
     """`gh api <path>` (a GET) from the repo's checkout, parsed; None when GitHub could not be asked. REST, not GraphQL:
     the box's login runs out of its GraphQL hour while REST still has quota (2026-10-19). The exit code is read before
     stdout: on a refusal gh prints GitHub's error JSON there, and that is never an answer.
     CONDITIONAL: the last answer and its ETag are kept per checkout and path, and the GET carries If-None-Match, so an
     unchanged answer is a 304 that costs no quota. The login spent its whole REST hour in about 45 min, every hour,
     and the lander stalled each time (2026-10-23). Every read still asks, so a kept copy is only ever what GitHub
-    just said is current, and it is replaced by rename, never written through a planted link (perms' read of #1898)."""
+    just said is current, and it is replaced by rename, never written through a planted link (perms' read of #1898).
+    It is read the same way: no link followed, nothing but a regular file opened (a FIFO there hung the read), and a
+    body that is not an object is no copy. But anyone who can write that file can give it a current ETag, so a merge
+    it says is not the box's own word: rest_kept() says when the answer was the copy, and a caller that settles a row
+    on a merge asks again with fresh=True (a plain GET) first."""
+    return rest_kept(repo, path, timeout, fresh)[0]
+
+
+def rest_kept(repo, path, timeout=20, fresh=False):
+    """(rest()'s answer, True when that answer is the kept copy a 304 vouched for)."""
     cwd = f"{DEV}/{repo}"
     f = f"{STATE}/reconcile-gh/{hashlib.sha1(f'{cwd} {path}'.encode()).hexdigest()}.json"
-    try:
-        kept = json.load(open(f))
-    except Exception:
-        kept = {}
+    kept = {}
+    with contextlib.suppress(Exception), os.fdopen(os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as r:
+        kept = json.load(r) if stat.S_ISREG(os.fstat(r.fileno()).st_mode) else {}
+    kept = kept if isinstance(kept, dict) and not fresh else {}
     tag = ["-H", f"If-None-Match: {kept['etag']}"] if kept.get("etag") else []
     p = sh("gh", "api", "-i", *tag, path, cwd=cwd if os.path.isdir(cwd) else None, timeout=timeout)
     if p is None:
-        return None
+        return None, False
     head, _, out = (p.stdout.replace("\r\n", "\n").partition("\n\n") if p.stdout.startswith("HTTP/")
                     else ("", "", p.stdout))   # -i's headers, which a selfcheck's fake gh leaves out
     if tag and re.match(r"HTTP/\S+ 304", head):
-        return kept.get("body")
+        return kept.get("body"), True
     if p.returncode:
-        return None
+        return None, False
     try:
         got = json.loads(out or "null")
     except Exception:
-        return None
+        return None, False
     m = re.search(r"^etag: *(.+?)\s*$", head, re.I | re.M)
     if m:
         with contextlib.suppress(OSError):
@@ -724,13 +733,16 @@ def rest(repo, path, timeout=20):
             with os.fdopen(fd, "w") as w:
                 json.dump({"etag": m.group(1), "body": got}, w)
             os.replace(tmp, f)
-    return got
+    return got, False
 
 
-def rest_pull(repo, url, timeout=20):
-    """The PR's REST object, or None when it names no pull or GitHub could not be asked."""
+def rest_pull(repo, url, timeout=20, settles=False):
+    """The PR's REST object, or None when it names no pull or GitHub could not be asked. For a caller that `settles`
+    a row on it, a merge the kept copy says is asked again with a plain GET (rest()'s docstring)."""
     path = pull_path(url)
-    j = rest(repo, path, timeout) if path else None
+    j, kept = rest_kept(repo, path, timeout) if path else (None, False)
+    if kept and settles and isinstance(j, dict) and j.get("merged_at"):
+        j = rest(repo, path, timeout, True)
     return j if isinstance(j, dict) else None
 
 
@@ -743,7 +755,7 @@ def pr_state(repo, url, net=True):
     """MERGED / OPEN / CLOSED, '?' when GitHub could not answer, None when never asked."""
     if not net or not url or not shutil.which("gh"):
         return None if not net else "?"
-    j = rest_pull(repo, url)
+    j = rest_pull(repo, url, settles=True)   # a MERGED here settles rows, so never on the kept copy's word alone
     s = rest_state(j) if j is not None else ""
     return s if s in ("MERGED", "OPEN", "CLOSED") else "?"
 
@@ -773,14 +785,16 @@ def board_pr_states(repo, prs, net=True):
         # every number not yet seen: a number the list went by without showing is no PR of this repo (an issue's, a
         # typo), and paging on for it read the whole list each run on the core quota the lander needs (perms, #1547)
         while any(n not in got and (low is None or n < low) for n, _ in want):
-            rows = rest(repo, f"repos/{owner}/{name}/pulls?state=all&sort=created&direction=desc&per_page=100"
-                              f"&page={page}", timeout=30)
+            rows, kept = rest_kept(repo, f"repos/{owner}/{name}/pulls?state=all&sort=created&direction=desc"
+                                        f"&per_page=100&page={page}", timeout=30)
             if not isinstance(rows, list):
                 break
             nums = [r.get("number") for r in rows if isinstance(r, dict) and isinstance(r.get("number"), int)]
             if nums and low is not None and min(nums) >= low:   # a page no lower than the last: the list went round
                 break
-            got.update((r.get("number"), rest_state(r)) for r in rows if isinstance(r, dict))
+            # a merge on a kept page is left out, so pr_state() asks that PR again before its row settles
+            got.update((r.get("number"), "?" if kept and r.get("merged_at") else rest_state(r))
+                       for r in rows if isinstance(r, dict))
             if len(rows) < 100 or not nums:
                 break
             low = min(nums if low is None else nums + [low])

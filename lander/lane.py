@@ -689,8 +689,8 @@ class Lane:
                     if j.key in self.reading:   # its verdict is saved; a LAND carries to the next lane (landed_at)
                         try:
                             self.review(j)
-                        except UnitFault as e:
-                            self.hold(j, str(e), kind="box")
+                        except (UnitFault, G.GitError) as e:
+                            self.hold(j, str(e), kind="box", pin=isinstance(e, G.Unpinned))
                 return moved
             if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
                 self.reap(0)   # a finished check is recorded (its slot freed) even while queued jobs keep todo full

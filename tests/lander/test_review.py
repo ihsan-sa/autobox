@@ -1762,6 +1762,14 @@ class TestTwoReaders(Case):
         self.assertEqual(R.stand_in(j, "gpt-astra-test", R.TIMED_OUT, {"silent": {"reader": "gpt-astra-test",
                                                                                  "why": R.TIMED_OUT, "head": HEAD}}), "")
 
+    def test_a_timeout_whose_output_cannot_be_kept_is_still_a_timeout(self):
+        # a read of #1895 (10-23): the dump's OSError made a plain timeout a reviewer fault
+        self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        os.makedirs(C.state("demo-7.codex-timeout.log"))   # a directory where the log goes: open() fails
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertIn("rc=124", v.extra["why"])
+
     def test_a_stand_in_that_fails_too_holds_the_pr_at_the_next_failure(self):
         # Opus read, 10-23: the stand-in's failure marked the PR with its own name, so the next read asked the hung
         # reader again for a full timeout, and the two took turns at one head forever with nobody told
