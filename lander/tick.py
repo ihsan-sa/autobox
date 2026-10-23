@@ -38,6 +38,8 @@
             moves under the rest lock; a held job is the lane's, so it moves only while no lane runs (the lane lock,
             never waited on). Nothing is posted, closed on a board or deployed for it:
             the tip catch-up deploys main. One repo's fault is said and logged (tick-fault), never the tick's end.
+  limits    each job held on a usage limit, before its until, once `cc-limit status` says clear: a request to the
+            inbox, which asks it again (lift_limits). Such a hold wants a tick every review.RETRY_AFTER (waits).
             `lander settle-merged <repo> <pr> [--by WHO]` runs the same for one PR at once (lander-self land calls it).
   landed    each query job host_hold ended at a head perms' ledger now records a LAND for, at the job's change
             (review.perms_recorded; no gh call): a request to the inbox, so this tick's lane runs it again. Any
@@ -449,6 +451,23 @@ def sweep_ended(repo="") -> list:
     return lines
 
 
+def lift_limits(repo="") -> list:
+    """The tick's `limits` step: a job held on a usage limit (extra.limit) is asked again once `cc-limit status` says
+    clear, whatever its stored until (10-23: an old login's stamp held 14 PRs' reviews for hours after the box had
+    moved to an account with room). An inbox request does it (jobs.drain), so a running lane takes it too, and one
+    already waiting is enough. cc-limit is asked once a tick, and only while such a hold runs. Only a limit cc-limit
+    has a stamp of is marked (review.STAMPED, _buy): one it never saw would read clear and be asked every tick."""
+    held = [(r, j.pr) for r in ([repo] if repo else J.all_repos()) for j in J.lane_jobs(r)
+            if j.state == T.HELD and j.extra.get("limit") and J.not_before_left(j)]
+    if not held or C.sh([os.path.join(R.BIN, "cc-limit"), "status"], timeout=60)[0] != 1:   # 1 = clear; a fault is not
+        return []
+    waiting = {(q["repo"], q["pr"]) for _, q in J.requests()}
+    for r, pr in held:
+        if (r, pr) not in waiting:
+            J.submit(r, pr, who="limit")
+    return [f"[{r}] PR #{pr}: the usage limit it was held on has gone, so it is asked again" for r, pr in held]
+
+
 def sweep_landed(repo="") -> list:
     """The tick's `landed` step: a query job host_hold ended at a head that perms' ledger now records a LAND for, at
     the job's change (review.perms_recorded, what the host check itself runs on), goes back in the lane however the
@@ -532,7 +551,9 @@ def waits(repo) -> list:
     """Seconds until each thing the repo still waits on wants a tick; [] when nothing does. A tip that is red waits
     on a person (or the next merge, whose lane kicks the tip itself), not on a clock."""
     jobs = J.lane_jobs(repo)
-    held = [J.not_before_left(j) for j in jobs if j.state == T.HELD and j.extra.get("not_before")]
+    # a usage limit's hold is looked at every RETRY_AFTER, whatever its until: lift_limits ends it with the limit
+    held = [min(J.not_before_left(j), R.RETRY_AFTER) if j.extra.get("limit") else J.not_before_left(j)
+            for j in jobs if j.state == T.HELD and j.extra.get("not_before")]
     out = [w for w in held if w > 0]
     if 0 in held and J.running(repo):   # a hold ran out while a lane runs: a lane that ends without it is followed up
         out.append(TICK_SECS)
@@ -976,6 +997,7 @@ def cmd_tick(argv) -> int:
         lines += sweep_strays(known_repos(repo))
         lines += sweep_ended(repo)
         lines += sweep_landed(repo)
+        lines += lift_limits(repo)
         repos = [repo] if repo else J.all_repos()   # a push or a stray may have queued a new repo
         for r in repos:
             if J.running(r):

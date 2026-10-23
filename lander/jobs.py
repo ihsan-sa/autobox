@@ -546,7 +546,9 @@ def _drain(repo: str) -> list:
                 if req.get(k) and not job.extra.get(k):
                     job.extra[k] = req[k]
             if job.state == T.CHECKING:   # lane.reread: a push mid-check is the commonest `again`
-                job.extra["reread"] = True   # only a checking job reads it; any other `again` leaves the job as it was
+                job.extra["reread"] = True   # only a checking job reads it
+            elif job.state == T.HELD and job.extra.get("limit"):   # a usage limit's hold is asked again now: a live
+                job.extra["not_before"] = E.stamp()                # limit holds it again with no read (review._buy)
             save(job)
             E.log("again", repo, pr)
             lines.append(f"{repo}#{pr} again")

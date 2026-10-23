@@ -614,4 +614,44 @@ EOF
     "$rc $(( SECONDS - s0 < 10 )) $(grep -c '^note:' <<<"$out") $(grep -cx clear <<<"$out")" '1 1 0 1'
   rm -rf "$d2"
 
+  # A LIMIT IS ONE ACCOUNT'S (2026-10-23: the old login's six-day weekly wall held the lander's reviews after the box
+  # had moved to another account). Its own HOME, whose .claude.json says which login is current.
+  d3=$(mktemp -d); mkdir -p "$d3/.cc/state"
+  la(){ jq -n --arg u "$1" '{oauthAccount: {accountUuid: $u}}' > "$d3/.claude.json"; }
+  sa(){ HOME="$d3" PATH="$d/bin:$PATH" CC_LIMIT_BIN="$d/bin" CC_LIMIT_STAMP="$d3/.cc/state/claude-limit" \
+    CC_LIMIT_RECORD="$d3/.cc/state/limit-interrupted" CC_LIMIT_SEEN="$d3/.cc/state/limit-seen" CC_FAKE_CALLS="$d3/calls" \
+    CC_LIMIT_NOW="$t0" CC_LIMIT_OBSERVER=x CC_LIMIT_MODEL_WAIT=1 bash "$SELF" "$@"; }
+  printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t0 + 6 * 86400))" +%Y-%m-%dT%H:%M:%SZ)" > "$d3/run.json"
+  la old-login; sa check "$d3/run.json" >/dev/null 2>&1
+  t 'the stamp names the account it was read on' \
+    "$(cut -f6 "$d3/.cc/state/claude-limit")" "$(printf old-login | md5sum | cut -c1-8)"
+  sed -i 's/\t[0-9a-f]*\t\([0-9a-f]*\)$/\taaaaaaaa,bbbbbbbb\t\1/' "$d3/.cc/state/claude-limit"   # two runs: account-wide
+  t 'a real wall on the current login still holds, with nothing spent to learn it' "$(sa status 2>/dev/null; echo $?)" \
+    "usage limit until $(date -u -d "@$((t0 + 6 * 86400))" +%H:%M)Z (8640m left)
+0"
+  la new-login; out=$(sa status 2>&1); rc=$?
+  t 'the box on another login: that account'"'"'s wall does not bind it, and a person reading status is told why' \
+    "$rc $(grep -cx clear <<<"$out") $(grep -c 'another login' <<<"$out")" '1 1 1'
+  t '…and does not hold a wait either' "$(sa wait >/dev/null 2>&1; echo $?)" 0
+  cut -f1-5 "$d3/.cc/state/claude-limit" > "$d3/s" && mv "$d3/s" "$d3/.cc/state/claude-limit"
+  t 'a stamp written before stamps named an account still binds: a wall nobody can place is held' \
+    "$(sa status >/dev/null 2>&1; echo $?)" 0
+  # The workers' stamp is the workers' login's: its account comes from the .claude.json beside that credential, not
+  # the box's (security read of #1920: the box's label kept a stale workers' wall binding across a login change).
+  mkdir -p "$d3/.claude-workers"; rm -f "$d3/.cc/state/claude-limit"; la box-login
+  printf '#!/bin/sh\n[ "$1 $2" = "get WORKER_CLAUDE_CREDENTIALS" ] && echo "~/.claude-workers/.credentials.json"\n' \
+    > "$d/bin/cc-config"; chmod +x "$d/bin/cc-config"
+  lw(){ jq -n --arg u "$1" '{oauthAccount: {accountUuid: $u}}' > "$d3/.claude-workers/.claude.json"; }
+  sw(){ HOME="$d3" PATH="$d/bin:$PATH" CC_LIMIT_BIN="$d/bin" CC_LIMIT_STAMP="$d3/.cc/state/claude-limit.workers" \
+    CC_LIMIT_RECORD="$d3/.cc/state/limit-interrupted" CC_LIMIT_SEEN="$d3/.cc/state/limit-seen" CC_FAKE_CALLS="$d3/calls" \
+    CC_LIMIT_NOW="$t0" CC_LIMIT_OBSERVER=x CC_LIMIT_MODEL_WAIT=1 bash "$SELF" "$@"; }
+  lw workers-login; sw check "$d3/run.json" >/dev/null 2>&1
+  t "the workers' stamp names the workers' login, not the box's" \
+    "$(cut -f6 "$d3/.cc/state/claude-limit.workers")" "$(printf workers-login | md5sum | cut -c1-8)"
+  lw workers-new; out=$(sw status 2>&1); rc=$?
+  t "…so once the workers move to another login, that wall does not bind them" "$rc $(grep -c 'another login' <<<"$out")" '1 1'
+  rm -f "$d/bin/cc-config"
+  rm -rf "$d3"
+
   rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }

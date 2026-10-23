@@ -91,7 +91,18 @@ def cmd_selfcheck(argv):
 BUILTIN = {"selfcheck": (cmd_selfcheck, "the skeleton's own cases")}
 
 
+def box_login(env):
+    """The lander's readers run on the box's login, so its usage limit and model record are the box's own, whoever
+    queued: a worker loop on the workers' login hands cc-land its CC_LIMIT_STAMP=….workers (security read of #1920)."""
+    env["CC_LIMIT_STAMP"] = env.get("CC_LIMIT_STAMP", "").removesuffix(".workers")
+    if not env["CC_LIMIT_STAMP"]:
+        del env["CC_LIMIT_STAMP"]
+    if env.get("CC_MODEL_CRED") == "workers":
+        del env["CC_MODEL_CRED"]
+
+
 def main(argv):
+    box_login(os.environ)
     if argv[:1] == ["selfcheck"]:   # never depends on another module importing cleanly
         return cmd_selfcheck(argv[1:])
     cmds, faults = collect(modules())

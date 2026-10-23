@@ -51,7 +51,8 @@ and some check runs on it, or it adds or changes no code nothing owns) needs no 
 read=none.
 Otherwise the lander buys one:
   - the usage limit binds (`cc-limit status` exit 0) -> INCOMPLETE, no read counted, nothing posted; extra
-    `until` (limit_until) says when to ask again, and the lane holds the job till then.
+    `until` (limit_until) says when to ask again, and the lane holds the job till then, or till `cc-limit status`
+    says clear (extra `limit`; tick.lift_limits), whichever comes first.
   - no count of reads stops one (owner, 10-16: the two-read cap turned a PR that still needed a read into a planning
     query and a stall). The PR's reads are summed in dollars (spent(): the family, repo + PR number, so a push or a
     reopen does not reset it), and the read that takes them past READ_CEILING_USD tells the planning seat, and so
@@ -1289,7 +1290,7 @@ def ask(text, repo, pr, digest, model=None):
     finally:
         os.unlink(f.name)
     if lrc == 0:
-        return None, usd, "limit: cc-limit check says the run hit a usage limit"
+        return None, usd, STAMPED
     bad = fault(rc, cli)   # the CLI's words only: a finding can quote "unknown option" too
     return None, usd, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {said[-200:]}"
 
@@ -1921,6 +1922,7 @@ def delta_review(job, prior, comments=None, diff=None):
 
 LIMIT_UNTIL = re.compile(r"usage limit until (\d\d):(\d\d)Z(?:\s*\((\d+)m left\))?")
 RETRY_AFTER = 900
+STAMPED = "limit: cc-limit check says the run hit a usage limit"   # cc-limit has the wall, so its status ends the hold
 
 
 def limit_until(text, now=None):
@@ -2021,7 +2023,7 @@ def _silent(job, j, model, why):
         charge(repo, pr, silent={"head": head, "reader": model, "why": why, "at": C.now()})
     return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
                      extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model,
-                            "silent": not why.startswith(("wall", "limit"))})
+                            "silent": not why.startswith(("wall", "limit")), "limit": why == STAMPED})
 
 
 def read_text(job, template, diff, more):
@@ -2050,7 +2052,7 @@ def _buy(job, template, diff, more, prior=None):
     lim_rc, lim = C.sh([os.path.join(BIN, "cc-limit"), "status"], timeout=60)
     if lim_rc == 0:
         return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
-                         extra={"why": f"usage limit: {lim.strip()}", "until": limit_until(lim)})
+                         extra={"why": f"usage limit: {lim.strip()}", "until": limit_until(lim), "limit": True})
     j = spent(repo, pr)
     if effort() not in EFFORTS:
         return _held(job, f"the review cannot run: CC_LAND_REVIEW_EFFORT={effort()!r} is not one of "

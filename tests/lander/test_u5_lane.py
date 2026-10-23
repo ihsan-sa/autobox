@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -234,6 +235,82 @@ class RealUnits(TL.Fixture):
         with mock.patch.object(RV, "_buy", side_effect=AssertionError("a read was asked for")):
             self.land()
         self.assertEqual(self.job().state, T.HELD)
+
+    def limit_held(self):
+        """PR 1 held on the stub's live usage limit, its until two hours out; -> the reads _buy is asked for, after."""
+        self.pr(1, {"c/w": "paid\n"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertTrue(self.job().extra.get("limit"))
+        asked = []
+        real = RV._buy
+        p = mock.patch.object(RV, "_buy", lambda *a, **k: asked.append(1) or real(*a, **k))
+        p.start()
+        self.addCleanup(p.stop)
+        return asked
+
+    def clear_limit(self):
+        with open(os.path.join(self.limit_bin, "cc-limit"), "w") as f:
+            f.write("#!/bin/sh\necho clear\nexit 1\n")
+
+    def test_a_live_limit_still_holds_with_no_read_spent(self):
+        asked = self.limit_held()
+        from lander import tick as TK
+        self.assertEqual(TK.lift_limits("demo"), [])                  # cc-limit still says limited: nothing asked
+        self.assertEqual(J.requests("demo"), [])
+        self.land()
+        self.assertEqual((asked, self.job().state), ([], T.HELD))
+        self.assertLessEqual(max(TK.waits("demo")), RV.RETRY_AFTER)   # but a tick comes to look again
+
+    def test_a_limit_hold_is_asked_again_at_the_next_tick_once_the_limit_has_gone(self):
+        asked = self.limit_held()
+        until = self.job().extra["not_before"]
+        self.clear_limit()                                            # 10-23: the stamp moved aside, status clear
+        from lander import tick as TK
+        self.assertEqual(len(TK.lift_limits("demo")), 1)
+        self.assertEqual(len(J.requests("demo")), 1)
+        TK.lift_limits("demo")                                        # one waiting request is enough
+        self.assertEqual(len(J.requests("demo")), 1)
+        with mock.patch.object(RV, "ask", lambda *a, **k: (None, 0.0, "no answer")):
+            self.land()
+        self.assertEqual(asked, [1], until)                           # asked again, whatever its until said
+
+    def test_queueing_a_limit_held_job_asks_it_again_at_once(self):
+        asked = self.limit_held()
+        J.submit("demo", 1, who="seat")                               # `cc-land queue` on it, the limit still live
+        self.land()
+        j = self.job()
+        self.assertEqual(asked, [1])                                  # asked at once, and held again on the limit
+        self.assertEqual((j.state, j.reads_used, j.extra.get("limit")), (T.HELD, 0, True))
+
+    def test_a_limit_cc_limit_never_saw_is_not_asked_every_tick(self):
+        # security read of #1920: a reader's own limit words (or a codex 429) leave no stamp, so cc-limit status
+        # reads clear; marked `limit`, lift_limits would re-ask it on every tick. Only cc-limit's own wall is marked.
+        job = types.SimpleNamespace(repo="demo", pr=1, head="h" * 40, digest="d")
+        said = RV._silent(job, {}, "claude", "limit: Claude usage limit reached")
+        self.assertEqual((said.verdict, said.extra["limit"]), (T.INCOMPLETE, False))
+        self.assertTrue(RV._silent(job, {}, "claude", RV.STAMPED).extra["limit"])
+
+    def test_a_missing_or_failing_cc_limit_is_not_clear(self):
+        self.limit_held()
+        from lander import tick as TK
+        with open(os.path.join(self.limit_bin, "cc-limit"), "w") as f:
+            f.write("#!/bin/sh\nexit 2\n")
+        self.assertEqual(TK.lift_limits("demo"), [])
+        os.unlink(os.path.join(self.limit_bin, "cc-limit"))
+        self.assertEqual(TK.lift_limits("demo"), [])
+        self.assertEqual(J.requests("demo"), [])
+
+    def test_the_lander_reads_the_box_login_limit_whoever_queued(self):
+        # security read of #1920: a worker on the workers' login queues with CC_LIMIT_STAMP=….workers, but the
+        # lander's readers run on the box's login, so a stale workers' wall must not hold its reviews
+        from lander import cli
+        env = {"CC_LIMIT_STAMP": "/h/.cc/state/claude-limit.workers", "CC_MODEL_CRED": "workers"}
+        cli.box_login(env)
+        self.assertEqual(env, {"CC_LIMIT_STAMP": "/h/.cc/state/claude-limit"})
+        env = {"CC_LIMIT_STAMP": "/t/claude-limit"}   # a test's own stamp is left where it is
+        cli.box_login(env)
+        self.assertEqual(env, {"CC_LIMIT_STAMP": "/t/claude-limit"})
 
     def recorded_land(self, num, head):
         """What `record` posts: a LAND marker at `head`, keyed by the reviewer's digest_of against today's main."""

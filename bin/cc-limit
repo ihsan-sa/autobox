@@ -22,9 +22,15 @@
 #                      whoever else it killed (see WHAT ELSE THE LIMIT KILLED), and telling the owner in one
 #                      line what the limit stalled and when it went again
 #   cc-limit selfcheck the record/resume state machine, on stubs
-# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>\t<observers>" — shared,
+# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>\t<observers>\t<account>" — shared,
 # so a second loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was
-# (may be empty when the message names none); the observers are which RUNS have hit it (see below). No secrets in it.
+# (may be empty when the message names none); the observers are which RUNS have hit it (see below); the account is
+# which login it was read on (see A LIMIT IS ONE ACCOUNT'S). No secrets in it.
+# A LIMIT IS ONE ACCOUNT'S. On 2026-10-23 a stamp of the old login's weekly wall, written 10-21 with six days to run,
+# held the lander's reviews of 14 PRs for hours after the box had moved to another account with room. So the stamp
+# names the account it was read on (an md5 of the login's accountUuid, in .claude.json beside it), and a stamp for
+# an account that is not the current login does not bind. A stamp or a login that names none still binds: a wall
+# nobody can place is held, as before.
 # Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
 # · CC_LIMIT_MIN_WAIT (test hook: cap any sleep at N seconds) · CC_LIMIT_STAMP (test hook: put the stamp somewhere
 #   else, so a test limit never makes the box's real loops wait) · CC_LIMIT_OBSERVER (test hook: the key that says
@@ -125,12 +131,20 @@ SETTLE="${CC_LIMIT_SETTLE:-2}"    # after the Escape that ends a dead turn, befo
 stamp(){   # the shared stamp's five fields. Split by awk and NOT by `IFS=$'\t' read`: tab is IFS WHITESPACE, so bash
            # folds "\t\t" into one delimiter — and the stamp of 2026-09-04 named no model, so its empty field 4 slid
            # the observers into $mdl and the run that hit the limit could not find its own key.
-  ends=0; src=""; first=0; mdl=""; obs=""
-  [ -f "$S" ] && { IFS= read -r ends; IFS= read -r src; IFS= read -r first; IFS= read -r mdl; IFS= read -r obs; } \
-    < <(awk -F'\t' 'NR==1{for (i = 1; i <= 5; i++) print $i}' "$S")
+  ends=0; src=""; first=0; mdl=""; obs=""; acc=""
+  [ -f "$S" ] && { IFS= read -r ends; IFS= read -r src; IFS= read -r first; IFS= read -r mdl; IFS= read -r obs; IFS= read -r acc; } \
+    < <(awk -F'\t' 'NR==1{for (i = 1; i <= 6; i++) print $i}' "$S")
   [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
 
-# ---- whose limit is it? (see "ONE RUN'S LIMIT IS NOT THE BOX'S" above)
+# ---- whose limit is it? (see "ONE RUN'S LIMIT IS NOT THE BOX'S" and "A LIMIT IS ONE ACCOUNT'S" above)
+account(){   # the current login's account, hashed as the observers are; empty when its .claude.json names none.
+             # The workers' stamp (cc-loop's WORKERS' LOGIN) is that login's, so its .claude.json is the one beside
+             # WORKER_CLAUDE_CREDENTIALS, not the box's (security read of #1920: the box's label kept it binding).
+  local d="${CLAUDE_CONFIG_DIR:-$HOME}" c u
+  case "$S" in *.workers) c=$("$BIN/cc-config" get WORKER_CLAUDE_CREDENTIALS 2>/dev/null); [ -n "$c" ] && d=$(dirname "${c/#\~/$HOME}");; esac
+  u=$(jq -r '.oauthAccount.accountUuid // empty' "$d/.claude.json" 2>/dev/null)
+  [ -n "$u" ] && printf '%s' "$u" | md5sum | cut -c1-8; }
+elsewhere(){ local a; a=$(account); [ -n "$acc" ] && [ -n "$a" ] && [ "$acc" != "$a" ]; }   # the stamp is another login's
 mykey(){   # which RUN this is. The cwd, because that is one per worktree and so one per worker — the unit the
            # incident was about ("one headless worker on this repo"). Hashed to keep paths out of a shared file.
   printf '%s' "${CC_LIMIT_OBSERVER:-$PWD}" | md5sum | cut -c1-8; }
@@ -174,6 +188,7 @@ believe(){   # exit 0 = the live stamp binds THIS caller, and stamp()'s variable
              # and `wait` share, so no caller has to know the rule.
   stamp
   [ "$ends" -gt "$now" ] || return 1
+  elsewhere && return 1
   answering && { disbelieve; return 1; }
   [ "$(nobs)" -ge 2 ] && return 0            # two runs hit it: account-wide, and the box parks as it always has
   obs_list | grep -qx "$(mykey)"; }          # one run: it binds that run, and nobody else
@@ -471,7 +486,9 @@ case "${1:-}" in
       # status` sees it and a caller capturing stdout does not have its answer changed. NOT in the words "usage
       # limit until HH:MMZ": cc-land captures stdout and stderr together and reads that phrase out of the text as a
       # reset to defer a merge to, so this line would park a queue on the very limit it says does not apply.
-      [ "$ends" -gt "$now" ] && printf 'note: another run hit a limit that resets %sZ; no second run has hit it, so the box is not held by it.\n' "$(date -u -d "@$ends" +%H:%M)" >&2
+      if [ "$ends" -gt "$now" ] && elsewhere; then
+        printf 'note: a limit that resets %sZ was hit on another login, so it does not hold this one.\n' "$(date -u -d "@$ends" +%H:%M)" >&2
+      else [ "$ends" -gt "$now" ] && printf 'note: another run hit a limit that resets %sZ; no second run has hit it, so the box is not held by it.\n' "$(date -u -d "@$ends" +%H:%M)" >&2; fi
       exit 1; fi
     only=""; [ "$(nobs)" -ge 2 ] || only=" (this run only)"
     printf 'usage limit until %sZ (%dm left)%s%s\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )) "${mdl:+ [$mdl]}" "$only"; exit 0 ;;
@@ -521,7 +538,7 @@ if grep -qiE "$SPEND_RE" <<<"$txt" || { grep -qiE "$CREDITS_RE" <<<"$txt" && ! g
 fi
 grep -qiE "$LIMIT_RE" <<<"$txt" || exit 1
 parse_reset "$txt"
-stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ]; } && same=1   # still the same limit episode
+stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ] && ! elsewhere; } && same=1   # still the same limit episode, on this login
 [ "$same" = 1 ] || first=$now
 if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, remembered in the stamp (5, 10, 20, 40, 60 min)
   b=5; [ "$same" = 1 ] && case "$src" in backoff:[0-9]*) b=$(( ${src#*:} * 2 )); [ "$b" -gt 60 ] && b=60;; esac
@@ -530,7 +547,7 @@ fi
 [ -n "$newm" ] || newm="$mdl"   # same episode, a message that names no model: keep what we already knew
 [ "$same" = 1 ] || obs=""       # a new episode: the runs on the old stamp saw a different limit and do not vouch for this one
 obs=$(add_obs "$(mykey)")       # THIS run has now hit it — one observer binds this run alone, two make it the box's
-mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" "$obs" > "$S"
+mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" "$obs" "$(account)" > "$S"
 # A limit on the box's primary model moves every session to the fallback (cc-model decides if it was) — but only once
 # a SECOND run has hit the same limit. One worker's word moved every session for six hours on 2026-09-04.
 [ "$(nobs)" -ge 2 ] && [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1

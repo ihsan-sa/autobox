@@ -134,7 +134,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              one the box wrote there), one read (a delta read when a prior verdict exists; none when a LAND is already
              recorded at this digest, and on a plan with a security path only while perms' record of it stands,
              landed_at()): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
-             `deferred`, which no reader counts as running), no read counted; INCOMPLETE with extra host (a
+             `deferred`, which no reader counts as running), no read counted; the hold of a usage limit cc-limit has a
+             stamp of is marked extra.limit and ends sooner once the limit does (tick.lift_limits, jobs.drain); INCOMPLETE with extra host (a
              read the host failed twice at one head: a 4xx, a timeout, its own cap; or a security path with no
              record by perms of this head and digest) -> query "planning", never a
              handback; HANDBACK ->
@@ -1032,11 +1033,12 @@ class Lane:
             self.hold(job, str(e), kind="box", pin=isinstance(e, G.Unpinned))
 
     # -- leaving the lane --
-    def hold(self, job, why, kind="pr", secs=HOLD_SECS, until=0, then=None, deferred=False, pin=False):
+    def hold(self, job, why, kind="pr", secs=HOLD_SECS, until=0, then=None, deferred=False, pin=False, limit=False):
         """kind "pr": a push mends it (a new queue starts fresh); "box": time mends it (a new queue joins it).
         until: an epoch to wait for instead of secs (a usage limit's reset). then: the state to go back to (default
         the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`. pin: only a
-        pin clears it (G.Unpinned), so the planning seat is told (cards.pin_hold)."""
+        pin clears it (G.Unpinned), so the planning seat is told (cards.pin_hold). limit: it waits on a usage limit,
+        and is asked again once that limit has gone, whatever `until` said (tick.lift_limits, jobs.drain)."""
         if job.state == T.HELD:
             return
         # perms, 10-13: "after a handback or a main-red hold, the job's other checks keep running for nothing"
@@ -1052,6 +1054,8 @@ class Lane:
         job.extra.update(held_from=then or job.state, hold=kind, why=why, not_before=E.stamp(at))
         if deferred:
             job.extra["deferred"] = True
+        if limit:
+            job.extra["limit"] = True
         J.move(job, T.HELD, why)
         self.say(f"PR #{job.pr} held: {why}")
         if pin:   # on a thread of its own: cc-notify may take its 60 s, and the lane lock is held here
@@ -1086,7 +1090,7 @@ class Lane:
         if job.extra.get("hold") == "box":   # tick.flag_waited counts the job's age from here (perms' read, 10-13)
             job.extra["unheld_at"] = E.stamp()
         job.extra["last_hold"] = job.extra.get("hold")   # queued() reads whose hold a later draft followed
-        for k in ("held_from", "hold", "not_before", "deferred"):
+        for k in ("held_from", "hold", "not_before", "deferred", "limit"):
             job.extra.pop(k, None)
         J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why=why)
 
@@ -1584,7 +1588,7 @@ class Lane:
                     if v.extra.get("silent") else "the review stopped on a usage or budget wall")
             self.hold(job, f"{what} ({v.extra.get('why') or 'no reason given'}); "
                            f"no read was counted" + (f", asked again at {until}" if until else ""),
-                      kind="box", until=E.epoch_of(until), deferred=True)
+                      kind="box", until=E.epoch_of(until), deferred=True, limit=bool(v.extra.get("limit")))
             return False
         job.extra["verdict"], job.review_key = v.to_dict(), v.digest
         if v.verdict == T.HANDBACK_VERDICT:
