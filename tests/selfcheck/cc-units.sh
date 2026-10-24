@@ -170,6 +170,14 @@ J
   # an unlinked unit is a fault even for a `timer` row, which every other test skips
   out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)   # a path that cannot exist: no temp dir to leak
   k "$(t grep -q 'cc-audit.service=unlinked' <<<"$out")" "an unlinked timer-driven .service is reported, not skipped"
+  # the memory slices (2026-10-24): linked, never enabled or started, and never a failed health check even when systemd
+  # calls them dead — a slice only lives while a scope is in it. sc is faked to answer `failed` for every slice.
+  k "$(t test "$("$0" link | grep -cE '^(worker|lander)\.slice$')" -eq 2)" "worker.slice and lander.slice are linked"
+  k "$(t test -z "$("$0" enable | grep slice)")" "…and no .slice is ever enabled or started"
+  out=$( sc(){ case "$2" in *.slice) echo failed;; *) echo active;; esac; }; CC_UNITS_LINKDIR="$UD" check 2>&1 )
+  k "$(nt grep -q 'slice' <<<"$out")" "…nor health-checked: a dead slice is no fault"
+  out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)
+  k "$(t grep -q 'worker.slice=unlinked' <<<"$out")" "…but an unlinked slice is reported, as any row is"
   # a timer whose own service is running shows NEXT '-' until the run ends: armed, not a fault (the 03:30 monthly audit
   # reported cc-audit.timer=not-armed — itself, mid-run, 2026-09-01). sc is a function, so a subshell fakes systemd.
   fake(){ local svc="$1"; shift; case "$1" in list-timers) ;; is-active) case "$2" in cc-audit.service) echo "$svc";; *) echo active;; esac;; is-failed) echo active;; *) echo enabled;; esac; }

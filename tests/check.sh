@@ -141,7 +141,7 @@ else echo "check.sh: · $PART_WHY"; fi
 # the box half is the only place it can report, and a run that did not happen is one somebody can see did not.
 if part_here systemd-units box; then
 H=$(mktemp -d); ln -s "$PWD/bin" "$H/bin"   # verify the units against THIS tree's bin/, not against what the box happens to have linked
-v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer config/systemd-user/*.path 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
+v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer config/systemd-user/*.path config/systemd-user/*.slice 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
 [ -z "$v" ] || { echo "$v"; exit 1; }
 else echo "check.sh: · $PART_WHY"; fi
 # A unit nobody links is a unit that never runs. install.sh used to name each one, so this test grepped it; now
