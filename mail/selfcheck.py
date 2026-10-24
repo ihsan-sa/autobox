@@ -4494,6 +4494,88 @@ def run():
         k(rc8 == 1 and a8 == [] and n8 == n6 and any("MAIL_OUT_PER_HOUR=1" in e for e in errs27),
           "…and a mail the caps would stop mints no link either")
 
+    # ------------------------------- 27b. MAIL_PDF_ATTACH: one job's filed PDFs go as files (perms-77, 2026-10-23)
+    # A weekly report job's mail, sent from ~/dev/weekly-job to the two people its row names, attaches its fresh filed
+    # PDFs. Each case below is its own Box, repo, fake cc-docs and worker, so no case leans on another's state.
+    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None):
+        """(exit, the mail the worker got or None, cc-docs argv lines, stderr, every PDF still there) for one send
+        of `names`, made in ~/dev/<repo> (`size` bytes each, `age` seconds old), under MAIL_PDF_ATTACH `row`."""
+        with Box(allow=ALLOWED + "," + OTHER) as b:
+            dev, argv = os.path.join(b.tmp, "dev"), os.path.join(b.tmp, "argv")
+            docs = os.path.join(b.tmp, "cc-docs")
+            with open(docs, "w") as f:
+                f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argv + "\n"
+                        "case \"$2\" in *unfiled*) echo \"cc-docs: $2 is not filed\" >&2; exit 1;; esac\n"
+                        "echo https://lib.test/d/001-0009\n")
+            os.chmod(docs, 0o755)
+            here = os.path.join(dev, repo)
+            os.makedirs(here)
+            paths = [os.path.join(here, n) for n in names]
+            for p in paths:
+                with open(p, "wb") as f:
+                    f.write(b"%" * size)
+                os.utime(p, (time.time() - age,) * 2)
+            env = {key: "" for key in r.SEND_KEYS if key not in Box.KEYS}
+            env.update({"MAIL_SEND_ALLOW": ALLOWED + "," + OTHER, "MAIL_SEND_SECRET": "s3cret", "MAIL_OUT_ROOTS": dev,
+                        "CC_DOCS_BIN": docs,
+                        "MAIL_PDF_ATTACH": "weekly-job=%s, %s" % (ALLOWED, OTHER) if row is None else row})
+            saved = {key: os.environ.get(key) for key in env}
+            cwd, out, dev0 = os.getcwd(), sys.stdout, outbound.DEV
+            ask = os.path.join(b.tmp, "ask.json")
+            with open(ask, "w") as f:
+                json.dump({"to": list(to), "subject": "stock", "body": "this week", "attachments": paths}, f)
+            try:
+                os.environ.update(env)
+                outbound.DEV = dev
+                os.chdir(here)
+                sys.stdout = io.StringIO()
+                with FakeWorker() as w:
+                    os.environ["MAIL_SEND_URL"] = w.url
+                    rc = r.cmd_send({"--json": ask})
+                    msg = w.calls[-1]["msg"] if w.calls else None
+            finally:
+                sys.stdout, outbound.DEV = out, dev0
+                os.chdir(cwd)
+                for key, v in saved.items():
+                    if v is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = v
+            calls = open(argv).read().splitlines() if os.path.exists(argv) else []
+            return rc, msg, calls, b.err.getvalue(), all(os.path.exists(p) for p in paths)
+
+    def files27b(msg):
+        return [p.get_filename() for p in msg.iter_attachments()] if msg is not None else None
+
+    def body27b(msg):
+        return next((p.get_content() for p in msg.walk() if p.get_content_type() == "text/plain"), "") if msg else ""
+
+    rc, m, calls, _e, kept = pdf27b(to=(ALLOWED, OTHER), names=("stock.pdf", "orders.pdf"))
+    k(rc == 0 and files27b(m) == ["stock.pdf", "orders.pdf"] and len(calls) == 2 and "lib.test" not in body27b(m)
+      and kept, "MAIL_PDF_ATTACH: a send from the repo its row names, to the people it names, attaches both filed "
+      "PDFs, each asked of cc-docs first, and the files stay where they were")
+    rc, m, _c, _e, _k = pdf27b(repo="other-repo")
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…a send from a repo no row names gets the link, as every other sender does")
+    rc, m, _c, _e, _k = pdf27b(row="")
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…and with MAIL_PDF_ATTACH unset nobody attaches a PDF")
+    rc, m, _c, err, _k = pdf27b(names=("unfiled.pdf",))
+    k(rc == 1 and m is None and "is not filed" in err,
+      "…an unfiled PDF from the allowed repo is still refused, and nothing is sent")
+    rc, m, _c, _e, _k = pdf27b(names=("a.pdf", "b.pdf"), size=outbound.PDF_ATTACH_MAX // 2 + 1)
+    k(rc == 0 and files27b(m) == [] and "b.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…PDFs over 2 MiB together go as links")
+    rc, m, _c, _e, _k = pdf27b(age=2 * 86400)
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…a PDF older than a day (an earlier run's) goes as its link")
+    rc, m, _c, _e, _k = pdf27b(to=(ALLOWED, OTHER), row="weekly-job=" + ALLOWED)
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…a verified recipient the row does not name turns the whole mail back to links")
+    rc, m, calls, err, _k = pdf27b(to=(ALLOWED, STRANGER), row="weekly-job=%s,%s" % (ALLOWED, STRANGER))
+    k(rc == 1 and m is None and calls == [] and STRANGER in err,
+      "…and the row grants no address: one off the verified list is refused before cc-docs is asked")
+
     # ------------------------------- 28. `cc-mail doc`: a library document by mail, laid out by a swappable template
     # "one command sends a library document to a verified address, with a test that proves an unverified address is
     # refused and a template file is picked up" (the brief, 2026-09-29). Its own register, templates and fake cc-docs.

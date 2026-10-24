@@ -1002,12 +1002,38 @@ def link_kind(cfg, rcpts):
     return ["--kind", "private"] + [x for a in others for x in ("--to", a)] if others else ["--kind", "signed-in"]
 
 
-def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace="", now=None):
+PDF_ATTACH_MAX = 2 * 1024 * 1024    # MAIL_PDF_ATTACH's cap on a mail's PDFs together; over it they go as links
+
+
+def run_repo(cwd=None):
+    """The repo under ~/dev a command runs in (its cwd), or "": the sender MAIL_PDF_ATTACH names."""
+    d = os.path.realpath(cwd or os.getcwd())
+    return d[len(DEV) + 1:].split(os.sep)[0] if d.startswith(DEV + os.sep) else ""
+
+
+def pdf_attach(cfg, sender, rcpts, reals):
+    """True when this mail's filed PDFs go as files, not links (perms-77, 2026-10-23, for one weekly report job).
+    MAIL_PDF_ATTACH is host config a member cannot write: rows `<repo>=<addr>,<addr>` split by `;` or a line break.
+    A row lets a mail sent from ~/dev/<repo> attach its PDFs when every recipient (blind copies too) is one the row
+    names, the PDFs were made in the last day (this run's, not an old filed one) and together are at most
+    PDF_ATTACH_MAX. Anything else keeps the links. The caller has already had each one filed (cc-docs link)."""
+    for row in re.split(r"[;\n]", cfg.get("MAIL_PDF_ATTACH") or ""):
+        repo, _, people = row.partition("=")
+        if sender and repo.strip() == sender and set(rcpts) <= set(_addrs(people)):
+            break
+    else:
+        return False
+    sts = [os.stat(p) for p in reals]
+    return sum(s.st_size for s in sts) <= PDF_ATTACH_MAX and all(time.time() - s.st_mtime < 86400 for s in sts)
+
+
+def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace="", now=None, sender=""):
     """A PDF goes out as a link to its library document, never attached (owner, 2026-09-28). Returns (the attachments
     left to attach, the link lines) or a str saying why nothing may be sent. Each .pdf is asked of
     `cc-docs link <path>`: private `--to` every recipient (blind copies too) that is not the owner's, signed-in
     when the owner is all of them. A PDF nobody filed is cc-docs' own refusal, which says to file it first. With
-    no cc-docs beside this tree the PDFs stay attachments, as before.
+    no cc-docs beside this tree the PDFs stay attachments, as before. A mail `sender` (run_repo) that a
+    MAIL_PDF_ATTACH row allows keeps its filed PDFs as attachments instead (pdf_attach).
 
     NOTHING IS MINTED FOR A MAIL THAT WILL NOT GO. A private link grants its people the document on the site
     whether or not the mail carrying it is sent, so before cc-docs is asked anything the mail passes send_to's
@@ -1042,6 +1068,8 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
             why = ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
             return "not sent — %s" % why
         lines.append((os.path.basename(a), out[0].strip()))
+    if pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals]):
+        return list(attachments), []          # filed (the link just minted proves it), and they travel as files
     return [a for a in attachments if a not in pdfs], lines
 
 

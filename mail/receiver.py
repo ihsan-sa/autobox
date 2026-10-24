@@ -83,7 +83,10 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             library document — private to every recipient who is not the owner
                                             (MAIL_WORKSPACE `addr=owner` rows), signed-in when the owner is all
                                             of them — and a PDF not yet filed (`cc-docs file`), or one outside
-                                            the trees a file may attach from, stops the mail.
+                                            the trees a file may attach from, stops the mail. The one
+                                            exception is MAIL_PDF_ATTACH (outbound.pdf_attach): a send run
+                                            in a repo it names, to only the addresses it names, attaches its
+                                            filed PDFs when they are a day old at most and 2 MiB together.
                                             Every other file named is attached, or the mail is not sent
                                             and the line names the file and why (a file attaches only from
                                             under MAIL_OUT_ROOTS or ~/.cc/slack/files, and under the byte
@@ -1239,7 +1242,7 @@ def cmd_show(opt):
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
 SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
              "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES",
-             "MAIL_WORKSPACE")   # MAIL_WORKSPACE: its `addr=owner` rows say who gets a signed-in PDF link (outbound.pdf_links)
+             "MAIL_WORKSPACE", "MAIL_PDF_ATTACH")   # MAIL_WORKSPACE: its `addr=owner` rows say who gets a signed-in PDF link (outbound.pdf_links)
 SEND_JSON_KEYS = ("to", "bcc", "subject", "body", "attachments", "thread", "html", "images")
 SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...], "
               "\"thread\": \"<chat_id>/<thread_ts>\"})\n"
@@ -1391,8 +1394,9 @@ def cmd_send(opt):
     # body and the html, private to the recipients who are not the owner; an unfiled one stops the mail here.
     # A blind copy is a recipient too, so the link names it, or it would get a link it cannot open. pdf_links
     # runs send_to's recipient gate, a look at the caps and the attachment roots first: a refused mail mints nothing.
+    # The one exception is a MAIL_PDF_ATTACH row for the repo this runs in (outbound.pdf_attach): its filed PDFs attach.
     channel = outbound.session_channel()
-    linked = outbound.pdf_links(keys, to, attachments, bcc=bcc, channel=channel)
+    linked = outbound.pdf_links(keys, to, attachments, bcc=bcc, channel=channel, sender=outbound.run_repo())
     if isinstance(linked, str):
         print(linked, file=sys.stderr)
         return 1
