@@ -47,6 +47,10 @@ class Ended(unittest.TestCase):
         p = mock.patch.object(GH, "pr_facts", pr_facts)
         p.start()
         self.addCleanup(p.stop)
+        self.heads = []   # the box's LANDER_SELF_MERGE_HEADS_demo
+        p = mock.patch.object(TK, "self_merge_heads", lambda repo: self.heads)
+        p.start()
+        self.addCleanup(p.stop)
 
     def job(self, pr, state, repo="demo"):
         """A job brought to `state` along the lane's own edges, as the lane leaves it."""
@@ -117,6 +121,20 @@ class Ended(unittest.TestCase):
         # every ended job left the live directory for rest/: the readers count *.json as in flight
         self.assertFalse(os.path.exists(J.job_path("demo", 3)))
         self.assertTrue(os.path.exists(J.rest_path("demo", 3)))
+
+    def test_an_open_job_on_a_head_its_repo_lands_itself_is_let_go(self):
+        self.heads = ["dispatch/"]
+        self.job(1, T.HELD)
+        self.job(2, T.QUERY)
+        self.job(3, T.HELD)
+        self.gh = {1: {"state": "OPEN", "headRefName": "dispatch/146"},
+                   2: {"state": "OPEN", "headRefName": "dispatch/x"}, 3: {"state": "OPEN", "headRefName": "track/fix"}}
+        lines = TK.sweep_ended()
+        self.assertEqual({p: J.load("demo", p).state for p in (1, 2, 3)}, {1: T.DONE, 2: T.DONE, 3: T.HELD})
+        self.assertTrue(os.path.exists(J.rest_path("demo", 1)))
+        self.assertRegex(self.log(), r"\tdone demo#1 rc=1\n")
+        self.assertNotIn("demo#1 merged", self.log())
+        self.assertIn("[demo] PR #1: its repo lands it itself — held -> done", lines)
 
     def test_the_sweep_runs_at_most_once_a_window_per_repo(self):
         self.job(1, T.QUERY)

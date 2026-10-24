@@ -26,15 +26,18 @@
             draft kept. The drafts' gh calls are capped per sweep at $LANDER_UNDRAFT_GH (20); the rest wait for the
             next sweep.
             Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
-            `dispatch/`) whose base is the repo's default branch and whose files touch no path on that branch's
-            security list, read from a fresh fetch; any doubt queues it as before.
+            `dispatch/`), whatever its base or files: that repo lands, reviews and secures those itself (10-24: a
+            repo with no security list had every such PR queued while a security-path test stood). An unread setting
+            names no prefix, so its PRs queue as before.
   ended     for each repo with a job stopped in query (rest/) or held, at most every $LANDER_ENDED_SECS (900) per repo:
             GitHub is asked what became of each such PR, with no lock held. A held job the lane itself tried to
             merge (merge_attempt set, or held from past queued/planned/checking) is left to the lane, which proves it.
             MERGED (lander-self landed it, or a person merged it by hand) -> merged, with the lane's own
             `stage <repo>#<pr> merged` line (by=outside, sha= the merge commit, merged_at= GitHub's mergedAt), then
             done and `done` rc 0, both written in one save into rest/ (a lane never finds it live at merged); CLOSED
-            -> done and `done` rc 1. The locks are taken only to move a job, which is read again under them: a query
+            -> done and `done` rc 1; open on a LANDER_SELF_MERGE_HEADS_<repo> head -> done and `done` rc 1, its
+            repo lands it (10-24: such a held job was asked about every sweep, and its notices woke a seat for nothing).
+            The locks are taken only to move a job, which is read again under them: a query
             moves under the rest lock; a held job is the lane's, so it moves only while no lane runs (the lane lock,
             never waited on). Nothing is posted, closed on a board or deployed for it:
             the tip catch-up deploys main. One repo's fault is said and logged (tick-fault), never the tick's end.
@@ -220,23 +223,8 @@ def default_base(root, slug) -> tuple:
     try:
         name = (GH.api_json(root, f"repos/{slug}") or {}).get("default_branch") or ""
         return (name, G.fetch(root, name)[name]) if name else ("", "")
-    except Exception:   # noqa: BLE001 — no default branch read: every declared head queues as before
+    except Exception:   # noqa: BLE001 — no default branch read: review's on_default carries nothing
         return ("", "")
-
-
-def merges_itself(root, slug, repo, p, base) -> bool:
-    """PR p touches no path on the security list at commit `base` (review.security_globs, the lane's own read), a
-    rename's old name included. False, so the sweep queues it, when the files or the list will not read, when the list
-    is empty (nothing then tells a security head from another), or at 100 files or more (one page of GitHub's)."""
-    files = GH.api_json(root, f"repos/{slug}/pulls/{p['number']}/files?per_page=100")
-    if not isinstance(files, list) or not 0 < len(files) < 100:
-        return False
-    try:
-        paths = [f["filename"] for f in files] + [f["previous_filename"] for f in files if "previous_filename" in f]
-        globs = R.security_globs(root, base, repo)
-        return bool(globs) and not any(MF.match(globs, x) for x in paths)
-    except Exception:   # noqa: BLE001 — any read that fails queues the PR as before
-        return False
 
 
 def logged_prs(repo) -> set:
@@ -261,8 +249,7 @@ def sweep_strays(repos) -> list:
     """Queue the box's own open PRs that nothing queued (raised-seat-pr-never-reaches-the-lane, 2026-10-03: a seat's
     `gh pr create` wrote no lane entry, and the PR sat 2.5 h unqueued while the owner had been told it was queued).
     cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back.
-    A head on a self_merge_heads prefix whose base is the default branch and that merges_itself (no security path)
-    is left to its repo; a PR to another base, and any doubt, queues."""
+    A head on a self_merge_heads prefix is left to its repo."""
     lines, budget = [], [undraft_cap()]
     for repo in repos:
         root = J.repo_root(repo)
@@ -275,7 +262,7 @@ def sweep_strays(repos) -> list:
         if prs is None:
             lines.append(f"[{repo}] strays: gh could not list the open PRs — {why}")
             continue
-        now, seen, heads, base, parents = time.time(), None, None, None, {}
+        now, seen, heads, parents = time.time(), None, None, {}
         for p in prs:
             if not isinstance(p, dict) or not isinstance(p.get("number"), int):
                 continue
@@ -292,9 +279,7 @@ def sweep_strays(repos) -> list:
                 continue
             heads = self_merge_heads(repo) if heads is None else heads
             if any(head.startswith(h) for h in heads):
-                base = default_base(root, s) if base is None else base
-                if base[0] and p.get("baseRefName") == base[0] and merges_itself(root, s, repo, p, base[1]):
-                    continue    # the repo merges it on its own read; a head on a security path still comes here
+                continue    # the repo lands it itself
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 qrc = L.cmd_queue([repo, str(n), "--who", "tick", "--no-start"])
@@ -397,21 +382,26 @@ def ended_jobs(repo="") -> dict:
 
 
 def settle_ended(repo, prs, by="outside", wait=False) -> list:
-    """Move each of `prs` that is a watched() job and whose PR GitHub says MERGED to merged then done, CLOSED to
-    done (tick docstring, `ended`). GitHub is asked first with no lock held (a gh call may take 60 s, and a lane
-    that starts meanwhile must not find its lock taken); the locks are then taken only to move a job, and each job
-    is read again under them. wait: wait for the rest lock (one PR, asked by hand) instead of skipping."""
+    """Move each of `prs` that is a watched() job and whose PR GitHub says MERGED to merged then done, CLOSED or
+    open on a self_merge_heads prefix to done (tick docstring, `ended`). GitHub is asked first with no lock held (a
+    gh call may take 60 s, and a lane that starts meanwhile must not find its lock taken); the locks are then taken
+    only to move a job, and each job is read again under them. wait: wait for the rest lock (one PR, asked by
+    hand) instead of skipping."""
     h = M.member_of(repo)[0]
     token = M.gh_token(h, repo) if h else None
-    root, lines, ended = J.repo_root(repo), [], {}
+    root, lines, ended, heads = J.repo_root(repo), [], {}, None
     for pr in prs:
         if not watched(J.load(repo, pr)):
             continue
-        facts, why = GH.pr_facts(root, pr, "state,mergedAt,mergeCommit", token, 60)
+        facts, why = GH.pr_facts(root, pr, "state,mergedAt,mergeCommit,headRefName", token, 60)
         if facts is None:
             lines.append(f"[{repo}] PR #{pr}: gh could not say whether it merged — {why}")
-        elif facts.get("state") in ("MERGED", "CLOSED"):
-            ended[pr] = facts
+            continue
+        if facts.get("state") not in ("MERGED", "CLOSED"):
+            heads = self_merge_heads(repo) if heads is None else heads
+            if not any(str(facts.get("headRefName") or "").startswith(x) for x in heads):
+                continue
+        ended[pr] = facts
     if not ended:
         return lines
     with contextlib.ExitStack() as st:
@@ -432,9 +422,10 @@ def settle_ended(repo, prs, by="outside", wait=False) -> list:
                 E.log("done", repo, pr, rc=0)
                 lines.append(f"[{repo}] PR #{pr}: merged on GitHub ({by}) — {was} -> merged -> done")
             else:
-                J.move(job, T.DONE, why="the PR is closed")
+                why = "the PR is closed" if facts["state"] == "CLOSED" else "its repo lands it itself"
+                J.move(job, T.DONE, why=why)
                 E.log("done", repo, pr, rc=1)
-                lines.append(f"[{repo}] PR #{pr}: closed on GitHub — {was} -> done")
+                lines.append(f"[{repo}] PR #{pr}: {why} — {was} -> done")
     return lines
 
 
@@ -1024,4 +1015,5 @@ def cmd_tick(argv) -> int:
 COMMANDS = {"tick": (cmd_tick, "resume lanes, poll handed PRs, run the tip and deploy it: [--repo R] [--detach] "
                                "[--rearm]"),
             "settle-merged": (cmd_settle_merged, "move <repo> <pr>'s query or held job to merged (or done) once GitHub "
-                                                 "says it merged (or closed) [--by WHO]")}
+                                                 "says it merged (or closed, or open on a head its repo lands itself) "
+                                                 "[--by WHO]")}
