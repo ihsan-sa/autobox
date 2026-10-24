@@ -658,6 +658,48 @@ usage(){ sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d'; }   # the whole heade
 # takes it once the worktree exists. Between them another owner can only ever get in FIRST, and then the claim
 # below refuses too. The task UUID goes on the marker's third line as a lookup hint; nothing reads authority off it.
 claim_check(){ "$BIN/cc-task" check "$repo" "$track" --executor "$1" || exit 1; }   # $1 = subagent|worker
+# A SETTLED TASK MAKES WAY FOR THE NEXT ONE (raised-merged-pr-leaves-row-delivery-pending, 2026-10-22). Only `cc done …
+# merged` ever closed a record: the lander, a hand-merge and a merge on GitHub reach the board through cc-reconcile,
+# which writes the board and never the record, so a member's merged row read delivery-pending for 20 h, and once
+# closed by hand its refusal named `cc rm`, which deletes a member's live worktree. So before `--go` asks its claim, a
+# record whose PR GitHub says merged is closed as merged, and it, one whose PR GitHub says closed, or one closed
+# already, is retired beside the repo's receipts as `cc rm` retires it; the claim then starts a new task. A bare
+# `cc claim` still refuses a closed record (cc-task's rule, e2e P18). A live claim is left to cc-task's rules, and
+# no answer from GitHub, a PR that is not the row's or a close cc-task refuses moves nothing, so the refusal stands.
+# A RETIRED RECORD IS NAMED BY ITS TASK ID, which a member can rewrite in a record it owns: so only a UUID names one,
+# else `x/../../.claude/settings` would put the record over a file the owner runs (perms' read of #1904). And the
+# receipts live in $STBASE/.receipts/<repo>, which no member can write (a repo name never starts with a dot): under
+# the member's own repo dir a link swapped in between a check and the move dropped the record in any dir the owner
+# can write (perms' race, 1 in 300), and with nothing member-owned on the path there is no check to race.
+# And a member can link its own <repo>/<track> dir to an owner row's of the same name, so retire asks state_dir_ok
+# again right before the move, for --go (checked once already, then gh pr view runs) and for `cc rm` alike.
+retire(){   # $1 the record · $2 its task id
+  local d="$STBASE/.receipts/$repo"
+  state_dir_ok "$repo" "$track" >&2 || return 1
+  [[ $2 =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || { echo "cc: $1 names task '$2', not a task id — refused" >&2; return 1; }
+  mkdir -p "$d" && mv -fT "$1" "$d/$track.$2.json"; }
+claim_settle(){
+  local rec="$st/delivery.json" r pr v s=""
+  state_dir_ok "$repo" "$track" >&2 || exit 1   # --go asked already; claim_settle does not lean on that
+  [ -f "$rec" ] && [ ! -L "$rec" ] && r=$("$BIN/cc-task" show "$repo" "$track" 2>/dev/null) || return 0
+  jq -e '.closed == null and .claim != null and .claim.ended_at == null' <<<"$r" >/dev/null && return 0
+  if jq -e '.closed == null' <<<"$r" >/dev/null; then
+    pr=$(jq -r '.pr.url // empty' <<<"$r"); case "$pr" in https://github.com/*/*/pull/[0-9]*) ;; *) return 0 ;; esac
+    v=$(timeout 30 gh pr view "$pr" --json state,headRefName,headRefOid 2>/dev/null) || return 0   # GraphQL: the REST hour is the scarce one
+    # The PR is this row's: its branch is the row's, or its head is what the record pushed. A record pointed at
+    # some other merged PR settles nothing.
+    jq -e --arg b "track/$track" --arg h "$(jq -r '.artifact.pushed_sha // empty' <<<"$r")" \
+      '.headRefName == $b or ($h != "" and .headRefOid == $h)' <<<"$v" >/dev/null || return 0
+    s=$(jq -r '.state' <<<"$v")
+    case "$s" in
+      MERGED) "$BIN/cc-task" close "$repo" "$track" --generation "$(jq -r '.claim.generation' <<<"$r")" merged >/dev/null || return 0 ;;
+      CLOSED) ;;
+      *) return 0 ;;
+    esac
+  fi
+  retire "$rec" "$(jq -r '.task_id' <<<"$r")" \
+    && echo "cc: $repo/$track's last task${s:+, whose PR ${s,,},} is retired to its receipts; this claim starts a new one" >&2
+}
 claim_track(){   # $1 = subagent|worker · $2 = the row's status (running; queued for a --go that waits in cc-room) · $3 = --launch
   local record
   # cc-task writes the marker as part of claiming — atomically, and refusing a link at a name the worktree's own
@@ -1682,6 +1724,44 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   ln -sf "$T/sy/victim" "$T/sy/r/t/pr-body.sent"; : > "$T/sy/gh.log"; printf 'outside\n' > "$T/sy/live"; sync
   grep -q '^pr view' "$T/sy/gh.log" && [ "$(cat "$T/sy/victim")" = outside ]; t "…and a linked record is read as no record, so the live body decides" $?
   compgen -G "$T/sy/r/t/.pr-body.sent.*" >/dev/null && rc=1 || rc=0; t "…and no temp record is left behind" "$rc"
+  # A SETTLED TASK MAKES WAY FOR THE NEXT ONE (claim_settle). Each case is its own row under $T/cs/<repo>, with a stub
+  # cc-task that shows that row's record and logs a close (row f's close fails), and a gh on PATH that logs its call
+  # and answers what GitHub says of the PR ("" is no answer).
+  mkdir -p "$T/cs/out"; printf '#!/bin/bash\ncs=%q\n%s\n' "$T/cs" 'case $1 in show) cat "$cs/$2/$3/delivery.json";; close) [ "$3" = f ] && exit 1; echo "$*" >> "$cs/closes";; esac' > "$T/cs/cc-task"
+  printf '#!/bin/bash\necho "$*" >> %q/gh.log; [ -n "$GHSAYS" ] && echo "$GHSAYS"\n' "$T/cs" > "$T/cs/gh"; chmod +x "$T/cs/cc-task" "$T/cs/gh"
+  csgo(){   # $1 row $2 its record $3 GitHub's state ("" none) $4 the PR's branch (track/$1) $5 repo (r) → settled or left
+    mkdir -p "$T/cs/${5:-r}/$1"; printf '%s\n' "$2" > "$T/cs/${5:-r}/$1/delivery.json"; : > "$T/cs/closes"; : > "$T/cs/gh.log"
+    ( repo=${5:-r}; track="$1"; st="$T/cs/$repo/$1"; STBASE="$T/cs"; BIN="$T/cs"; PATH="$T/cs:$PATH"
+      GHSAYS=${3:+"{\"state\":\"$3\",\"headRefName\":\"${4:-track/$1}\",\"headRefOid\":\"abc\"}"}; export GHSAYS; claim_settle ) >/dev/null 2>&1; }
+  csid(){ printf '00000000-0000-4000-8000-%012d' "$1"; }
+  csrec(){ printf '{"task_id":"%s","pr":{"url":"https://github.com/o/r/pull/3"},"artifact":{"pushed_sha":null},"closed":%s,"claim":{"generation":22,"ended_at":%s}}' "$1" "$2" "$3"; }
+  csgone(){ [ ! -e "$T/cs/${3:-r}/$1/delivery.json" ] && [ -f "$T/cs/.receipts/${3:-r}/$1.$2.json" ]; }
+  csleft(){ [ -f "$T/cs/${2:-r}/$1/delivery.json" ] && [ ! -s "$T/cs/closes" ]; }   # the record stays and nothing was closed
+  ended='"2026-10-14T00:00:00Z"'
+  csgo m "$(csrec "$(csid 1)" null "$ended")" MERGED
+  csgone m "$(csid 1)" && grep -qx 'close r m --generation 22 merged' "$T/cs/closes" \
+    && grep -qx 'pr view https://github.com/o/r/pull/3 --json state,headRefName,headRefOid' "$T/cs/gh.log"
+  t "cc --go: a record whose PR merged outside the lander is closed as merged and retired, so the claim starts a new task" $?
+  csgo c "$(csrec "$(csid 2)" null "$ended")" CLOSED
+  csgone c "$(csid 2)" && ! grep -q . "$T/cs/closes"; t "…one whose PR was closed unmerged is retired and not closed as merged" $?
+  csgo k "$(csrec "$(csid 3)" '{"status":"merged","at":"2026-10-22T07:08:31Z"}' '"2026-10-22T07:08:31Z"')" OPEN
+  csgone k "$(csid 3)" && [ ! -s "$T/cs/gh.log" ]; t "…one already closed is retired without asking GitHub, so a closed row needs no cc rm" $?
+  csgo o "$(csrec "$(csid 4)" null "$ended")" OPEN
+  csleft o; t "…one whose PR is still open stays delivery-pending" $?
+  csgo q "$(csrec "$(csid 5)" null "$ended")" ""
+  csleft q; t "…with no answer from GitHub nothing moves" $?
+  csgo l "$(csrec "$(csid 6)" null null)" MERGED
+  csleft l; t "…a live claim is left to cc-task's rules, merged PR or not" $?
+  csgo x "$(csrec "$(csid 7)" null "$ended")" MERGED track/other
+  csleft x; t "…a record pointed at another row's merged PR settles nothing" $?
+  csgo f "$(csrec "$(csid 8)" null "$ended")" MERGED
+  csleft f; t "…a close cc-task refuses leaves the record where it is" $?
+  mkdir -p "$T/cs/.receipts/r/v.x"; csgo v "$(csrec 'x/../../../out/settings' '{"status":"merged"}' "$ended")" MERGED
+  csleft v && [ -z "$(ls -A "$T/cs/out")" ]; t "…a task id that climbs out of the receipts is refused and nothing is written outside them" $?
+  # planning's read: the member links its own r/n to an owner row of the same name, whose PR merged (csgo writes the record through the link).
+  mkdir -p "$T/cs/own/n" "$T/cs/r"; ln -sfn "$T/cs/own/n" "$T/cs/r/n"; csgo n "$(csrec "$(csid 9)" null "$ended")" MERGED
+  [ -f "$T/cs/own/n/delivery.json" ] && [ ! -s "$T/cs/closes" ] && [ ! -e "$T/cs/.receipts/r/n.$(csid 9).json" ] && rc=0 || rc=1
+  t "…and a row dir the member links to an owner row of that name is refused: the owner's record is not read, closed or moved" "$rc"
   # A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design). Each case is
   # its own row under $T/nw, with a stub cc-slack that logs its posts; the reservation and the brief writer are stubbed.
   mkdir -p "$T/nw"; printf '#!/bin/bash\necho "$*" >> %q/nw/posts\n' "$T" > "$T/nw/slack"; chmod +x "$T/nw/slack"
@@ -2284,21 +2364,23 @@ PY
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track" 255; wt="$WTBASE/$repo/$track"
     real=$(readlink -f "$wt" 2>/dev/null); [ -n "$real" ] || real=$(readlink -m "$wt")
     case "$real" in "$WTBASE"/?*/?*) ;; *) echo "cc: refusing to remove '$wt' — it resolves to $real, outside $WTBASE"; exit 1;; esac
+    # A TASK'S RECEIPT OUTLIVES ITS ROW. Removing the worktree and the board row must not delete the only
+    # task-to-PR mapping the costing has, so the record is retired beside the repo's others rather than kept
+    # where it is: left in place it would also be the closed task a rebuilt row of the same name cannot claim,
+    # and `cc rm` would quietly retire the NAME. A record whose task id is no task id is refused before anything
+    # is removed, so the row stays as it is. Everything else about rm is unchanged.
+    state_dir_ok "$repo" "$track" || exit 1   # a member's row dir linked to an owner row is refused, not emptied
+    rec="$STBASE/$repo/$track/delivery.json"
+    if [ -f "$rec" ] && [ ! -L "$rec" ]; then
+      tid=$(jq -r '.task_id // empty' "$rec" 2>/dev/null); [ -n "$tid" ] || tid=$(cat /proc/sys/kernel/random/uuid)
+      retire "$rec" "$tid" || exit 1
+    fi
     id=$(win_id "$repo/$track"); [ -n "$id" ] && tmux kill-window -t "$id" 2>/dev/null
     git -C "$DEV/$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$real"
     git "${GITNH[@]}" -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true
     "$BIN/cc-trust" rm "$wt" >/dev/null 2>&1 || true
-    # A TASK'S RECEIPT OUTLIVES ITS ROW. Removing the worktree and the board row must not delete the only
-    # task-to-PR mapping the costing has, so the record is retired beside the repo's others rather than kept
-    # where it is: left in place it would also be the closed task a rebuilt row of the same name cannot claim,
-    # and `cc rm` would quietly retire the NAME. Everything else about rm is unchanged.
-    rec="$STBASE/$repo/$track/delivery.json"
-    if [ -f "$rec" ] && [ ! -L "$rec" ]; then
-      tid=$(jq -r '.task_id // empty' "$rec" 2>/dev/null); [ -n "$tid" ] || tid=$(date -u +%Y%m%dT%H%M%SZ)
-      mkdir -p "$STBASE/$repo/.receipts" && mv -f "$rec" "$STBASE/$repo/.receipts/$track.$tid.json"
-    fi
     rm -rf "${STBASE:?}/${repo:?}/${track:?}"
-    rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind (never .receipts)
+    rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind
     "$BOARD" rm "$repo" "$track" >/dev/null 2>&1; echo "removed $repo/$track (remote branch, if pushed, left intact)"; exit 0 ;;
   rename) shift; exec "$BIN/cc-rename" "$@" ;;   # cc rename <old> <new> [-n] [--stop] — one tool owns the dozen places a project's name is a key
   handoff)   # ONE OWNER: every phase of a handoff lives in cc-handoff. `cc handoff <repo> <track>` is the spelling
@@ -2468,7 +2550,7 @@ if [ "$mode" = go ] && [ -z "$SESS" ] && ! inside && [ "$("$BOARD" get "$repo" "
   CLAIM=1
   # A REPAIR IS ASKED AT ITS RESERVATION, not here: the plain check refuses every delivery-pending row, and that
   # refusal is exactly what --repair is the door through (repair_reserve, before the brief).
-  [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] || claim_check worker   # asked BEFORE the brief is written and the live window is killed; taken below, once
+  claim_settle; [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] || claim_check worker   # asked BEFORE the brief is written and the live window is killed; taken below, once
 fi
 # --session marks the row's KIND (cc-board KINDS): a channel-like session with no task to finish — cc-reconcile leaves
 # its status alone and the Home tab groups it under its repo instead of counting it as running. Idempotent; a row that

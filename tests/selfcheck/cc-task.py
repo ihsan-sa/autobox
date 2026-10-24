@@ -467,7 +467,7 @@ def selfcheck():
            and answer(run(*reserve2, "--generation", str(regranted["generation"]))).get("launch") is False)
 
         delivered(); old = json.loads(record2.read_text())
-        receipts = root / ".cc/state/r/.receipts"; receipts.mkdir(parents=True, exist_ok=True)
+        receipts = root / ".cc/state/.receipts/r"; receipts.mkdir(parents=True, exist_ok=True)
         kept = receipts / f"t2.{old['task_id']}.json"
         blocked = run("claim", "r", "t2", "--executor", "worker")
         os.replace(record2, kept)   # what `cc rm` does with a finished row: the receipt outlives it

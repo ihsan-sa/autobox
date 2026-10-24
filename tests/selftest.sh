@@ -2402,14 +2402,27 @@ echo later > "$wt/later.txt"; rundone
   && ok "P18 closure control: later edits cannot inherit a closed delivery" || bad "P18 closure control: $(cat "$D/out" "$D/err")"
 rm "$wt/later.txt"; rundone
 cp "$st/delivery.json" "$D/retained"; tid=$(jq -r .task_id "$st/delivery.json"); "$D/bin/cc" rm r "$row" >/dev/null 2>&1
-{ [ ! -d "$wt" ] && [ ! -d "$st" ] && cmp -s "$HOME/.cc/state/r/.receipts/$row.$tid.json" "$D/retained"; } \
+{ [ ! -d "$wt" ] && [ ! -d "$st" ] && cmp -s "$HOME/.cc/state/.receipts/r/$row.$tid.json" "$D/retained"; } \
   && ok "P19: removing a managed row retires its receipt instead of deleting the only task-to-PR mapping" \
   || bad "P19: $(ls -R "$HOME/.cc/state/r" 2>&1 | tr '\n' ' ')"
 newdone "$row"   # …and the name it freed takes a NEW task, rather than inheriting a closed one nothing can claim
-{ [ "$(jq -r .task_id "$st/delivery.json")" != "$tid" ] && [ -f "$HOME/.cc/state/r/.receipts/$row.$tid.json" ]; } \
+{ [ "$(jq -r .task_id "$st/delivery.json")" != "$tid" ] && [ -f "$HOME/.cc/state/.receipts/r/$row.$tid.json" ]; } \
   && ok "P19 reuse control: a rebuilt row of the same name gets its own task, and the retired receipt is still there" \
   || bad "P19 reuse control: $(jq -r .task_id "$st/delivery.json" 2>&1)"
 "$D/bin/cc" rm r "$row" >/dev/null 2>&1
+newdone badid
+cp "$st/delivery.json" "$D/victim"; ln -s "$st" "$HOME/.cc/state/r/lnk"   # a member links its own row dir to that row
+"$D/bin/cc" rm r lnk >/dev/null 2>&1; c1=$?
+{ [ "$c1" != 0 ] && cmp -s "$st/delivery.json" "$D/victim" && ! compgen -G "$HOME/.cc/state/.receipts/r/lnk.*" >/dev/null; } \
+  && ok "P19 link: cc rm on a row dir linked to another row's refuses, and that row's record stays" \
+  || bad "P19 link: rc=$c1 $(ls -R "$HOME/.cc/state/.receipts" 2>&1 | tr '\n' ' ')"
+rm -f "$HOME/.cc/state/r/lnk"
+jq '.task_id = "x/../../y"' "$st/delivery.json" > "$D/bad" && cat "$D/bad" > "$st/delivery.json"
+"$D/bin/cc" rm r "$row" >/dev/null 2>&1; c1=$?
+{ [ "$c1" != 0 ] && [ -d "$wt" ] && cmp -s "$st/delivery.json" "$D/bad" && [ -n "$("$B/cc-board" get r "$row" status)" ]; } \
+  && ok "P19 bad id: a record naming no task id is refused, and the worktree, record and board row all stay" \
+  || bad "P19 bad id: rc=$c1 $(ls "$wt" "$st" 2>&1 | tr '\n' ' ')"
+jq '.task_id = "00000000-0000-4000-8000-000000000001"' "$D/bad" > "$st/delivery.json"; "$D/bin/cc" rm r "$row" >/dev/null 2>&1
 newdone different; git -C "$wt" rev-parse HEAD > "$D/merged.oid"; rundone
 { [ "$rc" = 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.closed == null'; } \
   && ok "P18 control: a different merged head does not suppress new work" || bad "P18 control: $(cat "$D/out" "$D/err")"
