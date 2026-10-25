@@ -113,8 +113,8 @@ row's brief (on the worker model where the diff is control layer: that is the re
 buy), and `cc-land record <repo> <pr> <verdict> --by <who> --head <the sha it read>` writes the answer onto the
 PR — `--head` because a branch pushed between the read and the record would otherwise inherit the pass. The
 record is keyed to the diff and not the head SHA, so the rebase before merging keeps it and an edit does not.
-To hold a PR while you check something, record HANDBACK yourself; once your read passes, release it with LAND
-under the same `--by` and `--head` at the same head. Only that reader can release its own hold this way, and a
+To hold a PR while you check something, record HANDBACK yourself with `--by` your seat's name (the directory your
+session runs in); once your read passes, release it with LAND under that `--by` and `--head` at the same head. Only that reader can release its own hold this way, and a
 HANDBACK from another reader or from the lander's own read still stands until a fix is pushed.
 A landing that finds one buys no review — most of the hour a PR used to spend queued. A security-reviewer still
 reads anything touching a gate or a member boundary. Record nothing and the landing reviews it itself, as

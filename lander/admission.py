@@ -5,7 +5,11 @@ it (the environment, then ~/.cc/config) when that is a whole number of at least 
 per CORES_PER_SLOT (2) cores, and no more than MemTotal holds of LANDER_MEM_MAX, the most one check may use (on
 2026-10-12 a box of 20 cores and 30 GB ran 3, at load ~9 with PRs and green runs queued for a slot; it now runs 5,
 which its memory bounds, and the old box's 6 cores still run 3). Never below 1, and a LANDER_SLOTS above the box's
-cores counts as its cores. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
+cores counts as its cores. Every check's scope shares lander.slice (SCOPES), so K is also never more than its MemoryHigh
+holds of CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a check's peak), whichever way K was set: on 2026-10-25 the
+tower's K of 5 counted its 30 GB at 6G a check, and seven ~1.4G dispatch checks running together thrashed
+the slice's 6G for 33 min and dragged the tower into memory pressure. A slice with no MemoryHigh, or a systemctl that
+does not answer, leaves K alone. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
 value without a restart; a cc-config that does not answer counts as unset. The backoff below applies to K either
 way. The box's load is
 mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead, and
@@ -19,7 +23,8 @@ own quota does not slow the box, one contending for the cores does. That cgroup 
 units or SSH sessions, so a shortage of the whole box is read too, by short(): SYS_PSI's (/proc/pressure, or
 LANDER_PSI_DIR) memory `full avg10` at or above PSI_FULL (LANDER_PSI_FULL, default 10), or /proc/meminfo's MemAvailable
 below MEM_FLOOR (LANDER_MEM_FLOOR, default 2G). `full` counts only while every task stalls at once, so one capped
-tenant's own stall stays out of it. An unreadable file counts as calm, the same as PSI_DIR's. When memory `some avg10`
+tenant's own stall stays out of it. An unreadable file counts as calm, the same as PSI_DIR's, and says so once per
+process on stderr (_unread), since a dead signal otherwise looks like a calm box. When memory `some avg10`
 reaches PSI_MEM (default 20) or short() says so, the box is mem_loaded(); when it is, or cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
@@ -131,6 +136,8 @@ LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 MEM_FLOOR = os.environ.get("LANDER_MEM_FLOOR", "2G")
+CHECK_MEM = os.environ.get("LANDER_CHECK_MEM", "1536M")
+SLICE_HIGH: str | None = None   # lander.slice's MemoryHigh for a test to fix; None: systemctl says it
 CPU_WEIGHT = "20"
 LOAD_FACTOR = float(os.environ.get("LANDER_LOAD_FACTOR", "2") or 2)
 
@@ -165,14 +172,29 @@ FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below l
 def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
     """`<which> avg10` for cpu/memory/io from a cgroup's `<kind>.pressure` or /proc/pressure's `<kind>`, else 0.0."""
     path = os.path.join(root, kind + ".pressure")
+    path = path if os.path.exists(path) else os.path.join(root, kind)
     try:
-        with open(path if os.path.exists(path) else os.path.join(root, kind)) as f:
+        with open(path) as f:
             for line in f:
                 if line.startswith(which + " "):
                     return float(dict(kv.split("=") for kv in line.split()[1:])["avg10"])
     except (OSError, KeyError, ValueError):
         pass
+    _unread(f"{path} `{which} avg10`")
     return 0.0
+
+
+_dead: set = set()   # the signals _unread() has already told of in this process
+
+
+def _unread(what: str) -> None:
+    """Say once per process, on stderr (the lander's log), that a signal would not read or parse and so counts as
+    calm: a dead signal looks like a calm box, so a broken read must leave a trace."""
+    if what in _dead:
+        return
+    _dead.add(what)
+    with contextlib.suppress(OSError, ValueError):   # a gone or closed stderr
+        print(f"lander: {what} does not read, so it counts as calm", file=sys.stderr, flush=True)
 
 
 def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
@@ -180,7 +202,10 @@ def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
     full, avail = psi("memory", sys_psi or SYS_PSI, "full"), _meminfo("MemAvailable:", meminfo)
     if full >= PSI_FULL:
         return f"box-wide memory pressure (PSI full) at {full:.0f}"
-    if avail is not None and avail < (_bytes(MEM_FLOOR) or 0):
+    floor = _bytes(MEM_FLOOR)
+    if floor is None:
+        _unread(f"LANDER_MEM_FLOOR={MEM_FLOOR!r}")
+    if avail is not None and avail < (floor or 0):
         return f"box-wide memory short, {avail >> 20} MiB available"
     return ""
 
@@ -223,7 +248,10 @@ def _meminfo(key: str, meminfo: str | None = None) -> int | None:
     """/proc/meminfo's `key` (MemTotal:, MemAvailable:) in bytes, or None when it will not read."""
     with contextlib.suppress(OSError, ValueError, IndexError):
         with open(meminfo or MEMINFO) as f:
-            return next((int(line.split()[1]) * 1024 for line in f if line.startswith(key)), None)
+            n = next((int(line.split()[1]) * 1024 for line in f if line.startswith(key)), None)
+        if n is not None:
+            return n
+    _unread(f"{meminfo or MEMINFO} {key}")
     return None
 
 
@@ -256,12 +284,27 @@ def config_slots(name: str = "LANDER_SLOTS") -> int | None:
     return cores if len(n) > 9 else min(int(n), cores)
 
 
+def slice_slots() -> int | None:
+    """How many checks of CHECK_MEM lander.slice's MemoryHigh holds, at least 1; None when it has none or will not
+    read."""
+    high = SLICE_HIGH
+    if high is None:
+        try:
+            high = subprocess.run(["systemctl", "--user", "show", "-p", "MemoryHigh", "--value", "lander.slice"],
+                                  capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    cap, each = _bytes(high), _bytes(CHECK_MEM)
+    return max(1, cap // each) if cap and each else None
+
+
 _read: tuple = (None, 0.0)   # (K, when): config_slots() spawns cc-config, and slot() asks every poll (2 s)
 
 
 def slots(now: float | None = None) -> int:
-    """K before any backoff: SLOTS when a caller fixed it, else LANDER_SLOTS from cc-config, else host_slots(),
-    read again once CONFIG_TTL seconds have passed, so a running lane follows a change without a restart."""
+    """K before any backoff: SLOTS when a caller fixed it, else LANDER_SLOTS from cc-config, else host_slots(), no more
+    than slice_slots(), read again once CONFIG_TTL seconds have passed, so a running lane follows a change without a
+    restart."""
     global _read
     if SLOTS:
         return max(1, SLOTS)
@@ -269,6 +312,7 @@ def slots(now: float | None = None) -> int:
     k, at = _read
     if k is None or now - at >= CONFIG_TTL:
         k = config_slots() or host_slots()
+        k = min(k, slice_slots() or k)
         _read = (k, now)
     return k
 

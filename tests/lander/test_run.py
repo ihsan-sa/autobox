@@ -1865,6 +1865,9 @@ class Admission(unittest.TestCase):
             p = mock.patch.object(A, k, v)
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(A, "SLICE_HIGH", "infinity")   # nor the host's lander.slice
+        p.start()
+        self.addCleanup(p.stop)
 
     def loadavg(self, l1):
         fd, path = tempfile.mkstemp()
@@ -1981,6 +1984,26 @@ class Admission(unittest.TestCase):
                 self.assertEqual(A.slots_now(calm, 3, self.calm_load), 3)
                 self.assertEqual(A.slots_now(hot, 3, self.calm_load), 1)
 
+    def test_each_unreadable_signal_says_so_once(self):
+        # a dead signal counts as calm, so it must leave a trace, once per process however often it is read
+        calm = A.box_cgroup(*self.box(0.2))
+        for k, v, said in (("SYS_PSI", "/nonexistent", "/nonexistent/memory `full avg10`"),
+                           ("MEMINFO", "/nonexistent", "/nonexistent MemAvailable:"),
+                           ("MEMINFO", self.meminfo(1000), "MemAvailable:"),
+                           ("MEM_FLOOR", "lots", "LANDER_MEM_FLOOR='lots'")):
+            err = io.StringIO()
+            with mock.patch.object(A, k, v), mock.patch.object(A, "_dead", set()), \
+                    contextlib.redirect_stderr(err):
+                for _ in range(3):
+                    self.assertEqual(A.slots_now(calm, 3, self.calm_load), 3)
+            lines = [line for line in err.getvalue().splitlines() if said in line]
+            self.assertEqual(len(lines), 1, (k, v, err.getvalue()))
+            self.assertIn("counts as calm", lines[0])
+        err = io.StringIO()
+        with mock.patch.object(A, "_dead", set()), contextlib.redirect_stderr(err):
+            A.slots_now(calm, 3, self.calm_load)
+        self.assertEqual(err.getvalue(), "")   # every signal reads: nothing said
+
     def meminfo(self, kb, avail=None):
         fd, path = tempfile.mkstemp()
         with os.fdopen(fd, "w") as f:
@@ -2044,6 +2067,33 @@ class Admission(unittest.TestCase):
             with mock.patch.object(A.subprocess, "run", side_effect=boom):
                 self.assertIsNone(A.config_slots())
                 self.assertEqual(A.slots(now=2000.0), 4)
+
+    def test_k_is_no_more_than_lander_slice_holds(self):
+        # 2026-10-25: the tower's K of 5 counted its 30 GB at 6G a check, and ~1.4G checks thrashed the slice's 6G
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        quiet = dict(psi_root=self.psi_dir(0, 0), loadavg=self.calm_load, poll=0.05, say=lambda _: None)
+
+        def admits(high, cfg=None):
+            with mock.patch.object(A, "_read", (None, 0.0)), mock.patch.object(A, "SLOTS", None), \
+                    mock.patch.object(A, "host_slots", lambda *a, **k: 5), \
+                    mock.patch.object(A, "config_slots", lambda *a, **k: cfg), \
+                    mock.patch.object(A, "CHECK_MEM", "1536M"), mock.patch.object(A, "SLICE_HIGH", high), \
+                    contextlib.ExitStack() as held:
+                n = 0
+                while n < 9:
+                    try:
+                        held.enter_context(A.slot(st, deadline=0.3, **quiet))
+                    except TimeoutError:
+                        break
+                    n += 1
+                return n
+
+        self.assertEqual(admits("6G"), 4)              # the fifth waits: 6G holds four checks of 1.5G
+        self.assertEqual(admits("6G", cfg=7), 4)       # a LANDER_SLOTS past the slice counts as what it holds
+        self.assertEqual(admits("1G"), 1)              # never 0
+        self.assertEqual(admits("infinity"), 5)        # no ceiling: the host's K
+        self.assertEqual(admits(""), 5)                # a systemctl that did not answer leaves K alone
 
     def test_alone_waits_for_a_slot_past_its_own_k(self):
         # brief: "an 'alone' re-run ... runs beside checks on slots 4-8" when K rose 3 to 8 under it
@@ -3130,8 +3180,9 @@ class Judge(unittest.TestCase):
         self.addCleanup(d.cleanup)
         write(d.name, {"cpu": "some avg10=90.00 avg60=90.00 avg300=90.00 total=1\n",
                        "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"})
-        self.assertFalse(A.loaded(d.name))
-        self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
+        with mock.patch.object(A, "short", return_value=""):   # the tower's own memory stays out of it
+            self.assertFalse(A.loaded(d.name))
+            self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")

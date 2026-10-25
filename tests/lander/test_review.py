@@ -2314,11 +2314,47 @@ class TestRecord(Case):
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 
+    def seat(self, name):
+        """caller_seat() answers `name` for the rest of the test, as if run from that seat."""
+        self.addCleanup(setattr, R, "caller_seat", R.caller_seat)
+        R.caller_seat = lambda *a, **kw: name
+
+    def test_the_caller_seat_is_the_claude_sessions_own_dir(self):
+        self.versions()
+        self.assertEqual(R.caller_seat(30, self.proc(os.path.join(self.tmp, "wt", "seat"))), "seat")
+        self.assertIsNone(R.caller_seat(30, self.proc(os.path.join(self.tmp, "wt", "seat"), comm="bash")))
+
     def test_record_releases_its_own_handback_at_the_same_head(self):
         d = R.change_digest(DIFF)
+        self.seat("seat")
         box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by="seat")])})
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 0)
         self.assertIn("verdict=LAND by=seat", box.called("gh pr comment")[0]["input"])   # posted like any record
+
+    def test_record_refuses_a_release_under_another_seats_name(self):
+        """Every session shares one GitHub login, so --by alone is a label (perms' read of #1949): a session that
+        names another seat cannot release that seat's hold."""
+        d = R.change_digest(DIFF)
+        for caller in ("other", None):
+            self.seat(caller)
+            box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by="seat")])})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 1)
+            self.assertIn("not the seat this was run from", out.getvalue())
+            self.assertEqual(box.called("gh pr comment"), [])
+
+    def test_a_land_between_two_holds_resets_the_release(self):
+        """Only the holds since the last LAND count: another reader's HANDBACK that a LAND came after no longer holds
+        the PR, so the seat's own hold on top is its to release."""
+        d = R.change_digest(DIFF)
+        self.seat("seat")
+        box = self.box(**{"gh pr view": self.facts([
+            self.comment("HANDBACK", d, ["1. x"], by="other", at="2026-10-20T10:00:00Z"),
+            self.comment("LAND", d, by="other", at="2026-10-20T11:00:00Z"),
+            self.comment("HANDBACK", d, ["1. y"], by="seat", at="2026-10-20T12:00:00Z")])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 0)
+        self.assertIn("verdict=LAND by=seat", box.called("gh pr comment")[0]["input"])
 
     def test_record_refuses_to_release_another_readers_handback(self):
         d = R.change_digest(DIFF)

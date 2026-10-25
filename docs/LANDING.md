@@ -51,7 +51,8 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
    gh cannot give is held, never merged. The reader names in a review record are labels, not identities: they
    say which read it was, and prove nothing about who made it.
    A seat that recorded a HANDBACK to hold a PR releases it with a LAND under the same `--by` at the same head;
-   the record refuses that LAND over anyone else's HANDBACK or the lander's own.
+   the record refuses that LAND over anyone else's HANDBACK or the lander's own, and when `--by` is not the seat
+   it was run from.
 5. **Merge.** One merge lane per repo, `--squash --match-head-commit`. The board row closes and the approval card
    turns to landed.
 6. **Tip and deploy.** The tick runs the tip checks the merged range reaches, then deploys merged main target by

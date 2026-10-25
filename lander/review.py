@@ -4,7 +4,8 @@
                                      write a read a seat made as the PR's marker comment (from the perms seat, a
                                      LAND also goes in perms' ledger: "a security path"); refused if --head moved,
                                      if it is looser than a HANDBACK already standing (old words map as below) that
-                                     is not this --by's own at this head (a seat releases its own hold), or
+                                     is not this --by's own at this head (a seat releases its own hold, and --by
+                                     must then be the calling seat: caller_seat()), or
                                      if the head, the base or the change digest cannot be worked out right now (a
                                      marker with an empty change= matches no reader, so nothing is posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
@@ -2273,6 +2274,17 @@ def perms_seat_caller(pid=None, proc="/proc", state=None, versions=None):
     return cwd == os.path.realpath(os.path.join(state or PERMS_STATE, box, "perms"))
 
 
+def caller_seat(pid=None, proc="/proc", versions=None):
+    """The seat the calling Claude session (claude_ancestor()) runs in: the last part of its /proc/<pid>/cwd realpath,
+    read as perms_seat_caller() reads it, or None. Every session shares one GitHub login, so --by alone proves nothing
+    (perms' read of #1949); a HANDBACK release must name this."""
+    seat = claude_ancestor(pid, proc, versions)
+    try:
+        return os.path.basename(os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))) if seat else None
+    except OSError:
+        return None
+
+
 def cmd_record(argv):
     """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]. A --by of `perms` or starting
     `perms-` (perms-security-read among them) is refused unless perms_seat_caller(): only the perms seat writes
@@ -2341,6 +2353,10 @@ def cmd_record(argv):
         if any(h.model != who or bought(h) or not job.head.startswith(h.extra.get("head") or "-") for h in holds):
             print("lander record: HANDBACK stands for this change and LAND is looser; only the reader that "
                   "recorded it can release it, at the head it held; push the fix instead")
+            return 1
+        if who != caller_seat():
+            print(f"lander record: --by {who} is not the seat this was run from ({caller_seat() or 'no seat'}), "
+                  "and only a seat can release its own HANDBACK; nothing posted")
             return 1
     rows = [ln.strip() for ln in findings.splitlines() if ln.strip()]
     v = T.Verdict(verdict=word, digest=job.digest, blocking=rows if word != T.LAND else [],
