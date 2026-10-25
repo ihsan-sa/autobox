@@ -27,8 +27,9 @@ THE STEPS, per target, in order; the first that fails stops that target and says
   3. install  the one installer the repo names in tests/LANDING-deploy.toml (`installer = "<path>"`), with no
               flags; then `systemctl --user daemon-reload`; then <repo>.applied records the sha. Nothing at a guessed
               path runs: with no such file or key the deploy pulls only and says so. A name that is not a regular
-              file inside the checkout (a symlink anywhere on the way, an absolute path or one leaving the tree) fails
-              the step and says why. plan.py makes a change to that file a security read in every repo
+              file inside the checkout (a symlink anywhere on the way, an absolute path, one leaving the tree or one
+              holding a NUL) fails the step and says why, and so does that file itself reached through a symlink.
+              plan.py makes a change to that file a security read in every repo
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
               has no [Install], install.sh did not link it, or `cc-units policy <u> enable` says owner — then the
               owner gets one 🔐 card with the command, and nothing else asks him (S5). The policy is read from the
@@ -556,9 +557,14 @@ INSTALLER = M.DEPLOY
 
 def installer(root):
     """The checkout's named installer, relative to `root`, or "" when INSTALLER names none. Raises Failed when the
-    file does not parse, or the name is not a regular file inside the tree with no symlink on the way."""
+    file does not parse or has a symlink on its own path, or the name is not a regular file inside the tree with no
+    symlink on the way."""
+    # brief: "checks tests/LANDING-deploy.toml and the tests/ directory the way it checks the installer path"
+    cfg = os.path.join(os.path.realpath(root), INSTALLER)
+    if os.path.realpath(cfg) != cfg:
+        raise Failed("install", f"{INSTALLER} is reached through a symlink, which is refused")
     try:
-        with open(os.path.join(root, INSTALLER), "rb") as f:
+        with open(cfg, "rb") as f:
             inst = tomllib.load(f).get("installer", "")
     except FileNotFoundError:
         return ""
@@ -567,7 +573,7 @@ def installer(root):
     if not inst:
         return ""
     full = os.path.join(os.path.realpath(root), str(inst))
-    if (not isinstance(inst, str) or os.path.isabs(inst) or os.path.normpath(inst) != inst
+    if (not isinstance(inst, str) or "\0" in inst or os.path.isabs(inst) or os.path.normpath(inst) != inst
             or os.path.realpath(full) != full or not os.path.isfile(full)):
         raise Failed("install", f"{INSTALLER} names {inst!r}, which is not a regular file inside the checkout "
                                 f"(a symlink or a path out of the tree is refused)")

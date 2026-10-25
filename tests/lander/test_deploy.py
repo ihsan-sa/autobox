@@ -7,6 +7,7 @@ python3 -m unittest discover -s core/tests/lander -p 'test_deploy.py'
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -233,6 +234,39 @@ class TestDeploy(Box):
                 self.assertIn(f"install: {D.INSTALLER} names {name!r}, which is not a regular file inside", st["why"])
                 self.assertEqual((box.called("evil.sh"), box.called("install.sh")), ([], []))
                 self.assertEqual(D.applied("demo"), "")
+                os.unlink(D.req_path("demo"))
+
+    def test_a_nul_in_the_installer_name_fails_the_install_step_with_its_message(self):
+        # perms-2a on #1943: realpath raised ValueError on the NUL and crashed deploy
+        self.name_installer('installer = "install.sh\\u0000x"\n')
+        box = self.fake()
+        D.request("demo", NEW)
+        st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual(st["state"], "failed")
+        self.assertIn(f"install: {D.INSTALLER} names 'install.sh\\x00x', which is not a regular file inside", st["why"])
+        self.assertEqual((box.called("install.sh"), D.applied("demo")), ([], ""))
+
+    def test_a_symlinked_deploy_config_or_tests_dir_is_refused_and_nothing_runs(self):
+        # perms-2a on #1943: the config file or tests/ could itself be a symlink out of the tree
+        for link in ("file", "dir"):
+            with self.subTest(link=link):
+                cfg, tests = os.path.join(self.root, D.INSTALLER), os.path.join(self.root, "tests")
+                os.unlink(tests) if os.path.islink(tests) else shutil.rmtree(tests)
+                out = os.path.join(self.tmp, f"out-{link}")
+                os.makedirs(out)
+                with open(os.path.join(out, "LANDING-deploy.toml"), "w") as f:
+                    f.write('installer = "install.sh"\n')
+                if link == "dir":
+                    os.symlink(out, tests)
+                else:
+                    os.makedirs(tests)
+                    os.symlink(os.path.join(out, "LANDING-deploy.toml"), cfg)
+                box = self.fake()
+                D.request("demo", NEW)
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+                self.assertEqual(st["state"], "failed")
+                self.assertIn(f"install: {D.INSTALLER} is reached through a symlink", st["why"])
+                self.assertEqual((box.called("install.sh"), D.applied("demo")), ([], ""))
                 os.unlink(D.req_path("demo"))
 
     def test_a_moved_aside_draft_is_still_said_when_the_install_then_fails(self):
