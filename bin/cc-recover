@@ -15,7 +15,8 @@
   cc-recover selfcheck        every rule below against fixtures: a fake tmux and a fake /proc, never the live server
 
 THE SAVED SET is ~/.cc/recover/live.json: every session in tmux session "main" that runs under `cc __run…`
-or `cc-loop`, with its kind and what relaunches it.
+or `cc-loop`, with its kind and what relaunches it. The `cc __run…` is the pane itself or a child of it: a seat
+whose claude exited leaves its pane as a shell (`exec bash`), and one started again inside that shell is saved too.
   seat    <repo>, `cc __runmain` (and `__runplain`): relaunched `cc <repo>` on a CC_CLAUDE wrapper that runs
           `claude --resume <sid>`. The sid is read off the live claude's open <tmp>/claude-<uid>/<proj>/<sid>/tasks
           fd; a seat whose sid cannot be read comes back cold.
@@ -43,9 +44,11 @@ no prompt, argument or model. cc-perms decides everything else: it lets only thi
 down), and tells the owner once, with a line to paste, when it refuses or starts backing off. The tick logs each outcome to decisions.log on a change only, and
 CC_RECOVER_PERMS=off stops both callers, and a host ~/.cc/roles says is not the hub asks nothing. Bring-up runs in a unit of its own, which cc-perms refuses, so it leaves perms
 to the next tick and says so.
-A healthy tick rewrites the file, so it is never older than a minute or two while the box runs. A tick does NOT
-rewrite it while a restore is running, when the tmux server is down, or on a mass loss: at least half the saved
-set, and at least CC_RECOVER_MASS_MIN (3), gone at once. After an OUTAGE — a tick that found the tmux server down,
+A healthy tick rewrites the file, so it is never older than a minute or two while the box runs. A tick drops
+nothing from it while a restore is running or on a mass loss, and leaves it alone when the tmux server is down. A mass
+loss is at least half the saved set, and at least CC_RECOVER_MASS_MIN (3), gone at once. A held set still takes in
+every session that came up since, so a seat relaunched by hand after a crash is in it if a second one follows (10-24:
+dispatch's planning seat, relaunched during the hold after a crash, was missing from the next restore). After an OUTAGE — a tick that found the tmux server down,
 or a boot since the set was saved — any loss at all is a mass loss, so a box of one or two sessions comes back too.
 That held set is what a restore brings back. A smaller set that lasts CC_RECOVER_HOLD_MIN (30) is taken as
 deliberate and saved.
@@ -72,9 +75,9 @@ address, the hotspot and the firewall are never touched — the detector only re
 
 RESTORE: it takes ~/.cc/recover/.lock without waiting and holds it to the end, so of two restores started at once
 (cc-tmux-ledger's watcher after a tmux crash and the detector, say, or `cc-tmux-ledger restore` by hand) the second
-logs that and does nothing. It marks itself running before it reads the saved set, so no tick rewrites that set until it ends. Then
+logs that and does nothing. It marks itself running before it reads the saved set, so no tick drops anything from that set until it ends. Then
 the tmux server (cc-boot), then the network (up to 15 min by the wall clock: claude needs it), then each saved
-session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone. Each
+session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone; a window left as a bare shell is not live, and is closed and relaunched. Each
 non-worker gets a catch-up message once its claude is up (cc-msg; a track or member track by `cc <repo> <track> --say`); a worker
 keeps its own journal and gets none. The result goes to restore.log and one cc-notify line. The saved set is a file,
 so no record is trusted: one whose names are not from a safe charset, whose repo is not a directory under ~/dev, whose
@@ -82,11 +85,11 @@ worker flags are not the ones a scan saves, or whose claude is not the box's own
 and not relaunched; so is one for a repo the host records as a member's (~/.cc/members/<h>/) whose marker is gone. ~/.cc/recover and its wrapper directory must be this user's alone, and each wrapper is a new file.
 
 BRING-UP (owner, 2026-10-05: "find all the missing cc sessions … restart them", "unpause everything", "prompt planning
-sessions to resume dropped/in progress work"). It holds the restore guard while it runs, so no tick rewrites the saved
+sessions to resume dropped/in progress work"). It holds the restore guard while it runs, so no tick drops anything from the saved
 set and no restore runs beside it, and a repo named in --except is left exactly as it is in every step below:
   1. `cc-pause off <repo> --only` for each repo `cc-pause list` names, so an excluded child keeps its pause.
   2. Relaunches every seat, orch and member with no live claude under its window, whether the window is gone or holds
-     only a shell: the saved set's records (seats and orchs resumed on their sid), then a window's name for a shell
+     only a shell (closed first, as `cc` opens nothing where that window stands): the saved set's records (seats and orchs resumed on their sid), then a window's name for a shell
      window the set lacks (cold), then every ~/dev/<h> with .cc/member-workspace (cold). The relaunch rules are
      restore's, but 2-4 s apart, and its catch-up turn asks the session to pick its work back up.
   3. Relaunches each worker loop that stopped on the usage limit (loop.log ends on `exit 8` or a limit wait, no
@@ -360,7 +363,9 @@ def classify(name, pane):
     tree = descendants(pane)
     if any("--dangerously-skip-permissions" in argv(p) for p in tree):
         return None   # the perms session, however it was named
-    mode = next((t for t in words(argv(pane)) if t.startswith("__run")), None)
+    # the pane's own `cc __run…`, or its shell's child's: a seat whose claude exited leaves `exec bash` as the pane,
+    # and one started again inside that shell runs under it
+    mode = next((t for p in [pane, *children(pane)] for t in words(argv(p)) if t.startswith("__run")), None)
     kind = {"__runmain": "seat", "__runplain": "seat", "__runorch": "orch", "__runmember": "member", "__run": "track",
             "__runnext": "next"}.get(mode)
     if not kind:
@@ -410,6 +415,9 @@ def save(st):
     if live is None:
         st.setdefault("outage", now())
         return "tmux-down", sorted(prev)
+    held = {**prev, **live}   # a held set still takes in what came up since and drops nothing (see THE SAVED SET)
+    if held != prev and (restoring() or prev and set(prev) - set(live)):
+        store("live.json", {**saved, "sessions": held})
     if restoring():
         return "restoring", sorted(set(prev) - set(live))
     if saved.get("boot_id") and saved["boot_id"] != boot_id():
@@ -710,8 +718,14 @@ def watch_manager():
 # ---- restore ----
 
 def wid_live(name):
-    ws = windows() or []
-    return any(n == name for n, _ in ws)
+    """Something runs under the window's pane. A window left as a bare shell (its claude exited or was killed) is not
+    live: it is closed, so the relaunch can open it again, as `cc` opens nothing where a window of that name is."""
+    for n, pane in windows() or []:
+        if n == name:
+            if children(pane):
+                return True
+            tmux("kill-window", "-t", f"main:={name}")
+    return False
 
 
 def claude_pid(name):
@@ -864,7 +878,7 @@ def restore_locked(boot):
         log("restore.log", "a restore is already running — this one does nothing")
         return 0
     # the guard goes up BEFORE the saved set is read and held through every wait: until it comes down no tick
-    # rewrites live.json, so a tick during the network wait cannot replace the set this restore is bringing back
+    # drops anything from live.json, so a tick during the network wait cannot shrink the set this restore is bringing back
     store("restoring", {"pid": os.getpid(), "boot_id": boot_id(), "start": proc_start(os.getpid())})
     try:
         return restore_held(boot)
@@ -1230,7 +1244,7 @@ def bringup_held(excluded):
     def up(r):
         if r["kind"] == "worker":
             return any(n == r["window"] and (classify(n, p) or {}).get("kind") == "worker" for n, p in windows() or [])
-        return claude_pid(r["window"]) is not None
+        return wid_live(r["window"]) and claude_pid(r["window"]) is not None
     rep = {}
     relaunch(want, bringup_text(), env, live=up, stagger=gap, report=rep, notify=False, logname="bringup.log")
     left += [f"{w}: did not come up, see bringup.log" for w in rep.get("failed", [])]
@@ -1440,6 +1454,35 @@ def selfcheck():
         keep = [l for l in open(f"{d}/windows.tsv").read().splitlines() if not l.startswith("m1")]
         open(f"{d}/windows.tsv", "w").write("\n".join(keep) + "\n")
         check("save: one session gone is saved at once", save(st)[0] == "saved" and len(load("live.json", {})["sessions"]) == 4)
+
+        # 2a. 10-24: dispatch's planning seat was relaunched by hand while a set was held after a crash, and the restore
+        # after the next crash used the held set, which never took it in; nor did a seat started again inside the
+        # shell its exited claude left; and a window left as that bare shell counted as live, so nothing relaunched it
+        d = fixture(); live_box(d); st = {}; save(st)
+        lines = [l for l in open(f"{d}/windows.tsv").read().splitlines() if not l.startswith(("r1\t", "r1@ops", "m1"))]
+        proc(190, ["bash", "/b/cc", "__runmain", "r2"], [191]); proc(191, ["/c/claude"], env={"CC_CLAUDE": "/c/claude"}, sid="sid-r2")
+        open(f"{d}/windows.tsv", "w").write("\n".join(lines + ["r2\t190"]) + "\n")
+        r = save(st); ss = load("live.json", {})["sessions"]
+        check("save: a seat launched while a mass loss holds the set is taken into it, and nothing held is dropped",
+              r[0] == "mass-loss" and sorted(ss) == ["m1", "r1", "r1/fix", "r1/job", "r1@ops", "r2"] and ss["r2"]["sid"] == "sid-r2")
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        globals()["claude_pid"], globals()["net_probe"] = (lambda w: "999"), (lambda: "up")
+        restore(boot=True)
+        check("restore: the seat launched during the hold comes back", any(c.startswith("cc|r2|") for c in open(f"{d}/calls").read().splitlines()))
+        d = fixture()
+        proc(200, ["bash"], [201]); proc(201, ["bash", "/b/cc", "__runmain", "r2"], [202]); proc(202, ["/c/claude"], sid="sid-r2b")
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr2\t200\n")
+        s = scan()
+        check("scan: a seat started again inside the shell its exited claude left is saved, on its sid",
+              s.get("r2", {}).get("kind") == "seat" and s["r2"]["sid"] == "sid-r2b")
+        d = fixture(); live_box(d); save({})
+        proc(400, ["bash"]); open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t400\nr1/fix\t130\n")
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: a seat's window left as a bare shell is not live: it is closed and the seat relaunched; a live one is left",
+              "tmux|kill-window|tmux|-t|tmux|main:=r1|" in calls and any(c.startswith("cc|r1|") for c in calls)
+              and not any("main:=r1/fix" in c for c in calls) and not any(c.startswith("cc|r1|fix|") and "--say" not in c for c in calls))
+        globals()["claude_pid"], globals()["net_probe"] = real["claude_pid"], real["net_probe"]
 
         # 2b. an outage restores however few sessions there were: two saved, tmux seen down, back with box alone
         d = fixture(); live_box(d)
@@ -1986,8 +2029,9 @@ def selfcheck():
         check("bringup: each live seat or orch it did not relaunch gets one resume message; the dialog window and the excluded none",
               sorted(c.split("|")[1] for c in calls if c.startswith("cc-msg|")) == ["m1", "r1", "r1@ops", "r2"]
               and "owner asked for the whole box to be brought back up" in next(c for c in calls if c.startswith("cc-msg|r1|")))
-        check("bringup: the dialog window is listed and no key is sent to any window",
-              "on the usage-limit dialog, to answer by hand: r1@x" in blog and not any(c.startswith("tmux|") for c in calls))
+        check("bringup: the dialog window is listed and no key is sent to any window; only r1@ops's bare shell is closed",
+              "on the usage-limit dialog, to answer by hand: r1@x" in blog
+              and [c for c in calls if c.startswith("tmux|")] == ["tmux|kill-window|tmux|-t|tmux|main:=r1@ops|"])
         check("bringup: perms is never relaunched or messaged (its own unit is refused by cc-perms), and the next tick is named",
               not any("perms" in c for c in calls) and "perms: not live; the next cc-recover tick brings it back" in blog)
         gaps = [x for x in slept if x >= 1 and x != 15]   # subprocess waits in steps under 0.1 s

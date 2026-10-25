@@ -394,6 +394,19 @@ def main():
     case("dry: a FIFO at a brief's path doesn't block the run, and the duplicate pair still folds",
          rc == 0 and plan(h)["folds"] == [{"parent": "raised-dup-a", "children": ["raised-dup-b"]}])
 
+    # 1b. one row whose notes is a string is skipped and named; the rest of its board is consolidated, exit 0
+    h, env = fx()
+    add_row(h, "raised-old-thing-str", "old.py was removed.")
+    bp = os.path.join(h, ".cc", "boards", REPO + ".json")
+    d = json.load(open(bp))
+    d["tracks"]["raised-old-thing-str"]["notes"] = "a bare string"
+    json.dump(d, open(bp, "w"), indent=2)
+    rc, out = run(env, "run", "--repo", REPO, "--live")
+    t = board(h)
+    case("live: a string-notes row is skipped, untouched, and the rest of the board is consolidated; exit 0",
+         rc == 0 and t["raised-old-thing-str"]["notes"] == "a bare string" and t["raised-old-thing-str"]["status"] == "queued"
+         and t["raised-old-thing"]["status"] == "done" and "notes not a list" in json.dumps(plan(h)))
+
     # 2. a live run writes it, with a ledger line per action holding the old state
     h, env = fx()
     rc, out = run(env, "run", "--repo", REPO, "--live")
