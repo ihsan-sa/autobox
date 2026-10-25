@@ -2314,6 +2314,31 @@ class TestRecord(Case):
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 
+    def test_record_releases_its_own_handback_at_the_same_head(self):
+        d = R.change_digest(DIFF)
+        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by="seat")])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 0)
+        self.assertIn("verdict=LAND by=seat", box.called("gh pr comment")[0]["input"])   # posted like any record
+
+    def test_record_refuses_to_release_another_readers_handback(self):
+        d = R.change_digest(DIFF)
+        for held in ([self.comment("HANDBACK", d, ["1. x"], by="other")],
+                     # a hold of its own on top does not release the other reader's beneath it
+                     [self.comment("HANDBACK", d, ["1. x"], by="other"),
+                      self.comment("HANDBACK", d, ["1. y"], by="seat")],
+                     # its own hold at an earlier head is not this head's
+                     [self.comment("HANDBACK", d, ["1. x"], by="seat", head="a" * 40)]):
+            box = self.box(**{"gh pr view": self.facts(held)})
+            self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
+            self.assertEqual(box.called("gh pr comment"), [])
+
+    def test_record_refuses_to_release_the_landers_own_handback(self):
+        self.reviewer(CC_LAND_REVIEWERS="claude-fable-5-1")
+        d = R.change_digest(DIFF)
+        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. x"], by="claude-fable-5-1")])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "claude-fable-5-1"), 1)
+        self.assertEqual(box.called("gh pr comment"), [])
+
     def test_record_refuses_when_the_change_digest_cannot_be_computed(self):
         """A transient git failure once made the digest '' and a marker with 'change= ' was posted, which lander-self
         skipped as no read at all. The same call with git answering posts; failing, it posts nothing."""

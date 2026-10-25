@@ -3,7 +3,8 @@
     lander record <repo> <pr> LAND|HANDBACK --by <who> [--head <sha>] [--findings TEXT|-]
                                      write a read a seat made as the PR's marker comment (from the perms seat, a
                                      LAND also goes in perms' ledger: "a security path"); refused if --head moved,
-                                     if it is looser than a HANDBACK already standing (old words map as below), or
+                                     if it is looser than a HANDBACK already standing (old words map as below) that
+                                     is not this --by's own at this head (a seat releases its own hold), or
                                      if the head, the base or the change digest cannot be worked out right now (a
                                      marker with an empty change= matches no reader, so nothing is posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
@@ -2329,9 +2330,18 @@ def cmd_record(argv):
     if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
         print(f"lander record: {word} is already recorded for this change; nothing posted")
         return _perms_ledger(job, facts, seat, args[2], who, head)
+    # a seat that held a PR with its own HANDBACK releases it with LAND at the same head (hive-lite #29 needed a
+    # made-up change); every HANDBACK since the last LAND must be that reader's, at this head, and none the lander's
     if stands and stands.verdict == T.HANDBACK_VERDICT and word == T.LAND:
-        print(f"lander record: HANDBACK stands for this change and LAND is looser; push the fix instead")
-        return 1
+        holds = []
+        for c in facts.get("comments") or []:
+            v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
+            if v and v.digest == job.digest:
+                holds = holds + [v] if v.verdict == T.HANDBACK_VERDICT else []
+        if any(h.model != who or bought(h) or not job.head.startswith(h.extra.get("head") or "-") for h in holds):
+            print("lander record: HANDBACK stands for this change and LAND is looser; only the reader that "
+                  "recorded it can release it, at the head it held; push the fix instead")
+            return 1
     rows = [ln.strip() for ln in findings.splitlines() if ln.strip()]
     v = T.Verdict(verdict=word, digest=job.digest, blocking=rows if word != T.LAND else [],
                   advisory=rows if word == T.LAND else [], model=opts["by"])
