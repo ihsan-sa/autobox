@@ -1827,20 +1827,22 @@ esac
 
 
 class Admission(unittest.TestCase):
-    def psi_dir(self, mem, cpu):
+    def psi_dir(self, mem, cpu, full=0):
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(d))
         for k, v in (("memory", mem), ("cpu", cpu)):
             with open(os.path.join(d, k), "w") as f:
-                f.write(f"some avg10={v} avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=0\n")
+                f.write(f"some avg10={v} avg60=0 avg300=0 total=1\nfull avg10={full} avg60=0 avg300=0 total=0\n")
         return d
 
     def setUp(self):
-        # a calm load average of the case's own: the box's real one must never decide a case
+        # a calm load average, system PSI and meminfo of the case's own: the box's real ones must never decide a case
         self.calm_load = self.loadavg(0.0)
-        p = mock.patch.object(A, "LOADAVG", self.calm_load)
-        p.start()
-        self.addCleanup(p.stop)
+        for k, v in (("LOADAVG", self.calm_load), ("SYS_PSI", self.psi_dir(0, 0)),
+                     ("MEMINFO", self.meminfo(31918896, 16 * 1024 ** 2)), ("MEM_FLOOR", "2G")):
+            p = mock.patch.object(A, k, v)
+            p.start()
+            self.addCleanup(p.stop)
 
     def loadavg(self, l1):
         fd, path = tempfile.mkstemp()
@@ -1908,10 +1910,61 @@ class Admission(unittest.TestCase):
             f.write("0::/system.slice/cc-lander.service\n")
         self.assertIsNone(A.box_cgroup(own, sysfs))                     # not under a user manager
 
-    def meminfo(self, kb):
+    def test_a_box_cgroup_pressure_file_without_a_figure_falls_back(self):
+        own, sysfs = self.box(0.2)
+        for text in ("", "garbage\n", "some avg10=x avg60=0\n", "full avg10=0.0 avg60=0\n"):
+            with open(os.path.join(sysfs, "user.slice/user-1000.slice/user@1000.service/memory.pressure"), "w") as f:
+                f.write(text)
+            self.assertIsNone(A.box_cgroup(own, sysfs), text)
+
+    def test_psi_dir_is_the_override_then_the_box_cgroup_then_proc_pressure(self):
+        own, sysfs = self.box(0.2)
+        self.assertEqual(A.psi_dir("/x", own, sysfs), "/x")
+        self.assertEqual(A.psi_dir(None, own, sysfs), A.box_cgroup(own, sysfs))
+        self.assertTrue(A.psi_dir("", own, sysfs).endswith("/user@1000.service"))
+        self.assertEqual(A.psi_dir(None, os.path.join(sysfs, "none"), sysfs), "/proc/pressure")
+
+    def test_a_capped_tenant_lifting_system_some_alone_admits(self):
+        # the 10-24 tenant: system `some` at 57, but `full` low, because the rest of the box kept running
+        d = A.box_cgroup(*self.box(0.2))
+        with mock.patch.object(A, "SYS_PSI", self.psi_dir(57.0, 1.0, full=0.5)):
+            self.assertEqual(A.short(), "")
+            self.assertFalse(A.loaded(d))
+            self.assertEqual(A.slots_now(d, 3, self.calm_load), 3)
+
+    def test_box_wide_full_pressure_holds(self):
+        # members, Hive or a system unit thrashing the whole box, which the user manager's cgroup does not see
+        d = A.box_cgroup(*self.box(0.2))
+        with mock.patch.object(A, "SYS_PSI", self.psi_dir(30.0, 1.0, full=A.PSI_FULL)):
+            self.assertTrue(A.loaded(d))
+            self.assertEqual(A.slots_now(d, 3, self.calm_load), 1)
+            self.assertIn("PSI full", A.overloaded(d, self.calm_load))
+
+    def test_memavailable_under_the_floor_holds(self):
+        d = A.box_cgroup(*self.box(0.2))
+        with mock.patch.object(A, "MEMINFO", self.meminfo(31918896, 1024 ** 2)):   # 1 GiB available, floor 2G
+            self.assertTrue(A.mem_loaded(d))
+            self.assertEqual(A.slots_now(d, 3, self.calm_load), 1)
+            self.assertIn("1024 MiB available", A.overloaded(d, self.calm_load))
+        with mock.patch.object(A, "MEMINFO", self.meminfo(31918896, 2 * 1024 ** 2)):   # at the floor: not under it
+            self.assertEqual(A.short(), "")
+
+    def test_unreadable_system_figures_count_as_calm_and_the_box_cgroup_still_decides(self):
+        # the gate is never shut by a file it cannot read, and the box's own pressure still holds it
+        calm, hot = A.box_cgroup(*self.box(0.2)), A.box_cgroup(*self.box(40.0))
+        for k, v in (("SYS_PSI", "/nonexistent"), ("MEMINFO", "/nonexistent"), ("MEMINFO", self.meminfo(1000)),
+                     ("MEM_FLOOR", "lots")):
+            with mock.patch.object(A, k, v):
+                self.assertEqual(A.short(), "", (k, v))
+                self.assertEqual(A.slots_now(calm, 3, self.calm_load), 3)
+                self.assertEqual(A.slots_now(hot, 3, self.calm_load), 1)
+
+    def meminfo(self, kb, avail=None):
         fd, path = tempfile.mkstemp()
         with os.fdopen(fd, "w") as f:
             f.write(f"MemTotal:       {kb} kB\nMemFree:        1000 kB\n")
+            if avail is not None:
+                f.write(f"MemAvailable:   {avail} kB\n")
         self.addCleanup(os.unlink, path)
         return path
 

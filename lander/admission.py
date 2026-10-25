@@ -10,12 +10,17 @@ value without a restart; a cc-config that does not answer counts as unset. The b
 way. The box's load is
 mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead, and
 the pressure the box's own work feels: PSI_DIR is the user manager's cgroup (user@<uid>.service, from /proc/self/cgroup)
-when its memory.pressure reads, else /proc/pressure, and LANDER_PSI_DIR overrides it with either layout. On 2026-10-24 a
-tenant capped in its own unit stalled 61% against its own limit and lifted the system figure to 57 while the box's
-sessions stalled ~0%, holding every launch; a real shortage still stalls the box's tasks, and PSI counts a stall in each
+when its memory.pressure holds a `some avg10` figure, else /proc/pressure (psi_dir()), and LANDER_PSI_DIR overrides it
+with either layout. On 2026-10-24 a tenant capped in its own unit stalled 61% against its own limit and lifted the
+system figure to 57 while the box's sessions stalled ~0%, holding every launch; a real shortage still stalls the box's
+tasks, and PSI counts a stall in each
 cgroup ancestor, so it shows here too. CPU is read from the same cgroup for the same reason: a tenant throttled by its
-own quota does not slow the box, one contending for the cores does. When
-memory `some avg10` reaches PSI_MEM (default 20) or cpu `some avg10` reaches PSI_CPU
+own quota does not slow the box, one contending for the cores does. That cgroup does not see members, Hive, system
+units or SSH sessions, so a shortage of the whole box is read too, by short(): SYS_PSI's (/proc/pressure, or
+LANDER_PSI_DIR) memory `full avg10` at or above PSI_FULL (LANDER_PSI_FULL, default 10), or /proc/meminfo's MemAvailable
+below MEM_FLOOR (LANDER_MEM_FLOOR, default 2G). `full` counts only while every task stalls at once, so one capped
+tenant's own stall stays out of it. An unreadable file counts as calm, the same as PSI_DIR's. When memory `some avg10`
+reaches PSI_MEM (default 20) or short() says so, the box is mem_loaded(); when it is, or cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
 PSI or the load average only slots 1-2 admit; under memory pressure only slot 1, because parallel checks have run the
@@ -115,47 +120,67 @@ CONFIG_TTL = 60.0
 MEMINFO = "/proc/meminfo"
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
+PSI_FULL = float(os.environ.get("LANDER_PSI_FULL", "10"))
 LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
+MEM_FLOOR = os.environ.get("LANDER_MEM_FLOOR", "2G")
 CPU_WEIGHT = "20"
 LOAD_FACTOR = float(os.environ.get("LANDER_LOAD_FACTOR", "2") or 2)
 
 
 def box_cgroup(own: str = "/proc/self/cgroup", sysfs: str = "/sys/fs/cgroup") -> str | None:
-    """The user manager's cgroup the box's work runs under (user@<uid>.service), when its memory.pressure reads."""
+    """The user manager's cgroup the box's work runs under (user@<uid>.service), when its memory.pressure reads and
+    holds a `some avg10=` figure."""
     try:
         with open(own) as f:
             m = re.search(r"^0::(/.*?/user@\d+\.service)(/|$)", f.read(), re.M)
         d = sysfs + m.group(1)
-        with open(os.path.join(d, "memory.pressure")):
-            return d
-    except (OSError, AttributeError):
+        with open(os.path.join(d, "memory.pressure")) as f:
+            float(re.search(r"^some .*\bavg10=(\S+)", f.read(), re.M).group(1))
+        return d
+    except (OSError, AttributeError, ValueError):
         return None
 
 
-PSI_DIR = os.environ.get("LANDER_PSI_DIR") or box_cgroup() or "/proc/pressure"
+def psi_dir(override: str | None = None, own: str = "/proc/self/cgroup", sysfs: str = "/sys/fs/cgroup") -> str:
+    """LANDER_PSI_DIR when set, else box_cgroup(), else /proc/pressure."""
+    return override or box_cgroup(own, sysfs) or "/proc/pressure"
+
+
+PSI_DIR = psi_dir(os.environ.get("LANDER_PSI_DIR"))
+SYS_PSI = os.environ.get("LANDER_PSI_DIR") or "/proc/pressure"
 LOADAVG = os.environ.get("LANDER_LOADAVG") or "/proc/loadavg"
 WAIT_SAY = float(os.environ.get("LANDER_WAIT_SAY", "600") or 600)
 TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
 FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below lander-self's HOLD_BACK of 3600
 
 
-def psi(kind: str, root: str = PSI_DIR) -> float:
-    """`some avg10` for cpu/memory/io from a cgroup's `<kind>.pressure` or /proc/pressure's `<kind>`, else 0.0."""
+def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
+    """`<which> avg10` for cpu/memory/io from a cgroup's `<kind>.pressure` or /proc/pressure's `<kind>`, else 0.0."""
     path = os.path.join(root, kind + ".pressure")
     try:
         with open(path if os.path.exists(path) else os.path.join(root, kind)) as f:
             for line in f:
-                if line.startswith("some "):
+                if line.startswith(which + " "):
                     return float(dict(kv.split("=") for kv in line.split()[1:])["avg10"])
     except (OSError, KeyError, ValueError):
         pass
     return 0.0
 
 
+def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
+    """"" unless the whole box runs short of memory, else one line saying how."""
+    full, avail = psi("memory", sys_psi or SYS_PSI, "full"), _meminfo("MemAvailable:", meminfo)
+    if full >= PSI_FULL:
+        return f"box-wide memory pressure (PSI full) at {full:.0f}"
+    if avail is not None and avail < (_bytes(MEM_FLOOR) or 0):
+        return f"box-wide memory short, {avail >> 20} MiB available"
+    return ""
+
+
 def mem_loaded(root: str = PSI_DIR) -> bool:
-    return psi("memory", root) >= PSI_MEM
+    return psi("memory", root) >= PSI_MEM or bool(short())
 
 
 def loaded(root: str = PSI_DIR) -> bool:
@@ -175,7 +200,7 @@ def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
     """"" when the box is not overloaded, else one line saying why: loaded(), or the 1-minute load average at or
     above LOAD_FACTOR x cores. An unreadable load average counts as calm."""
     if loaded(root):
-        return f"memory or cpu pressure (PSI) at {psi('memory', root):.0f}/{psi('cpu', root):.1f}"
+        return short() or f"memory or cpu pressure (PSI) at {psi('memory', root):.0f}/{psi('cpu', root):.1f}"
     n, l1 = os.cpu_count() or 1, load1(loadavg)
     if l1 is None:
         return ""
@@ -188,14 +213,19 @@ def _bytes(size: str) -> int | None:
     return int(m.group(1)) * 1024 ** ("KMGT".index(m.group(2)) + 1 if m.group(2) else 0) if m else None
 
 
+def _meminfo(key: str, meminfo: str | None = None) -> int | None:
+    """/proc/meminfo's `key` (MemTotal:, MemAvailable:) in bytes, or None when it will not read."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open(meminfo or MEMINFO) as f:
+            return next((int(line.split()[1]) * 1024 for line in f if line.startswith(key)), None)
+    return None
+
+
 def host_slots(meminfo: str | None = None, cores: int | None = None) -> int:
     """The host's own K: one slot per CORES_PER_SLOT cores, and no more than MemTotal / MEM_MAX. At least 1. A
     MemTotal or MEM_MAX that will not read leaves the cores alone to decide."""
     k = (cores or os.cpu_count() or 1) // CORES_PER_SLOT
-    cap, total = _bytes(MEM_MAX), None
-    with contextlib.suppress(OSError, ValueError, IndexError):
-        with open(meminfo or MEMINFO) as f:
-            total = next((int(line.split()[1]) * 1024 for line in f if line.startswith("MemTotal:")), None)
+    cap, total = _bytes(MEM_MAX), _meminfo("MemTotal:", meminfo)
     if cap and total:
         k = min(k, total // cap)
     return max(1, k)
