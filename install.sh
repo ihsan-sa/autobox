@@ -10,6 +10,7 @@
 # A box may keep this tree as `core/` inside a private repo — the "overlay" — and then the installer also links
 # the overlay's home/*.md and bin-private/*, uses its config/etc, and lays its config/claude-settings.json over
 # the default when it writes a first ~/.claude/settings.json. A bare clone of autobox has no overlay.
+# A script with a root-owned copy in /usr/local/bin is never linked into ~/bin, where it would shadow that copy.
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 O=""; [ "$(basename "$R")" = core ] && O="$(cd "$R/.." && pwd)"   # R = this tree, O = the private overlay or ""
@@ -40,10 +41,20 @@ link() {
   if [ -e "$2" ] && [ ! -L "$2" ]; then mv -f "$2" "$2.bak"; echo "kept the existing $2 as $2.bak"; fi
   ln -sfn "$1" "$2"
 }
+# linkbin <script> — link it into ~/bin, unless a root-owned regular file of that name sits in /usr/local/bin: perms
+# installs hardened copies there, and ~/bin comes first on PATH, so a link would shadow one. An old link of ours goes.
+rootbin=${CC_ROOT_BIN:-/usr/local/bin} rootuid=${CC_ROOT_UID:-0}   # the selftest points these at its own dir and uid
+linkbin() {
+  local n; n=$(basename "$1")
+  if [ -f "$rootbin/$n" ] && [ ! -L "$rootbin/$n" ] && [ "$(stat -c %u "$rootbin/$n")" = "$rootuid" ]; then
+    case "$(readlink ~/bin/"$n")" in "${O:-$R}"/*) rm -f ~/bin/"$n" ;; esac
+    echo "skipped $n: root-owned $rootbin/$n would be shadowed by a ~/bin link"
+  else link "$1" ~/bin/"$n"; fi
+}
 
 for f in "$R"/bin/*; do
   [ -f "$f" ] && [ -x "$f" ] || continue        # skip dirs (bin/__pycache__) and non-executables
-  link "$f" ~/bin/"$(basename "$f")"
+  linkbin "$f"
 done
 # prune the links THIS tree made whose target left it or is not a file (renamed/retired scripts, __pycache__).
 # Only those: a dangling link the owner or another tool put in ~/bin is not the installer's to delete (it used to).
@@ -54,7 +65,7 @@ done
 if [ -n "$O" ]; then
   for f in "$O"/bin-private/*; do                # the overlay's own scripts, linked exactly like core's
     [ -f "$f" ] && [ -x "$f" ] || continue
-    link "$f" ~/bin/"$(basename "$f")"
+    linkbin "$f"
   done
   for f in "$O"/home/*.md; do                    # the overlay's ~ docs (CLAUDE.md, USAGE.md, RUNBOOK.md, COMMS.md, …)
     [ -f "$f" ] && link "$f" ~/"$(basename "$f")"

@@ -3704,6 +3704,15 @@ ln -s "$IR/bin/retired-script" "$IH/bin/retired-script"; ln -s "$T/never-ours" "
 inst
 [ ! -L "$IH/bin/retired-script" ] && [ -L "$IH/bin/foreign" ] && ok "prune removes only this tree's stale ~/bin links — a foreign dangling link is left alone" || bad "prune scope: retired link $([ -L "$IH/bin/retired-script" ] && echo kept || echo gone), foreign link $([ -L "$IH/bin/foreign" ] && echo kept || echo gone)"
 rm -f "$IH/bin/foreign"
+# a script named like a root-owned tool in /usr/local/bin is never linked over it, and an old link of ours goes: perms'
+# hardened /usr/local/bin/hive-test was shadowed by the ~/bin link every deploy put back (2026-10-23). A fixture dir
+# and this uid stand in for /usr/local/bin and root
+mkdir -p "$T/rootbin"; for n in hardened unhardened; do printf '#!/bin/sh\n' > "$IR/bin/$n"; chmod +x "$IR/bin/$n"; done
+cp "$IR/bin/hardened" "$T/rootbin/hardened"; ln -sfn "$IR/bin/hardened" "$IH/bin/hardened"
+( cd "$IH" && env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" USER=tester CC_BOX=testbox CC_ROOT_BIN="$T/rootbin" CC_ROOT_UID="$(id -u)" GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install-root.log" 2>&1
+{ [ ! -L "$IH/bin/hardened" ] && [ -f "$T/rootbin/hardened" ] && [ -f "$IR/bin/hardened" ] && grep -q "^skipped hardened: root-owned $T/rootbin/hardened" "$T/install-root.log"; } && ok "a script shadowing a root-owned tool is skipped with a line and its old link removed; both copies stay" || bad "root-installed skip: link $([ -L "$IH/bin/hardened" ] && echo kept || echo gone), log: $(grep skipped "$T/install-root.log" | tr '\n' ' ')"
+[ "$(readlink -f "$IH/bin/unhardened")" = "$IR/bin/unhardened" ] && ok "…and a script with no root copy still links" || bad "a script with no root copy was not linked"
+rm -f "$IR/bin/hardened" "$IR/bin/unhardened"
 miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/$u" ] || miss="$miss $u"; done
 [ -z "$miss" ] && ok "every unit in the manifest is linked, cc-reconcile.timer included (switching on is the services step)" || bad "units not linked:$miss"
 # the same prune, scoped the same way, for ~/.config/systemd/user: a unit a PR deletes must not leave its link
