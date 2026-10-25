@@ -1011,19 +1011,29 @@ def run_repo(cwd=None):
     return d[len(DEV) + 1:].split(os.sep)[0] if d.startswith(DEV + os.sep) else ""
 
 
-def pdf_attach(cfg, sender, rcpts, reals):
+def pdf_attach(cfg, sender, rcpts, reals, rec):
     """True when this mail's filed PDFs go as files, not links (perms-77, 2026-10-23, for one weekly report job).
     MAIL_PDF_ATTACH is host config a member cannot write: rows `<repo>=<addr>,<addr>` split by `;` or a line break.
     A row lets a mail sent from ~/dev/<repo> attach its PDFs when every recipient (blind copies too) is one the row
-    names, the PDFs were made in the last day (this run's, not an old filed one) and together are at most
-    PDF_ATTACH_MAX. Anything else keeps the links. The caller has already had each one filed (cc-docs link)."""
+    names, the PDFs were made in the last day (this run's, not an old filed one), begin with %PDF and together are
+    at most PDF_ATTACH_MAX. Each is opened once (_open_ours) and judged on that fd. Anything else keeps the links. The caller has already had each one filed (cc-docs link)."""
     for row in re.split(r"[;\n]", cfg.get("MAIL_PDF_ATTACH") or ""):
         repo, _, people = row.partition("=")
         if sender and repo.strip() == sender and set(rcpts) <= set(_addrs(people)):
             break
     else:
         return False
-    sts = [os.stat(p) for p in reals]
+    sts = []
+    for p in reals:
+        fd, st, _ = _open_ours(p, rec, cfg)
+        if fd is None:
+            return False
+        try:
+            if os.read(fd, 4) != b"%PDF":
+                return False
+        finally:
+            os.close(fd)
+        sts.append(st)
     return sum(s.st_size for s in sts) <= PDF_ATTACH_MAX and all(time.time() - s.st_mtime < 86400 for s in sts)
 
 
@@ -1068,8 +1078,10 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
             why = ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
             return "not sent — %s" % why
         lines.append((os.path.basename(a), out[0].strip()))
-    if pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals]):
-        return list(attachments), []          # filed (the link just minted proves it), and they travel as files
+    if pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec):
+        # filed (the link just minted proves it); the PDFs travel by the real path that was checked, not the name
+        reals = dict(reals)
+        return [reals.get(a, a) for a in attachments], []
     return [a for a in attachments if a not in pdfs], lines
 
 

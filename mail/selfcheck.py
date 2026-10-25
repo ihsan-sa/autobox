@@ -4497,7 +4497,7 @@ def run():
     # ------------------------------- 27b. MAIL_PDF_ATTACH: one job's filed PDFs go as files (perms-77, 2026-10-23)
     # A weekly report job's mail, sent from ~/dev/weekly-job to the two people its row names, attaches its fresh filed
     # PDFs. Each case below is its own Box, repo, fake cc-docs and worker, so no case leans on another's state.
-    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None):
+    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None, head=b"%PDF"):
         """(exit, the mail the worker got or None, cc-docs argv lines, stderr, every PDF still there) for one send
         of `names`, made in ~/dev/<repo> (`size` bytes each, `age` seconds old), under MAIL_PDF_ATTACH `row`."""
         with Box(allow=ALLOWED + "," + OTHER) as b:
@@ -4513,7 +4513,7 @@ def run():
             paths = [os.path.join(here, n) for n in names]
             for p in paths:
                 with open(p, "wb") as f:
-                    f.write(b"%" * size)
+                    f.write(head + b"%" * (size - len(head)))
                 os.utime(p, (time.time() - age,) * 2)
             env = {key: "" for key in r.SEND_KEYS if key not in Box.KEYS}
             env.update({"MAIL_SEND_ALLOW": ALLOWED + "," + OTHER, "MAIL_SEND_SECRET": "s3cret", "MAIL_OUT_ROOTS": dev,
@@ -4566,6 +4566,9 @@ def run():
     rc, m, _c, _e, _k = pdf27b(names=("a.pdf", "b.pdf"), size=outbound.PDF_ATTACH_MAX // 2 + 1)
     k(rc == 0 and files27b(m) == [] and "b.pdf: https://lib.test/d/001-0009" in body27b(m),
       "…PDFs over 2 MiB together go as links")
+    rc, m, _c, _e, _k = pdf27b(head=b"GIF8")
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…a file named .pdf whose bytes do not start with %PDF goes as its link")
     rc, m, _c, _e, _k = pdf27b(age=2 * 86400)
     k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
       "…a PDF older than a day (an earlier run's) goes as its link")
