@@ -14759,6 +14759,30 @@ def run_selfcheck():
           and "not a channel of this workspace" in foreign[("history", "CFOREIGN")]["error"]
           and "cannot learn" in foreign[("history", "CPUB, no team")]["error"])
 
+    # A failed cc-config read (boot-time OOM, 2026-10-24) is retried; if it keeps failing the daemon exits, never local-only.
+    real_run, real_sleep, reads = subprocess.run, time.sleep, []
+    def cfg_run(first_ok):
+        def fake(cmd, **kw):
+            reads.append(1)
+            if len(reads) == 1 and not first_ok or not first_ok and first_ok is None:
+                raise subprocess.TimeoutExpired(cmd, 10)
+            return subprocess.CompletedProcess(cmd, 0, "SLACK_BOT_TOKEN=xoxb-t\nSLACK_APP_TOKEN=xapp-t\n", "")
+        return fake
+    try:
+        time.sleep = lambda s: None
+        subprocess.run = cfg_run(False)
+        dm_retry = Daemon(use_slack=True)
+        retried = (len(reads), dm_retry.use_slack)
+        reads.clear(); subprocess.run = cfg_run(None)
+        try:
+            Daemon(use_slack=True); exited = None
+        except SystemExit as e:
+            exited = e.code
+    finally:
+        subprocess.run, time.sleep = real_run, real_sleep
+    check(f"load_cfg: a failed first config read is retried and the daemon still connects ({retried}); three failures exit non-zero ({exited}), never local-only",
+          retried == (2, True) and exited == 1)
+
     shutil.rmtree(scratch_dev, ignore_errors=True); globals()["DEV"] = real_dev
     leaked = sorted(n for n in (set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()) - dev_before
                     if not n.startswith("_"))

@@ -301,11 +301,18 @@ CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_OWNER_ID", "SLACK_CHANN
 def load_cfg():
     """Every key in the file, plus the five above when only the environment has them."""
     cfg = {}
-    try:
-        out = subprocess.run([f"{BIN}/cc-config", "list", "--secrets"], capture_output=True, text=True,
-                             stdin=subprocess.DEVNULL, timeout=10).stdout
-    except Exception:
-        return cfg
+    for attempt in range(3):          # one slow read (OOM at boot) must not look like an empty config
+        try:
+            r = subprocess.run([f"{BIN}/cc-config", "list", "--secrets"], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=10)
+            if r.returncode == 0:
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+    else:
+        return {"CFG_READ_FAILED": "1"}   # the daemon exits on it (systemd restarts it) rather than stay local-only
+    out = r.stdout
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
@@ -4658,6 +4665,9 @@ class MailPlaces:
 class Daemon:
     def __init__(self, use_slack):
         self.cfg = load_cfg()
+        if use_slack and self.cfg.get("CFG_READ_FAILED"):
+            log("config read failed three times: exiting so systemd restarts us, not running local-only")
+            sys.exit(1)
         self.use_slack = use_slack and bool(self.cfg.get("SLACK_BOT_TOKEN") and self.cfg.get("SLACK_APP_TOKEN"))
         self.lock = threading.Lock()
         self.subs = collections.defaultdict(list)          # target -> [Conn]
