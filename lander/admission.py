@@ -8,8 +8,14 @@ which its memory bounds, and the old box's 6 cores still run 3). Never below 1, 
 cores counts as its cores. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
 value without a restart; a cc-config that does not answer counts as unset. The backoff below applies to K either
 way. The box's load is
-mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead. When
-/proc/pressure/memory `some avg10` reaches PSI_MEM (default 20) or /proc/pressure/cpu `some avg10` reaches PSI_CPU
+mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead, and
+the pressure the box's own work feels: PSI_DIR is the user manager's cgroup (user@<uid>.service, from /proc/self/cgroup)
+when its memory.pressure reads, else /proc/pressure, and LANDER_PSI_DIR overrides it with either layout. On 2026-10-24 a
+tenant capped in its own unit stalled 61% against its own limit and lifted the system figure to 57 while the box's
+sessions stalled ~0%, holding every launch; a real shortage still stalls the box's tasks, and PSI counts a stall in each
+cgroup ancestor, so it shows here too. CPU is read from the same cgroup for the same reason: a tenant throttled by its
+own quota does not slow the box, one contending for the cores does. When
+memory `some avg10` reaches PSI_MEM (default 20) or cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
 PSI or the load average only slots 1-2 admit; under memory pressure only slot 1, because parallel checks have run the
@@ -114,7 +120,21 @@ MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 CPU_WEIGHT = "20"
 LOAD_FACTOR = float(os.environ.get("LANDER_LOAD_FACTOR", "2") or 2)
-PSI_DIR = os.environ.get("LANDER_PSI_DIR") or "/proc/pressure"
+
+
+def box_cgroup(own: str = "/proc/self/cgroup", sysfs: str = "/sys/fs/cgroup") -> str | None:
+    """The user manager's cgroup the box's work runs under (user@<uid>.service), when its memory.pressure reads."""
+    try:
+        with open(own) as f:
+            m = re.search(r"^0::(/.*?/user@\d+\.service)(/|$)", f.read(), re.M)
+        d = sysfs + m.group(1)
+        with open(os.path.join(d, "memory.pressure")):
+            return d
+    except (OSError, AttributeError):
+        return None
+
+
+PSI_DIR = os.environ.get("LANDER_PSI_DIR") or box_cgroup() or "/proc/pressure"
 LOADAVG = os.environ.get("LANDER_LOADAVG") or "/proc/loadavg"
 WAIT_SAY = float(os.environ.get("LANDER_WAIT_SAY", "600") or 600)
 TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
@@ -122,9 +142,10 @@ FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below l
 
 
 def psi(kind: str, root: str = PSI_DIR) -> float:
-    """`some avg10` for cpu/memory/io, or 0.0 when the kernel has no PSI."""
+    """`some avg10` for cpu/memory/io from a cgroup's `<kind>.pressure` or /proc/pressure's `<kind>`, else 0.0."""
+    path = os.path.join(root, kind + ".pressure")
     try:
-        with open(os.path.join(root, kind)) as f:
+        with open(path if os.path.exists(path) else os.path.join(root, kind)) as f:
             for line in f:
                 if line.startswith("some "):
                     return float(dict(kv.split("=") for kv in line.split()[1:])["avg10"])

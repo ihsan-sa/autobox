@@ -1872,6 +1872,42 @@ class Admission(unittest.TestCase):
         self.assertIn("pressure", A.overloaded(self.psi_dir(40.0, 0), calm))
         self.assertEqual(A.psi("memory", "/nonexistent"), 0.0)
 
+    def box(self, mem):
+        # a fake /sys/fs/cgroup whose user manager's cgroup reads `mem`, beside a /proc/self/cgroup naming a scope in it
+        sysfs = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(sysfs))
+        d = os.path.join(sysfs, "user.slice/user-1000.slice/user@1000.service")
+        os.makedirs(os.path.join(d, "app.slice"))
+        for k, v in (("memory", mem), ("cpu", 1.0)):
+            with open(os.path.join(d, k + ".pressure"), "w") as f:
+                f.write(f"some avg10={v} avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=0\n")
+        own = os.path.join(sysfs, "self-cgroup")
+        with open(own, "w") as f:
+            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/tmux.scope\n")
+        return own, sysfs
+
+    def test_a_tenant_stalling_against_its_own_cap_holds_nothing(self):
+        # 2026-10-24: a capped system unit lifted /proc/pressure/memory to 57 while the box's own cgroup stalled ~0%
+        root = self.psi_dir(57.0, 1.0)
+        d = A.box_cgroup(*self.box(0.2))
+        self.assertTrue(d.endswith("/user@1000.service"))
+        self.assertEqual(A.slots_now(d, 3, self.calm_load), 3)
+        self.assertEqual(A.slots_now(root, 3, self.calm_load), 1)
+
+    def test_the_box_own_memory_pressure_holds(self):
+        d = A.box_cgroup(*self.box(40.0))
+        self.assertTrue(A.loaded(d))
+        self.assertEqual(A.slots_now(d, 3, self.calm_load), 1)
+
+    def test_no_box_cgroup_falls_back_to_proc_pressure(self):
+        own, sysfs = self.box(0.2)
+        os.remove(os.path.join(sysfs, "user.slice/user-1000.slice/user@1000.service/memory.pressure"))
+        self.assertIsNone(A.box_cgroup(own, sysfs))                     # its pressure does not read
+        self.assertIsNone(A.box_cgroup(os.path.join(sysfs, "none"), sysfs))   # no /proc/self/cgroup
+        with open(own, "w") as f:
+            f.write("0::/system.slice/cc-lander.service\n")
+        self.assertIsNone(A.box_cgroup(own, sysfs))                     # not under a user manager
+
     def meminfo(self, kb):
         fd, path = tempfile.mkstemp()
         with os.fdopen(fd, "w") as f:
