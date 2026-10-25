@@ -1071,6 +1071,7 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
         if not real:
             return cold_refused(cold_not_ours(a, rec, cfg))
         reals.append((a, real))
+    got = pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec)
     kind = link_kind(cfg, rcpts + blind)
     run = run or __import__("subprocess").run
     lines = []
@@ -1084,9 +1085,9 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
             why = ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
             return "not sent — %s" % why
         lines.append((os.path.basename(a), out[0].strip()))
-    got = pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec)
-    if got:
-        # filed (the link just minted proves it); the PDFs travel as the bytes that were checked, not as a name
+    # filed (the link just minted proves it); the PDFs travel as the bytes checked before filing, and only when a
+    # second read after filing finds the same bytes, so the filed PDF is the sent one
+    if got and got == pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec):
         got = {a: g for (a, _), g in zip(reals, got)}
         return [got.get(a, a) for a in attachments], []
     return [a for a in attachments if a not in pdfs], lines
@@ -1223,9 +1224,10 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     attach = []
     for path in paths:
         if isinstance(path, tuple):    # (path, bytes) already read and checked by pdf_attach
-            attach.append(path)
-            continue
-        data, why = attach_bytes(os.path.expanduser(path), rec, cfg, cap)
+            data, why = path[1], TOO_BIG if len(path[1]) > cap else None
+            path = path[0]
+        else:
+            data, why = attach_bytes(os.path.expanduser(path), rec, cfg, cap)
         if why == TOO_BIG:
             return refuse("%s is over the %s attachment cap (MAIL_OUT_MAX_ATTACH_BYTES) — nothing sent"
                           % (clip(os.path.basename(path)),

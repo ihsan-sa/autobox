@@ -4497,7 +4497,7 @@ def run():
     # ------------------------------- 27b. MAIL_PDF_ATTACH: one job's filed PDFs go as files (perms-77, 2026-10-23)
     # A weekly report job's mail, sent from ~/dev/weekly-job to the two people its row names, attaches its fresh filed
     # PDFs. Each case below is its own Box, repo, fake cc-docs and worker, so no case leans on another's state.
-    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None, head=b"%PDF", swap=None):
+    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None, head=b"%PDF", swap=None, grow=False):
         """(exit, the mail the worker got or None, cc-docs argv lines, stderr, every PDF still there) for one send
         of `names`, made in ~/dev/<repo> (`size` bytes each, `age` seconds old), under MAIL_PDF_ATTACH `row`. `swap`
         is called with the paths just before send_to runs, after the check: the file changing under its name."""
@@ -4507,7 +4507,7 @@ def run():
             with open(docs, "w") as f:
                 f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argv + "\n"
                         "case \"$2\" in *unfiled*) echo \"cc-docs: $2 is not filed\" >&2; exit 1;; esac\n"
-                        "echo https://lib.test/d/001-0009\n")
+                        + ("printf X >> \"$2\"\n" if grow else "") + "echo https://lib.test/d/001-0009\n")
             os.chmod(docs, 0o755)
             here = os.path.join(dev, repo)
             os.makedirs(here)
@@ -4569,6 +4569,16 @@ def run():
     got27b = list(m.iter_attachments())[0].get_content() if rc == 0 and files27b(m) == ["a.pdf"] else b""
     k(got27b.startswith(b"%PDF%%") and b"SWAPPED" not in got27b,
       "…a PDF swapped under its name after the check still goes out as the bytes that were checked")
+    rc, m, _c, _e, _k = pdf27b(grow=True)
+    k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
+      "…a PDF that changes while cc-docs files it is not attached: the filed one and the sent one must be the same bytes")
+    with Box(allow=ALLOWED) as b27c, FakeWorker() as w27c:
+        ok27c, line27c = outbound.send_to(
+            {"MAIL_SEND_URL": w27c.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+             "MAIL_SEND_ALLOW": ALLOWED, "MAIL_OUT_MAX_ATTACH_BYTES": "10"},
+            ALLOWED, "big", "text", attachments=[("/x/a.pdf", b"%PDF" + b"0" * 20)])
+        k(not ok27c and not w27c.calls and "over the 10-byte attachment cap" in line27c,
+          "…a pre-read (path, bytes) attachment over MAIL_OUT_MAX_ATTACH_BYTES is refused like a path is")
     with tempfile.TemporaryDirectory() as td27b:
         pdf27b_path = os.path.join(td27b, "a.pdf")
         with open(pdf27b_path, "wb") as f:
