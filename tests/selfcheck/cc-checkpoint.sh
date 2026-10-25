@@ -885,6 +885,42 @@ SH
   strict "$d"; rc=$?
   k "$([ "$rc" = 0 ] && [ "$(git -C "$d" rev-parse HEAD)" != "$tip" ] && echo 0 || echo 1)" \
     "C3 recovery: removing the failure commits the same work" "rc=$rc"
+  echo stale >> "$d/work.txt"; before=$(git -C "$d" rev-parse HEAD); : > "$d/.git/index.lock"; touch -d 2000-01-01 "$d/.git/index.lock"
+  strict "$d"; rc=$?
+  k "$([ "$rc" = 0 ] && [ "$(git -C "$d" rev-parse HEAD)" != "$before" ] && [ ! -e "$d/.git/index.lock" ] && echo 0 || echo 1)" \
+    "L1: a lock from before the boot is removed and the work commits" "rc=$rc"
+  echo live >> "$d/work.txt"; before=$(git -C "$d" rev-parse HEAD); : > "$d/.git/index.lock"
+  strict "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && [ -e "$d/.git/index.lock" ] && echo 0 || echo 1)" \
+    "L2 control: a lock written since the boot (a live git's) is left alone" "rc=$rc"
+  rm "$d/.git/index.lock"; strict "$d"
+  echo link >> "$d/work.txt"; before=$(git -C "$d" rev-parse HEAD); : > "$T/lockfile"; touch -d 2000-01-01 "$T/lockfile"; ln -s "$T/lockfile" "$d/.git/index.lock"
+  strict "$d"; rc=$?
+  k "$([ -L "$d/.git/index.lock" ] && [ -e "$T/lockfile" ] && echo 0 || echo 1)" "L3: a lock that is a symlink is left alone, however old its target" "rc=$rc"
+  rm -f "$d/.git/index.lock"; strict "$d"
+  echo nogd >> "$d/work.txt"; : > "$d/.git/index.lock"; touch -d 2000-01-01 "$d/.git/index.lock"
+  mkdir -p "$T/nogd"; real=$(type -P git)
+  printf '#!/bin/sh\ncase "$*" in *--absolute-git-dir*) exit 1;; esac\nexec "%s" "$@"\n' "$real" > "$T/nogd/git"; chmod +x "$T/nogd/git"
+  ( cd "$d" && PATH="$T/nogd:$PATH" "$bin/cc-checkpoint" --commit </dev/null >/dev/null 2>&1 )
+  k "$([ -e "$d/.git/index.lock" ] && grep -q 'failed: git add' "$d/.cc/checkpoint.err" && echo 0 || echo 1)" "L4: no git dir printed, no cleanup is attempted" "lock gone"
+  rm -f "$d/.git/index.lock"; strict "$d"
+  echo exitn >> "$d/work.txt"; : > "$d/.git/index.lock"; touch -d 2000-01-01 "$d/.git/index.lock"
+  printf '#!/bin/sh\ncase "$*" in *--absolute-git-dir*) echo "%s"; exit 1;; esac\nexec "%s" "$@"\n' "$d/.git" "$real" > "$T/nogd/git"
+  ( cd "$d" && PATH="$T/nogd:$PATH" "$bin/cc-checkpoint" --commit </dev/null >/dev/null 2>&1 )
+  k "$([ -e "$d/.git/index.lock" ] && echo 0 || echo 1)" "L5: a git dir printed with a failing exit is no cleanup either" "lock gone"
+  rm -f "$d/.git/index.lock"; strict "$d"
+  echo held >> "$d/work.txt"; before=$(git -C "$d" rev-parse HEAD); : > "$d/.git/index.lock"; touch -d 2000-01-01 "$d/.git/index.lock"
+  # shellcheck disable=SC2217 # the redirect is the point: sleep holds the lock file open
+  sleep 60 < "$d/.git/index.lock" & hp=$!; sleep 0.2
+  strict "$d"; rc=$?; kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  k "$([ "$rc" != 0 ] && [ -e "$d/.git/index.lock" ] && [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && echo 0 || echo 1)" \
+    "L6: an old lock a live process holds open is left alone" "rc=$rc"
+  rm -f "$d/.git/index.lock"; strict "$d"
+  echo vialn >> "$d/work.txt"; : > "$d/.git/index.lock"; touch -d 2000-01-01 "$d/.git/index.lock"; ln -s "$d" "$T/dlink"
+  printf '#!/bin/sh\ncase "$*" in *--absolute-git-dir*) echo "%s"; exit 0;; esac\nexec "%s" "$@"\n' "$T/dlink/.git" "$real" > "$T/nogd/git"
+  ( cd "$d" && PATH="$T/nogd:$PATH" "$bin/cc-checkpoint" --commit </dev/null >/dev/null 2>&1 )
+  k "$([ ! -e "$d/.git/index.lock" ] && echo 0 || echo 1)" "L7: a git dir named through a symlinked parent is resolved once and its old lock removed" "lock kept"
+  rm -f "$d/.git/index.lock"; strict "$d"
   # G1: NO PROGRAM THE WORKER CONFIGURED RUNS IN THE HOST'S CHECKPOINT. With extensions.worktreeConfig on, a hook dir and
   # a core.fsmonitor planted in config.worktree (a worker could once write its admin dir's, which git reads as repo
   # config): the unpinned checkpoint commits and runs neither; with the caller's pin the hook it names does run; plain
@@ -1578,6 +1614,10 @@ SH
   eq "moved: the seat's own edit rides along — committed on top of the hand fix" "$(git -C "$seat" rev-parse 'HEAD^' 2>/dev/null)" "$fix"
   eq "…that commit carrying only the seat's file" "$(git -C "$seat" diff --name-only 'HEAD^' HEAD 2>/dev/null)" notes.txt
   eq "…and the fix intact" "$(cat "$seat/work.txt")" fix2
+  fix=$(handfix fix2b); sl="$HOME/dev/shared/.git/worktrees/seat/index.lock"; : > "$sl"; touch -d 2000-01-01 "$sl"
+  seatrun
+  eq "L8 moved: a lock from before the boot does not stop the carry to the new tip" "$(git -C "$seat" rev-parse HEAD)" "$fix"
+  k "$([ ! -e "$sl" ] && [ ! -e "$seat/.cc/checkpoint.err" ] && echo 0 || echo 1)" "…the lock is gone and nothing was refused" "$(cat "$seat/.cc/checkpoint.err" 2>/dev/null)"
   fix=$(handfix fix3); echo collide > "$seat/work.txt"   # the seat's own edit, to the file the fix changed
   seatrun
   eq "moved: an edit that collides with the fix is refused — the branch still ends at the hand fix" "$(git -C "$seat" rev-parse HEAD)" "$fix"
