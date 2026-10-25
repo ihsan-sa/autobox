@@ -24,8 +24,11 @@ THE STEPS, per target, in order; the first that fails stops that target and says
               ignored directory without refusing). A staged or changed file the merge changes whose copy on disk
               is already <sha>'s is staged as it is (settle); one that differs is a person's edit, kept, and the
               deploy fails as "a dirty checkout, not main red", naming the checkout and the files
-  3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
-              daemon-reload`; then <repo>.applied records the sha
+  3. install  the one installer the repo names in tests/LANDING-deploy.toml (`installer = "<path>"`), with no
+              flags; then `systemctl --user daemon-reload`; then <repo>.applied records the sha. Nothing at a guessed
+              path runs: with no such file or key the deploy pulls only and says so. A name that is not a regular
+              file inside the checkout (a symlink anywhere on the way, an absolute path or one leaving the tree) fails
+              the step and says why. plan.py makes a change to that file a security read in every repo
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
               has no [Install], install.sh did not link it, or `cc-units policy <u> enable` says owner — then the
               owner gets one 🔐 card with the command, and nothing else asks him (S5). The policy is read from the
@@ -57,9 +60,11 @@ import shlex
 import stat
 import tempfile
 import time
+import tomllib
 
 from lander import cards as C
 from lander import git as G
+from lander import manifest as M
 from lander import scope
 
 NEVER = "tmux-main.service"
@@ -546,8 +551,31 @@ def copy_at(s, d, name):
         os.close(i)
 
 
+INSTALLER = M.DEPLOY
+
+
+def installer(root):
+    """The checkout's named installer, relative to `root`, or "" when INSTALLER names none. Raises Failed when the
+    file does not parse, or the name is not a regular file inside the tree with no symlink on the way."""
+    try:
+        with open(os.path.join(root, INSTALLER), "rb") as f:
+            inst = tomllib.load(f).get("installer", "")
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as e:
+        raise Failed("install", f"{INSTALLER}: {e}")
+    if not inst:
+        return ""
+    full = os.path.join(os.path.realpath(root), str(inst))
+    if (not isinstance(inst, str) or os.path.isabs(inst) or os.path.normpath(inst) != inst
+            or os.path.realpath(full) != full or not os.path.isfile(full)):
+        raise Failed("install", f"{INSTALLER} names {inst!r}, which is not a regular file inside the checkout "
+                                f"(a symlink or a path out of the tree is refused)")
+    return inst
+
+
 def install(root, repo, sha):
-    inst = next((p for p in ("core/install.sh", "install.sh") if os.access(os.path.join(root, p), os.X_OK)), "")
+    inst = installer(root)
     if inst:
         path = os.path.join(root, inst)
         rc, out = C.sh([path], cwd=os.path.dirname(path), timeout=900)
@@ -555,7 +583,7 @@ def install(root, repo, sha):
             raise Failed("install", f"{inst}: {last(out)}")
         systemctl("daemon-reload")
     record_applied(repo, sha)
-    return f"installed with {inst}" if inst else "pulled; no install.sh to run"
+    return f"installed with {inst}" if inst else f"pulled only: {INSTALLER} names no installer"
 
 
 def manifest_env(root):

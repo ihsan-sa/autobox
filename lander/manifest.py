@@ -69,6 +69,9 @@ from lander import types as T
 PREFIXES = ("", "core/")
 MANIFEST, POLICY, REACH = "tests/LANDING.toml", "tests/LANDING-policy.toml", "tests/reach.tsv"
 SECURITY = "tests/LANDING-security.toml"
+# at the repo root only: its one key, `installer`, names what deploy runs as the box's user, so plan.py makes a change
+# to it a security read in every repo, whatever that repo's own LANDING-security.toml lists
+DEPLOY = "tests/LANDING-deploy.toml"
 POLICY_LISTS = ("gate_first", "paid_review", "lander", "protected")
 TOOL_DIRS = ("bin/", "bin-private/", "core/bin/")
 # Higher runs earlier or on more: host runs before every merge, box only on the tip, hermetic in the sandbox,

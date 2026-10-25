@@ -58,6 +58,7 @@ class Box(Case):
         with open(inst, "w") as f:
             f.write("#!/bin/sh\n")
         os.chmod(inst, 0o755)
+        self.name_installer('installer = "install.sh"\n')
         self.pids = {}
         self.real_running = D.running
         G.REMOTES = os.path.join(self.tmp, "remotes.json")   # what `lander-self promote` pins
@@ -91,6 +92,16 @@ class Box(Case):
 
     def unit(self, name, text="[Service]\nExecStart=%h/dev/demo/bin/daemon\n[Install]\nWantedBy=default.target\n"):
         with open(os.path.join(self.units, name), "w") as f:
+            f.write(text)
+
+    def name_installer(self, text):
+        """The checkout's tests/LANDING-deploy.toml; None takes it away."""
+        p = os.path.join(self.root, D.INSTALLER)
+        if text is None:
+            os.unlink(p)
+            return
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
             f.write(text)
 
     def fake(self, changes="M\tbin/daemon", branch="main", **kw):
@@ -175,6 +186,54 @@ class TestDeploy(Box):
             D.request("demo", "d" * 40)
             st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
         self.assertEqual((st["state"], box.called("cc-slack post")), ("verified", []))
+
+    def test_a_stray_root_install_sh_with_no_key_is_not_run_and_the_deploy_says_it_pulled_only(self):
+        # dispatch#1889 (10-24): a public installer at the root ran with no flags on every deploy (perms-6a)
+        for text in (None, "# no key\n"):
+            with self.subTest(text=text):
+                self.name_installer(text)
+                box = self.fake()
+                D.request("demo", NEW)
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+                self.assertEqual((st["state"], box.called("install.sh")), ("verified", []))
+                self.assertIn(f"pulled only: {D.INSTALLER} names no installer", st["why"])
+                self.assertEqual(D.applied("demo"), NEW)
+                os.unlink(C.state("demo.applied"))
+                os.unlink(D.req_path("demo"))
+
+    def test_the_named_installer_runs_and_no_other(self):
+        os.makedirs(os.path.join(self.root, "core"))
+        inst = os.path.join(self.root, "core", "setup")
+        with open(inst, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(inst, 0o755)
+        self.name_installer('installer = "core/setup"\n')
+        box = self.fake(**{"setup": (0, "")})
+        D.request("demo", NEW)
+        st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual(st["state"], "verified")
+        self.assertEqual([c["argv"] for c in box.called("setup")], [[inst]])
+        self.assertEqual(box.called("install.sh"), [])
+        self.assertIn("installed with core/setup", st["why"])
+
+    def test_a_symlinked_or_out_of_tree_installer_is_refused_and_nothing_runs(self):
+        outside = os.path.join(self.tmp, "evil.sh")
+        with open(outside, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(outside, 0o755)
+        os.symlink(outside, os.path.join(self.root, "link.sh"))
+        os.symlink(self.tmp, os.path.join(self.root, "up"))
+        for name in ("link.sh", "up/evil.sh", "../evil.sh", outside, "./install.sh", "nope.sh", "tests"):
+            with self.subTest(name=name):
+                self.name_installer(f'installer = "{name}"\n')
+                box = self.fake(**{"evil.sh": (0, "")})
+                D.request("demo", NEW)
+                st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+                self.assertEqual(st["state"], "failed")
+                self.assertIn(f"install: {D.INSTALLER} names {name!r}, which is not a regular file inside", st["why"])
+                self.assertEqual((box.called("evil.sh"), box.called("install.sh")), ([], []))
+                self.assertEqual(D.applied("demo"), "")
+                os.unlink(D.req_path("demo"))
 
     def test_a_moved_aside_draft_is_still_said_when_the_install_then_fails(self):
         box = self.fake(**{"install.sh": (1, "install broke\n")})

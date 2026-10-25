@@ -1589,6 +1589,14 @@ class SecurityPaths(unittest.TestCase):
         p = P.select(M.load(r.root, r.base), ["bin-private/door", "config/systemd-user/tunnel.service"])
         self.assertNotIn("security", p.extra)
 
+    def test_the_deploy_installer_file_is_a_security_read_in_every_repo(self):
+        """perms-6a, 10-25: tests/LANDING-deploy.toml names what deploy runs as the box's user, so adding or changing
+        it is marked even in a repo whose own security list is empty; the same name under core/ is not the key."""
+        r = Repo(self)
+        p = P.select(M.load(r.root, r.base), [M.DEPLOY, "core/bin/a"])
+        self.assertEqual((p.extra.get("security"), p.paid), ([M.DEPLOY], True))
+        self.assertNotIn("security", P.select(M.load(r.root, r.base), ["core/" + M.DEPLOY]).extra)
+
     def test_the_security_file_is_lander_class_and_may_not_narrow(self):
         r = Repo(self, {"tests/LANDING-security.toml": self.SEC})
         head = r.commit("narrow", {"tests/LANDING-security.toml": 'paths = ["bin-private/door"]\n'})

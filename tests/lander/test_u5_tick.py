@@ -79,7 +79,8 @@ class Tick(unittest.TestCase):
         self.git(self.tmp, "init", "-q", "--bare", "-b", "main", self.origin)
         self.git(self.tmp, "clone", "-q", self.origin, self.work)
         self.git(self.work, "checkout", "-q", "-b", "main")
-        self.put({"tests/LANDING.toml": MANIFEST, "install.sh": INSTALL, "app/x": "1\n"}, "first")
+        self.put({"tests/LANDING.toml": MANIFEST, "install.sh": INSTALL, "app/x": "1\n",
+                  "tests/LANDING-deploy.toml": 'installer = "install.sh"\n'}, "first")
         self.git(self.tmp, "clone", "-q", self.origin, self.root)
         self.first = self.git(self.root, "rev-parse", "HEAD")
         os.makedirs(os.path.join(self.tmp, ".cc", "lander"))

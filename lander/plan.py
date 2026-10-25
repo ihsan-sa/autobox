@@ -44,7 +44,8 @@ manifest of its own and no host fallback, or an add-only change nothing owns, wh
 added file nothing loads by place or name is never covered by the default set: it widens only because another file
 made the change not add-only, so a file a real check owns can't pad it out of a read. Such
 a change is read instead of landing on nothing, and extra["ungated"] says why it was paid.
-SECURITY: the changed files that match the base's tests/LANDING-security.toml (Policy.security_review) go in
+SECURITY: the changed files that match the base's tests/LANDING-security.toml (Policy.security_review), and in every
+repo its root tests/LANDING-deploy.toml (M.DEPLOY: the installer deploy runs as the box's user; perms-6a), go in
 extra["security"], and the plan is paid. review.py then lands it only on a security reader's LAND at its digest
 (perms, after #1265 merged a tunnel unit with no security read and its read found a HIGH).
 
@@ -204,7 +205,7 @@ def select(m: M.Manifest, files: list, added=(), generated=(), clean=()) -> T.Pl
         extra["add_only"] = quiet
     if faults:
         extra["faults"] = faults
-    security = [f for f in files if M.match(pol.security_review, f)]
+    security = [f for f in files if f == M.DEPLOY or M.match(pol.security_review, f)]
     if security:
         extra["security"] = security
     return T.Plan(checks=sorted(names), owned=owned, unowned=unowned, klass=klass,
