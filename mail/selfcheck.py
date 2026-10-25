@@ -4497,9 +4497,10 @@ def run():
     # ------------------------------- 27b. MAIL_PDF_ATTACH: one job's filed PDFs go as files (perms-77, 2026-10-23)
     # A weekly report job's mail, sent from ~/dev/weekly-job to the two people its row names, attaches its fresh filed
     # PDFs. Each case below is its own Box, repo, fake cc-docs and worker, so no case leans on another's state.
-    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None, head=b"%PDF"):
+    def pdf27b(repo="weekly-job", to=(ALLOWED,), names=("a.pdf",), size=1000, age=0, row=None, head=b"%PDF", swap=None):
         """(exit, the mail the worker got or None, cc-docs argv lines, stderr, every PDF still there) for one send
-        of `names`, made in ~/dev/<repo> (`size` bytes each, `age` seconds old), under MAIL_PDF_ATTACH `row`."""
+        of `names`, made in ~/dev/<repo> (`size` bytes each, `age` seconds old), under MAIL_PDF_ATTACH `row`. `swap`
+        is called with the paths just before send_to runs, after the check: the file changing under its name."""
         with Box(allow=ALLOWED + "," + OTHER) as b:
             dev, argv = os.path.join(b.tmp, "dev"), os.path.join(b.tmp, "argv")
             docs = os.path.join(b.tmp, "cc-docs")
@@ -4529,12 +4530,19 @@ def run():
                 outbound.DEV = dev
                 os.chdir(here)
                 sys.stdout = io.StringIO()
+                real_send = outbound.send_to
+                def send_after_swap(*a, **kw):
+                    swap(paths)
+                    return real_send(*a, **kw)
+                if swap:
+                    outbound.send_to = send_after_swap
                 with FakeWorker() as w:
                     os.environ["MAIL_SEND_URL"] = w.url
                     rc = r.cmd_send({"--json": ask})
                     msg = w.calls[-1]["msg"] if w.calls else None
             finally:
                 sys.stdout, outbound.DEV = out, dev0
+                outbound.send_to = real_send
                 os.chdir(cwd)
                 for key, v in saved.items():
                     if v is None:
@@ -4554,6 +4562,29 @@ def run():
     k(rc == 0 and files27b(m) == ["stock.pdf", "orders.pdf"] and len(calls) == 2 and "lib.test" not in body27b(m)
       and kept, "MAIL_PDF_ATTACH: a send from the repo its row names, to the people it names, attaches both filed "
       "PDFs, each asked of cc-docs first, and the files stay where they were")
+    def swap27b(paths):
+        with open(paths[0], "wb") as f:
+            f.write(b"%PDF-SWAPPED")
+    rc, m, _c, _e, _k = pdf27b(swap=swap27b)
+    got27b = list(m.iter_attachments())[0].get_content() if rc == 0 and files27b(m) == ["a.pdf"] else b""
+    k(got27b.startswith(b"%PDF%%") and b"SWAPPED" not in got27b,
+      "…a PDF swapped under its name after the check still goes out as the bytes that were checked")
+    with tempfile.TemporaryDirectory() as td27b:
+        pdf27b_path = os.path.join(td27b, "a.pdf")
+        with open(pdf27b_path, "wb") as f:
+            f.write(b"%PDF-1")
+        cfg27b = {"MAIL_OUT_ROOTS": td27b, "MAIL_PDF_ATTACH": "job=" + ALLOWED}
+        fdopen0 = os.fdopen
+        def fdopen_fails(fd, *a, **kw):
+            os.close(fd)
+            raise OSError("disk went away")
+        try:
+            os.fdopen = fdopen_fails
+            bad27b = outbound.pdf_attach(cfg27b, "job", [ALLOWED], [pdf27b_path], {})
+        finally:
+            os.fdopen = fdopen0
+        k(bad27b is None and outbound.pdf_attach(cfg27b, "job", [ALLOWED], [pdf27b_path], {}) == [(pdf27b_path, b"%PDF-1")],
+          "…a PDF that cannot be read is not attached (it keeps its link) rather than crashing the send")
     rc, m, _c, _e, _k = pdf27b(repo="other-repo")
     k(rc == 0 and files27b(m) == [] and "a.pdf: https://lib.test/d/001-0009" in body27b(m),
       "…a send from a repo no row names gets the link, as every other sender does")

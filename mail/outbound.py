@@ -1012,29 +1012,35 @@ def run_repo(cwd=None):
 
 
 def pdf_attach(cfg, sender, rcpts, reals, rec):
-    """True when this mail's filed PDFs go as files, not links (perms-77, 2026-10-23, for one weekly report job).
-    MAIL_PDF_ATTACH is host config a member cannot write: rows `<repo>=<addr>,<addr>` split by `;` or a line break.
-    A row lets a mail sent from ~/dev/<repo> attach its PDFs when every recipient (blind copies too) is one the row
-    names, the PDFs were made in the last day (this run's, not an old filed one), begin with %PDF and together are
-    at most PDF_ATTACH_MAX. Each is opened once (_open_ours) and judged on that fd. Anything else keeps the links. The caller has already had each one filed (cc-docs link)."""
+    """The filed PDFs of this mail as [(path, bytes)] when they go as files, not links (perms-77, 2026-10-23, for one
+    weekly report job), else None. MAIL_PDF_ATTACH is host config a member cannot write: rows `<repo>=<addr>,<addr>`
+    split by `;` or a line break. A row lets a mail sent from ~/dev/<repo> attach its PDFs when every recipient
+    (blind copies too) is one the row names, the PDFs were made in the last day (this run's, not an old filed one),
+    begin with %PDF and together are at most PDF_ATTACH_MAX. Each is opened once (_open_ours), judged on that fd
+    and read from it, and send_to is handed those bytes, so the bytes sent are the bytes checked. A file that
+    cannot be read is logged and the PDFs keep their links. The caller has already had each one filed (cc-docs link)."""
     for row in re.split(r"[;\n]", cfg.get("MAIL_PDF_ATTACH") or ""):
         repo, _, people = row.partition("=")
         if sender and repo.strip() == sender and set(rcpts) <= set(_addrs(people)):
             break
     else:
-        return False
-    sts = []
+        return None
+    got, total = [], 0
     for p in reals:
         fd, st, _ = _open_ours(p, rec, cfg)
         if fd is None:
-            return False
+            return None
         try:
-            if os.read(fd, 4) != b"%PDF":
-                return False
-        finally:
-            os.close(fd)
-        sts.append(st)
-    return sum(s.st_size for s in sts) <= PDF_ATTACH_MAX and all(time.time() - s.st_mtime < 86400 for s in sts)
+            with os.fdopen(fd, "rb") as f:
+                data = f.read(PDF_ATTACH_MAX + 1)
+        except OSError as e:
+            log("pdf_attach: %s could not be read (%s); it goes as a link" % (clip(os.path.basename(p)), e))
+            return None
+        total += len(data)
+        if not data.startswith(b"%PDF") or total > PDF_ATTACH_MAX or time.time() - st.st_mtime >= 86400:
+            return None
+        got.append((p, data))
+    return got
 
 
 def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace="", now=None, sender=""):
@@ -1078,10 +1084,11 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
             why = ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
             return "not sent — %s" % why
         lines.append((os.path.basename(a), out[0].strip()))
-    if pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec):
-        # filed (the link just minted proves it); the PDFs travel by the real path that was checked, not the name
-        reals = dict(reals)
-        return [reals.get(a, a) for a in attachments], []
+    got = pdf_attach(cfg, sender, rcpts + blind, [real for _, real in reals], rec)
+    if got:
+        # filed (the link just minted proves it); the PDFs travel as the bytes that were checked, not as a name
+        got = {a: g for (a, _), g in zip(reals, got)}
+        return [got.get(a, a) for a in attachments], []
     return [a for a in attachments if a not in pdfs], lines
 
 
@@ -1191,7 +1198,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     if why:
         return refuse(why)
     copies = [a for a in rcpts if a in _addrs(cc)]
-    paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
+    paths = [p if isinstance(p, tuple) else str(p).strip() for p in (attachments or []) if p and str(p).strip()]
     html = str(html or "")
     pics = [str(p).strip() for p in (images or []) if str(p or "").strip()]
     if html and not body:     # a client that shows no HTML shows this: the HTML's own words, tags stripped
@@ -1215,6 +1222,9 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     rec = {"workspace": (workspace or "").strip()}   # a member's files come only from their own trees (bases)
     attach = []
     for path in paths:
+        if isinstance(path, tuple):    # (path, bytes) already read and checked by pdf_attach
+            attach.append(path)
+            continue
         data, why = attach_bytes(os.path.expanduser(path), rec, cfg, cap)
         if why == TOO_BIG:
             return refuse("%s is over the %s attachment cap (MAIL_OUT_MAX_ATTACH_BYTES) — nothing sent"
