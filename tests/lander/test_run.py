@@ -1375,6 +1375,28 @@ class HostAndRunners(Env):
             r = self.run_(chk(klass=T.HOST))
             self.assertEqual((r.status, calls), (T.PASSED, [True, False]))
 
+    def test_an_alone_rerun_held_off_past_settle_runs_beside_and_only_a_loaded_red_from_it_is_no_answer(self):
+        # dispatch 10-24/25: another user's load kept a slot busy, and an alone rerun waited for all of them for good
+        real = A.slot   # a deadline on every wait: a SETTLE that stops letting go fails here instead of hanging
+        bounded = lambda *a, **k: real(*a, **{"deadline": 30, **k})
+        red, green = chk(run="exit 1", klass=T.HOST, cap=5), chk(klass=T.HOST, cap=5)
+        with mock.patch.object(A, "slots", lambda *a, **k: 2), mock.patch.object(A, "slots_now", lambda *a, **k: 2), \
+                mock.patch.object(RUN, "starved", lambda *a: False), \
+                real(self.state, k=2, say=lambda _: None) as busy, mock.patch.object(A, "slot", bounded):
+            self.assertEqual(busy, [1])   # slot 1, held the whole case
+            with mock.patch.object(A, "loaded", lambda *a, **k: True):
+                r = self.run_(red, alone=True, settle=0.2)   # SETTLE: then slot 2 beside the busy one
+                self.assertEqual((r.status, r.extra["alone"]), (T.UNRUNNABLE, False), r.extra)
+                self.assertIn("no run alone", r.extra["why"])
+                r = self.run_(green, alone=True, settle=0.2)    # a green under load is a green
+                self.assertEqual((r.status, r.extra["alone"]), (T.PASSED, False), r.extra)
+            with mock.patch.object(A, "loaded", lambda *a, **k: False):   # settled, but nothing loaded it: it stands
+                r = self.run_(red, alone=True, settle=0.2)
+                self.assertEqual((r.status, r.extra["alone"]), (T.FAILED, False), r.extra)
+        with mock.patch.object(A, "loaded", lambda *a, **k: True), mock.patch.object(A, "slot", bounded):
+            r = self.run_(red, alone=True, settle=0.2)   # nothing busy: it runs alone, and its red stands
+        self.assertEqual((r.status, r.extra["alone"]), (T.FAILED, True), r.extra)
+
     def test_a_lanes_express_run_takes_no_slot_and_its_other_runs_wait_as_a_lane(self):
         # lane=True only moves the run's ticket ahead of a worker's: an express run still takes no slot at all
         calls, real = [], A.slot
@@ -2046,6 +2068,24 @@ class Admission(unittest.TestCase):
             with self.assertRaises(TimeoutError):   # and while it runs, no check takes slot 2 beside it
                 with A.slot(st, psi_root=calm, k=8, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
+
+    def test_an_alone_wait_under_sustained_load_settles_for_one_slot_in_its_place(self):
+        # dispatch 10-24/25: a slot held through another user's load; an alone run given settle stops waiting for
+        # all of them and takes what load admits, ahead of a check that came after it
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        hot, calm = self.loadavg(2.0 * (os.cpu_count() or 1)), self.psi_dir(0, 0)   # load admits slots 1-2
+        quiet = {"say": lambda _: None, "psi_root": calm, "loadavg": hot, "k": 4, "poll": 0.05}
+        with A.slot(st, **quiet) as busy:
+            self.assertEqual(busy, [1])
+            with self.assertRaises(TimeoutError):   # no settle: it waits for all four as before
+                with A.slot(st, alone=True, deadline=0.3, **quiet):
+                    pass
+            with A.slot(st, alone=True, settle=0.2, deadline=5, **quiet) as mine:
+                self.assertEqual(mine, [2])
+                with self.assertRaises(TimeoutError):   # what it took is held: load admits no third
+                    with A.slot(st, deadline=0.3, **quiet):
+                        pass
 
     def test_free_counts_the_slots_a_check_takes_now_and_none_while_anyone_waits(self):
         # brief (2026-10-02, #772): a check must not wait for a box slot while a runner has room, so spill() asks
@@ -3264,6 +3304,20 @@ class CheckCaged(Env):
         seen.clear()
         with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), mock.patch.object(RUN, "spill", return_value=""):
             self.assertEqual((plan(), seen), (T.PASSED, ["box"]))   # a box with room keeps it
+
+    def test_an_alone_rerun_settles_after_its_manifests_longest_cap_and_a_security_checks_never_does(self):
+        # Opus read of #1942: a 120 s check's slots are held by 1800 s ones, so its own cap is too short a wait. perms'
+        # read: a member who loads the box must not trade a security check's rerun alone for a loaded one
+        seen = {}
+
+        def runner(check, tree, where, **kw):
+            seen[check.name] = kw.get("settle")
+            return T.Result(check=check.name, tree=tree, status=T.PASSED, secs=0, extra={"why": ""})
+        m = M.Manifest(checks={"short": chk(name="short", cap=120), "long": chk(name="long", cap=1800),
+                               "guard": chk(name="guard", cap=60, paths=["core/bin/guard"])},
+                       policy=T.Policy(gate_first=["core/bin/guard"]))
+        RUN.run_plan(self.repo, m, T.Plan(checks=list(m.checks)), [], "h", runner=runner, record_reds=False)
+        self.assertEqual(seen, {"short": 1800, "long": 1800, "guard": None})
 
     def test_caged_only_lets_the_plan_spill(self):
         with mock.patch.object(RUN, "run_plan", return_value={}) as rp:

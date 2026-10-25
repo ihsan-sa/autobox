@@ -3031,6 +3031,31 @@ class AtOnce(Fixture):
         runner = self.checked_both(())
         self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), False)])
 
+    def test_a_check_with_no_place_says_so_in_the_queue_log_once_until_it_gets_one(self):
+        # dispatch 10-24/25: the lane said "waiting for a slot" only to its own lines, which go nowhere, so a PR
+        # waiting on the box looked wedged
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(L.Lane, "width", lambda lane: 0):   # every box place taken, no laptop
+            self.land()
+        waits = [ln for ln in self.log().splitlines() if "\tslot demo#1 " in ln]
+        self.assertEqual(len(waits), 1, self.log())   # once a lane run, not once a look
+        self.assertIn("check=a", waits[0])
+        self.assertIn("box=0/0", waits[0])
+
+    def test_a_check_left_without_a_place_beside_its_jobs_running_one_says_so_each_time_it_waits_again(self):
+        # one slot, three checks: a runs, b has no place (the box places filled inside the per-check loop), b runs,
+        # c has no place. A place taken in between clears the job's line, so the second wait is said too
+        self.push("main", {"tests/LANDING.toml": Express.MANIFEST})
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        J.submit("demo", 1)
+        with one_slot():
+            self.land(runner=Runner())
+        waits = [ln for ln in self.log().splitlines() if "\tslot demo#1 " in ln]
+        self.assertEqual([ln.split("check=")[1].split()[0] for ln in waits], ["b", "c"], self.log())
+        self.assertIn("box=1/1", waits[0])
+        self.assertEqual(sorted(self.job(1).results), ["a", "b", "c"])
+
 
 class HostFallback(Fixture):
     """A repo that ships no LANDING.toml gets its checks from the release's tests/landing-repos/<repo>.toml

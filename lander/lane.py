@@ -612,6 +612,7 @@ class Lane:
         self.lines = []
         self.tried = set()
         self.waiting = set()     # tried and waiting on a slot: tried again when one frees
+        self.placeless = set()   # waiting with no place for a check, said once in queue.log (no_place) until one has
         self.refused = set()     # tried and refused a turn by a GitHub backoff or a box hold: tried again when it ends
         self.inflight = {}       # (job key, check) -> Flight: every check the lane has in the pool
         self.laptop_down = 0.0   # when the laptop last gave no answer: the box takes its checks for LAPTOP_REST
@@ -656,7 +657,7 @@ class Lane:
                 with contextlib.suppress(OSError, ValueError):   # base runs an earlier lane shared are not reused
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
-                self.waiting, self.refused, self.inflight = set(), set(), {}
+                self.waiting, self.refused, self.inflight, self.placeless = set(), set(), {}, set()
                 # as wide as the cores, not today's K: the pool outlives a change of K, which takes no restart
                 width = max(A.slots(), os.cpu_count() or 1)
                 with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS + self.review_slots,
@@ -785,6 +786,17 @@ class Lane:
         """A box slot is free, or a runner's while the laptop is up."""
         return self.room(False) or (bool(RUN.laptop_dest()) and not self.member and self.laptop_up()
                                     and self.room(True))
+
+    def no_place(self, job, check, up):
+        """queue.log says once that job's next check has no place now, until one of its checks gets one: the lane's
+        own lines go nowhere a person reads, and a PR waiting for a slot looked wedged (dispatch, 10-24/25)."""
+        if job.key in self.placeless:
+            return
+        self.placeless.add(job.key)
+        box = sum(1 for f in self.inflight.values() if not f.laptop and not f.express)
+        far = sum(1 for f in self.inflight.values() if f.laptop)
+        E.log("slot", self.repo, job.pr, "waiting for a place to run a check", check=check,
+              box=f"{box}/{self.width()}", laptop=f"{far}/{A.LAPTOP_SLOTS}" if up else "down")
 
     def width(self) -> int:
         """How many box checks this lane keeps in flight: the admission slots the box allows now."""
@@ -1340,6 +1352,8 @@ class Lane:
             kw = {"box_only": True} if dest else {}   # a box slot's check stays on the box, not a wait on ssh
             fast = [n for n in todo if n in self.express(job)]
             if not todo or not (self.room(False) or (up and self.room(True)) or (fast and self.express_room())):
+                if todo:
+                    self.no_place(job, todo[0], up)
                 self.waiting.add(job.key)    # it goes on when a check finishes and frees a slot
                 return None
             m = self.manifest(job)
@@ -1397,7 +1411,10 @@ class Lane:
                     # resting and the box has room
                     laptop = False
                 else:
+                    if not self.room(False):   # not the one box check per job: the lane's box places are all taken
+                        self.no_place(job, n, up)
                     continue   # no place of either kind for it now: tried again when a check finishes
+                self.placeless.discard(job.key)
                 stop = threading.Event()
                 fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
                                        base_tree, member=self.member, store=store, job_key=job.key,

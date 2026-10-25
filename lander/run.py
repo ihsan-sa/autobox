@@ -68,7 +68,8 @@ case only when the base names none either and both print a failure count, the he
 base run and its red is the diff's — except a check the base defines whose run file is on neither tree, which is not
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
 load (A.loaded() at either end, or starved(): a box run whose wall time was STARVED times its CPU time while a load
-average stood at the box's cores), on either tree, gets ONE diagnostic rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+average stood at the box's cores), on either tree, gets ONE diagnostic rerun alone (every slot held; one that has not got them all within the largest cap
+in its manifest runs as load admits instead, admission SETTLE, though a security check never does, and a loaded red from it is unrunnable, no answer), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
 whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded
 (or loaded by starved() alone short of its cap: a PR's own check sets its ratio with a sleep), a check that guards a security path or that the change touches, whose first red stands; green the second time passes
 with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
@@ -813,7 +814,8 @@ def laptop_argv(check, tree, cwd, dest=""):
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
         label: str = "lander.0", changed: list | None = None, alone: bool = False, base_tree: str = "",
-        state: str | None = None, express: bool = False, lane: bool = False, first: bool = False) -> T.Result:
+        state: str | None = None, express: bool = False, lane: bool = False, first: bool = False,
+        settle: float | None = None) -> T.Result:
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
@@ -821,7 +823,8 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     repo's refs/lander/base (materialise), and where a PINNED check's files come from for its second pass, which runs
     only when the head's own pass passed, in a head written out afresh (pinned_head), and whose red is the result. lane: a landing lane's run, whose slot ticket goes before a worker's
     (admission). first: main health's or a main-red fix's run,
-    whose ticket goes ahead of every younger one (admission FIRST CLAIM)."""
+    whose ticket goes ahead of every younger one (admission FIRST CLAIM). settle: an alone run's wait for every slot
+    before it runs beside others (admission SETTLE); None waits for every slot however long that takes."""
     t0 = time.monotonic()
 
     def res(st, why, **kw):
@@ -851,7 +854,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     def attempt(head: str, run_dir: str) -> T.Result:
         if kind != "laptop":
             return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane,
-                            first)
+                            first, settle)
         # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
         # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
         # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
@@ -865,7 +868,8 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         passed += [f"{d}: not reached lately" for d in dests if d not in awake]
         r, took = None, False
         for dest in awake:
-            r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane, first)
+            r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane, first,
+                         settle)
             why = str(r.extra.get("why", ""))
             if r.status != T.UNRUNNABLE or stopped() or not (r.extra.get("not_sent") or r.extra.get("never_started")):
                 if r.extra.get("never_started") != "unreached":
@@ -900,7 +904,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         p_want = base_of(p_head)
         if kind == "laptop":
             p = _attempt(check, tree_sha, "box", "", p_head, p_dir, cwd, env_extra, alone, state, express, lane,
-                         first)
+                         first, settle)
         else:
             p = attempt(p_head, p_dir)
         p = base_kept(p, p_head, p_want)
@@ -920,7 +924,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
 
 
 def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,
-             first=False) -> T.Result:
+             first=False, settle=None) -> T.Result:
     """One run of `check` at `where` (on the runner `dest` when that is the laptop kind); Result.runner names the
     runner that took it: `laptop:<user@host>:-` off the box."""
     kind = where.split(":")[0]
@@ -939,10 +943,13 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         scope = "-"
         # the laptop's work is the laptop's: it takes no slot of the box's; nor does an express run (lane EXPRESS)
         free = kind == "laptop" or (express and not alone)
+        k = A.slots() if alone else None
         held = contextlib.nullcontext() if free else A.slot(state or REC.state_dir(), alone=alone,
                                                             who=f"{check.name}@{tree_sha[:8]}", lane=lane,
-                                                            first=first)
-        with held:
+                                                            first=first, k=k, settle=settle if alone else None)
+        with held as got:
+            settled = alone and got is not None and len(got) < k   # SETTLE: it waited out settle and ran beside others
+            alone = alone and not settled
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
                 argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
@@ -967,6 +974,8 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
             started = {"never_started": never_started(text, capped)} if dest else {}
             text, rc = _laptop_verdict(text, rc)
         st, why = status_of(rc, text, capped, started=said, net=check.net)
+        if st == T.FAILED and settled and loaded:   # the rerun alone it stood for never ran: no answer, not a red
+            st, why = T.UNRUNNABLE, f"red under load again, and no run alone in {settle / 60:.0f} min"
         if kind == "laptop" and rc == -1 and not capped:   # capped: it ran there, and "stopped at its cap" says so
             why = text.splitlines()[0] if text else "the laptop did not answer"
         kept = {}
@@ -1121,8 +1130,10 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         r2 = go(head_tree, alone=loaded)
         out.results.append(r2)
         if r2.status == T.PASSED:
-            out.status, out.note = T.PASSED, ("flaky: red under load, green alone" if loaded
-                                              else "flaky: red, then green on the same tree")
+            out.status, out.note = T.PASSED, ("flaky: red, then green on the same tree" if not loaded
+                                              else "flaky: red under load, green on a rerun"
+                                              if r2.extra.get("alone") is False   # SETTLE ran it beside others
+                                              else "flaky: red under load, green alone")
             return out
         if r2.status == T.UNRUNNABLE:
             out.status, out.note = T.UNRUNNABLE, r2.extra.get("why", "")
@@ -1274,6 +1285,9 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory", so it is never quarantined
         security = name == M.BUILTIN or any(M.match(list(m.policy.gate_first) + list(m.policy.security_review) +
                                                      list(SECURITY_PATHS), p) for p in own if p)
+        # SETTLE waits out the longest a check holding a slot may run; a security check never settles, because a
+        # member who loads the box could otherwise trade its rerun alone for a loaded one, where a green passes
+        settle = None if security else max([c.cap] + [o.cap for o in m.checks.values()])
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
         where = choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:
@@ -1285,7 +1299,7 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0",
                           **({"express": True} if express else {}), **({"lane": True} if lane else {}),
-                          **({"first": True} if first else {}))
+                          **({"first": True} if first else {}), **({"settle": settle} if settle else {}))
         gone = gone or laptop_gone({name: out[name]})
     return out
 

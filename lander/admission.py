@@ -29,6 +29,12 @@ mergeable job's short check; each lane runs at most lane.EXPRESS_SLOTS of them a
 lane, and none while mem_loaded()) takes no slot and no ticket. A diagnostic rerun takes every
 slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
+SETTLE (dispatch, 10-24/25: under another user's load the box's checks ran slow, five alone reruns queued, the
+oldest 92 min, and main stayed red ~6 h behind its fix). An alone wait given settle= (run.py: the largest cap in the
+check's manifest, the longest any of its checks holding a slot may run; none for a security check) that still
+lacks a slot by then lets go of what it holds and waits for one slot as load admits, in its place in the queue;
+run.py takes a loaded red from such a run for no answer, so load still cannot fake a red, and a green under load
+or a red without it stands.
 ALONE GATE: K is read per process, so two callers can disagree on it (LANDER_SLOTS raised, or one's cc-config did
 not answer) and slots 1..K alone would leave a busy slot past K. So an alone run first takes `<state>/slots/alone`
 exclusively, which it gets only once no check holds a slot, and every other check holds it shared beside its slot.
@@ -411,11 +417,12 @@ def _whose(name: str) -> str:
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
          k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False,
-         first: bool = False):
+         first: bool = False, settle: float | None = None):
     """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
     in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
     on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST).
-    first=True: main health's or a main-red fix's check (FIRST CLAIM)."""
+    first=True: main health's or a main-red fix's check (FIRST CLAIM). settle (seconds): an alone wait that has not
+    got every slot by then waits for one slot instead, in the same place in the queue (SETTLE)."""
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
@@ -428,6 +435,17 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     mine, tf = _ticket(q, lane, first)
     try:
         while True:
+            if alone and settle is not None and time.monotonic() - t0 >= settle:
+                alone = False   # SETTLE: what it holds goes back, and it takes one slot as load admits
+                for _, f in held:
+                    f.close()
+                held = []
+                if gate is not None:
+                    gate.close()
+                    gate = None
+                with contextlib.suppress(OSError, ValueError):
+                    say(f"lander: {who or 'a check'} had no run alone in {settle / 60:.0f} min, so it runs beside "
+                        f"others as load admits")
             want = range(1, total + 1) if alone else range(1, slots_now(psi_root, total, loadavg) + 1)
             ahead, oldest, stale = _ahead(q, mine)
             for name in set(stale) - told:
