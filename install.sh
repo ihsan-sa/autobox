@@ -140,8 +140,9 @@ core_units=$("$R/bin/cc-units" link)
 for u in $core_units; do
   link "$R/config/systemd-user/$u" ~/.config/systemd/user/"$u"
 done
-# the overlay's own user units, for what only that box runs: linked like core's, never enabled here — which of
-# them should start is the box owner's call (`systemctl --user enable --now <unit>` once, after this installer).
+# the overlay's own user units, for what only that box runs: linked like core's. Its long-running services are
+# enabled below with core's (`cc-units enable` names them); the rest are the box owner's call
+# (`systemctl --user enable --now <unit>` once, after this installer).
 if [ -n "$O" ]; then
   for f in "$O"/config/systemd-user/*.service "$O"/config/systemd-user/*.timer "$O"/config/systemd-user/*.path; do
     [ -f "$f" ] || continue

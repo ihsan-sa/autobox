@@ -2,7 +2,8 @@
 # cc-boot-notify — one Slack/ntfy message per boot (via cc-notify): when the box came up, whether the
 # previous boot ended cleanly or by power loss / hard reset, and how long it was dark (from cc-heartbeat); and one
 # per user-manager restart inside a boot (cc-heartbeat's cause=user-manager-restart line), with how long it was dark.
-# After a boot's message, `cc-units check`: a declared unit that is down or never enabled goes to the planning seat (--ask).
+# After a boot's message, `cc-units check`: a declared unit that is down or never enabled goes to the planning seat (--ask),
+# and after a boot to #alerts as well, once.
 # Every later run in the same boot runs that check too, notice or none: a fresh user manager (a crash, a TERM) starts
 # default.target and so this unit again, and units it brought back half-way are said once per manager pid. A
 # `daemon-reexec` keeps the manager's pid and every unit's state and queues no default job, so it runs nothing here.
@@ -103,6 +104,17 @@ if [ "${1:-}" = selfcheck ]; then
   rm -f "$P/calls"; HOME=$P PATH="$P/bin:$PATH" TZ=UTC CC_BOX=box MANAGERPID=6666 "$0" >/dev/null 2>&1
   grep -q "^--ask|.*|units-restart:$b:6666|" "$P/calls" || c=1
   k "$c" "a boot announced before boot-manager existed asks its own manager under the boot ask's id, and a later one under its pid"
+  # a fresh boot with a unit down: asked of the seat, and said once in #alerts under the boot's id. Its own scratch HOME,
+  # with the network, journal and disk tools stubbed so the boot message goes out at once.
+  B=$(mktemp -d); trap 'rm -rf "$H" "$U" "$P" "$B"' EXIT; mkdir -p "$B/bin" "$B/.cc/state"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s/calls"; echo >> "%s/calls"\n' "$B" "$B" > "$B/bin/cc-notify"
+  printf '#!/bin/sh\necho "user units — site@one.service=inactive"; exit 1\n' > "$B/bin/cc-units"
+  for x in curl journalctl sudo cc-config systemctl; do printf '#!/bin/sh\nexit 0\n' > "$B/bin/$x"; done; chmod +x "$B/bin/"*
+  echo "x boot=$(date -u -d "$(uptime -s)" +%FT%TZ) cause=clean-reboot" > "$B/.cc/state/power-events.log"
+  HOME=$B PATH="$B/bin:$PATH" TZ=UTC CC_BOX=box "$0" >/dev/null 2>&1; rc=$?
+  c=0; [ "$rc" = 0 ] && grep -q "^--ask|-t|units down after boot|--id|units-boot:$b|" "$B/calls" \
+    && grep -qx -- "--kind|boot|--id|units-boot-alert:$b|-t|box boot: units down|user units — site@one.service=inactive|" "$B/calls" || c=1
+  k "$c" "a unit down after a boot is asked of the seat and said once in #alerts, under the boot's id"
   echo "cc-boot-notify selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]; exit $?
 fi
@@ -203,3 +215,6 @@ printf '%s\n' "$bootid" > "$stamp"; [ -z "$mpid" ] || printf '%s %s\n' "$bootid"
 # …then whether every declared unit came back. A unit linked but never enabled does not survive a restart, and the
 # planning seat is the one that switches it on (the library editor stayed down 3.5 h after the 10-01 restart).
 ask_units "units down after boot" "units-boot:$bootid"
+# …and said in #alerts too, once per boot (--id), so the owner hears it from the box: a site sat at 502 for most of a
+# day after the 2026-10-24 boot and the owner found it himself.
+down=$("$HOME/bin/cc-units" check 2>&1) || "$notify" --kind boot --id "units-boot-alert:$bootid" -t "${CC_BOX:-$(hostname -s)} boot: units down" "$down" || true

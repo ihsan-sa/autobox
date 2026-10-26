@@ -125,6 +125,23 @@ J
   k "$(t test -z "$(pl no-such.service enable)")" "…and a unit no manifest declares comes back empty, not an error"
   unset -f pl
 
+  # `enable` names the overlay's long-running services too, so install.sh enables them and a boot brings them back
+  # (a boot on 2026-10-24 found two with no wants link): [Install], no `enable: owner`, no timer or path of its own,
+  # and an instance row by its template's file. Its own fixture.
+  X=$(mktemp -d); mkdir -p "$X/core/config/systemd-user" "$X/config/systemd-user"
+  echo '{ "units": [] }' > "$X/core/config/units.json"
+  cat > "$X/config/units.json" <<'J'
+{ "units": [ { "unit": "srv.service" }, { "unit": "site@.service" }, { "unit": "site@one.service" },
+             { "unit": "off.service", "enable": "owner" }, { "unit": "bare.service" },
+             { "unit": "job.service" }, { "unit": "job.timer" } ] }
+J
+  for u in srv site@ off job; do printf '[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n' > "$X/config/systemd-user/$u.service"; done
+  printf '[Service]\nExecStart=/bin/true\n' > "$X/config/systemd-user/bare.service"; : > "$X/config/systemd-user/job.timer"
+  out=$(CC_UNITS_MANIFEST="$X/core/config/units.json" CC_UNITS_DIR="$X/core/config/systemd-user" CC_UNITS_OVERLAY="$X" "$0" enable)
+  k "$(t test "$out" = "srv.service	none
+site@one.service	none")" "enable names an overlay service with [Install] and an instance by name, never a template, an owner row, one with no [Install] or a timer's service — got: $(tr '\n' ' ' <<<"$out")"
+  rm -rf "$X"
+
   # a manifest with a typo in it must not read as "this tree declares nothing": jq complains on stderr and keeps
   # going, and an empty answer that exits 0 is what a landing believes
   printf '{ this is not valid json\n' > "$T/config/units.json"
