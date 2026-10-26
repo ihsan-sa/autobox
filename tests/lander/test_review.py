@@ -2314,41 +2314,63 @@ class TestRecord(Case):
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 
-    def seat(self, name):
-        """caller_seat() answers `name` for the rest of the test, as if run from that seat."""
+    def seat(self, cwd):
+        """caller_seat() answers `cwd` for the rest of the test, as if run from that directory."""
         self.addCleanup(setattr, R, "caller_seat", R.caller_seat)
-        R.caller_seat = lambda *a, **kw: name
+        R.caller_seat = lambda *a, **kw: cwd
+
+    def home(self, *parts):
+        return os.path.realpath(os.path.join(C.PASSWD_HOME, *parts))
 
     def test_the_caller_seat_is_the_claude_sessions_own_dir(self):
         self.versions()
-        self.assertEqual(R.caller_seat(30, self.proc(os.path.join(self.tmp, "wt", "seat"))), "seat")
-        self.assertIsNone(R.caller_seat(30, self.proc(os.path.join(self.tmp, "wt", "seat"), comm="bash")))
+        wt = os.path.join(self.tmp, "wt", "seat")
+        self.assertEqual(R.caller_seat(30, self.proc(wt)), os.path.realpath(wt))
+        self.assertIsNone(R.caller_seat(30, self.proc(wt, comm="bash")))
+
+    def test_a_seat_runs_in_one_directory(self):
+        self.assertEqual(R.seat_home("demo", "owner/demo"), os.path.join(C.PASSWD_HOME, "dev", "demo"))
+        self.assertEqual(R.seat_home("seat", "demo"), os.path.join(C.PASSWD_HOME, ".cc", "worktrees", "demo", "seat"))
 
     def test_record_releases_its_own_handback_at_the_same_head(self):
         d = R.change_digest(DIFF)
-        self.seat("seat")
-        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by="seat")])})
-        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 0)
-        self.assertIn("verdict=LAND by=seat", box.called("gh pr comment")[0]["input"])   # posted like any record
+        for by, cwd in (("seat", self.home(".cc", "worktrees", "demo", "seat")), ("demo", self.home("dev", "demo"))):
+            self.seat(cwd)
+            box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by=by)])})
+            self.assertEqual(self.run_record("demo", "7", "LAND", "--by", by, "--head", HEAD), 0)
+            self.assertIn(f"verdict=LAND by={by}", box.called("gh pr comment")[0]["input"])   # posted like any record
+
+    def test_the_perms_seat_releases_its_security_hold(self):
+        d = R.change_digest(DIFF)
+        self.addCleanup(setattr, R, "perms_seat_caller", R.perms_seat_caller)
+        R.perms_seat_caller = lambda *a, **kw: True
+        self.seat(os.path.join(R.PERMS_STATE, "demo", "perms"))
+        os.makedirs(os.path.join(R.PERMS_STATE, "demo", "perms"), mode=0o700)   # the seat's LAND goes in its ledger
+        box = self.box(**{"gh pr view": self.facts([
+            self.comment("HANDBACK", d, ["1. [security] x"], by=R.PERMS_SECURITY_READER)])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", R.PERMS_SECURITY_READER, "--head", HEAD), 0)
+        self.assertIn(f"verdict=LAND by={R.PERMS_SECURITY_READER}", box.called("gh pr comment")[0]["input"])
 
     def test_record_refuses_a_release_under_another_seats_name(self):
         """Every session shares one GitHub login, so --by alone is a label (perms' read of #1949): a session that
         names another seat cannot release that seat's hold."""
         d = R.change_digest(DIFF)
-        for caller in ("other", None):
+        for caller in (self.home(".cc", "worktrees", "demo", "other"), None,
+                       os.path.join(self.tmp, "elsewhere", "seat"),   # the seat's name, from a folder of its own
+                       self.home("dev", "seat"), "/work"):            # another kind of seat's home; a member sandbox
             self.seat(caller)
             box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. hold"], by="seat")])})
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD), 1)
-            self.assertIn("not the seat this was run from", out.getvalue())
+            self.assertIn("only a seat can release its own HANDBACK", out.getvalue())
             self.assertEqual(box.called("gh pr comment"), [])
 
     def test_a_land_between_two_holds_resets_the_release(self):
         """Only the holds since the last LAND count: another reader's HANDBACK that a LAND came after no longer holds
         the PR, so the seat's own hold on top is its to release."""
         d = R.change_digest(DIFF)
-        self.seat("seat")
+        self.seat(self.home(".cc", "worktrees", "demo", "seat"))
         box = self.box(**{"gh pr view": self.facts([
             self.comment("HANDBACK", d, ["1. x"], by="other", at="2026-10-20T10:00:00Z"),
             self.comment("LAND", d, by="other", at="2026-10-20T11:00:00Z"),

@@ -4,8 +4,8 @@
                                      write a read a seat made as the PR's marker comment (from the perms seat, a
                                      LAND also goes in perms' ledger: "a security path"); refused if --head moved,
                                      if it is looser than a HANDBACK already standing (old words map as below) that
-                                     is not this --by's own at this head (a seat releases its own hold, and --by
-                                     must then be the calling seat: caller_seat()), or
+                                     is not this --by's own at this head (a seat releases its own hold, run from
+                                     that seat's own directory, seat_home(); perms' own, from the perms seat), or
                                      if the head, the base or the change digest cannot be worked out right now (a
                                      marker with an empty change= matches no reader, so nothing is posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
@@ -2274,13 +2274,24 @@ def perms_seat_caller(pid=None, proc="/proc", state=None, versions=None):
     return cwd == os.path.realpath(os.path.join(state or PERMS_STATE, box, "perms"))
 
 
+def seat_home(who, repo):
+    """The one directory the seat named `who` runs in for `repo`, at the passwd home as perms_seat_caller() finds the
+    perms seat: the planning seat and its orchs in ~/dev/<repo> (cc's __runmain, __runorch), a track in
+    ~/.cc/worktrees/<repo>/<track> (__run)."""
+    name = repo_name(repo)
+    if who == name:
+        return os.path.join(C.PASSWD_HOME, "dev", name)
+    return os.path.join(C.PASSWD_HOME, ".cc", "worktrees", name, who)
+
+
 def caller_seat(pid=None, proc="/proc", versions=None):
-    """The seat the calling Claude session (claude_ancestor()) runs in: the last part of its /proc/<pid>/cwd realpath,
-    read as perms_seat_caller() reads it, or None. Every session shares one GitHub login, so --by alone proves nothing
-    (perms' read of #1949); a HANDBACK release must name this."""
+    """The directory the calling Claude session (claude_ancestor()) runs in: its /proc/<pid>/cwd realpath, read as
+    perms_seat_caller() reads it, or None. Every session shares one GitHub login, so --by alone proves nothing
+    (perms' read of #1949); a HANDBACK release must come from seat_home(). Never the folder name alone, which any
+    session can make and start a claude in (perms, 10-25), and a member sandbox's /work is no seat of the host's."""
     seat = claude_ancestor(pid, proc, versions)
     try:
-        return os.path.basename(os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))) if seat else None
+        return os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd"))) if seat else None
     except OSError:
         return None
 
@@ -2308,7 +2319,8 @@ def cmd_record(argv):
     # a bare `perms` is its name too (#1523 was recorded --by perms)
     seat = perms_seat_caller()
     named = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]).lower()
-    if (named == "perms" or named.startswith("perms-")) and not seat:
+    perms_name = named == "perms" or named.startswith("perms-")
+    if perms_name and not seat:
         print(f"lander record: --by {opts['by']} is perms' name, and this was not run from the perms seat; "
               "nothing posted. Perms records its own read from its seat, which also puts it in perms' ledger.")
         return 1
@@ -2354,8 +2366,10 @@ def cmd_record(argv):
             print("lander record: HANDBACK stands for this change and LAND is looser; only the reader that "
                   "recorded it can release it, at the head it held; push the fix instead")
             return 1
-        if who != caller_seat():
-            print(f"lander record: --by {who} is not the seat this was run from ({caller_seat() or 'no seat'}), "
+        # perms' own holds (perms-security-read among them) are the perms seat's, which perms_seat_caller() found
+        home, caller = os.path.realpath(seat_home(who, repo)), caller_seat()
+        if not perms_name and caller != home:
+            print(f"lander record: --by {who} runs in {home}, not where this was run from ({caller or 'no seat'}), "
                   "and only a seat can release its own HANDBACK; nothing posted")
             return 1
     rows = [ln.strip() for ln in findings.splitlines() if ln.strip()]
