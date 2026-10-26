@@ -3697,13 +3697,15 @@ def run_selfcheck():
             rc_down = main(["seat"])
             globals()["load_cfg"] = lambda: {}
             rc_noslack = main(["seat"])
+            globals()["load_cfg"] = lambda: {"CFG_READ_FAILED": "1"}
+            rc_cfgfail = main(["seat"])
     finally:
         globals()["load_cfg"] = real_load_cfg
         SOCK = real_sock_s
     check("seat: a daemon that cannot be reached exits 2, never 1 — cc-notify reads 1 ('the daemon says no seat owns "
           "this pid') as the box's own hand and opens the owner's door to it, so a socket that is down has to answer "
           "differently; on a box with no Slack at all there is no daemon to have a word and it stays a plain 1",
-          rc_down == 2 and rc_noslack == 1 and "did not answer" in errS.getvalue())
+          rc_down == 2 and rc_noslack == 1 and rc_cfgfail == 2 and "did not answer" in errS.getvalue())
 
     postedH = []
     try:                                                     # …and a repo with no twin keeps its routine post in #<repo>

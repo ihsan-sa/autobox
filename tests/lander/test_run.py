@@ -3299,8 +3299,12 @@ class Judge(unittest.TestCase):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         write(d.name, {"cpu": "some avg10=90.00 avg60=90.00 avg300=90.00 total=1\n",
-                       "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"})
-        with mock.patch.object(A, "short", return_value=""):   # the tower's own memory stays out of it
+                       "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n",
+                       # the box-wide sources loaded() also reads, calm: the live ones must not decide this case
+                       "sys/memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+                       "meminfo": "MemTotal: 33554432 kB\nMemAvailable: 16777216 kB\n"})
+        with mock.patch.object(A, "SYS_PSI", os.path.join(d.name, "sys")), \
+                mock.patch.object(A, "MEMINFO", os.path.join(d.name, "meminfo")), mock.patch.object(A, "MEM_FLOOR", "2G"):
             self.assertFalse(A.loaded(d.name))
             self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
 
