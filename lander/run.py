@@ -385,8 +385,11 @@ def stopped() -> bool:
     return bool(ev is not None and ev.is_set())
 
 
-def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, keep: tuple = ()) -> tuple:
-    """-> (rc, secs, cpu_secs, capped). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, keep: tuple = (),
+            mem: str = "") -> tuple:
+    """-> (rc, secs, cpu_secs, capped, peak): peak is the bytes the run's scope held at most, its memory.peak file
+    `mem` as last read while it ran (the scope goes when it exits), or wait4's ru_maxrss, the most its largest process
+    held, when that never read; a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
     keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
@@ -395,7 +398,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     t0 = time.monotonic()
     try:
         if stopped():
-            return -signal.SIGTERM, 0.0, 0.0, False
+            return -signal.SIGTERM, 0.0, 0.0, False, 0
         with open(log, "wb") as out:
             p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
                                  stdout=out, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
@@ -404,8 +407,11 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     finally:
         for fd in keep:
             os.close(fd)
-    capped, ru = False, None
+    capped, ru, held = False, None, 0
     while True:
+        if mem:
+            with contextlib.suppress(OSError, ValueError), open(mem) as f:
+                held = int(f.read())
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
             rc = os.waitstatus_to_exitcode(status)
@@ -428,7 +434,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     except (ProcessLookupError, PermissionError):
         pass
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
-    return rc, time.monotonic() - t0, cpu, capped
+    return rc, time.monotonic() - t0, cpu, capped, held or (ru.ru_maxrss * 1024 if ru else 0)
 
 
 def starved(secs: float, cpu: float) -> bool:
@@ -872,7 +878,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     def attempt(head: str, run_dir: str) -> T.Result:
         if kind != "laptop":
             return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane,
-                            first, settle)
+                            first, settle, repo_root)
         # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
         # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
         # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
@@ -887,7 +893,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         r, took = None, False
         for dest in awake:
             r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane, first,
-                         settle)
+                         settle, repo_root)
             why = str(r.extra.get("why", ""))
             if r.status != T.UNRUNNABLE or stopped() or not (r.extra.get("not_sent") or r.extra.get("never_started")):
                 if r.extra.get("never_started") != "unreached":
@@ -922,7 +928,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         p_want = base_of(p_head)
         if kind == "laptop":
             p = _attempt(check, tree_sha, "box", "", p_head, p_dir, cwd, env_extra, alone, state, express, lane,
-                         first, settle)
+                         first, settle, repo_root)
         else:
             p = attempt(p_head, p_dir)
         p = base_kept(p, p_head, p_want)
@@ -942,7 +948,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
 
 
 def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,
-             first=False, settle=None) -> T.Result:
+             first=False, settle=None, repo=".") -> T.Result:
     """One run of `check` at `where` (on the runner `dest` when that is the laptop kind); Result.runner names the
     runner that took it: `laptop:<user@host>:-` off the box."""
     kind = where.split(":")[0]
@@ -962,10 +968,11 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         # the laptop's work is the laptop's: it takes no slot of the box's; nor does an express run (lane EXPRESS)
         free = kind == "laptop" or (express and not alone)
         k = A.slots() if alone else None
-        held = contextlib.nullcontext() if free else A.slot(state or REC.state_dir(), alone=alone,
-                                                            who=f"{check.name}@{tree_sha[:8]}", lane=lane,
-                                                            first=first, k=k, settle=settle if alone else None,
-                                                            stop=_waiting)
+        sd = state or REC.state_dir()
+        held = contextlib.nullcontext() if free else A.slot(sd, alone=alone, who=f"{check.name}@{tree_sha[:8]}",
+                                                            lane=lane, first=first, k=k,
+                                                            settle=settle if alone else None, stop=_waiting,
+                                                            need=A.peak(sd, repo, check.name))
         with held as got:
             settled = alone and got is not None and len(got) < k   # SETTLE: it waited out settle and ran beside others
             alone = alone and not settled
@@ -973,8 +980,10 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
                 argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
             # the write end is execute's from here: it closes it once the run has it (pipe keeps only the read end)
-            rc, secs, cpu, capped = execute(argv, wd, env, check.cap, log, stdin,
-                                            keep=(pipe.pop(),) if pipe else ())
+            rc, secs, cpu, capped, peak = execute(argv, wd, env, check.cap, log, stdin,
+                                                  keep=(pipe.pop(),) if pipe else (), mem=A.scope_peak(argv))
+            if kind == "box" and rc == 0 and not capped:   # a red may have died before its peak (admission MEMORY)
+                A.record(sd, repo, check.name, peak)
             # under load at either end of the run, or starved through it (dispatch #1504, 10-21: 1421 s for 774 s of
             # CPU at load 32.7, four timeouts, and neither end's PSI saw it)
             # A PR's own check sets its wall-to-CPU ratio (a sleep is enough), so a red loaded by that alone

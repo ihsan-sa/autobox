@@ -69,6 +69,7 @@ class Env(unittest.TestCase):
         os.mkdir(tmpdir)
         # CC_SUITES_DIR: no laptop unless a case makes one (this box's own ~/.cc/suites would route a loaded run there)
         p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "CC_LAND_STATE": os.path.join(self.tmp, "land"),
+                                         "CC_LANDER_STATE": os.path.join(self.tmp, "land"),
                                          "LANDER_SCOPE": "0", "TMPDIR": tmpdir,
                                          "CC_SUITES_DIR": os.path.join(self.tmp, "suites"),
                                          # the host's checkouts are $CC_DEV/<repo> and the boards' paths (git.host_tree)
@@ -203,12 +204,12 @@ class Cancel(unittest.TestCase):
     def test_a_cancel_kills_the_running_check_and_starts_no_more(self):
         threading.Timer(0.3, self.ev.set).start()
         t0 = time.monotonic()
-        rc, _, _, capped = self.execute(["sleep", "60"])
+        rc, _, _, capped, _ = self.execute(["sleep", "60"])
         self.assertLess(time.monotonic() - t0, 20)
         self.assertLess(rc, 0)
         self.assertFalse(capped)   # stopped, not timed out: status_of calls it unrunnable, never red
         marker = os.path.join(self.tmp, "ran")
-        rc, _, _, _ = self.execute(["touch", marker])
+        rc, _, _, _, _ = self.execute(["touch", marker])
         self.assertLess(rc, 0)
         self.assertFalse(os.path.exists(marker))
 
@@ -216,6 +217,13 @@ class Cancel(unittest.TestCase):
         marker = os.path.join(self.tmp, "ran")
         self.assertEqual(self.execute(["touch", marker])[0], 0)
         self.assertTrue(os.path.exists(marker))
+
+    def test_a_run_says_the_peak_memory_it_held(self):
+        # admission MEMORY counts a check's last peak as its need, so execute must measure it
+        rc, _, _, _, peak = self.execute([sys.executable, "-c", "b = bytearray(64 << 20); b[::4096] = b'x' * len(b[::4096])"])
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(peak, 64 << 20)
+        self.assertLess(peak, 1 << 30)
 
 
 class Tree(Env):
@@ -882,11 +890,11 @@ class Tree(Env):
     def starved_run(self, secs, cpu, load):
         """A box check that fails after `secs` of wall time and `cpu` of CPU, its run ending at load `load` on 20
         cores, with no PSI pressure at either end."""
-        def execute(argv, cwd, env, cap, log, stdin=None, keep=()):
+        def execute(argv, cwd, env, cap, log, stdin=None, keep=(), mem=""):
             for fd in keep:
                 os.write(fd, S.STARTED)
                 os.close(fd)
-            return 1, secs, cpu, False
+            return 1, secs, cpu, False, 0
         with mock.patch.object(RUN, "execute", execute), mock.patch.object(A, "loaded", return_value=False), \
                 mock.patch("os.getloadavg", return_value=(load, load, load)), \
                 mock.patch("os.cpu_count", return_value=20):
@@ -904,6 +912,44 @@ class Tree(Env):
 
     def test_a_run_that_kept_its_cpu_under_load_is_not_loaded(self):
         self.assertFalse(self.starved_run(800.0, 774.0, 32.7))
+
+
+class Peak(Env):
+    def test_a_box_run_keeps_its_peak_and_is_admitted_by_it(self):
+        seen = []
+        real = A.slot
+        with mock.patch.object(A, "slot", lambda *a, **k: seen.append(k["need"]) or real(*a, **k)):
+            self.assertEqual(self.run_(chk(name="voice", run="echo 0 failed", klass=T.HOST)).status, T.PASSED)
+            self.assertEqual(self.run_(chk(name="voice", run="echo 0 failed", klass=T.HOST)).status, T.PASSED)
+        self.assertIsNone(seen[0])                       # no peak yet: CHECK_MEM
+        self.assertEqual(seen[1], A.peak(self.state, self.repo, "voice"))
+        self.assertGreater(seen[1], 0)
+
+    def test_a_fast_red_records_no_peak(self):
+        # review of #1962: a voice gate dying on an import error at ~30M must not let the next heavy runs reserve 30M
+        self.assertEqual(self.run_(chk(name="voice", run="exit 1", klass=T.HOST)).status, T.FAILED)
+        self.assertIsNone(A.peak(self.state, self.repo, "voice"))
+
+    def test_a_capped_run_records_no_peak(self):
+        # a run stopped at its cap died before its peak, even when its exit code says 0
+        with mock.patch.object(RUN, "execute", return_value=(0, 1.0, 1.0, True, 30 << 20)):
+            self.run_(chk(name="voice", run="echo 0 failed", klass=T.HOST))
+        self.assertIsNone(A.peak(self.state, self.repo, "voice"))
+
+    def test_a_scoped_run_counts_its_scopes_memory_peak(self):
+        # ru_maxrss is the largest process only; the scope's memory.peak is the whole tree's
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        mem, log = os.path.join(d, "memory.peak"), os.path.join(d, "log")
+        with open(mem, "w") as f:
+            f.write(str(5 << 30))
+        rc, _, _, _, peak = RUN.execute(["true"], d, os.environ.copy(), 30, log, mem=mem)
+        self.assertEqual((rc, peak), (0, 5 << 30))
+        rc, _, _, _, peak = RUN.execute(["true"], d, os.environ.copy(), 30, log, mem=os.path.join(d, "gone"))
+        self.assertTrue(0 < peak < 5 << 30)              # no scope file: ru_maxrss
+        self.assertEqual(A.scope_peak(["systemd-run", "--unit=lander-x-1", "--", "true"]),
+                         os.path.join(A.SLICE_DIR, "lander-x-1.scope", "memory.peak"))
+        self.assertEqual(A.scope_peak(["true"]), "")
 
 
 class Pinned(Env):
@@ -1917,7 +1963,13 @@ class Admission(unittest.TestCase):
             p = mock.patch.object(A, k, v)
             p.start()
             self.addCleanup(p.stop)
-        p = mock.patch.object(A, "SLICE_HIGH", "infinity")   # nor the host's lander.slice
+        land = tempfile.mkdtemp()   # an unread signal's queue.log line lands here, never in the box's
+        self.addCleanup(shutil.rmtree, land)
+        for k, v in (("SLICE_HIGH", "infinity"), ("SLICE_DIR", os.path.join(land, "no-slice"))):   # nor the host's
+            p = mock.patch.object(A, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.dict(os.environ, {"CC_LANDER_STATE": land})
         p.start()
         self.addCleanup(p.stop)
 
@@ -2051,10 +2103,17 @@ class Admission(unittest.TestCase):
             lines = [line for line in err.getvalue().splitlines() if said in line]
             self.assertEqual(len(lines), 1, (k, v, err.getvalue()))
             self.assertIn("counts as calm", lines[0])
+            # a lane started detached has its stderr on /dev/null, so queue.log carries it too, once
+            with open(os.path.join(os.environ["CC_LANDER_STATE"], "queue.log")) as f:
+                logged = [line for line in f if said in line]
+            self.assertEqual(len(logged), 1, (k, v, logged))
+            self.assertIn("\tunread lander ", logged[0])
+            os.unlink(f.name)
         err = io.StringIO()
-        with mock.patch.object(A, "_dead", set()), contextlib.redirect_stderr(err):
+        with mock.patch.object(A, "_dead", set()), mock.patch.object(A, "MEM_FLOOR", "infinity"), \
+                contextlib.redirect_stderr(err):
             A.slots_now(calm, 3, self.calm_load)
-        self.assertEqual(err.getvalue(), "")   # every signal reads: nothing said
+        self.assertEqual(err.getvalue(), "")   # every signal reads, and a floor of `infinity` is no floor: nothing said
 
     def meminfo(self, kb, avail=None):
         fd, path = tempfile.mkstemp()
@@ -2120,32 +2179,74 @@ class Admission(unittest.TestCase):
                 self.assertIsNone(A.config_slots())
                 self.assertEqual(A.slots(now=2000.0), 4)
 
-    def test_k_is_no_more_than_lander_slice_holds(self):
-        # 2026-10-25: the tower's K of 5 counted its 30 GB at 6G a check, and ~1.4G checks thrashed the slice's 6G
+    def test_lander_slice_admits_by_the_memory_checks_use(self):
+        # 2026-10-25: the tower's K of 8 (LANDER_SLOTS in its ~/.cc/config) let seven ~1.4G dispatch checks run
+        # together and thrash the slice's 6G for 33 min; a fixed 1536M a check then held fast gates to 4 slots too
         st = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, st)
         quiet = dict(psi_root=self.psi_dir(0, 0), loadavg=self.calm_load, poll=0.05, say=lambda _: None)
+        sl = os.path.join(st, "lander.slice")
+        os.makedirs(sl)
 
-        def admits(high, cfg=None):
-            with mock.patch.object(A, "_read", (None, 0.0)), mock.patch.object(A, "SLOTS", None), \
-                    mock.patch.object(A, "host_slots", lambda *a, **k: 5), \
-                    mock.patch.object(A, "config_slots", lambda *a, **k: cfg), \
-                    mock.patch.object(A, "CHECK_MEM", "1536M"), mock.patch.object(A, "SLICE_HIGH", high), \
-                    contextlib.ExitStack() as held:
+        def admits(high, need=None, stat=None):
+            with open(os.path.join(sl, "memory.stat"), "w") as f:
+                f.write(stat if stat is not None else "anon 0\nfile 9999999999\n")   # page cache does not count
+            with mock.patch.object(A, "CHECK_MEM", "1536M"), mock.patch.object(A, "SLICE_HIGH", high), \
+                    mock.patch.object(A, "SLICE_DIR", sl), contextlib.ExitStack() as held:
                 n = 0
                 while n < 9:
                     try:
-                        held.enter_context(A.slot(st, deadline=0.3, **quiet))
+                        held.enter_context(A.slot(st, k=8, deadline=0.3, need=need, **quiet))
                     except TimeoutError:
                         break
                     n += 1
                 return n
 
-        self.assertEqual(admits("6G"), 4)              # the fifth waits: 6G holds four checks of 1.5G
-        self.assertEqual(admits("6G", cfg=7), 4)       # a LANDER_SLOTS past the slice counts as what it holds
-        self.assertEqual(admits("1G"), 1)              # never 0
-        self.assertEqual(admits("infinity"), 5)        # no ceiling: the host's K
-        self.assertEqual(admits(""), 5)                # a systemctl that did not answer leaves K alone
+        self.assertEqual(admits("6G"), 4)                         # no peak recorded: 1536M each, so the fifth waits
+        self.assertEqual(admits("6G", need=1400 << 20), 4)        # dispatch's ~1.4G checks: four, never seven
+        self.assertEqual(admits("6G", need=100 << 20), 8)         # a fast gate's own peak: all eight slots
+        self.assertEqual(admits("6G", need=100 << 20, stat=f"anon {(6 << 30) - (50 << 20)}\n"), 1)   # what the
+        # slice holds now (an express run, a peak under-counted) leaves room for one, and never 0
+        self.assertEqual(admits("1G"), 1)                         # never 0
+        self.assertEqual(admits("infinity"), 8)                   # no ceiling: K
+        err = io.StringIO()
+        with mock.patch.object(A, "_dead", set()), contextlib.redirect_stderr(err):
+            self.assertEqual(admits("6G", stat="no anon line\n"), 4)   # unread: the reservations alone, said once
+            self.assertEqual(admits(""), 8)                       # a systemctl that did not answer: no bound, said
+        self.assertEqual(len(err.getvalue().splitlines()), 2, err.getvalue())
+        self.assertIn("memory.stat anon does not read, so only what running checks reserved counts", err.getvalue())
+        self.assertIn("MemoryHigh ('') does not read, so no memory bound holds a check", err.getvalue())
+
+    def test_a_systemctl_that_fails_or_hangs_on_the_slice_is_said(self):
+        for boom in (OSError("no systemctl"), subprocess.TimeoutExpired(["systemctl"], 10)):
+            err = io.StringIO()
+            with mock.patch.object(A, "SLICE_HIGH", None), mock.patch.object(A, "_high", ("", None)), \
+                    mock.patch.object(A, "_dead", set()), mock.patch.object(A.subprocess, "run", side_effect=boom), \
+                    contextlib.redirect_stderr(err):
+                self.assertIsNone(A.slice_high())
+            self.assertIn("MemoryHigh ('') does not read, so no memory bound holds a check", err.getvalue(), boom)
+        err = io.StringIO()
+        ok = subprocess.CompletedProcess([], 0, "infinity\n", "")
+        with mock.patch.object(A, "SLICE_HIGH", None), mock.patch.object(A, "_high", ("", None)), \
+                mock.patch.object(A, "_dead", set()), mock.patch.object(A.subprocess, "run", return_value=ok), \
+                contextlib.redirect_stderr(err):
+            self.assertIsNone(A.slice_high())
+        self.assertEqual(err.getvalue(), "")   # no MemoryHigh is no bound, not a dead signal
+
+    def test_a_checks_peak_is_kept_for_its_next_admission(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        self.assertIsNone(A.peak(st, "/r/dispatch", "voice gate"))
+        A.record(st, "/r/dispatch", "voice gate", 0)             # a peak that did not measure keeps nothing
+        self.assertIsNone(A.peak(st, "/r/dispatch", "voice gate"))
+        A.record(st, "/r/dispatch", "voice gate", 1400 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # the largest peak, not the last run's
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 1400 << 20)
+        self.assertIsNone(A.peak(st, "/r/other", "voice gate"))  # another repo's check of the same name is its own
+        os.makedirs(os.path.dirname(A._peak_path(st, "/r/other", "voice gate")))
+        with open(A._peak_path(st, "/r/other", "voice gate"), "w") as f:
+            f.write("-5")                                        # a stored peak at or below 0 is no peak: CHECK_MEM
+        self.assertIsNone(A.peak(st, "/r/other", "voice gate"))
 
     def test_alone_waits_for_a_slot_past_its_own_k(self):
         # brief: "an 'alone' re-run ... runs beside checks on slots 4-8" when K rose 3 to 8 under it

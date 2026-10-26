@@ -5,11 +5,19 @@ it (the environment, then ~/.cc/config) when that is a whole number of at least 
 per CORES_PER_SLOT (2) cores, and no more than MemTotal holds of LANDER_MEM_MAX, the most one check may use (on
 2026-10-12 a box of 20 cores and 30 GB ran 3, at load ~9 with PRs and green runs queued for a slot; it now runs 5,
 which its memory bounds, and the old box's 6 cores still run 3). Never below 1, and a LANDER_SLOTS above the box's
-cores counts as its cores. Every check's scope shares lander.slice (SCOPES), so K is also never more than its MemoryHigh
-holds of CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a check's peak), whichever way K was set: on 2026-10-25 the
-tower's K of 5 counted its 30 GB at 6G a check, and seven ~1.4G dispatch checks running together thrashed
-the slice's 6G for 33 min and dragged the tower into memory pressure. A slice with no MemoryHigh, or a systemctl that
-does not answer, leaves K alone. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
+cores counts as its cores. MEMORY: every check's scope shares lander.slice (SCOPES), so a check also waits until
+the slice has room for it: the memory its running checks hold (memory.stat `anon`, so page cache the kernel can drop
+does not count) or, when that is more, what they reserved, plus this check's own need, within the slice's MemoryHigh.
+A check's need is the largest peak a green run of it reached (run.py records its scope cgroup's memory.peak, or
+wait4's ru_maxrss, the largest process alone, with no scope, in `<state>/slots/peak/<repo>/<check>`; a red or capped
+run may have died before its peak, so it records nothing), and CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a
+heavy check's peak) until it has one; the holder of a slot writes
+its need in the slot's file, which is what it reserved. A slice whose memory.stat does not read counts reservations
+alone, so with no peak recorded the slice holds MemoryHigh / CHECK_MEM checks. A slice with no MemoryHigh, or a
+systemctl that does not answer, sets no memory bound, and a check always runs when no slot is held. On 2026-10-25
+the tower's K of 8, LANDER_SLOTS in its ~/.cc/config, let seven ~1.4G dispatch checks run together, and they
+thrashed the slice's 6G for 33 min and dragged the tower into memory pressure; a fixed 1536M for every check then held
+fast gates to the same 4 slots. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
 value without a restart; a cc-config that does not answer counts as unset. The backoff below applies to K either
 way. The box's load is
 mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead, and
@@ -24,14 +32,16 @@ units or SSH sessions, so a shortage of the whole box is read too, by short(): S
 LANDER_PSI_DIR) memory `full avg10` at or above PSI_FULL (LANDER_PSI_FULL, default 10), or /proc/meminfo's MemAvailable
 below MEM_FLOOR (LANDER_MEM_FLOOR, default 2G). `full` counts only while every task stalls at once, so one capped
 tenant's own stall stays out of it. An unreadable file counts as calm, the same as PSI_DIR's, and says so once per
-process on stderr (_unread), since a dead signal otherwise looks like a calm box. When memory `some avg10`
+process on stderr and in queue.log (_unread), since a dead signal otherwise looks like a calm box, and a lane started
+detached sends its stderr to /dev/null. A LANDER_MEM_FLOOR of `infinity` sets no floor. When memory `some avg10`
 reaches PSI_MEM (default 20) or short() says so, the box is mem_loaded(); when it is, or cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
 PSI or the load average only slots 1-2 admit; under memory pressure only slot 1, because parallel checks have run the
 box out of memory. Never 0: a check always gets to run, only later. An EXPRESS run (the lane's Δ rerun of a
 mergeable job's short check; each lane runs at most lane.EXPRESS_SLOTS of them at once, so the box runs that many per
-lane, and none while mem_loaded()) takes no slot and no ticket. A diagnostic rerun takes every
+lane, and none while mem_loaded()) takes no slot and no ticket, so it reserves no memory either, though what it
+holds counts in the slice's `anon` (MEMORY). A diagnostic rerun takes every
 slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
 SETTLE (dispatch, 10-24/25: under another user's load the box's checks ran slow, five alone reruns queued, the
@@ -131,6 +141,7 @@ import sys
 import time
 import uuid
 
+from lander import events as E
 from lander import types as T
 
 SLOTS: int | None = None   # a fixed K for a caller that sets it (cc-replay --slots); None: slots() works it out
@@ -144,8 +155,10 @@ LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 MEM_FLOOR = os.environ.get("LANDER_MEM_FLOOR", "2G")
-CHECK_MEM = os.environ.get("LANDER_CHECK_MEM", "1536M")
+CHECK_MEM = os.environ.get("LANDER_CHECK_MEM", "1536M")   # a check's need until its own peak is recorded
 SLICE_HIGH: str | None = None   # lander.slice's MemoryHigh for a test to fix; None: systemctl says it
+SLICE_DIR = os.environ.get("LANDER_SLICE_DIR") or \
+    f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/lander.slice"
 CPU_WEIGHT = "20"
 LOAD_FACTOR = float(os.environ.get("LANDER_LOAD_FACTOR", "2") or 2)
 
@@ -196,14 +209,16 @@ def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
 _dead: set = set()   # the signals _unread() has already told of in this process
 
 
-def _unread(what: str) -> None:
-    """Say once per process, on stderr (the lander's log), that a signal would not read or parse and so counts as
-    calm: a dead signal looks like a calm box, so a broken read must leave a trace."""
+def _unread(what: str, so: str = "it counts as calm") -> None:
+    """Say once per process, on stderr (the lander's log) and in queue.log, that a signal would not read or parse and
+    so what it counts as: a dead signal looks like a calm box, so a broken read must leave a trace, and a lane started
+    detached has its stderr on /dev/null."""
     if what in _dead:
         return
     _dead.add(what)
     with contextlib.suppress(OSError, ValueError):   # a gone or closed stderr
-        print(f"lander: {what} does not read, so it counts as calm", file=sys.stderr, flush=True)
+        print(f"lander: {what} does not read, so {so}", file=sys.stderr, flush=True)
+    E.line(f"unread lander {what} does not read, so {so}")
 
 
 def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
@@ -212,7 +227,7 @@ def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
     if full >= PSI_FULL:
         return f"box-wide memory pressure (PSI full) at {full:.0f}"
     floor = _bytes(MEM_FLOOR)
-    if floor is None:
+    if floor is None and MEM_FLOOR.strip().lower() != "infinity":
         _unread(f"LANDER_MEM_FLOOR={MEM_FLOOR!r}")
     if avail is not None and avail < (floor or 0):
         return f"box-wide memory short, {avail >> 20} MiB available"
@@ -293,27 +308,115 @@ def config_slots(name: str = "LANDER_SLOTS") -> int | None:
     return cores if len(n) > 9 else min(int(n), cores)
 
 
-def slice_slots() -> int | None:
-    """How many checks of CHECK_MEM lander.slice's MemoryHigh holds, at least 1; None when it has none or will not
-    read."""
-    high = SLICE_HIGH
-    if high is None:
+_high: tuple = ("", None)   # (MemoryHigh as systemctl said it, when): asked once per CONFIG_TTL, as cc-config is
+
+
+def slice_high(now: float | None = None) -> int | None:
+    """lander.slice's MemoryHigh in bytes; None when it has none (`infinity`) or does not read, which _unread says."""
+    global _high
+    now = time.monotonic() if now is None else now
+    high, at = _high
+    if SLICE_HIGH is None and (at is None or now - at >= CONFIG_TTL):
         try:
             high = subprocess.run(["systemctl", "--user", "show", "-p", "MemoryHigh", "--value", "lander.slice"],
-                                  capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL).stdout
+                                  capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL).stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
-            return None
-    cap, each = _bytes(high), _bytes(CHECK_MEM)
-    return max(1, cap // each) if cap and each else None
+            high = ""
+        _high = (high, now)
+    high = high if SLICE_HIGH is None else SLICE_HIGH
+    n = _bytes(high)
+    if n is None and high.strip().lower() != "infinity":
+        _unread(f"lander.slice's MemoryHigh ({high!r})", "no memory bound holds a check")
+    return n
+
+
+def slice_used() -> int | None:
+    """The memory lander.slice's checks hold now, memory.stat's `anon` (page cache the kernel can drop does not
+    count); 0 while the slice is not running; None when it does not read, which _unread says."""
+    if not os.path.isdir(SLICE_DIR):
+        return 0
+    path = os.path.join(SLICE_DIR, "memory.stat")
+    try:
+        with open(path) as f:
+            return next(int(line.split()[1]) for line in f if line.startswith("anon "))
+    except (OSError, ValueError, IndexError, StopIteration):
+        _unread(f"{path} anon", "only what running checks reserved counts")
+        return None
+
+
+def _peak_path(state: str, repo: str, name: str) -> str:
+    safe = lambda v: re.sub(r"[^A-Za-z0-9._-]", "-", v)[:120]
+    return os.path.join(state, "slots", "peak", safe(os.path.basename(os.path.realpath(repo))), safe(name))
+
+
+def peak(state: str, repo: str, name: str) -> int | None:
+    """The largest peak memory a green run of `repo`'s check `name` reached, in bytes; None when none is recorded."""
+    with contextlib.suppress(OSError, ValueError):
+        with open(_peak_path(state, repo, name)) as f:
+            n = int(f.read())
+        return n if n > 0 else None
+    return None
+
+
+def record(state: str, repo: str, name: str, n: int) -> None:
+    """Keep `n` bytes as `repo`'s check `name`'s need next time when it is the largest yet (MEMORY); the caller
+    records only a green run's, and nothing comes of a peak that did not measure."""
+    if n <= (peak(state, repo, name) or 0):
+        return
+    p = _peak_path(state, repo, name)
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = f"{p}.{uuid.uuid4().hex[:8]}"
+        with open(tmp, "w") as f:
+            f.write(str(n))
+        os.replace(tmp, p)
+
+
+def scope_peak(argv: list) -> str:
+    """The memory.peak file of the scope wrap() put argv in; "" for a run with no scope."""
+    unit = next((a[len("--unit="):] for a in argv if a.startswith("--unit=")), "")
+    return os.path.join(SLICE_DIR, f"{unit}.scope", "memory.peak") if unit else ""
+
+
+def _held(d: str) -> tuple:
+    """(how many slots are held, the memory their holders reserved): each held slot's file names its holder's need,
+    and one that does not (written a moment from now, or by a release before MEMORY) counts as CHECK_MEM."""
+    n = reserved = 0
+    for name in os.listdir(d):
+        if not re.fullmatch(r"slot\.[0-9]+", name):
+            continue
+        with open(os.path.join(d, name), "a+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                continue   # nobody holds it
+            except OSError:
+                pass
+            f.seek(0)
+            n += 1
+            reserved += _bytes(f.read()) or _bytes(CHECK_MEM) or 0
+    return n, reserved
+
+
+def room(d: str, need: int) -> str:
+    """"" when a check that needs `need` bytes fits in lander.slice now (MEMORY), else what it waits for. Always ""
+    while no slot is held, so a check always gets to run."""
+    high = slice_high()
+    if high is None:
+        return ""
+    n, reserved = _held(d)
+    # brief: "weighs the slice's live memory.current plus each check's recorded peak", with `anon` for current
+    used = max(slice_used() or 0, reserved)
+    if not n or used + need <= high:
+        return ""
+    return f"room in lander.slice ({used >> 20} of {high >> 20} MiB held, {need >> 20} MiB wanted)"
 
 
 _read: tuple = (None, 0.0)   # (K, when): config_slots() spawns cc-config, and slot() asks every poll (2 s)
 
 
 def slots(now: float | None = None) -> int:
-    """K before any backoff: SLOTS when a caller fixed it, else LANDER_SLOTS from cc-config, else host_slots(), no more
-    than slice_slots(), read again once CONFIG_TTL seconds have passed, so a running lane follows a change without a
-    restart."""
+    """K before any backoff: SLOTS when a caller fixed it, else LANDER_SLOTS from cc-config, else host_slots(), read
+    again once CONFIG_TTL seconds have passed, so a running lane follows a change without a restart."""
     global _read
     if SLOTS:
         return max(1, SLOTS)
@@ -321,7 +424,6 @@ def slots(now: float | None = None) -> int:
     k, at = _read
     if k is None or now - at >= CONFIG_TTL:
         k = config_slots() or host_slots()
-        k = min(k, slice_slots() or k)
         _read = (k, now)
     return k
 
@@ -489,13 +591,15 @@ def _whose(name: str) -> str:
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
          k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False,
-         first=False, settle: float | None = None, stop=None):
+         first=False, settle: float | None = None, stop=None, need: int | None = None):
     """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
     in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
     on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST).
     first=True (or a callable that says so, asked each poll): main health's or a main-red fix's check; FRONT: one of a
     job put first (FIRST CLAIM). stop: a callable; True leaves the wait with TimeoutError (STOP). settle (seconds): an
-    alone wait that has not got every slot by then waits for one slot instead, in the same place in the queue (SETTLE)."""
+    alone wait that has not got every slot by then waits for one slot instead, in the same place in the queue (SETTLE).
+    need (bytes): the check's recorded peak, None for CHECK_MEM; a slot is taken only while lander.slice has room for
+    it (MEMORY)."""
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
@@ -505,6 +609,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     held: list = []
     gate = None   # the ALONE GATE: exclusive for an alone run, shared beside another's slot
     told: set = set()
+    need = need or _bytes(CHECK_MEM) or 0
     ask = first if callable(first) else lambda: first
     firsted = ask()
     mine, tf = _ticket(q, lane, firsted)
@@ -540,7 +645,8 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     say(line)
             if alone and not ahead and gate is None:
                 gate = _gate(d, fcntl.LOCK_EX)   # none while any check holds a slot, whatever K it counted
-            for n in want if not ahead and (gate or not alone) else ():   # only the oldest waiter takes a slot
+            short_of = room(d, need) if not alone and not ahead else ""   # an alone run has the slice to itself
+            for n in want if not ahead and not short_of and (gate or not alone) else ():   # only the oldest takes one
                 if n in [h for h, _ in held]:
                     continue
                 f = open(os.path.join(d, f"slot.{n}"), "a")
@@ -556,6 +662,9 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     if gate is None:   # an alone run holds the box
                         f.close()
                         break
+                    os.ftruncate(f.fileno(), 0)   # what it reserved, for the next waiter's room()
+                    f.write(str(need))
+                    f.flush()
                 held.append((n, f))
                 if not alone:
                     break
@@ -566,7 +675,8 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             if said is None or time.monotonic() - said >= WAIT_SAY:
                 said = time.monotonic()
                 what = (f"all {total} slots (alone)" if alone
-                        else f"one of slots 1-{len(want)} (load admits {len(want)} of {total})")
+                        else f"one of slots 1-{len(want)} (load admits {len(want)} of {total})"
+                        + (f" and {short_of}" if short_of else ""))
                 line = (f"lander: {who or 'a check'} waiting since {since} ({(said - t0) / 60:.0f} min) for {what}; "
                         f"{ahead} waiting ahead of it" + (f", the oldest {_whose(oldest)}" if oldest else "")
                         + (f", holding {[h for h, _ in held]}" if held else ""))
@@ -611,9 +721,11 @@ def _gate(d: str, how: int):
     return f
 
 
-def free(state: str, psi_root: str = PSI_DIR, k: int | None = None, loadavg: str | None = None) -> int:
+def free(state: str, psi_root: str = PSI_DIR, k: int | None = None, loadavg: str | None = None,
+         need: int | None = None) -> int:
     """How many of slots_now()'s slots a check would take now without waiting: each one nobody holds, and none while
-    a ticket waits in the queue (it goes first, FAIR WAIT) or an alone run holds the gate. It only looks: a slot is
+    a ticket waits in the queue (it goes first, FAIR WAIT), an alone run holds the gate or lander.slice has no room
+    for a check of `need` bytes (MEMORY; None: CHECK_MEM). It only looks: a slot is
     flocked for the instant it takes to see it is free. run.spill() asks it, so a check that would wait here goes to
     a runner instead."""
     d = os.path.join(state, "slots")
@@ -621,6 +733,8 @@ def free(state: str, psi_root: str = PSI_DIR, k: int | None = None, loadavg: str
         return slots_now(psi_root, k, loadavg)
     q = os.path.join(d, "queue")
     if os.path.isdir(q) and _ahead(q, "~")[0]:   # "~" sorts after every ticket's name, so each live one counts
+        return 0
+    if room(d, need or _bytes(CHECK_MEM) or 0):
         return 0
     gate = _gate(d, fcntl.LOCK_SH)
     if gate is None:
