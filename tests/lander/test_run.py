@@ -1360,6 +1360,29 @@ class HostAndRunners(Env):
             r = self.run_(chk(run=probe, klass=T.HOST))
         self.assertEqual((r.status, r.runner.split(":")[1]), (T.PASSED, "host"), r.extra)
 
+    def test_a_run_says_when_it_began_and_once_its_process_started_and_a_stopped_one_starts_nothing(self):
+        # NOSTART: the lane reads beat["since"] (when the current run began, 0 once its process started)
+        beat, seen, real = {}, [], A.slot
+        RUN._STOP.beat = beat
+        self.addCleanup(setattr, RUN._STOP, "beat", None)
+
+        def slot(*a, **kw):
+            seen.append(beat.get("since"))
+            return real(*a, **kw)
+
+        with mock.patch.object(A, "slot", slot):
+            r = self.run_(chk(klass=T.HOST))
+        self.assertEqual((r.status, beat["since"]), (T.PASSED, 0), r.extra)
+        self.assertGreater(seen[0], 0)
+        stop = threading.Event()
+        stop.set()
+        RUN._STOP.event = stop
+        self.addCleanup(setattr, RUN._STOP, "event", None)
+        r = self.run_(chk(klass=T.HOST))
+        self.assertEqual(r.status, T.UNRUNNABLE)
+        self.assertIn("stopped while it waited for a lander slot", r.extra["why"])
+        self.assertGreater(beat["since"], 0)   # it never started
+
     def test_an_express_run_takes_no_slot_and_a_lone_one_takes_them_all(self):
         # the lane's EXPRESS bounds its own runs; a diagnostic rerun alone still runs by itself
         calls, real = [], A.slot
@@ -2516,6 +2539,74 @@ class Admission(unittest.TestCase):
                 pass
         self.assertIn("1 waiting ahead of it, the oldest pid 4545", said[0])
         self.assertLess(A.FIRST_BACK, 3600)
+
+    def test_a_wait_put_first_meanwhile_moves_up_and_keeps_the_older_place(self):
+        # dispatch #2026, 10-25: put first while its check waited for a slot, it kept its ordinary ticket for 5 h
+        for age in (120, 2 * 3600):   # a lane's waiter 2 min in, and one 2 h in: past FIRST_BACK, a first claim is not
+            st = self.lanes_first_queue(f"+{time.time_ns() - age * 10**9:019d}-4242-0000beef")   # enough to pass it
+            asked = []
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=2, say=lambda _: None, lane=True,
+                        first=lambda: A.FRONT if len(asked) > 3 or asked.append(1) else False) as held:   # 4th poll
+                self.assertEqual(held, [1])
+            self.assertEqual(len(asked), 4)   # it waited behind the older lane ticket until then
+        q = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(q))
+        name, f = A._ticket(q, lane=True, first=True, born=1000 * 10**9)   # waited longer than FIRST_BACK already
+        f.close()
+        self.assertEqual(A._born(name), 1000)
+
+    def test_a_put_first_check_goes_ahead_of_older_waiters_and_behind_a_prove_hold(self):
+        # #1960 review: FIRST_BACK (50 min) put a put-first check behind every lane check that had waited longer
+        now = time.time_ns()
+        st = self.lanes_first_queue(f"+{now - 2 * 3600 * 10**9:019d}-4242-0000beef")   # a lane's check, 2 h in
+        q = os.path.join(st, "slots", "queue")
+        said = []   # suppressed: a main-red fix's first claim stays behind it
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append, lane=True,
+                        first=True):
+                pass
+        self.assertIn("1 waiting ahead of it, the oldest pid 4242", said[0])
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True,
+                    first=A.FRONT) as held:   # kept: a put-first one goes ahead
+            self.assertEqual(held, [1])
+        # a PROVE HOLD named 100 s back (one ns before the youngest lane ticket then) by a running lander-self
+        holder = subprocess.Popen(["bash", "-c", "exec -a lander-self sleep 30"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        for _ in range(100):
+            with open(f"/proc/{holder.pid}/cmdline", "rb") as f:
+                if f.read().startswith(b"lander-self"):
+                    break
+            time.sleep(0.02)
+        hold = f"+{now - 100 * 10**9:019d}-{holder.pid}-0000a0a0"
+        h = open(os.path.join(q, hold), "a")
+        fcntl.flock(h, fcntl.LOCK_EX)
+        self.addCleanup(h.close)
+        self.assertEqual(A._hold(q), now - 100 * 10**9)
+        name, f = A._ticket(q, lane=True, first=A.FRONT)
+        f.close()
+        self.assertGreater(name, hold)   # behind the hold, though FIRST_BACK and the 2 h waiter are older
+
+    def test_a_live_slot_wait_keeps_the_lanes_beat(self):
+        # #1960 review: NOSTART stopped a check that had waited 2 h in the slot queue, a live wait, not a stuck one
+        beat = {"since": time.time() - 3 * 3600}
+        RUN._STOP.beat = beat
+        self.addCleanup(setattr, RUN._STOP, "beat", None)
+        st = self.lanes_first_queue(f"+{time.time_ns() - 120 * 10**9:019d}-4242-0000beef")
+        with self.assertRaises(TimeoutError):   # its deadline, not a stop
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=lambda _: None,
+                        lane=True, stop=RUN._waiting):
+                pass
+        self.assertGreater(beat["since"], time.time() - 60)
+
+    def test_a_stopped_wait_leaves_the_queue(self):
+        # NOSTART: the lane stops a check that has not started; its wait ends at once and gives up its ticket
+        st = self.lanes_first_queue(f"+{time.time_ns() - 120 * 10**9:019d}-4242-0000beef")
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, say=lambda _: None, lane=True,
+                        stop=lambda: True):
+                pass
+        self.assertEqual(len(os.listdir(os.path.join(st, "slots", "queue"))), 1)
 
     def test_a_stopped_waiter_is_passed_after_the_cap_and_said(self):
         st = tempfile.mkdtemp()

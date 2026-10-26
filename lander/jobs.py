@@ -57,8 +57,10 @@ verdict comes only from the lane's own review or from PR markers the box's login
   first     <LANDQ>/first/<repo>-<pr>.json {by, at} — `lander queue --first` put the PR at the front of its lane
             (put_first/first). Never a request field, for the same reason as an approval. lane_jobs lists a job
             with one before every other, oldest `at` first. It is good for one landing: the job's move to a resting
-            state (merged, closed, handed back, a query) and its removal take it away (drop_first), so a PR closed
-            unmerged and queued again later waits its turn unless someone puts it first again.
+            state (merged, closed, handed back) and its removal take it away (drop_first), so a PR closed unmerged
+            and queued again later waits its turn unless someone puts it first again. A query keeps it, noting the
+            head it was queried at (`head`): perms' read or planning's answer sends the job back, and dispatch #2026
+            sat 7 h behind 8 older PRs when it did not. A new head read after the query drops it (lane queued).
 """
 from __future__ import annotations
 
@@ -317,7 +319,9 @@ def move(job: T.Job, state: str, why: str = "", defer: bool = False, **kv) -> T.
     job.state = state
     if not defer:
         save(job)
-    if state in RESTING:   # a put-first is good for one landing (jobs.first)
+    if state == T.QUERY and first(job.repo, job.pr) and job.head:   # a query is not a landing: kept, at this head
+        write_atomic(first_path(job.repo, job.pr), {**first(job.repo, job.pr), "head": job.head})
+    elif state in RESTING and state != T.QUERY:   # a put-first is good for one landing (first)
         drop_first(job.repo, job.pr)
     if state == T.MERGED:   # its rebase rounds are over; a close keeps them, so a reopen does not buy more
         drop_repair(job.repo, job.pr)
@@ -654,10 +658,11 @@ def drop_first(repo: str, pr) -> None:
 
 
 def first(repo: str, pr) -> dict:
-    """{by, at} when (repo, pr) was put first, else {}."""
+    """{by, at} when (repo, pr) was put first, else {}; and head, the one it was queried at, once it was."""
     r = read_json(first_path(repo, pr))
     ok = isinstance(r, dict) and isinstance(r.get("by"), str) and E.epoch_of(r.get("at") or "")
-    return {"by": r["by"], "at": r["at"]} if ok else {}
+    head = {"head": r["head"]} if ok and isinstance(r.get("head"), str) else {}
+    return {"by": r["by"], "at": r["at"], **head} if ok else {}
 
 
 def arrival(job: T.Job) -> tuple:

@@ -361,7 +361,23 @@ def clean_env(extra: dict | None = None) -> dict:
     return env
 
 
-_STOP = threading.local()   # .event: run_plan's `cancel`, for every execute() on the thread that runs the plan
+_STOP = threading.local()   # .event: run_plan's `cancel`, for every execute() on the thread that runs the plan;
+                            # .beat: run_plan's `beat`, which _beat() keeps
+
+
+def _beat(since: float) -> None:
+    """beat["since"] = when the plan's current run began, before its tree and its process (0: its process started),
+    and again each poll of its slot wait (_waiting), so the lane sees a check that stops on the way (lane NOSTART)."""
+    b = getattr(_STOP, "beat", None)
+    if b is not None:
+        b["since"] = since
+
+
+def _waiting() -> bool:
+    """admission's stop, asked each poll of a slot wait: a live wait keeps the beat fresh, so the lane's NOSTART never
+    takes a check waiting its turn for one that never started; True when the lane has stopped the plan."""
+    _beat(time.time())
+    return stopped()
 
 
 def stopped() -> bool:
@@ -384,6 +400,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
                                  stdout=out, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
                                  preexec_fn=None, restore_signals=True)
+            _beat(0)
     finally:
         for fd in keep:
             os.close(fd)
@@ -814,7 +831,7 @@ def laptop_argv(check, tree, cwd, dest=""):
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
         label: str = "lander.0", changed: list | None = None, alone: bool = False, base_tree: str = "",
-        state: str | None = None, express: bool = False, lane: bool = False, first: bool = False,
+        state: str | None = None, express: bool = False, lane: bool = False, first=False,
         settle: float | None = None) -> T.Result:
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
@@ -822,9 +839,9 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen, as the check
     repo's refs/lander/base (materialise), and where a PINNED check's files come from for its second pass, which runs
     only when the head's own pass passed, in a head written out afresh (pinned_head), and whose red is the result. lane: a landing lane's run, whose slot ticket goes before a worker's
-    (admission). first: main health's or a main-red fix's run,
-    whose ticket goes ahead of every younger one (admission FIRST CLAIM). settle: an alone run's wait for every slot
-    before it runs beside others (admission SETTLE); None waits for every slot however long that takes."""
+    (admission). first: main health's, a main-red fix's or a put-first job's run (a callable from the lane, asked
+    while it waits), whose ticket goes ahead of every younger one (admission FIRST CLAIM). settle: an alone run's
+    wait for every slot before it runs beside others (admission SETTLE); None waits for every slot however long that takes."""
     t0 = time.monotonic()
 
     def res(st, why, **kw):
@@ -841,6 +858,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         return res(T.PASSED if ok else T.FAILED, "" if ok else "the head narrows the manifest", runner="builtin",
                    tail=text.splitlines()[-TAIL:])
     env_extra = {"CC_LAND_CHANGED": " ".join(changed)} if changed else {}
+    _beat(time.time())
     try:
         run_dir, head = materialise(repo_root, tree_sha, label, base_tree)
     except Unrunnable as e:
@@ -946,7 +964,8 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         k = A.slots() if alone else None
         held = contextlib.nullcontext() if free else A.slot(state or REC.state_dir(), alone=alone,
                                                             who=f"{check.name}@{tree_sha[:8]}", lane=lane,
-                                                            first=first, k=k, settle=settle if alone else None)
+                                                            first=first, k=k, settle=settle if alone else None,
+                                                            stop=_waiting)
         with held as got:
             settled = alone and got is not None and len(got) < k   # SETTLE: it waited out settle and ran beside others
             alone = alone and not settled
@@ -989,7 +1008,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
                         if st == T.FAILED else [],
                         extra={"why": why, "rc": rc, "loaded": loaded, "starved": thin, "alone": alone,
                                "tail": text.splitlines()[-TAIL:], **kept, **started})
-    except Unrunnable as e:
+    except (Unrunnable, TimeoutError) as e:   # TimeoutError: stopped while it waited for a slot (admission STOP)
         return T.Result(check=check.name, tree=tree_sha, status=T.UNRUNNABLE, secs=0.0, load=os.getloadavg()[0],
                         runner=f"{where}:{dest}:-" if dest else where, extra={"why": str(e), "not_sent": True})
     finally:
@@ -1234,26 +1253,27 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
              fallback: str = "", box_only: bool = False, runners: bool = False, cancel=None, express: bool = False,
-             lane: bool = False, caged: bool = False, main=None, first: bool = False) -> dict:
+             lane: bool = False, caged: bool = False, main=None, first=False, beat=None) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
     threading.Event the lane sets to stop the plan; every execute() on this thread polls it. express: the lane's
     EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all.
-    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). first=True from the lane for
-    a main-red fix: its box runs take the first claim on a slot (run's `first`). runners=True from the lane
+    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). first from the lane: a
+    callable, true for a main-red fix or a job put first, whose box runs take the first claim on a slot (run's
+    `first`). beat: a dict _beat() keeps for the lane (NOSTART). runners=True from the lane
     only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
     caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
     rest go where choose_where puts the lane's: one that may leave goes to a runner's cage while this box is full. main: {check: status} of main's own record on exactly base_tree (health.at), which
     judge() takes in place of a base run."""
-    _STOP.event = cancel
+    _STOP.event, _STOP.beat = cancel, beat
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
                          only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, runners=runners,
                          express=express, lane=lane, caged=caged, main=main or {}, first=first)
     finally:
-        _STOP.event = None
+        _STOP.event = _STOP.beat = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,

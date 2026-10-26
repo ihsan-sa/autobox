@@ -81,8 +81,16 @@ FIRST CLAIM (brief, 10-13: "give main health's checks and a main-red fix's check
 ordinary PR checks, so health can't starve"). slot(first=True) takes a lane-style ticket backdated FIRST_BACK seconds,
 so it goes ahead of every lane or worker ticket younger than FIRST_BACK and behind a PROVE HOLD, which lander-self
 names up to its HOLD_BACK (3600 s) back: FIRST_BACK stays below that. Its callers are tick.make_check (the tip run's and
-main health's checks) and the lane's checks of a job whose plan holds a check main's record holds red. It is still a
-TICKET, so TICKET_CAP and a dead holder treat it as any other.
+main health's checks) and the lane's checks of a job put first or whose plan holds a check main's record holds red.
+It is still a TICKET, so TICKET_CAP and a dead holder treat it as any other. The lane passes first as a callable, asked
+again each poll: a check already waiting when its job is put first takes a first ticket then, in place of its own
+(dispatch #2026, 10-25: put first while its check waited, it waited 5 h more), named the older of FIRST_BACK back and
+its own wait's start. A put-first job's says FRONT: its ticket is named one ns before every live one too, so it goes
+ahead of every waiter however long they have waited (FIRST_BACK alone did nothing for one past it), and never before
+a live PROVE HOLD's ticket (_hold: its pid is a lander-self's). A later first ticket is younger than a FRONT one.
+STOP: slot(stop=) is asked each poll too, and a waiter it says is stopped leaves the queue with TimeoutError, as one
+past its deadline does: the lane stops a check whose job moved on. run asks it to keep the lane's beat too, so a live
+wait is never taken for a check that has not started (lane NOSTART).
 
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
@@ -167,6 +175,7 @@ LOADAVG = os.environ.get("LANDER_LOADAVG") or "/proc/loadavg"
 WAIT_SAY = float(os.environ.get("LANDER_WAIT_SAY", "600") or 600)
 TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
 FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below lander-self's HOLD_BACK of 3600
+FRONT = "front"     # slot(first=) for a put-first job's check: ahead of every waiter, behind a PROVE HOLD (FIRST CLAIM)
 
 
 def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
@@ -330,12 +339,18 @@ TICKET = re.compile(r"[0-9+][0-9]{19}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: 
 BAD = (errno.ELOOP, errno.ENXIO, errno.EACCES, errno.EPERM)   # a symlink, a socket, an unreadable file: not a ticket
 
 
-def _ticket(qdir: str, lane: bool = False, first: bool = False):
+def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None = None):
     """Join the queue: a file named by when the wait began, flocked for as long as this process waits. It is locked
     before it is given its listed name, so nobody sees it unlocked and takes it for a dead one. A lane's name starts
     `+` (LANES FIRST), which sorts before a digit and still reads as the same number. first: a lane's name, its time
-    FIRST_BACK seconds back (FIRST CLAIM)."""
-    born = time.time_ns() - (FIRST_BACK * 10**9 if first else 0)
+    FIRST_BACK seconds back (FIRST CLAIM), or `born` (ns) when that is older; first=FRONT: one ns before the oldest
+    live ticket too, and never before a PROVE HOLD (_hold)."""
+    now = time.time_ns()
+    born = min(now - (FIRST_BACK * 10**9 if first else 0), born or now)
+    if first == FRONT:
+        oldest, hold = _ahead(qdir, "~")[1], _hold(qdir)
+        born = min(born, int(oldest.split("-")[0]) - 1) if oldest else born
+        born = max(born, hold + 1) if hold is not None else born
     name = f"{'+' if lane or first else '0'}{born:019d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     tmp = os.path.join(qdir, f".new-{name}")
     f = open(tmp, "a")
@@ -446,6 +461,19 @@ def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
     return n, oldest, stale
 
 
+def _hold(qdir: str) -> int | None:
+    """The time (ns) a live PROVE HOLD's ticket is named, the newest when there are more, else None: a ticket whose
+    pid is a running lander-self (it holds no slot wait of its own, so only its process says what it is)."""
+    born = None
+    for name in os.listdir(qdir):
+        if TICKET.fullmatch(name) and name.startswith("+"):
+            with contextlib.suppress(OSError):
+                with open(f"/proc/{name.split('-')[1]}/cmdline", "rb") as f:
+                    if b"lander-self" in f.read():
+                        born = max(born or 0, int(name.split("-")[0]))
+    return born
+
+
 def _born(name: str) -> float | None:
     """When a ticket's wait began, from its name (time_ns-pid-rand, maybe `.new-` before it), or None when the name
     is not one _ticket gives."""
@@ -461,12 +489,13 @@ def _whose(name: str) -> str:
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
          k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False,
-         first: bool = False, settle: float | None = None):
+         first=False, settle: float | None = None, stop=None):
     """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
     in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
     on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST).
-    first=True: main health's or a main-red fix's check (FIRST CLAIM). settle (seconds): an alone wait that has not
-    got every slot by then waits for one slot instead, in the same place in the queue (SETTLE)."""
+    first=True (or a callable that says so, asked each poll): main health's or a main-red fix's check; FRONT: one of a
+    job put first (FIRST CLAIM). stop: a callable; True leaves the wait with TimeoutError (STOP). settle (seconds): an
+    alone wait that has not got every slot by then waits for one slot instead, in the same place in the queue (SETTLE)."""
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
@@ -476,9 +505,20 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     held: list = []
     gate = None   # the ALONE GATE: exclusive for an alone run, shared beside another's slot
     told: set = set()
-    mine, tf = _ticket(q, lane, first)
+    ask = first if callable(first) else lambda: first
+    firsted = ask()
+    mine, tf = _ticket(q, lane, firsted)
     try:
         while True:
+            if stop is not None and stop():
+                raise TimeoutError("stopped while it waited for a lander slot")
+            if firsted != FRONT and ask() not in (firsted, False):   # put first while it waited: moved up, never back
+                firsted = ask()
+                new, nf = _ticket(q, lane, firsted, born=int(mine.split("-")[0]))
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(q, mine))
+                tf.close()
+                mine, tf = new, nf
             if alone and settle is not None and time.monotonic() - t0 >= settle:
                 alone = False   # SETTLE: what it holds goes back, and it takes one slot as load admits
                 for _, f in held:

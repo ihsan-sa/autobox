@@ -70,7 +70,14 @@ WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplann
 LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy, but a
 main-red fix (below).
 PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
-first; place() says who put it there.
+first; place() says who put it there. Its checks take a FRONT slot ticket, ahead of every waiter's, and one already
+waiting for a slot when it is put first moves up then (admission FIRST CLAIM; dispatch #2026, 10-25: put first, its
+check sat 5 h in the slot queue). A new head after a query drops the put-first (queued; perms-c9, 10-26).
+NOSTART (dispatch #2026, 10-25: a check's gate dir sat 5 h with nothing run in it while the lane checked later PRs): a
+check whose current run has not started its process LANDER_NOSTART seconds (default 7200) after it began, a live wait
+for a slot aside (run keeps the beat while it polls), is said in queue.log (`nostart`) and stopped, so one stopped
+before its slot comes back unrunnable and the job is held and tried again (took), its third time a query naming why.
+One stuck before that (its tree written out by a hung git) is only said: nothing there asks the stop.
 MAIN-RED FIX FIRST (brief, 10-13: "A PR whose plan includes a check that is red on main, and that is green on the PR,
 jumps the queue: it's checked and merged first"): after the jobs put first, a job whose plan holds a check main's
 record holds red (health.red, read once per pass; none in a member's lane) goes before every other, overdue or not;
@@ -315,6 +322,7 @@ RECHECK_SECS = float(os.environ.get("LANDER_RECHECK_SECS") or 300)   # a checkin
 CI_UNREADS = 4           # holds (HOLD_SECS each: an hour) at one head whose CI GitHub would not show, then a query
 CARDS_WAIT = 30          # seconds the lane's end waits for its queued cards (cards_pass); a slower Slack is left
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
+NOSTART = float(os.environ.get("LANDER_NOSTART") or 7200)   # a check not started this long after it began is stopped
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip", "repair": "repair"}
 
@@ -327,6 +335,8 @@ class Flight:
         self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
         self.stop = stop   # a threading.Event; set: run.execute kills the check (the job left this head)
         self.express = express   # a rerun's after main moved (EXPRESS): it counts against EXPRESS_SLOTS, not the box's slots
+        self.beat = {"since": time.time()}   # run._beat: when its current run began or last polled for a slot, 0 once
+                                             # its process started
 
 
 class Reading:
@@ -708,6 +718,7 @@ class Lane:
                     r.seen = True
                     tried.discard(k)
             self.reds = self.main_reds()
+            self.nostart()
             for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
                 # run out, (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
                 # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept, or
@@ -761,6 +772,15 @@ class Lane:
                 tried.discard(job.key)
             if (job.state, len(job.history), len(self.inflight)) != before:
                 self.wake(but=job.key)   # a job moved or took a slot: whatever waited on it looks again
+
+    def nostart(self):
+        """Stop each check whose current run has not started NOSTART seconds after it began; say so once."""
+        for (_, n), f in self.inflight.items():
+            since = f.beat.get("since") or 0
+            if since and time.time() - since >= NOSTART and not f.stop.is_set():
+                f.stop.set()
+                E.log("nostart", self.repo, f.pr, f"check {n} has not started in {(time.time() - since) / 60:.0f} min; "
+                                                  "stopped, and tried again after a hold", check=n)
 
     def wake(self, but=""):
         """The jobs waiting on a slot or a read look again."""
@@ -1199,6 +1219,8 @@ class Lane:
         with self.lock():
             got = self.fetch(base, branch)
             job.base_sha, job.head = got[base], got[branch]
+        if J.first(job.repo, job.pr).get("head") not in (None, job.head):   # put first, queried, then pushed (first)
+            J.drop_first(job.repo, job.pr)
         mr = job.extra.get("main_red")
         if isinstance(mr, dict) and (mr.get("base"), mr.get("head")) == (job.base_sha, job.head) \
                 and int(mr.get("waits") or 0) < MAIN_RED_WAITS:
@@ -1391,7 +1413,10 @@ class Lane:
             main = {} if self.member else HL.at(self.repo, base_tree)   # main's own record on this base (health.py)
             # brief, 10-13: "give main health's checks and a main-red fix's checks first claim on a free slot, ahead of
             # ordinary PR checks, so health can't starve": a job whose plan holds a check main is red on
-            fix = bool(set(job.plan.checks) & self.reds)
+            fix, repo, pr = bool(set(job.plan.checks) & self.reds), job.repo, job.pr
+
+            def first():   # asked by admission each poll: put first while it waits, the check moves up to the front
+                return A.FRONT if J.first(repo, pr) else fix
             for n in todo:
                 c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
                 express = n in fast and self.express_room()
@@ -1416,15 +1441,16 @@ class Lane:
                     continue   # no place of either kind for it now: tried again when a check finishes
                 self.placeless.discard(job.key)
                 stop = threading.Event()
+                flight = Flight(None, job.pr, n, job.head, job.base_sha, tree, laptop, stop, express)
                 fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
                                        base_tree, member=self.member, store=store, job_key=job.key,
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
                                        only=[n], fallback=self.fallback, cancel=stop, lane=True,
                                        **({"runners": True} if laptop else kw),
                                        **({"express": True} if express else {}), **({"main": main} if main else {}),
-                                       **({"first": True} if fix else {}))
-                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop,
-                                                     express)
+                                       first=first, beat=flight.beat)
+                flight.future = fut
+                self.inflight[(job.key, n)] = flight
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
             return None
         # a handback standing from an earlier head is read again even off the paid paths: #1064's security handback

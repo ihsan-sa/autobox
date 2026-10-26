@@ -303,7 +303,8 @@ class Runner:
         """lander.run.run_plan's shape: {name: Outcome}; a name in `missing` is one the manifest lacks."""
         from lander import run as RUN
         self.plan_kw.append((tuple(only or ()), kw.get("express", False), kw.get("lane", False)))
-        self.firsts.append((kw.get("pr"), tuple(only or ()), bool(kw.get("first"))))
+        first = kw.get("first")
+        self.firsts.append((kw.get("pr"), tuple(only or ()), bool(first() if callable(first) else first)))
         out = {}
         for n in plan.checks:
             if only and n not in only:
@@ -2997,9 +2998,9 @@ class AtOnce(Fixture):
                 u, lines = self.land(planner=Planner(owners={"a": "a/", "b": ""}), runner=Counted(counts))
                 self.assertEqual(self.merged_order(), merged, lines)
 
-    def checked_both(self, red):
+    def checked_both(self, red, first=None):
         """#1 (a/x, plan [a]) queued before #2 (b/y, plan [b]); main's record holds `red` red; both planned with no
-        slot yet, then the lane runs with one slot. -> the runner"""
+        slot yet, PR `first` then put first, then the lane runs with one slot. -> the runner"""
         self.push("main", {"tests/LANDING.toml": Express.MANIFEST})
         self.pr(1, {"a/x": "n\n"})
         self.pr(2, {"b/y": "n\n"})
@@ -3010,6 +3011,8 @@ class AtOnce(Fixture):
         with mock.patch.object(L.Lane, "width", lambda lane: 0):   # planned, no check started
             self.land()
         self.assertEqual((self.job(1).state, self.job(2).state), (T.CHECKING, T.CHECKING))
+        if first:
+            J.put_first("demo", first, "seat")
         runner = Runner()
         with one_slot():
             self.land(runner=runner)
@@ -3030,6 +3033,27 @@ class AtOnce(Fixture):
         self.setUp()
         runner = self.checked_both(())
         self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), False)])
+
+    def test_a_put_first_jobs_check_takes_the_first_claim(self):
+        # dispatch #2026, 10-25: put first, its check waited in the slot queue behind later PRs' for 5 h
+        runner = self.checked_both((), first=2)
+        self.assertEqual([c[0] for c in runner.calls], ["b", "a"])
+        self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), True)])
+
+    def test_a_check_that_never_starts_is_said_and_stopped_once(self):
+        # dispatch #2026, 10-25: its gate dir sat 5 h with no check run in it, and nothing said so or tried again
+        lane = L.Lane.__new__(L.Lane)
+        lane.repo, lane.inflight = "demo", {}
+        for pr, since in ((1, time.time() - L.NOSTART - 1), (2, time.time()), (3, 0)):   # stuck, fresh, started
+            f = L.Flight(None, pr, "a", "h" * 40, "b" * 40, "t" * 40, False, threading.Event())
+            f.beat["since"] = since
+            lane.inflight[(f"demo-{pr}", "a")] = f
+        lane.nostart()
+        lane.nostart()
+        self.assertEqual([f.stop.is_set() for f in lane.inflight.values()], [True, False, False])
+        said = [ln for ln in self.log().splitlines() if "\tnostart demo#" in ln]
+        self.assertEqual(len(said), 1, self.log())
+        self.assertIn("nostart demo#1 check=a check a has not started in 120 min", said[0])
 
     def test_a_check_with_no_place_says_so_in_the_queue_log_once_until_it_gets_one(self):
         # dispatch 10-24/25: the lane said "waiting for a slot" only to its own lines, which go nowhere, so a PR
@@ -4354,6 +4378,39 @@ class SmallFirst(Fixture):
             u, _ = self.land()
         self.assertEqual(self.merged_order(), [1, 2])
         self.assertEqual([c[0] for c in u["runner"].calls][:3], ["a", "b", "c"])   # #1's suite before #2's check
+
+    def test_a_query_keeps_a_put_first(self):
+        # dispatch #2026, 10-25: put first, then a query for perms' read and queued again, it sat behind 8 older PRs
+        self.pr(2, {"b/y": "n\n"})
+        self.pr(1, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        J.put_first("demo", 2, "seat")
+        J.move(self.job(2), T.QUERY, why="perms' read")
+        J.move(self.job(2), T.QUEUED, why="queued again")
+        self.assertEqual([j.pr for j in J.lane_jobs("demo")], [2, 1])
+
+    def test_a_new_head_after_a_query_drops_a_put_first(self):
+        # perms-c9, 10-26: kept through a query, a put-first stayed at the front for whatever head came next
+        for push in (False, True):
+            self.setUp()
+            head = self.pr(1, {"a/x": "n\n"})
+            J.submit("demo", 1)
+            with J.lane_lock("demo"):
+                J.drain("demo")
+            J.put_first("demo", 1, "seat")
+            job = self.job(1)
+            job.head = head
+            J.move(job, T.QUERY, why="perms' read")
+            self.assertEqual(J.first("demo", 1)["head"], head)
+            J.move(self.job(1), T.QUEUED, why="queued again")
+            if push:
+                self.push("track/row-1", {"a/x": "m\n"})
+            with mock.patch.object(L.Lane, "width", lambda lane: 0):   # read and planned, no check started
+                self.land()
+            self.assertEqual(bool(J.first("demo", 1)), not push, push)
 
     def test_a_put_first_is_good_for_one_landing(self):
         # merged or closed, the record goes: a PR closed unmerged and queued again later waits its turn
