@@ -1397,6 +1397,34 @@ class HostAndRunners(Env):
             r = self.run_(red, alone=True, settle=0.2)   # nothing busy: it runs alone, and its red stands
         self.assertEqual((r.status, r.extra["alone"]), (T.FAILED, True), r.extra)
 
+    def test_a_loaded_red_of_mains_base_run_after_a_settle_is_stored_as_neither_red_nor_green(self):
+        # #1942's follow-up: the base run judge() makes of main is the same attempt, so a red that stayed loaded after
+        # its settle is no answer for main: nothing shared, so no false base red blocks or ratchets a PR through
+        red, head = chk(run="exit 1", klass=T.HOST, cap=5), "h" * 40
+        os.makedirs(os.path.join(self.state, "lanes"))
+        lock = open(os.path.join(self.state, "lanes", "repo.lock"), "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        REC.new_nonce("repo", self.state)
+        store = REC.Store("repo", lock, self.state)
+
+        def runner(check, tree, where, alone=False, **kw):
+            if tree == head:   # the PR's own red, from a calm run
+                return T.Result(check=check.name, tree=tree, status=T.FAILED, cases=[{"name": "FAIL x", "status": T.FAILED}],
+                                extra={"loaded": False, "why": "red", "fails": ["x"]})
+            return RUN.run(check, tree, where, alone=alone, repo_root=self.repo, settle=0.2, **kw)
+        real = A.slot
+        bounded = lambda *a, **k: real(*a, **{"deadline": 30, **k})
+        with mock.patch.object(A, "slots", lambda *a, **k: 2), mock.patch.object(A, "slots_now", lambda *a, **k: 2), \
+                mock.patch.object(RUN, "starved", lambda *a: False), mock.patch.object(A, "loaded", lambda *a, **k: True), \
+                real(self.state, k=2, say=lambda _: None), mock.patch.object(A, "slot", bounded):
+            o = RUN.judge(red, head, self.tree, runner=runner, store=store, job_key="repo-1", security=True)
+        base = [r for r in o.results if r.tree == self.tree]
+        self.assertEqual([r.status for r in base], [T.FAILED, T.UNRUNNABLE], o.results)
+        self.assertIn("no run alone", base[-1].extra["why"])
+        self.assertIsNone(store.base(red.name, self.tree))
+        self.assertEqual(o.status, T.FAILED, o.note)   # the PR's own red stands; main's is neither blocking nor waving it through
+
     def test_a_lanes_express_run_takes_no_slot_and_its_other_runs_wait_as_a_lane(self):
         # lane=True only moves the run's ticket ahead of a worker's: an express run still takes no slot at all
         calls, real = [], A.slot
@@ -1801,8 +1829,9 @@ esac
 
     def test_a_served_job_is_caged_and_cannot_change_the_runner_or_its_verdict(self):
         # the security read of #806: a job is a PR's code, run as the runner's own account. It must not write the
-        # runner, or its verdict, or a later job could be told it passed. The fixture stands outside any tmp dir,
-        # which the cage replaces, so the job sees it and meets a read-only file, not a missing one.
+        # runner, or its verdict, or a later job could be told it passed. No place outside /home, /root, /tmp, /var/tmp
+        # and /run is writable here, so the fixture stands in the home, which the cage empties (#1814): the job
+        # sees no runner at all, and the fixture must stay as written.
         if subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
                           capture_output=True).returncode:
             self.skipTest("no bwrap that runs here, so the runner takes no job at all (its selfcheck proves that)")
@@ -1827,9 +1856,9 @@ esac
         text = out.getvalue()
         body, verdict = RUN._laptop_verdict(text, rc)
         self.assertEqual((rc, verdict), (0, 1), text)                  # the job's own exit, not the one it printed
-        self.assertIn("SAW", body.splitlines())                        # it could read the runner…
-        self.assertIn("OWN", body.splitlines())                        # …and write its own tree…
-        self.assertNotIn("WROTE", body)                                # …but not the runner
+        self.assertNotIn("SAW", body.splitlines())                     # it cannot see the home's runner…
+        self.assertIn("OWN", body.splitlines())                        # …but writes its own tree…
+        self.assertNotIn("WROTE", body)                                # …and not the runner
         with open(inst) as f:
             self.assertEqual(f.read(), "installed-runner\n")
 
