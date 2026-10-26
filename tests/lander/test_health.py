@@ -338,10 +338,15 @@ class Judge(unittest.TestCase):
             return T.Result(check=check.name, tree=tree, status=T.FAILED if tree in red else T.PASSED)
         return run
 
-    def test_main_red_on_the_base_blocks_without_a_base_run(self):
-        o = RUN.judge(self.c, "head", "base", runner=self.runner({"head", "base"}), main=T.FAILED, touched=True)
+    def test_main_red_on_the_base_blocks_a_security_check_without_a_base_run(self):
+        o = RUN.judge(self.c, "head", "base", runner=self.runner({"head", "base"}), main=T.FAILED, security=True)
         self.assertEqual(o.status, RUN.BLOCKED)
         self.assertEqual(self.trees, ["head"])
+
+    def test_main_red_runs_the_base_for_a_touched_check(self):
+        # a fix to one of main's reds may pass the ratchet now, which needs a base run made now
+        RUN.judge(self.c, "head", "base", runner=self.runner({"head", "base"}), main=T.FAILED, touched=True)
+        self.assertIn("base", self.trees)
 
     def test_main_red_still_runs_the_base_where_the_ratchet_may_pass_it(self):
         # the ratchet needs a base run made now, so a red record does not stand in for it
@@ -349,10 +354,16 @@ class Judge(unittest.TestCase):
         self.assertIn("base", self.trees)
         self.assertNotEqual(o.status, T.FAILED)
 
-    def test_main_green_on_the_base_makes_a_red_the_prs_without_a_base_run(self):
-        o = RUN.judge(self.c, "head", "base", runner=self.runner({"head", "base"}), main=T.PASSED)
+    def test_a_red_main_showed_now_holds_as_main_red_though_its_record_is_green(self):
+        # 10-25: main's green from 09:46 handed dispatch #1478 back at 10:48 for a red main's own runs had that hour
+        o = RUN.judge(self.c, "head", "base", runner=self.runner({"head", "base"}), main=T.PASSED, touched=True)
+        self.assertEqual(o.status, RUN.BLOCKED)
+        self.assertIn("base", self.trees)
+
+    def test_a_red_main_does_not_show_now_is_the_prs(self):
+        o = RUN.judge(self.c, "head", "base", runner=self.runner({"head"}), main=T.PASSED, touched=True)
         self.assertEqual(o.status, T.FAILED)
-        self.assertNotIn("base", self.trees)
+        self.assertIn("base", self.trees)
 
     def test_a_pr_that_turns_a_main_red_check_green_passes(self):
         o = RUN.judge(self.c, "head", "base", runner=self.runner({"base"}), main=T.FAILED)

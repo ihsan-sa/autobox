@@ -21,7 +21,7 @@ def selfcheck():
     for k, v in {"CC_BOARDS": f"{tmp}/boards", "CC_STATE": f"{tmp}/state", "CC_LANDER_STATE": f"{tmp}/land",
                  "CC_WORKTREES": f"{tmp}/wt", "CC_SESSIONS": f"{tmp}/sessions", "CC_MEMBERS": f"{tmp}/members",
                  "CC_DEV": f"{tmp}/dev", "CC_PULSE": f"{tmp}/state/pulse.json",
-                 "CC_PULSE_SUITES": f"{tmp}/bin/suites", "CC_AGENT_LEDGER": f"{tmp}/state/agent-numbers.jsonl"}.items():
+                 "CC_MEMBER_FACING": f"{tmp}/home/.cc/member-facing", "CC_PULSE_SUITES": f"{tmp}/bin/suites", "CC_AGENT_LEDGER": f"{tmp}/state/agent-numbers.jsonl"}.items():
         os.environ[k] = v
     for d in ("boards", "state/r/w1", "state/statusline", "state/vitals", "land", "proc", "wt/r/w1", "bin",
               "sessions", "members/mem", "dev/r", "state/fund", "state/mem"):

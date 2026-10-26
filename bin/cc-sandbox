@@ -37,7 +37,7 @@
 #                                           In the host refresher's mode, its copy or nothing and exit 2 (THE HOST REFRESHER'S MODE).
 #   cc-sandbox selfcheck                   a scratch repo + worktree: the world inside is what this header says
 #                                           — always in a HOME of its own (selfcheck_home); it refuses the account's real one
-#   cc-sandbox selfcheck <section>         one section that builds its own fixture HOME (go, hwde, toolchains, workercred), alone; a section that builds none, or runs no case, fails
+#   cc-sandbox selfcheck <section>         one section that builds its own fixture HOME (go, hwde, tmpsize, toolchains, workercred), alone; a section that builds none, or runs no case, fails
 #   cc-sandbox --help | -h                  this header, exit 0
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
@@ -227,6 +227,8 @@
 #   it. The host makes the two files when they are missing. Nothing else of /dev, and no capability. A host with no
 #   nvidia<N> node binds none of it and makes nothing; a queue file that is a link or not a regular file binds no card
 #   at all, one line, so the card is never inside without the host's queue in front of it.
+# /tmp AND THE tmpfs HOME ARE SIZED: 2 GiB each by default, CC_SANDBOX_TMP_SIZE (bytes) to change it, in a worker, a member
+#   workspace and vet (/tmp). A write past it gets ENOSPC instead of filling RAM and swap. A worker's TMPDIR is that /tmp.
 # OTHER HARNESSES' LOGINS ARE ABSENT, not stripped: $HOME inside is a tmpfs and only the binds above are in it, so
 #   ~/.codex (auth.json, config.toml), ~/.cursor and ~/.config/cursor do not exist in a worker's world at all. The
 #   selfcheck plants each one in a fixture HOME and reads for it from inside. A harness that needs its own credential
@@ -310,6 +312,8 @@ set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); EGRESS="$BIN/cc-egress"
 MEMBER_MARK=/.cc-member-boundary   # at the root, where the host user cannot make a file; the member bwrap binds it
 TREE=""   # `member … --tree <dir>`: one host tree bound into the boundary as the working directory (a landing's gates)
+TMPSZ=(--size "${CC_SANDBOX_TMP_SIZE:-2147483648}")   # EVERY tmpfs A SESSION CAN FILL HAS A SIZE (2 GiB, bytes): tmpfs pages are RAM that belong to no process, so a
+# runaway writing into /tmp or ~ gets ENOSPC instead of filling memory and swap (a worker's test wrote 16 GB on 2026-10-24)
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
 # ── THE PERMISSION BASELINE OF A SEALED SESSION ───────────────────────────────────────────────────────────────────
 # A prompt the boundary already answers buys no safety and costs the owner a message. Worse, a stream of harmless ones
@@ -530,7 +534,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   mkdir -p "$proj" "$mem" "$cn" "$cc" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
+     --ro-bind /etc /etc --proc /proc --dev /dev "${TMPSZ[@]}" --tmpfs /tmp "${TMPSZ[@]}" --tmpfs "$H")
   # THE WORKER'S SOURCES ARE DESCRIPTORS TOO — the same wall as the member boundary's, not a second one (see `pin`).
   # The parent `.git` is NOT rw any more: it is a tmpfs holding mountpoints of the real one (below), so `config` and
   # `hooks` are names in a directory no worker can write and neither is the reason for the pin. What this list still
@@ -919,7 +923,7 @@ launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES F
   exec bwrap --die-with-parent --unshare-all --new-session --clearenv --hostname sandbox --chdir / \
     --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
     --tmpfs /etc --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache --ro-bind-try /etc/magic /etc/magic \
-    --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+    --proc /proc --dev /dev "${TMPSZ[@]}" --tmpfs /tmp --tmpfs /run \
     --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv TMPDIR /tmp --setenv LC_ALL C -- "$@"; }
 board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards/<h>.json and .lock become links into
   # ~/.cc/members/<h>/board/, and build_member binds THAT DIRECTORY as the session's ~/.cc/boards. The file itself used to be
@@ -1323,7 +1327,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   board_dir "$h"
   B=(--die-with-parent --unshare-pid --clearenv
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
+     --ro-bind /etc /etc --proc /proc --dev /dev "${TMPSZ[@]}" --tmpfs /tmp "${TMPSZ[@]}" --tmpfs "$H"
      --ro-bind /dev/null "$MEMBER_MARK")   # in_member: the worker fence reads this, not the env var, to stand aside
   # THE WORKSPACE IS THE MEMBER'S; ITS GIT DIRECTORY IS NOT. The HOST runs git in this very repo — `cc <h> <track>`
   # fetches and adds a worktree here — so a hook the member drops in, a core.hooksPath they point at their own tree, or
@@ -3512,7 +3516,26 @@ selfcheck_section(){   # $1 a section name (`cc-sandbox selfcheck hwde`) → tha
   local p=$((n - bad))
   [ $rc = 0 ] && [ $n -gt 0 ] || { bad=$((bad+1)); echo "FAIL $1: the section returned $rc after $n cases — its fixture was not built, so this is no pass"; }
   printf 'cc-sandbox selfcheck %s: %s passed, %s failed\n' "$1" "$p" "$bad"; [ "$bad" = 0 ]; }
-SELFCHECK_ALONE="caches go hwde toolchains workercred"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
+selfcheck_tmpsize(){   # THE SIZED tmpfs (TMPSZ), in a HOME of its own: a worker writing 4 MiB under a 1 MiB cap gets ENOSPC in
+  # /tmp and in ~, and at most 1 MiB lands; the vet boundary's /tmp is capped the same; with no setting the cap is 2 GiB.
+  local fh probe
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxts-XXXXXX") || return 1; chmod 700 "$fh"
+  mkdir -p "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
+  printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$fh/.cc/worktrees/r/t" >/dev/null 2>&1 || return 1
+  # $1 a directory: 4 MiB into it → "full" when dd says no space is left, then "bounded" when at most 1 MiB landed
+  probe='dd if=/dev/zero of="$1/fill" bs=1M count=4 2>&1 | grep -q "No space left" && printf full
+    [ "$(stat -c %s "$1/fill")" -le 1048576 ] && printf /bounded; echo'
+  w(){ env HOME="$fh" CC_WORKER_SANDBOX=1 CC_SANDBOX_TMP_SIZE=1048576 "$SELF" r t -- sh -c "$probe" _ "$1" 2>/dev/null | tail -1; }
+  t 'tmpsize: a worker writing 4 MiB into /tmp under a 1 MiB cap gets no space left, and at most 1 MiB lands' "$(w /tmp)" full/bounded
+  t 'tmpsize: …and so does a write into its tmpfs home' "$(w "$fh")" full/bounded
+  t 'tmpsize: the vet boundary'"'"'s /tmp has the same cap' "$(CC_SANDBOX_TMP_SIZE=1048576 "$SELF" vet -- sh -c "$probe" _ /tmp 2>/dev/null | tail -1)" full/bounded
+  t 'tmpsize: with no setting a worker'"'"'s /tmp is 2 GiB' \
+    "$(env -u CC_SANDBOX_TMP_SIZE HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- df -k --output=size /tmp 2>/dev/null | tail -1 | tr -d ' ')" 2097152
+  t 'tmpsize: control — on the host the same write lands whole, so the cap above is the sandbox' "$(sh -c "$probe" _ "$fh")/$(stat -c %s "$fh/fill")" /4194304
+  rm -rf "${fh:?}"; }
+SELFCHECK_ALONE="caches go hwde toolchains tmpsize workercred"   # the sections that build their own fixture HOME; the rest lean on the full run's (fence, member…)
 selfcheck_gpu(){   # THE CARD (gpu_bind), in a HOME of its own. The bind list and the no-card host are driven on a fixture
   # dir of plain files standing in for /dev, so they run on every host; the launch cases run where the host has a card,
   # and on one without it they prove a worker sees no /dev/nvidia* and the host's ~/.cc/gpu is never made.
@@ -4510,7 +4533,7 @@ print(" ".join(m for m in "ownnote owndoc ownprog leakmem leakseat leakarch leak
   out="$(env HOME="$out" CC_SANDBOX_SELFCHECK_HOME="$out" "$SELF" selfcheck 2>&1; echo "rc=$?")|$(env CC_SANDBOX_SELFCHECK_HOME="$H/x" "$SELF" selfcheck 2>&1; echo "rc=$?")"
   t 'selfcheck refuses the real HOME, and a marker that is not HOME, in one line each' \
     "$(grep -c '^cc-sandbox selfcheck: refused: ' <<<"${out//|/$'\n'}")/$(grep -o 'rc=[0-9]*' <<<"$out" | tr '\n' ' ')" '2/rc=1 rc=1 '
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_go; selfcheck_caches; selfcheck_hwde; selfcheck_cfgwt; selfcheck_gpu; selfcheck_workercred; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_secretenv; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_go; selfcheck_caches; selfcheck_hwde; selfcheck_cfgwt; selfcheck_gpu; selfcheck_workercred; selfcheck_tmpsize; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip. Where no pid namespace of
   # its own here can hold the sandboxes its cases start, they run unnested over the host's /proc and print an
   # UNNESTED line saying why (tests/member_v2.py, own_pidns). That reason goes on this tally's last line.

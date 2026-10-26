@@ -8,9 +8,11 @@ which its memory bounds, and the old box's 6 cores still run 3). Never below 1, 
 cores counts as its cores. MEMORY: every check's scope shares lander.slice (SCOPES), so a check also waits until
 the slice has room for it: the memory its running checks hold (memory.stat `anon`, so page cache the kernel can drop
 does not count) or, when that is more, what they reserved, plus this check's own need, within the slice's MemoryHigh.
-A check's need is the largest peak a green run of it reached (run.py records its scope cgroup's memory.peak, or
-wait4's ru_maxrss, the largest process alone, with no scope, in `<state>/slots/peak/<repo>/<check>`; a red or capped
-run may have died before its peak, so it records nothing), and CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a
+A check's need is the peak a green run of it reached, or half the need kept before when that is more, so an old peak
+fades once runs stop reaching it (run.py records the most `anon` its scope cgroup's memory.stat showed while it ran,
+since memory.peak counts the page cache of every file it read, or wait4's ru_maxrss, the largest process alone, with
+no scope, in `<state>/slots/peak/<repo>/<check>`; a red or capped run may have died before its peak, so it records
+nothing), and CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a
 heavy check's peak) until it has one; the holder of a slot writes
 its need in the slot's file, which is what it reserved. A slice whose memory.stat does not read counts reservations
 alone, so with no peak recorded the slice holds MemoryHigh / CHECK_MEM checks. A slice with no MemoryHigh, or a
@@ -337,11 +339,16 @@ def slice_used() -> int | None:
         return 0
     path = os.path.join(SLICE_DIR, "memory.stat")
     try:
-        with open(path) as f:
-            return next(int(line.split()[1]) for line in f if line.startswith("anon "))
+        return anon(path)
     except (OSError, ValueError, IndexError, StopIteration):
         _unread(f"{path} anon", "only what running checks reserved counts")
         return None
+
+
+def anon(stat: str) -> int:
+    """The `anon` bytes a cgroup's memory.stat file says it holds; raises when that does not read."""
+    with open(stat) as f:
+        return next(int(line.split()[1]) for line in f if line.startswith("anon "))
 
 
 def _peak_path(state: str, repo: str, name: str) -> str:
@@ -350,7 +357,8 @@ def _peak_path(state: str, repo: str, name: str) -> str:
 
 
 def peak(state: str, repo: str, name: str) -> int | None:
-    """The largest peak memory a green run of `repo`'s check `name` reached, in bytes; None when none is recorded."""
+    """The need record() kept for `repo`'s check `name`, in bytes; None when none is recorded, or for the moment a
+    record() is rewriting it, which counts as CHECK_MEM."""
     with contextlib.suppress(OSError, ValueError):
         with open(_peak_path(state, repo, name)) as f:
             n = int(f.read())
@@ -359,23 +367,31 @@ def peak(state: str, repo: str, name: str) -> int | None:
 
 
 def record(state: str, repo: str, name: str, n: int) -> None:
-    """Keep `n` bytes as `repo`'s check `name`'s need next time when it is the largest yet (MEMORY); the caller
-    records only a green run's, and nothing comes of a peak that did not measure."""
-    if n <= (peak(state, repo, name) or 0):
+    """Keep `n` bytes, or half the peak kept before when that is more, as `repo`'s check `name`'s need next time
+    (MEMORY): the largest peak stands while runs keep reaching it, and one no run reaches again halves at each run. The
+    caller records only a green run's, and nothing comes of a peak that did not measure. Two runs finishing together
+    take turns on the file's lock, so neither loses the other's peak."""
+    if n <= 0:
         return
     p = _peak_path(state, repo, name)
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = f"{p}.{uuid.uuid4().hex[:8]}"
-        with open(tmp, "w") as f:
+        with open(p, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                n = max(n, int(f.read()) // 2)
+            except ValueError:
+                pass
+            f.seek(0)
+            f.truncate()
             f.write(str(n))
-        os.replace(tmp, p)
 
 
-def scope_peak(argv: list) -> str:
-    """The memory.peak file of the scope wrap() put argv in; "" for a run with no scope."""
+def scope_stat(argv: list) -> str:
+    """The memory.stat file of the scope wrap() put argv in; "" for a run with no scope."""
     unit = next((a[len("--unit="):] for a in argv if a.startswith("--unit=")), "")
-    return os.path.join(SLICE_DIR, f"{unit}.scope", "memory.peak") if unit else ""
+    return os.path.join(SLICE_DIR, f"{unit}.scope", "memory.stat") if unit else ""
 
 
 def _held(d: str) -> tuple:

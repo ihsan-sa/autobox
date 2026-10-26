@@ -33,7 +33,7 @@ def selfcheck():
     iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
     for k, v in {"CC_BOARDS": f"{tmp}/boards", "CC_STATE": f"{tmp}/state", "CC_LANDER_STATE": f"{tmp}/land",
                  "CC_WORKTREES": f"{tmp}/wt", "CC_SESSIONS": f"{tmp}/sessions", "CC_MEMBERS": f"{tmp}/members",
-                 "CC_DEV": f"{tmp}/dev", "CC_PULSE": f"{tmp}/state/pulse.json", "CC_PULSE_SUITES": "/bin/true",
+                 "CC_MEMBER_FACING": f"{tmp}/member-facing", "CC_DEV": f"{tmp}/dev", "CC_PULSE": f"{tmp}/state/pulse.json", "CC_PULSE_SUITES": "/bin/true",
                  "CC_LIVE_FAILURES": f"{tmp}/bin/failures"}.items():
         os.environ[k] = v
     os.environ.pop("TMUX", None)

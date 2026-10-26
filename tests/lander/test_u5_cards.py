@@ -559,6 +559,24 @@ class Board(Stubbed):
         self.assertEqual(len(logged), 1)
         self.assertIn("request-answered demo#7 request=req-1 asker=ece298a/pll", logged[0])
 
+    def test_closes_answers_a_land_request_by_its_full_id(self):
+        # "such a line matches just 'land' and the request never closes"
+        red, query = "land:main-red:dispatch:check@1792980187", "land:demo:1960:query:98a19875"
+        self.assertEqual(B.closes(f"Closes {red}. Also Closes {query}, req-1 and row_2:"), [red, query, "req-1", "row_2"])
+        self.board("demo", {"own": {"pr": "7"}})
+        self.request(red)
+        self.request(query)
+        self.brief(f"Closes {red} and {query}")
+        line = B.close(self.job(body=f"Closes {red} and {query}."))
+        self.assertEqual(self.answered(), [red, query])
+        self.assertIn(f"answers request {red}, {query}", line)
+
+    def test_a_request_name_that_could_leave_the_requests_dir_is_refused(self):
+        self.request("x..y")
+        self.assertEqual(B.closes("Closes x..y"), ["x..y"])
+        self.assertEqual(B.request_file("x..y"), "")
+        self.assertEqual(B.request_file("a/b"), "")
+
     def test_a_body_alone_answers_no_request(self):
         # "Answer only ids that the row's brief (task.md, written by the planning seat) also names with 'Closes'"
         self.board("demo", {"own": {"pr": "7"}})

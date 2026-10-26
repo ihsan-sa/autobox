@@ -936,20 +936,32 @@ class Peak(Env):
             self.run_(chk(name="voice", run="echo 0 failed", klass=T.HOST))
         self.assertIsNone(A.peak(self.state, self.repo, "voice"))
 
-    def test_a_scoped_run_counts_its_scopes_memory_peak(self):
-        # ru_maxrss is the largest process only; the scope's memory.peak is the whole tree's
+    def test_a_scoped_run_counts_its_scopes_anon_not_its_page_cache(self):
+        # ru_maxrss is the largest process only; the scope's anon is the whole tree's, and memory.peak would count
+        # the page cache of every file the check read (follow-up to #1962)
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
-        mem, log = os.path.join(d, "memory.peak"), os.path.join(d, "log")
+        mem, log = os.path.join(d, "memory.stat"), os.path.join(d, "log")
         with open(mem, "w") as f:
-            f.write(str(5 << 30))
+            f.write(f"file {9 << 30}\nanon {2 << 30}\n")
         rc, _, _, _, peak = RUN.execute(["true"], d, os.environ.copy(), 30, log, mem=mem)
-        self.assertEqual((rc, peak), (0, 5 << 30))
+        self.assertEqual((rc, peak), (0, 2 << 30))
         rc, _, _, _, peak = RUN.execute(["true"], d, os.environ.copy(), 30, log, mem=os.path.join(d, "gone"))
-        self.assertTrue(0 < peak < 5 << 30)              # no scope file: ru_maxrss
-        self.assertEqual(A.scope_peak(["systemd-run", "--unit=lander-x-1", "--", "true"]),
-                         os.path.join(A.SLICE_DIR, "lander-x-1.scope", "memory.peak"))
-        self.assertEqual(A.scope_peak(["true"]), "")
+        self.assertTrue(0 < peak < 2 << 30)              # no scope file: ru_maxrss
+        self.assertEqual(A.scope_stat(["systemd-run", "--unit=lander-x-1", "--", "true"]),
+                         os.path.join(A.SLICE_DIR, "lander-x-1.scope", "memory.stat"))
+        self.assertEqual(A.scope_stat(["true"]), "")
+
+    def test_a_scoped_run_keeps_the_most_anon_any_poll_saw(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        mem, log = os.path.join(d, "memory.stat"), os.path.join(d, "log")
+        with open(mem, "w") as f:
+            f.write(f"anon {3 << 30}\n")
+        # the run itself drops its anon to 1G before it ends; the 3G an earlier poll saw stands
+        rc, _, _, _, peak = RUN.execute(["sh", "-c", f"sleep 0.5; echo 'anon {1 << 30}' > {mem}; sleep 0.5"], d,
+                                        os.environ.copy(), 30, log, mem=mem)
+        self.assertEqual((rc, peak), (0, 3 << 30))
 
 
 class Pinned(Env):
@@ -2240,13 +2252,37 @@ class Admission(unittest.TestCase):
         A.record(st, "/r/dispatch", "voice gate", 0)             # a peak that did not measure keeps nothing
         self.assertIsNone(A.peak(st, "/r/dispatch", "voice gate"))
         A.record(st, "/r/dispatch", "voice gate", 1400 << 20)
-        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # the largest peak, not the last run's
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # a smaller run halves the old peak, not drops it
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 700 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # a peak no run reaches again fades to the runs'
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 90 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 1400 << 20)    # a larger run counts at once
         self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 1400 << 20)
         self.assertIsNone(A.peak(st, "/r/other", "voice gate"))  # another repo's check of the same name is its own
         os.makedirs(os.path.dirname(A._peak_path(st, "/r/other", "voice gate")))
         with open(A._peak_path(st, "/r/other", "voice gate"), "w") as f:
             f.write("-5")                                        # a stored peak at or below 0 is no peak: CHECK_MEM
         self.assertIsNone(A.peak(st, "/r/other", "voice gate"))
+
+    def test_two_runs_finishing_together_keep_the_larger_peak(self):
+        # follow-up to #1962: an unlocked read-compare-write let the smaller of two finishes overwrite the larger
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        A.record(st, "/r/dispatch", "voice gate", 100 << 20)
+        p = A._peak_path(st, "/r/dispatch", "voice gate")
+        with open(p) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)   # the first finish holds the record while it writes
+            t = threading.Thread(target=A.record, args=(st, "/r/dispatch", "voice gate", 1400 << 20))
+            t.start()
+            t.join(0.3)
+            self.assertTrue(t.is_alive())      # the second waits its turn
+            with open(p, "w") as f:
+                f.write(str(200 << 20))         # what the first finish wrote
+            fcntl.flock(held, fcntl.LOCK_UN)
+        t.join(5)
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 1400 << 20)
 
     def test_alone_waits_for_a_slot_past_its_own_k(self):
         # brief: "an 'alone' re-run ... runs beside checks on slots 4-8" when K rose 3 to 8 under it
@@ -3778,6 +3814,33 @@ class Ratchet(unittest.TestCase):
                           ({self.H: {"passes": 9}, self.B: {"passes": 9}}, T.PASSED)):
             run, _ = self.runner(fails, ran=ran)
             self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, ran)
+
+    def test_a_touched_check_passes_only_when_it_greens_one_of_mains_reds_and_names_no_other(self):
+        # 10-25: #2020-#2022 each fixed one of a check's reds, held on the other two's, and went to hand merges
+        for head, want in ((["✗ b", "✗ c"], T.PASSED), (["✗ a", "✗ b", "✗ c"], RUN.BLOCKED),
+                           (["✗ b", "✗ new"], RUN.BLOCKED), ([], RUN.BLOCKED)):
+            run, _ = self.runner({self.H: head, self.B: ["✗ a", "✗ b", "✗ c"]})
+            self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=True).status, want, head)
+        run, _ = self.runner({self.H: ["✗ b"], self.B: ["✗ a", "✗ b"]})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=True, security=True).status,
+                         RUN.BLOCKED)
+
+    def test_a_touched_check_is_judged_on_the_base_run_again_not_the_stored_one(self):
+        # a stored red one case wider than main now must not make the head's equal set look like a fix
+        stored = T.Result(check="c", tree=self.B, status=T.FAILED, runner="box:x:-", extra={"fails": ["✗ a", "✗ b"]})
+        run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})
+
+        class Store:
+            def base(self, check, tree):
+                return stored
+
+            def put(self, *a):
+                pass
+
+            put_base = put
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=Store(), job_key="repo-5", touched=True)
+        self.assertEqual(o.status, RUN.BLOCKED)
+        self.assertIn((self.B, False), calls)
 
     def test_ran_reads_passes_and_crashes(self):
         self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "failed": 1, "crash": False,

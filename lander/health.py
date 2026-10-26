@@ -22,9 +22,10 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    may be on an older tip.
     red(repo)                      {name: entry} of every check the record holds red on main, whatever tree, if fresh
     at(repo, tree)                 {name: status} measured on exactly `tree` within the last FRESH seconds: a fresh
-                                   record of a PR's base, which run.judge() takes instead of running the check on that
-                                   base again. An older one is left out, so the base runs as before: main sitting
-                                   still while the box breaks a check must not leave a stale green blaming every PR.
+                                   record of a PR's base, whose red run.judge() takes instead of running a security
+                                   check on that base again. An older one is left out, so the base runs as before.
+                                   A green is never taken: a green 62 minutes old blamed a PR for main's own red under
+                                   load (10-25).
 
 A check red here is never left out of a PR's plan: the record says only that the check is red, not which cases, so a
 PR that owned none of its paths was planned without it, and a red case it added there landed unseen behind main's

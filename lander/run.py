@@ -54,16 +54,17 @@ said it started is unrunnable whatever it exited (perms on #1452). A member's or
 its first line is read for those words as before.
 
 JUDGE (a red, per check): the same check on the BASE tree — main's own record of it on exactly that tree when the
-tip run made one (health.py): green there is no base red, and red there stands as `blocked-by-main` with no run when
-the ratchet cannot apply (a check that guards a security path or that the change touches); else the lane's shared
-record when there is one — red there too
+tip run made one (health.py): red there stands as `blocked-by-main` with no run for a check that guards a security
+path, where the ratchet cannot apply; a green there stands for nothing, since main's green an hour old blamed a PR
+for a red main's own runs showed under load (10-25); else the lane's shared record when there is one — red there too
 is `blocked-by-main` (main is red, the diff is not blamed) — unless THE RATCHET lets it pass: every case the head's run
 names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths and full shas blanked) fails
 on the base too, the head ran as far (no fewer passes, no more failures, no crash the base lacks), both ran in the
 same place, and the base's red is a run made now, in this judge() (a shared one that would let it pass is run again
 first, and when that re-run is unrunnable the shared red holds as main-red), then it passes with a `ratchet` note and
 Outcome.sets naming both sets (no_new_reds; never for a check that guards a security path — gate_first,
-LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, and for a head red that names no
+LANDING-security.toml's paths or SECURITY_PATHS — nor for one the change touches unless the head's named reds are a
+strict subset of the base's, so a fix to one of main's reds lands while the check's others stay red; and for a head red that names no
 case only when the base names none either and both print a failure count, the head's no higher); a check the base does not define, or whose run file the base lacks, has no
 base run and its red is the diff's — except a check the base defines whose run file is on neither tree, which is not
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
@@ -387,9 +388,9 @@ def stopped() -> bool:
 
 def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, keep: tuple = (),
             mem: str = "") -> tuple:
-    """-> (rc, secs, cpu_secs, capped, peak): peak is the bytes the run's scope held at most, its memory.peak file
-    `mem` as last read while it ran (the scope goes when it exits), or wait4's ru_maxrss, the most its largest process
-    held, when that never read; a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    """-> (rc, secs, cpu_secs, capped, peak): peak is the most `anon` the run's scope held, its memory.stat file `mem`
+    as read each poll while it ran (the scope goes when it exits; page cache does not count), or wait4's ru_maxrss, the
+    most its largest process held, when that never read; a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
     keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
@@ -410,8 +411,8 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     capped, ru, held = False, None, 0
     while True:
         if mem:
-            with contextlib.suppress(OSError, ValueError), open(mem) as f:
-                held = int(f.read())
+            with contextlib.suppress(OSError, ValueError, IndexError, StopIteration):
+                held = max(held, A.anon(mem))
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
             rc = os.waitstatus_to_exitcode(status)
@@ -981,7 +982,7 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
                 argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
             # the write end is execute's from here: it closes it once the run has it (pipe keeps only the read end)
             rc, secs, cpu, capped, peak = execute(argv, wd, env, check.cap, log, stdin,
-                                                  keep=(pipe.pop(),) if pipe else (), mem=A.scope_peak(argv))
+                                                  keep=(pipe.pop(),) if pipe else (), mem=A.scope_stat(argv))
             if kind == "box" and rc == 0 and not capped:   # a red may have died before its peak (admission MEMORY)
                 A.record(sd, repo, check.name, peak)
             # under load at either end of the run, or starved through it (dispatch #1504, 10-21: 1421 s for 774 s of
@@ -1077,7 +1078,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     """What one check says about a change. runner defaults to run(); store (records.Store, the lane's) keeps each
     run and shares base runs; record(result, text) is called once for a red that is the diff's. on_base=False: the
     base tree has no such check or not its run file, so there is no base run and a red is the diff's. main: main's
-    own record of this check on exactly base_tree (health.at), passed or failed, which stands for the base run."""
+    own record of this check on exactly base_tree (health.at); failed stands for the base run of a security check."""
     runner = runner or run
     kw = {**run_kw, "base_tree": base_tree}
 
@@ -1108,11 +1109,13 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         return out
     # a check the base does not have (or whose run file it lacks) has no base to compare: its red is the diff's
     # brief 10-13: "This replaces judge()'s base re-run for checks with a fresh main record" -- a red record stands
-    # without a run only where the ratchet could not let the head pass anyway; it needs a base run made now
-    if base_tree and check.name != M.BUILTIN and on_base and main == T.FAILED and (security or touched):
+    # without a run only where the ratchet could not let the head pass anyway; it needs a base run made now. A green
+    # record never stands in: on 10-25 main's 09:46 green blamed dispatch #1478 at 10:48 for a red main's own runs
+    # showed all that hour under load
+    if base_tree and check.name != M.BUILTIN and on_base and main == T.FAILED and security:
         out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name} (main's own record)"
         return out
-    if base_tree and check.name != M.BUILTIN and on_base and main != T.PASSED:
+    if base_tree and check.name != M.BUILTIN and on_base:
         def base_run():
             b = go(base_tree, base=True, keep=False)
             if b.status == T.FAILED and b.extra.get("loaded"):
@@ -1127,9 +1130,11 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         b = base_run() if fresh else b
         out.results.append(b)
         # the ratchet follows quarantine's rule: never on security checks or on a PR touching the check, whose
-        # change could reword its own red lines into main's
-        may = not security and not touched
-        if b.status == T.FAILED and may and not fresh and no_new_reds(r, b):
+        # change could reword its own red lines into main's -- unless it turns one of main's named reds green and
+        # names no other: on 10-25 #2020-#2022 each fixed one of a check's reds and held on the other two's
+        def may(b):
+            return not security and (not touched or set(r.extra.get("fails") or []) < set(b.extra.get("fails") or []))
+        if b.status == T.FAILED and may(b) and not fresh and no_new_reds(r, b):
             # brief: "main's result at the PR's own base_sha, run in the same environment, never a cached result
             # from another host state": the shared red would let this one through, so the base is run again now
             # ...and a re-run that gave no answer (unrunnable: its cap, the laptop gone) keeps the stored red, which
@@ -1140,7 +1145,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
                 b, fresh = again, True
         if b.status == T.FAILED:
             # brief: "If the PR's failing set is a subset of main's, the check counts as passed for this PR"
-            if may and fresh and no_new_reds(r, b):
+            if may(b) and fresh and no_new_reds(r, b):
                 out.status, out.note = T.PASSED, f"ratchet: no new reds, {check.name} is red on the base too"
                 out.sets = {"pr": r.extra["fails"], "main": b.extra["fails"]}
                 return out

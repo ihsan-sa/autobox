@@ -22,7 +22,8 @@ track will finish it then; closed `done` with a note and its agent mark cleared 
 or underscore that is not on the board is reported; a bare word ("Closes the gap") is prose and ignored.
 
 A CLOSED REQUEST HEARS ITS FIX. A name with a file in ~/.cc/requests/ is a planner request (`cc-notify --ask`), not a
-row (an id of letters, digits, `-` and `_`, as `req-<stamp>-<pid>` is): one still open is answered with `cc-notify
+row (an id of letters, digits and `_.:@-`, as `req-<stamp>-<pid>` and the lander's own
+`land:<repo>:main-red:<check>@<tip>` are): one still open is answered with `cc-notify
 requests answer`, from the box's hand (cards.box_hand), so the repo that asked hears its fix landed; an answered one is
 skipped. ONLY A REQUEST THE ROW'S BRIEF ALSO CLOSES is answered: the brief (~/.cc/state/<project>/<row>/task.md, a
 regular file) is the planning seat's text, and the PR body is the track's, so a track cannot answer other repos' asks
@@ -45,8 +46,10 @@ import re
 from lander import cards as C
 from lander import types as T
 
-CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)"
-                       r"[A-Za-z0-9][A-Za-z0-9_-]*)*)")
+# a row or a request id as cc-notify keeps it (land:main-red:demo:check@1792980187); it never ends in `.`, `:` or `@`,
+# so a sentence's full stop stays out of it
+ID = r"[A-Za-z0-9](?:[A-Za-z0-9_.:@-]*[A-Za-z0-9_-])?"
+CLOSES_RE = re.compile(rf"\bCloses:?\s+({ID}(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+){ID})*)")
 CLOSES_SPLIT = re.compile(r"\s*,\s*(?:and\s+)?|\s+and\s+")
 BRANCH_RE = re.compile(r"^(?:track|planning|builder)/(.+)$")
 ORCH_MARK = re.compile(r"^@\d+$")
@@ -187,7 +190,9 @@ def _close(job, project, track):
 
 
 def request_file(name):
-    """~/.cc/requests/<name>.json when it is a regular file, else "". `name` is a CLOSES_RE word, so it holds no slash."""
+    """~/.cc/requests/<name>.json when it is a regular file, else "". A name with a slash or `..` is refused."""
+    if "/" in name or ".." in name:
+        return ""
     p = os.path.join(C.PASSWD_HOME, ".cc", "requests", f"{name}.json")
     return p if os.path.isfile(p) and not os.path.islink(p) else ""
 
