@@ -62,6 +62,7 @@ def selfcheck():
         os.makedirs(f"{d}/bin")
         for name, body in (("cc-broker", f'echo "$*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
                            ("cc-notify", f'echo "notify $*" >> "{d}/told"; [ ! -e "{d}/down" ]'),
+                           ("cc-board", f'echo "$*" >> "{d}/board"'),
                            ("tmux", f'''if [ "$1" = -S ]; then echo "$2 $3" >> "{d}/sockets"; shift 2; fi
 case "$1" in
   display-message) printf 'main\\t\\n' ;;
@@ -241,6 +242,8 @@ esac''')):
         h.wait()
         w.wait(timeout=20)
         t("frees: it runs by itself once the slot is freed", os.path.exists(mark), True)
+        t("frees: its row says the queued launch started, so its DONE is not taken for an earlier worker's",
+          lines(f"{d}/board"), ["note r queued queued worker started after 0 min in the queue"])
         t("frees: a finished launch holds no slot", live("slots"), {})
 
         # TWO HOSTS: a busy home hands the next worker to a peer with room; a quiet home keeps it. The peer is a
