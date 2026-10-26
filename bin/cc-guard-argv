@@ -91,7 +91,9 @@ Rules for both gated roles:
   ~/.cc/state/<x>/perms or ~/.cc/state/handoff/perms.{json,brief} (unless GUARD_PSEAT). A `$` target passes; a glob
   is cut at its first wildcard and the cut judged as a prefix, but for the seat's state it is matched a component at a
   time against the seat places that exist (above, at or inside one is refused)                      -> never
-- remove from above: rm rmdir, mv (sources), rsync --delete* (destination) or --remove-source-files, find -delete
+- remove from above: rm rmdir, mv (sources), git rm/mv, rsync --delete* (destination) or --remove-source-files
+  (--remove-sent-files), tar --remove-files (any prefix), ln -f (what it lands on), find -delete, and for a member
+  or worker chmod/chown/chgrp
   whose target is a PARENT of an existing ~/.cc/state/<x>/perms or handoff seat file, of ~/dev, or of a write-fence
   place (`rm -rf ~/.cc`, `mv ~/.cc/state x`); unless GUARD_PSEAT                                     -> never
 - a `$X` verb is the literal value of an earlier X= / export / declare in the same command; any other `$X` /
@@ -1093,14 +1095,34 @@ class Guard:
     def rmtargets(g, R):   # what this command removes or moves away whole (its parents matter, not only its insides)
         v, ws, a = R['verb'], R['argw'], R['args']
         if v in ('rm', 'rmdir'): return pos(ws)
+        if v == 'git':   # git rm / git mv, each path under the -C dirs
+            dirs, sub, rest = gitparse(ws)
+            if sub not in ('rm', 'mv') or any(d.dyn for d in dirs): return []
+            p = [w.like(os.path.join('.', *[d.v for d in dirs], w.v)) for w in pos(rest)]
+            return p if sub == 'rm' else p[:-1]
         if v == 'mv':
             p = pos(ws, {'-t', '--target-directory', '-S', '--suffix'})
             return p if optval(ws, '-t', '--target-directory') else p[:-1]
         if v == 'rsync':
             p = [w for w in pos(ws, {'-e', '--rsh', '-f', '--filter', '--exclude', '--include', '-T', '--temp-dir'})
                  if not re.match(r'[^/]*:', w.v)]
-            out = p[:-1] if '--remove-source-files' in a else []
+            out = p[:-1] if '--remove-source-files' in a or '--remove-sent-files' in a else []
             return out + (p[-1:] if len(p) >= 2 and any(x.startswith('--del') for x in a) else [])
+        if v == 'tar' and any(x.startswith('--rem') and '--remove-files'.startswith(x) for x in a):   # what it archives (any
+            # prefix GNU takes), under its -C dir (the archive itself too: harmless)
+            c = optval(ws, '-C', '--directory')
+            return [w if not c or w.v.startswith('/') else Word(os.path.join(c.v, w.v), c.dyn or w.dyn, w.glob)
+                    for w in pos(ws, {'-C', '--directory'})]
+        if v == 'ln' and any(x == '--force' or re.fullmatch(r'-[a-zA-Z]*f[a-zA-Z]*', x) for x in a):   # a forced link
+            # replaces what it lands on, and readers test the record with -e, so a dangling link reads as absent
+            t, p = optval(ws, '-t', '--target-directory'), pos(ws, {'-t', '--target-directory', '-S', '--suffix'})
+            d, src = (t, p) if t else (p[-1], p[:-1]) if len(p) >= 2 else (None, [])
+            if d and (t or os.path.isdir(g.absp(d.v, R['cwd']))): return [d.like(os.path.join(d.v, os.path.basename(w.v.rstrip('/')))) for w in src]
+            return [d] if d else []
+        if v in ('chmod', 'chown', 'chgrp') and g.role in ('member', 'worker'):   # a mode can hide the record as a remove
+            # does (its readers fail closed on a dir they can't search, the rest don't); only the marker fence asks
+            p = pos(ws)
+            return p if any(x.startswith('--reference') for x in a) else p[1:]
         if v == 'find' and '-delete' in a:
             k = 0
             while k < len(ws) and not ws[k].v.startswith(('-', '(', '!')): k += 1
@@ -1112,6 +1134,8 @@ class Guard:
         # is a glob's literal prefix, and a glob's own `*` never names a dot file, so only a prefix that already spells
         # `.cc/`, `.cc/m…` or `.c…` can reach a marker.
         names = ('member-facing', 'member-workspace')
+        rec = g.home + '/.cc/member-facing'   # …and the host's record of member-facing repos, which decides the same thing
+        if cut and (q.startswith(rec) or rec.startswith(q)) or q == rec or q.startswith(rec + '/') or whole and rec.startswith(q + '/'): return True
         holds = lambda d: any(os.path.lexists(os.path.join(d, '.cc', x)) for x in names)
         slash, q = q.endswith('/'), q.rstrip('/')
         d, b = os.path.split(q)
@@ -1128,15 +1152,32 @@ class Guard:
         if g.role in ('member', 'worker'):
             rms = g.rmtargets(R)
             for w in g.wtargets(R) + rms:
-                if w.dyn: continue
+                if w.dyn and w not in rms: continue   # a computed write can't take a marker away; a computed remove can
+                v = re.sub(r'\$\{?PWD\}?(?!\w)', lambda m: R['cwd'], w.v)   # $PWD is the cwd, and a substitution whose
+                # text names ~, /, HOME, .cc or .. may print any path, so the word is /* (as dynpat takes a variable set
+                # from one): Python's glob never matches .., so build$(echo /../../.cc/x) has to be judged as anywhere.
+                sub = r'\$\([^)]*\)|`[^`]*`'
+                if any(re.search(r'[~/]|HOME|\.cc|\.\.', m.group(0)) for m in re.finditer(sub, v)): v = '/*'
+                lit = re.sub(sub + r'|\$\{[^}]*\}|\$\w+', '', v)   # the word's own text around what it computes
+                pat = g.dynpat(v) if w.dyn else v
                 if w in rms and os.path.basename(w.v.rstrip('/')) == '.cc': hit = True   # a whole .cc moved or removed away
-                elif w.glob:
-                    cut = re.split(r'[*?[]', w.v)[0]
-                    hit = g.marker(cut if cut.startswith('/') else os.path.join(R['cwd'], cut), cut=True)
+                elif w.dyn and (re.search(r'(^|/)\.cc(/|$)|member-', lit) or re.search('(' + sub + r').*/\.\.(/|$)', v)):
+                    hit = True   # a computed word that spells .cc or member- itself, or climbs out of a substitution
+                elif w.glob or w.dyn:   # its literal prefix, and that prefix through a symlinked parent (lnk/* → the record),
+                    # then what it matches on disk with each computed part as `*` (l*2/x, ./$(echo lnk2)/x, ~/.cc/w*/../x), each
+                    # match and it through its parent's realpath (a link it matches is removed, not followed). A value the guard can't resolve that matches nothing near the record passes
+                    cut = re.split(r'[*?[]', pat)[0]
+                    cut = cut if cut.startswith('/') else os.path.join(R['cwd'], cut)
+                    hit = g.marker(cut, cut=True) or g.marker(os.path.join(os.path.realpath(os.path.dirname(cut)), os.path.basename(cut)), cut=True)
+                    full = re.sub(r'\$\(.*?\)|`[^`]*`|\$\{[^}]*\}|\$\w+', lambda m: g.dynpat(m.group(0)), v)
+                    full = g.home + full[1:] if full == '~' or full.startswith('~/') else full
+                    full = os.path.join(R['cwd'], full)   # not normalised: a ../ after a link goes up from the link's target
+                    hit = hit or any(g.marker(os.path.normpath(x), whole=w in rms) or g.marker(os.path.join(os.path.realpath(os.path.dirname(x)), os.path.basename(x)), whole=w in rms)
+                                 for x in glob.glob(full))
                 else:
                     a, whole = g.absp(w.v, R['cwd']), w in rms
-                    hit = g.marker(a, whole=whole) or g.marker(os.path.realpath(a), whole=whole)
-                if hit: return 'never', f'writing, moving or removing a member marker ({w.v}): .cc/member-facing and .cc/member-workspace are the host\'s to write'
+                    hit = any(g.marker(x, whole=whole) for x in (a, os.path.realpath(a), os.path.realpath(os.path.join(R['cwd'], w.v))))
+                if hit: return 'never', f'writing, moving or removing a member marker ({w.v}): .cc/member-facing and .cc/member-workspace are the host\'s to write, and a computed or globbed path that can reach one counts (spell it out)'
             # …nor cc-lib's caller records: cc-guard writes ~/.cc/library/owner/callers/<pid> for the session's claude
             # (ccrec), and a session that wrote one would choose whether cc-lib shows it the owner's Slack copy.
             cr = g.home + '/.cc/library/owner/callers'

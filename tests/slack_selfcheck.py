@@ -21,6 +21,9 @@ def run_selfcheck():
     # repositories; and it is recorded, so an `except Exception` that swallows the raise still ends the run red. This
     # is what makes `cc-slack selfcheck` runnable on a bare clone with no ~/.cc and no network, which is what makes it
     # usable as a health probe and a ledger check-cmd.
+    # …NOR THE HOST'S RECORD OF MEMBER-FACING REPOS: provisioning writes ~/.cc/member-facing/<repo> under the real HOME,
+    # and a fixture's .seeded there would stop the box's own seed for good. Only the case about it calls the real one.
+    record_mf = record_member_facing; globals()["record_member_facing"] = lambda repo: None
     scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")
     real_dev = f"{HOME}/dev"   # checked at the end: the run leaves no folder there (the `_` ones are parallel suites')
     dev_before = set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()
@@ -5973,6 +5976,34 @@ def run_selfcheck():
           toS == ["UOWN", "CMF", "UOWN", "CNONE", "DOWN"] and saidS[0] == needs_text(stS)
           and saidS[1] == "`!needs` answered in your DM" and "may I restart" not in saidS[1]
           and saidS[3] == "`!status` answered in your DM" and saidS[4] == needs_text(stS))
+    # THE HOST'S RECORD, ~/.cc/member-facing/<repo>: a commit deleting a repo's marker leaves it member-facing. Own
+    # fixture: `mfrec` has the record and no marker, `mfnone` neither; `mfmark` has only a marker, for the seed.
+    _homeF, _devF, _cwdF = globals()["HOME"], globals()["DEV"], os.getcwd()
+    hF = tempfile.mkdtemp(prefix="cc-slack-mf-")
+    try:
+        globals()["HOME"], globals()["DEV"] = hF, f"{hF}/dev"   # its own ~/dev too: the seed globs every marker there
+        for d in ("mfrec", "mfnone", "mfmark", "mfnew"):
+            os.makedirs(f"{DEV}/{d}/.cc", exist_ok=True)
+        open(f"{DEV}/mfmark/.cc/member-facing", "a").close()
+        os.makedirs(f"{hF}/.cc/member-facing"); open(f"{hF}/.cc/member-facing/mfrec", "a").close()
+        readF = (members_read("mfrec"), members_read("mfnone"))
+        os.chdir(f"{DEV}/mfrec"); hereRec = member_facing_here()
+        os.chdir(f"{DEV}/mfnone"); hereNone = member_facing_here()
+        os.chdir(_cwdF)
+        record_mf("mfnew")
+        seedF = sorted(os.listdir(f"{hF}/.cc/member-facing"))
+        os.unlink(f"{hF}/.cc/member-facing/mfmark")             # the record of a marker-only repo, gone
+        record_mf("mfnone")
+        seedF2 = sorted(os.listdir(f"{hF}/.cc/member-facing"))
+    finally:
+        os.chdir(_cwdF); globals()["HOME"], globals()["DEV"] = _homeF, _devF
+        subprocess.run(["rm", "-rf", hF], check=False)
+    check("the host's record ~/.cc/member-facing/<repo> with no marker makes a repo member-facing (members_read, and "
+          "member_facing_here in its checkout); a repo with neither is not",
+          readF == (True, False) and hereRec is True and hereNone is False)
+    check("…record_member_facing's first write seeds a record for every marked repo, the named one and .seeded; a "
+          "later write seeds nothing again, so a deleted record of a marker-only repo stays deleted",
+          seedF == [".seeded", "mfmark", "mfnew", "mfrec"] and seedF2 == [".seeded", "mfnew", "mfnone", "mfrec"])
     # …and through the REAL home_state, not a stub: the method `!needs` calls exists under that name and carries
     # the owner-asks table as "asks". Every costly input is pre-cached, so nothing outside the fixture runs.
     del dmS.home_state

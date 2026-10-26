@@ -353,6 +353,14 @@ STUB
   k "$(t test "$rc" = 2 -a ! -s "$lg")" "a daemon that did not answer is no answer: refused, nothing written"
   rc=$(seatis "" 1; SA_CWD=$d/wt sa repo --title t --run "curl x" -- "from a worktree" >/dev/null 2>&1; echo $?)
   k "$(t test "$rc" = 2 -a ! -s "$lg")" "a caller under a .cc/track marker is refused, nothing written"
+  # …and one the host records member-facing (~/.cc/member-facing/<repo>) with no marker in the checkout, in ~/dev/<repo>
+  # or its worktree ~/.cc/worktrees/<repo>/<track>; a repo with neither still files, as the box's own hand does
+  mkdir -p "$d/.cc/member-facing" "$d/dev/carol" "$d/dev/dave" "$d/.cc/worktrees/carol/t"; : > "$d/.cc/member-facing/carol"
+  rc=$(HOME=$d SA_CWD=$d/dev/carol sa repo --title t --run "curl x" -- "recorded" >/dev/null 2>&1; echo $?)
+  rc=$rc$(HOME=$d SA_CWD=$d/.cc/worktrees/carol/t sa repo --title t --run "curl x" -- "recorded worktree" >/dev/null 2>&1; echo $?)
+  k "$(t test "$rc" = 22 -a ! -s "$lg")" "a caller in a repo the host records as member-facing, or in its worktree, is refused with no marker, nothing written"
+  rc=$(HOME=$d SA_CWD=$d/dev/dave sa repo --title t --run "curl x" -- "unrecorded" >/dev/null 2>&1; echo $?)
+  k "$(t test "$rc" = 0 -a -s "$lg")" "…while one with neither marker nor record files its ask"
   fresh; seatis "" 1
   a1=$(sa repo --title "repo approval" --run "systemctl --user restart x.service" --id "land:x" -- "restart x")
   a3=$(sa repo --title "repo approval" -- "restart y")

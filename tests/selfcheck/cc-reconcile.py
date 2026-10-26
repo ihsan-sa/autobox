@@ -2794,6 +2794,9 @@ def selfcheck():
         ok("MEMBER CHECKOUT: the host-side ~/.cc/members/<repo> marks a member workspace when the checkout's own marker "
            "is gone (a member can delete that one), and a repo with neither is the owner's",
            member_ws("mb") and not member_ws("vic"))
+        os.rmdir(f"{tm2}/.cc/members/mb"); os.makedirs(f"{tm2}/.cc/member-facing"); open(f"{tm2}/.cc/member-facing/mb", "w").close()
+        ok("…and so does the host's record ~/.cc/member-facing/<repo> alone (a commit deleting .cc/member-facing "
+           "leaves it), and the repo with neither stays the owner's", member_ws("mb") and not member_ws("vic"))
     finally:
         globals().update(HOME=_home); restore(); shutil.rmtree(tm2, ignore_errors=True)
     ok("branch_verdict: a MERGED PR with no head read deletes nothing",

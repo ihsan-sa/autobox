@@ -423,6 +423,16 @@ def selfcheck():
         t.join()
     case("landed() called from several threads at once gives each the same answer",
          len(res) == 8 and all(r == res[0] for r in res) and res[0] and _LOG["off"] == os.path.getsize(f"{tmp}/land/queue.log"))
+    # the host's record ~/.cc/member-facing/<repo> makes a repo a member's with no marker in its checkout
+    real_home = globals()["HOME"]
+    globals()["HOME"] = f"{tmp}/home"
+    os.makedirs(f"{tmp}/home/.cc/member-facing"); open(f"{tmp}/home/.cc/member-facing/rec", "w").close()
+    os.makedirs(f"{tmp}/dev/rec"); os.makedirs(f"{tmp}/dev/plain")
+    _MEMBER.update(at=0)
+    case("a repo with the host's record and no marker is a member's; one with neither is not",
+         is_member("rec") is True and is_member("plain") is False)
+    globals()["HOME"] = real_home
+    _MEMBER.update(at=0)
     write(p)
     case("write() leaves the pulse whole and no tmp file", json.load(open(out_path()))["v"] == V
          and not os.path.exists(out_path() + ".tmp"))

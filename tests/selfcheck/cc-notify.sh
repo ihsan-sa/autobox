@@ -532,6 +532,16 @@ PY
   k "$(no_ grep -q -- '-c UOWNER' <<<"$(args)")" "…and no DM went out"
   k "$(yes_ test "$(reqf .from)" = alice)" "…the request is from the workspace the marker names"
   k "$(yes_ grep -q -- "cc-slack post -c '#alice'" <<<"$(bargs)")" "…and the seat is told the way back to it"
+  # …and the HOST'S RECORD (~/.cc/member-facing/<repo>) does the same with no marker, a commit having deleted it: in
+  # ~/dev/<repo> and in its worktree ~/.cc/worktrees/<repo>/<track>, both named for the repo. A repo with neither does not.
+  mkdir -p "$NH/.cc/member-facing" "$NH/dev/carol" "$NH/dev/dave" "$NH/.cc/worktrees/carol/t"; : > "$NH/.cc/member-facing/carol"
+  NC "$NH/dev/carol" --owner "I need a repo on GitHub"
+  k "$(yes_ test "$(grep -c 'kind=request send=broker$' <<<"$(last)")/$(reqf .from)" = 1/carol)" "a repo the host records as member-facing, with no marker, asks the planner too, from that repo"
+  NC "$NH/.cc/worktrees/carol/t" --owner "I need a second repo"
+  k "$(yes_ test "$(grep -c 'kind=request send=broker$' <<<"$(last)")/$(reqf .from)" = 1/carol)" "…and so does its worktree, from the repo the path names"
+  NC "$NH/dev/dave" --owner "I need a repo on GitHub"
+  k "$(no_ grep -q 'kind=request send=broker$' <<<"$(last)")" "…while a repo with neither marker nor record is not member-facing"
+  rm -rf "${NH:?}/.cc/member-facing" "$NH/dev/carol" "$NH/dev/dave" "$NH/.cc/worktrees/carol"
   # --from IS THE RELAYER'S WORD, honoured from control alone: the daemon naming a member socket's workspace.
   N --ask --from bob -t "bob: blocked" "the daemon relays bob's escalation"
   k "$(yes_ test "$(reqf .from)" = bob)" "--from names the asker when the control seat (the daemon, here) relays for it"
