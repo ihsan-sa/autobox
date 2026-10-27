@@ -2100,6 +2100,24 @@ class TestRecord(Case):
                                          "--findings", "[correctness] x breaks"), 0)
         self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
 
+    def test_record_says_whether_a_failed_post_is_worth_retrying(self):
+        # a3490's read of #1991: gh's "Could not resolve to a PullRequest" is permanent; only the host is a blip
+        self.box(**{"gh pr view": self.facts()})
+        for why, retry in (("dial tcp: could not resolve host github.com", True),
+                           ("GraphQL: Could not resolve to a PullRequest with the number of 7", False)):
+            with self.subTest(why=why), mock.patch.object(R, "post_why", lambda *a: why), \
+                    mock.patch("builtins.print") as out:
+                self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", HEAD[:12]), 1)
+                self.assertEqual("waiting and running it again" in out.call_args[0][0], retry)
+
+    def test_comment_why_over_rest_gives_ghs_words_when_the_api_fails(self):
+        with mock.patch.object(GH, "slug", lambda root: "o/demo"), \
+                mock.patch.object(GH, "gh", lambda *a, **k: (1, "", "HTTP 403: forbidden")):
+            self.assertIn("403", GH.comment_why("/x", 7, "body"))
+        with mock.patch.object(GH, "slug", lambda root: "o/demo"), \
+                mock.patch.object(GH, "gh", lambda *a, **k: (0, "{}", "")):   # a 200 with no comment id is no post
+            self.assertTrue(GH.comment_why("/x", 7, "body"))
+
     def proc(self, cwd, comm="claude", exe=None):
         """A fixture /proc: this process (pid 30) -> a shell (20) -> a process named `comm` (10) in `cwd`, running
         `exe` (default: a binary under the CLAUDE_VERSIONS the test patches in)."""

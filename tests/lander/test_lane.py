@@ -2933,10 +2933,28 @@ class AtOnce(Fixture):
         # a3334's read of #1983: no saved read and no answer from gh is missing evidence, so it is not a full LAND
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
-        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(R, "pr_view", lambda *a, **k: None):
+        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(R, "pr_view", lambda *a, **k: None), \
+                mock.patch.object(GH, "slug", lambda root: "o/demo"), mock.patch.object(R, "LIGHT_WAIT", 0):
             _, lines = self.land()
         self.assertEqual(self.merged_order(), [], lines)
         self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
+
+    def test_a_light_pr_whose_comments_were_read_with_no_marker_is_a_full_land(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(GH, "slug", lambda root: "o/demo"), \
+                mock.patch.object(R, "pr_view", lambda *a, **k: {"comments": []}):
+            _, lines = self.land()
+        self.assertEqual(self.merged_order(), [1], lines)
+
+    def test_a_blip_is_asked_again_and_a_non_github_repo_is_not_handed_back(self):
+        views = iter([None, {"comments": []}])
+        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(GH, "slug", lambda root: "o/demo"), \
+                mock.patch.object(R, "pr_view", lambda *a, **k: next(views)), mock.patch.object(R, "LIGHT_WAIT", 0):
+            self.assertFalse(R.light_fixed(T.Job(repo="demo", pr=1, digest="d")))
+        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(GH, "slug", lambda root: ""), \
+                mock.patch.object(R, "pr_view", lambda *a, **k: None):
+            self.assertFalse(R.light_fixed(T.Job(repo="demo", pr=1, digest="d")))
 
     def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
         with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to

@@ -1718,8 +1718,9 @@ class Lane:
             if job.extra.get("ci") == "none" and R.light_fixed(job):
                 # security read of #1922: a PR that drops its own CI trigger lands as "no CI", and a demoted FIX
                 # would merge with no test at all; with no CI the light path keeps the HANDBACK
-                return self.handback(job, f"its read was a FIX the light path demoted, and no GitHub CI ran at "
-                                          f"{job.head[:12]}, so it needs a full fix round")
+                return self.handback(job, f"no GitHub CI ran at {job.head[:12]}, and its read was not shown to be a full "
+                                          f"LAND (a FIX the light path demoted, or GitHub gave no answer), so it "
+                                          f"needs a full fix round")
             # row, 10-19: "the landing lane merged dispatch#1296 on its own one review read ... before perms'
             # security read finished" — so a read perms has going holds the merge, and one that ended short of a
             # LAND is a query (perms' read of #1525: a dead read held silently)

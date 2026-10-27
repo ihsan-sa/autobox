@@ -1792,8 +1792,13 @@ def pr_view(root, pr, fields="comments"):
     return GH.pr_facts(root, pr, fields)[0]
 
 
+def post_why(root, pr, body):
+    """'' when the comment went up, else gh's words for why not; every post, `record`'s too, goes through here."""
+    return GH.comment_why(root, pr, body)
+
+
 def post(root, pr, body):
-    return GH.comment(root, pr, body)
+    return not post_why(root, pr, body)
 
 
 # --- review / delta_review -----------------------------------------------------------------------------------------
@@ -2173,15 +2178,25 @@ def _buy(job, template, diff, more, prior=None, light=False):
     return v
 
 
+LIGHT_TRIES, LIGHT_WAIT = 3, 3   # asks, and seconds between them, for a PR's comments when gh blips
+
+
 def light_fixed(job) -> bool:
     """Whether the LAND at the job's head is a FIX the light path demoted: this box's saved read says so, or the PR's
-    own marker does (light=1). With no saved read and GitHub not answering there is no evidence either way, so it
-    reads as demoted: the light path never lands on missing evidence."""
+    own marker does (light=1). With no saved read and GitHub not answering (after LIGHT_TRIES asks) there is no
+    evidence either way, so it reads as demoted: the light path never lands on missing evidence. A repo that is not
+    GitHub's has no marker to find, so it is not."""
     v = saved(job.digest)
     if not v:
-        view = pr_view(root_of(job), job.pr)
+        root = root_of(job)
+        for i in range(LIGHT_TRIES):
+            view = pr_view(root, job.pr)
+            if view is not None or not GH.slug(root):
+                break
+            if i + 1 < LIGHT_TRIES:
+                time.sleep(LIGHT_WAIT)
         if view is None:
-            return True
+            return bool(GH.slug(root))
         v = recorded(view.get("comments") or [], {job.digest} - {""}, job.head)
     return bool((getattr(v, "extra", None) or {}).get("light_fix"))
 
@@ -2399,9 +2414,9 @@ def cmd_record(argv):
     rows = [ln.strip() for ln in findings.splitlines() if ln.strip()]
     v = T.Verdict(verdict=word, digest=job.digest, blocking=rows if word != T.LAND else [],
                   advisory=rows if word == T.LAND else [], model=opts["by"])
-    why = GH.comment_why(root_of(job), pr, marker(v, job.base_sha, job.head, opts["by"]))
+    why = post_why(root_of(job), pr, marker(v, job.base_sha, job.head, opts["by"]))
     if why:
-        wait = re.search(r"rate limit|timed out|timeout|\b50[234]\b|could not resolve", why, re.I)
+        wait = re.search(r"rate limit|timed out|timeout|\b50[234]\b|could not resolve host", why, re.I)
         print(f"lander record: the record did not reach PR #{pr}: {why} — "
               + ("waiting and running it again is the fix" if wait else "waiting will not fix this; check the PR and the login"))
         return 1
