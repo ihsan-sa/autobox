@@ -48,7 +48,7 @@ slot at once (alone=True), so it runs by itself; it takes them in order and neve
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
 SETTLE (dispatch, 10-24/25: under another user's load the box's checks ran slow, five alone reruns queued, the
 oldest 92 min, and main stayed red ~6 h behind its fix). An alone wait given settle= (run.py: the largest cap in the
-check's manifest, the longest any of its checks holding a slot may run; none for a security check) that still
+check's manifest, the longest any of its checks holding a slot may run; a security check too, though run.py then takes no answer from it, so a loaded run cannot pass one) that still
 lacks a slot by then lets go of what it holds and waits for one slot as load admits, in its place in the queue;
 run.py takes a loaded red from such a run for no answer, so load still cannot fake a red, and a green under load
 or a red without it stands.

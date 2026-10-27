@@ -71,7 +71,7 @@ base run and its red is the diff's — except a check the base defines whose run
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
 load (A.loaded() at either end, or starved(): a box run whose wall time was STARVED times its CPU time while a load
 average stood at the box's cores), on either tree, gets ONE diagnostic rerun alone (every slot held; one that has not got them all within the largest cap
-in its manifest runs as load admits instead, admission SETTLE, though a security check never does, and a loaded red from it is unrunnable, no answer: a base red under load whose rerun gives none holds as `blocked-by-main`, never ratcheted), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+in its manifest runs as load admits instead, admission SETTLE, a security check too, but it gives no answer, green or red, instead of running beside others; a loaded red from the rest is unrunnable, no answer: a base red under load whose rerun gives none holds as `blocked-by-main`, never ratcheted), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
 whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded
 (or loaded by starved() alone short of its cap: a PR's own check sets its ratio with a sleep), a check that guards a security path or that the change touches, whose first red stands; green the second time passes
 with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
@@ -859,7 +859,7 @@ def laptop_argv(check, tree, cwd, dest=""):
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
         label: str = "lander.0", changed: list | None = None, alone: bool = False, base_tree: str = "",
         state: str | None = None, express: bool = False, lane: bool = False, first=False,
-        settle: float | None = None) -> T.Result:
+        settle: float | None = None, security: bool = False) -> T.Result:
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
@@ -899,7 +899,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     def attempt(head: str, run_dir: str) -> T.Result:
         if kind != "laptop":
             return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane,
-                            first, settle, repo_root)
+                            first, settle, repo_root, security)
         # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
         # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
         # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
@@ -914,7 +914,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         r, took = None, False
         for dest in awake:
             r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane, first,
-                         settle, repo_root)
+                         settle, repo_root, security)
             why = str(r.extra.get("why", ""))
             if r.status != T.UNRUNNABLE or stopped() or not (r.extra.get("not_sent") or r.extra.get("never_started")):
                 if r.extra.get("never_started") != "unreached":
@@ -949,7 +949,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         p_want = base_of(p_head)
         if kind == "laptop":
             p = _attempt(check, tree_sha, "box", "", p_head, p_dir, cwd, env_extra, alone, state, express, lane,
-                         first, settle, repo_root)
+                         first, settle, repo_root, security)
         else:
             p = attempt(p_head, p_dir)
         p = base_kept(p, p_head, p_want)
@@ -969,7 +969,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
 
 
 def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,
-             first=False, settle=None, repo=".") -> T.Result:
+             first=False, settle=None, repo=".", security=False) -> T.Result:
     """One run of `check` at `where` (on the runner `dest` when that is the laptop kind); Result.runner names the
     runner that took it: `laptop:<user@host>:-` off the box."""
     kind = where.split(":")[0]
@@ -997,6 +997,8 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
         with held as got:
             settled = alone and got is not None and len(got) < k   # SETTLE: it waited out settle and ran beside others
             alone = alone and not settled
+            if settled and security:   # a security check never runs loaded, where a green could pass: no answer, requeue
+                raise Unrunnable(f"no run alone in {settle / 60:.0f} min, and a security check does not run beside others")
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
                 argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
@@ -1100,7 +1102,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     base tree has no such check or not its run file, so there is no base run and a red is the diff's. main: main's
     own record of this check on exactly base_tree (health.at); failed stands for the base run of a security check."""
     runner = runner or run
-    kw = {**run_kw, "base_tree": base_tree}
+    kw = {**run_kw, "base_tree": base_tree, **({"security": True} if security else {})}
 
     def go(tree, alone=False, base=False, keep=True):
         # once the box has taken a check over, every later run of it (alone, base) stays on the box: a laptop pass
@@ -1359,9 +1361,9 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory", so it is never quarantined
         security = name == M.BUILTIN or any(M.match(list(m.policy.gate_first) + list(m.policy.security_review) +
                                                      list(SECURITY_PATHS), p) for p in own if p)
-        # SETTLE waits out the longest a check holding a slot may run; a security check never settles, because a
-        # member who loads the box could otherwise trade its rerun alone for a loaded one, where a green passes
-        settle = None if security else max([c.cap] + [o.cap for o in m.checks.values()])
+        # SETTLE waits out the longest a check holding a slot may run; a security check then gives no answer instead
+        # of running beside others, because a member who loads the box could trade its rerun alone for a loaded one
+        settle = max([c.cap] + [o.cap for o in m.checks.values()])
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
         where = choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:

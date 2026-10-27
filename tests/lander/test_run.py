@@ -4097,9 +4097,20 @@ class CheckCaged(Env):
         with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), mock.patch.object(RUN, "spill", return_value=""):
             self.assertEqual((plan(), seen), (T.PASSED, ["box"]))   # a box with room keeps it
 
-    def test_an_alone_rerun_settles_after_its_manifests_longest_cap_and_a_security_checks_never_does(self):
+    def test_a_security_check_that_settles_gives_no_answer_even_for_a_green(self):
+        real = A.slot
+        bounded = lambda *a, **k: real(*a, **{"deadline": 30, **k})
+        green = chk(klass=T.HOST, cap=5)
+        with mock.patch.object(A, "slots", lambda *a, **k: 2), mock.patch.object(A, "slots_now", lambda *a, **k: 2), \
+                real(self.state, k=2, say=lambda _: None), mock.patch.object(A, "slot", bounded):
+            r = self.run_(green, alone=True, settle=0.2, security=True)
+        self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+        self.assertIn("security check", r.extra["why"])
+
+    def test_an_alone_rerun_settles_after_its_manifests_longest_cap_security_checks_too(self):
         # Opus read of #1942: a 120 s check's slots are held by 1800 s ones, so its own cap is too short a wait. perms'
-        # read: a member who loads the box must not trade a security check's rerun alone for a loaded one
+        # read: a member who loads the box must not trade a security check's rerun alone for a loaded one, so a
+        # security check that settles gives no answer (next test) instead of never giving up (raised-alone-base-rerun)
         seen = {}
 
         def runner(check, tree, where, **kw):
@@ -4109,7 +4120,7 @@ class CheckCaged(Env):
                                "guard": chk(name="guard", cap=60, paths=["core/bin/guard"])},
                        policy=T.Policy(gate_first=["core/bin/guard"]))
         RUN.run_plan(self.repo, m, T.Plan(checks=list(m.checks)), [], "h", runner=runner, record_reds=False)
-        self.assertEqual(seen, {"short": 1800, "long": 1800, "guard": None})
+        self.assertEqual(seen, {"short": 1800, "long": 1800, "guard": 1800})
 
     def test_caged_only_lets_the_plan_spill(self):
         with mock.patch.object(RUN, "run_plan", return_value={}) as rp:
