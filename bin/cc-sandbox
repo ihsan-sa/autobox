@@ -72,7 +72,7 @@
 #     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
 #     starts from and what every other live session of the handle reads next; its host path is not inside) and
 #     whichever account the owner minted for it, his own included: a member can print whatever is in there, so that is his call to
-#     make per workspace. With no credential of its own the workspace does not start · a
+#     make per workspace. With no credential of its own the workspace does not start, and a signed-out one starts only a command that is not claude or cc-loop (a build) · a
 #     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
 #     workspace (`hasCompletedOnboarding` and `hasTrustDialogAccepted` on its own paths) so the member is not walked through the setup
 #     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
@@ -1487,9 +1487,12 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # Fail closed, and say what to mint.
   # This is the LAST wall: cc checks the same file on the host before it opens the window (member_credential), and tells
   # #<h> and the owner — a refusal here lands in a pane nobody reads (review-156d).
-  if ! cred_usable "$own"; then
+  # THE WALL IS FOR CLAUDE. A command that is not claude or cc-loop (auto-publish's npm/vite build) never logs in, so a
+  # SIGNED-OUT file — there, token blank — does not stop it: the blank file is still what is bound, nothing falls back.
+  # A member's lessons were off the site for 2.5 days behind this wall (2026-10-24). A file that is not there still refuses.
+  if ! cred_usable "$own" && { [ ! -e "$own" ] || claude_launch "$1"; }; then
     why=$(cred_why "$own")
-    echo "cc-sandbox: $h has no credential of its own ($own: $why) — a workspace never falls back to anyone else's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. Nothing starts here until then." >&2
+    echo "cc-sandbox: $h has no credential of its own ($own: $why) — a workspace never falls back to anyone else's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. No claude starts here until then." >&2
     exit 2
   fi
   # THE FILE ITSELF, bound rw at claude's path — not a copy of its content. A copy landed in the tmpfs, so the refresh a
@@ -1552,6 +1555,7 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
                         | reduce ($d, $cwd) as $k (.; .[$k] = ((.[$k] // {}) + {hasTrustDialogAccepted: true}))),
              mcpServers: $m, hasCompletedOnboarding: true, hasSeenAutoModeEntryWarning: true, hasSeenAutoDefaultNotice: true}'); }
 CLAUDEBIN="${CC_CLAUDE:-$H/.local/bin/claude}"   # the same knob cc and cc-loop use to name claude
+claude_launch(){ case "${1##*/}" in claude|cc-loop) return 0;; esac; [ "$1" = "$CLAUDEBIN" ]; }   # $1 a member command → true when it starts claude
 # A HANDLE NEVER NAMES THE BOX'S OWN STATE (security read of #1050, 2026-10-12). build_member binds ~/.cc/state/<handle>
 # read-write into the member's boundary, so a handle `land` would hand that member the whole landing state dir, and a repo's
 # name that repo's planning dir. The brief: "refuses a handle that names an existing box-owned dir under ~/.cc/state that
@@ -1971,17 +1975,22 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: with no credential of its own the workspace does NOT start — the owner'"'"'s is no fallback' "$rc/$(grep -c STARTED <<<"$out")" 2/0
   t 'member: and the refusal names the command that mints one' "$(grep -cF "Mint one: cc-sandbox mint $h" <<<"$out")" 1
   mkdir -p "$(dirname "$own")" && echo '{"claudeAiOauth": {}}' > "$own" || return 1
-  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
-  t 'member: a credential file without an access token is no credential — still no start' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/0/1
+  out=$("$SELF" member "$h" t -- cc-loop "$h" t 2>&1); rc=$?
+  t 'member: a credential file without an access token is no credential — cc-loop does not start' "$rc/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/1
   # …AND NEITHER IS A BLANKED ONE. This exact file — accessToken and refreshToken emptied in place, expiresAt 0, the rest
   # of a real credential intact — is what claude leaves behind when a refresh is refused, and `jq -e .accessToken` says
   # true for "". So the wall passed it and a member's sub-project session sat for hours showing "Not logged in · Run
   # /login" while its row said running (2026-09-08). It is a signed-out workspace, not an unminted
   # one, and the refusal has to say which: only one of the two is a mint that never happened.
   echo '{"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionType": "max"}}' > "$own" || return 1
-  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
-  t 'member: a credential BLANKED by a refused refresh is no credential either — no start, and the reason says signed out rather than unminted' \
-    "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'access token is EMPTY' <<<"$out")" 2/0/1
+  out=$("$SELF" member "$h" t -- "$CLAUDEBIN" -p hi 2>&1); rc=$?
+  t 'member: a credential BLANKED by a refused refresh is no credential either — claude does not start, and the reason says signed out rather than unminted' \
+    "$rc/$(grep -c 'access token is EMPTY' <<<"$out")" 2/1
+  # …BUT A BUILD IS NOT CLAUDE. auto-publish's npm/vite step through here never logs in, and a signed-out member's lessons
+  # fell off the site behind this wall (2026-10-24). It starts, and what it sees at claude's path is the blank file itself.
+  echo '{"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}' > "$own" || return 1
+  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED; jq -r .claudeAiOauth.accessToken "$1" | wc -c' sh "$c" 2>&1); rc=$?
+  t 'member: a signed-out workspace still runs a command that is not claude, on its own blank file and no one else'"'"'s' "$rc/$(grep -c STARTED <<<"$out")/$(tail -1 <<<"$out")" 0/1/1
   # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
   mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
   { jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" && chmod 600 "$own"; } || return 1   # 600, as mint installs it
