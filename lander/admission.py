@@ -63,7 +63,17 @@ anyone who came later, the lane included, and an alone run at the head of the qu
 lets go instead of losing it to the next check. Nobody gets more slots than slots_now() allows; the order changes,
 not the count. LANES FIRST (planning seat, 2026-10-06: a lane sat 6h45m behind workers' green runs): a landing
 lane's ticket is named `+` then 19 digits instead of 20, so it sorts before every worker's and waits only behind
-an older lane's; a worker's wait is unchanged otherwise. A ticket whose holder died is unlocked, and the next
+an older lane's. AGED (convert-refuses-a-former-member-repo's green run, 10-26/27: the dispatch lane's heavy checks
+ran back to back and the worker waited over 12 h while the count ahead of it grew): a worker's wait still without a
+slot after AGED seconds (LANDER_WORKER_AGED, default 2 h, never under AGED_MIN's 10 min whatever a caller sets)
+takes a lane's ticket named when its wait began, so from then on it goes ahead of every lane ticket younger than it,
+and waits as a lane that came when it did would. It never goes ahead of a put-first job's: it is named FRONT_GAP
+behind the newest in their leading run, which leaves the room behind them for later ones, and the same behind a
+live PROVE HOLD's, again whenever a hold is taken behind it later (perms and Opus' reads of #1996). A lane
+waits behind a worker only once that worker has waited AGED, so a pile of fresh worker runs still never holds it up,
+and a worker waits at most AGED plus what was queued as a lane before it came. 2 h is a third of the ~6 h longest
+wait a fair queue sees (TICKET_CAP is twice that), so it never pushes a starved worker past the cap.
+A ticket whose holder died is unlocked, and the next
 waiter removes it, as it does anything in the queue that is not a regular file. A name _ticket would not have given is ignored, never waited on and never said,
 so a planted `!hold` that sorts first holds nobody up. A ticket it cannot open or lock for want of a file
 descriptor, memory or a lock still counts as live: only a bad entry is removed. A waiter behind another holds no slot,
@@ -205,6 +215,18 @@ FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below l
 FRONT = "front"     # slot(first=) for a put-first job's check: ahead of every waiter, behind a PROVE HOLD (FIRST CLAIM)
 FRONT_GAP = 10**6   # ns the first FRONT ticket goes before the oldest waiter: room for later ones behind it
 FRONT_MARK = "ffff"   # a FRONT ticket's rand starts with it: an older cc-green's random one does 1 time in 65536
+AGED_MIN = 600   # seconds: no caller's LANDER_WORKER_AGED makes a worker's wait a lane's sooner (AGED)
+
+
+def _aged(v: str | None) -> float:
+    """AGED's seconds from LANDER_WORKER_AGED: 7200 unset or not a number, never under AGED_MIN."""
+    try:
+        return max(float(AGED_MIN), float(v or 7200))
+    except ValueError:
+        return 7200.0
+
+
+AGED = _aged(os.environ.get("LANDER_WORKER_AGED"))   # seconds before a worker waits as a lane (AGED)
 
 
 def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
@@ -490,16 +512,17 @@ TICKET = re.compile(r"[0-9+][0-9]{19}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: 
 BAD = (errno.ELOOP, errno.ENXIO, errno.EACCES, errno.EPERM)   # a symlink, a socket, an unreadable file: not a ticket
 
 
-def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None = None):
+def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None = None, aged: bool = False):
     """Join the queue: a file named by when the wait began, flocked for as long as this process waits. It is locked
     before it is given its listed name, so nobody sees it unlocked and takes it for a dead one. A lane's name starts
     `+` (LANES FIRST), which sorts before a digit and still reads as the same number. first: a lane's name, its time
     FIRST_BACK seconds back (FIRST CLAIM), or `born` (ns) when that is older; first=FRONT: FRONT_GAP before the oldest
     live ticket too, but one ns behind the newest FRONT one in the leading run of them (FRONT_MARK), and never
-    before a PROVE HOLD (_hold); never before time 1 either, so a planted time-0 ticket cannot make a name TICKET does not match."""
+    before a PROVE HOLD (_hold); aged: FRONT_GAP behind those and the hold (AGED); never before time 1 either, so a
+    planted time-0 ticket cannot make a name TICKET does not match."""
     now = time.time_ns()
     born = min(now - (FIRST_BACK * 10**9 if first else 0), born or now)
-    if first == FRONT:
+    if first == FRONT or aged:
         _, oldest, stale, _ = _ahead(qdir, "~")   # _ahead drops the dead, so the fronts left are live
         hold, fronts = _hold(qdir), []   # the leading run of FRONT tickets
         for n in sorted(n for n in os.listdir(qdir) if TICKET.fullmatch(n) and n not in stale):
@@ -507,9 +530,10 @@ def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None
                 fronts.append(int(n.split("-")[0]))
             elif int(n.split("-")[0]) > (hold or 0):   # what waits behind a hold does not end the run before it
                 break
-        born = min(born, int(oldest.split("-")[0]) - FRONT_GAP) if oldest else born
-        born = max([born, *(f + 1 for f in fronts)])   # put first later, it goes behind those put first before
-        born = max(born, hold + 1) if hold is not None else born
+        step = 1 if first == FRONT else FRONT_GAP   # aged: the room a first FRONT one leaves stays for later ones
+        born = min(born, int(oldest.split("-")[0]) - FRONT_GAP) if oldest and first == FRONT else born
+        born = max([born, *(f + step for f in fronts)])   # put first later, it goes behind those put first before
+        born = max(born, hold + step) if hold is not None else born
     born = max(born, 1)
     rand = FRONT_MARK + uuid.uuid4().hex[:4] if first == FRONT else "0" + uuid.uuid4().hex[:7]
     name = f"{'+' if lane or first else '0'}{born:019d}-{os.getpid()}-{rand}"
@@ -675,16 +699,18 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     told: set = set()
     need = need or _bytes(CHECK_MEM) or 0
     ask = first if callable(first) else lambda: first
-    firsted = ask()
+    firsted, worker = ask(), not lane
     mine, tf = _ticket(q, lane, firsted)
     marked, mark_f = "", None
     try:
         while True:
             if stop is not None and stop():
                 raise TimeoutError("stopped while it waited for a lander slot")
-            if firsted != FRONT and ask() not in (firsted, False):   # put first while it waited: moved up, never back
-                firsted = ask()
-                new, nf = _ticket(q, lane, firsted, born=int(mine.split("-")[0]))
+            aged = worker and not firsted and time.time() - began >= AGED and (   # AGED: a worker's wait becomes a
+                not lane or (_hold(q) or 0) >= int(mine.split("-")[0]))   # lane's, and goes behind a hold taken since
+            if aged or firsted != FRONT and ask() not in (firsted, False):   # aged, or put first meanwhile: up, never back
+                lane, firsted = lane or aged, ask()
+                new, nf = _ticket(q, lane, firsted, born=int(mine.split("-")[0]), aged=aged)
                 with contextlib.suppress(OSError):
                     os.unlink(os.path.join(q, mine))
                 tf.close()

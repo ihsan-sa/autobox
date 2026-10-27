@@ -2849,6 +2849,112 @@ class Admission(unittest.TestCase):
         with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True) as held:
             self.assertEqual(held, [1])
 
+    def test_a_worker_that_waited_aged_goes_ahead_of_lanes_that_keep_coming(self):
+        # AGED (10-26/27: a worker's green run waited over 12 h while the dispatch lane's checks kept arriving ahead)
+        began = time.time_ns()
+        st = self.lanes_first_queue(f"+{began + 10**9:019d}-4141-0000beef")   # a lane's check, younger than the worker's
+        q = os.path.join(st, "slots", "queue")
+        done, lanes = threading.Event(), []
+
+        def arrive():   # a new lane ticket every 20 ms, each younger than the worker's wait
+            while not done.wait(0.02):
+                f = open(os.path.join(q, f"+{time.time_ns():019d}-4242-{len(lanes):08x}"), "a")
+                fcntl.flock(f, fcntl.LOCK_EX)
+                lanes.append(f)
+        t = threading.Thread(target=arrive)
+        t.start()
+        self.addCleanup(lambda: [f.close() for f in lanes])
+        self.addCleanup(t.join)
+        self.addCleanup(done.set)
+        said = []
+        with mock.patch.object(A, "AGED", 0.5):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=3, say=said.append) as held:
+                self.assertEqual(held, [1])   # past AGED it goes ahead of every lane ticket younger than its wait
+        self.assertIn("waiting ahead of it, the oldest pid 4141", said[0])   # before it, it waited behind them all
+        self.assertGreater(len(lanes), 10)
+        self.assertLess(A.AGED, A.TICKET_CAP / 2)   # a starved worker is never pushed past the cap
+
+    def aging_worker(self, st, wait=1.5):
+        """A worker's slot() waiting in a thread with AGED 0.3 s -> (thread, what it raised, queue dir)."""
+        out = []
+
+        def run():
+            try:
+                with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=wait, say=lambda _: None):
+                    out.append("held")
+            except TimeoutError as e:
+                out.append(e)
+        patch = mock.patch.object(A, "AGED", 0.3)
+        patch.start()
+        self.addCleanup(patch.stop)
+        t = threading.Thread(target=run)
+        t.start()
+        self.addCleanup(t.join)
+        return t, out, os.path.join(st, "slots", "queue")
+
+    def aged_ticket(self, q, after=""):
+        """The aged worker's ticket in q (named after `after`), once it has one."""
+        for _ in range(200):
+            mine = [n for n in os.listdir(q) if n.startswith("+") and n.split("-")[1] == str(os.getpid())
+                    and n.split("-")[2].startswith("0") and n > after]
+            if mine:
+                return mine[0]
+            time.sleep(0.02)
+        self.fail(f"no aged ticket in {sorted(os.listdir(q))}")
+
+    def lander_self(self):
+        """A running process whose cmdline says lander-self, as a PROVE HOLD's holder is."""
+        holder = subprocess.Popen(["bash", "-c", "exec -a lander-self sleep 30"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        for _ in range(100):
+            with open(f"/proc/{holder.pid}/cmdline", "rb") as f:
+                if f.read().startswith(b"lander-self"):
+                    break
+            time.sleep(0.02)
+        return holder.pid
+
+    def test_an_aged_worker_stays_behind_checks_put_first_while_it_waited(self):
+        # Opus' read of #1996: named when its wait began, the aged ticket went ahead of a put-first job's, and a
+        # later put-first one sorted ahead of the earlier
+        st = self.lanes_first_queue(f"+{time.time_ns() + 10**9:019d}-4141-0000beef")   # a lane's, younger than it
+        patch = mock.patch.object(A, "FIRST_BACK", 0)   # the worker has waited longer than FIRST_BACK before it
+        patch.start()
+        self.addCleanup(patch.stop)
+        t, out, q = self.aging_worker(st)
+        time.sleep(0.1)
+        first, f = A._ticket(q, lane=True, first=A.FRONT)   # put first while the worker waits
+        self.addCleanup(f.close)
+        aged = self.aged_ticket(q)
+        second, f = A._ticket(q, lane=True, first=A.FRONT)
+        self.addCleanup(f.close)
+        t.join()
+        self.assertIsInstance(out[0], TimeoutError)   # it never went ahead of them
+        self.assertLess(first, second)
+        self.assertLess(second, aged)
+
+    def test_an_aged_worker_stays_behind_a_live_prove_hold(self):
+        # perms' read of #1996: an aged ticket named when its wait began went ahead of a release proof's hold
+        pid = self.lander_self()
+        hold = f"+{time.time_ns() + 10**9:019d}-{pid}-0000a0a0"   # younger than the worker's wait
+        st = self.lanes_first_queue(hold)
+        t, out, q = self.aging_worker(st)
+        aged = self.aged_ticket(q)
+        self.assertGreater(aged, hold)
+        later = f"+{int(aged.split('-')[0]) + 10**9:019d}-{pid}-0000a0a1"   # a hold taken behind it later
+        h = open(os.path.join(q, later), "a")
+        fcntl.flock(h, fcntl.LOCK_EX)
+        self.addCleanup(h.close)
+        self.assertGreater(self.aged_ticket(q, after=later), later)   # it goes behind that one too
+        t.join()
+        self.assertIsInstance(out[0], TimeoutError)
+
+    def test_a_callers_aged_threshold_never_goes_under_ten_minutes(self):
+        # perms' read of #1996: LANDER_WORKER_AGED=0 in a caller's env made a worker's wait a lane's at once
+        for v, want in (("0", 600), ("-5", 600), ("abc", 7200), ("", 7200), (None, 7200), ("900", 900)):
+            self.assertEqual(A._aged(v), want, v)
+        self.assertGreaterEqual(A.AGED, A.AGED_MIN)
+
     def test_a_prove_hold_holds_the_lane_and_lets_its_own_sweep_through(self):
         # PROVE HOLD: "the lane admits no new checks while a prove runs" — but the sweep that names the hold does
         import time
