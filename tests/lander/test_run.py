@@ -2331,6 +2331,43 @@ class Admission(unittest.TestCase):
             first.close()   # slot 1 lets go: what is left is a passer's, so nobody passes now and the slice drains
             head_says(str(big))
 
+    def test_a_passers_mark_waits_out_a_shared_lock_and_never_follows_a_symlink(self):
+        # #1978's reads: a peer's _held() holding the mark shared at that instant left the passer a non-passer for
+        # its whole run, and a symlink planted as the mark redirected the open and the flock
+        import threading
+        import time
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        quiet = dict(psi_root=self.psi_dir(0, 0), loadavg=self.calm_load, poll=0.02, say=lambda _: None, k=8)
+        sl, d = os.path.join(st, "lander.slice"), os.path.join(st, "slots")
+        os.makedirs(os.path.join(d, "queue"))
+        os.makedirs(sl)
+        with open(os.path.join(sl, "memory.stat"), "w") as f:
+            f.write("anon 0\n")
+        big, small = 3400 << 20, 100 << 20
+        with mock.patch.object(A, "SLICE_HIGH", "6G"), mock.patch.object(A, "SLICE_DIR", sl), \
+                A.slot(st, need=big, **quiet):
+            head = open(os.path.join(d, "queue", f"+{time.time_ns() - 60 * 10**9:019d}-4242-0000beef"), "a")
+            fcntl.flock(head, fcntl.LOCK_EX)
+            self.addCleanup(head.close)
+            head.write(str(big))
+            head.flush()
+            peer = open(os.path.join(d, "slot.2.passed"), "a")
+            fcntl.flock(peer, fcntl.LOCK_SH)
+            threading.Timer(0.2, peer.close).start()
+            with A.slot(st, deadline=1, need=small, **quiet) as got:
+                self.assertEqual(got, [2])
+                self.assertEqual(A._held(d)[2], big)   # still marked a passer
+            os.unlink(os.path.join(d, "slot.2.passed"))
+            target = os.path.join(st, "elsewhere")
+            open(target, "w").close()
+            os.symlink(target, os.path.join(d, "slot.2.passed"))
+            with A.slot(st, deadline=1, need=small, **quiet) as got:
+                self.assertEqual(got, [2])
+                with open(target) as t:
+                    fcntl.flock(t, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the symlink's target was never locked
+                self.assertEqual(A._held(d)[2], big + small)   # nor read as a mark: counted a non-passer
+
     def test_a_systemctl_that_fails_or_hangs_on_the_slice_is_said(self):
         for boom in (OSError("no systemctl"), subprocess.TimeoutExpired(["systemctl"], 10)):
             err = io.StringIO()

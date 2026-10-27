@@ -408,6 +408,11 @@ def scope_stat(argv: list) -> str:
     return os.path.join(SLICE_DIR, f"{unit}.scope", "memory.stat") if unit else ""
 
 
+def _nofollow(path: str, flags: int) -> int:
+    """open()'s opener for a `slot.N.passed` mark: a symlink planted in its place is never followed."""
+    return os.open(path, flags | os.O_NOFOLLOW, 0o644)
+
+
 def _held(d: str) -> tuple:
     """(how many slots are held, the memory their holders reserved, what the holders that passed nobody (PASS)
     reserved, None while none of them holds one): each held slot's file names its holder's need, a flocked
@@ -429,7 +434,7 @@ def _held(d: str) -> tuple:
             n += 1
             reserved += mem
             try:
-                with open(os.path.join(d, name + ".passed")) as p:
+                with open(os.path.join(d, name + ".passed"), opener=_nofollow) as p:
                     fcntl.flock(p, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:   # its holder passed
                 continue
@@ -731,10 +736,10 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     os.ftruncate(f.fileno(), 0)   # what it reserved, for the next waiter's room()
                     f.write(str(need))
                     f.flush()
-                    if passed:
-                        mark_f = open(os.path.join(d, f"slot.{n}.passed"), "a")
+                    if passed:   # advisory: a mark it can't open or lock only counts it a non-passer
                         with contextlib.suppress(OSError):
-                            fcntl.flock(mark_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            mark_f = open(os.path.join(d, f"slot.{n}.passed"), "a", opener=_nofollow)
+                            fcntl.flock(mark_f, fcntl.LOCK_EX)   # waits out a peer _held()'s brief LOCK_SH
                 held.append((n, f))
                 if not alone:
                     break
@@ -773,10 +778,10 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(q, mine))
             tf.close()
+        if mark_f is not None:   # before its slot, so the next holder of the slot never waits on this mark
+            mark_f.close()
         for _, f in held:
             f.close()
-        if mark_f is not None:
-            mark_f.close()
         if gate is not None:
             gate.close()
 
