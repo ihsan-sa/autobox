@@ -38,7 +38,8 @@ a fresh start that keeps reads_used and the prior verdict (`requeued`); one for 
 empty (`again`), and on a checking job sets
 extra.reread so it reads its PR's state and head at its next turn (a push mid-check re-queues it, which says `again`).
 A job held by the box itself (hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would
-not mend it.
+not mend it. Its hold is made due now only for a usage limit's or for main health's (who=main-health: the check it was
+held main-red on passed on main again, tick.main_health).
 A release request (release=WHO, from `lander release`) is applied before the rest, by release.apply: it drops a job
 still queued as the request found it, at the head it was read on, with the PR's other waiting requests, or logs why
 not; it never makes a job. A second release request for a PR this drain released is answered `duplicate`, and one
@@ -551,8 +552,10 @@ def _drain(repo: str) -> list:
                     job.extra[k] = req[k]
             if job.state == T.CHECKING:   # lane.reread: a push mid-check is the commonest `again`
                 job.extra["reread"] = True   # only a checking job reads it
-            elif job.state == T.HELD and job.extra.get("limit"):   # a usage limit's hold is asked again now: a live
-                job.extra["not_before"] = E.stamp()                # limit holds it again with no read (review._buy)
+            elif job.state == T.HELD and (job.extra.get("limit") or req.get("who") == "main-health"):
+                # a usage limit's hold is asked again now (a live limit holds it again with no read, review._buy), and
+                # so is a main-red hold on a check main passes again (tick.main_health)
+                job.extra["not_before"] = E.stamp()
             save(job)
             E.log("again", repo, pr)
             lines.append(f"{repo}#{pr} again")

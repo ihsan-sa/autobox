@@ -1628,6 +1628,68 @@ class HostAndRunners(Env):
         # read of #1966: main's red under load with no answer alone holds; it never makes the red the PR's, nor passes it
         self.assertEqual(o.status, RUN.BLOCKED, o.note)
 
+    @contextlib.contextmanager
+    def loaded_box(self):
+        """k=2 under load with slot 1 held by another user's check: an alone run can only settle, as SETTLE does."""
+        real = A.slot
+        bounded = lambda *a, **k: real(*a, **{"deadline": 30, **k})   # a wait that never settles fails, never hangs
+        with mock.patch.object(A, "slots", lambda *a, **k: 2), mock.patch.object(A, "slots_now", lambda *a, **k: 2), \
+                mock.patch.object(RUN, "starved", lambda *a: False), mock.patch.object(A, "loaded", lambda *a, **k: True), \
+                real(self.state, k=2, say=lambda _: None), mock.patch.object(A, "slot", bounded):
+            yield
+
+    def test_judge_hands_security_to_its_reruns_alone_so_a_settled_one_gives_no_answer(self):
+        # reviews of #2004: security=True must reach run() from judge(), or a settled rerun's green would stand
+        green, head = chk(klass=T.HOST, cap=5), "h" * 40
+        red = lambda tree, loaded: T.Result(check=green.name, tree=tree, status=T.FAILED, extra={
+            "loaded": loaded, "why": "red", "fails": ["x"]}, cases=[{"name": "FAIL x", "status": T.FAILED}])
+
+        def runner(first):   # the first run of each tree is the red given; a rerun alone is a real green run
+            def go(check, tree, where, alone=False, **kw):
+                if not alone:
+                    return first[tree]
+                return RUN.run(check, self.tree, where, alone=True, repo_root=self.repo, settle=0.2, **kw)
+            return go
+        base = runner({head: red(head, False), self.tree: red(self.tree, True)})   # main's red under load
+        loaded_head = runner({head: red(head, True)})
+        with self.loaded_box():
+            o = RUN.judge(green, head, self.tree, runner=base, security=True)
+            self.assertEqual((o.status, o.results[-1].status), (RUN.BLOCKED, T.UNRUNNABLE), o.results)
+            o = RUN.judge(green, head, self.tree, runner=loaded_head, security=True, on_base=False)
+            self.assertEqual(o.status, T.UNRUNNABLE, o.results)
+            self.assertIn("security check", o.note)
+            # without the flag the same settled reruns are greens: the base's is main's, the head's passes it
+            self.assertEqual(RUN.judge(green, head, self.tree, runner=base).status, T.FAILED)
+            self.assertEqual(RUN.judge(green, head, self.tree, runner=loaded_head, on_base=False).status, T.PASSED)
+
+    def test_two_security_reruns_alone_on_two_slots_both_settle_and_neither_passes(self):
+        # reviews of #2004: two alone runs each wanting both slots must each give up, and a green from neither stands
+        green, out = chk(run="sleep 0.3", klass=T.HOST, cap=5), {}
+
+        def one(i):
+            out[i] = self.run_(green, alone=True, settle=0.2, security=True, label=f"lander.{i}")
+        with self.loaded_box():
+            ts = [threading.Thread(target=one, args=(i,)) for i in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(60)
+            self.assertEqual([t.is_alive() for t in ts], [False, False])
+        self.assertEqual([out[i].status for i in range(2)], [T.UNRUNNABLE] * 2, out)
+        self.assertTrue(all("security check" in out[i].extra["why"] for i in range(2)), out)
+
+    def test_judge_keeps_security_when_a_laptop_hands_a_check_to_the_box(self):
+        # reviews of #2004: a busy or red laptop hands the run to the box, which must still know it is a security check
+        for laptop in (T.UNRUNNABLE, T.FAILED):
+            seen = []
+
+            def runner(check, tree, where, **kw):
+                seen.append((where, kw.get("security")))
+                return T.Result(check=check.name, tree=tree, status=laptop if where == "laptop" else T.PASSED,
+                                extra={"why": "laptop"})
+            o = RUN.judge(chk(where=["laptop", "box"]), "h", "b", "laptop", runner=runner, security=True)
+            self.assertEqual((o.status, seen), (T.PASSED, [("laptop", True), ("box", True)]), laptop)
+
     def test_a_lanes_express_run_takes_no_slot_and_its_other_runs_wait_as_a_lane(self):
         # lane=True only moves the run's ticket ahead of a worker's: an express run still takes no slot at all
         calls, real = [], A.slot

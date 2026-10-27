@@ -6,9 +6,12 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    blocking check (plan.select, less the box checks the tip run itself runs and the
                                    checks nightly.py moved out) that the range since the last checked tip reaches, and
                                    every check the record holds red, run once on the tip by `check(name, sha)`
-                                   (tick.make_check). Each result is recorded. A check that turns red sends ONE alert
-                                   on the tip run's route, naming the check, the merge, and whether the merge's parent
-                                   passes it (code: the merge broke it) or fails it too (machine). -> {name: status}
+                                   (tick.make_check), the checks the record holds red first. Before each check after
+                                   the first, origin's tip is read again; once main has moved the pass stops, owed
+                                   (pending), so the next tick's pass runs on the newest tip. Each result is
+                                   recorded. A check that turns red sends ONE alert on the tip run's route, naming the
+                                   check, the merge, and whether the merge's parent passes it (code: the merge broke
+                                   it) or fails it too (machine). -> {name: status}
                                    of what ran, {} when the tip was already checked. Each result is written as it
                                    finishes, with "running": tip; a pass killed part-way leaves those on disk, and the
                                    next pass on the same tip runs only the checks it had not reached. After TRIES
@@ -17,9 +20,9 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    "running", stamps the tip in "gave_up" and runs nothing more on it; a send that
                                    raises writes nothing, so the pass stays pending and the next tick sends the card.
     lock(repo)                     the health lock: True when held, False when another pass holds it (never waits)
-    pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way, or a tick
-                                   found the lock taken and asked for one more (want(repo)), since the running pass
-                                   may be on an older tip.
+    pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way or stopped
+                                   on a tip main moved past, or a tick found the lock taken and asked for one more
+                                   (want(repo)), since the running pass may be on an older tip.
     red(repo)                      {name: entry} of every check the record holds red on main, whatever tree, if fresh
     at(repo, tree)                 {name: failed} of each check red on exactly `tree` within the last FRESH seconds:
                                    a fresh record of a PR's base, whose red run.judge() takes instead of running a
@@ -187,7 +190,14 @@ def run(repo, check, fallback=""):
     rc, subject = git(root, "log", "-1", "--format=%s", tip)
     merge = subject if rc == 0 and subject else tip[:12]
     done = {}
-    for name in sorted(names):
+    # 10-27: a pass on 5fadc4da ran three hours after main had moved five merges on, and the red it held kept PRs
+    # main-red after the newer tip passed. Main's reds run first, and a tip that moved stops the pass: "running" stays
+    # set and "tip" unmoved, so the next tick's pass is owed and covers this range on the newest tip.
+    first = sorted(names, key=lambda n: ((rec["checks"].get(n) or {}).get("status") != T.FAILED, n))
+    for i, name in enumerate(first):
+        if i and TP.origin_tip(root, base) not in ("", tip):
+            C.log("main-health", repo, "moved", tip=tip[:12])
+            return done
         r = check(name, tip)
         if r.status == T.UNRUNNABLE:
             continue

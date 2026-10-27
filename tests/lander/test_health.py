@@ -287,6 +287,52 @@ class Run(Case):
         self.assertEqual(said, [f"land:demo:main-health-gave-up@{TIP2[:12]}"], "the next tick sends it, once")
         self.assertEqual(HL.load("demo")["gave_up"], TIP2)
 
+    def test_a_pass_that_finds_main_moved_stops_and_the_next_runs_on_the_newest_tip(self):
+        """10-27: a pass on 5fadc4da ran three hours past five newer merges, and its stale red held PRs main-red."""
+        # the red is lib, which sorts after app by name, so only the reds-first order puts it first
+        self.go(TIP1, ["lib/x.py"], red={"lib"})
+        self.tip, self.files[TIP2], asked = TIP2, ["lib/z.py", "app/y.py"], []
+
+        def check(name, sha):
+            asked.append((name, sha))
+            self.tip = TIP3   # main moves while the first check runs
+            return T.Result(check=name, tree=sha, status=T.FAILED if name == "lib" else T.PASSED)
+        self.assertEqual(HL.run("demo", check), {"lib": T.FAILED})
+        self.assertEqual(asked, [("lib", TIP2)], "main's red runs first, and nothing more runs on the old tip")
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"]), (TIP1, TIP2), "the range stays owed")
+        self.assertTrue(HL.pending("demo"))
+        self.assertEqual(len(self.said), 1, "still red: no second alert")
+        ran, asked = self.go(TIP3, ["lib/z.py", "app/y.py"])
+        self.assertEqual(ran, {"app": T.PASSED, "lib": T.PASSED})
+        self.assertEqual(asked, [("lib", TIP3), ("app", TIP3)])
+        self.assertEqual(HL.red("demo"), {}, "the newer tip cleared the red")
+        self.assertEqual((HL.load("demo")["tip"], HL.load("demo")["running"]), (TIP3, ""))
+        self.assertFalse(HL.pending("demo"))
+
+    def test_a_job_held_main_red_is_tried_now_once_the_newer_tip_passes_the_check(self):
+        from lander import jobs as J
+        later = "2099" + C.now()[4:]   # a hold that would not end for decades
+        for pr, n in ((7, "app"), (8, "lib")):
+            J.save(T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
+                         extra={"hold": "box", "not_before": later, "main_red": {"check": n}}))
+        self.go(TIP1, ["app/x.py"], red={"app", "lib"})
+        self.tip, self.files[TIP2] = TIP2, ["app/y.py"]
+
+        def check(name, sha):
+            return T.Result(check=name, tree=sha, status=T.FAILED if name == "lib" else T.PASSED)
+        with mock.patch.object(TK, "make_check", lambda root, fallback="": check), \
+                mock.patch.object(TK.D, "root_of", lambda repo: self.tmp):
+            lines = TK.main_health("demo", True, "")
+        self.assertIn("[demo] PR #7: main passes app again, so its main-red hold is tried now", lines)
+        self.assertFalse(any("PR #8" in x for x in lines), "lib is still red on main")
+        with mock.patch.object(TK.J, "lane_jobs", lambda repo: []), \
+                mock.patch.object(TK.C, "left_held", lambda repo: False):
+            self.assertEqual(TK.waits("demo"), [TK.TICK_SECS], "the request wants the next tick")
+        self.assertEqual(J.drain("demo"), ["demo#7 again"])
+        self.assertEqual(J.not_before_left(J.load("demo", 7)), 0)
+        self.assertGreater(J.not_before_left(J.load("demo", 8)), 0)
+
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])
         self.assertIn("e2e-flow", ran)

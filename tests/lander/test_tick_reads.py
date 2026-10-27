@@ -191,7 +191,11 @@ class TickReads(unittest.TestCase):
         lines = TK.sweep_handed("alpha")
         self.assertEqual(len(lines), 2)
         self.assertTrue(all("pushed after it was handed back" in ln for ln in lines))
-        self.assertEqual(TK.waits("alpha"), [])                # its watches ended: nothing left to wake for
+        # its watches ended, but the push's request waits in the inbox for the next tick's drain: one tick more
+        self.assertEqual(TK.waits("alpha"), [TK.TICK_SECS])
+        with J.lane_lock("alpha"):
+            J.drain("alpha")
+        self.assertEqual(TK.waits("alpha"), [])                # drained: nothing left to wake for
 
 if __name__ == "__main__":
     unittest.main()
