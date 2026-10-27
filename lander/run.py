@@ -393,7 +393,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             mem: str = "") -> tuple:
     """-> (rc, secs, cpu_secs, capped, peak): peak is the most `anon` the run's scope held, its memory.stat file `mem`
     as read each poll while it ran (the scope goes when it exits; page cache does not count), or wait4's ru_maxrss, the
-    most its largest process held, when that is more (a child too brief for a poll still counts); a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    most its largest process held, when that is more (a child too brief for a poll still counts); a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group, as does a raise mid-run; rc < 0 is a signal.
     The cap catches a hung check, not a slow one: past it, a run whose log grew in the last min(cap, SILENT) seconds
     goes on (dispatch #1984, 10-25: held at 2404 s of a 2400 s cap at load 40-117, twice, for 15 h), and one that
     went that long without a line is ended, with a last line in its log saying so; so is one still printing at CEILING
@@ -416,42 +416,44 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
         for fd in keep:
             os.close(fd)
     capped, ru, held, size, grew = False, None, 0, 0, t0
-    while True:
-        if mem:
-            with contextlib.suppress(OSError, ValueError, IndexError, StopIteration):
-                held = max(held, A.anon(mem))
-        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
-        if pid:
-            rc = os.waitstatus_to_exitcode(status)
-            break
-        now = time.monotonic()
-        with contextlib.suppress(OSError):
-            if os.path.getsize(log) > size:
-                size, grew = os.path.getsize(log), now
-        silent = now - grew > min(cap, SILENT)
-        if (now - t0 > cap and silent) or now - t0 > CEILING * cap or stopped():
-            capped = not stopped()
-            if capped:
-                with contextlib.suppress(OSError), open(log, "a") as out:
-                    out.write(f"\nlander: stopped at {now - t0:.0f}s, past its cap of {cap}s, after"
-                              f" {now - grew:.0f}s with no output\n" if silent else
-                              f"\nlander: stopped at {now - t0:.0f}s, past {CEILING} times its cap of {cap}s,"
-                              f" still printing\n")
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(p.pid, sig)
-                except ProcessLookupError:
-                    pass
-                time.sleep(2)
-            _, status, ru = os.wait4(p.pid, 0)
-            rc = os.waitstatus_to_exitcode(status)
-            break
-        time.sleep(0.2)
-    p.returncode = rc
-    try:   # anything the check left behind in its group goes with it
-        os.killpg(p.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    try:
+        while True:
+            if mem:
+                with contextlib.suppress(OSError, ValueError, IndexError, StopIteration):
+                    held = max(held, A.anon(mem))
+            pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+            if pid:
+                rc = os.waitstatus_to_exitcode(status)
+                break
+            now = time.monotonic()
+            with contextlib.suppress(OSError):
+                if os.path.getsize(log) > size:
+                    size, grew = os.path.getsize(log), now
+            silent = now - grew > min(cap, SILENT)
+            if (now - t0 > cap and silent) or now - t0 > CEILING * cap or stopped():
+                capped = not stopped()
+                if capped:
+                    with contextlib.suppress(OSError), open(log, "a") as out:
+                        out.write(f"\nlander: stopped at {now - t0:.0f}s, past its cap of {cap}s, after"
+                                  f" {now - grew:.0f}s with no output\n" if silent else
+                                  f"\nlander: stopped at {now - t0:.0f}s, past {CEILING} times its cap of {cap}s,"
+                                  f" still printing\n")
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(p.pid, sig)
+                    except ProcessLookupError:
+                        pass
+                    time.sleep(2)
+                _, status, ru = os.wait4(p.pid, 0)
+                rc = os.waitstatus_to_exitcode(status)
+                break
+            time.sleep(0.2)
+        p.returncode = rc
+    finally:   # anything the check left behind in its group goes with it, on a raise too
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
     return rc, time.monotonic() - t0, cpu, capped, max(held, ru.ru_maxrss * 1024 if ru else 0)
 

@@ -14,6 +14,7 @@ import fcntl
 import io
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -249,7 +250,7 @@ class Cap(unittest.TestCase):
 
     def test_a_check_still_printing_at_its_ceiling_is_ended_and_its_log_says_why(self):
         t0 = time.monotonic()
-        rc, _, _, capped, _ = self.execute("while :; do echo retry; sleep 0.2; done")
+        rc, _, _, capped, _ = self.execute("for i in $(seq 150); do echo retry; sleep 0.2; done")   # 30 s at least
         self.assertLess(time.monotonic() - t0, 20)
         self.assertTrue(capped)
         self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped at its cap"))
@@ -257,11 +258,44 @@ class Cap(unittest.TestCase):
 
     def test_a_check_gone_silent_past_its_cap_is_ended_and_its_log_says_why(self):
         t0 = time.monotonic()
-        rc, _, _, capped, _ = self.execute("echo started; sleep 60")
+        with mock.patch.object(RUN, "CEILING", 1000):   # the silence alone ends it, not the ceiling
+            rc, _, _, capped, _ = self.execute("echo started; sleep 60")
         self.assertLess(time.monotonic() - t0, 20)
         self.assertTrue(capped)
         self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped at its cap"))
         self.assertRegex(RUN.read_log(self.log), r"lander: stopped at \d+s, past its cap of 1s, after \d+s with no output")
+
+
+    def test_past_its_cap_a_run_is_ended_after_SILENT_without_a_line_when_that_is_shorter_than_its_cap(self):
+        with mock.patch.object(RUN, "SILENT", 1), mock.patch.object(RUN, "CEILING", 1000):
+            rc, _, _, capped, _ = self.execute("for i in $(seq 25); do echo $i; sleep 0.2; done; sleep 60", 6)
+        self.assertTrue(capped)
+        gap = int(re.search(r"after (\d+)s with no output", RUN.read_log(self.log)).group(1))
+        self.assertLess(gap, 6)   # its cap would be 6 s or more
+
+    def test_a_check_that_deletes_its_own_log_still_reaches_its_verdict(self):
+        rc, _, _, capped, _ = self.execute(f"rm {self.log}; sleep 0.6; echo 1 passed", 30)
+        self.assertEqual((rc, capped), (0, False))
+
+    def test_a_raise_in_the_poll_still_kills_the_checks_group(self):
+        pidfile = os.path.join(self.tmp, "pid")
+
+        def stopped():   # False until the check's child is up, then a raise mid-poll
+            if os.path.exists(pidfile) and os.path.getsize(pidfile):
+                raise RuntimeError("poll broke")
+            return False
+        with mock.patch.object(RUN, "stopped", stopped), self.assertRaises(RuntimeError):
+            self.execute(f"sleep 60 & echo $! > {pidfile}; wait", 30)
+        child = int(pathlib.Path(pidfile).read_text())
+        for _ in range(100):   # its parent was killed too, so init reaps it
+            with contextlib.suppress(OSError), open(f"/proc/{child}/stat") as st:
+                if st.read().rsplit(")", 1)[1].split()[0] != "Z":
+                    time.sleep(0.1)
+                    continue
+            break
+        else:
+            os.kill(child, 9)
+            self.fail("the check's child outlived a raise in execute's poll")
 
 
 class Tree(Env):
