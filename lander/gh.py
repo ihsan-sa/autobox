@@ -201,18 +201,25 @@ def my_open_prs(root, token=None, timeout=120):
     return got, ""
 
 
-def comment(root, pr, body, token=None) -> bool:
-    """Post `body` as a PR comment over REST; True when GitHub took it."""
+def comment_why(root, pr, body, token=None) -> str:
+    """Post `body` as a PR comment over REST -> "" when GitHub took it, else gh's own words for why not."""
     s = slug(root)   # the body on stdin, never in argv: a long review would pass the kernel's argument limit
     if not s or not str(pr).isdigit():
-        rc, _, _ = gh(["pr", "comment", str(pr), "--body-file", "-"], root, token, 120, stdin=body)
-        return not rc
-    rc, out, _ = gh(["api", f"repos/{s}/issues/{int(pr)}/comments", "--input", "-"], root, token, 120,
-                    stdin=json.dumps({"body": body}))
+        rc, out, err = gh(["pr", "comment", str(pr), "--body-file", "-"], root, token, 120, stdin=body)
+        return (last(err or out) or f"gh exit {rc}") if rc else ""
+    rc, out, err = gh(["api", f"repos/{s}/issues/{int(pr)}/comments", "--input", "-"], root, token, 120,
+                      stdin=json.dumps({"body": body}))
     try:
-        return not rc and bool(json.loads(out).get("id"))
+        if not rc and json.loads(out).get("id"):
+            return ""
     except (ValueError, AttributeError):
-        return False
+        pass
+    return last(err or out) or f"gh exit {rc}"
+
+
+def comment(root, pr, body, token=None) -> bool:
+    """Post `body` as a PR comment over REST; True when GitHub took it."""
+    return not comment_why(root, pr, body, token)
 
 
 def rest_facts(p, want) -> dict:

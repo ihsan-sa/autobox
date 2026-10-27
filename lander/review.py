@@ -2175,9 +2175,14 @@ def _buy(job, template, diff, more, prior=None, light=False):
 
 def light_fixed(job) -> bool:
     """Whether the LAND at the job's head is a FIX the light path demoted: this box's saved read says so, or the PR's
-    own marker does (light=1), so a lost state file cannot let it merge as a full LAND."""
-    v = saved(job.digest) or recorded((pr_view(root_of(job), job.pr) or {}).get("comments") or [],
-                                      {job.digest} - {""}, job.head)
+    own marker does (light=1). With no saved read and GitHub not answering there is no evidence either way, so it
+    reads as demoted: the light path never lands on missing evidence."""
+    v = saved(job.digest)
+    if not v:
+        view = pr_view(root_of(job), job.pr)
+        if view is None:
+            return True
+        v = recorded(view.get("comments") or [], {job.digest} - {""}, job.head)
     return bool((getattr(v, "extra", None) or {}).get("light_fix"))
 
 
@@ -2394,8 +2399,11 @@ def cmd_record(argv):
     rows = [ln.strip() for ln in findings.splitlines() if ln.strip()]
     v = T.Verdict(verdict=word, digest=job.digest, blocking=rows if word != T.LAND else [],
                   advisory=rows if word == T.LAND else [], model=opts["by"])
-    if not post(root_of(job), pr, marker(v, job.base_sha, job.head, opts["by"])):
-        print(f"lander record: the record did not reach PR #{pr}")
+    why = GH.comment_why(root_of(job), pr, marker(v, job.base_sha, job.head, opts["by"]))
+    if why:
+        wait = re.search(r"rate limit|timed out|timeout|\b50[234]\b|could not resolve", why, re.I)
+        print(f"lander record: the record did not reach PR #{pr}: {why} — "
+              + ("waiting and running it again is the fix" if wait else "waiting will not fix this; check the PR and the login"))
         return 1
     C.log("recorded", repo, pr, verdict=word, by=re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]),
           head=job.head[:12], change=job.digest[:12] or "-")

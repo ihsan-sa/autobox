@@ -2929,6 +2929,15 @@ class AtOnce(Fixture):
         self.assertEqual(self.merged_order(), [], lines)
         self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
 
+    def test_a_light_fix_with_no_ci_is_handed_back_when_state_is_lost_and_github_is_silent(self):
+        # a3334's read of #1983: no saved read and no answer from gh is missing evidence, so it is not a full LAND
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(R, "pr_view", lambda *a, **k: None):
+            _, lines = self.land()
+        self.assertEqual(self.merged_order(), [], lines)
+        self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
+
     def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
         with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to
             json.dump({"tracks": {"row-1": {"status": "review"}}}, f)

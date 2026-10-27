@@ -3482,6 +3482,17 @@ class TestPermsReads(Case):
         box = self.box(**{"gh pr view": self.facts(head=head, comments=comments)})
         return R.cmd_record(["demo", "7", *argv]), box
 
+    def test_a_record_gh_refuses_says_why_and_whether_to_wait(self):
+        R.perms_seat_caller = lambda *a, **kw: True
+        for said, fix in (("gh: You have exceeded a secondary rate limit. (HTTP 403)", "waiting and running it again"),
+                          ("gh: Not Found (HTTP 404)", "waiting will not fix")):
+            self.box(**{"gh pr view": self.facts(head=HEAD), "gh pr comment": (1, said)})
+            with mock.patch("builtins.print") as pr:
+                self.assertEqual(R.cmd_record(["demo", "7", "LAND", "--by", "perms", "--head", HEAD]), 1)
+            line = pr.call_args[0][0]
+            self.assertIn(said, line)
+            self.assertIn(fix, line)
+
     def test_a_perms_seat_land_record_is_perms_recorded(self):
         digest = R.change_digest(DIFF)
         self.assertFalse(R.perms_recorded("demo", 7, HEAD, {digest}))
