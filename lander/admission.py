@@ -109,8 +109,9 @@ its own wait's start. A put-first job's says FRONT: its ticket is named before e
 ahead of every waiter however long they have waited (FIRST_BACK alone did nothing for one past it), and never before
 a live PROVE HOLD's ticket (_hold: its pid is a lander-self's). Several put first keep the order they were put first in:
 the first goes FRONT_GAP before the oldest waiter, and each later one one ns behind the newest FRONT ticket, which its
-name marks (its rand starts `f`, every other's `0`). Only the leading run of `f` tickets counts, because an older
-cc-green names its rand at random, so one in 16 starts `f`. A later first ticket is younger than a FRONT one.
+name marks (its rand starts FRONT_MARK, every other's `0`; an older cc-green's random rand starts so 1 time in 65536).
+Only the leading run of FRONT tickets counts, so a waiter's never does; a stale ticket neither joins nor ends the run.
+A later first ticket is younger than a FRONT one.
 STOP: slot(stop=) is asked each poll too, and a waiter it says is stopped leaves the queue with TimeoutError, as one
 past its deadline does: the lane stops a check whose job moved on. run asks it to keep the lane's beat too, so a live
 wait is never taken for a check that has not started (lane NOSTART).
@@ -203,6 +204,7 @@ TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
 FIRST_BACK = 3000   # seconds a first ticket is backdated (FIRST CLAIM); below lander-self's HOLD_BACK of 3600
 FRONT = "front"     # slot(first=) for a put-first job's check: ahead of every waiter, behind a PROVE HOLD (FIRST CLAIM)
 FRONT_GAP = 10**6   # ns the first FRONT ticket goes before the oldest waiter: room for later ones behind it
+FRONT_MARK = "ffff"   # a FRONT ticket's rand starts with it: an older cc-green's random one does 1 time in 65536
 
 
 def psi(kind: str, root: str = PSI_DIR, which: str = "some") -> float:
@@ -493,15 +495,15 @@ def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None
     before it is given its listed name, so nobody sees it unlocked and takes it for a dead one. A lane's name starts
     `+` (LANES FIRST), which sorts before a digit and still reads as the same number. first: a lane's name, its time
     FIRST_BACK seconds back (FIRST CLAIM), or `born` (ns) when that is older; first=FRONT: FRONT_GAP before the oldest
-    live ticket too, but one ns behind the newest FRONT one in the leading run of them (rand starts `f`), and never
+    live ticket too, but one ns behind the newest FRONT one in the leading run of them (FRONT_MARK), and never
     before a PROVE HOLD (_hold); never before time 1 either, so a planted time-0 ticket cannot make a name TICKET does not match."""
     now = time.time_ns()
     born = min(now - (FIRST_BACK * 10**9 if first else 0), born or now)
     if first == FRONT:
-        oldest, hold = _ahead(qdir, "~")[1], _hold(qdir)   # _ahead drops the dead, so the fronts left are live
-        fronts = []   # the leading run of `f` tickets: an older cc-green's fully random rand starts `f` one time in 16
-        for n in sorted(n for n in os.listdir(qdir) if TICKET.fullmatch(n)):
-            if n.split("-")[2] >= "f":
+        _, oldest, stale, _ = _ahead(qdir, "~")   # _ahead drops the dead, so the fronts left are live
+        hold, fronts = _hold(qdir), []   # the leading run of FRONT tickets
+        for n in sorted(n for n in os.listdir(qdir) if TICKET.fullmatch(n) and n not in stale):
+            if n.split("-")[2].startswith(FRONT_MARK):
                 fronts.append(int(n.split("-")[0]))
             elif int(n.split("-")[0]) > (hold or 0):   # what waits behind a hold does not end the run before it
                 break
@@ -509,7 +511,7 @@ def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None
         born = max([born, *(f + 1 for f in fronts)])   # put first later, it goes behind those put first before
         born = max(born, hold + 1) if hold is not None else born
     born = max(born, 1)
-    rand = ("f" if first == FRONT else "0") + uuid.uuid4().hex[:7]
+    rand = FRONT_MARK + uuid.uuid4().hex[:4] if first == FRONT else "0" + uuid.uuid4().hex[:7]
     name = f"{'+' if lane or first else '0'}{born:019d}-{os.getpid()}-{rand}"
     tmp = os.path.join(qdir, f".new-{name}")
     f = open(tmp, "a")

@@ -2903,6 +2903,51 @@ class Admission(unittest.TestCase):
         self.addCleanup(f.close)
         self.assertEqual(sorted(os.listdir(q)), [name, waiter, young])   # ahead of both
 
+    def test_an_older_ticket_whose_rand_starts_f_at_the_front_is_not_a_front_ticket(self):
+        # perms' read of #1982: at the front of the queue, an older cc-green's random `f` rand still read as FRONT
+        legacy = f"+{time.time_ns() - 2 * 3600 * 10**9:019d}-4243-f1234567"   # a lane's check, 2 h in
+        q = os.path.join(self.lanes_first_queue(legacy), "slots", "queue")
+        name, f = A._ticket(q, lane=True, first=A.FRONT)
+        self.addCleanup(f.close)
+        self.assertEqual(sorted(os.listdir(q)), [name, legacy])
+
+    def test_checks_put_first_behind_a_prove_hold_keep_their_order(self):
+        # Opus' read of #1982: a waiter older than a live PROVE HOLD must not end the run of FRONT tickets behind it
+        now = time.time_ns()
+        q = os.path.join(self.lanes_first_queue(f"+{now - 2 * 3600 * 10**9:019d}-4242-0000beef"), "slots", "queue")
+        holder = subprocess.Popen(["bash", "-c", "exec -a lander-self sleep 30"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        for _ in range(100):
+            with open(f"/proc/{holder.pid}/cmdline", "rb") as f:
+                if f.read().startswith(b"lander-self"):
+                    break
+            time.sleep(0.02)
+        h = open(os.path.join(q, f"+{now - 100 * 10**9:019d}-{holder.pid}-0000a0a0"), "a")
+        fcntl.flock(h, fcntl.LOCK_EX)
+        self.addCleanup(h.close)
+        names = []
+        for _ in range(2):
+            name, f = A._ticket(q, lane=True, first=A.FRONT)
+            self.addCleanup(f.close)
+            names.append(name)
+        self.assertGreater(names[1].split("-")[0], names[0].split("-")[0])   # the second behind the first, both behind the hold
+
+    def test_a_stale_ticket_does_not_end_the_run_of_front_tickets(self):
+        # Opus' read of #1982: a ticket past TICKET_CAP ahead of the FRONT ones ended the run, so a later one went
+        # alongside the first instead of behind it
+        now = time.time_ns()
+        q = os.path.join(self.lanes_first_queue(f"+{now - 13 * 3600 * 10**9:019d}-4241-0000dead"), "slots", "queue")
+        w = open(os.path.join(q, f"+{now - 2 * 3600 * 10**9:019d}-4242-0000beef"), "a")   # a live waiter, 2 h in
+        fcntl.flock(w, fcntl.LOCK_EX)
+        self.addCleanup(w.close)
+        names = []
+        for _ in range(2):
+            name, f = A._ticket(q, lane=True, first=A.FRONT)
+            self.addCleanup(f.close)
+            names.append(name)
+        self.assertGreater(names[1].split("-")[0], names[0].split("-")[0])
+
     def test_a_put_first_ticket_never_goes_before_time_one(self):
         # #1960 review: a planted time-0 ticket put a FRONT one at time -1, a name no reader takes for a ticket
         st = self.lanes_first_queue("+0000000000000000000-4242-0000beef")

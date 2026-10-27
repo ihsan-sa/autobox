@@ -1232,8 +1232,9 @@ class Lane:
             got = self.fetch(base, branch)
             job.base_sha, job.head = got[base], got[branch]
         put, moved = J.first(job.repo, job.pr), (job.extra.get("behind_update") or {}).get("from")
-        if put.get("head") and put["head"] == moved and self.parent(job.head) == moved:
+        if put.get("head") and put["head"] == moved and self.base_merge(job.head, moved, job.base_sha):
             # the lane's own update moved it: GitHub's merge of the base sits on the head put first, and nothing on top
+            # (#1982 review: a merge whose second parent is not on the base is an author's, so it drops the put-first)
             J.write_atomic(J.first_path(job.repo, job.pr), {**put, "head": job.head})
         elif put.get("head") not in (None, job.head):   # put first, queried, then pushed (first)
             J.drop_first(job.repo, job.pr)
@@ -1886,12 +1887,14 @@ class Lane:
         self.proved(job, expected, tip, pin)
         return "merged"
 
-    def parent(self, head):
-        """`head`'s first parent, "" when it does not read."""
+    def base_merge(self, head, first, base):
+        """Whether `head` is a merge onto `first` of a commit on `base`, as GitHub's update-branch makes; False when
+        it does not read."""
         try:
-            return G.rev(self.root, f"{head}^1", env=self.genv)
+            return G.rev(self.root, f"{head}^1", env=self.genv) == first and \
+                G.git(self.root, "merge-base", "--is-ancestor", f"{head}^2", base, env=self.genv).rc == 0
         except G.GitError:
-            return ""
+            return False
 
     def behind(self, job, base, refused):
         """GitHub's strict branch protection refused the merge because the PR's branch is BEHIND `base` (chip-flow #66,
