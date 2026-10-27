@@ -4496,8 +4496,15 @@ class SmallFirst(Fixture):
             J.move(job, T.QUEUED, why="queued again")
             if author == "merge":
                 new = merge(self.push("track/stray", {"b/y": "s\n"}))
-            elif author == "tree":   # the right parents, but a tree that is not their merge
-                new = merge(self.origin_rev("main"), tree=f"{self.origin_rev('main')}^{{tree}}")
+            elif author == "tree":   # the right parents, but a tree that is main's plus one file, not their merge
+                self.git(self.work, "fetch", "-q", "origin")
+                idx = {"GIT_INDEX_FILE": os.path.join(self.work, ".git", "tree-case-index")}
+                with mock.patch.dict(os.environ, idx):
+                    self.git(self.work, "read-tree", "origin/main")
+                    self.write(self.work, {"b/extra": "x\n"})
+                    self.git(self.work, "add", "b/extra")
+                    tree = self.git(self.work, "write-tree")
+                new = merge(self.origin_rev("main"), tree=tree)
             else:
                 new = merge(self.origin_rev("main"))   # GitHub's merge of the base
             if author == "push":
