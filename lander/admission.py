@@ -156,6 +156,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import math
 import os
 import re
 import shutil
@@ -221,9 +222,10 @@ AGED_MIN = 600   # seconds: no caller's LANDER_WORKER_AGED makes a worker's wait
 def _aged(v: str | None) -> float:
     """AGED's seconds from LANDER_WORKER_AGED: 7200 unset or not a number, never under AGED_MIN."""
     try:
-        return max(float(AGED_MIN), float(v or 7200))
+        n = float(v or 7200)
     except ValueError:
         return 7200.0
+    return max(float(AGED_MIN), n) if math.isfinite(n) else 7200.0
 
 
 AGED = _aged(os.environ.get("LANDER_WORKER_AGED"))   # seconds before a worker waits as a lane (AGED)
@@ -392,13 +394,25 @@ def _peak_path(state: str, repo: str, name: str) -> str:
     return os.path.join(state, "slots", "peak", safe(os.path.basename(os.path.realpath(repo))), safe(name))
 
 
+def _flock(f, how: int, wait: float = 1.0) -> None:
+    """flock `f` without blocking for good: LOCK_NB again every 10 ms for `wait` seconds, then BlockingIOError."""
+    end = time.monotonic() + wait
+    while True:
+        try:
+            return fcntl.flock(f, how | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                raise
+            time.sleep(0.01)
+
+
 def peak(state: str, repo: str, name: str) -> int | None:
     """The need record() kept for `repo`'s check `name`, in bytes, and never below a quarter of CHECK_MEM, so a few
     small runs cannot shrink a need a burst then runs far past; None, which counts as CHECK_MEM, when none reads or
     record() holds the lock, so a stuck writer never holds an admission up."""
     with contextlib.suppress(OSError, ValueError):
         with open(_peak_path(state, repo, name)) as f:
-            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            _flock(f, fcntl.LOCK_SH)
             n = int(f.read())
         return max(n, (_bytes(CHECK_MEM) or 0) // 4) if n > 0 else None
     return None
@@ -433,8 +447,8 @@ def scope_stat(argv: list) -> str:
 
 
 def _nofollow(path: str, flags: int) -> int:
-    """open()'s opener for a `slot.N.passed` mark: a symlink planted in its place is never followed."""
-    return os.open(path, flags | os.O_NOFOLLOW, 0o644)
+    """open()'s opener for a `slot.N.passed` mark: a symlink planted in its place is never followed, a FIFO never parks."""
+    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
 
 
 def _held(d: str) -> tuple:
@@ -534,7 +548,7 @@ def _ticket(qdir: str, lane: bool = False, first: bool = False, born: int | None
         born = min(born, int(oldest.split("-")[0]) - FRONT_GAP) if oldest and first == FRONT else born
         born = max([born, *(f + step for f in fronts)])   # put first later, it goes behind those put first before
         born = max(born, hold + step) if hold is not None else born
-    born = max(born, 1)
+    born = min(max(born, 1), 10**19 - 1)   # 19 digits: a hold near the top cannot spill into 20
     rand = FRONT_MARK + uuid.uuid4().hex[:4] if first == FRONT else "0" + uuid.uuid4().hex[:7]
     name = f"{'+' if lane or first else '0'}{born:019d}-{os.getpid()}-{rand}"
     tmp = os.path.join(qdir, f".new-{name}")
@@ -767,7 +781,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     if passed:   # advisory: a mark it can't open or lock only counts it a non-passer
                         with contextlib.suppress(OSError):
                             mark_f = open(os.path.join(d, f"slot.{n}.passed"), "a", opener=_nofollow)
-                            fcntl.flock(mark_f, fcntl.LOCK_EX)   # waits out a peer _held()'s brief LOCK_SH
+                            _flock(mark_f, fcntl.LOCK_EX)   # waits out a peer _held()'s brief LOCK_SH, else not passed
                 held.append((n, f))
                 if not alone:
                     break

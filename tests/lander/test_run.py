@@ -2402,6 +2402,66 @@ class Admission(unittest.TestCase):
                     fcntl.flock(t, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the symlink's target was never locked
                 self.assertEqual(A._held(d)[2], big + small)   # nor read as a mark: counted a non-passer
 
+    def test_a_marks_read_never_follows_a_symlink_or_parks_on_a_fifo(self):
+        # Opus read of #1987: _held() opened slot.N.passed through a link, and a FIFO there parked both opens
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        held = open(os.path.join(d, "slot.1"), "a")
+        fcntl.flock(held, fcntl.LOCK_EX)   # a non-passer's slot
+        self.addCleanup(held.close)
+        target = os.path.join(d, "elsewhere")
+        tf = open(target, "w")
+        fcntl.flock(tf, fcntl.LOCK_EX)   # a passer's mark, if the link were followed
+        self.addCleanup(tf.close)
+        os.symlink(target, os.path.join(d, "slot.1.passed"))
+        self.assertEqual(A._held(d)[2], A._bytes(A.CHECK_MEM))   # still a non-passer
+        os.unlink(os.path.join(d, "slot.1.passed"))
+        os.mkfifo(os.path.join(d, "slot.1.passed"))
+        t0 = time.monotonic()
+        self.assertEqual(A._held(d)[2], A._bytes(A.CHECK_MEM))   # the FIFO is no mark, and nothing waited on it
+        with self.assertRaises(OSError):
+            A._nofollow(os.path.join(d, "slot.1.passed"), os.O_WRONLY)   # nor does a write open park on it
+        self.assertLess(time.monotonic() - t0, 2)
+
+    def test_a_busy_mark_or_peak_lock_never_waits_forever(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        record = lambda n: A.record(st, "r", "c", n)   # noqa: E731
+        record(3 << 30)
+        pf = open(A._peak_path(st, "r", "c"), "a")
+        fcntl.flock(pf, fcntl.LOCK_EX)   # a writer that never lets go
+        self.addCleanup(pf.close)
+        t0 = time.monotonic()
+        self.assertIsNone(A.peak(st, "r", "c"))   # not read: CHECK_MEM
+        mark = open(os.path.join(st, "mark"), "a")
+        other = open(os.path.join(st, "mark"), "a")
+        fcntl.flock(other, fcntl.LOCK_SH)
+        self.addCleanup(other.close)
+        self.addCleanup(mark.close)
+        with self.assertRaises(BlockingIOError):
+            A._flock(mark, fcntl.LOCK_EX, wait=0.1)   # a mark busy past the window is not passed
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_a_held_peak_lock_is_waited_out_briefly(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        A.record(st, "r", "c", 3 << 30)
+        pf = open(A._peak_path(st, "r", "c"), "a")
+        fcntl.flock(pf, fcntl.LOCK_EX)
+        threading.Timer(0.2, pf.close).start()
+        self.assertEqual(A.peak(st, "r", "c"), 3 << 30)   # the reserve is the measured peak, not CHECK_MEM
+
+    def test_a_non_finite_aged_and_a_hold_at_the_top_of_the_range(self):
+        for v in ("nan", "inf", "-inf", "NaN"):
+            self.assertEqual(A._aged(v), 7200.0)
+        self.assertEqual(A._aged("5"), float(A.AGED_MIN))
+        qdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, qdir)
+        with mock.patch.object(A, "_hold", return_value=10**19 - 1):
+            name, f = A._ticket(qdir, aged=True)
+            f.close()
+        self.assertEqual(len(name.split("-")[0]), 20)   # '+' and 19 digits, never 20 digits
+
     def test_a_never_measured_head_short_of_room_is_passed_and_then_runs(self):
         # perms, reading #1978: a check nobody has measured (need None, so CHECK_MEM) must not stall the lane
         st = tempfile.mkdtemp()
