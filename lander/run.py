@@ -390,7 +390,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             mem: str = "") -> tuple:
     """-> (rc, secs, cpu_secs, capped, peak): peak is the most `anon` the run's scope held, its memory.stat file `mem`
     as read each poll while it ran (the scope goes when it exits; page cache does not count), or wait4's ru_maxrss, the
-    most its largest process held, when that never read; a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    most its largest process held, when that is more (a child too brief for a poll still counts); a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
     keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
@@ -435,7 +435,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     except (ProcessLookupError, PermissionError):
         pass
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
-    return rc, time.monotonic() - t0, cpu, capped, held or (ru.ru_maxrss * 1024 if ru else 0)
+    return rc, time.monotonic() - t0, cpu, capped, max(held, ru.ru_maxrss * 1024 if ru else 0)
 
 
 def starved(secs: float, cpu: float) -> bool:

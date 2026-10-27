@@ -10,9 +10,9 @@ the slice has room for it: the memory its running checks hold (memory.stat `anon
 does not count) or, when that is more, what they reserved, plus this check's own need, within the slice's MemoryHigh.
 A check's need is the peak a green run of it reached, or half the need kept before when that is more, so an old peak
 fades once runs stop reaching it (run.py records the most `anon` its scope cgroup's memory.stat showed while it ran,
-since memory.peak counts the page cache of every file it read, or wait4's ru_maxrss, the largest process alone, with
-no scope, in `<state>/slots/peak/<repo>/<check>`; a red or capped run may have died before its peak, so it records
-nothing), and CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a
+since memory.peak counts the page cache of every file it read, or wait4's ru_maxrss, the largest process alone, when
+that is more, in `<state>/slots/peak/<repo>/<check>`; a red or capped run may have died before its peak, so it records
+nothing), never below a quarter of CHECK_MEM, and CHECK_MEM (LANDER_CHECK_MEM, default 1536M, about a
 heavy check's peak) until it has one; the holder of a slot writes
 its need in the slot's file, which is what it reserved. A slice whose memory.stat does not read counts reservations
 alone, so with no peak recorded the slice holds MemoryHigh / CHECK_MEM checks. A slice with no MemoryHigh, or a
@@ -357,12 +357,14 @@ def _peak_path(state: str, repo: str, name: str) -> str:
 
 
 def peak(state: str, repo: str, name: str) -> int | None:
-    """The need record() kept for `repo`'s check `name`, in bytes; None when none is recorded, or for the moment a
-    record() is rewriting it, which counts as CHECK_MEM."""
+    """The need record() kept for `repo`'s check `name`, in bytes, and never below a quarter of CHECK_MEM, so a few
+    small runs cannot shrink a need a burst then runs far past; None, which counts as CHECK_MEM, when none reads. It
+    waits its turn on the lock record() writes under."""
     with contextlib.suppress(OSError, ValueError):
         with open(_peak_path(state, repo, name)) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
             n = int(f.read())
-        return n if n > 0 else None
+        return max(n, (_bytes(CHECK_MEM) or 0) // 4) if n > 0 else None
     return None
 
 

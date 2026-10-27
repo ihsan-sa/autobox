@@ -948,6 +948,11 @@ class Peak(Env):
         self.assertEqual((rc, peak), (0, 2 << 30))
         rc, _, _, _, peak = RUN.execute(["true"], d, os.environ.copy(), 30, log, mem=os.path.join(d, "gone"))
         self.assertTrue(0 < peak < 2 << 30)              # no scope file: ru_maxrss
+        with open(mem, "w") as f:
+            f.write("anon 4096\n")                       # a child the polls missed: ru_maxrss is more, so it counts
+        rc, _, _, _, peak = RUN.execute([sys.executable, "-c", "b = bytearray(64 << 20); b[::4096] = b'x' * len(b[::4096])"],
+                                        d, os.environ.copy(), 30, log, mem=mem)
+        self.assertGreaterEqual(peak, 64 << 20)
         self.assertEqual(A.scope_stat(["systemd-run", "--unit=lander-x-1", "--", "true"]),
                          os.path.join(A.SLICE_DIR, "lander-x-1.scope", "memory.stat"))
         self.assertEqual(A.scope_stat(["true"]), "")
@@ -2256,8 +2261,8 @@ class Admission(unittest.TestCase):
         self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 700 << 20)
         A.record(st, "/r/dispatch", "voice gate", 90 << 20)
         A.record(st, "/r/dispatch", "voice gate", 90 << 20)
-        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # a peak no run reaches again fades to the runs'
-        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 90 << 20)
+        A.record(st, "/r/dispatch", "voice gate", 90 << 20)      # a peak no run reaches again fades, to the floor
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), A._bytes(A.CHECK_MEM) // 4)
         A.record(st, "/r/dispatch", "voice gate", 1400 << 20)    # a larger run counts at once
         self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 1400 << 20)
         self.assertIsNone(A.peak(st, "/r/other", "voice gate"))  # another repo's check of the same name is its own
@@ -2265,6 +2270,22 @@ class Admission(unittest.TestCase):
         with open(A._peak_path(st, "/r/other", "voice gate"), "w") as f:
             f.write("-5")                                        # a stored peak at or below 0 is no peak: CHECK_MEM
         self.assertIsNone(A.peak(st, "/r/other", "voice gate"))
+
+    def test_a_peak_record_never_gives_a_need_below_the_floor(self):
+        # perms' read of #1969: small runs must not shrink a need so far that a burst runs past what admission reserved
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        p = A._peak_path(st, "/r/dispatch", "voice gate")
+        os.makedirs(os.path.dirname(p))
+        for text, need in (("", None), ("garbage\n", None), ("0", None), ("1", A._bytes(A.CHECK_MEM) // 4)):
+            with open(p, "w") as f:
+                f.write(text)
+            self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), need, repr(text))   # None: CHECK_MEM
+        os.remove(p)
+        A.record(st, "/r/dispatch", "voice gate", 0)             # a zero reading keeps nothing: CHECK_MEM
+        self.assertIsNone(A.peak(st, "/r/dispatch", "voice gate"))
+        A.record(st, "/r/dispatch", "voice gate", 1)
+        self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), A._bytes(A.CHECK_MEM) // 4)
 
     def test_two_runs_finishing_together_keep_the_larger_peak(self):
         # follow-up to #1962: an unlocked read-compare-write let the smaller of two finishes overwrite the larger
