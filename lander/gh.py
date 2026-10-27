@@ -6,7 +6,8 @@
         for each gh run; when it gives nothing, gh is not run at all.
     pr_facts(root, pr, fields) -> (dict, "") | (None, why)     `gh pr view --json <fields> [-R <slug>]`'s answer,
         over REST (GET repos/<slug>/pulls/<pr>, .../files, the head's check-runs and status) when every field is in
-        REST_FIELDS, else through that GraphQL call; a spent rate limit is said with its reset (spent)
+        REST_FIELDS, else through that GraphQL call; a spent rate limit is said with its reset (spent), GitHub's
+        secondary limit as itself (SECONDARY, which clears in minutes)
     get(root, path, token=None, timeout=120) -> (rc, body, stderr): `gh api <path>` (a GET), CONDITIONAL: the last
         answer and its ETag are kept under <LANDQ>/gh-etag, and the GET carries If-None-Match, so an unchanged answer
         is a 304, which costs no quota and gives the kept body while it says open; a closed or merged one is asked
@@ -122,7 +123,15 @@ def gh(argv, root, token=None, timeout=120, note=True, stdin=None):
     return rc, out, err
 
 
+# GITHUB'S SECONDARY (CONTENT-CREATION) LIMIT IS NOT A SPENT QUOTA (raised-cc-done-secondary-limit-stops-rows,
+# 2026-10-27): lander record's comment was refused twice with core at 4862 of 5000, and gh's line ran past 200 characters,
+# so its tail kept only "(HTTP 403)" and record said waiting would not fix it. It clears by itself in minutes.
+SECONDARY = "GitHub's secondary (content-creation) rate limit for this login was hit; it clears by itself in minutes"
+
+
 def last(text, n=200) -> str:
+    if "secondary rate limit" in (text or "").lower():
+        return SECONDARY
     return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
 
 
@@ -257,8 +266,8 @@ def spent(root, text, token=None) -> str:
     every lane and the tick wait on; a member's quota or GraphQL's holds just its job (Opus read of #1799). Else "":
     text that only says rate limit, or a rate_limit that will not answer, is gh's own failure, counted like any other
     (perms' read of #1769: the words alone held a job forever)."""
-    if "rate limit" not in (text or "").lower():
-        return ""
+    if "rate limit" not in (text or "").lower() or "secondary rate limit" in text.lower():
+        return ""   # the secondary limit holds no quota at 0: last() names it
     kind = "graphql" if "graphql" in text.lower() else "core"
     rc, out, _ = gh(["api", "rate_limit"], root, token, 30, note=False)
     try:

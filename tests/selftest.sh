@@ -2268,9 +2268,10 @@ cat > "$D/bin/gh" <<'SH'
 echo "$*" >> "$D/gh.calls"
 [ "${GH_REPO:-}" = "$(cat "$D/gh-repo" 2>/dev/null || echo "$D/remote.git")" ] || [ -e "$D/legacy" ] || exit 9
 case "$*" in
-  *"api rate_limit"*) echo 1792444560; exit 0;;   # the reset gh_said reads: 21:16Z
+  *"api rate_limit"*) [ -e "$D/rl.left" ] && echo left || echo 1792444560; exit 0;;   # the reset gh_said reads: 21:16Z
   *"/pulls?"*"state=open"*) [ ! -e "$D/open.fail" ] || exit 1
     [ ! -e "$D/open.ratelimit" ] || { echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" >&2; exit 1; }
+    [ ! -e "$D/open.secondary" ] || { echo "gh: You have exceeded a secondary rate limit and have been temporarily blocked from content creation. Please retry your request again later. (HTTP 403)" >&2; exit 1; }
     cat "$D/open" 2>/dev/null; exit 0;;
   *"/pulls?"*"state=closed"*)
     [ ! -e "$D/merged.fail" ] || exit 1
@@ -2357,7 +2358,13 @@ newdone lookup; touch "$D/open.fail"; rundone
 rm "$D/open.fail"; touch "$D/open.ratelimit"; rundone
 { [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && grep -q "rate limit for this login is spent until 21:16Z" "$D/out" "$D/err"; } \
   && ok "P14 rate limit: a lookup refused on GitHub's rate limit says so with the reset time" || bad "P14 rate limit: $(cat "$D/out" "$D/err")"
-rm "$D/open.ratelimit"; touch "$D/merged.fail"; rundone
+touch "$D/rl.left"; rundone; rm "$D/open.ratelimit" "$D/rl.left"   # the same words with the quota left: the secondary limit
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && grep -q "secondary (content-creation) rate limit for this login is spent until [0-2][0-9]:[0-5][0-9]Z; it clears" "$D/out" "$D/err"; } \
+  && ok "P14 secondary: rate limit words with the quota left are the secondary limit, with a reset quota_wait reads" || bad "P14 secondary: $(cat "$D/out" "$D/err")"
+touch "$D/open.secondary"; rundone; rm "$D/open.secondary"   # GitHub's own words, while rate_limit still names a spent reset
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && grep -q "secondary (content-creation) rate limit" "$D/out" "$D/err" && ! grep -q "21:16Z" "$D/out" "$D/err"; } \
+  && ok "P14 secondary: GitHub saying secondary rate limit is never read as the spent hour" || bad "P14 secondary words: $(cat "$D/out" "$D/err")"
+touch "$D/merged.fail"; rundone
 { [ "$rc" != 0 ] && [ ! -s "$D/creates" ]; } && ok "P14 control: failed merged lookup also cannot create" || bad "P14 control: $(cat "$D/out" "$D/err")"
 rm "$D/merged.fail"; touch "$D/lost"; rundone
 { [ "$rc" != 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.pr_url == null and .errors[0].stage == "pr"'; } \

@@ -635,6 +635,16 @@ class RestFacts(unittest.TestCase):
             self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, "HTTP 502: bad gateway"))
 
 
+    def test_the_secondary_limit_is_not_a_spent_quota(self):
+        # 2026-10-27: a 403 for the content-creation limit with core at 4862 of 5000, its line past 200 characters
+        said = ("gh: You have exceeded a secondary rate limit and have been temporarily blocked from content creation. "
+                "Please retry your request again later. If you reach out to GitHub Support for help, please include the "
+                "request ID 1234:5678:9ABC:DEF0:12345678. (HTTP 403)")
+        _, p = self.run_gh({"api repos/o/r/pulls/7": (1, "", said)})   # rate_limit is never asked
+        with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
+            self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, GH.SECONDARY))
+        self.assertNotIn(GH.SPENT, GH.SECONDARY)
+
     def test_a_spent_reset_already_past_backs_off_a_minute(self):
         # Opus read of #1799: a reset in the past (clock skew) wrote a backoff already over, and every lane asked
         # GitHub against the spent quota each tick

@@ -3502,13 +3502,16 @@ class TestPermsReads(Case):
 
     def test_a_record_gh_refuses_says_why_and_whether_to_wait(self):
         R.perms_seat_caller = lambda *a, **kw: True
-        for said, fix in (("gh: You have exceeded a secondary rate limit. (HTTP 403)", "waiting and running it again"),
-                          ("gh: Not Found (HTTP 404)", "waiting will not fix")):
+        long = ("gh: You have exceeded a secondary rate limit and have been temporarily blocked from content creation. "
+                "Please retry your request again later. If you reach out to GitHub Support for help, please include the "
+                "request ID 1234:5678:9ABC:DEF0:12345678. (HTTP 403)")   # 2026-10-27: its tail alone said "(HTTP 403)"
+        for said, fix, shown in ((long, "waiting and running it again", GH.SECONDARY),
+                                 ("gh: Not Found (HTTP 404)", "waiting will not fix", "gh: Not Found (HTTP 404)")):
             self.box(**{"gh pr view": self.facts(head=HEAD), "gh pr comment": (1, said)})
             with mock.patch("builtins.print") as pr:
                 self.assertEqual(R.cmd_record(["demo", "7", "LAND", "--by", "perms", "--head", HEAD]), 1)
             line = pr.call_args[0][0]
-            self.assertIn(said, line)
+            self.assertIn(shown, line)
             self.assertIn(fix, line)
 
     def test_a_perms_seat_land_record_is_perms_recorded(self):
