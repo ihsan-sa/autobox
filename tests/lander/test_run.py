@@ -2402,6 +2402,38 @@ class Admission(unittest.TestCase):
                     fcntl.flock(t, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the symlink's target was never locked
                 self.assertEqual(A._held(d)[2], big + small)   # nor read as a mark: counted a non-passer
 
+    def test_a_never_measured_head_short_of_room_is_passed_and_then_runs(self):
+        # perms, reading #1978: a check nobody has measured (need None, so CHECK_MEM) must not stall the lane
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        quiet = dict(psi_root=self.psi_dir(0, 0), loadavg=self.calm_load, poll=0.02, say=lambda _: None, k=8)
+        sl = os.path.join(st, "lander.slice")
+        os.makedirs(os.path.join(st, "slots", "queue"))
+        os.makedirs(sl)
+        with open(os.path.join(sl, "memory.stat"), "w") as f:
+            f.write("anon 0\n")
+        q = os.path.join(st, "slots", "queue")
+        got = []
+        with mock.patch.object(A, "SLICE_HIGH", "6G"), mock.patch.object(A, "SLICE_DIR", sl):
+            first = contextlib.ExitStack()
+            self.assertEqual(first.enter_context(A.slot(st, need=5000 << 20, **quiet)), [1])
+
+            def head():
+                with A.slot(st, deadline=5, need=None, **quiet) as s:
+                    got.append(s)
+            t = threading.Thread(target=head)
+            t.start()
+            for _ in range(100):
+                if [n for n in os.listdir(q) if not n.startswith(".") and open(os.path.join(q, n)).read()]:
+                    break
+                time.sleep(0.02)
+            self.assertEqual([open(os.path.join(q, n)).read() for n in os.listdir(q)], [str(A._bytes(A.CHECK_MEM))])
+            with A.slot(st, deadline=1, need=100 << 20, **quiet) as s:
+                self.assertEqual(s, [2])   # it fits, so it passes the unmeasured head
+            first.close()
+            t.join(5)
+        self.assertEqual(got, [[1]])   # and the head runs once slot 1 lets go
+
     def test_a_systemctl_that_fails_or_hangs_on_the_slice_is_said(self):
         for boom in (OSError("no systemctl"), subprocess.TimeoutExpired(["systemctl"], 10)):
             err = io.StringIO()
@@ -2472,6 +2504,21 @@ class Admission(unittest.TestCase):
             fcntl.flock(held, fcntl.LOCK_UN)
         t.join(5)
         self.assertEqual(A.peak(st, "/r/dispatch", "voice gate"), 1400 << 20)
+
+    def test_a_held_peak_lock_reads_as_no_peak_at_once(self):
+        # brief: a writer holding the peak's lock must not hold every admission behind it
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        A.record(st, "/r/dispatch", "voice gate", 1400 << 20)
+        seen = []
+        with open(A._peak_path(st, "/r/dispatch", "voice gate")) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            t = threading.Thread(target=lambda: seen.append(A.peak(st, "/r/dispatch", "voice gate")), daemon=True)
+            t.start()
+            t.join(2)
+            self.assertFalse(t.is_alive())     # it did not wait on the lock
+            fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(seen, [None])         # None: CHECK_MEM
 
     def test_alone_waits_for_a_slot_past_its_own_k(self):
         # brief: "an 'alone' re-run ... runs beside checks on slots 4-8" when K rose 3 to 8 under it
