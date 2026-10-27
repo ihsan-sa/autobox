@@ -211,11 +211,14 @@ def self_lands(repo) -> bool:
 def self_merge_heads(repo) -> list:
     """LANDER_SELF_MERGE_HEADS_<repo> (cc-config, whitespace-separated branch namespaces, each ending in "/", such
     as `dispatch/`): the head prefixes the repo merges on its own read. Kept on the box, so a repo cannot switch off
-    its own sweep; [] when unset, when cc-config did not answer, or when any word is not such a namespace."""
-    key = "LANDER_SELF_MERGE_HEADS_" + re.sub(r"[^A-Za-z0-9]", "_", repo)
+    its own sweep; [] when unset, when cc-config did not answer, or when any word is not such a namespace or lies
+    under track/ (cc-loop's own heads). Each character of the name past [A-Za-z0-9] is written _XX (its hex), so
+    a-b (a_2Db) and a_b (a_5Fb) keep keys of their own."""
+    key = "LANDER_SELF_MERGE_HEADS_" + re.sub(r"[^A-Za-z0-9]", lambda m: f"_{ord(m.group()):02X}", repo)
     rc, out, _ = L.run([f"{J.bin_dir()}/cc-config", "get", key], timeout=30)
     heads = out.split() if rc == 0 else []
-    return heads if all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) for h in heads) else []
+    return heads if all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) and not h.startswith("track/")
+                        for h in heads) else []
 
 
 def default_base(root, slug) -> tuple:

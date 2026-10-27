@@ -31,12 +31,13 @@ nothing.
 
 WHERE VERDICTS LIVE. On the PR, as marker comments. Today's shape is kept so every reader still parses it:
 
-    <!-- cc-land-review v2 change=<digest> base=<12> head=<12> verdict=<V> by=<who> -->
+    <!-- cc-land-review v2 change=<digest> base=<12> head=<12> verdict=<V> by=<who> [light=1] -->
 
-The new lander writes V = LAND or HANDBACK. Markers the old lander wrote are IMPORTED: LAND stays LAND;
-LAND-AFTER-FIX whose findings are all `[other]` lands (that was its rule too: the findings went to a follow-up
-row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the box's own GitHub login wrote count
-(gh's viewerDidAuthor), as before: anyone can type a marker into a PR.
+The new lander writes V = LAND or HANDBACK, and light=1 on a LAND the light FIX demoted (imported as light_fix).
+Markers the old lander wrote are IMPORTED: LAND stays LAND; LAND-AFTER-FIX whose findings are all `[other]` lands
+(that was its rule too: the findings went to a follow-up row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is
+HANDBACK. Only comments the box's own GitHub login wrote count (gh's viewerDidAuthor), as before: anyone can type a
+marker into a PR.
 
 WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> INCOMPLETE, nothing read or landed:
 a handback recorded there cannot be ruled out. A HANDBACK by perms' security reader (security_reader(): exactly
@@ -181,8 +182,9 @@ passwd home's config, owner/name or a bare name the box owner's, default empty: 
 HANDBACK standing on the PR) that hands back only for blockers below high and none of kind security, on a plan with
 no security path of a base that names some (light_lane()), files those blockers as a board row labelled demoted FIX
 findings (board.followup) and only then is recorded as a LAND with them as its advisory findings, extra light_fix; the
-lane merges it once CI is green, and hands it back when no CI ran (Lane.ci_green). Every reader must be a LAND or
-such a handback. A high or unnamed severity, a security blocker or security path, a change to .github/, a base with
+lane merges it once CI is green, and hands it back when no CI ran (Lane.ci_green; light_fixed() reads the flag from
+the saved read or the PR's marker). Every reader must be a LAND or such a handback. A high or unnamed severity, a
+security blocker or security path, a change to .github/, core/lander/ or a landing policy file, a base with
 no tests/LANDING-security.toml, a row that will not file, a carried blocker, a delta read, and a lane that has not
 opted in keep the full path.
 
@@ -290,7 +292,8 @@ def marker(v: T.Verdict, base, head, by):
     rows = [f"{i}. {b}" for i, b in enumerate(v.blocking, 1)]
     rows += [f"{i}. [other] {a}" for i, a in enumerate(v.advisory, len(rows) + 1)]
     by = re.sub(r"[^A-Za-z0-9._@-]+", "-", by or "lander")
-    head_ = f"<!-- {MARK} v2 change={v.digest} base={base[:12]} head={head[:12]} verdict={v.verdict} by={by} -->"
+    head_ = f"<!-- {MARK} v2 change={v.digest} base={base[:12]} head={head[:12]} verdict={v.verdict} by={by}" + (
+        " light=1" if (v.extra or {}).get("light_fix") else "") + " -->"
     said = [f"- `{r['model']}`: {r['verdict']}" + (f" (stood in for `{r['stood_in_for']}`, "
                                                    + ("timed out on its last read)" if r.get("timed_out")
                                                       else "at its usage limit)")
@@ -324,7 +327,8 @@ def imported(body):
     strip = lambda rs: [re.sub(r"^\d+\. (\[other\] )?", "", r) for r in rs]  # noqa: E731
     return T.Verdict(verdict=verdict, digest=digest, blocking=strip(hard) if verdict != T.LAND else [],
                      advisory=strip(other), model=by.group(1) if by else "",
-                     extra={"head": head.group(1) if head else "", "imported": old})
+                     extra=dict({"head": head.group(1) if head else "", "imported": old},
+                                **({"light_fix": True} if re.search(r"\blight=1\b", tail) else {})))
 
 
 def bought(v):
@@ -2074,7 +2078,10 @@ def light_lane(job):
     """True when the job's repo opts in to the light FIX (CC_LAND_REVIEW_LIGHT_FIX: repos as owner/name, a bare name
     the box owner's, read from the passwd home's config only, default none), its base names security paths (a repo
     with no LANDING-security.toml cannot tell a sandbox change from any other, so it keeps the full path) and its plan
-    touches none of them, nor .github/. At merge the lane refuses its LAND again when no CI ran (Lane.ci_green)."""
+    touches none of them, nor .github/, the lander's own code (core/lander/) or a landing policy file (any
+    LANDING*.toml, or what manifest-widen owns): a light PR never changes the lander or the rules it lands by (perms
+    on #1922). At merge the lane refuses its LAND again when no CI ran (Lane.ci_green)."""
+    from lander import manifest as M
     if (repo_key(job.repo) not in {repo_key(r) for r in C.conf("CC_LAND_REVIEW_LIGHT_FIX", "").split()}
             or job.plan is None or job.plan.extra.get("security")):
         return False
@@ -2083,6 +2090,10 @@ def light_lane(job):
         return False
     if any(f.startswith(".github/") for f in job.files):   # its CI runs from the PR's own head
         C.log("light-refused", job.repo, job.pr, why="it changes .github/, where the CI it would merge on is defined")
+        return False
+    own = M.builtin_check().paths + ["core/lander/**", "**/LANDING*.toml"]
+    if any(M.match(own, f) for f in job.files):
+        C.log("light-refused", job.repo, job.pr, why="it changes the lander or a landing policy file")
         return False
     return True
 
@@ -2160,6 +2171,14 @@ def _buy(job, template, diff, more, prior=None, light=False):
             # the same check every other path runs first: a security HANDBACK posted while the read ran outranks it
             return _security_stands(job, now) or land
     return v
+
+
+def light_fixed(job) -> bool:
+    """Whether the LAND at the job's head is a FIX the light path demoted: this box's saved read says so, or the PR's
+    own marker does (light=1), so a lost state file cannot let it merge as a full LAND."""
+    v = saved(job.digest) or recorded((pr_view(root_of(job), job.pr) or {}).get("comments") or [],
+                                      {job.digest} - {""}, job.head)
+    return bool((getattr(v, "extra", None) or {}).get("light_fix"))
 
 
 def saved(digest):

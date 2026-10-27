@@ -135,7 +135,7 @@ def last(text, n=200) -> str:
 # the rate limit says so with its reset.
 REST_FIELDS = {"state", "isDraft", "mergeable", "headRefOid", "headRefName", "baseRefName", "title", "body",
                "mergeCommit", "mergedAt", "mergeStateStatus", "files", "number", "url", "statusCheckRollup",
-               "comments"}
+               "comments", "isCrossRepository"}
 _VIEWER = {}
 
 
@@ -225,7 +225,8 @@ def rest_facts(p, want) -> dict:
              "baseRefName": base.get("ref") or "", "title": p.get("title") or "", "body": p.get("body") or "",
              "mergeCommit": {"oid": p.get("merge_commit_sha") or ""} if merged else None,
              "mergedAt": p.get("merged_at"), "mergeStateStatus": str(p.get("mergeable_state") or "unknown").upper(),
-             "number": p.get("number"), "url": p.get("html_url") or ""}
+             "number": p.get("number"), "url": p.get("html_url") or "",
+             "isCrossRepository": (head.get("repo") or {}).get("full_name") != (base.get("repo") or {}).get("full_name")}
     return {k: every[k] for k in want if k in every}
 
 

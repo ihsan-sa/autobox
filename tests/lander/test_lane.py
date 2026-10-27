@@ -152,7 +152,7 @@ if me == "gh":
                                "mergeable_state": d["mergeStateStatus"].lower(), "title": d["title"], "body": d["body"],
                                "head": {"sha": d.get("headRefOid"), "ref": d.get("headRefName"),
                                         "repo": {"full_name": d.get("headRepo", "o/demo")}},
-                               "base": {"ref": d["baseRefName"]}}))
+                               "base": {"ref": d["baseRefName"], "repo": {"full_name": "o/demo"}}}))
         out(0, json.dumps({f: d.get(f) for f in fields}))
     if a[:2] == ["pr", "merge"]:
         pr = prs[a[2]]
@@ -2633,13 +2633,16 @@ class Merge(Fixture):
         self.assertEqual(self.box()["deleted"], ["track/row-1"])   # the branch, as --delete-branch did
         self.assertIn(f"stage demo#1 merged sha={head[:12]}", self.log())
 
-    def test_a_forks_branch_is_never_deleted(self):
-        head = self.pr(1, {"a/x": "n\n"}, headRepo="someone/demo")
+    def test_a_fork_pr_is_a_query_never_checked_merged_or_deleted(self):
+        # perms on #1925: a fork's branch of a name origin also has was checked at origin's head, then re-queued as
+        # "moved" at every pass
+        self.pr(1, {"a/x": "n\n"}, isCrossRepository=True, headRepo="someone/demo")
         J.submit("demo", 1)
-        self.land()
-        self.assertEqual(len(self.box()["rest_merges"]), 1)
+        u, _ = self.land()
+        self.assertEqual((self.job().state, u["runner"].calls), (T.QUERY, []))
+        self.assertIn("comes from a fork", self.job().extra["why"])
+        self.assertNotIn("rest_merges", self.box())
         self.assertNotIn("deleted", self.box())   # not ours to delete
-        self.assertIn(f"stage demo#1 merged sha={head[:12]}", self.log())
 
     def test_a_failed_branch_delete_still_reports_the_merge(self):
         head = self.pr(1, {"a/x": "n\n"})
@@ -2911,6 +2914,20 @@ class AtOnce(Fixture):
                     self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
                 else:
                     self.assertEqual((self.job().state, self.job().extra.get("ci")), (T.DEPLOY_PENDING, "none"))
+
+    def test_a_light_fix_with_no_ci_is_handed_back_when_its_state_file_is_lost(self):
+        # security read of #1922: the light flag lived only in the saved review state; the PR's marker carries it too
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        marker = R.marker(T.Verdict(verdict=T.LAND, digest="d", extra={"light_fix": True}), "b" * 40, "c" * 40, "me")
+        self.assertTrue(R.imported(marker).extra.get("light_fix"))
+        light = T.Verdict(verdict=T.LAND, digest="d", extra=R.imported(marker).extra)
+        with mock.patch.object(R, "saved", lambda digest: None), \
+                mock.patch.object(R, "recorded", lambda comments, digests, head="": light), \
+                mock.patch.object(R, "pr_view", lambda *a, **k: {"comments": []}):
+            _, lines = self.land()
+        self.assertEqual(self.merged_order(), [], lines)
+        self.assertIn("no GitHub CI ran", J.read_json(J.handed_path("demo", 1))["why"])
 
     def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
         with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to
@@ -5653,6 +5670,19 @@ class Rereads(Fixture):
         self.assertLess(calls[0], 100, "the lane spun on the held job")   # ~20 passes at POLL 0.05; the spin made 1000s
         self.assertLessEqual(sum("is paused" in ln for ln in lines), 1, lines[-3:])
         self.assertEqual(self.job().state, T.CHECKING)
+
+    def test_a_merged_or_closed_pr_reads_no_remote_head(self):
+        # Opus security read of #1925: the ls-remote (120 s) ran on the lane thread for a PR that had already ended
+        for state in ("MERGED", "CLOSED"):
+            with self.subTest(state=state):
+                j = T.Job(repo="demo", pr=1, head="e" * 40, state=T.CHECKING, extra={"branch": "track/row-1"})
+                J.save(j)
+                asked = []
+                with mock.patch.object(GH, "pr_facts", lambda *a, **k: ({"state": state, "headRefOid": "f" * 40}, "")), \
+                        mock.patch.object(G, "remote_head", lambda *a, **k: asked.append(a) or "f" * 40):
+                    self.assertTrue(L.Lane("demo", self.units()).reread(j))
+                self.assertEqual(asked, [])
+                self.assertEqual(J.load("demo", 1).state, T.QUEUED)
 
 
 class FlakeRetry(Fixture):

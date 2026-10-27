@@ -92,7 +92,8 @@ with main (CONFLICT below) stops it. Each turn of the loop first records the che
 is seen while queued jobs keep the turn list full, and a job held during the pass has a turn again once its
 not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
-  queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft -> held 15 min; a conflict -> CONFLICT
+  queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a fork's PR (isCrossRepository: the lane reads
+             heads from origin's branches only) -> query; a draft -> held 15 min; a conflict -> CONFLICT
              below (GitHub's CONFLICTING with no file git names -> held 15 min). Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
              reviewer's digest_of, the key `record` and `will-review` use). A member PR meets its
@@ -124,7 +125,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              10-20: a worker that edits a host check's run file selects it, and its head ran as the box's user
              before any read). RE-READ: every RECHECK_SECS while it
              checks, at its next turn after an `again` request, and before its review read is bought (hive#67, 10-23: 2
-             full reads of heads a push had replaced), the job reads the PR's state and origin's head; not OPEN or
+             full reads of heads a push had replaced), the job reads the PR's state and, only while it is OPEN,
+             origin's head (#1925's read: no 120 s ls-remote on the lane thread for a PR that ended); not OPEN or
              a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
              back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so no check
              runs on for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
@@ -295,7 +297,7 @@ PLACE_HOLDS = 4          # holds a job keeps its queued_at through; the next one
 MAIN_RED_WAITS = 4       # holds a main-red job sits out while main and its head stay put, before it tries anyway
 MOVES_BEFORE_HOLD = 5    # main moving under the merge this many times in one step holds the job
 GH_PR_FILES = 100        # gh lists at most this many files; at or over it git names them all
-FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body"
+FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body,isCrossRepository"
 PRE_MERGE = (T.QUEUED, T.PLANNED, T.CHECKING)
 SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
 # …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
@@ -979,7 +981,9 @@ class Lane:
             J.save(job)
             return False
         state = facts.get("state") or ""
-        head = G.remote_head(self.root, job.extra.get("branch") or "", env=self.genv) or facts.get("headRefOid") or ""
+        # only an open PR's head matters: a merged or closed one leaves checking whatever it points at (#1925)
+        head = (G.remote_head(self.root, job.extra.get("branch") or "", env=self.genv) or facts.get("headRefOid") or ""
+                if state == "OPEN" else "")
         if state == "OPEN" and (not head or head == job.head):
             J.save(job)
             return False
@@ -1199,6 +1203,13 @@ class Lane:
         if state == "CLOSED":
             J.move(job, T.DONE, why="the PR is closed")
             return E.log("done", job.repo, job.pr, rc=1)
+        if facts.get("isCrossRepository"):
+            # perms on #1925: the lane reads a head from origin's branch of that name, so a fork's PR whose branch
+            # name origin also has was checked at origin's head, then queued again at every pass as "moved". A
+            # query rests: a handback's push watch reads origin's branch too, and would re-queue it each tick
+            return self.query(job, f"PR #{job.pr} comes from a fork, and the lane checks and merges only branches "
+                                   f"on this repo: push {branch or 'it'} here and open the PR from that",
+                              M.route(job) or "seat")
         if facts.get("isDraft"):
             # held for something of the PR's own (not the box's), then drafted: a person did that, and the hold's
             # why stays out of DRAFT so tick's un-draft sweep leaves it theirs
@@ -1694,7 +1705,7 @@ class Lane:
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
             from lander import review as R
-            if job.extra.get("ci") == "none" and (getattr(R.saved(job.digest), "extra", None) or {}).get("light_fix"):
+            if job.extra.get("ci") == "none" and R.light_fixed(job):
                 # security read of #1922: a PR that drops its own CI trigger lands as "no CI", and a demoted FIX
                 # would merge with no test at all; with no CI the light path keeps the HANDBACK
                 return self.handback(job, f"its read was a FIX the light path demoted, and no GitHub CI ran at "

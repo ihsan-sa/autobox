@@ -190,14 +190,17 @@ class Strays(Fixture):
 
     def test_self_merge_heads_reads_the_repo_key_on_the_box(self):
         answers = {"LANDER_SELF_MERGE_HEADS_dispatch": (0, "dispatch/ hive/\n", ""),
-                   "LANDER_SELF_MERGE_HEADS_a_b": (1, "", ""), "LANDER_SELF_MERGE_HEADS_slow": (125, "", "timeout"),
+                   "LANDER_SELF_MERGE_HEADS_a_2Eb": (1, "", ""), "LANDER_SELF_MERGE_HEADS_a_2Db": (0, "hive/\n", ""),
+                   "LANDER_SELF_MERGE_HEADS_a_5Fb": (1, "", ""), "LANDER_SELF_MERGE_HEADS_slow": (125, "", "timeout"),
                    "LANDER_SELF_MERGE_HEADS_deep": (0, "hive/runs/\n", "")}
-        bad = ["dispatch", "dispatch/ d", "*/", "/", "../", "dispatch/ -x/", "a//"]
+        bad = ["dispatch", "dispatch/ d", "*/", "/", "../", "dispatch/ -x/", "a//", "track/", "hive/ track/x/"]
         answers.update({f"LANDER_SELF_MERGE_HEADS_bad{i}": (0, v, "") for i, v in enumerate(bad)})
         with mock.patch.object(L, "run", lambda argv, timeout=60: answers[argv[2]]):
             self.assertEqual(SELF_MERGE_HEADS("dispatch"), ["dispatch/", "hive/"])
             self.assertEqual(SELF_MERGE_HEADS("deep"), ["hive/runs/"])
             self.assertEqual(SELF_MERGE_HEADS("a.b"), [])     # unset
+            self.assertEqual(SELF_MERGE_HEADS("a-b"), ["hive/"])   # a key of its own, not a.b's or a_b's
+            self.assertEqual(SELF_MERGE_HEADS("a_b"), [])
             self.assertEqual(SELF_MERGE_HEADS("slow"), [])    # cc-config did not answer: queue as before
             for i, v in enumerate(bad):                       # one word that is no namespace voids the whole setting
                 self.assertEqual(SELF_MERGE_HEADS(f"bad{i}"), [], v)

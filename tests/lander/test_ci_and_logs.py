@@ -445,6 +445,12 @@ class RestFacts(unittest.TestCase):
         self.assertEqual(j, {"state": "OPEN", "mergeCommit": None, "mergeable": "CONFLICTING",
                              "mergeStateStatus": "BEHIND"})
 
+    def test_a_fork_is_cross_repository(self):
+        for head_repo, cross in (({"full_name": "o/r"}, False), ({"full_name": "x/r"}, True), (None, True)):
+            pull = dict(self.PULL, head=dict(self.PULL["head"], repo=head_repo), base={"ref": "main",
+                                                                                      "repo": {"full_name": "o/r"}})
+            self.assertEqual(GH.rest_facts(pull, ["isCrossRepository"]), {"isCrossRepository": cross}, head_repo)
+
     def test_files_are_the_rest_file_list(self):
         calls, p = self.run_gh({"api --paginate repos/o/r/pulls/7/files?per_page=100 -q .[].filename": "a.py\nb/c.sh\n"})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):

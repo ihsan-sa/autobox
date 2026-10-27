@@ -1492,6 +1492,22 @@ class TestLightFix(Case):
         v, box = self.read(self.blocker("low"), job=dataclasses.replace(self.job(), files=["x.py", ".github/ci.yml"]))
         self.assertEqual((v.verdict, box.called("cc-board add")), (T.HANDBACK_VERDICT, []))
 
+    def test_a_change_to_the_lander_or_its_landing_policy_keeps_the_full_path(self):
+        # security read of #1922 and perms on its LAND: a light FIX could drop the lane's own policy lists, or change
+        # the lander that judges it, on one medium finding
+        for f in ("core/lander/review.py", "tests/LANDING-security.toml", "core/tests/LANDING.toml",
+                  "tests/LANDING-policy.toml", "tests/reach.tsv", "hive/LANDING-extra.toml"):
+            v, box = self.read(self.blocker("low"), job=dataclasses.replace(self.job(), files=["x.py", f]))
+            self.assertEqual((v.verdict, box.called("cc-board add")), (T.HANDBACK_VERDICT, []), f)
+
+    def test_the_marker_carries_the_light_flag(self):
+        # security read of #1922: a lost state file must not lose the flag the no-CI refusal reads
+        v, box = self.read(self.blocker("low"))
+        body = box.called("gh pr comment")[0]["input"]
+        self.assertIn(" light=1 ", body)
+        self.assertTrue(R.imported(body).extra.get("light_fix"))
+        self.assertNotIn("light_fix", R.imported(R.marker(T.Verdict(verdict=T.LAND, digest="ab"), "b", "c", "me")).extra)
+
     def test_a_lane_that_has_not_opted_in_keeps_the_full_path(self):
         self.reviewer(CC_LAND_REVIEW_LIGHT_FIX=None)
         v, _ = self.read(self.blocker("low"))
