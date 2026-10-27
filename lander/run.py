@@ -402,7 +402,10 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
     A plan's `cancel` set (the lane: the job's PR merged, closed or moved on) kills the group the same way, and a
-    stopped plan starts nothing more: rc -SIGTERM, which status_of calls unrunnable, never red."""
+    stopped plan starts nothing more: rc -SIGTERM, which status_of calls unrunnable, never red.
+    Two gaps, named: a grandchild that calls setsid leaves the group, so the group kill never reaches it (the check's
+    cage or the unit's cgroup ends it; a check that runs one is its own to clean up); and the lander installs no
+    SIGTERM handler, so a SIGTERM to the lane skips the finally above (the unit's cgroup kill covers it)."""
     t0 = time.monotonic()
     try:
         if stopped():
@@ -414,7 +417,8 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             _beat(0)
     finally:
         for fd in keep:
-            os.close(fd)
+            with contextlib.suppress(OSError):   # one that fails to close must not strand the group Popen started
+                os.close(fd)
     capped, ru, held, size, grew = False, None, 0, 0, t0
     try:
         while True:
@@ -454,6 +458,9 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        if p.returncode is None:   # a raise before the wait: reap the killed child, no zombie
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(p.pid, 0)
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
     return rc, time.monotonic() - t0, cpu, capped, max(held, ru.ru_maxrss * 1024 if ru else 0)
 

@@ -226,6 +226,31 @@ class Cancel(unittest.TestCase):
         self.assertGreaterEqual(peak, 64 << 20)
         self.assertLess(peak, 1 << 30)
 
+    def test_a_raise_mid_run_kills_the_group_and_reaps_the_child(self):
+        pids = []
+        real = subprocess.Popen
+
+        def popen(*a, **k):
+            pids.append(real(*a, **k))
+            return pids[-1]
+        with mock.patch.object(subprocess, "Popen", popen), mock.patch.object(RUN.os, "wait4", side_effect=OSError):
+            with self.assertRaises(OSError):
+                self.execute(["sleep", "60"])
+        self.assertFalse(os.path.exists(f"/proc/{pids[0].pid}"))   # a zombie would still have its /proc entry
+
+    def test_a_keep_fd_that_fails_to_close_does_not_strand_the_run(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        real = os.close
+
+        def close(fd):
+            real(fd)
+            if fd == w:
+                raise OSError
+        with mock.patch.object(RUN.os, "close", close):
+            rc = RUN.execute(["true"], self.tmp, dict(os.environ), 120, os.path.join(self.tmp, "log"), keep=(w,))[0]
+        self.assertEqual(rc, 0)
+
 
 class Cap(unittest.TestCase):
     """The cap ends a hung check, not a slow one (dispatch #1984, 10-25: held at 2404 s of its 2400 s cap)."""
@@ -4322,12 +4347,24 @@ class Ratchet(unittest.TestCase):
             if tree == self.B:
                 st = T.UNRUNNABLE if alone else T.FAILED
                 return T.Result(check=check.name, tree=tree, status=st, runner="box:x:-",
-                                extra={"loaded": True, "why": st, "fails": ["✗ a", "✗ b"]})
+                                extra={"loaded": True, "why": st, "fails": ["✗ a", "✗ b"], "failed": 2, "passes": 9,
+                                       "ends": True})
             return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
-                            extra={"loaded": False, "why": "red", "fails": ["✗ a"], "failed": 1, "ends": True})
+                            extra={"loaded": False, "why": "red", "fails": ["✗ a"], "failed": 1, "passes": 9,
+                                   "ends": True})
         for touched in (False, True):
             o = RUN.judge(chk(), self.H, self.B, runner=run, touched=touched)
             self.assertEqual(o.status, RUN.BLOCKED, touched)
+
+    def test_a_new_case_on_a_base_red_under_load_with_no_answer_is_not_the_prs(self):
+        # the base's loaded red stands for nothing, so its case list cannot show the head's case as new
+        def run(check, tree, where, alone=False, **kw):
+            if tree == self.B:
+                return T.Result(check=check.name, tree=tree, status=T.UNRUNNABLE if alone else T.FAILED,
+                                runner="box:x:-", extra={"loaded": True, "why": "red", "fails": ["✗ a"]})
+            return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
+                            extra={"loaded": False, "why": "red", "fails": ["✗ new"]})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, RUN.BLOCKED)
 
     def test_a_head_naming_a_case_mains_red_lacks_is_the_prs(self):
         # read of #1966: a new case on a base red only elsewhere was held as main-red, not handed back
