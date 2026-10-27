@@ -4475,13 +4475,13 @@ class SmallFirst(Fixture):
         # #1960 review: a put-first kept through a query was dropped at the head the lane's own update-branch made.
         # #1982 review: an author's push on top of that update kept it too, and so did an author's merge of a commit
         # not on the base, on the head put first
-        def merge(second):   # on the branch's tip, its tree unchanged
+        def merge(second, tree="origin/track/row-1^{tree}"):   # on the branch's tip, its tree unchanged
             self.git(self.work, "fetch", "-q", "origin")
-            sha = self.git(self.work, "commit-tree", "origin/track/row-1^{tree}", "-p", "origin/track/row-1",
+            sha = self.git(self.work, "commit-tree", tree, "-p", "origin/track/row-1",
                            "-p", second, "-m", "merge")
             self.git(self.work, "push", "-q", "-f", "origin", f"{sha}:refs/heads/track/row-1")
             return sha
-        for author in (False, "push", "merge"):
+        for author in (False, "push", "merge", "tree"):
             self.setUp()
             head = self.pr(1, {"a/x": "n\n"})
             J.submit("demo", 1)
@@ -4496,6 +4496,8 @@ class SmallFirst(Fixture):
             J.move(job, T.QUEUED, why="queued again")
             if author == "merge":
                 new = merge(self.push("track/stray", {"b/y": "s\n"}))
+            elif author == "tree":   # the right parents, but a tree that is not their merge
+                new = merge(self.origin_rev("main"), tree=f"{self.origin_rev('main')}^{{tree}}")
             else:
                 new = merge(self.origin_rev("main"))   # GitHub's merge of the base
             if author == "push":

@@ -1888,11 +1888,14 @@ class Lane:
         return "merged"
 
     def base_merge(self, head, first, base):
-        """Whether `head` is a merge onto `first` of a commit on `base`, as GitHub's update-branch makes; False when
-        it does not read."""
+        """Whether `head` is exactly GitHub's update-branch merge onto `first` of a commit on `base`: two parents, the
+        first `first`, the second on `base`, and the tree the merge of the two; False when it does not read."""
         try:
-            return G.rev(self.root, f"{head}^1", env=self.genv) == first and \
-                G.git(self.root, "merge-base", "--is-ancestor", f"{head}^2", base, env=self.genv).rc == 0
+            parents = G.git(self.root, "rev-list", "--parents", "-n1", head, env=self.genv).out.split()[1:]
+            return len(parents) == 2 and parents[0] == first and \
+                G.git(self.root, "merge-base", "--is-ancestor", parents[1], base, env=self.genv).rc == 0 and \
+                G.merge_tree(self.root, first, parents[1], env=self.genv)[0] == \
+                G.git(self.root, "rev-parse", f"{head}^{{tree}}", check=True, env=self.genv).out.strip()
         except G.GitError:
             return False
 
