@@ -1566,7 +1566,8 @@ class HostAndRunners(Env):
         self.assertEqual([r.status for r in base], [T.FAILED, T.UNRUNNABLE], o.results)
         self.assertIn("no run alone", base[-1].extra["why"])
         self.assertIsNone(store.base(red.name, self.tree))
-        self.assertEqual(o.status, T.FAILED, o.note)   # the PR's own red stands; main's is neither blocking nor waving it through
+        # read of #1966: main's red under load with no answer alone holds; it never makes the red the PR's, nor passes it
+        self.assertEqual(o.status, RUN.BLOCKED, o.note)
 
     def test_a_lanes_express_run_takes_no_slot_and_its_other_runs_wait_as_a_lane(self):
         # lane=True only moves the run's ticket ahead of a worker's: an express run still takes no slot at all
@@ -3968,12 +3969,39 @@ class Ratchet(unittest.TestCase):
     def test_a_touched_check_passes_only_when_it_greens_one_of_mains_reds_and_names_no_other(self):
         # 10-25: #2020-#2022 each fixed one of a check's reds, held on the other two's, and went to hand merges
         for head, want in ((["✗ b", "✗ c"], T.PASSED), (["✗ a", "✗ b", "✗ c"], RUN.BLOCKED),
-                           (["✗ b", "✗ new"], RUN.BLOCKED), ([], RUN.BLOCKED)):
+                           (["✗ b", "✗ new"], T.FAILED), ([], RUN.BLOCKED)):
             run, _ = self.runner({self.H: head, self.B: ["✗ a", "✗ b", "✗ c"]})
             self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=True).status, want, head)
         run, _ = self.runner({self.H: ["✗ b"], self.B: ["✗ a", "✗ b"]})
         self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=True, security=True).status,
                          RUN.BLOCKED)
+
+    def test_a_base_red_under_load_with_no_answer_alone_holds_and_never_ratchets(self):
+        # read of #1966: under SETTLE the base's alone rerun gave nothing, and the head's alone rerun blamed the PR
+        def run(check, tree, where, alone=False, **kw):
+            if tree == self.B:
+                st = T.UNRUNNABLE if alone else T.FAILED
+                return T.Result(check=check.name, tree=tree, status=st, runner="box:x:-",
+                                extra={"loaded": True, "why": st, "fails": ["✗ a", "✗ b"]})
+            return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
+                            extra={"loaded": False, "why": "red", "fails": ["✗ a"], "failed": 1, "ends": True})
+        for touched in (False, True):
+            o = RUN.judge(chk(), self.H, self.B, runner=run, touched=touched)
+            self.assertEqual(o.status, RUN.BLOCKED, touched)
+
+    def test_a_head_naming_a_case_mains_red_lacks_is_the_prs(self):
+        # read of #1966: a new case on a base red only elsewhere was held as main-red, not handed back
+        for touched in (False, True):
+            run, _ = self.runner({self.H: ["✗ new"], self.B: ["✗ a"]})
+            self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=touched).status, T.FAILED)
+        # a rerun naming only main's reds holds as main-red
+        heads = iter((["✗ new"], ["✗ a"]))
+
+        def run(check, tree, where, alone=False, **kw):
+            f = next(heads) if tree == self.H else ["✗ a"]
+            return T.Result(check=check.name, tree=tree, status=T.FAILED, runner="box:x:-",
+                            extra={"loaded": False, "why": "red", "fails": f})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, RUN.BLOCKED)
 
     def test_a_touched_check_is_judged_on_the_base_run_again_not_the_stored_one(self):
         # a stored red one case wider than main now must not make the head's equal set look like a fix
@@ -4065,12 +4093,6 @@ class Ratchet(unittest.TestCase):
         self.assertEqual(o.sets, {"pr": ["✗ a"], "main": ["✗ a", "✗ b"]})
         self.assertEqual(calls, [(self.H, False), (self.B, False)])   # no rerun of the head: main's red explains it
         rec.assert_not_called()
-
-    def test_a_red_main_lacks_still_holds(self):
-        run, _ = self.runner({self.H: ["✗ a", "✗ new"], self.B: ["✗ a"]})
-        o = RUN.judge(chk(name="c"), self.H, self.B, runner=run)
-        self.assertEqual((o.status, o.note), (RUN.BLOCKED, "blocked-by-main:c"))
-        self.assertEqual(o.sets, {"pr": ["✗ a", "✗ new"], "main": ["✗ a"]})
 
     def test_a_suite_that_names_nothing_falls_back_to_the_exit_code_and_holds(self):
         for head, base in (([], ["✗ a"]), ([], []), (["✗ a"], []), (None, ["✗ a"]), (["✗ a"], None)):
@@ -4198,12 +4220,12 @@ class Ratchet(unittest.TestCase):
         o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-3")
         self.assertEqual(o.status, T.FAILED)
         self.assertEqual(store.base("c", self.B).status, T.PASSED)
-        # a stored red that already shows a new red holds without a base run
+        # a stored red that already shows a new red needs no base run: the red is the PR's when it repeats
         run, calls = self.runner({self.H: ["✗ new"], self.B: ["✗ a"]})
         store.put_base(run(chk(), self.B, "box"))
         calls.clear()
         o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-4")
-        self.assertEqual((o.status, calls), (RUN.BLOCKED, [(self.H, False)]))
+        self.assertEqual((o.status, calls), (T.FAILED, [(self.H, False), (self.H, False)]))
 
     def test_never_for_a_security_check_a_touched_check_or_runs_in_two_places(self):
         run, _ = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})

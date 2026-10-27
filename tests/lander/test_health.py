@@ -104,7 +104,7 @@ class Run(Case):
         self.assertEqual(ran, {"app": T.PASSED})              # not lib (untouched), not boxy (the tip run's)
         self.assertEqual(asked, [("app", TIP1)])
         self.assertEqual(HL.load("demo")["tip"], TIP1)
-        self.assertEqual(HL.at("demo", "t" + TIP1[:5]), {"app": T.PASSED})
+        self.assertEqual(HL.at("demo", "t" + TIP1[:5]), {})   # a green is never taken (10-25)
         self.assertEqual(self.go(TIP1, ["app/x.py"])[0], {})  # a tip already checked runs nothing again
         self.assertEqual(self.said, [])
 
@@ -302,12 +302,12 @@ class At(Case):
         self.assertEqual(HL.at("demo", ""), {})
 
     def test_at_trusts_a_record_only_while_it_is_fresh(self):
-        # architect read, 10-13: a stale green must not skip the base run when the box broke the check since
-        self.go(TIP1, ["app/x.py"])
+        # architect read, 10-13: a stale red must not stand for a base run when the box fixed the check since
+        self.go(TIP1, ["app/x.py"], red={"app"})
         tree = "t" + TIP1[:5]
         stamp = HL.load("demo")["checks"]["app"]["at"]
         t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-        self.assertEqual(HL.at("demo", tree, now=t + datetime.timedelta(seconds=HL.FRESH - 60)), {"app": T.PASSED})
+        self.assertEqual(HL.at("demo", tree, now=t + datetime.timedelta(seconds=HL.FRESH - 60)), {"app": T.FAILED})
         self.assertEqual(HL.at("demo", tree, now=t + datetime.timedelta(seconds=HL.FRESH)), {})
         rec = HL.load("demo")
         rec["checks"]["app"]["at"] = "not a stamp"

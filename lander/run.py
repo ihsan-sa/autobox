@@ -57,7 +57,8 @@ JUDGE (a red, per check): the same check on the BASE tree — main's own record 
 tip run made one (health.py): red there stands as `blocked-by-main` with no run for a check that guards a security
 path, where the ratchet cannot apply; a green there stands for nothing, since main's green an hour old blamed a PR
 for a red main's own runs showed under load (10-25); else the lane's shared record when there is one — red there too
-is `blocked-by-main` (main is red, the diff is not blamed) — unless THE RATCHET lets it pass: every case the head's run
+is `blocked-by-main` (main is red, the diff is not blamed), though a head red naming a case the base's red (from a run
+that stands, its names trusted) does not is judged as on a green base, and held only if its rerun names none — unless THE RATCHET lets it pass: every case the head's run
 names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths and full shas blanked) fails
 on the base too, the head ran as far (no fewer passes, no more failures, no crash the base lacks), both ran in the
 same place, and the base's red is a run made now, in this judge() (a shared one that would let it pass is run again
@@ -70,7 +71,7 @@ base run and its red is the diff's — except a check the base defines whose run
 run at all and is `blocked-by-main` (missing_run: main registered it before its script landed); a red run under
 load (A.loaded() at either end, or starved(): a box run whose wall time was STARVED times its CPU time while a load
 average stood at the box's cores), on either tree, gets ONE diagnostic rerun alone (every slot held; one that has not got them all within the largest cap
-in its manifest runs as load admits instead, admission SETTLE, though a security check never does, and a loaded red from it is unrunnable, no answer), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+in its manifest runs as load admits instead, admission SETTLE, though a security check never does, and a loaded red from it is unrunnable, no answer: a base red under load whose rerun gives none holds as `blocked-by-main`, never ratcheted), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
 whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded
 (or loaded by starved() alone short of its cap: a PR's own check sets its ratio with a sleep), a check that guards a security path or that the change touches, whose first red stands; green the second time passes
 with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
@@ -1132,20 +1133,27 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     if base_tree and check.name != M.BUILTIN and on_base and main == T.FAILED and security:
         out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name} (main's own record)"
         return out
+    held = None   # main's red on the base, when the head's names a case it lacks
     if base_tree and check.name != M.BUILTIN and on_base:
         def base_run():
             b = go(base_tree, base=True, keep=False)
+            out.results.append(b)
             if b.status == T.FAILED and b.extra.get("loaded"):
-                # the head's rule on the base too: a red under load is rerun alone, and only that rerun is shared
-                out.results.append(b)
-                b = go(base_tree, alone=True, base=True)
+                # the head's rule on the base too: a red under load is rerun alone, and only that rerun is shared;
+                # one that gives no answer (SETTLE: red under load again) leaves main's loaded red, which holds as
+                # main-red: the head's own rerun never makes it the PR's, nor the ratchet passes it (read of #1966)
+                again = go(base_tree, alone=True, base=True)
+                out.results.append(again)
+                b = b if again.status == T.UNRUNNABLE else again
             elif store is not None and b.status != T.UNRUNNABLE:
                 store.put_base(b)
             return b
         b = store.base(check.name, base_tree) if store is not None else None
         fresh = b is None
-        b = base_run() if fresh else b
-        out.results.append(b)
+        if fresh:
+            b = base_run()
+        else:
+            out.results.append(b)
         # the ratchet follows quarantine's rule: never on security checks or on a PR touching the check, whose
         # change could reword its own red lines into main's -- unless it turns one of main's named reds green and
         # names no other: on 10-25 #2020-#2022 each fixed one of a check's reds and held on the other two's
@@ -1157,12 +1165,14 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
             # ...and a re-run that gave no answer (unrunnable: its cap, the laptop gone) keeps the stored red, which
             # holds as main-red: the PR is never handed back for a red main has (Opus and perms, 10-13)
             again = base_run()
-            out.results.append(again)
             if again.status != T.UNRUNNABLE:
                 b, fresh = again, True
-        if b.status == T.FAILED:
+        # a head that names a case main's red lacks is judged as on a green base: its red is the PR's when a rerun
+        # repeats it (read of #1966: a new case X on a base red only elsewhere was held as main-red)
+        held = b if b.status == T.FAILED and news(r, b) else None
+        if b.status == T.FAILED and held is None:
             # brief: "If the PR's failing set is a subset of main's, the check counts as passed for this PR"
-            if may(b) and fresh and no_new_reds(r, b):
+            if may(b) and fresh and not b.extra.get("loaded") and no_new_reds(r, b):
                 out.status, out.note = T.PASSED, f"ratchet: no new reds, {check.name} is red on the base too"
                 out.sets = {"pr": r.extra["fails"], "main": b.extra["fails"]}
                 return out
@@ -1189,6 +1199,10 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
             out.status, out.note = T.UNRUNNABLE, r2.extra.get("why", "")
             return out
         r = r2
+    if held is not None and not news(r, held):   # the rerun's reds are all main's
+        out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name}"
+        out.sets = {"pr": r.extra.get("fails"), "main": held.extra.get("fails")}
+        return out
     lines = [c["name"] for c in r.cases] or red_lines("\n".join(r.extra.get("tail", [])))
     # design §0: quarantine "never on security checks or on a PR touching the check"
     if not security and not touched and REC.quarantined(check, lines, list(quarantine)):
@@ -1198,6 +1212,13 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     if record:
         record(r, "\n".join(r.extra.get("tail", [])))
     return out
+
+
+def news(head: T.Result, base: T.Result) -> bool:
+    """The head's red names a failing case the base's red does not, where the base's red names cases of its own, from a
+    run that stands (not a red under load)."""
+    pr, main = head.extra.get("fails"), base.extra.get("fails")
+    return bool(pr) and bool(main) and not base.extra.get("loaded") and not set(pr) <= set(main)
 
 
 def no_new_reds(head: T.Result, base: T.Result) -> bool:
@@ -1295,8 +1316,8 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
     `first`). beat: a dict _beat() keeps for the lane (NOSTART). runners=True from the lane
     only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
     caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
-    rest go where choose_where puts the lane's: one that may leave goes to a runner's cage while this box is full. main: {check: status} of main's own record on exactly base_tree (health.at), which
-    judge() takes in place of a base run."""
+    rest go where choose_where puts the lane's: one that may leave goes to a runner's cage while this box is full. main: {check: failed} of each check main's own record holds red on exactly base_tree
+    (health.at), which judge() takes in place of a base run of a security check."""
     _STOP.event, _STOP.beat = cancel, beat
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,

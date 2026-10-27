@@ -3483,7 +3483,8 @@ class Review(Fixture):
         self.assertNotIn("ok=yes", self.log().split("gate=a ")[1].split("\n")[0])
 
     def test_a_main_red_hold_keeps_when_it_first_held_on_that_check(self):
-        lane = mock.Mock()
+        lane = mock.MagicMock()
+        lane.fetch.return_value = {"main": "b" * 40}   # main has not moved
         job = T.Job(repo="demo", pr=1, head="h" * 40, base_sha="b" * 40, extra={})
         blocked = {"a": L.RUN.Outcome("a", L.RUN.BLOCKED, "blocked-by-main:a", [],
                                       {"pr": ["FAIL n"], "main": ["FAIL m"]})}
@@ -3498,6 +3499,15 @@ class Review(Fixture):
         f.name = "b"
         L.Lane.took(lane, job, f, {"b": L.RUN.Outcome("b", L.RUN.BLOCKED, "blocked-by-main:b")})
         self.assertNotEqual(job.extra["main_red"]["since"], "2026-10-13T00:00:00Z")   # another check starts its own
+        # 10-26: a judge on a main that has moved since queues it again, and the record it carries is this judge's
+        job.base_sha, since = "c" * 40, job.extra["main_red"]["since"]
+        lane.fetch.return_value = {"main": "d" * 40}
+        with mock.patch.object(L.J, "move") as move:
+            L.Lane.took(lane, job, f, {"b": L.RUN.Outcome("b", L.RUN.BLOCKED, "blocked-by-main:b", [],
+                                                          {"main": ["FAIL z"]})})
+        self.assertEqual(move.call_args[0][1], T.QUEUED)
+        mr = job.extra["main_red"]
+        self.assertEqual((mr["base"], mr["fails"], mr["since"]), ("c" * 40, ["FAIL z"], since))
 
     def test_a_flaky_check_passes_and_is_logged_by_name(self):
         self.pr(1, {"a/x": "n\n"})
@@ -3606,6 +3616,29 @@ class Review(Fixture):
         self.assertRegex(self.log(), r"gate=a ok=no secs=\d+\n\S+\tstage demo#1 queued\n")   # back, not handed
         self.assertEqual(self.job().state, T.DEPLOY_PENDING)
         self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "show", "main:b/fix"), "10")
+
+    def test_a_main_red_on_a_main_that_moved_is_gated_again_not_held(self):
+        """Read of #1966: a hold on a main that has moved since says nothing of the main it would merge into."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        class MainRed(Runner):   # its red is red on the base too: blocked-by-main
+            def run_plan(self, *a, **kw):
+                out = super().run_plan(*a, **kw)
+                for o in out.values():
+                    o.status = L.RUN.BLOCKED if o.status == T.FAILED else o.status
+                return out
+        runner = MainRed(status={"a": T.FAILED})
+
+        def hook(name, count):
+            if count == 1:   # main takes the fix mid-gate; this run is still red on the old main
+                self.push("main", {"b/fix": "10\n"}, fresh=False)
+            else:
+                runner.status.clear()
+        runner.hook = hook
+        self.land(runner=runner)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertNotEqual(runner.calls[0][1], runner.calls[1][1])   # the second gate's tree is the new main's
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
 
     def test_a_red_again_on_a_newer_main_is_handed_back_after_one_regate(self):
         """Opus read of #1767: main moves under every gate, so a PR that is really red is gated again once at its

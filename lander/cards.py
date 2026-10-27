@@ -764,8 +764,10 @@ def main_red(job, secs, now=None):
         return False
     named = "; ".join(fails[:5]) + (f" (+{len(fails) - 5} more)" if len(fails) > 5 else "") if fails \
         else "none named, only its exit code"
+    # base: the main its newest judge found red, so a reader sees which main the cases are from (10-26)
     text = (f"[{job.repo}] check {check} has been red on main for {secs // 60} min and holds PRs that add a red of "
-            f"their own to it (PR #{job.pr} among them). Main's failing cases: {named}.")
+            f"their own to it (PR #{job.pr} among them). Main's failing cases at {(mr.get('base') or '?')[:12]}: "
+            f"{named}.")
     rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", f"land:{key}@{t}", "-t", f"{job.repo} landing", text],
                timeout=60, **box_hand())
     log("main-red-alert", job.repo, job.pr, check=check, mins=secs // 60, fails=len(fails), rc=rc)

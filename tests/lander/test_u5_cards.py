@@ -1267,6 +1267,14 @@ class MainRedAlert(Stubbed):
         self.assertEqual(len(self.flag([self.held(10, fails=("✗ c on port 41235",))], 3601 + 3600)), 1)
         self.assertEqual(len(self.argvs("cc-notify")), 3)
 
+    def test_the_alert_names_the_base_its_newest_judge_found_red(self):
+        # 10-26: #1952's alert named its first hold's cases while main was red on a newer base; the record is the
+        # newest judge's (lane.took), and the alert says which main it is from
+        job = self.held(7)
+        job.base_sha = "e" * 40   # planned again on a newer main, its judge there still to come: the red holds
+        self.assertEqual(len(self.flag([job], 3601)), 1)
+        self.assertIn("Main's failing cases at cccccccccccc: ✗ a; ✗ b.", self.argvs("cc-notify")[0][-1])
+
     def test_a_refused_alert_is_tried_again_and_a_suite_naming_nothing_is_said_so(self):
         os.makedirs(self.answers_path, exist_ok=True)
         with open(os.path.join(self.answers_path, "cc-notify.rc"), "w") as f:

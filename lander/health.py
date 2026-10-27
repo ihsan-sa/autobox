@@ -21,11 +21,11 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    found the lock taken and asked for one more (want(repo)), since the running pass
                                    may be on an older tip.
     red(repo)                      {name: entry} of every check the record holds red on main, whatever tree, if fresh
-    at(repo, tree)                 {name: status} measured on exactly `tree` within the last FRESH seconds: a fresh
-                                   record of a PR's base, whose red run.judge() takes instead of running a security
-                                   check on that base again. An older one is left out, so the base runs as before.
-                                   A green is never taken: a green 62 minutes old blamed a PR for main's own red under
-                                   load (10-25).
+    at(repo, tree)                 {name: failed} of each check red on exactly `tree` within the last FRESH seconds:
+                                   a fresh record of a PR's base, whose red run.judge() takes instead of running a
+                                   security check on that base again. An older one is left out, so the base runs as
+                                   before. A green is left out too: a green 62 minutes old blamed a PR for main's own
+                                   red under load (10-25).
 
 A check red here is never left out of a PR's plan: the record says only that the check is red, not which cases, so a
 PR that owned none of its paths was planned without it, and a red case it added there landed unseen behind main's
@@ -91,7 +91,7 @@ def at(repo, tree, now=None):
         return {}
     out = {}
     for n, e in load(repo)["checks"].items():
-        if e.get("tree") == tree and fresh(e, now):
+        if e.get("tree") == tree and e.get("status") == T.FAILED and fresh(e, now):
             out[n] = e["status"]
     return out
 

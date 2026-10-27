@@ -136,9 +136,9 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              back naming both mains; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
              a red whose failing cases are all red on the base too (run.no_new_reds, the ratchet) passes, with
              `stage … gate ok=ratchet` and a `ratchet <repo>#<pr> check= pr_reds= main_reds=` line naming both sets;
-             blocked-by-main (red on the base tree too, with a case the base does not fail or none named) -> held 15
-             min and planned again from main then, not blamed; extra.main_red keeps since= (its first hold on that
-             check) and main's ids for tick.flag_main_red;
+             blocked-by-main (red on the base tree too, and the ratchet would not pass it) -> queued again at once
+             when main has moved off base_sha since, else held 15 min and planned again from main then, not blamed;
+             extra.main_red keeps since= (its first hold on that check) and main's ids for tick.flag_main_red;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query, each
              quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
              when the plan is paid or a HANDBACK stands on the PR from any head (handed_back(): the job's own, or
@@ -1578,11 +1578,20 @@ class Lane:
                                       + (f": {J.quoted(o.note)}" if o.note else ""))
         if o.status == RUN.BLOCKED:
             # since: when this check first held this job, kept while it holds it again, for tick.flag_main_red's
-            # hour; fails: main's failing ids, which that alert names
+            # hour; base and fails: this newest judge's, which that alert names, also when main has moved and it is
+            # queued again below (10-26: the alert for #1952 named its first hold's base while main was red on a newer)
             mr = job.extra.get("main_red") if isinstance(job.extra.get("main_red"), dict) else {}
             since = mr.get("since") if mr.get("check") == n and mr.get("since") else E.stamp()
             job.extra["main_red"] = {"check": n, "base": job.base_sha, "head": job.head, "waits": 0, "since": since,
                                      "fails": (o.sets.get("main") or [])[:20]}
+            # as a red at #1468: a red on a main that has moved since says nothing of the main it would merge into, so
+            # it is planned again there now, not held on the old one (read of #1966)
+            with self.lock():
+                now = self.fetch(base_ref)[base_ref]
+            if now != job.base_sha:
+                self.stop_checks(job)
+                return J.move(job, T.QUEUED, why=f"check {n} is red on {base_ref} {job.base_sha[:12]}, which has "
+                                                 f"moved to {now[:12]}: gated again on it")
             # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
             return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
                                   f"is main's, not this PR's — tried again from {base_ref} later",
