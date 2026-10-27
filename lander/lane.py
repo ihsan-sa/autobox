@@ -72,7 +72,8 @@ main-red fix (below).
 PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
 first; place() says who put it there. Its checks take a FRONT slot ticket, ahead of every waiter's, and one already
 waiting for a slot when it is put first moves up then (admission FIRST CLAIM; dispatch #2026, 10-25: put first, its
-check sat 5 h in the slot queue). A new head after a query drops the put-first (queued; perms-c9, 10-26).
+check sat 5 h in the slot queue). A new head after a query drops the put-first (queued; perms-c9, 10-26), but the
+head the lane's own branch update made (behind) keeps it, at that head.
 NOSTART (dispatch #2026, 10-25: a check's gate dir sat 5 h with nothing run in it while the lane checked later PRs): a
 check whose current run has not started its process LANDER_NOSTART seconds (default 7200) after it began, a live wait
 for a slot aside (run keeps the beat while it polls), is said in queue.log (`nostart`) and stopped, so one stopped
@@ -1219,7 +1220,11 @@ class Lane:
         with self.lock():
             got = self.fetch(base, branch)
             job.base_sha, job.head = got[base], got[branch]
-        if J.first(job.repo, job.pr).get("head") not in (None, job.head):   # put first, queried, then pushed (first)
+        put, moved = J.first(job.repo, job.pr), (job.extra.get("behind_update") or {}).get("from")
+        if put.get("head") and put["head"] == moved and self.parent(job.head) == moved:
+            # the lane's own update moved it: GitHub's merge of the base sits on the head put first, and nothing on top
+            J.write_atomic(J.first_path(job.repo, job.pr), {**put, "head": job.head})
+        elif put.get("head") not in (None, job.head):   # put first, queried, then pushed (first)
             J.drop_first(job.repo, job.pr)
         mr = job.extra.get("main_red")
         if isinstance(mr, dict) and (mr.get("base"), mr.get("head")) == (job.base_sha, job.head) \
@@ -1860,6 +1865,13 @@ class Lane:
             tip = self.fetch(base)[base]
         self.proved(job, expected, tip, pin)
         return "merged"
+
+    def parent(self, head):
+        """`head`'s first parent, "" when it does not read."""
+        try:
+            return G.rev(self.root, f"{head}^1", env=self.genv)
+        except G.GitError:
+            return ""
 
     def behind(self, job, base, refused):
         """GitHub's strict branch protection refused the merge because the PR's branch is BEHIND `base` (chip-flow #66,

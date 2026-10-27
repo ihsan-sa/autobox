@@ -304,7 +304,7 @@ class Runner:
         from lander import run as RUN
         self.plan_kw.append((tuple(only or ()), kw.get("express", False), kw.get("lane", False)))
         first = kw.get("first")
-        self.firsts.append((kw.get("pr"), tuple(only or ()), bool(first() if callable(first) else first)))
+        self.firsts.append((kw.get("pr"), tuple(only or ()), first() if callable(first) else first))
         out = {}
         for n in plan.checks:
             if only and n not in only:
@@ -3038,7 +3038,7 @@ class AtOnce(Fixture):
         # dispatch #2026, 10-25: put first, its check waited in the slot queue behind later PRs' for 5 h
         runner = self.checked_both((), first=2)
         self.assertEqual([c[0] for c in runner.calls], ["b", "a"])
-        self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), True)])
+        self.assertEqual(sorted(runner.firsts), [(1, ("a",), False), (2, ("b",), L.A.FRONT)])
 
     def test_a_check_that_never_starts_is_said_and_stopped_once(self):
         # dispatch #2026, 10-25: its gate dir sat 5 h with no check run in it, and nothing said so or tried again
@@ -4411,6 +4411,29 @@ class SmallFirst(Fixture):
             with mock.patch.object(L.Lane, "width", lambda lane: 0):   # read and planned, no check started
                 self.land()
             self.assertEqual(bool(J.first("demo", 1)), not push, push)
+
+    def test_the_lanes_own_branch_update_keeps_a_put_first(self):
+        # #1960 review: a put-first kept through a query was dropped at the head the lane's own update-branch made.
+        # #1982 review: an author's push on top of that update kept it too
+        for author in (False, True):
+            self.setUp()
+            head = self.pr(1, {"a/x": "n\n"})
+            J.submit("demo", 1)
+            with J.lane_lock("demo"):
+                J.drain("demo")
+            J.put_first("demo", 1, "seat")
+            job = self.job(1)
+            job.head = head
+            J.move(job, T.QUERY, why="perms' read")
+            job = self.job(1)
+            job.extra["behind_update"] = {"from": head, "at": E.stamp()}
+            J.move(job, T.QUEUED, why="queued again")
+            new = self.push("track/row-1", {"a/x": "m\n"}, fresh=False)   # on the head, as GitHub's merge would be
+            if author:
+                new = self.push("track/row-1", {"a/x": "o\n"}, fresh=False)
+            with mock.patch.object(L.Lane, "width", lambda lane: 0):
+                self.land()
+            self.assertEqual(J.first("demo", 1).get("head"), None if author else new, author)
 
     def test_a_put_first_is_good_for_one_landing(self):
         # merged or closed, the record goes: a PR closed unmerged and queued again later waits its turn

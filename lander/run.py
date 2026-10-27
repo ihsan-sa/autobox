@@ -44,7 +44,7 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   member   `cc-sandbox member <h> <t> --tree <head> -- env … /bin/sh -c <run>`, the workspace's own boundary (B5).
 
 THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite that says "1 failed" failed whatever
-it exited with). unrunnable — never red: killed at the check's cap, killed by a signal or the scope's MemoryMax
+it exited with). unrunnable — never red: killed past the check's cap once silent (execute), killed by a signal or the scope's MemoryMax
 (exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork) from a run that exited non-zero (a
 passing check may quote that text itself), a sandbox that did not start (its stub not installed included), a mount
 that is not there, a tree that did not reproduce. failed: anything else. On the box, setup says it started OUT OF
@@ -137,6 +137,8 @@ SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 TAIL = 40
 STARVED = 1.5   # starved(): wall time this many times the CPU time
+SILENT = 600   # execute(): past its cap, a run silent this long (or its cap, if shorter) is ended
+CEILING = 3    # execute(): past this many times its cap, a run is ended even while it still prints
 LOG_KEEP, LOG_DAYS = 200, 7   # a red's kept log (keep_log): at most this many, none older than this many days
 BLOCKED = "blocked-by-main"
 # run_plan(caged=True), `lander check --caged-only`: a check that would run anywhere but the default bwrap on this box
@@ -391,6 +393,10 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     """-> (rc, secs, cpu_secs, capped, peak): peak is the most `anon` the run's scope held, its memory.stat file `mem`
     as read each poll while it ran (the scope goes when it exits; page cache does not count), or wait4's ru_maxrss, the
     most its largest process held, when that is more (a child too brief for a poll still counts); a green box check's next admission counts it as its need (admission MEMORY). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    The cap catches a hung check, not a slow one: past it, a run whose log grew in the last min(cap, SILENT) seconds
+    goes on (dispatch #1984, 10-25: held at 2404 s of a 2400 s cap at load 40-117, twice, for 15 h), and one that
+    went that long without a line is ended, with a last line in its log saying so; so is one still printing at CEILING
+    times its cap (a test retrying forever), so a slow check gets room but no run holds its slot for good.
     keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
@@ -408,7 +414,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     finally:
         for fd in keep:
             os.close(fd)
-    capped, ru, held = False, None, 0
+    capped, ru, held, size, grew = False, None, 0, 0, t0
     while True:
         if mem:
             with contextlib.suppress(OSError, ValueError, IndexError, StopIteration):
@@ -417,8 +423,19 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
         if pid:
             rc = os.waitstatus_to_exitcode(status)
             break
-        if time.monotonic() - t0 > cap or stopped():
+        now = time.monotonic()
+        with contextlib.suppress(OSError):
+            if os.path.getsize(log) > size:
+                size, grew = os.path.getsize(log), now
+        silent = now - grew > min(cap, SILENT)
+        if (now - t0 > cap and silent) or now - t0 > CEILING * cap or stopped():
             capped = not stopped()
+            if capped:
+                with contextlib.suppress(OSError), open(log, "a") as out:
+                    out.write(f"\nlander: stopped at {now - t0:.0f}s, past its cap of {cap}s, after"
+                              f" {now - grew:.0f}s with no output\n" if silent else
+                              f"\nlander: stopped at {now - t0:.0f}s, past {CEILING} times its cap of {cap}s,"
+                              f" still printing\n")
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(p.pid, sig)

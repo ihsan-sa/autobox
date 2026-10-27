@@ -226,6 +226,44 @@ class Cancel(unittest.TestCase):
         self.assertLess(peak, 1 << 30)
 
 
+class Cap(unittest.TestCase):
+    """The cap ends a hung check, not a slow one (dispatch #1984, 10-25: held at 2404 s of its 2400 s cap)."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lander-cap-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.log = os.path.join(self.tmp, "log")
+
+    def execute(self, script, cap=1):
+        return RUN.execute(["/bin/sh", "-c", script], self.tmp, dict(os.environ), cap, self.log)
+
+    def test_a_slow_check_still_printing_past_its_cap_reaches_its_verdict(self):
+        rc, secs, _, capped, _ = self.execute("for i in $(seq 15); do echo step $i; sleep 0.2; done; echo 1 passed", 2)
+        self.assertEqual((rc, capped), (0, False))
+        self.assertGreater(secs, 2.5)
+        self.assertEqual(RUN.status_of(rc, RUN.read_log(self.log), capped)[0], T.PASSED)
+
+    def test_a_check_silent_longer_than_SILENT_but_inside_its_cap_is_not_ended(self):
+        with mock.patch.object(RUN, "SILENT", 1):
+            rc, _, _, capped, _ = self.execute("sleep 2; echo 1 passed", 3)
+        self.assertEqual((rc, capped), (0, False))
+
+    def test_a_check_still_printing_at_its_ceiling_is_ended_and_its_log_says_why(self):
+        t0 = time.monotonic()
+        rc, _, _, capped, _ = self.execute("while :; do echo retry; sleep 0.2; done")
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertTrue(capped)
+        self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped at its cap"))
+        self.assertRegex(RUN.read_log(self.log), r"lander: stopped at \d+s, past 3 times its cap of 1s, still printing")
+
+    def test_a_check_gone_silent_past_its_cap_is_ended_and_its_log_says_why(self):
+        t0 = time.monotonic()
+        rc, _, _, capped, _ = self.execute("echo started; sleep 60")
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertTrue(capped)
+        self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped at its cap"))
+        self.assertRegex(RUN.read_log(self.log), r"lander: stopped at \d+s, past its cap of 1s, after \d+s with no output")
+
+
 class Tree(Env):
     def test_materialise_writes_the_exact_tree_as_a_git_repo_in_the_member_path_shape(self):
         run_dir, head = RUN.materialise(self.repo, self.tree, "repo.7")
@@ -1445,6 +1483,25 @@ class HostAndRunners(Env):
         self.assertEqual(r.status, T.UNRUNNABLE)
         self.assertIn("stopped while it waited for a lander slot", r.extra["why"])
         self.assertGreater(beat["since"], 0)   # it never started
+
+    def test_a_runs_slot_wait_refreshes_the_beat_each_poll(self):
+        # #1960 review: run_ hands admission _waiting as its stop; without it a 2 h wait read as a check never started
+        beat, seen, real = {}, [], A.slot
+        RUN._STOP.beat = beat
+        self.addCleanup(setattr, RUN._STOP, "beat", None)
+
+        def slot(*a, stop=None, **kw):   # three polls of a long wait
+            for _ in range(3):
+                beat["since"] = 1.0
+                stop and stop()
+                seen.append(beat["since"])
+            return real(*a, stop=stop, **kw)
+
+        with mock.patch.object(A, "slot", slot):
+            r = self.run_(chk(klass=T.HOST))
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all(t > time.time() - 60 for t in seen), seen)
 
     def test_an_express_run_takes_no_slot_and_a_lone_one_takes_them_all(self):
         # the lane's EXPRESS bounds its own runs; a diagnostic rerun alone still runs by itself
@@ -2783,6 +2840,39 @@ class Admission(unittest.TestCase):
         name, f = A._ticket(q, lane=True, first=A.FRONT)
         f.close()
         self.assertGreater(name, hold)   # behind the hold, though FIRST_BACK and the 2 h waiter are older
+
+    def test_checks_put_first_keep_the_order_they_were_put_first_in(self):
+        # #1960 review: each FRONT ticket went one ns before the oldest live one, so the newest went ahead of the rest
+        waiter = f"+{time.time_ns() - 2 * 3600 * 10**9:019d}-4242-0000beef"   # a lane's check, 2 h in
+        q = os.path.join(self.lanes_first_queue(waiter), "slots", "queue")
+        names = []
+        for _ in range(3):
+            name, f = A._ticket(q, lane=True, first=A.FRONT)
+            self.addCleanup(f.close)
+            names.append(name)
+        self.assertEqual(sorted(os.listdir(q)), names + [waiter])   # in turn, and all ahead of the waiter
+
+    def test_a_young_waiter_whose_rand_starts_f_is_not_a_front_ticket(self):
+        # #1982 review: an older cc-green's random rand starts `f` one time in 16; read as FRONT, a real FRONT ticket
+        # went one ns behind it, so behind nearly every waiter
+        waiter = f"+{time.time_ns() - 2 * 3600 * 10**9:019d}-4242-0000beef"   # a lane's check, 2 h in
+        q = os.path.join(self.lanes_first_queue(waiter), "slots", "queue")
+        young = f"+{time.time_ns():019d}-4243-f1234567"
+        y = open(os.path.join(q, young), "a")
+        fcntl.flock(y, fcntl.LOCK_EX)
+        self.addCleanup(y.close)
+        name, f = A._ticket(q, lane=True, first=A.FRONT)
+        self.addCleanup(f.close)
+        self.assertEqual(sorted(os.listdir(q)), [name, waiter, young])   # ahead of both
+
+    def test_a_put_first_ticket_never_goes_before_time_one(self):
+        # #1960 review: a planted time-0 ticket put a FRONT one at time -1, a name no reader takes for a ticket
+        st = self.lanes_first_queue("+0000000000000000000-4242-0000beef")
+        with mock.patch.object(A, "TICKET_CAP", 10**12):   # not stale, so it counts as the oldest
+            name, f = A._ticket(os.path.join(st, "slots", "queue"), lane=True, first=A.FRONT)
+        f.close()
+        self.assertTrue(A.TICKET.fullmatch(name), name)
+        self.assertGreater(A._born(name), 0)
 
     def test_a_live_slot_wait_keeps_the_lanes_beat(self):
         # #1960 review: NOSTART stopped a check that had waited 2 h in the slot queue, a live wait, not a stuck one
