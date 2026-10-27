@@ -492,8 +492,9 @@ o8c=$(done8 CC_SELF_LAND_EXCEPT=); rm -f ~/dev/$REPO/.cc/member-facing
 # that. 1 = named as an exception, or member-facing · 0 = granted · 2 = a workspace with no token.
 mkdir -p "$T/dev8/ws/.cc" "$T/dev8/mf/.cc" "$T/dev8/proj"
 touch "$T/dev8/ws/.cc/member-workspace" "$T/dev8/mf/.cc/member-facing"
-sl8(){ ( export DEV="$T/dev8" BIN="$B" HOME="$T/dev8" CC_SELF_LAND_EXCEPT="$1"
-         eval "$(sed -n '/^member_facing()/p;/^member_workspace()/p;/^self_lands(){/,/^}/p' "$B/cc")"
+# Each function is lifted whole: from its first line to the first whose code (comments off) ends in `}`.
+sl8(){ ( export DEV="$T/dev8" BIN="$B" HOME="$T/dev8" WTBASE="$T/dev8/.cc/worktrees" CC_SELF_LAND_EXCEPT="$1"
+         eval "$(awk '/^(member_facing|member_workspace|member_record|self_lands)\(\)/{on=1} on{print; c=$0; sub(/[ \t]+#.*/,"",c); if (c ~ /}[ \t]*$/) on=0}' "$B/cc")"
          self_lands "$2" ); echo $?; }
 { [ "$(sl8 'a b' proj)" = 0 ] && [ "$(sl8 '' proj)" = 0 ] && [ "$(sl8 'a proj b' proj)" = 1 ] \
   && [ "$(sl8 '' ws)" = 2 ] && [ "$(sl8 '' mf)" = 1 ] && [ "$(sl8 ws ws)" = 1 ] && [ "$(sl8 mf mf)" = 1 ]; } \

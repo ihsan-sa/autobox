@@ -431,6 +431,10 @@ def selfcheck():
     _MEMBER.update(at=0)
     case("a repo with the host's record and no marker is a member's; one with neither is not",
          is_member("rec") is True and is_member("plain") is False)
+    os.chmod(f"{tmp}/home/.cc/member-facing", 0); _MEMBER.update(at=0)
+    case("…and with the record dir unsearchable, the repo with neither is a member's too: a chmod fails closed",
+         is_member("plain") is True)
+    os.chmod(f"{tmp}/home/.cc/member-facing", 0o755)
     globals()["HOME"] = real_home
     _MEMBER.update(at=0)
     write(p)

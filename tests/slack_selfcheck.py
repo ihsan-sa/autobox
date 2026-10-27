@@ -22,8 +22,9 @@ def run_selfcheck():
     # is what makes `cc-slack selfcheck` runnable on a bare clone with no ~/.cc and no network, which is what makes it
     # usable as a health probe and a ledger check-cmd.
     # …NOR THE HOST'S RECORD OF MEMBER-FACING REPOS: provisioning writes ~/.cc/member-facing/<repo> under the real HOME,
-    # and a fixture's .seeded there would stop the box's own seed for good. Only the case about it calls the real one.
-    record_mf = record_member_facing; globals()["record_member_facing"] = lambda repo: None
+    # and a fixture's .seeded there would stop the box's own seed for good. Only the case about it calls the real one;
+    # the stand-in keeps the repos it was asked to record, so a provisioning case can see the call was made.
+    record_mf, mf_calls = record_member_facing, []; globals()["record_member_facing"] = mf_calls.append
     scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")
     real_dev = f"{HOME}/dev"   # checked at the end: the run leaves no folder there (the `_` ones are parallel suites')
     dev_before = set(os.listdir(real_dev)) if os.path.isdir(real_dev) else set()
@@ -5989,6 +5990,8 @@ def run_selfcheck():
         readF = (members_read("mfrec"), members_read("mfnone"))
         os.chdir(f"{DEV}/mfrec"); hereRec = member_facing_here()
         os.chdir(f"{DEV}/mfnone"); hereNone = member_facing_here()
+        os.chmod(f"{hF}/.cc/member-facing", 0); lockF = (members_read("mfnone"), member_facing_here())
+        os.chmod(f"{hF}/.cc/member-facing", 0o755)
         os.chdir(_cwdF)
         record_mf("mfnew")
         seedF = sorted(os.listdir(f"{hF}/.cc/member-facing"))
@@ -6001,6 +6004,8 @@ def run_selfcheck():
     check("the host's record ~/.cc/member-facing/<repo> with no marker makes a repo member-facing (members_read, and "
           "member_facing_here in its checkout); a repo with neither is not",
           readF == (True, False) and hereRec is True and hereNone is False)
+    check("…and with the record dir unsearchable, the repo with neither is member-facing to both: a chmod fails closed",
+          lockF == (True, True))
     check("…record_member_facing's first write seeds a record for every marked repo, the named one and .seeded; a "
           "later write seeds nothing again, so a deleted record of a marker-only repo stays deleted",
           seedF == [".seeded", "mfmark", "mfnew", "mfrec"] and seedF2 == [".seeded", "mfnew", "mfnone", "mfrec"])
@@ -8318,7 +8323,7 @@ def run_selfcheck():
         delivP.clear(); saidP.clear()                # the provisioning cases below count what THEY delivered and said
         evP = lambda chat, text, ts, ct="channel": {"type": "message", "channel": chat, "ts": ts, "user": "UOWNER",
                                                     "text": text, "channel_type": ct}
-        dmP.on_event(evP("CNEW", "how do I start?", "1.1"))
+        mf_calls.clear(); dmP.on_event(evP("CNEW", "how do I start?", "1.1")); mf_newthing = list(mf_calls)
         dP = f"{devP}/newthing"
         mdP = open(f"{dP}/CLAUDE.md").read() if os.path.exists(f"{dP}/CLAUDE.md") else ""
         check("first message in an unmapped channel: ~/dev/<name> is provisioned (CLAUDE.md naming the channel and carrying the writing block once, "
@@ -8329,6 +8334,8 @@ def run_selfcheck():
               and "{{WRITING_BLOCK}}" in open(f"{ROOT}/templates/channel-CLAUDE.md").read()
               and os.path.isdir(f"{dP}/.git") and [t for t, _ in delivP] == ["newthing"]
               and len(saidP) == 1 and "~/dev/newthing" in saidP[0][1] and "no project maps" not in saidP[0][1])
+        check("…and the host records it member-facing (record_member_facing), so a commit deleting the marker leaves it gated",
+              mf_newthing == ["newthing"])
         atP = load_provisioned()["newthing"]["at"]
         dmP.on_event(evP("CNEW", "one more question", "1.2"))
         check("a second message to the same channel re-uses the dir: no re-provision, no second notice, still delivered",
@@ -8960,7 +8967,8 @@ def run_selfcheck():
         os.makedirs(f"{DEV}/hank", exist_ok=True); os.makedirs(f"{DEV}/iris", exist_ok=True)
         with open(f"{DEV}/hank/README.md", "w") as fh:
             fh.write("# hank\nnotes of my own\n")
-        provision_member_workspace("hank", "hank"); provision_member_workspace("iris", "iris")
+        mf_calls.clear(); provision_member_workspace("hank", "hank"); provision_member_workspace("iris", "iris")
+        mf_ws = list(mf_calls)   # both dirs exist already, so these records are the workspace's own call, not provision_dir's
         hank_doc, iris_doc = open(f"{DEV}/hank/README.md").read(), open(f"{DEV}/iris/README.md").read()
         hank_again = ensure_member_readme("hank", "hank"); hank_doc2 = open(f"{DEV}/hank/README.md").read()
         routed = dmw.route(fkm.chans["alice-b"], "channel")
@@ -9140,6 +9148,8 @@ def run_selfcheck():
                                           "a SESSION saying it is ignored"))
           and hank_again == "kept" and hank_doc2 == hank_doc
           and iris_doc.startswith("# iris") and "new project <name>" in iris_doc)
+    check("…and a member workspace provisioned over a dir that already exists is recorded member-facing by the host too",
+          mf_ws == ["hank", "iris"])
     check("the OWNER's own team_join creates nothing at all — he owns the whole box",
           made3 == made2 and mem3 == mem1 and "owner" not in load_members())
     check("routing needs no table: #<handle> IS the target, and a reply under the project's root in #<handle> IS "

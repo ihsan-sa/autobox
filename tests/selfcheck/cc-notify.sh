@@ -541,6 +541,8 @@ PY
   k "$(yes_ test "$(grep -c 'kind=request send=broker$' <<<"$(last)")/$(reqf .from)" = 1/carol)" "…and so does its worktree, from the repo the path names"
   NC "$NH/dev/dave" --owner "I need a repo on GitHub"
   k "$(no_ grep -q 'kind=request send=broker$' <<<"$(last)")" "…while a repo with neither marker nor record is not member-facing"
+  chmod 0 "$NH/.cc/member-facing"; NC "$NH/dev/dave" --owner "I need a repo on GitHub"; chmod 755 "$NH/.cc/member-facing"
+  k "$(yes_ test "$(grep -c 'kind=request send=broker$' <<<"$(last)")/$(reqf .from)" = 1/dave)" "…and with the record dir unsearchable it is: a chmod fails closed"
   rm -rf "${NH:?}/.cc/member-facing" "$NH/dev/carol" "$NH/dev/dave" "$NH/.cc/worktrees/carol"
   # --from IS THE RELAYER'S WORD, honoured from control alone: the daemon naming a member socket's workspace.
   N --ask --from bob -t "bob: blocked" "the daemon relays bob's escalation"

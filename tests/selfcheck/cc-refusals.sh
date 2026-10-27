@@ -361,6 +361,11 @@ STUB
   k "$(t test "$rc" = 22 -a ! -s "$lg")" "a caller in a repo the host records as member-facing, or in its worktree, is refused with no marker, nothing written"
   rc=$(HOME=$d SA_CWD=$d/dev/dave sa repo --title t --run "curl x" -- "unrecorded" >/dev/null 2>&1; echo $?)
   k "$(t test "$rc" = 0 -a -s "$lg")" "…while one with neither marker nor record files its ask"
+  # …and a record dir it can't search reads as recorded, so a chmod of ~/.cc/member-facing fails closed
+  fresh; chmod 0 "$d/.cc/member-facing"
+  rc=$(HOME=$d SA_CWD=$d/dev/dave sa repo --title t --run "curl x" -- "unreadable record" >/dev/null 2>&1; echo $?)
+  chmod 755 "$d/.cc/member-facing"
+  k "$(t test "$rc" = 2 -a ! -s "$lg")" "…and with the record dir unsearchable, that same repo is refused, nothing written"
   fresh; seatis "" 1
   a1=$(sa repo --title "repo approval" --run "systemctl --user restart x.service" --id "land:x" -- "restart x")
   a3=$(sa repo --title "repo approval" -- "restart y")

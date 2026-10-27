@@ -2797,6 +2797,8 @@ def selfcheck():
         os.rmdir(f"{tm2}/.cc/members/mb"); os.makedirs(f"{tm2}/.cc/member-facing"); open(f"{tm2}/.cc/member-facing/mb", "w").close()
         ok("…and so does the host's record ~/.cc/member-facing/<repo> alone (a commit deleting .cc/member-facing "
            "leaves it), and the repo with neither stays the owner's", member_ws("mb") and not member_ws("vic"))
+        os.chmod(f"{tm2}/.cc/member-facing", 0); locked = member_ws("vic"); os.chmod(f"{tm2}/.cc/member-facing", 0o755)
+        ok("…and with the record dir unsearchable, the repo with neither is a member's too: a chmod fails closed", locked)
     finally:
         globals().update(HOME=_home); restore(); shutil.rmtree(tm2, ignore_errors=True)
     ok("branch_verdict: a MERGED PR with no head read deletes nothing",

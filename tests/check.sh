@@ -555,6 +555,17 @@ for d in templates/home/USAGE.md templates/home/COMMS.md templates/home/RUNBOOK.
   done < <(grep -niE 'your phone' "$d" | grep -viE 'from your phone')
 done
 
+# EVERY READER OF THE HOST'S MEMBER-FACING RECORD FAILS CLOSED. ~/.cc/member-facing/<repo> makes a repo member-facing,
+# and a record dir nobody can search must read as recorded, not as "the owner's" (perms' read of #1889 found six
+# readers that answered no). A tool that names the record also carries the unsearchable test; cc-guard-argv only
+# fences writes to it and decides no role.
+for f in $(grep -lsE '(\$HOME|\$H|\{HOME\}|home \+ .)/\.cc/member-facing|"~/\.cc/member-facing' bin/*); do
+  [ "$f" = bin/cc-guard-argv ] && continue
+  grep -qE 'member-facing" \] && ! \[ -x|os\.X_OK' "$f" || {
+    echo "check.sh: $f reads the host's member-facing record but never treats a record dir it can't search as recorded"
+    echo "  Copy the test cc-guard's mfrec uses, so an unreadable record fails closed."; exit 1; }
+done
+
 # AND THE PROMPT MUST TEACH A COMMAND THAT ACTUALLY REACHES HIM. Every track and planning session is told in its
 # system prompt how to reach the owner when it is truly blocked. When the table moved the rung-1 door to
 # --decision/--owner, that one sentence was not moved with it, so the box's main blocked-escalation path went
