@@ -2234,6 +2234,45 @@ class Admission(unittest.TestCase):
         self.assertIn("memory.stat anon does not read, so only what running checks reserved counts", err.getvalue())
         self.assertIn("MemoryHigh ('') does not read, so no memory bound holds a check", err.getvalue())
 
+    def test_a_check_that_fits_passes_a_head_short_of_room_and_never_starves_it(self):
+        # 2026-10-26: dispatch's check in slot 1 reserved 3.4G and its next, at the queue's head, wanted 3.4G more of
+        # the slice's 6G, so every later ticket waited behind it for over an hour with 7 slots free
+        import time
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        quiet = dict(psi_root=self.psi_dir(0, 0), loadavg=self.calm_load, poll=0.02, say=lambda _: None, k=8)
+        sl = os.path.join(st, "lander.slice")
+        os.makedirs(os.path.join(st, "slots", "queue"))
+        os.makedirs(sl)
+        with open(os.path.join(sl, "memory.stat"), "w") as f:
+            f.write("anon 0\n")
+        big = 3400 << 20
+        with mock.patch.object(A, "SLICE_HIGH", "6G"), mock.patch.object(A, "SLICE_DIR", sl), \
+                contextlib.ExitStack() as held:
+            first = contextlib.ExitStack()
+            self.assertEqual(first.enter_context(A.slot(st, need=big, **quiet)), [1])
+            head = open(os.path.join(st, "slots", "queue", f"+{time.time_ns() - 60 * 10**9:019d}-4242-0000beef"), "a")
+            fcntl.flock(head, fcntl.LOCK_EX)
+            self.addCleanup(head.close)
+            head.write(str(big))   # what the head waits on room for
+            head.flush()
+            self.assertEqual(held.enter_context(A.slot(st, deadline=1, need=100 << 20, **quiet)), [2])
+            with open(os.path.join(st, "slots", "slot.2")) as f:
+                self.assertEqual(f.read(), str(100 << 20))   # a bare need, as older releases read it
+            self.assertEqual(A._held(os.path.join(st, "slots")), (2, big + (100 << 20), big))
+
+            def head_says(mark):
+                head.truncate(0)
+                head.write(mark)
+                head.flush()
+                with self.assertRaises(TimeoutError):
+                    with A.slot(st, deadline=0.3, need=100 << 20, **quiet):
+                        pass
+            head_says("")   # a head waiting on a slot, not on room, is never passed, though slot 1 still holds
+            head_says(str(2700 << 20))   # it fits beside slot 1, short only for the passer's 100M: nobody passes it
+            first.close()   # slot 1 lets go: what is left is a passer's, so nobody passes now and the slice drains
+            head_says(str(big))
+
     def test_a_systemctl_that_fails_or_hangs_on_the_slice_is_said(self):
         for boom in (OSError("no systemctl"), subprocess.TimeoutExpired(["systemctl"], 10)):
             err = io.StringIO()
@@ -2839,7 +2878,7 @@ class Admission(unittest.TestCase):
                     raise OSError(e, os.strerror(e))
                 return real(p, *a)
             with mock.patch.object(A.os, "open", side_effect=fake):
-                n, oldest, stale = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
+                n, oldest, stale, _ = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
             self.assertEqual((n, oldest, stale), (1, ahead, []), errno.errorcode[e])
             self.assertTrue(os.path.exists(live.name))
         real_flock = fcntl.flock
@@ -2849,7 +2888,7 @@ class Admission(unittest.TestCase):
         dead = os.path.join(q, f"{time.time_ns() - 90 * 10**9:020d}-4343-0000dead")   # unlocked, but unknowable
         open(dead, "a").close()
         with mock.patch.object(A.fcntl, "flock", side_effect=no_locks):
-            n, oldest, stale = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
+            n, oldest, stale, _ = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
         self.assertEqual((n, oldest), (2, os.path.basename(dead)))
         self.assertTrue(os.path.exists(dead) and os.path.exists(live.name))
         self.assertIs(fcntl.flock, real_flock)

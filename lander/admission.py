@@ -77,6 +77,14 @@ what to do about it: such runs sat 2-3 h with only a header in their log five ti
 as hung. The landing lane sets no note. A cc-green run also names a per-repo file in LANDER_WAIT_LOG (and its row in
 LANDER_WAIT_ROW), and every slot it takes appends `start end row who secs` there once held, the wait cc-i2m counts
 as the green stage: the run's own log is one per worktree and the next run overwrites it.
+PASS (a2920, 10-26: dispatch's check in slot 1 reserved 3.4G and its next, at the head, wanted 3.4G more of the
+slice's 6G, so every later ticket waited behind it over an hour with 7 slots free). A waiter that would take a slot
+but for room() writes the need it waits on into its ticket. A later waiter, not alone, passes such a ticket while
+the slots held by checks that passed nobody, reserving R, keep it out (R plus its need is past MemoryHigh), and takes
+a slot when it fits itself; it then holds a flock on the slot's sibling `slot.N.passed`, and the slot file stays a
+bare need, which older releases' cc-green runs still read. Once those holders finish nobody new passes, so the head
+waits at most for the passers already running. A head that needs more than the whole slice is passed too while a
+non-passer holds, and runs once the slots are empty, as room() lets it.
 
 PROVE HOLD (perms, 10-13: promotes stopped at lander-self's PROVE_CAP because the lane's queued checks took every
 slot from the proof's sweep). While `lander-self promote` or `prove` proves a release, it holds a lane-named ticket
@@ -397,9 +405,12 @@ def scope_stat(argv: list) -> str:
 
 
 def _held(d: str) -> tuple:
-    """(how many slots are held, the memory their holders reserved): each held slot's file names its holder's need,
-    and one that does not (written a moment from now, or by a release before MEMORY) counts as CHECK_MEM."""
+    """(how many slots are held, the memory their holders reserved, what the holders that passed nobody (PASS)
+    reserved, None while none of them holds one): each held slot's file names its holder's need, a flocked
+    `slot.N.passed` beside it says its holder passed, and one that names none (written a moment from now, or by a
+    release before MEMORY) counts as CHECK_MEM."""
     n = reserved = 0
+    kept = None
     for name in os.listdir(d):
         if not re.fullmatch(r"slot\.[0-9]+", name):
             continue
@@ -410,9 +421,18 @@ def _held(d: str) -> tuple:
             except OSError:
                 pass
             f.seek(0)
+            mem = _bytes(f.read()) or _bytes(CHECK_MEM) or 0
             n += 1
-            reserved += _bytes(f.read()) or _bytes(CHECK_MEM) or 0
-    return n, reserved
+            reserved += mem
+            try:
+                with open(os.path.join(d, name + ".passed")) as p:
+                    fcntl.flock(p, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:   # its holder passed
+                continue
+            except OSError:
+                pass
+            kept = (kept or 0) + mem
+    return n, reserved, kept
 
 
 def room(d: str, need: int) -> str:
@@ -421,7 +441,7 @@ def room(d: str, need: int) -> str:
     high = slice_high()
     if high is None:
         return ""
-    n, reserved = _held(d)
+    n, reserved, _ = _held(d)
     # brief: "weighs the slice's live memory.current plus each check's recorded peak", with `anon` for current
     used = max(slice_used() or 0, reserved)
     if not n or used + need <= high:
@@ -526,15 +546,16 @@ def _drop(p: str) -> None:
         os.rmdir(p)
 
 
-def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
-    """-> (n, oldest, stale): how many live tickets are older than mine, the oldest of those, and the live ones past
-    cap seconds, which no longer count. A dead ticket (its flock free) is removed on the way, and so is a ticket-named
+def _ahead(qdir: str, mine: str, cap: float | None = None, passes=None) -> tuple:
+    """-> (n, oldest, stale, passed): how many live tickets are older than mine, the oldest of those, the live ones
+    past cap seconds, which no longer count, and how many it may pass: a ticket naming the need it waits on room for
+    (PASS) when passes(need) says so. A dead ticket (its flock free) is removed on the way, and so is a ticket-named
     entry that is not a regular file, or a `.new-` ticket a crash left before its rename. A name _ticket would not
     have given is skipped."""
     cap = TICKET_CAP if cap is None else cap
     hold = os.environ.get("LANDER_PROVE_HOLD", "")   # PROVE HOLD: the proof's sweep counts only what is older
     stop = min(mine, hold) if TICKET.fullmatch(hold) else mine
-    n, oldest, stale = 0, None, []
+    n, oldest, stale, passed = 0, None, [], 0
     for name in sorted(os.listdir(qdir)):
         if name >= stop:
             break
@@ -570,6 +591,10 @@ def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
                 if time.time() - born > cap:
                     stale.append(name)
                     continue
+                mark = os.pread(fd, 32, 0) if fd is not None and passes else b""
+                if mark.isdigit() and passes(int(mark)):
+                    passed += 1
+                    continue
                 n += 1
                 oldest = oldest or name
                 continue
@@ -578,7 +603,7 @@ def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
         finally:
             if fd is not None:
                 os.close(fd)
-    return n, oldest, stale
+    return n, oldest, stale, passed
 
 
 def _hold(qdir: str) -> int | None:
@@ -631,6 +656,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     ask = first if callable(first) else lambda: first
     firsted = ask()
     mine, tf = _ticket(q, lane, firsted)
+    marked, mark_f = "", None
     try:
         while True:
             if stop is not None and stop():
@@ -641,7 +667,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                 with contextlib.suppress(OSError):
                     os.unlink(os.path.join(q, mine))
                 tf.close()
-                mine, tf = new, nf
+                mine, tf, marked = new, nf, ""
             if alone and settle is not None and time.monotonic() - t0 >= settle:
                 alone = False   # SETTLE: what it holds goes back, and it takes one slot as load admits
                 for _, f in held:
@@ -654,7 +680,9 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     say(f"lander: {who or 'a check'} had no run alone in {settle / 60:.0f} min, so it runs beside "
                         f"others as load admits")
             want = range(1, total + 1) if alone else range(1, slots_now(psi_root, total, loadavg) + 1)
-            ahead, oldest, stale = _ahead(q, mine)
+            high, kept = slice_high(), _held(d)[2]   # PASS: a ticket short of room only for what non-passers hold
+            passes = None if alone or high is None or kept is None else lambda h: kept + h > high
+            ahead, oldest, stale, passed = _ahead(q, mine, passes=passes)
             for name in set(stale) - told:
                 told.add(name)
                 line = (f"lander: {who or 'a check'} no longer waits on ticket {name} ({_whose(name)}): "
@@ -664,6 +692,12 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             if alone and not ahead and gate is None:
                 gate = _gate(d, fcntl.LOCK_EX)   # none while any check holds a slot, whatever K it counted
             short_of = room(d, need) if not alone and not ahead else ""   # an alone run has the slice to itself
+            if (mark := str(need) if short_of else "") != marked:   # PASS: what it waits on room for, for those behind
+                with contextlib.suppress(OSError):
+                    os.ftruncate(tf.fileno(), 0)
+                    tf.write(mark)
+                    tf.flush()
+                marked = mark
             for n in want if not ahead and not short_of and (gate or not alone) else ():   # only the oldest takes one
                 if n in [h for h, _ in held]:
                     continue
@@ -683,6 +717,10 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                     os.ftruncate(f.fileno(), 0)   # what it reserved, for the next waiter's room()
                     f.write(str(need))
                     f.flush()
+                    if passed:
+                        mark_f = open(os.path.join(d, f"slot.{n}.passed"), "a")
+                        with contextlib.suppress(OSError):
+                            fcntl.flock(mark_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 held.append((n, f))
                 if not alone:
                     break
@@ -723,6 +761,8 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             tf.close()
         for _, f in held:
             f.close()
+        if mark_f is not None:
+            mark_f.close()
         if gate is not None:
             gate.close()
 
