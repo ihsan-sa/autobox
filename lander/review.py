@@ -2181,11 +2181,12 @@ def _buy(job, template, diff, more, prior=None, light=False):
 LIGHT_TRIES, LIGHT_WAIT = 3, 3   # asks, and seconds between them, for a PR's comments when gh blips
 
 
-def light_fixed(job) -> bool:
+def light_fixed(job):
     """Whether the LAND at the job's head is a FIX the light path demoted: this box's saved read says so, or the PR's
     own marker does (light=1). With no saved read and GitHub not answering (after LIGHT_TRIES asks) there is no
     evidence either way, so it reads as demoted: the light path never lands on missing evidence. A repo that is not
-    GitHub's has no marker to find, so it is not."""
+    GitHub's has no marker to find, so with no saved read it is None, which the lane makes a query for planning
+    (perms' read of #2008: a lost state file would let a demoted FIX land with no CI)."""
     v = saved(job.digest)
     if not v:
         root = root_of(job)
@@ -2196,7 +2197,7 @@ def light_fixed(job) -> bool:
             if i + 1 < LIGHT_TRIES:
                 time.sleep(LIGHT_WAIT)
         if view is None:
-            return bool(GH.slug(root))
+            return True if GH.slug(root) else None
         v = recorded(view.get("comments") or [], {job.digest} - {""}, job.head)
     return bool((getattr(v, "extra", None) or {}).get("light_fix"))
 

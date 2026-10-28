@@ -171,7 +171,7 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
              one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
-             the CI_UNREADS+1th at one head a query "planning", but a spent rate limit (GitHub's rate_limit at 0) is held uncounted until its reset; green or no CI at all -> on, but a light FIX (review.light_lane) with no CI is handed back. Perms reading the PR
+             the CI_UNREADS+1th at one head a query "planning", but a spent rate limit (GitHub's rate_limit at 0) is held uncounted until its reset; green or no CI at all -> on, but a light FIX (review.light_lane) with no CI is handed back (one not on GitHub with no saved read is a query "planning"). Perms reading the PR
              (review.perms_reading: its read of any head still running, or its perms-hold stub at this head) ->
              held (box), so a read perms started or claimed is waited on; any other read of the PR short of a LAND
              at this head (or an older head's LAND at this change), or perms' reads that will not read -> query
@@ -1715,7 +1715,11 @@ class Lane:
             if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
                 return
             from lander import review as R
-            if job.extra.get("ci") == "none" and R.light_fixed(job):
+            fixed = job.extra.get("ci") == "none" and R.light_fixed(job)
+            if fixed is None:   # perms' read of #2008: not on GitHub and no saved read, so nothing says it was a LAND
+                return self.query(job, f"no saved read at {job.head[:12]} and no GitHub to ask whether it was a full "
+                                       f"LAND, so it needs a person to look", "planning")
+            if fixed:
                 # security read of #1922: a PR that drops its own CI trigger lands as "no CI", and a demoted FIX
                 # would merge with no test at all; with no CI the light path keeps the HANDBACK
                 return self.handback(job, f"no GitHub CI ran at {job.head[:12]}, and its read was not shown to be a full "

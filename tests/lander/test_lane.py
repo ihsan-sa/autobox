@@ -2947,14 +2947,21 @@ class AtOnce(Fixture):
             _, lines = self.land()
         self.assertEqual(self.merged_order(), [1], lines)
 
-    def test_a_blip_is_asked_again_and_a_non_github_repo_is_not_handed_back(self):
+    def test_a_blip_is_asked_again(self):
         views = iter([None, {"comments": []}])
         with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(GH, "slug", lambda root: "o/demo"), \
                 mock.patch.object(R, "pr_view", lambda *a, **k: next(views)), mock.patch.object(R, "LIGHT_WAIT", 0):
-            self.assertFalse(R.light_fixed(T.Job(repo="demo", pr=1, digest="d")))
+            self.assertIs(R.light_fixed(T.Job(repo="demo", pr=1, digest="d")), False)
+
+    def test_a_non_github_repo_with_no_saved_read_is_a_query_for_planning(self):
+        # perms' read of #2008: with its state file lost, nothing says the read was a full LAND and not a demoted FIX
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
         with mock.patch.object(R, "saved", lambda digest: None), mock.patch.object(GH, "slug", lambda root: ""), \
                 mock.patch.object(R, "pr_view", lambda *a, **k: None):
-            self.assertFalse(R.light_fixed(T.Job(repo="demo", pr=1, digest="d")))
+            _, lines = self.land()
+        self.assertEqual((self.merged_order(), self.job().state), ([], T.QUERY), lines)
+        self.assertIn("no saved read", self.job().extra["why"])
 
     def test_a_mergeable_pr_that_conflicts_with_the_moved_main_goes_to_repair(self):
         with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:   # the board row its round goes to
