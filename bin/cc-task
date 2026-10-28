@@ -26,6 +26,7 @@ and what a member session may do all keep coming from the path rules — no fiel
   cc-task project <repo> <row> --generation N board|card [--chat CHAT --ts TS]   acknowledge a projection
   cc-task delivered <repo> <row> --generation N          a delivery with no PR: the board says done, the task stays open
   cc-task close <repo> <row> --generation N done|merged   record closure and its board projection
+  cc-task retire <repo> <row> [--unmerged]               move the record to the repo's receipts, by fd
   cc-task selfcheck                                      fixtures only
 
 WHO THE OWNER IS is read off the running process: its pid and start time, the boot it started in, the tmux
@@ -83,7 +84,7 @@ import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, tempfile, t
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
-NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,254}")  # as long as cc rm accepts
 SCHEMA = 1
 
 def stamp(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -93,10 +94,10 @@ def paths(repo, row):
         raise ValueError("invalid repo/row name")
     return Path.home() / ".cc/state" / repo / row, Path.home() / ".cc/worktrees" / repo / row
 
-def regular(path, flags):
+def regular(path, flags, dir_fd=None):
     """os.open that refuses a link, a pipe, a directory or a second name at that path — the state dir is a
     directory other sessions write, so what is opened there is checked the way cc-board checks a board."""
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
         os.close(fd); raise ValueError(f"{path}: expected a regular file with one name")
@@ -105,10 +106,11 @@ def regular(path, flags):
 class Lock:
     """The row lock. Every read-modify-write of delivery.json happens inside one, so two claims arriving at once
     are two writers in a queue rather than one lost record."""
-    def __init__(self, state, timeout=30): self.path = state / "delivery.lock"; self.timeout = timeout
+    def __init__(self, state, timeout=30, dir_fd=None):
+        self.dir_fd = dir_fd; self.path = "delivery.lock" if dir_fd is not None else state / "delivery.lock"; self.timeout = timeout
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = regular(self.path, os.O_RDWR | os.O_CREAT)
+        if self.dir_fd is None: self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = regular(self.path, os.O_RDWR | os.O_CREAT, self.dir_fd)
         end = time.monotonic() + self.timeout
         while True:
             try: fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
@@ -135,6 +137,38 @@ def save(state, record):
         finally: os.close(d)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
+
+def retire(repo, row, unmerged=False):
+    """Move <row>'s record to ~/.cc/state/.receipts/<repo>/<row>.<task id>.json, as `cc rm` and `cc --go` retire it.
+    BY FILE DESCRIPTOR, because a member owns the <row> entry in its own <repo> dir (that dir is a bind it cannot
+    swap) and a rename-exchange loop swapped it for a link to an owner row of the same name between a path check
+    and a path move, 109 times in 300 (Opus read of #1904). Each step opens the one below it with O_NOFOLLOW, and the
+    rename runs between those fds, so a link at <repo> or <row> is refused, and a swap after the open moves the
+    member's own record. Only a UUID names a receipt; a record with none gets a fresh one. --unmerged stamps a
+    record that never closed as closed unmerged, in the receipt, which only the owner can write."""
+    base = Path.home() / ".cc/state"; at = lambda name, fd: os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    paths(repo, row); (base / ".receipts" / repo).mkdir(parents=True, exist_ok=True)
+    fds = [os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        fds += [at(repo, fds[0])]; fds += [at(row, fds[1])]; fds += [at(".receipts", fds[0])]; fds += [at(repo, fds[3])]
+        rec, rc = fds[2], fds[4]
+        with os.fdopen(regular("delivery.json", os.O_RDONLY, rec)) as f:
+            try: d = json.load(f)
+            except ValueError: d = None
+        tid = d.get("task_id") if isinstance(d, dict) else None
+        tid = str(uuid.uuid4()) if tid is None else tid
+        if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(tid)):
+            raise ValueError(f"{repo}/{row}'s record names task '{tid}', not a task id — refused")
+        name = f"{row}.{tid}.json"
+        with Lock(None, dir_fd=rec): os.rename("delivery.json", name, src_dir_fd=rec, dst_dir_fd=rc)
+        if unmerged and isinstance(d, dict) and d.get("closed") is None:
+            d["closed"] = {"status": "unmerged", "at": stamp()}
+            fd, tmp = tempfile.mkstemp(dir=base / ".receipts" / repo, prefix="receipt.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f: json.dump(d, f, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, name, dst_dir_fd=rc)
+    finally:
+        for fd in fds: os.close(fd)
 
 # ---- who is asking -------------------------------------------------------------------------------------------
 def process(pid, proc="/proc"):
@@ -604,6 +638,10 @@ def main(argv):
                 return selfcheck()
             finally:
                 tempfile.tempdir = None
+    if argv[:1] == ["retire"]:
+        if len(argv) not in (3, 4) or argv[3:] not in ([], ["--unmerged"]):
+            raise ValueError("usage: cc-task retire <repo> <row> [--unmerged]")
+        return retire(argv[1], argv[2], argv[3:] == ["--unmerged"])
     if argv[:1] == ["begin"]:
         if not native_enabled(): return 0
         if len(argv) != 2: raise ValueError("usage: cc-task begin <claim-token>")

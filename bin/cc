@@ -549,6 +549,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
 state_dir_ok(){   # $1 repo · $2 track → 0 when ~/.cc/state/<repo>/<track> is really itself, with no link on the way
   { [ ! -L "$STBASE/$1" ] && mkdir -p "$STBASE/$1/$2" 2>/dev/null \
     && [ "$(readlink -f "$STBASE/$1/$2")" = "$(readlink -f "$STBASE")/$1/$2" ]; } && return 0
+  [ -L "$STBASE/$1/$2" ] && { echo "cc: refusing $1/$2 — its state dir $STBASE/$1/$2 is a symlink to $(readlink "$STBASE/$1/$2"), which is not this row's. Remove the link itself (rm $STBASE/$1/$2) and run this again"; return 1; }
   echo "cc: refusing $1/$2's state dir — ~/.cc/state/$1/$2 is a symlink, sits behind one, or could not be made"; return 1; }
 write_brief(){   # $st/task.md from $text — THE BRIEF HAS ONE HOME (see the --go case for the history)
   # …AND ONE WRITER (2026-09-11): `cc-board brief append --top`, a read-modify-write under the track's own lock.
@@ -674,15 +675,13 @@ claim_check(){ "$BIN/cc-task" check "$repo" "$track" --executor "$1" || exit 1; 
 # receipts live in $STBASE/.receipts/<repo>, which no member can write (a repo name never starts with a dot): under
 # the member's own repo dir a link swapped in between a check and the move dropped the record in any dir the owner
 # can write (perms' race, 1 in 300), and with nothing member-owned on the path there is no check to race.
-# And a member can link its own <repo>/<track> dir to an owner row's of the same name, so retire asks state_dir_ok
-# again right before the move, for --go (checked once already, then gh pr view runs) and for `cc rm` alike.
-retire(){   # $1 the record · $2 its task id
-  local d="$STBASE/.receipts/$repo"
-  state_dir_ok "$repo" "$track" >&2 || return 1
-  [[ $2 =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || { echo "cc: $1 names task '$2', not a task id — refused" >&2; return 1; }
-  mkdir -p "$d" && mv -fT "$1" "$d/$track.$2.json"; }
+# And a member can swap its own <repo>/<track> dir for a link to an owner row's of the same name at any moment, so
+# a check before a move by path is a race it wins (the Opus read of #1904, 109 in 300): `cc-task retire` moves the
+# record between file descriptors opened with O_NOFOLLOW, for --go and `cc rm` alike. $1 --unmerged stamps a record
+# whose PR closed unmerged as closed in its receipt.
+retire(){ "$BIN/cc-task" retire "$repo" "$track" "$@" >&2; }
 claim_settle(){
-  local rec="$st/delivery.json" r pr v s=""
+  local rec="$st/delivery.json" r pr v s="" u=""
   state_dir_ok "$repo" "$track" >&2 || exit 1   # --go asked already; claim_settle does not lean on that
   [ -f "$rec" ] && [ ! -L "$rec" ] && r=$("$BIN/cc-task" show "$repo" "$track" 2>/dev/null) || return 0
   jq -e '.closed == null and .claim != null and .claim.ended_at == null' <<<"$r" >/dev/null && return 0
@@ -696,11 +695,11 @@ claim_settle(){
     s=$(jq -r '.state' <<<"$v")
     case "$s" in
       MERGED) "$BIN/cc-task" close "$repo" "$track" --generation "$(jq -r '.claim.generation' <<<"$r")" merged >/dev/null || return 0 ;;
-      CLOSED) ;;
+      CLOSED) u=--unmerged ;;
       *) return 0 ;;
     esac
   fi
-  retire "$rec" "$(jq -r '.task_id' <<<"$r")" \
+  retire $u \
     && echo "cc: $repo/$track's last task${s:+, whose PR ${s,,},} is retired to its receipts; this claim starts a new one" >&2
 }
 claim_track(){   # $1 = subagent|worker · $2 = the row's status (running; queued for a --go that waits in cc-room) · $3 = --launch
@@ -1745,7 +1744,9 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   # A SETTLED TASK MAKES WAY FOR THE NEXT ONE (claim_settle). Each case is its own row under $T/cs/<repo>, with a stub
   # cc-task that shows that row's record and logs a close (row f's close fails), and a gh on PATH that logs its call
   # and answers what GitHub says of the PR ("" is no answer).
-  mkdir -p "$T/cs/out"; printf '#!/bin/bash\ncs=%q\n%s\n' "$T/cs" 'case $1 in show) cat "$cs/$2/$3/delivery.json";; close) [ "$3" = f ] && exit 1; echo "$*" >> "$cs/closes";; esac' > "$T/cs/cc-task"
+  # retire is the real cc-task's, with $T/cs as its state dir.
+  mkdir -p "$T/cs/out" "$T/csh/.cc"; ln -sfn "$T/cs" "$T/csh/.cc/state"
+  printf '#!/bin/bash\ncs=%q\nh=%q\nct=%q\n%s\n' "$T/cs" "$T/csh" "$BIN/cc-task" 'case $1 in show) cat "$cs/$2/$3/delivery.json";; close) [ "$3" = f ] && exit 1; echo "$*" >> "$cs/closes";; retire) HOME=$h exec "$ct" "$@";; esac' > "$T/cs/cc-task"
   printf '#!/bin/bash\necho "$*" >> %q/gh.log; [ -n "$GHSAYS" ] && echo "$GHSAYS"\n' "$T/cs" > "$T/cs/gh"; chmod +x "$T/cs/cc-task" "$T/cs/gh"
   csgo(){   # $1 row $2 its record $3 GitHub's state ("" none) $4 the PR's branch (track/$1) $5 repo (r) → settled or left
     mkdir -p "$T/cs/${5:-r}/$1"; printf '%s\n' "$2" > "$T/cs/${5:-r}/$1/delivery.json"; : > "$T/cs/closes"; : > "$T/cs/gh.log"
@@ -1761,7 +1762,8 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
     && grep -qx 'pr view https://github.com/o/r/pull/3 --json state,headRefName,headRefOid' "$T/cs/gh.log"
   t "cc --go: a record whose PR merged outside the lander is closed as merged and retired, so the claim starts a new task" $?
   csgo c "$(csrec "$(csid 2)" null "$ended")" CLOSED
-  csgone c "$(csid 2)" && ! grep -q . "$T/cs/closes"; t "…one whose PR was closed unmerged is retired and not closed as merged" $?
+  csgone c "$(csid 2)" && ! grep -q . "$T/cs/closes" && [ "$(jq -r .closed.status "$T/cs/.receipts/r/c.$(csid 2).json")" = unmerged ]
+  t "…one whose PR was closed unmerged is retired, its receipt closed unmerged rather than merged or null" $?
   csgo k "$(csrec "$(csid 3)" '{"status":"merged","at":"2026-10-22T07:08:31Z"}' '"2026-10-22T07:08:31Z"')" OPEN
   csgone k "$(csid 3)" && [ ! -s "$T/cs/gh.log" ]; t "…one already closed is retired without asking GitHub, so a closed row needs no cc rm" $?
   csgo o "$(csrec "$(csid 4)" null "$ended")" OPEN
@@ -1780,6 +1782,28 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   mkdir -p "$T/cs/own/n" "$T/cs/r"; ln -sfn "$T/cs/own/n" "$T/cs/r/n"; csgo n "$(csrec "$(csid 9)" null "$ended")" MERGED
   [ -f "$T/cs/own/n/delivery.json" ] && [ ! -s "$T/cs/closes" ] && [ ! -e "$T/cs/.receipts/r/n.$(csid 9).json" ] && rc=0 || rc=1
   t "…and a row dir the member links to an owner row of that name is refused: the owner's record is not read, closed or moved" "$rc"
+  # perms' race on #1904: while retire runs, the member rename-exchanges its own r/t dir with a link to the owner's
+  # row own/t, and refills its own record each time one is retired. 60 retires: the path-checked move lost ~1 in 3.
+  mkdir -p "$T/rc/h/.cc/state/r/t" "$T/rc/h/.cc/state/own/t"; R="$T/rc/h/.cc/state"
+  printf '{"task_id":"%s"}\n' "$(csid 11)" > "$R/own/t/delivery.json"; ln -s "$R/own/t" "$R/r/lnk"
+  cat > "$T/rc/swap.py" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True); r, stop = sys.argv[1:3]; d = os.open(f"{r}/t", os.O_RDONLY | os.O_DIRECTORY)
+while not os.path.exists(stop):
+    try: os.stat("delivery.json", dir_fd=d)
+    except FileNotFoundError:
+        fd = os.open("delivery.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=d); os.write(fd, b'{"task_id":"00000000-0000-4000-8000-000000000012"}'); os.close(fd)
+    libc.renameat2(-100, f"{r}/t".encode(), -100, f"{r}/lnk".encode(), 2)
+PY
+  python3 "$T/rc/swap.py" "$R/r" "$T/rc/stop" & sp=$!
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=t; for _ in $(seq 60); do retire; done ) >/dev/null 2>&1
+  : > "$T/rc/stop"; wait "$sp"
+  [ -f "$R/own/t/delivery.json" ] && ! compgen -G "$R/.receipts/r/t.$(csid 11).json" >/dev/null && compgen -G "$R/.receipts/r/t.$(csid 12).json" >/dev/null; rc=$?
+  t "…and a member swapping its row dir for a link to an owner row of that name during the move never moves the owner's record" "$rc"
+  L=$(printf 'a%.0s' $(seq 65)); mkdir -p "$R/r/$L"; printf '{"task_id":"%s"}\n' "$(csid 13)" > "$R/r/$L/delivery.json"
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track="$L"; retire ) >/dev/null 2>&1
+  rc=1; [ ! -e "$R/r/$L/delivery.json" ] && [ -f "$R/.receipts/r/$L.$(csid 13).json" ] && rc=0
+  t "…and a 65-character row with a task record is retired like any other" "$rc"
   # A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design). Each case is
   # its own row under $T/nw, with a stub cc-slack that logs its posts; the reservation and the brief writer are stubbed.
   mkdir -p "$T/nw"; printf '#!/bin/bash\necho "$*" >> %q/nw/posts\n' "$T" > "$T/nw/slack"; chmod +x "$T/nw/slack"
@@ -2389,10 +2413,7 @@ PY
     # is removed, so the row stays as it is. Everything else about rm is unchanged.
     state_dir_ok "$repo" "$track" || exit 1   # a member's row dir linked to an owner row is refused, not emptied
     rec="$STBASE/$repo/$track/delivery.json"
-    if [ -f "$rec" ] && [ ! -L "$rec" ]; then
-      tid=$(jq -r '.task_id // empty' "$rec" 2>/dev/null); [ -n "$tid" ] || tid=$(cat /proc/sys/kernel/random/uuid)
-      retire "$rec" "$tid" || exit 1
-    fi
+    if [ -f "$rec" ] && [ ! -L "$rec" ]; then retire || exit 1; fi
     id=$(win_id "$repo/$track"); [ -n "$id" ] && tmux kill-window -t "$id" 2>/dev/null
     git -C "$DEV/$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$real"
     git "${GITNH[@]}" -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true

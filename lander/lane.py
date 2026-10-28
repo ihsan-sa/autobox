@@ -138,7 +138,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              `stage … gate ok=ratchet` and a `ratchet <repo>#<pr> check= pr_reds= main_reds=` line naming both sets;
              blocked-by-main (red on the base tree too, and the ratchet would not pass it) -> queued again at once
              when main has moved off base_sha since, else held 15 min and planned again from main then, not blamed;
-             extra.main_red keeps since= (its first hold on that check) and main's ids for tick.flag_main_red;
+             extra.main_red keeps since= (its first hold on that check) and main's ids for tick.flag_main_red,
+             dropped when the job is planned at a new head;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query, each
              quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
              when the plan is paid or a HANDBACK stands on the PR from any head (handed_back(): the job's own, or
@@ -1239,8 +1240,11 @@ class Lane:
         elif put.get("head") not in (None, job.head):   # put first, queried, then pushed (first)
             J.drop_first(job.repo, job.pr)
         mr = job.extra.get("main_red")
-        if isinstance(mr, dict) and (mr.get("base"), mr.get("head")) == (job.base_sha, job.head) \
-                and int(mr.get("waits") or 0) < MAIN_RED_WAITS:
+        if isinstance(mr, dict) and mr.get("head") != job.head:
+            # a new head is planned against current main, so the old head's hold, its since= and its alert are moot
+            # (#2107: a merge of main into the branch left the old head's record alerting for 3 h)
+            job.extra.pop("main_red")
+        elif isinstance(mr, dict) and mr.get("base") == job.base_sha and int(mr.get("waits") or 0) < MAIN_RED_WAITS:
             # main was red on a check and neither main nor the head has moved: no checks, held again (hold() saves
             # job.extra, so the count carries to the next pass)
             mr["waits"] = int(mr.get("waits") or 0) + 1

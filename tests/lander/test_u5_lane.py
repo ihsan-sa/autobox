@@ -200,6 +200,22 @@ class RealUnits(TL.Fixture):
         self.assertIn("blocked-by-main:b", j.extra["why"])
         self.assertEqual(j.extra["main_red"]["waits"], 0)
 
+    def test_a_new_head_drops_the_old_heads_main_red_record(self):
+        # #2107: main merged into the branch, and the old head's record (its since=) kept the alert going for 3 h
+        self.main({"b/gate": "bad\n"})
+        self.pr(1, {"b/y": "a change b owns\n"})
+        J.submit("demo", 1)
+        self.land()
+        j = self.job()
+        j.extra["main_red"]["since"] = "2026-10-27T22:37:00Z"
+        J.save(j)
+        head = self.push("track/row-1", {"a/x": "good\n"}, fresh=False)   # a new head; main is still red on b
+        self.release()
+        u, lines = self.land()
+        mr = self.job().extra["main_red"]
+        self.assertEqual(mr["head"], head, lines)
+        self.assertNotEqual(mr["since"], "2026-10-27T22:37:00Z")   # its own hold, counted from now
+
     def test_the_check_red_on_main_runs_first_once_main_moves(self):
         self.main({"b/gate": "bad\n"})
         self.pr(1, {"a/x": "good\n", "b/y": "a change b owns\n"})

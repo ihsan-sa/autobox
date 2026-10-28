@@ -55,7 +55,8 @@
   main-red  each repo (none in a GitHub backoff): a check red on main whose oldest hold on a job (extra.main_red
             since=) began more than cards.WAIT_FLAG_SECS ago -> one planner request (cards.main_red) naming the
             check and main's failing cases, at most once an hour per repo and check, whichever PRs it holds. A
-            hold main's own record (health) has since seen pass on main says nothing: main went green on it.
+            hold main's own record (health) has since seen pass on main, or seen pass on a tip newer than the
+            hold's base, says nothing: main went green on it. Nor does one from a head the job has left.
   stalled   each repo with a due job whose lane has moved no job on (no verdict, hold, handback, query or merge
             line) for over STALL_TIMES (3) times the p90 of its own last STALL_HISTORY (100) gaps between those, or
             the box's when it has fewer than STALL_GAPS (20) -> one request to its seat (cards.stalled) per stall, at
@@ -844,9 +845,11 @@ def flag_main_red(repos, cards, now=None) -> list:
     and its failing IDs". For each repo, each job whose extra.main_red names a check with a since= more than
     cards.WAIT_FLAG_SECS ago (seconds against seconds; exactly an hour is not more) -> cards.main_red, which says it
     at most once an hour per repo and check, whichever PR it names; the oldest such job per check is the one asked.
-    A hold whose check main's own record (health) passed at or after its since= is skipped: a held job keeps
-    extra.main_red until its own run of the check, so without this main going green left the hold aging into an
-    alert (10-19: "red on main for 203 min" sent 21 min after main-health logged it passed on the tip).
+    A hold whose check main's own record (health) passed at or after its since=, or passed on a tip newer than its
+    base, is skipped: a held job keeps extra.main_red until its own run of the check, so without this main going
+    green left the hold aging into an alert (10-19: "red on main for 203 min" sent 21 min after main-health logged it
+    passed on the tip; 10-27: #2107 held on a base older than the tip health had passed 50 min before). So is a record
+    from a head the job has left (lane drops it when it plans the new head).
     `cards` is the installed cards unit; with none, or in a GitHub backoff, nothing is flagged."""
     lines, t = [], int(now if now is not None else time.time())
     for r in (repos if cards and not GH.backoff() else []):
@@ -860,7 +863,11 @@ def flag_main_red(repos, cards, now=None) -> list:
                 mr = j.extra.get("main_red")
                 at = E.epoch_of(mr.get("since") or "") if isinstance(mr, dict) else 0
                 main = rec.get(mr.get("check")) if at else None
-                if isinstance(main, dict) and main.get("status") == T.PASSED and E.epoch_of(main.get("at")) >= at:
+                if at and mr.get("head") != j.head:
+                    continue   # an old head's record: the lane drops it when it plans the new head
+                if isinstance(main, dict) and main.get("status") == T.PASSED and (
+                        E.epoch_of(main.get("at")) >= at or main.get("tip") not in (None, "", mr.get("base"))
+                        and covers(J.repo_root(r), main.get("tip"), mr.get("base"))):
                     continue
                 if at and t - at > C.WAIT_FLAG_SECS and (mr.get("check") not in oldest
                                                          or at < oldest[mr.get("check")][0]):

@@ -1237,13 +1237,15 @@ class MainRedAlert(Stubbed):
     check and its failing IDs ... not one per PR"."""
 
     def held(self, pr, check="e2e-cc-context", since=Q, fails=("✗ a", "✗ b")):
-        return T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
-                     extra={"queued_at": Q, "main_red": {"check": check, "base": "c" * 40, "since": since,
-                                                          "fails": list(fails)}})
+        return T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD, head="h" * 40,
+                     extra={"queued_at": Q, "main_red": {"check": check, "base": "c" * 40, "head": "h" * 40,
+                                                          "since": since, "fails": list(fails)}})
 
-    def flag(self, jobs, secs_after_q, backoff=0):
+    def flag(self, jobs, secs_after_q, backoff=0, newer=False):
+        """`newer`: whether health's tip descends from the hold's base (git's answer, faked here)."""
         from lander import tick as TK
-        with mock.patch.object(TK.J, "lane_jobs", lambda r: jobs), mock.patch.object(TK.GH, "backoff", lambda: backoff):
+        with mock.patch.object(TK.J, "lane_jobs", lambda r: jobs), mock.patch.object(TK.GH, "backoff", lambda: backoff), \
+                mock.patch.object(TK, "covers", lambda root, tip, base: newer):
             return TK.flag_main_red(["demo"], C, now=E.epoch_of(Q) + secs_after_q)
 
     def test_one_alert_per_red_check_after_an_hour_whatever_it_holds(self):
@@ -1302,6 +1304,23 @@ class MainRedAlert(Stubbed):
         self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
         self.assertEqual(len(self.flag([self.held(7)], 3601 + 3601)), 1)
         self.assertEqual(len(self.argvs("cc-notify")), 2)
+
+    def test_a_pass_on_a_tip_newer_than_the_holds_base_clears_the_alert(self):
+        # #2107: health passed the tip at 21:47Z, and a hold from 22:37Z on an older base alerted for 3 h
+        self.main_record(T.PASSED, E.stamp(E.epoch_of(Q) - 3000))
+        self.assertEqual(self.flag([self.held(7)], 3601, newer=True), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_record_from_a_head_the_job_has_left_is_not_said(self):
+        job = self.held(7)
+        job.head = "n" * 40   # the branch moved on; the record is the old head's
+        self.assertEqual(self.flag([job], 3601), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_red_still_failing_on_the_tip_alerts_at_its_head(self):
+        self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
+        self.assertEqual(len(self.flag([self.held(7)], 3601, newer=True)), 1)
+        self.assertIn("at cccccccccccc", self.argvs("cc-notify")[0][-1])
 
     def test_a_health_file_of_the_wrong_shape_reads_as_no_record_and_still_alerts(self):
         os.makedirs(os.path.dirname(HL.path("demo")), exist_ok=True)
