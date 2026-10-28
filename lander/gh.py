@@ -130,9 +130,9 @@ SECONDARY = "GitHub's secondary (content-creation) rate limit for this login was
 
 
 def last(text, n=200) -> str:
-    if "secondary rate limit" in (text or "").lower():
-        return SECONDARY
-    return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
+    # the last line only (Opus read of #2013): an earlier line naming the secondary limit is not the failure that ended it
+    line = next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")
+    return SECONDARY if "secondary rate limit" in line.lower() else line[-n:]
 
 
 # THE LANE READS A PR OVER REST (raised-graphql-hour-spent-stalls-landing, 2026-10-19): `gh pr view` spends the

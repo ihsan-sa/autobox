@@ -645,6 +645,12 @@ class RestFacts(unittest.TestCase):
             self.assertEqual(GH.pr_facts("/x", 7, "state"), (None, GH.SECONDARY))
         self.assertNotIn(GH.SPENT, GH.SECONDARY)
 
+    def test_only_the_last_line_names_the_secondary_limit(self):
+        # Opus read of #2013: a queue buffer whose earlier line hit the secondary limit and whose last is the real failure
+        said = "gh: You have exceeded a secondary rate limit (HTTP 403)\nretried\nmerge failed: Pull request is not mergeable\n"
+        self.assertEqual(GH.last(said), "merge failed: Pull request is not mergeable")
+        self.assertEqual(GH.last(said + "gh: You have exceeded a secondary rate limit (HTTP 403)\n\n"), GH.SECONDARY)
+
     def test_a_spent_reset_already_past_backs_off_a_minute(self):
         # Opus read of #1799: a reset in the past (clock skew) wrote a backoff already over, and every lane asked
         # GitHub against the spent quota each tick
