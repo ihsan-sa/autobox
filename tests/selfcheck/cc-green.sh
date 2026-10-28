@@ -13,6 +13,7 @@ selfcheck(){
   D=$(mktemp -d); trap 'rm -rf "$D"; trap - RETURN' RETURN
   unset CC_GREEN_RUNID CC_GREEN_SCOPE   # a selfcheck run under a cc-green run must not pass for that run
   unset CC_GREEN_ASK CC_ROLE CC_MEMBER_SANDBOX   # …nor take a worker's fence from the shell it runs in: a case sets these itself
+  unset CC_GREEN_LOOP CC_GREEN_ROW   # …nor be asked, as a worker's run is, whether the loop it runs under still wants it
   export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
   export CC_REVIEWS_DIR="$D/reviews" CC_STATE_BASE="$D/state"   # …and the review record the report reads is a scratch one
 
@@ -541,6 +542,37 @@ EOS
   k "$(t test "$rc" -ne 0 -a "$rc" -ne 124 -a -n "$(grep 'asked to stop' <<<"$out")")" "…not exit 0 and not the timeout, and it says it was asked"
   k "$(t test ! -e "$D/stD.pid")" "…and its check never started"
   touch "$D/sgit/go"; rm -rf "$D2"
+
+  # 18d A RUN NOBODY WILL READ ENDS ITSELF (2026-10-28: seven worker runs for merged rows held lander slots ahead of a
+  # live row for 3 h). A run cc-loop started carries its loop's pid and row; its watcher asks each tick here (WANT_EVERY=1).
+  printf '#!/bin/sh\ncat "%s/board.status" 2>/dev/null\n' "$D" > "$D/board"; chmod +x "$D/board"
+  sleep 0 & p=$!; wait "$p"   # a pid that has exited: a loop that is gone
+  want(){   # $1 = name, $2 = loop pid (empty: none), $3 = board status once the check runs, $4 = edit the tree (1), $5 = the
+    # board command → out=`wait 8`'s output, rc its exit. The board says running until the check has started, so a case
+    # that ends the run ends one whose check is already up (in the lander, already waiting in its slot queue).
+    D2=$(mktemp -d); R=$(newrepo "$1" 120); echo running > "$D/board.status"
+    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_LOOP=$2 CC_GREEN_ROW=r/t CC_GREEN_BOARD="${5:-$D/board}" CC_GREEN_WANT_EVERY=1 "$SELF" start >/dev/null 2>&1 )
+    for _ in $(seq 100); do [ -s "$D/$1.pid" ] && break; sleep 0.1; done
+    echo "$3" > "$D/board.status"
+    [ "${4:-}" = 1 ] && echo moved > "$R/a.txt"
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 8 2>&1 ); rc=$?; GDIR=$D2 lock_files "$R"; }
+  want wmerged $$ merged
+  k "$(t test -s "$D/wmerged.pid")" "a worker's run whose row is merged had its check running first"
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no longer wanted — the row r/t is merged' "$LOG")")" "…ends itself once the row is merged, and its log says why"
+  k "$(nt kill -0 "$(head -1 "$D/wmerged.pid")")" "…and its check is gone"; rm -rf "$D2"
+  want wgone "$p" running
+  k "$(t test "$rc" -eq 1 -a -n "$(grep "no longer wanted — the worker's loop (pid $p) has exited" "$LOG")")" "a worker's run whose loop has exited ends itself"; rm -rf "$D2"
+  want wmoved $$ running 1
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no longer wanted — the working copy is .* now, not the' "$LOG")")" "a worker's run whose tree is no longer the working copy ends itself"; rm -rf "$D2"
+  want wlive $$ running
+  k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a live row's run, its loop alive and its tree unchanged, keeps going"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
+  want wlane "" merged   # a lane's or a seat's run carries no loop pid, so nobody asks the board about it
+  k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a run with no loop pid keeps going though the board says merged"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
+  want wnoboard $$ merged "" "$D/no-such-board"
+  k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a worker's run whose board command is missing keeps going"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
 
   # THE WORKER SANDBOX'S SHAPE: only the control repo's core/bin is bound there, as ~/bin, so no tests/ sits beside
   # it. A copy of this bin with nothing beside it stands in for that. With the checkout carrying core/tests/green.sh,

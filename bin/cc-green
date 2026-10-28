@@ -489,12 +489,34 @@ stale_hint(){   # $1 = root (lock_files already read). Says nothing unless the r
 # wait out the stop's 45 s and exit 1 though the run went on to stop itself (review of #942). So the group is read
 # from the note when the stop comes, and a run stopped before its check started has none. It holds no fd of the
 # lock and ends with the run.
+# A RUN NOBODY WILL READ ENDS ITSELF. Eight worker runs, seven for rows merged 20-34 h before and one on a superseded
+# head, sat in the lander's slot queue on 2026-10-28 and, aged, ranked ahead of a live row that waited 3 h behind them.
+# So a run cc-loop starts for its worker (green_kick sets CC_GREEN_LOOP and CC_GREEN_ROW) asks every
+# CC_GREEN_WANT_EVERY seconds (60) whether its verdict is still wanted: the loop's pid is alive, the board does not say
+# the row is done or merged, and the working copy is still the tree it runs on. One that is not stops the way a
+# `cc-green stop` does, which takes its check, and the check's slot wait, down. Any other run is never asked.
+unwanted(){   # → why this run's verdict is no longer wanted; 1 while it still is (or the run says nothing to ask by)
+  local s t
+  [ -n "${CC_GREEN_LOOP:-}" ] || return 1
+  kill -0 "$CC_GREEN_LOOP" 2>/dev/null || { echo "the worker's loop (pid $CC_GREEN_LOOP) has exited"; return 0; }
+  if [ -n "${CC_GREEN_ROW:-}" ]; then
+    s=$(timeout 10 "${CC_GREEN_BOARD:-$BIN/cc-board}" get "${CC_GREEN_ROW%%/*}" "${CC_GREEN_ROW#*/}" status 2>/dev/null)   # CC_GREEN_BOARD: test hook
+    case "$s" in done|merged) echo "the row $CC_GREEN_ROW is $s"; return 0;; esac
+  fi
+  s=$(status_field tree); [ -n "$s" ] || return 1
+  t=$(green_tree "$(status_field root)"); [ -n "$t" ] && [ "$t" != "$s" ] || return 1
+  echo "the working copy is ${t:0:12} now, not the ${s:0:12} this run checks"
+}
 stop_watch(){   # The RUN's side, started by take_run
-  local me=$$ g
+  local me=$$ g why n=0 every=${CC_GREEN_WANT_EVERY:-60}
+  case "$every" in ''|0*|*[!0-9]*) every=60;; esac   # 0, a leading zero or no number: the default, not an arithmetic error
   ( exec 9>&-
     while kill -0 "$me" 2>/dev/null; do
-      if [ -n "${CC_GREEN_RUNID:-}" ] && [ "$(cat "$STATUS.stop" 2>/dev/null)" = "$CC_GREEN_RUNID" ]; then
-        echo "cc-green: asked to stop (cc-green stop, from a scope that cannot signal this run) — stopping"
+      n=$((n + 1)); why=""
+      [ $((n % every)) = 0 ] && why=$(unwanted)
+      if [ -n "$why" ] || { [ -n "${CC_GREEN_RUNID:-}" ] && [ "$(cat "$STATUS.stop" 2>/dev/null)" = "$CC_GREEN_RUNID" ]; }; then
+        if [ -n "$why" ]; then echo "cc-green: no longer wanted — $why — stopping"
+        else echo "cc-green: asked to stop (cc-green stop, from a scope that cannot signal this run) — stopping"; fi
         kill -TERM "$me" 2>/dev/null
         for _ in $(seq 300); do kill -0 "$me" 2>/dev/null || break; sleep 0.1; done
         g=$(status_field gate_pgid)
