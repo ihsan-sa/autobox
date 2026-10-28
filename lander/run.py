@@ -458,9 +458,8 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        if p.returncode is None:   # a raise before the wait: reap the killed child, no zombie
-            with contextlib.suppress(ChildProcessError):
-                os.waitpid(p.pid, 0)
+        if p.returncode is None:   # a raise before the wait: reap through Popen, so __del__ never polls the pid again
+            p.wait()
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
     return rc, time.monotonic() - t0, cpu, capped, max(held, ru.ru_maxrss * 1024 if ru else 0)
 

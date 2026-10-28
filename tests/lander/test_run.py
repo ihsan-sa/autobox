@@ -237,6 +237,7 @@ class Cancel(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.execute(["sleep", "60"])
         self.assertFalse(os.path.exists(f"/proc/{pids[0].pid}"))   # a zombie would still have its /proc entry
+        self.assertIsNotNone(pids[0].returncode)   # unset, Popen's __del__ would reap a reused pid
 
     def test_a_keep_fd_that_fails_to_close_does_not_strand_the_run(self):
         r, w = os.pipe()
