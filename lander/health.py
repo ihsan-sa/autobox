@@ -7,8 +7,11 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    checks nightly.py moved out) that the range since the last checked tip reaches, and
                                    every check the record holds red, run once on the tip by `check(name, sha)`
                                    (tick.make_check), the checks the record holds red first. Before each check after
-                                   the first, origin's tip is read again; once main has moved the pass stops, owed
-                                   (pending), so the next tick's pass runs on the newest tip. Each result is
+                                   the first, origin's tip is read again (a read that comes back empty is not a move);
+                                   once main has moved the pass stops, owed (pending), so the next tick's pass runs on
+                                   the newest tip. After TRIES passes in a row stopped so, the next one finishes on the
+                                   tip it started on whatever main does, so a main that moves on every pass still gets
+                                   a whole record, one tip behind at worst. Each result is
                                    recorded. A check that turns red sends ONE alert on the tip run's route, naming the
                                    check, the merge, and whether the merge's parent passes it (code: the merge broke
                                    it) or fails it too (machine). -> {name: status}
@@ -36,7 +39,8 @@ PR that owned none of its paths was planned without it, and a red case it added 
 or, where neither run names a case, when it fails no more of them than main's tree.
 
 THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked in full, "running": the tip a
-pass is on ("" between passes), "tries": [tip, passes started on it], "gave_up": the last tip given up on (its
+pass is on ("" between passes), "tries": [tip, passes started on it], "moved": passes in a row stopped because main
+moved (0 once one finishes), "gave_up": the last tip given up on (its
 range stays owed to the next tip's pass, since "tip" is not moved), "checks": {name: {"status", "tree", "tip",
 "at", "since", "cause"}}}. since and cause are kept from the run that turned the check red until it is green again.
 An unrunnable result is never recorded, as red or green. Nothing here holds a deploy or reverts a merge: the tip run
@@ -65,7 +69,8 @@ def path(repo):
 def load(repo):
     rec = C.read_json(path(repo), {}) or {}
     return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "tries": list(rec.get("tries") or []),
-            "gave_up": rec.get("gave_up") or "", "checks": dict(rec.get("checks") or {})}
+            "moved": int(rec.get("moved") or 0), "gave_up": rec.get("gave_up") or "",
+            "checks": dict(rec.get("checks") or {})}
 
 
 def red(repo, now=None):
@@ -195,8 +200,10 @@ def run(repo, check, fallback=""):
     # set and "tip" unmoved, so the next tick's pass is owed and covers this range on the newest tip.
     first = sorted(names, key=lambda n: ((rec["checks"].get(n) or {}).get("status") != T.FAILED, n))
     for i, name in enumerate(first):
-        if i and TP.origin_tip(root, base) not in ("", tip):
-            C.log("main-health", repo, "moved", tip=tip[:12])
+        if i and rec["moved"] < TRIES and TP.origin_tip(root, base) not in ("", tip):
+            rec["moved"] += 1   # perms' read of #2012: bounded, so a main moving on every pass still gets a record
+            C.write_json(path(repo), rec)
+            C.log("main-health", repo, "moved", tip=tip[:12], times=rec["moved"])
             return done
         r = check(name, tip)
         if r.status == T.UNRUNNABLE:
@@ -212,7 +219,7 @@ def run(repo, check, fallback=""):
         rec["checks"][name] = e
         C.write_json(path(repo), rec)   # as it finishes: a killed pass keeps what it learned
         C.log("main-health", repo, "tip", tip=tip[:12], check=name, ok=r.status)
-    rec["tip"], rec["running"] = tip, ""
+    rec["tip"], rec["running"], rec["moved"] = tip, "", 0
     C.write_json(path(repo), rec)
     return done
 

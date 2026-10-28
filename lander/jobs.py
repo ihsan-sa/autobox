@@ -38,8 +38,8 @@ a fresh start that keeps reads_used and the prior verdict (`requeued`); one for 
 empty (`again`), and on a checking job sets
 extra.reread so it reads its PR's state and head at its next turn (a push mid-check re-queues it, which says `again`).
 A job held by the box itself (hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would
-not mend it. Its hold is made due now only for a usage limit's or for main health's (who=main-health: the check it was
-held main-red on passed on main again, tick.main_health).
+not mend it. Its hold is made due now only for a usage limit's or for main health's (who=main-health, and only when
+the job holds a main-red record whose check health's record now holds green: tick.main_health, relieved()).
 A release request (release=WHO, from `lander release`) is applied before the rest, by release.apply: it drops a job
 still queued as the request found it, at the head it was read on, with the PR's other waiting requests, or logs why
 not; it never makes a job. A second release request for a PR this drain released is answered `duplicate`, and one
@@ -477,6 +477,15 @@ def _fresh(job: T.Job, req: dict) -> None:
     job.extra.update(queued_at=E.stamp(), attempts=0)
 
 
+def relieved(job, req):
+    """main health's ask (who=main-health) for a job held main-red on a check main's record now holds green. Perms'
+    read of #2012: who is inbox-writable, so the ask alone frees nothing; the job's main-red record and health's say."""
+    from lander import health as HL
+    n = (job.extra.get("main_red") or {}).get("check")
+    return (req.get("who") == "main-health"
+            and (HL.load(job.repo)["checks"].get(n) or {}).get("status") == T.PASSED)
+
+
 def drain(repo: str) -> list:
     """Fold every inbox request for `repo` into its job. Call only under lane_lock(repo). Returns one line each.
     Release requests first, under the lane lock alone: apply reads gh and fetches under git_lock, so holding rest_lock
@@ -552,7 +561,7 @@ def _drain(repo: str) -> list:
                     job.extra[k] = req[k]
             if job.state == T.CHECKING:   # lane.reread: a push mid-check is the commonest `again`
                 job.extra["reread"] = True   # only a checking job reads it
-            elif job.state == T.HELD and (job.extra.get("limit") or req.get("who") == "main-health"):
+            elif job.state == T.HELD and (job.extra.get("limit") or relieved(job, req)):
                 # a usage limit's hold is asked again now (a live limit holds it again with no read, review._buy), and
                 # so is a main-red hold on a check main passes again (tick.main_health)
                 job.extra["not_before"] = E.stamp()

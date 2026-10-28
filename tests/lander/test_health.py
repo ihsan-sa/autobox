@@ -333,6 +333,49 @@ class Run(Case):
         self.assertEqual(J.not_before_left(J.load("demo", 7)), 0)
         self.assertGreater(J.not_before_left(J.load("demo", 8)), 0)
 
+    def test_an_ask_from_main_health_frees_only_a_main_red_hold_whose_check_main_passes(self):
+        """Perms' read of #2012: who is inbox-writable, so who=main-health alone frees no hold."""
+        from lander import jobs as J
+        later = "2099" + C.now()[4:]
+        self.go(TIP1, ["app/x.py", "lib/x.py"], red={"app"})
+        for pr, red in ((7, {"check": "app"}), (8, None), (9, {"check": "lib"})):
+            J.save(T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
+                         extra={"hold": "box", "not_before": later, **({"main_red": red} if red else {})}))
+            J.submit("demo", pr, who="main-health")
+        J.drain("demo")
+        self.assertGreater(J.not_before_left(J.load("demo", 7)), 0, "main still fails app")
+        self.assertGreater(J.not_before_left(J.load("demo", 8)), 0, "no main-red record")
+        self.assertEqual(J.not_before_left(J.load("demo", 9)), 0, "main passes lib")
+
+    def test_an_empty_tip_read_is_not_main_moving(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2], asked = TIP2, ["app/y.py", "lib/y.py"], []
+
+        def check(name, sha):
+            asked.append(name)
+            self.tip = ""   # origin could not be read
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        self.assertEqual(HL.run("demo", check), {"app": T.PASSED, "lib": T.PASSED})
+        self.assertEqual((HL.load("demo")["tip"], HL.load("demo")["running"]), (TIP2, ""))
+
+    def test_a_main_that_moves_on_every_pass_gets_a_whole_record_after_tries(self):
+        tips = [str(d) * 40 for d in range(4, 5 + HL.TRIES)]
+        p = mock.patch.dict(PARENT, zip(tips, [TIP1] + tips))
+        p.start()
+        self.addCleanup(p.stop)
+        self.go(TIP1, ["app/x.py"])
+        for k, t in enumerate(tips):
+            self.tip, self.files[t] = t, ["app/y.py", "lib/y.py"]
+
+            def check(name, sha, nxt=(tips + [""])[k + 1]):
+                self.tip = nxt or self.tip + "x"   # main moves while every check runs
+                return T.Result(check=name, tree=sha, status=T.PASSED)
+            ran = HL.run("demo", check)
+            self.assertEqual(len(ran), 1 if k < HL.TRIES else 2, f"pass {k}")
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"], rec["moved"]), (tips[-1], "", 0))
+        self.assertFalse(HL.pending("demo"))
+
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])
         self.assertIn("e2e-flow", ran)
