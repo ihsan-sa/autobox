@@ -862,15 +862,16 @@ def flag_main_red(repos, cards, now=None) -> list:
             for j in J.lane_jobs(r):
                 mr = j.extra.get("main_red")
                 at = E.epoch_of(mr.get("since") or "") if isinstance(mr, dict) else 0
-                main = rec.get(mr.get("check")) if at else None
-                if at and mr.get("head") != j.head:
+                if not at or t - at <= C.WAIT_FLAG_SECS:
+                    continue   # under the hour: not said yet, so no git call to ask whether main moved past it
+                if mr.get("head") != j.head:
                     continue   # an old head's record: the lane drops it when it plans the new head
+                main = rec.get(mr.get("check"))
                 if isinstance(main, dict) and main.get("status") == T.PASSED and (
                         E.epoch_of(main.get("at")) >= at or main.get("tip") not in (None, "", mr.get("base"))
                         and covers(J.repo_root(r), main.get("tip"), mr.get("base"))):
                     continue
-                if at and t - at > C.WAIT_FLAG_SECS and (mr.get("check") not in oldest
-                                                         or at < oldest[mr.get("check")][0]):
+                if mr.get("check") not in oldest or at < oldest[mr.get("check")][0]:
                     oldest[mr.get("check")] = (at, j)
             for n, (at, j) in sorted(oldest.items()):
                 if cards.main_red(j, t - at, now=t):

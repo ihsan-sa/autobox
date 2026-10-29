@@ -1317,10 +1317,23 @@ class MainRedAlert(Stubbed):
         self.assertEqual(self.flag([job], 3601), [])
         self.assertEqual(self.argvs("cc-notify"), [])
 
-    def test_a_red_still_failing_on_the_tip_alerts_at_its_head(self):
+    def test_a_red_still_failing_on_the_tip_alerts_at_its_base(self):
         self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
         self.assertEqual(len(self.flag([self.held(7)], 3601, newer=True)), 1)
         self.assertIn("at cccccccccccc", self.argvs("cc-notify")[0][-1])
+
+    def test_a_hold_under_the_hour_asks_git_nothing(self):
+        # Opus read of #2023: covers() is a git call, and it ran for every held job on every tick
+        from lander import tick as TK
+        self.main_record(T.PASSED, E.stamp(E.epoch_of(Q) - 3000))
+        asked = []
+        with mock.patch.object(TK.J, "lane_jobs", lambda r: [self.held(7)]), \
+                mock.patch.object(TK.GH, "backoff", lambda: 0), \
+                mock.patch.object(TK, "covers", lambda *a: asked.append(a) or True):
+            self.assertEqual(TK.flag_main_red(["demo"], C, now=E.epoch_of(Q) + 3600), [])
+            self.assertEqual(asked, [])
+            self.assertEqual(TK.flag_main_red(["demo"], C, now=E.epoch_of(Q) + 3601), [])
+            self.assertEqual(len(asked), 1)
 
     def test_a_health_file_of_the_wrong_shape_reads_as_no_record_and_still_alerts(self):
         os.makedirs(os.path.dirname(HL.path("demo")), exist_ok=True)

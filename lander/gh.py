@@ -266,8 +266,8 @@ def spent(root, text, token=None) -> str:
     every lane and the tick wait on; a member's quota or GraphQL's holds just its job (Opus read of #1799). Else "":
     text that only says rate limit, or a rate_limit that will not answer, is gh's own failure, counted like any other
     (perms' read of #1769: the words alone held a job forever)."""
-    if "rate limit" not in (text or "").lower() or "secondary rate limit" in text.lower():
-        return ""   # the secondary limit holds no quota at 0: last() names it
+    if "rate limit" not in (text or "").lower() or last(text) == SECONDARY:
+        return ""   # the secondary limit holds no quota at 0: last() names it, from the last line as there (#2018)
     kind = "graphql" if "graphql" in text.lower() else "core"
     rc, out, _ = gh(["api", "rate_limit"], root, token, 30, note=False)
     try:
@@ -556,10 +556,10 @@ def slug(root) -> str:
     return m.group(1) if m else ""
 
 
-def merge_argv(root, pr, pin, title) -> list:
+def merge_argv(s, pr, pin, title) -> list:
     """The squash merge over REST, pinned: GitHub refuses it (409) when the head is no longer `pin`. REST never arms
     auto-merge, and spends none of the login's GraphQL hour (2026-10-19: `gh pr merge` failed twice on it)."""
-    return (["api", "-X", "PUT", f"repos/{slug(root)}/pulls/{int(pr)}/merge", "-f", "merge_method=squash",
+    return (["api", "-X", "PUT", f"repos/{s}/pulls/{int(pr)}/merge", "-f", "merge_method=squash",
              "-f", f"sha={pin}"] + (["-f", f"commit_title={title} (#{pr})"] if title else []))
 
 
@@ -580,9 +580,10 @@ def delete_branch(root, pr, token=None) -> str:
 def merge(root, pr, pin, title, token=None):
     if not pin:
         return False, "no head to pin the merge to"
-    if not slug(root) or not str(pr).isdigit():
+    s = slug(root)   # perms' read of #2017: the slug checked here is the one the merge goes to, read just before it
+    if not s or not str(pr).isdigit():
         return False, "no GitHub repo or PR number to merge"
-    rc, out, err = gh(merge_argv(root, pr, pin, title), root, token, timeout=300)
+    rc, out, err = gh(merge_argv(s, pr, pin, title), root, token, timeout=300)
     try:   # rc first: on a refusal stdout holds GitHub's error JSON, never a merge
         merged = not rc and json.loads(out).get("merged") is True
     except (ValueError, AttributeError):

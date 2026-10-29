@@ -430,6 +430,13 @@ class RestFacts(unittest.TestCase):
             return got if isinstance(got, tuple) else (0, got, "") if got is not None else (1, "", "HTTP 404")
         return calls, mock.patch.object(GH, "gh", gh)
 
+    def test_the_merge_goes_to_the_slug_it_checked(self):
+        # perms' read of #2017: a second read of the remote that came back blank sent the merge to repos//pulls
+        calls, p = self.run_gh({})
+        with p, mock.patch.object(GH, "slug", mock.Mock(side_effect=["o/r", ""])):
+            GH.merge("/x", 7, "h" * 40, "")
+        self.assertEqual(calls[0][:4], ["api", "-X", "PUT", "repos/o/r/pulls/7/merge"])
+
     def test_lane_fields_are_one_rest_get(self):
         calls, p = self.run_gh({"api repos/o/r/pulls/7": json.dumps(self.PULL)})
         with p, mock.patch.object(GH, "slug", lambda root: "o/r"):
@@ -650,6 +657,15 @@ class RestFacts(unittest.TestCase):
         said = "gh: You have exceeded a secondary rate limit (HTTP 403)\nretried\nmerge failed: Pull request is not mergeable\n"
         self.assertEqual(GH.last(said), "merge failed: Pull request is not mergeable")
         self.assertEqual(GH.last(said + "gh: You have exceeded a secondary rate limit (HTTP 403)\n\n"), GH.SECONDARY)
+        # perms' read of #2018: spent() reads the same last line, so an earlier secondary line hides no spent quota
+        reset = int(time.time()) + 3000
+        limit = json.dumps({"resources": {"core": {"remaining": 0, "reset": reset}}})
+        self.addCleanup(lambda: os.path.exists(GH.backoff_path()) and os.unlink(GH.backoff_path()))
+        _, p = self.run_gh({"api rate_limit": limit})
+        with p:
+            self.assertEqual(GH.spent("/x", "gh: You have exceeded a secondary rate limit\ngh: API rate limit exceeded"),
+                             f"{GH.SPENT} until " + time.strftime("%H:%MZ", time.gmtime(reset)))
+            self.assertEqual(GH.spent("/x", "gh: API rate limit exceeded\ngh: You have exceeded a secondary rate limit"), "")
 
     def test_a_spent_reset_already_past_backs_off_a_minute(self):
         # Opus read of #1799: a reset in the past (clock skew) wrote a backoff already over, and every lane asked

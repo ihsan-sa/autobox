@@ -481,7 +481,8 @@ def relieved(job, req):
     """main health's ask (who=main-health) for a job held main-red on a check main's record now holds green. Perms'
     read of #2012: who is inbox-writable, so the ask alone frees nothing; the job's main-red record and health's say."""
     from lander import health as HL
-    n = (job.extra.get("main_red") or {}).get("check")
+    mr = job.extra.get("main_red")
+    n = mr.get("check") if isinstance(mr, dict) else None   # as lane's hold reads it: a bad record frees nothing
     return (req.get("who") == "main-health"
             and (HL.load(job.repo)["checks"].get(n) or {}).get("status") == T.PASSED)
 

@@ -338,7 +338,7 @@ class Run(Case):
         from lander import jobs as J
         later = "2099" + C.now()[4:]
         self.go(TIP1, ["app/x.py", "lib/x.py"], red={"app"})
-        for pr, red in ((7, {"check": "app"}), (8, None), (9, {"check": "lib"})):
+        for pr, red in ((7, {"check": "app"}), (8, None), (9, {"check": "lib"}), (10, "lib")):
             J.save(T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
                          extra={"hold": "box", "not_before": later, **({"main_red": red} if red else {})}))
             J.submit("demo", pr, who="main-health")
@@ -346,6 +346,13 @@ class Run(Case):
         self.assertGreater(J.not_before_left(J.load("demo", 7)), 0, "main still fails app")
         self.assertGreater(J.not_before_left(J.load("demo", 8)), 0, "no main-red record")
         self.assertEqual(J.not_before_left(J.load("demo", 9)), 0, "main passes lib")
+        self.assertGreater(J.not_before_left(J.load("demo", 10)), 0, "a main-red record that is no dict frees nothing")
+
+    def test_a_bad_moved_count_reads_as_none(self):
+        """Perms' read of #2019: a hand-edited or torn record must not crash the pass."""
+        for bad in ("x", [1], None):
+            C.write_json(HL.path("demo"), {"moved": bad})
+            self.assertEqual(HL.load("demo")["moved"], 0, repr(bad))
 
     def test_an_empty_tip_read_is_not_main_moving(self):
         self.go(TIP1, ["app/x.py"])
@@ -364,6 +371,8 @@ class Run(Case):
         p.start()
         self.addCleanup(p.stop)
         self.go(TIP1, ["app/x.py"])
+        log = mock.patch.object(C, "log").start()
+        self.addCleanup(mock.patch.stopall)
         for k, t in enumerate(tips):
             self.tip, self.files[t] = t, ["app/y.py", "lib/y.py"]
 
@@ -375,6 +384,8 @@ class Run(Case):
         rec = HL.load("demo")
         self.assertEqual((rec["tip"], rec["running"], rec["moved"]), (tips[-1], "", 0))
         self.assertFalse(HL.pending("demo"))
+        # Opus read of #2019: the pass that finishes anyway says so, once
+        self.assertEqual([c.args[2] for c in log.call_args_list if c.args[:1] == ("main-health",)].count("finish"), 1)
 
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])

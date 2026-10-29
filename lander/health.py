@@ -69,7 +69,7 @@ def path(repo):
 def load(repo):
     rec = C.read_json(path(repo), {}) or {}
     return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "tries": list(rec.get("tries") or []),
-            "moved": int(rec.get("moved") or 0), "gave_up": rec.get("gave_up") or "",
+            "moved": m if isinstance(m := rec.get("moved"), int) else 0, "gave_up": rec.get("gave_up") or "",
             "checks": dict(rec.get("checks") or {})}
 
 
@@ -199,6 +199,8 @@ def run(repo, check, fallback=""):
     # main-red after the newer tip passed. Main's reds run first, and a tip that moved stops the pass: "running" stays
     # set and "tip" unmoved, so the next tick's pass is owed and covers this range on the newest tip.
     first = sorted(names, key=lambda n: ((rec["checks"].get(n) or {}).get("status") != T.FAILED, n))
+    if rec["moved"] >= TRIES:   # Opus read of #2019: the pass that finishes on this tip whatever main does says so
+        C.log("main-health", repo, "finish", tip=tip[:12], moved=rec["moved"])
     for i, name in enumerate(first):
         if i and rec["moved"] < TRIES and TP.origin_tip(root, base) not in ("", tip):
             rec["moved"] += 1   # perms' read of #2012: bounded, so a main moving on every pass still gets a record
