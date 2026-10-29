@@ -98,6 +98,26 @@ def selfcheck():
         found = [p for p, *_ in unfiled([os.path.join(t, "c5", "dev")], 24, reg)]
         ok("the same bytes at two paths are listed once", len(found) == 1)
 
+        # git runs only in a tree holding a PDF in the window: most worktrees hold none, and each cost three git
+        # calls anyway in the scan killed at its timeout on 10-27
+        trees = {}
+        for name, age in (("quiet", 3 * 86400), ("busy", 0)):
+            trees[name] = os.path.join(t, "c9", "dev", name)
+            os.makedirs(trees[name])
+            subprocess.run(["git", "-C", trees[name], "init", "-q"], capture_output=True)
+            with open(os.path.join(trees[name], "book.pdf"), "wb") as f:
+                f.write(b"%PDF-1.4 not a real one")
+            os.utime(os.path.join(trees[name], "book.pdf"), (time.time() - age,) * 2)
+        global checked_out
+        real, asked = checked_out, []
+        checked_out = lambda d, since: asked.append(d) or real(d, since)
+        try:
+            unfiled([os.path.join(t, "c9", "dev")], 24, os.path.join(t, "c9", "docs"))
+        finally:
+            checked_out = real
+        ok("a git tree with no PDF in the window costs no git call", trees["quiet"] not in asked)
+        ok("…while one holding a PDF in the window is still asked", trees["busy"] in asked)
+
         # the register's recorded hash is trusted, so a run never re-reads the whole library; an old revision with
         # no recorded hash still has its filed copy read
         reg = os.path.join(t, "c8", "docs")
