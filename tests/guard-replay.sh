@@ -32,7 +32,8 @@
 #        there, the way a session can inside its own worktree. pseat rows are the perms seat writing its
 #        own state, which the guard knows by a live claude in that dir; cc-guard's selfcheck case 68 holds those.
 #        A "fixture":"never-touch" row names the argv selfcheck's own never-touch list (192.0.2.10), which cc-guard
-#        never reads, so it is left to that selfcheck. The fixture HOME holds a seat dir under ~/.cc/state/demo.
+#        never reads, so it is left to that selfcheck. An "inb":true row runs inside a member boundary, which bwrap makes
+#        and this script does not, so cc-guard's selfcheck case 11a' holds those. The fixture HOME holds a seat dir under ~/.cc/state/demo.
 set -uo pipefail
 main(){
 R=$(cd "$(dirname "$0")/.." && pwd); G=$R/bin/cc-guard
@@ -96,6 +97,7 @@ for l in "${CORE[@]}"; do
   [ -n "$l" ] || continue
   [ "$(jq -r '.pseat // false' <<<"$l")" = true ] && continue
   [ "$(jq -r '.fixture // ""' <<<"$l")" = never-touch ] && continue
+  [ "$(jq -r '.inb // false' <<<"$l")" = true ] && continue
   role=$(jq -r .role <<<"$l"); cmd=$(jq -r .cmd <<<"$l"); exp=$(jq -r .expect <<<"$l")
   rc=$(run "$G" "$role" "$cmd" "$(jq -r '.cwd // ""' <<<"$l")" "$(jq -r 'if has("mws") then .mws else "alice" end' <<<"$l")" "$(jq -r '.marker // false' <<<"$l")")
   got=pass; [ "$rc" = 2 ] && got=refuse; [ "$rc" = 0 ] || [ "$rc" = 2 ] || got="rc$rc"
