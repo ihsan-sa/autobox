@@ -112,6 +112,13 @@ def stale_release() -> str:
     return cur if cur and mine.startswith(rels + "/") and cur != mine else ""
 
 
+def stops_old(release) -> bool:
+    """Whether ~/.cc/lander/stop-old, which a promote with --stop-old points at the release it promotes, names
+    `release`: a lane left on an older one gives no job a turn, not even a finishing one."""
+    p = f"{_home()}/.cc/lander/stop-old"
+    return bool(release) and os.path.islink(p) and os.path.realpath(p) == os.path.realpath(release)
+
+
 def state_dir() -> str:
     """The directory LANDQ sits in (~/.cc/state by default): member-spend.json lives there, as cc's member_gate reads it."""
     return os.path.dirname(landq().rstrip("/"))

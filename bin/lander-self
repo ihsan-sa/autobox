@@ -36,7 +36,7 @@ A planning seat runs it by hand; the lander never installs itself.
         it runs the current release's `lander settle-merged <repo> <pr> --by lander-self` (its own process), which
         moves the PR's query job to merged and writes the lane's merged line; a release without that command, or
         none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
-    lander-self promote [REV] [--repo DIR] [--pr N] [--cap SECONDS] [--no-prove]
+    lander-self promote [REV] [--repo DIR] [--pr N] [--cap SECONDS] [--no-prove] [--stop-old]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
         less any __pycache__, .pyc, .pyo, .so, .pyd or binary file it tracks (not_source: a tracked unchecked-hash
         .pyc or an extension module would run in place of its .py), plus the repo's
@@ -78,6 +78,9 @@ A planning seat runs it by hand; the lander never installs itself.
         build, the release's own selfcheck and `previous` all stand, and the promoted line says the proof was
         skipped (owner, 2026-10-13 17:33Z: a fix to the lander must not wait on the proof sweep). It refuses `--pr`
         (exit 2, before anything is built), so an unproven release is always built from a commit on origin/main.
+        --stop-old points ~/.cc/lander/stop-old at the new release before `current` moves: a lane still on the old
+        one then gives no job a turn, not even one whose checks are done, so nothing merges on the old gates while
+        its checks in flight end; the new lane reads and merges them (perms, 10-29). A promote without it removes the link.
         Every promote that switches appends a line to ~/.cc/lander/promote.log (time, sha, `proven` or `no-prove`,
         the calling Claude session's pid and cwd) before it moves `current`, and refuses with current unchanged if it
         cannot; `status` reads it to say whether the live release was proven. Nothing is written into the release
@@ -1122,6 +1125,10 @@ def cmd_promote(args, opts):
         return die(f"promote: cannot append to {os.path.join(ROOT, PROMOTE_LOG)}, current is unchanged: {e}", 3)
     if cur:
         swap("previous", cur)
+    if opts.get("stop-old"):   # before `current` moves, so no old lane sees the move without it
+        swap("stop-old", rel)
+    else:
+        unlink("stop-old")
     swap("current", rel)
     unlink("legacy-on")
     print(f"lander-self: promoted {sha[:12]} (was {os.path.basename(cur)[:12] or 'none'}); "
@@ -2258,10 +2265,10 @@ def selfcheck():
                 del proofs[:]
                 sys.stdout = said = io.StringIO()
                 try:
-                    r_np = cmd_promote([a], np)
+                    r_np = cmd_promote([a], {**np, "stop-old": True})
                 finally:
                     sys.stdout = quiet
-                cur_np, prev_np = link_target("current"), link_target("previous")
+                cur_np, prev_np, stop_np = link_target("current"), link_target("previous"), link_target("stop-old")
                 rec_np, rec_b = promote_record(a), promote_record(b)
                 sys.stdout = st_np = io.StringIO()
                 try:
@@ -2273,6 +2280,9 @@ def selfcheck():
                 globals()["proven"] = real_proven
             r_np_rb = cmd_rollback([], {})            # back to b current, a previous, for the cases below
             cur_np_rb = link_target("current")
+            swap("stop-old", cur_b)
+            r_plain, stop_plain = cmd_promote([a], np), link_target("stop-old")   # no --stop-old: the link goes
+            cmd_rollback([], {})
             sys.stdout = st_rb = io.StringIO()
             try:
                 cmd_status([], {})
@@ -2379,6 +2389,9 @@ def selfcheck():
         case("promote --no-prove switches without starting a proof, keeps previous and says it skipped",
              r_np == 0 and proofs == [] and cur_np.endswith(a) and prev_np == cur_b and
              "proof skipped (--no-prove) on the owner's 2026-10-13 17:33Z direction" in said.getvalue())
+        case("promote --stop-old points stop-old at the release it promotes", stop_np == cur_np != "")
+        case("a promote without --stop-old removes the link", r_plain == 0 and stop_plain == "")
+        case("--stop-old: parse() takes it", parse(["promote", "--stop-old"])[1].get("stop-old") is True)
         case("rollback after a --no-prove promote puts the one before back", r_np_rb == 0 and cur_np_rb == cur_b)
         case("prove refuses --no-prove (promote's alone)", r_np_prove == 2)
         case("prove from a seat that is not perms is refused before any proof or hold, with or without --cap",
@@ -3404,8 +3417,8 @@ def parse(argv):
             opts[a[2:]] = next(it, "")
         elif a == "--legacy":
             opts["legacy"] = True
-        elif a == "--no-prove":
-            opts["no-prove"] = True
+        elif a in ("--no-prove", "--stop-old"):
+            opts[a[2:]] = True
         else:
             args.append(a)
     return args, opts

@@ -2640,6 +2640,42 @@ class ReleaseSwitch(Fixture):
         self.assertEqual((self.job(1).state, sorted(self.job(1).results)), (T.CHECKING, ["a"]))
         self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
 
+    def test_after_a_stop_old_promote_a_finished_job_is_merged_by_the_new_release_not_the_old(self):
+        # perms on #2025, 10-29: a promote that tightens a gate in a hurry was held back while the old lane merged
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        recorded, promoted, seen, real = threading.Event(), threading.Event(), {}, L.Lane.reap
+
+        def reap(lane, timeout):   # the lane records #2's check, then meets the promote before #2's next turn
+            real(lane, timeout)
+            if not recorded.is_set() and "b" in self.job(2).results:
+                recorded.set()
+                promoted.wait(WAIT)
+
+        def merged():
+            return getattr(self.job(2), "state", "") == T.DEPLOY_PENDING
+
+        def hook(name, _):
+            if name == "a":   # #1's long check: the promote comes once #2's checks are all recorded
+                seen["recorded"] = recorded.wait(WAIT)
+                os.symlink(self.rels["bbbb"], os.path.join(self.home, ".cc", "lander", "stop-old"))
+                self.point("bbbb")
+                promoted.set()
+                seen["merged"] = until(merged, timeout=2)   # a turn for #2 on the old release would merge it now
+        with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "POLL", 0.05), \
+                mock.patch.object(L.Lane, "reap", reap):
+            self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND")))
+        self.assertTrue(seen["recorded"], "#2's check b was not recorded beside #1's check")
+        self.assertFalse(seen["merged"], "the old release merged #2 after a --stop-old promote")
+        self.assertFalse(self.box().get("merges"))
+        self.assertEqual((self.job(2).state, sorted(self.job(2).results)), (T.CHECKING, ["b"]))
+        self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
+        self.mine = self.rels["bbbb"]   # the lane on the new release merges both
+        self.land(runner=Runner(), reviewer=Reviewer(V("LAND"), V("LAND")))
+        self.assertEqual((self.job(1).state, self.job(2).state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
+
     def test_a_pr_submitted_while_a_promote_waits_stays_queued_for_the_new_release_to_plan(self):
         # Opus review of #2025: the old release planned it, and the new lane checked and merged it on the old rules
         self.pr(1, {"a/x": "n\n"})
