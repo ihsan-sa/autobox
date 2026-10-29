@@ -146,7 +146,7 @@ class Sh(unittest.TestCase):
         try:   # gone, or a zombie its new parent has not reaped yet
             with open(f"/proc/{kid}/stat") as f:
                 self.assertEqual(f.read().rsplit(")", 1)[1].split()[0], "Z")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             pass
 
     def test_a_timeout_is_bounded_when_a_grandchild_holds_the_pipes(self):
