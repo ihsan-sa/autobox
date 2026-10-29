@@ -313,6 +313,20 @@ FSTUB
      && kill -0 "$hm" 2>/dev/null; then r=0; else r=1; fi
   ok "a worker hunting with pgrep and killing through xargs is fenced on what the pgrep finds — with an option between the two, refused outside its subtree, allowed inside it, and refused when the feed is not a pgrep at all" $r
 
+  # 7b. …AND THROUGH A VARIABLE (10-28: a builder waiting on its own checks took the lander's unittest run from
+  #     pgrep and killed it, ending a 66 min gate). The variable cannot be read, so the pgrep that fills it is.
+  hk=varhunted$$
+  printf '#!/bin/sh\nsleep 600\n' > "$T/$hk"; chmod +x "$T/$hk"
+  sleep 600 >/dev/null 2>&1 & hbare=$!; pids="$pids $hbare"
+  "$T/$hk" >/dev/null 2>&1 & hm=$!; pids="$pids $hm"
+  sleep 0.3
+  vset=$(g Bash "{\"command\":\"P=\$(pgrep -f $hk); kill \$P\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  vfor=$(g Bash "{\"command\":\"for p in \$(pgrep -f $hk); do kill -9 \$p; done\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  vmine=$(g Bash "{\"command\":\"for p in \$(pgrep -f $hk); do kill -9 \$p; done\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  vjob=$(g Bash '{"command":"sleep 600 & kill $!"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  if [ "$vset" = 2 ] && [ "$vfor" = 2 ] && [ "$vmine" = 0 ] && [ "$vjob" = 0 ] && kill -0 "$hm" 2>/dev/null; then r=0; else r=1; fi
+  ok "a kill of a variable a pgrep fills is fenced on what the pgrep finds, by assignment or for loop, while a variable with no pgrep beside it (kill \$!) passes" $r
+
   # 8. AN OPTION'S VALUE IS NOT THE PATTERN. `pkill --signal TERM <name>` read TERM as the pattern, matched
   #    nothing and went through — and TERMs every match of the real name, this session included.
   ASKS=$T/asks8; CALLS=$T/calls8; : > "$CALLS"
@@ -7057,7 +7071,8 @@ case "$tool" in
     #     detached suite, a poller — stay killable, which is the whole point of the subtree test rather than a ban.
     #     A pattern (pkill/killall) is resolved with ONE pgrep and every match must pass the same test; a pattern
     #     matching nothing is nothing to refuse. Same honest ceiling as rule 5: a pid or pattern held in a shell
-    #     variable cannot be resolved here and passes.
+    #     variable cannot be resolved here and passes, unless a pgrep in the same command fills it: then that
+    #     pgrep is resolved and fenced.
     #     WORKER *and* MEMBER, because those are not two populations here: a worker dispatched inside a member
     #     workspace is given role=member by track_dir() (the repo decides the tier, not the worktree), and it is
     #     the one running `claude -p` in a loop — exactly the session the incident happened to. `role=member` is
@@ -7186,7 +7201,15 @@ case "$tool" in
                 first=""                                 # as a substitution rather than a pipe
                 kresolve "$inv" "the pids a pgrep found for kill" \
                   || never "killing what a command substitution returns — this worker cannot see whose pids those are";;
-              *[!0-9]*) first="";;                       # a variable or a glob: unresolvable, same ceiling as rule 5
+              *'$'*)                                     # `P=$(pgrep -f x); kill $P`, `for p in $(pgrep …)`:
+                # A VARIABLE FILLED BY A HUNT IS THE HUNT. The variable itself cannot be read here, so it used to
+                # pass, and on 10-28 a builder took the lander's check run that way (python3 -m unittest, found by
+                # pgrep) and ended a 66 min gate. Every pgrep the same command runs is resolved and fenced instead;
+                # a variable with no pgrep beside it (`kill $!`, the worker's own job) still passes.
+                first=""
+                while IFS= read -r hs; do kresolve "$hs" "kill $x, where the command fills it from a pgrep"; done \
+                  < <(grep -oE '(^|[^A-Za-z0-9_.-])pgrep[[:space:]][^;&|]*' <<<"$cmd");;
+              *[!0-9]*) first="";;                       # a glob: unresolvable, same ceiling as rule 5
               *) first=""; kfence "$x" "kill $x";;
             esac
           done
