@@ -238,7 +238,7 @@ def cases(m, plant):
         source = (m.BIN / "cc-sandbox").read_text()
         legacy = source[source.index("build_member(){"):source.index("CLAUDEBIN=")]
         digest = hashlib.sha256(legacy.encode()).hexdigest()
-        check(digest == "42156ffb621c3de2cce141d6bebd2e83bf798c61c0d4fe256cac242dc9dc4b37", "legacy implementation frozen",
+        check(digest == "1234831ff65564c88a3b7e1ed22a9094d53fee8749196be5fa927c9596d09883", "legacy implementation frozen",
               "build_member/launch_member changed. The flag-off cases below still pass, because both sides run "
               f"the same edited code. Re-read the change against the legacy profile, then pin it: {digest}")
         stub = root / "stub"

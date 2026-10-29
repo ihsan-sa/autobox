@@ -72,7 +72,7 @@
 #     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
 #     starts from and what every other live session of the handle reads next; its host path is not inside) and
 #     whichever account the owner minted for it, his own included: a member can print whatever is in there, so that is his call to
-#     make per workspace. With no credential of its own the workspace does not start, and a signed-out one starts only a build (npm, npx, node or vite as the first word) · a
+#     make per workspace. With no credential of its own the workspace does not start, and a signed-out one starts only a command whose first word is a build tool (npm, npx, node, vite) · a
 #     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
 #     workspace (`hasCompletedOnboarding` and `hasTrustDialogAccepted` on its own paths) so the member is not walked through the setup
 #     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
@@ -93,6 +93,8 @@
 #     read-write at its own path and is the working directory. This is how a member project's PR is gated (cc-land, MEMBERS): the merged
 #     tree is built on the host, and its test scripts run in HERE, in the member's world, never on the host as the owner.
 #     Nothing else about the boundary changes: same binds, same asks, same cleared environment, same credential wall.
+#   cc-sandbox member <handle> [<track>] [--tree <dir>] --tutor 0|1 -- <cmd...>   …WITH VITE_TUTOR SET INSIDE to that 0 or 1, which
+#     the cleared environment would drop: a lessons build that runs npm and vite with no wrapper. No other value is taken, and the two flags come in either order.
 #   cc-sandbox mint <handle> [--from <file>]   THE WORKSPACE'S OWN CREDENTIAL, the one thing `member` will not start without.
 #     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
 #     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
@@ -313,6 +315,7 @@ set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); EGRESS="$BIN/cc-egress"
 MEMBER_MARK=/.cc-member-boundary   # at the root, where the host user cannot make a file; the member bwrap binds it
 TREE=""   # `member … --tree <dir>`: one host tree bound into the boundary as the working directory (a landing's gates)
+TUTOR=""   # `member … --tutor 0|1`: VITE_TUTOR inside, which --clearenv drops (a lessons build run with no wrapper to set it)
 TMPSZ=(--size "${CC_SANDBOX_TMP_SIZE:-2147483648}")   # EVERY tmpfs A SESSION CAN FILL HAS A SIZE (2 GiB, bytes): tmpfs pages are RAM that belong to no process, so a
 # runaway writing into /tmp or ~ gets ENOSPC instead of filling memory and swap (a worker's test wrote 16 GB on 2026-10-24)
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
@@ -1426,6 +1429,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
     config/writing-ref-prompt.md config/raise-prompt.md config/spend-prompt.md config/mail-prompt.md config/library-prompt.md; do
     [ -f "$(dirname "$cb")/$f" ] && B+=(--ro-bind "$(dirname "$cb")/$f" "$H/$f"); done
   B+=(--setenv CC_FAILURES "$H/.cc/state/$h/failures")
+  [ -n "$TUTOR" ] && B+=(--setenv VITE_TUTOR "$TUTOR")   # 0 or 1 only, checked where it is parsed: a member boundary takes no free value
   [ -n "$TREE" ] && B+=(--bind "$TREE" "$TREE")   # the one host tree a landing's gates run on, rw, at its own path (see the header)
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
@@ -1490,8 +1494,10 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # #<h> and the owner — a refusal here lands in a pane nobody reads (review-156d).
   # A BUILD NEEDS NO LOGIN. A command whose first word is a build tool (signed_out_ok: auto-publish's npm/vite build)
   # starts on a SIGNED-OUT file — there, token blank — since it never logs in: the blank file is still what is bound,
-  # nothing falls back. A member's lessons were off the site for 2.5 days behind this wall (2026-10-24). Everything else
-  # is refused, so `env claude` or `sh -c claude` is no way round it (#2010 guessed "is this claude" and let both by).
+  # nothing falls back. A member's lessons were off the site for 2.5 days behind this wall (2026-10-24). Any other first
+  # word is refused, so `env claude` or `sh -c claude` is told to mint (#2010 guessed "is this claude" and let both by).
+  # The list is no jail: node -e, npx or any file named node can still start claude in here. What stops a signed-out
+  # claude is the blank credential itself, which logs in as nobody and falls back to no one's (perms' read of #2020).
   # A file that is not there still refuses.
   if ! cred_usable "$own" && { [ ! -e "$own" ] || ! signed_out_ok "$1"; }; then
     why=$(cred_why "$own")
@@ -2022,10 +2028,16 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     if [ "$w" = env ]; then out=$("$SELF" member "$h" t -- env "$CLAUDEBIN" -p hi 2>&1); else out=$("$SELF" member "$h" t -- sh -c 'echo STARTED; "$0" -p hi' "$CLAUDEBIN" 2>&1); fi
     r="$r $?/$(grep -c STARTED <<<"$out")/$(grep -c 'Only a build starts here' <<<"$out")"
   done
-  t 'member: a signed-out workspace refuses env claude and sh -c claude — off the build list, whatever it wraps' "$r" ' 2/0/1 2/0/1'
+  t 'member: a signed-out workspace refuses a first word off the build list (env claude, sh -c claude) and says only a build starts' "$r" ' 2/0/1 2/0/1'
   # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
   mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
   { jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" && chmod 600 "$own"; } || return 1   # 600, as mint installs it
+  # --tutor: VITE_TUTOR reaches a lessons build through --clearenv, and takes only 0 or 1 (a member boundary takes no free value)
+  r=""; for w in 1 0 none x; do
+    if [ $w = none ]; then out=$(VITE_TUTOR=1 "$SELF" member "$h" t -- sh -c 'echo "T=${VITE_TUTOR-unset}"' 2>&1)
+    else out=$("$SELF" member "$h" t --tutor "$w" -- sh -c 'echo "T=${VITE_TUTOR-unset}"' 2>&1); fi
+    r="$r $?/$(grep -o 'T=.*' <<<"$out" | tail -1)"; done
+  t "member: --tutor 1 or 0 sets VITE_TUTOR inside, none leaves the host's out, and any other value is refused" "$r" ' 0/T=1 0/T=0 0/T=unset 2/'
   out=$(TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak SLACK_BOT_TOKEN=leak CC_LOOP_TRIM=trim-77 "$SELF" member "$h" t -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
     echo other=$(e ~/dev/'"$o"'); echo ctl=$(e '"$ctl"'); echo devls=$(ls -A ~/dev | tr "\n" " "); echo ccls=$(ls -A ~/.cc | sort | tr "\n" " ")
@@ -2325,6 +2337,8 @@ PY
   mkdir -p "$tree" || return 1
   out=$(CC_MEMBER_V2=1 TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c 'echo STARTED' 2>&1); rc=$?
   t 'tree: not a cc-member-v2 option — refused before anything runs' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'not a cc-member-v2 option' <<<"$out")" 2/0/1
+  out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tutor 1 --tree "$tree" -- sh -c 'echo "T=$VITE_TUTOR"' 2>&1); rc=$?
+  t 'tree: --tutor before --tree parses as well as after' "$rc/$(grep -o 'T=.*' <<<"$out" | tail -1)" 0/T=1
   out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
     echo cwd=$PWD; echo wrote=$(echo hi > out.txt 2>/dev/null && echo ok || echo ro)
@@ -4681,12 +4695,15 @@ case "${1:-}" in selfcheck) if [ -n "${2:-}" ]; then selfcheck_section "$2"; eli
   web) shift; web "${1:-}"; exit $?;;
   github) shift; github "$@"; exit $?;;
   env) shift; env_grant "${1:-}" "${2:-}" "${3:-}"; exit $?;;
-  member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
-          if [ "${1:-}" = --tree ]; then TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; }; fi
+  member) h="${2:?handle}"; shift 2; tr=""; case "${1:-}" in --|--tree|--tutor) ;; *) tr="${1:-}"; shift;; esac   # <handle> [<track>|""] [--tree <dir>] [--tutor 0|1] [--] cmd
+          while :; do case "${1:-}" in   # --tree and --tutor, in either order
+            --tree) TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; };;
+            --tutor) case "${2:-}" in 0|1) TUTOR=$2; shift 2;; *) echo "cc-sandbox: --tutor takes 0 or 1, not '${2:-}'" >&2; exit 2;; esac;;
+            *) break;; esac; done
           [ "${1:-}" = -- ] && shift
-          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] -- <cmd...>" >&2; exit 2; }
+          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] [--tutor 0|1] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
-            [ -z "$TREE" ] || { echo "cc-sandbox: --tree is not a cc-member-v2 option" >&2; exit 2; }
+            for f in ${TREE:+--tree} ${TUTOR:+--tutor}; do echo "cc-sandbox: $f is not a cc-member-v2 option" >&2; exit 2; done
             ! handle_ok "$h" || ! ev=$(env_names "$h") \
               || echo "cc-sandbox: ~/dev/$h is granted $ev (cc-sandbox env), but a CC_MEMBER_V2=1 launch does not carry grants — this session runs without them" >&2
             BIN=$(dirname "$SELF"); exec "$BIN/cc-member-v2" run "$h" "${tr:-$h}" -- "$@"
