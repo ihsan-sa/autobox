@@ -2016,10 +2016,12 @@ def split_opts(argv, *names):
 def spawn_lane(repo, release):
     """Start `lander lane <repo>` detached from `release` (what `current` named a moment ago). -> (ok, how).
     As its own transient unit, like a tick: this lane may be running inside a tick's unit, and a child left in that
-    unit's cgroup is killed when the tick ends, mid-job. A plain detached child only when systemd-run fails."""
+    unit's cgroup is killed when the tick ends, mid-job. A plain detached child only when systemd-run fails.
+    The pid is in the name: a lane that finds `current` moved again switches within the second it started, and
+    systemd-run refuses the name of its own unit, still loaded (10-27: dispatch was left with no lane)."""
     argv = [sys.executable, "-P", os.path.join(release, "core", "lander", "cli.py"), "lane", repo]
     sysrun = os.environ.get("LANDER_SYSTEMD_RUN") or "systemd-run"
-    unit = f"lander-lane-{repo}-{int(time.time())}"
+    unit = f"lander-lane-{repo}-{int(time.time())}-{os.getpid()}"
     rc, out, err = run([sysrun, "--user", "--collect", "--quiet", f"--unit={unit}",
                         "--setenv=PYTHONDONTWRITEBYTECODE=1", *argv], timeout=30)
     if rc == 0:

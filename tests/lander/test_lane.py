@@ -5814,6 +5814,24 @@ class SpawnLaneTest(unittest.TestCase):
         self.assertIn("--user", argv)
         self.assertEqual(argv[-4:-1], ["/rel/bbbb/core/lander/cli.py", "lane", "demo"])
 
+    def test_a_lane_switching_again_in_its_first_second_takes_a_name_of_its_own(self):
+        # 10-27: the lane started at T found `current` moved again and asked for lander-lane-dispatch-T, its own
+        # unit's name, still loaded; systemd-run refused it and dispatch had no lane
+        with tempfile.TemporaryDirectory() as t:
+            fake = os.path.join(t, "systemd-run")
+            with open(fake, "w") as f:
+                f.write(f"#!/bin/sh\nfor a; do case $a in --unit=*) n=$a;; esac; done\n"
+                        f"grep -qx -- \"$n\" {t}/loaded && exit 1\necho \"$n\" >> {t}/loaded\n")
+            os.chmod(fake, 0o755)
+            with mock.patch.dict(os.environ, {"LANDER_SYSTEMD_RUN": fake, "INVOCATION_ID": "x"}), \
+                    mock.patch.object(L.time, "time", lambda: 1793089495.5):
+                with mock.patch.object(L.os, "getpid", lambda: 1635530):
+                    first = L.spawn_lane("dispatch", "/rel/e720")
+                with mock.patch.object(L.os, "getpid", lambda: 1635531):
+                    second = L.spawn_lane("dispatch", "/rel/f449")
+        self.assertTrue(first[0], first)
+        self.assertTrue(second[0], second)
+
     def fallback(self, env):
         popen = mock.MagicMock(return_value=mock.MagicMock(pid=4242))
         with mock.patch.dict(os.environ, env), mock.patch.object(L, "run", lambda *a, **k: (1, "", "no bus")), \
