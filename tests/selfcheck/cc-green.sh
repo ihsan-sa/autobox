@@ -573,6 +573,8 @@ EOS
   want wnoboard $$ merged "" "$D/no-such-board"
   k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a worker's run whose board command is missing keeps going"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
+  every=18446744073709551616; eval "$(grep -m1 -F 'every=60;;' "$SELF" | sed 's/^ *//')"   # the watcher's own check, run on 2^64
+  k "$(t test "$every" = 60)" "a CC_GREEN_WANT_EVERY over six digits (2^64, which wraps to 0) falls back to 60"
 
   # THE WORKER SANDBOX'S SHAPE: only the control repo's core/bin is bound there, as ~/bin, so no tests/ sits beside
   # it. A copy of this bin with nothing beside it stands in for that. With the checkout carrying core/tests/green.sh,
