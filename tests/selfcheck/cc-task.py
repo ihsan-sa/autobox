@@ -556,7 +556,7 @@ def selfcheck():
         # opening the window left the claim held by the seat that typed it, alive for hours. Each case writes its
         # own row's record: the owner is a live process that is not this check's, the launcher one that has exited.
         # recurring-defect-ok: pause-hold-missing — these cases write delivery.json under the check's temp root; nothing launches a worker or writes the board
-        seat = subprocess.Popen(["sleep", "60"]); gone = subprocess.Popen(["sleep", "60"])
+        seat = subprocess.Popen(["sleep", "600"]); gone = subprocess.Popen(["sleep", "600"])   # killed in finally
         try:
             def ident(pid): return {k: process(pid)[k] for k in ("pid", "start_ticks")}
             live_owner = {"process": ident(seat.pid), "boot_id": boot_id(), "agent_id": None}
@@ -584,6 +584,16 @@ def selfcheck():
             ok("the same seat launching again hands its own claim to the new cc, and the same cc changes nothing",
                do_claim(d, live_owner, "worker", by=live_cc) == 1 and d["claim"] is c and c["launcher"] == live_cc
                and c["generation"] == 1 and do_claim(d, live_owner, "worker", by=live_cc) == 0)
+            # recurring-defect-ok: pause-hold-missing — an in-memory record; nothing launches or writes the board
+            ok("…and the same seat's `cc claim` (no launcher) keeps the one that --go recorded",
+               do_claim(d, live_owner, "worker") == 0 and c["launcher"] == live_cc)
+            # e2e-cc-claim, run by the lander's lane on this PR's tree merged with main (tree a7626c05) at
+            # 2026-10-29T12:12Z: passed in 74 s.
+            # recurring-defect-ok: pause-hold-missing — an in-memory record; nothing launches or writes the board
+            dd = held("k11", "worker", dead_cc); dc = dd["claim"]
+            ok("a plain `cc claim` over a worker claim whose --go has exited returns 0, keeps the dead launcher, and the row is free to the next dispatcher",
+               do_claim(dd, live_owner, "worker") == 0 and dd["claim"] is dc and dc["launcher"] == dead_cc
+               and run("check", "r", "k11", "--executor", "worker").returncode == 0)
             sub = new_record("r", "k6", root / ".cc/worktrees/r/k6"); do_claim(sub, live_owner, "subagent", by=live_cc)
             ok("…and a subagent's claim never records one", sub["claim"]["launcher"] is None)
             killed = held("k7", "worker", dead_cc); other = {**live_owner, "agent_id": "next-dispatcher"}
