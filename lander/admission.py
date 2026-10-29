@@ -667,13 +667,14 @@ def _ahead(qdir: str, mine: str, cap: float | None = None, passes=None) -> tuple
 
 def _hold(qdir: str) -> int | None:
     """The time (ns) a live PROVE HOLD's ticket is named, the newest when there are more, else None: a ticket whose
-    pid is a running lander-self (it holds no slot wait of its own, so only its process says what it is)."""
+    pid is a running lander-self (it holds no slot wait of its own, so only its process says what it is): one of its
+    first argv entries is named exactly that, so a check run inside a lander-self.check.X tree is not one."""
     born = None
     for name in os.listdir(qdir):
         if TICKET.fullmatch(name) and name.startswith("+"):
             with contextlib.suppress(OSError):
                 with open(f"/proc/{name.split('-')[1]}/cmdline", "rb") as f:
-                    if b"lander-self" in f.read():
+                    if any(os.path.basename(a) == b"lander-self" for a in f.read().split(b"\0")[:3]):
                         born = max(born or 0, int(name.split("-")[0]))
     return born
 

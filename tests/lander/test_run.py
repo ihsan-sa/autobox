@@ -3214,6 +3214,30 @@ class Admission(unittest.TestCase):
         f.close()
         self.assertGreater(name, hold)   # behind the hold, though FIRST_BACK and the 2 h waiter are older
 
+    def test_a_prove_hold_is_a_process_named_lander_self_not_one_that_mentions_it(self):
+        # main went red under lander-self: its check tree is lander-self.check.X, so the test run's own tickets held
+        d = tempfile.mkdtemp(prefix="lander-self.check.")
+        self.addCleanup(shutil.rmtree, d)
+        prog = os.path.join(d, "lander-self")
+        with open(prog, "w") as f:
+            f.write(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+        os.chmod(prog, 0o755)
+        q = os.path.join(d, "queue")
+        os.mkdir(q)
+        now = time.time_ns()
+        for back, argv in ((200, [sys.executable, "-c", "import time; time.sleep(30)", f"{d}/core/tests/x.py"]),
+                           (100, [prog])):   # a check run inside the tree, then a real lander-self by its shebang
+            p = subprocess.Popen(argv)
+            self.addCleanup(p.wait)
+            self.addCleanup(p.kill)
+            for _ in range(100):   # its cmdline reads empty until its exec is through
+                with open(f"/proc/{p.pid}/cmdline", "rb") as f:
+                    if f.read():
+                        break
+                time.sleep(0.02)
+            open(os.path.join(q, f"+{now - back * 10**9:019d}-{p.pid}-0000a0a0"), "a").close()
+            self.assertEqual(A._hold(q), None if back == 200 else now - 100 * 10**9)
+
     def test_checks_put_first_keep_the_order_they_were_put_first_in(self):
         # #1960 review: each FRONT ticket went one ns before the oldest live one, so the newest went ahead of the rest
         waiter = f"+{time.time_ns() - 2 * 3600 * 10**9:019d}-4242-0000beef"   # a lane's check, 2 h in
