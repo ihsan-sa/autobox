@@ -766,6 +766,17 @@ def run_selfcheck():
               not mverr and mvtext == "taken as a move" and n_mv == n_posts0
               and mvreqs[0] == {"move": "C1", "thread_ts": "5.0", "text": "move #proj"}
               and not mverr2 and mvtext2.startswith("sent") and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1)
+        # `cc-slack ask --help` is usage, and an unknown lone flag is an error: neither reaches the daemon, so no card.
+        real_sockAsk, askreqs = globals()["sock_request"], []
+        try:
+            globals()["sock_request"] = lambda req, timeout=15: askreqs.append(req) or {"ok": True, "text": "posted"}
+            with contextlib.redirect_stdout(io.StringIO()) as askout, contextlib.redirect_stderr(io.StringIO()):
+                rcs = [main(["ask", a]) for a in ("--help", "-h", "--bogus")]
+            main(["ask", "--", "--help"])
+        finally:
+            globals()["sock_request"] = real_sockAsk
+        check("ask: --help and -h print usage, an unknown flag errors, none posts; `-- --help` still asks",
+              rcs == [0, 0, 2] and "[-t" in askout.getvalue() and askreqs == [{"ask": "", "text": "--help"}])
         text, err = ch.call("history", {"chat_id": "C1", "n": 500})
         check("channel tool history: clamps like the CLI, formats compact lines", not err
               and [kw for m, kw in acalls2 if m == "conversations.history"][-1]["limit"] == "100" and "hi" in text)
