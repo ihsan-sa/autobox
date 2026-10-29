@@ -1729,11 +1729,20 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
 # EVERY git convert runs on ~/dev/<repo> goes through cgd, one small copy of core/bin/cc's gd (#1840), kept in step with it:
 # hooks and fsmonitor off, and GIT_DIR and GIT_COMMON_DIR pinned so git takes its config from that .git alone,
 # never a git dir a `commondir` planted there names. Its ref backend still follows commondir, and a main checkout never
-# has one, so one is refused outright.
-cgd(){ local d="$1"; shift   # $1 ~/dev/<repo> · the rest git's own arguments
-  [ -d "$d/.git" ] || { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$d" "$@"; return; }
-  if [ -e "$d/.git/commondir" ] || [ -L "$d/.git/commondir" ]; then echo "cc-sandbox: refusing to run git in $d: its .git has a commondir, which only a worktree's admin dir carries" >&2; return 1; fi
-  GIT_DIR="$d/.git" GIT_COMMON_DIR="$d/.git" git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$d" "$@"; }
+# has one, so one is refused outright, as is a .git that is a file or a link (a `gitdir:` pointer names a git dir
+# somewhere else). That .git's own config still names what runs, so every filter driver it names is blanked (env, not
+# -c, so a subsection with an = in it survives) and commit signing is off: a clean filter or a gpg.program never runs.
+cgd_why(){   # $1 dir → prints why cgd will not run git there, exit 0 when it will not
+  if [ -L "$1/.git" ] || { [ -e "$1/.git" ] && [ ! -d "$1/.git" ]; }; then echo "its .git is not a directory, so it names a git dir somewhere else"
+  elif [ -e "$1/.git/commondir" ] || [ -L "$1/.git/commondir" ]; then echo "its .git has a commondir, which only a worktree's admin dir carries"
+  else return 1; fi; }
+cgd(){ local d="$1" why k n=0 e=(); shift   # $1 ~/dev/<repo> · the rest git's own arguments
+  set -- -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=false -C "$d" "$@"
+  [ -e "$d/.git" ] || [ -L "$d/.git" ] || { git "$@"; return; }
+  why=$(cgd_why "$d") && { echo "cc-sandbox: refusing to run git in $d: $why" >&2; return 1; }
+  while IFS= read -r -d '' k; do e+=("GIT_CONFIG_KEY_$n=$k" "GIT_CONFIG_VALUE_$n="); n=$((n + 1)); done \
+    < <(GIT_DIR="$d/.git" GIT_COMMON_DIR="$d/.git" git -C "$d" config -z --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null)
+  env "${e[@]}" GIT_CONFIG_COUNT=$n GIT_DIR="$d/.git" GIT_COMMON_DIR="$d/.git" git "$@"; }
 convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, or is refused with the reason. The four that
   # exist were made by cc-slack's join flow; a repo already on the box has no such path, and hand-editing the markers leaves
   # out the board, the exclude and the first commit. This makes the same workspace that flow makes, and says what it changed.
@@ -1745,8 +1754,8 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   # ONCE A MEMBER'S, NEVER ORDINARY AGAIN. The marker above is the member's to delete, so its absence proves nothing; the
   # host's own record says this handle was a workspace, and its .git is one the member wrote (perms' read of #1840).
   [ -e "$H/.cc/members/$r" ] && { echo "cc-sandbox: refusing ~/dev/$r — ~/.cc/members/$r says it was a member workspace, so its missing .cc/member-workspace marker was deleted from inside, and its .git is the member's. Put the marker back by hand (~/dev/$r/.cc/member-workspace) instead of converting it again." >&2; return 2; }
-  # cgd refuses a commondir too, but convert swallows git's errors, so this one stops it before anything is written.
-  [ -e "$dev/.git/commondir" ] || [ -L "$dev/.git/commondir" ] && { echo "cc-sandbox: refusing ~/dev/$r — its .git has a commondir, which only a worktree's admin dir carries" >&2; return 2; }
+  # cgd refuses these too, but convert swallows git's errors, so this one stops it before anything is written.
+  why=$(cgd_why "$dev") && { echo "cc-sandbox: refusing ~/dev/$r — $why" >&2; return 2; }
   # THE CONTROL REPO IS NOT SOMEBODY'S WORKSPACE. This command lives in it; converting it would put the box's own source —
   # every script that runs the box, this one included — inside one member's world, where they may edit it.
   ctl=$(dirname "$(dirname "$(dirname "$SELF")")")
@@ -2502,6 +2511,23 @@ EOS
   out=$(HOME="$fh" "$SELF" convert planted 2>&1); rc=$?
   t 'convert: a repo whose .git carries a planted commondir is refused, and nothing is made' \
     "$rc/$(grep -c 'commondir' <<<"$out")/$([ -e "$fh/dev/planted/.cc" ] && echo made || echo none)/$([ -e "$fh/.cc/members/planted" ] && echo rec || echo none)" 2/1/none/none
+  mkdir -p "$fh/dev/gitfile" && git init -q --bare "$fh/elsewhere.git" >/dev/null 2>&1 && printf 'gitdir: %s\n' "$fh/elsewhere.git" > "$fh/dev/gitfile/.git"
+  out=$(HOME="$fh" "$SELF" convert gitfile 2>&1); rc=$?
+  t 'convert: a repo whose .git is a file (a gitdir: pointer) is refused, and nothing is made' \
+    "$rc/$(grep -c 'not a directory' <<<"$out")/$([ -e "$fh/dev/gitfile/.cc" ] && echo made || echo none)" 2/1/none
+  # …and what that .git's own config names never runs as the owner: a clean filter its first commit would feed every
+  # file through, and a gpg.program its signed commit would call. Each a repo with no HEAD, so convert commits.
+  mkdir -p "$fh/dev/filtered" && git -C "$fh/dev/filtered" init -q >/dev/null 2>&1 && echo '* filter=evil' > "$fh/dev/filtered/.gitattributes" \
+    && git -C "$fh/dev/filtered" config filter.evil.clean "touch $fh/filter-ran; cat"
+  out=$(HOME="$fh" "$SELF" convert filtered 2>&1); rc=$?
+  t 'convert: a clean filter the repo'"'"'s own config names never runs, and the first commit is still made' \
+    "$rc/$([ -e "$fh/filter-ran" ] && echo ran || echo quiet)/$(git -C "$fh/dev/filtered" rev-parse -q --verify HEAD >/dev/null && echo head)" 0/quiet/head
+  printf '#!/bin/sh\ntouch %s/gpg-ran\nexit 1\n' "$fh" > "$fh/evilgpg" && chmod +x "$fh/evilgpg"
+  mkdir -p "$fh/dev/signed" && git -C "$fh/dev/signed" init -q >/dev/null 2>&1 && echo x > "$fh/dev/signed/f" \
+    && git -C "$fh/dev/signed" config commit.gpgSign true && git -C "$fh/dev/signed" config gpg.program "$fh/evilgpg"
+  out=$(HOME="$fh" "$SELF" convert signed 2>&1); rc=$?
+  t 'convert: commit.gpgSign with a gpg.program the repo'"'"'s own config names never runs it, and the first commit is still made' \
+    "$rc/$([ -e "$fh/gpg-ran" ] && echo ran || echo quiet)/$(git -C "$fh/dev/signed" rev-parse -q --verify HEAD >/dev/null && echo head)" 0/quiet/head
   # ── mint: what a login produced, and only that ────────────────────────────────────────────────────────────────────
   dest="$fh/.cc/members/alice/credentials.json"
   out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=alice-access LOGIN_REFRESH=alice-refresh LOGIN_UUID=alice-uuid LOGIN_EMAIL=alice@example.invalid "$SELF" mint alice 2>&1); rc=$?
