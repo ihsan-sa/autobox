@@ -2503,9 +2503,20 @@ class Lanes(Fixture):
         self.assertNotIn("stage demo#1 lane", self.log())   # a held job is not timed
 
 
+WAIT = 120   # a wait on another thread's event: generous, since a loaded box (load ~100) runs these slowly
+
+
+def until(cond, timeout=WAIT):
+    """Poll `cond` until it holds or `timeout` passes. -> whether it held."""
+    end = time.time() + timeout
+    while not cond() and time.time() < end:
+        time.sleep(0.05)
+    return cond()
+
+
 class ReleaseSwitch(Fixture):
-    """A promote reaches a running lane between jobs: the job in flight ends on its release, the next one does not
-    start there."""
+    """A promote reaches a running lane between jobs: the check in flight ends on its release, no new check starts
+    there, and a job whose checks are done is read and merged while it waits."""
 
     def setUp(self):
         super().setUp()
@@ -2524,6 +2535,20 @@ class ReleaseSwitch(Fixture):
                                                                   (True, "test"))[1])
         p.start()
         self.addCleanup(p.stop)
+
+    def turn_of(self, pr, promoted):
+        """An event set when job `pr`'s turn ends after `promoted`, its checks all recorded before the turn."""
+        turned, real = threading.Event(), L.Lane.advance
+
+        def advance(lane, job):
+            ready = promoted.is_set() and job.pr == pr and job.plan and set(job.plan.checks) <= set(job.results)
+            real(lane, job)
+            if ready:
+                turned.set()
+        p = mock.patch.object(L.Lane, "advance", advance)
+        p.start()
+        self.addCleanup(p.stop)
+        return turned
 
     def point(self, n):
         cur = os.path.join(self.home, ".cc", "lander", "current")
@@ -2585,6 +2610,170 @@ class ReleaseSwitch(Fixture):
         self.assertFalse(self.box().get("merges"))
         self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
         self.assertIn("this lane takes no new job", lines[-1])
+
+    def test_a_job_whose_checks_are_done_merges_while_a_promote_waits_for_another_check(self):
+        # dispatch #2121, 10-28: green, read and adopted, it sat 2 h at stage review while the lane on the old release
+        # waited out two other PRs' full suites and gave no job a turn
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        b_runs, promoted, seen = threading.Event(), threading.Event(), {}
+
+        def merged():
+            return getattr(self.job(2), "state", "") == T.DEPLOY_PENDING
+
+        def hook(name, _):
+            if name == "a":   # #1's long check: the promote comes while it runs, and it ends once #2 has merged
+                seen["b"] = b_runs.wait(WAIT)
+                self.point("bbbb")
+                promoted.set()
+                until(merged)
+            else:
+                b_runs.set()
+                promoted.wait(WAIT)
+        with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "POLL", 0.05):
+            self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND")))
+        self.assertTrue(seen["b"], "#2's check b never started beside #1's")
+        self.assertTrue(merged(), "#2's checks were done, yet it waited for #1's check to end before the switch")
+        self.assertEqual((self.job(1).state, sorted(self.job(1).results)), (T.CHECKING, ["a"]))
+        self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
+
+    def test_a_pr_submitted_while_a_promote_waits_stays_queued_for_the_new_release_to_plan(self):
+        # Opus review of #2025: the old release planned it, and the new lane checked and merged it on the old rules
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        seen = {}
+
+        def hook(name, _):
+            self.point("bbbb")
+            J.submit("demo", 2)
+            time.sleep(0.5)   # the lane loops at POLL meanwhile: a drain would take and plan #2 now
+            seen["two"] = (getattr(self.job(2), "state", None), getattr(self.job(2), "plan", None))
+        with mock.patch.object(L, "POLL", 0.05):
+            self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND")))
+        self.assertIn(seen["two"][0], (None, T.QUEUED))
+        self.assertIsNone(seen["two"][1], "the old release planned a PR submitted after the promote")
+        self.assertIsNone(getattr(self.job(2), "plan", None))
+
+    def test_a_push_to_a_finishing_pr_after_a_promote_waits_for_the_new_release(self):
+        # Opus review of #2025 at eafa9825: #2's checks were done, a push came, then the promote; in one turn the old
+        # release sent it back to queued, planned it again, ran check b and merged it on the old rules
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        b_runs, promoted = threading.Event(), threading.Event()
+        after, seen = [], {}
+        turned = self.turn_of(2, promoted)
+
+        def hook(name, _):
+            if promoted.is_set():
+                after.append(name)
+            if name == "a":
+                seen["b"] = b_runs.wait(WAIT)
+                self.push("track/row-2", {"b/z": "m\n"}, fresh=False)
+                self.point("bbbb")
+                promoted.set()
+                seen["turn"] = turned.wait(WAIT)   # #2's turn once b is recorded, while a still runs
+            elif not promoted.is_set():
+                b_runs.set()
+                promoted.wait(WAIT)
+        with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "POLL", 0.05):
+            self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND"), V("LAND")))
+        self.assertEqual((seen["b"], seen["turn"]), (True, True), "#2 never ran b, or had no turn after the promote")
+        self.assertEqual(after, [], "the old release ran a check after the promote")
+        states = [h["state"] for h in self.job(2).history]
+        self.assertEqual((self.job(2).state, states[-1]), (T.QUEUED, T.QUEUED), "the old release planned it again")
+        self.assertNotIn(T.MERGED, states)
+
+    def test_main_moving_under_a_finishing_pr_while_a_promote_waits_leaves_it_to_the_new_release(self):
+        # perms' read of #2025 at 795785e4, the brief's own case: a PR merges during the wait, so the next one's base
+        # moves; in one mergeable step the old release planned it again at the new base (a light one adopted that plan)
+        # and merged it on the old rules. It waits instead, and the new lane, red on its check or not, takes it on
+        for red in (True, False):
+            with self.subTest(red=red):
+                self.setUp()
+                self.pr(1, {"a/x": "n\n"})
+                self.pr(2, {"b/y": "n\n"})
+                J.submit("demo", 1)
+                J.submit("demo", 2)
+                b_runs, promoted = threading.Event(), threading.Event()
+                after, real_call, seen = [], L.Lane.call, {}
+                turned = self.turn_of(2, promoted)
+
+                def call(me, unit, *a, **k):
+                    if promoted.is_set():
+                        after.append(unit)
+                    return real_call(me, unit, *a, **k)
+
+                def hook(name, _):
+                    if promoted.is_set():
+                        after.append(name)
+                    if name == "a":
+                        seen["b"] = b_runs.wait(WAIT)
+                        self.push("main", {"c/z": "main moved\n"})
+                        if red:
+                            self.main_red("b")
+                        self.point("bbbb")
+                        promoted.set()
+                        seen["turn"] = turned.wait(WAIT)   # #2's turn once b is recorded, while a still runs
+                    elif not promoted.is_set():
+                        b_runs.set()
+                        promoted.wait(WAIT)
+                with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "POLL", 0.05), \
+                        mock.patch.object(L.Lane, "call", call):
+                    self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND")))
+                self.assertEqual((seen["b"], seen["turn"]), (True, True), "no b, or no turn for #2 after the promote")
+                base = self.origin_rev("main")
+                self.assertNotIn("planner", after, "the old release planned #2 at the new base")
+                self.assertNotIn("b", after, "the old release ran a check after the promote")
+                self.assertEqual(self.job(2).state, T.MERGEABLE)
+                self.assertNotEqual(self.job(2).base_sha, base)
+                self.assertFalse(self.box().get("merges"))
+                self.mine = self.rels["bbbb"]   # the new lane
+                self.land(runner=Runner(), reviewer=Reviewer(V("LAND")))
+                j = self.job(2)
+                if red:
+                    self.assertIn("main moved and is red on b: rerun b", [h.get("why") for h in j.history])
+                self.assertEqual(j.state, T.DEPLOY_PENDING)
+
+    def finished_job(self, state):
+        """#1 planned to check a, none recorded, at `state`, on a lane built directly (no loop)."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        job, lane = self.job(1), L.Lane("demo", self.units())
+        job.state, job.plan, job.results = state, T.Plan(checks=["a"]), {}
+        job.extra.update(base_ref="main", branch="track/row-1")
+        J.save(job)
+        return job, lane
+
+    def test_checking_starts_no_check_while_a_promote_waits(self):
+        job, lane = self.finished_job(T.CHECKING)
+        lane.moved = self.rels["bbbb"]
+        with mock.patch.object(lane, "reread_due", lambda j: False):
+            self.assertIsNone(lane.checking(job))
+        self.assertIn(job.key, lane.waiting)
+        self.assertEqual((lane.inflight, job.state), ({}, T.CHECKING))
+
+    def test_a_light_job_whose_base_moved_while_a_promote_waits_is_left_to_the_new_release(self):
+        job, lane = self.finished_job(T.MERGEABLE)
+        job.extra["light"] = True
+        old, main_now = job.base_sha, "c" * 40
+        fetch = lambda *refs: {"main": main_now, "track/row-1": job.head}
+        with mock.patch.object(lane, "fetch", fetch), mock.patch.object(L.LT, "why_not", return_value="") as why, \
+                mock.patch.object(lane, "main_moved") as moved:
+            lane.moved = self.rels["bbbb"]
+            self.assertIsNone(lane.mergeable(job))
+            self.assertEqual((job.state, job.base_sha, job.extra["light"]), (T.MERGEABLE, old, True))
+            self.assertEqual((why.call_count, moved.call_count), (0, 0))
+            lane.moved = ""   # the control: with no promote the light path asks again at the new base
+            with mock.patch.object(lane, "ci_green", return_value=False):
+                lane.mergeable(job)
+            self.assertEqual((why.call_count, job.base_sha), (1, main_now))
 
     def test_a_switch_whose_new_lane_will_not_start_leaves_the_job_for_the_next_tick(self):
         self.pr(1, {"a/x": "n\n"})
@@ -4917,7 +5106,9 @@ class Parallel(Fixture):
         lane.review(one)
         land = T.Verdict(verdict=T.LAND, digest=one.digest, tokens=100, blocking=[], extra={})
         threading.Timer(0.3, submitted[0].set_result, [land]).start()
-        with mock.patch.object(J, "stale_release", lambda: "/rel/new"):
+        # its job goes on to the merge in the old lane once its read is recorded: these jobs have no branch to merge
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"), \
+                mock.patch.object(L.Lane, "mergeable", lambda lane, job: None):
             self.assertEqual(lane.loop(set()), "/rel/new")
         got = self.job(1)
         self.assertEqual(got.extra["verdict"]["verdict"], T.LAND)
@@ -4937,7 +5128,9 @@ class Parallel(Fixture):
                         [T.Verdict(verdict=T.LAND, digest=two.digest, tokens=100, blocking=[], extra={})]).start()
         calls, real = [], lane.reap
         lane.reap = lambda w: (calls.append(w), real(w))
-        with mock.patch.object(J, "stale_release", lambda: "/rel/new"):
+        # its job goes on to the merge in the old lane once its read is recorded: these jobs have no branch to merge
+        with mock.patch.object(J, "stale_release", lambda: "/rel/new"), \
+                mock.patch.object(L.Lane, "mergeable", lambda lane, job: None):
             self.assertEqual(lane.loop(set()), "/rel/new")
         self.assertLess(len(calls), 20, "the promote's wait spun on the finished read")
         self.assertEqual(self.job(1).extra["verdict"]["verdict"], T.LAND)

@@ -211,8 +211,12 @@ mark cleared, an unknown row named; a symlinked board file is refused.
 
 A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
 it runs from with what ~/.cc/lander/current names now (jobs.stale_release; a lander run from a checkout never
-switches). When they differ it starts nothing new — no job and no check — waits for the checks and review reads in
-flight and records them (a read's verdict is saved on its job, and a LAND carries to the new lane through landed_at;
+switches). When they differ it drains no request, plans no job and starts no check, but while the checks and review
+reads in flight finish, a checking job whose checks are all recorded and a mergeable or merged one still take their
+turns, so one whose checks are done is read and merged meanwhile (dispatch #2121, 10-28: green, read
+and adopted, it sat 2 h at stage review while the old lane waited out two full suites at load 58), and a mergeable one
+whose base moved waits for the new release to plan it there; once none is in
+flight it records the reads (a read's verdict is saved on its job, and a LAND carries to the new lane through landed_at;
 10-22: #23's read, dropped at two promotes, was bought again each time), lets the lane lock go, starts `lander lane <repo>` detached from the new release, logs `lane-switch` and
 returns. A check in flight finishes on the release it started on; a job partway through its checks keeps its results
 and goes on in the new lane. It starts the new lane rather than exec'ing itself because a lane may be running inside
@@ -636,6 +640,7 @@ class Lane:
         self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
         self.tried_q = {}        # job key -> (queued_at, head) when its turn ended: another is a re-queue or a push
         self.pool = None
+        self.moved = ""          # the release `current` moved to while this lane runs: only finishing jobs step
         self.jobs = []           # the lane's jobs as this pass of the loop read them (spare_box)
         self.reading = {}        # job key -> Reading: each review read the lane has in the pool
         self.dropped = []        # reads whose job moved on mid-read: they hold a review slot until they end
@@ -685,7 +690,8 @@ class Lane:
                 E.log("lane-switch", self.repo, None, f"{mine}->{os.path.basename(moved)[:12]}: "
                                                       f"{'lane started, ' + how if ok else 'no lane: ' + how}")
                 self.say(f"`current` moved from {mine} to {os.path.basename(moved)[:12]}: this lane takes no new "
-                         f"job; " + (f"a lane on the new release started ({how})" if ok
+                         f"job and starts no check, only finishing the jobs whose checks are done; "
+                         + (f"a lane on the new release started ({how})" if ok
                                      else f"the new lane would not start ({how}); the next tick starts it"))
                 return self.lines
             if not J.requests(self.repo):   # a request that met the held lock after its last drain: once more
@@ -694,12 +700,11 @@ class Lane:
     def loop(self, tried) -> str:
         """Step jobs until none is due and no check is in flight. -> the release `current` moved to, or ''."""
         while True:
-            moved = J.stale_release()   # a promote since the last job: take nothing new on this release
-            if moved:
-                # the checks and reads in flight finish here and are recorded before the switch: a read left behind
-                # was thrown away, and its job took a place in the next lane to read again (#23, 2026-10-22)
-                while self.inflight or not all(f.done() for f in self.pending_reads()):
-                    self.reap(POLL)
+            # a promote since the last job: no new job and no new check on this release, and the switch once the checks
+            # and reads in flight have finished and been recorded: a read left behind was thrown away, and its job took
+            # a place in the next lane to read again (#23, 2026-10-22)
+            moved = self.moved = J.stale_release()
+            if moved and not self.inflight and all(f.done() for f in self.pending_reads()):
                 jobs = J.lane_jobs(self.repo)
                 self.drop_reads(jobs)
                 for j in jobs:
@@ -712,8 +717,9 @@ class Lane:
             if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
                 self.reap(0)   # a finished check is recorded (its slot freed) even while queued jobs keep todo full
                 continue       # and a promote that came while it ran is seen before any job moves on
-            for ln in J.drain(self.repo):
+            for ln in ([] if moved else J.drain(self.repo)):   # a request waits for the new release to plan it
                 self.say(ln)
+            moved = self.moved = J.stale_release()   # again: a promote before a request this drain took leaves it queued
             jobs = self.jobs = J.lane_jobs(self.repo)
             self.drop_reads(jobs)
             self.cards_pass(jobs)
@@ -740,9 +746,9 @@ class Lane:
                         or (j.key in self.refused and not GH.backoff() and not self.box_hold(j)):
                     tried.discard(j.key)
                     self.refused.discard(j.key)
-            todo = [j for j in jobs if j.key not in tried and self.due(j)]
+            todo = [j for j in jobs if j.key not in tried and self.due(j) and (not moved or self.finishing(j))]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
-                if not self.inflight and not self.pending_reads():
+                if not (self.inflight or self.pending_reads() or moved):
                     return ""
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
@@ -800,6 +806,13 @@ class Lane:
             return set(HL.red(self.repo))
         except Exception:  # noqa: BLE001 — an unread record orders nothing first, never stops the lane
             return set()
+
+    @staticmethod
+    def finishing(job) -> bool:
+        """A job whose checks are all recorded, or that is merging: what an old release still takes a turn for while
+        a promote waits on the checks in flight (dispatch #2121, 10-28)."""
+        return job.state in (T.MERGEABLE, T.MERGED) or (
+            job.state == T.CHECKING and bool(job.plan) and all(n in job.results for n in job.plan.checks))
 
     def check_left(self, job) -> bool:
         """A checking job with a check of its plan neither recorded nor in the pool."""
@@ -1055,7 +1068,9 @@ class Lane:
         if job.state == T.QUEUED:
             E.stage(job.repo, job.pr, "lane")
         for _ in range(MAX_STEPS):
-            if not self.due(job):
+            # after a promote, a job that is no longer finishing (a push or a re-read sent it back, main moved and a
+            # check reruns) stops here: the new release plans and checks it
+            if not self.due(job) or (self.moved and not self.finishing(job)):
                 return
             before = (job.state, len(job.history))
             self.step(job)
@@ -1386,6 +1401,9 @@ class Lane:
         # the check main was red on goes first (while main is still red, one check says so), then any check main's
         # record holds red now: a main-red fix proves its fix before the rest of its plan
         todo.sort(key=lambda n: (n != red, n not in self.reds))
+        if todo and self.moved:   # a promote: the lane on the new release runs it
+            self.waiting.add(job.key)
+            return None
         if todo:
             # the laptop's slots first (every check of the plan that may leave the box, several PRs' at once), the
             # box's beside them (one check per job there); a check waits only for a place of its own kind
@@ -1700,6 +1718,8 @@ class Lane:
                 head_now, main_now = got[branch], got[base]
             if head_now != job.head:
                 return J.move(job, T.QUEUED, why=f"the head moved to {head_now[:12]}")
+            if main_now != job.base_sha and self.moved:   # a promote waits: the new release plans it at main_now
+                return
             if main_now != job.base_sha and job.extra.get("light") is True:
                 # asked again at the new base: a policy main took since may now list one of its files
                 why = LT.why_not(self.root, main_now, job.files, protected_rules(self.repo), self.fallback)
