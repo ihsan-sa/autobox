@@ -15,6 +15,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
+import calm_host  # noqa: E402,F401  (pins load and pressure; before any lander import)
 from lander import cards as C  # noqa: E402
 from lander import health as HL  # noqa: E402
 from lander import manifest as M  # noqa: E402

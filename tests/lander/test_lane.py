@@ -31,6 +31,7 @@ CORE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
+import calm_host  # noqa: E402,F401  (pins load and pressure; before any lander import)
 from lander import cards as C  # noqa: E402
 from lander import events as E  # noqa: E402
 from lander import gh as GH  # noqa: E402

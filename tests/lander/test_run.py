@@ -31,6 +31,7 @@ for p in (CORE, HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import calm_host  # noqa: E402,F401  (pins load and pressure; before any lander import)
 from lander import admission as A  # noqa: E402
 from lander import cards as C  # noqa: E402
 from lander import check as CK  # noqa: E402
