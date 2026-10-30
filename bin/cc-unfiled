@@ -3,7 +3,7 @@
 
     cc-unfiled [--hours N] [--root DIR]… [--to FILE]
         Lists every PDF under the roots (default ~/dev, which holds the member workspaces, ~/.cc/worktrees, which
-        holds every track's, each session scratchpad ~/.cc/tmp/*/*/*/scratchpad, and ~/.cc/slack/files, where a
+        holds every track's, each session scratchpad ~/.cc/tmp/claude-*/*/*/scratchpad, and ~/.cc/slack/files, where a
         PDF sent to Slack is often left) modified in the last N hours (default 24) that looks like a finished document and that
         the register (cc-docs, $CC_DOCS_ROOT) does not hold. The list goes to stdout; with --to it is also appended
         to FILE as one dated journal entry, and nothing is appended when the list is empty. Exit 0 either way.
@@ -130,15 +130,23 @@ def checked_out(d, since):
     return {os.path.join(d, x) for x in tracked - changed - {r.strip("\n") for r in recent}}
 
 
+def repo(d, root):
+    """The git tree under root holding directory d, or None. Asked only for a PDF in the window, so a walk of
+    millions of directories keeps none of them in memory."""
+    while not os.path.exists(os.path.join(d, ".git")):
+        if d == root:
+            return None
+        d = os.path.dirname(d)
+    return d
+
+
 def candidates(roots, since):
     """Every PDF under the roots changed after `since` that looks like a finished document, as (path, pages,
     mtime, sha256), one per distinct content: a PDF copied into many trees is one document."""
-    seen, shas, skip, repo = set(), set(), {}, {}
+    seen, shas, skip = set(), set(), {}
     for root in roots:
-        for d, dirs, files in os.walk(root):
-            repo[d] = d if ".git" in dirs or ".git" in files else repo.get(os.path.dirname(d))
-            dirs[:] = [x for x in dirs if x.lower() not in SKIP_DIRS and not x.lower().endswith(".old")
-                       and not os.path.islink(os.path.join(d, x))]
+        for d, dirs, files in os.walk(root):   # os.walk never enters a symlinked directory
+            dirs[:] = [x for x in dirs if x.lower() not in SKIP_DIRS and not x.lower().endswith(".old")]
             for n in files:
                 if not n.lower().endswith(".pdf") or SKIP_NAME.search(n[:-4]) or INBOUND.match(n):
                     continue
@@ -147,10 +155,12 @@ def candidates(roots, since):
                     st = os.stat(p)
                 except OSError:
                     continue
-                rp = os.path.realpath(p)
-                if st.st_mtime < since or not st.st_size or rp in seen:
+                if st.st_mtime < since or not st.st_size:
                     continue
-                r = repo[d]
+                rp = os.path.realpath(p)
+                if rp in seen:
+                    continue
+                r = repo(d, root)
                 if r and r not in skip:
                     skip[r] = checked_out(r, since)   # git runs only in a tree holding a PDF in the window
                 if r and p in skip[r]:
@@ -219,7 +229,9 @@ def main(argv, docs_root=None, quiet=False):
     ap.add_argument("--to")
     a = ap.parse_args(argv)
     roots = a.root or [os.path.join(HOME, "dev"), os.path.join(HOME, ".cc", "worktrees"),
-                       *sorted(glob.glob(os.path.join(HOME, ".cc", "tmp", "*", "*", "*", "scratchpad"))),
+                       # claude-<uid> is Claude Code's own: ~/.cc/tmp is the box's TMPDIR, and listing three levels of
+                       # everything in it read GBs before the walk began (10-29 profile)
+                       *sorted(glob.glob(os.path.join(HOME, ".cc", "tmp", "claude-*", "*", "*", "scratchpad"))),
                        os.path.join(HOME, ".cc", "slack", "files")]
     docs_root = docs_root or os.environ.get("CC_DOCS_ROOT") or os.path.join(HOME, ".cc", "documents")
     found = unfiled([r for r in roots if os.path.isdir(r)], a.hours, docs_root)
