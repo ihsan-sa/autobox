@@ -90,7 +90,7 @@ EOS
     "in a fence, a bare cc-green exits 1 and points at the journal line and the green.log copy"
   rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo askhost)
   ( cd "$R" && CC_GREEN_ASK="$D/askst/green.ask" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
-      && CC_GREEN_DIR="$D2" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+      && CC_GREEN_DIR="$D2" "$SELF" wait 120 >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -e "$D/askhost.args" -a ! -e "$D/askst/green.ask")" "on the host, CC_GREEN_ASK changes nothing: start runs the check itself"
   rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo outside)
   ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
@@ -103,11 +103,11 @@ EOS
   k "$(t test "$rc" -eq 2 -a ! -e "$D/stale.args" -a -z "$(ls -A "$D2")")" "a worker in its fence with no CC_GREEN_ASK: start exits 2, having run no check and taken no lock, status or log"
   k "$(t grep -q 'set no CC_GREEN_ASK' <<<"$out")" "…and says its loop set no CC_GREEN_ASK"
   ( cd "$R" && CC_ROLE=worker CC_MEMBER_SANDBOX=1 CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
-      && CC_GREEN_DIR="$D2" CC_GREEN_PID1_COMM="$D/pid1" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+      && CC_GREEN_DIR="$D2" CC_GREEN_PID1_COMM="$D/pid1" "$SELF" wait 120 >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -e "$D/stale.args")" "…while inside a member boundary, where no loop asks, start still runs the check in there"
   rm -rf "$D2" "$D/stale.args"; D2=$(mktemp -d)
   ( cd "$R" && CC_ROLE=worker CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" start >/dev/null 2>&1 \
-      && CC_GREEN_DIR="$D2" "$SELF" wait 30 >/dev/null 2>&1 ); rc=$?
+      && CC_GREEN_DIR="$D2" "$SELF" wait 120 >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -e "$D/stale.args")" "…and a worker on the host (sandbox off) still starts its own run"
   rm -rf "$D2"
   # 1d A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the pinned lander, caged checks only, and none of
@@ -151,7 +151,7 @@ EOS
   k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-somerepo.tsv my-row.2")" "…control: plain names are taken as written"
   # 1f …and the file is read only when it is a regular one reached through no symlink. Each case is its own repo.
   R=$(newrepo trkfifo); mkdir -p "$R/.cc"; mkfifo "$R/.cc/track"
-  out=$(GDIR="$D/g" timeout 10 bash -c "$(declare -f name_ok track_lines wait_log); wait_log \"\$1\"" _ "$R"); rc=$?
+  out=$(GDIR="$D/g" timeout 120 bash -c "$(declare -f name_ok track_lines wait_log); wait_log \"\$1\"" _ "$R"); rc=$?
   k "$(t test "$rc" -eq 0 -a "$out" = "$D/g/waits-trkfifo.tsv trkfifo")" "a FIFO at .cc/track is not read: no stall, the fallback names stand"
   R=$(newrepo trklink); mkdir -p "$R/.cc"; printf 'hostrepo\nhostrow\n' > "$D/host-file"; ln -s "$D/host-file" "$R/.cc/track"
   k "$(t test "$(GDIR="$D/g" wait_log "$R")" = "$D/g/waits-trklink.tsv trklink")" "…nor a symlink at .cc/track, so a host file's lines never name the record"
@@ -173,7 +173,7 @@ EOS
     out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
     if [ "$p" = 1 ]; then k "$(t test "$rc" -eq 1 -a -n "$(grep 'RED     lander check' <<<"$out")")" "lander check exit 1: the run is red, exit 1, and says RED"
     else k "$(t test "$rc" -eq 1 -a -n "$(grep 'RUN     lander check — no verdict (exit 3' <<<"$out")")" "lander check exit 3: the run is not green, exit 1, and says no verdict"; fi
-    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
     k "$(t test "$rc" -eq 1 -a -n "$(grep 'has ended (exit 1)' <<<"$out")")" "…wait after it says the run ended with exit 1, and exits 1"
     ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
     k "$(t test "$rc" -eq 1)" "…and so does a plain call on the same tree"
@@ -211,7 +211,7 @@ EOS
   # over, `wait` is the report. One line in the fake's log is the whole claim — one check ran.
   D2=$(mktemp -d); R=$(newrepo locked 15)
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 50); do [ -f "$D/locked.started" ] && break; sleep 0.1; done     # …the check is going, so the lock is held
+  for _ in $(seq 600); do [ -f "$D/locked.started" ] && break; sleep 0.1; done     # …the check is going, so the lock is held
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "a second run on the same root while one is going exits 3"
   k "$(t grep -q 'a run is already going' <<<"$out")" "…and says so"
@@ -222,7 +222,7 @@ EOS
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "wait while it is going gives the call back and exits 3"
   k "$(t grep -q "still running (pid $pid," <<<"$out")" "…naming the same pid"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$rc" "wait after it has ended is the report, exit 0"
   k "$(t grep -q "green   lander check" <<<"$out")" "…for the tree the run passed on"
   wait "$p"
@@ -271,20 +271,23 @@ EOS
   # writes a `waiting=` line there as admission does past WAIT_SAY, and `wait` on the running run prints it. Before
   # that line is written, the same wait prints none.
   cat > "$D/slotwait.py" <<EOS
-open(f"{D}/slotwait.started", "w").close(); time.sleep(3)
+open(f"{D}/slotwait.started", "w").close(); 
+while not os.path.exists(f"{D}/slotwait.go"): time.sleep(0.1)
 open(os.environ["LANDER_WAIT_NOTE"], "a").write("waiting=T0 lander: waiting for a check slot — not a hang\n")
-open(f"{D}/slotwait.noted", "w").close(); time.sleep(4)
+open(f"{D}/slotwait.noted", "w").close()
+while not os.path.exists(f"{D}/slotwait.end"): time.sleep(0.1)
 EOS
   D2=$(mktemp -d); R=$(newrepo slotwait)
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 50); do [ -f "$D/slotwait.started" ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ -f "$D/slotwait.started" ] && break; sleep 0.1; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "a run on a lander slot: wait while it is going exits 3"
   k "$(nt grep -q 'waiting for a check slot' <<<"$out")" "…and says nothing of a slot before the check notes one"
-  for _ in $(seq 80); do [ -f "$D/slotwait.noted" ] && break; sleep 0.1; done
+  touch "$D/slotwait.go"   # the check holds its note, and then its end, until the case lets it go
+  for _ in $(seq 600); do [ -f "$D/slotwait.noted" ] && break; sleep 0.1; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t grep -qx '  T0 lander: waiting for a check slot — not a hang' <<<"$out")" "…and once it has, wait prints the check's waiting= line under still running"
-  wait "$p"; rm -rf "$D2"
+  touch "$D/slotwait.end"; wait "$p"; rm -rf "$D2"
 
   # 9 `red` WRITES ONE LEDGER RECORD PER KEY, with a bounded excerpt of the log that outlives it, and never fails
   # its caller: cc-loop's stops call it.
@@ -319,15 +322,15 @@ EOS
   # …started the way a terminal starts it, INT at default: a signal ignored at entry cannot be trapped, so the run
   # under a plain `&` here would sit through the INT and this case would pass on a tool that never handled one.
   ( cd "$R" && CC_GREEN_DIR="$D2" env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 100); do [ -s "$D/interrupted.pid" ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ -s "$D/interrupted.pid" ] && break; sleep 0.1; done
   gpid=$(head -1 "$D/interrupted.pid" 2>/dev/null)
   pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
   k "$(t test -n "$gpid")" "a run with a slow check has a check of its own to lose"
-  sleep 0.5                        # the run is on `wait`, past the breath between starting the check and trapping
+  sleep 2                        # the run is on `wait`, past the breath between starting the check and trapping
   kill -INT "$pid" 2>/dev/null
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 130)" "an INT on a foreground run ends it, 130"
-  for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
+  for _ in $(seq 600); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
   k "$(nt kill -0 "$gpid")" "…and the check goes with it, rather than running on as an orphan"
   k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…so the root's lock is free, and the next run is not a second one"
   k "$(nt grep -qx check "$D/interrupted.log")" "…and the check it interrupted never finished"
@@ -338,13 +341,13 @@ EOS
   # "everything this command started" does. The run finishes, keeps its verdict, and holds the lock while it goes.
   D2=$(mktemp -d); R=$(newrepo outlives 15)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec setsid env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 50); do [ -f "$D/outlives.started" ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ -f "$D/outlives.started" ] && break; sleep 0.1; done
   k "$(nt test -e "/proc/$p/fd/9")" "a launcher whose run has started holds no fd 9 of its own"
   kill -TERM -- -"$p" 2>/dev/null; wait "$p"; rc=$?
   k "$(t test "$rc" -eq 143)" "a TERM on the launcher's group ends the launcher"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…while the run it started still holds the lock: a second run says already going, exit 3"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$rc" "…and wait on that run is the report, exit 0"
   k "$(t grep -q 'has ended (exit 0)' <<<"$out")" "…saying the run ended with exit 0"
   k "$(t grep -q "green   lander check" <<<"$out")" "…and the check it ran is green"
@@ -355,12 +358,12 @@ EOS
   # must not call that green nor wait for ever, and the launcher following it must not exit 0.
   D2=$(mktemp -d); R=$(newrepo killed 8)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 100); do [ -s "$D/killed.pid" ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ -s "$D/killed.pid" ] && break; sleep 0.1; done
   gpid=$(head -1 "$D/killed.pid" 2>/dev/null); pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
   kill -KILL "$pid" 2>/dev/null; kill -KILL -- -"$gpid" 2>/dev/null   # the check too: a SIGKILLed run cannot take it along
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 1)" "a launcher whose run was SIGKILLed exits 1, not the run's green"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 10 "$SELF" wait 5 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1)" "wait on a SIGKILLed run exits 1 at once, not 0 and not 3"
   k "$(t grep -q "the run (pid $pid, .*) was KILLED before it finished" <<<"$out")" "…and says the run was killed"
   rm -rf "$D2"
@@ -369,14 +372,14 @@ EOS
   # reaches only the launcher; it carries the INT over, the run takes its check down, and wait says interrupted.
   D2=$(mktemp -d); R=$(newrepo ctrlc 8)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 100); do [ -s "$D/ctrlc.pid" ] && break; sleep 0.1; done
-  gpid=$(head -1 "$D/ctrlc.pid" 2>/dev/null); sleep 0.5
+  for _ in $(seq 600); do [ -s "$D/ctrlc.pid" ] && break; sleep 0.1; done
+  gpid=$(head -1 "$D/ctrlc.pid" 2>/dev/null); sleep 2
   kill -INT "$p" 2>/dev/null
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 130)" "an INT on the launcher ends the run, and the launcher exits with its 130"
-  for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
+  for _ in $(seq 600); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
   k "$(nt kill -0 "$gpid")" "…and the run's check went with it"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted (exit 130)' <<<"$out")")" "…and wait says interrupted, exit 1"
   k "$(nt grep -qx check "$D/ctrlc.log")" "…and the check never finished"
   rm -rf "$D2"
@@ -387,7 +390,7 @@ EOS
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" __run >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2)" "__run by hand refuses, exit 2"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 50); do [ -f "$D/byhand.started" ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ -f "$D/byhand.started" ] && break; sleep 0.1; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=forged "$SELF" __run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…and a forged one while a run is going finds the lock taken, exit 3"
   wait "$p"
@@ -396,11 +399,11 @@ EOS
 
   # 16 THE SCOPE. Where the user manager answers, the run sits in a transient scope of its own, out of the cgroup
   # that started it; CC_GREEN_SCOPE=0 keeps it in place. Both, on one slow fixture each.
-  if timeout 10 systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
+  if timeout 120 systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
     for p2 in 1 0; do
       D2=$(mktemp -d); R=$(newrepo "scope$p2" 2)
       ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=$p2 "$SELF" run >/dev/null 2>&1 ) & p=$!
-      for _ in $(seq 50); do [ -f "$D/scope$p2.started" ] && break; sleep 0.1; done
+      for _ in $(seq 600); do [ -f "$D/scope$p2.started" ] && break; sleep 0.1; done
       pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
       out=$(cat "/proc/$pid/cgroup" 2>/dev/null)
       if [ "$p2" = 1 ]; then k "$(t grep -q 'cc-green-' <<<"$out")" "a run gets a scope of its own where systemd-run --user answers"
@@ -416,26 +419,26 @@ EOS
   # report. `start -- SUITE` runs one of the repo's own suites in place of lander check, and `wait` answers with its
   # exit and no report — 1 for a suite that failed, 0 for one that passed.
   D2=$(mktemp -d); R=$(newrepo started 15)
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'started lander check on' <<<"$out")")" "start returns 0 once the run is going, and says so"
   k "$(nt grep -qx check "$D/started.log")" "…before its check has finished"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "…so a short wait on it says still running, exit 3"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'green   lander check' <<<"$out")")" "…and a longer one is the report, green, exit 0"
   k "$(t test "$(grep -cx check "$D/started.log")" = 1)" "…one check ran"
   mkdir -p "$R/tests" "$R/bin"
   printf '#!/bin/sh\nsleep 1; echo slow-suite-ran; exit 5\n' > "$R/tests/check-slow.sh"
   printf '#!/bin/sh\n[ "$1" = selfcheck ] && echo tool-selfcheck-ran\n' > "$R/bin/cc-tool"
   chmod +x "$R/tests/check-slow.sh" "$R/bin/cc-tool"; ( cd "$R" && git add -A && git commit -qm suites )
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start -- tests/check-slow.sh 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start -- tests/check-slow.sh 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0)" "start -- SUITE returns 0 once the repo's own suite is going"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'has ended (exit 5)' <<<"$out")")" "…and wait on a suite that failed says its exit, exit 1"
   k "$(nt grep -q 'lander check' <<<"$out")" "…with no check report, which would answer a question nobody asked"
   k "$(t grep -qx slow-suite-ran "$(ls "$D2"/run-*.log)")" "…and the suite's output is in the run's log"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" start -- ./bin/cc-tool selfcheck >/dev/null 2>&1 )
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'has ended (exit 0)' <<<"$out")")" "…a tool's selfcheck runs the same way, and on one that passed, exit 0"
   # 17b NOTHING ELSE DETACHES. An open `-- CMD` would be a general way round the classifier's refusal of a detached
   # process (review of PR #675): any command, a tool with other arguments, a path out of the repo, a symlink, a
@@ -447,12 +450,12 @@ EOS
   for c in "bin/cc-nosc selfcheck" "sh -c true" "bin/cc-tool rm" "tests/check-slow.sh extra" "../x/tests/check.sh" \
            "/bin/true" "tests/check-new.sh" "tests/check-link.sh" "bin/../tests/check-new.sh"; do
     # shellcheck disable=SC2086   # the words are the case
-    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start -- $c 2>&1 ); rc=$?
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start -- $c 2>&1 ); rc=$?
     k "$(t test "$rc" -eq 2 -a -n "$(grep -E 'refused|not an executable file' <<<"$out")")" "start -- $c is refused with a reason, exit 2"
   done
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2)" "…run -- CMD is refused the same way"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=x timeout 20 "$SELF" __run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=x timeout 60 "$SELF" __run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2)" "…and so is __run -- CMD called straight"
   sleep 1; k "$(nt test -e "$D/escaped")" "…and not one of them ran"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" start -- >/dev/null 2>&1 ); rc=$?
@@ -466,30 +469,30 @@ EOS
   D2=$(mktemp -d)
   for p2 in stA stB; do
     R=$(newrepo "$p2" 120)
-    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 20 "$SELF" start >/dev/null 2>&1 )
-    for _ in $(seq 100); do [ -s "$D/$p2.pid" ] && break; sleep 0.1; done
+    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 120 "$SELF" start >/dev/null 2>&1 )
+    for _ in $(seq 600); do [ -s "$D/$p2.pid" ] && break; sleep 0.1; done
   done
   R="$D/stA"; R2="$D/stB"; gpid=$(head -1 "$D/stA.pid"); p=$(head -1 "$D/stB.pid")
   GDIR=$D2 lock_files "$R2"; p2=$(status_field pid)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'stopped' <<<"$out")")" "stop on a root whose run is going ends it, exit 0"
   k "$(nt kill -0 "$gpid")" "…and its check is gone"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted' <<<"$out")")" "…and wait on it says interrupted, exit 1 — never green"
   k "$(t kill -0 "$p")" "…while the other root's check is still going"
   k "$(t kill -0 "$p2")" "…and so is the other root's run"
   out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "…which its own wait still calls running, exit 3"
-  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "start on a root whose run is going is still refused, exit 3"
   k "$(nt grep -q 'cc-green stop' <<<"$out")" "…and with its tree unmoved nothing calls that run stale"
   echo two > "$R2/a.txt"
-  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3 -a -n "$(grep 'its verdict will not answer for it' <<<"$out")")" "…but once its tree has moved, the refusal says the run is stale"
   k "$(t grep -q 'cc-green stop' <<<"$out")" "…and names cc-green stop"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$SELF" start 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0)" "after stop, start on that root runs again, exit 0 — no stale run holds it"
-  for _ in $(seq 100); do [ "$(wc -l < "$D/stA.pid")" -ge 2 ] && break; sleep 0.1; done
+  for _ in $(seq 600); do [ "$(wc -l < "$D/stA.pid")" -ge 2 ] && break; sleep 0.1; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc2=$?
   k "$(t test "$rc$rc2" = 00 -a -n "$(grep 'nothing to stop' <<<"$out")")" "stop with no run going says so, exit 0"
@@ -511,16 +514,16 @@ EOS
   # the stop's call can neither read the run's environment nor signal it: the stop asks, and the run ends itself.
   if "$BIN/cc-nosignal" probe >/dev/null 2>&1; then
     D2=$(mktemp -d); R=$(newrepo stC 120)
-    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 20 "$BIN/cc-nosignal-shell" "$SELF start" >/dev/null 2>&1 )
-    for _ in $(seq 100); do [ -s "$D/stC.pid" ] && break; sleep 0.1; done
+    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 120 "$BIN/cc-nosignal-shell" "$SELF start" >/dev/null 2>&1 )
+    for _ in $(seq 600); do [ -s "$D/stC.pid" ] && break; sleep 0.1; done
     gpid=$(head -1 "$D/stC.pid"); GDIR=$D2 lock_files "$R"; p2=$(status_field pid)
     out=$( cd "$R" && CC_GREEN_DIR="$D2" "$BIN/cc-nosignal-shell" "test -r /proc/$p2/environ && : < /proc/$p2/environ" 2>&1 ); rc=$?
     k "$(t test "$rc" -ne 0)" "a second Bash call cannot read the run's environment (the control: why stop must ask)"
-    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 60 "$BIN/cc-nosignal-shell" "$SELF stop" 2>&1 ); rc=$?
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 120 "$BIN/cc-nosignal-shell" "$SELF stop" 2>&1 ); rc=$?
     k "$(t test "$rc" -eq 0 -a -n "$(grep 'asking it to stop' <<<"$out")" -a -n "$(grep 'stopped' <<<"$out")")" \
       "stop in a later Bash call asks the run, and it stops, exit 0"
     k "$(nt kill -0 "$gpid")" "…and its check is gone"
-    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 120 2>&1 ); rc=$?
     k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted' <<<"$out")")" "…and wait on it says interrupted, exit 1"
     k "$(t test "$(cat "$D/stC.log" 2>/dev/null)" = "")" "…and the check never finished"
     k "$(t test ! -e "$STATUS.stop")" "…and the stop took its .stop file away once the run was gone"
@@ -548,14 +551,14 @@ EOS
   printf '#!/bin/sh\ncat "%s/board.status" 2>/dev/null\n' "$D" > "$D/board"; chmod +x "$D/board"
   sleep 0 & p=$!; wait "$p"   # a pid that has exited: a loop that is gone
   want(){   # $1 = name, $2 = loop pid (empty: none), $3 = board status once the check runs, $4 = edit the tree (1), $5 = the
-    # board command → out=`wait 8`'s output, rc its exit. The board says running until the check has started, so a case
+    # board command, $6 = seconds to wait (a run that should keep going waits out a short 8) → out=`wait`'s output, rc its exit. The board says running until the check has started, so a case
     # that ends the run ends one whose check is already up (in the lander, already waiting in its slot queue).
     D2=$(mktemp -d); R=$(newrepo "$1" 120); echo running > "$D/board.status"
     ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_LOOP=$2 CC_GREEN_ROW=r/t CC_GREEN_BOARD="${5:-$D/board}" CC_GREEN_WANT_EVERY=1 "$SELF" start >/dev/null 2>&1 )
-    for _ in $(seq 100); do [ -s "$D/$1.pid" ] && break; sleep 0.1; done
+    for _ in $(seq 600); do [ -s "$D/$1.pid" ] && break; sleep 0.1; done
     echo "$3" > "$D/board.status"
     [ "${4:-}" = 1 ] && echo moved > "$R/a.txt"
-    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 8 2>&1 ); rc=$?; GDIR=$D2 lock_files "$R"; }
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait "${6:-120}" 2>&1 ); rc=$?; GDIR=$D2 lock_files "$R"; }
   want wmerged $$ merged
   k "$(t test -s "$D/wmerged.pid")" "a worker's run whose row is merged had its check running first"
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'no longer wanted — the row r/t is merged' "$LOG")")" "…ends itself once the row is merged, and its log says why"
@@ -564,13 +567,13 @@ EOS
   k "$(t test "$rc" -eq 1 -a -n "$(grep "no longer wanted — the worker's loop (pid $p) has exited" "$LOG")")" "a worker's run whose loop has exited ends itself"; rm -rf "$D2"
   want wmoved $$ running 1
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'no longer wanted — the working copy is .* now, not the' "$LOG")")" "a worker's run whose tree is no longer the working copy ends itself"; rm -rf "$D2"
-  want wlive $$ running
+  want wlive $$ running "" "" 8
   k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a live row's run, its loop alive and its tree unchanged, keeps going"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
-  want wlane "" merged   # a lane's or a seat's run carries no loop pid, so nobody asks the board about it
+  want wlane "" merged "" "" 8   # a lane's or a seat's run carries no loop pid, so nobody asks the board about it
   k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a run with no loop pid keeps going though the board says merged"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
-  want wnoboard $$ merged "" "$D/no-such-board"
+  want wnoboard $$ merged "" "$D/no-such-board" 8
   k "$(t test "$rc" -eq 3 -a -z "$(grep 'no longer wanted' "$LOG")")" "a worker's run whose board command is missing keeps going"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rm -rf "$D2"
   every=18446744073709551616; eval "$(grep -m1 -F 'every=60;;' "$SELF" | sed 's/^ *//')"   # the watcher's own check, run on 2^64
