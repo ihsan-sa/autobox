@@ -2014,6 +2014,9 @@ def split_opts(argv, *names):
     return pos, opts
 
 
+SPAWN_TRIES, SPAWN_RETRY_WAIT = 3, 2
+
+
 def spawn_lane(repo, release):
     """Start `lander lane <repo>` detached from `release` (what `current` named a moment ago). -> (ok, how).
     As its own transient unit, like a tick: this lane may be running inside a tick's unit, and a child left in that
@@ -2023,8 +2026,13 @@ def spawn_lane(repo, release):
     argv = [sys.executable, "-P", os.path.join(release, "core", "lander", "cli.py"), "lane", repo]
     sysrun = os.environ.get("LANDER_SYSTEMD_RUN") or "systemd-run"
     unit = f"lander-lane-{repo}-{int(time.time())}-{os.getpid()}"
-    rc, out, err = run([sysrun, "--user", "--collect", "--quiet", f"--unit={unit}",
-                        "--setenv=PYTHONDONTWRITEBYTECODE=1", *argv], timeout=30)
+    for attempt in range(SPAWN_TRIES):   # a bus timeout or a manager hiccup is gone in seconds; no tick need wait for it
+        if attempt:
+            time.sleep(SPAWN_RETRY_WAIT)
+        rc, out, err = run([sysrun, "--user", "--collect", "--quiet", f"--unit={unit}",
+                            "--setenv=PYTHONDONTWRITEBYTECODE=1", *argv], timeout=30)
+        if rc == 0:
+            break
     if rc == 0:
         return True, f"unit {unit}"
     if os.environ.get("INVOCATION_ID"):   # inside a unit: a child would die with it; the next tick starts the lane

@@ -5869,10 +5869,21 @@ class SpawnLaneTest(unittest.TestCase):
         self.assertTrue(first[0], first)
         self.assertTrue(second[0], second)
 
+    def test_a_spawn_that_fails_once_is_retried_so_the_repo_gets_its_lane_without_a_tick(self):
+        calls = []
+        def flaky(argv, **k):
+            calls.append(argv)
+            return (1, "", "Failed to connect to bus: timed out") if len(calls) == 1 else (0, "", "")
+        with mock.patch.object(L, "run", flaky), mock.patch.object(L.time, "sleep"), \
+                mock.patch.dict(os.environ, {"INVOCATION_ID": "x"}):
+            ok, how = L.spawn_lane("demo", "/rel/bbbb")
+        self.assertTrue(ok, how)
+        self.assertEqual(len(calls), 2)
+
     def fallback(self, env):
         popen = mock.MagicMock(return_value=mock.MagicMock(pid=4242))
         with mock.patch.dict(os.environ, env), mock.patch.object(L, "run", lambda *a, **k: (1, "", "no bus")), \
-                mock.patch.object(L.subprocess, "Popen", popen):
+                mock.patch.object(L.subprocess, "Popen", popen), mock.patch.object(L.time, "sleep"):
             if "INVOCATION_ID" not in env:
                 os.environ.pop("INVOCATION_ID", None)
             return L.spawn_lane("demo", "/rel/bbbb"), popen
