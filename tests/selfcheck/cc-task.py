@@ -34,6 +34,10 @@ def selfcheck():
         ok("a detached `cc --go` whose shell exited, adopted by pid 1 with only `cc` above cc-task, is still a "
            "caller: the nearest `cc` owns it, not 'cannot identify the calling process' (2026-10-12)",
            pick(ancestry(91, proc), "1")["pid"] == 91)
+        sub_held = {"owner": owner(ancestry(91, proc)), "ended_at": None}
+        Path(proc, "91").rename(Path(proc, "gone91")); outer = ancestry(90, proc)
+        ok("…and once that `$(…)` copy (91) exits, the outer `cc` (90) is still the launch that owns its claim",
+           launch_owner(sub_held, outer, owner(outer)) == sub_held["owner"] != owner(outer))
 
         # L1: THE LAUNCH OWNS ITS OWN CLAIM WHEN ITS PARENTS GO (2026-10-15). A seat's Bash runs `cc` (61) whose
         # reservation walks up to the seat's claude (41); the shell (60) is gone by the claim, `cc` is re-parented
@@ -57,6 +61,17 @@ def selfcheck():
            and launch_owner(held, later, owner(later)) == owner(later)
            and launch_owner(dict(held, ended_at=stamp()), orphan, bare) == bare
            and launch_owner({"owner": dict(seat, boot_id="previous-boot"), "ended_at": None}, orphan, bare) == bare)
+        # A seat's window runs under `cc __run` (100), which is in the ancestry of every claim the seat takes. A
+        # cc-task call that wrapper makes itself, with no shell between, is not the launch that took the claim.
+        # recurring-defect-ok: pause-hold-missing — fake process argv in a fixture; nothing launches or writes a board
+        fake(100, 12, "bash", ["bash", str(BIN / "cc"), "__run"]); fake(101, 100, "claude", ["claude"])
+        fake(102, 101, "bash", ["bash", "-c", "cc r/t --go"]); fake(103, 102, "bash", ["bash", str(BIN / "cc")])
+        took = ancestry(103, proc); window_held = {"owner": owner(took), "ended_at": None}; wrapper = ancestry(100, proc)
+        ok("L1 control: the seat's `cc __run` wrapper calling cc-task directly is not the launch that took a claim "
+           "under it, though the claim's recorded ancestry holds it; the launch itself still is",
+           100 in [p["pid"] for p in took] and launch_run(wrapper) == [(100, 100)]
+           and launch_owner(window_held, wrapper, owner(wrapper)) == owner(wrapper)
+           and launch_owner(window_held, took, owner(wrapper)) == window_held["owner"])
     with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
         env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
         def run(*args):
