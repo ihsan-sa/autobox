@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# cc-review-keys — the permission seat's setter for the keys that pick who reads a change before it lands.
+#   cc-review-keys KEY VALUE    KEY is one of KEYS; an empty VALUE unsets it (the lander's default then holds)
+#   cc-review-keys selfcheck
+# Owner, 2026-10-23: choosing the reviewers is perms' call, not a line he pastes by hand. A deny rule in
+# ~/.claude/settings.json still refuses `cc-config set` of CC_LAND_REVIEWERS to every session, and cc-guard refuses
+# the other review keys to a worker and a member; this is the one door past both, and only the seat may use it.
+#   WHO: the caller is the permission seat by the test cc-guard's pseat() makes — the nearest claude above carries
+#     --dangerously-skip-permissions, runs in ~/.cc/state/<repo>/perms beside its brief.md, and has no claude above
+#     it (the owner starts it detached; one spawned from another claude forged the flag). Anyone else is refused.
+#     cc-guard refuses this command to every other session as well. The seat's home is the account's (getent), never
+#     HOME, and no variable from the caller names the claude: only the selfcheck, in-process, points SEAT_HOME and
+#     SEAT_PID at its fixture, and both are reset below so an exported value is never read.
+#   WHAT: model keys take only ids on MODELS, the effort key only a word on EFFORTS, so a typo or a fake binary's
+#     name never reaches the lander. MODELS is the one list of review models; add a new model here.
+#   RECORD: one entry in the seat's ledger.md (when, who, key, old, new), and old and new printed.
+#   STORE: cc-config, the same file and format every reader uses. The old value is the file's, not the environment's.
+set -uo pipefail
+KEYS="CC_LAND_REVIEWERS CC_LAND_REVIEW_MODEL CC_LAND_REVIEW_EFFORT"
+MODELS="claude-fable-5-1 claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 gpt-6-astra gpt-5.6-sol gpt-5.5"
+EFFORTS="low medium high xhigh max"   # core/lander/review.py's EFFORTS
+CFG_BIN="$(dirname "$(readlink -f "$0")")/cc-config"
+SEAT_HOME=$(getent passwd "$(id -u)" | cut -d: -f6); SEAT_PID=""
+
+ppid_of(){ awk '/^PPid:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
+seat(){   # prints the seat's directory when the caller is the permission seat (cc-guard's pseat)
+  local p=$SEAT_PID n=0 h=$SEAT_HOME d q
+  [ -n "$h" ] || return 1
+  if [ -z "$p" ]; then p=$PPID
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+      [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && break
+      p=$(ppid_of "$p"); n=$((n+1)); done
+  fi
+  [ "$(cat "/proc/${p:-0}/comm" 2>/dev/null)" = claude ] || return 1
+  tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- --dangerously-skip-permissions || return 1
+  d=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  case "$d" in "$h"/.cc/state/?*/perms) case "${d#"$h"/.cc/state/}" in */*/*) return 1;; esac;; *) return 1;; esac
+  [ -f "$d/brief.md" ] || return 1
+  n=0; q=$(ppid_of "$p")
+  while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
+    [ "$(cat "/proc/$q/comm" 2>/dev/null)" = claude ] && return 1
+    q=$(ppid_of "$q"); n=$((n+1)); done
+  printf '%s' "$d"; }
+
+valid(){   # rc 0 = $2 is a value key $1 takes (empty: unset)
+  local w
+  [ -z "$2" ] && return 0
+  case "$1" in
+    CC_LAND_REVIEW_EFFORT) [[ " $EFFORTS " == *" $2 "* ]];;
+    CC_LAND_REVIEW_MODEL) [[ " $MODELS " == *" $2 "* ]];;
+    CC_LAND_REVIEWERS) for w in $2; do [[ " $MODELS " == *" $w "* ]] || return 1; done; [ -n "${2// /}" ];;
+    *) return 1;;
+  esac; }
+
+set_key(){
+  local k=$1 v=${2:-} d old
+  [[ " $KEYS " == *" $k "* ]] || { echo "cc-review-keys: $k is not a review key (one of: $KEYS)" >&2; return 2; }
+  d=$(seat) || { echo "cc-review-keys: refused — which models review a change is the permission seat's call; ask perms" >&2; return 2; }
+  valid "$k" "$v" || { echo "cc-review-keys: refused — '$v' is not a value $k takes (models: $MODELS; efforts: $EFFORTS)" >&2; return 2; }
+  old=$(env -u "$k" "$CFG_BIN" get "$k")
+  if [ -n "$v" ]; then "$CFG_BIN" set "$k" "$v" || return 1; else "$CFG_BIN" unset "$k" >/dev/null; fi
+  printf '\n## %s review key\n%s: %s from `%s` to `%s`, by cc-review-keys.\n' "$(date -u +%Y-%m-%dT%H:%MZ)" \
+    "perms seat ($d)" "$k" "$old" "$v" >> "$d/ledger.md"
+  printf '%s: was %s, now %s\n' "$k" "${old:-(unset)}" "${v:-(unset)}"; }
+
+selfcheck(){
+  local n=0 f=0 T H SD P A S k
+  ok(){ local d=$1; shift; n=$((n+1)); if "$@"; then echo "  ok   $d"; else f=$((f+1)); echo "  FAIL $d"; fi; }
+  T=$(mktemp -d); H=$T/home; SD=$H/.cc/state/demo/perms; mkdir -p "$SD" "$T/elsewhere"; : > "$SD/brief.md"
+  printf '#!/bin/sh\nsleep 60\n:\n' > "$T/claude"; chmod +x "$T/claude"   # ':' after: sh never execs sleep in its place
+  cp "$T/claude" "$T/sleeper"   # the same program under another name: its comm is not claude
+  spawn(){ (cd "$1" && setsid -f "$T/${2:-claude}" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown); sleep 0.3
+    local c; for c in $(pgrep -f -- "$T/${2:-claude} --dangerously-skip-permissions"); do
+      [ "$(readlink "/proc/$c/cwd")" = "$1" ] && { echo "$c"; return; }; done; }
+  P=$(spawn "$SD"); A=$(spawn "$T/elsewhere"); S=$(spawn "$SD" sleeper)
+  run(){ ( SEAT_HOME=$H; SEAT_PID=$1; shift; export HOME="$H" CC_CONFIG=''; set_key "$@" ) 2>&1; }
+  get(){ env -u "$1" HOME="$H" CC_CONFIG='' "$CFG_BIN" get "$1"; }
+  refused(){ run "$@" >/dev/null; [ $? = 2 ]; }
+  sets(){ local out; out=$(run "$P" "$1" "$2") && grep -qxF "$1: was (unset), now $2" <<<"$out" && [ "$(get "$1")" = "$2" ] \
+    && grep -qF "$1 from \`\` to \`$2\`" "$SD/ledger.md"; }
+  says(){ local out; out=$(run "$@"); [ $? = 2 ] && grep -qF "permission seat's call" <<<"$out"; }
+  ok "fixture seat, stray claude and sleeper started" test -n "$P" -a -n "$A" -a -n "$S"
+  for k in CC_LAND_REVIEWERS="claude-opus-5-5 gpt-6-astra" CC_LAND_REVIEW_MODEL=claude-opus-5-5 CC_LAND_REVIEW_EFFORT=xhigh; do
+    ok "the seat sets ${k%%=*}, prints old and new, and its ledger gets the line" sets "${k%%=*}" "${k#*=}"
+  done
+  ok "a second set prints the old value" grep -qxF "CC_LAND_REVIEW_EFFORT: was xhigh, now high" <<<"$(run "$P" CC_LAND_REVIEW_EFFORT high)"
+  run "$P" CC_LAND_REVIEW_MODEL "" >/dev/null; ok "an empty value unsets the key" test -z "$(get CC_LAND_REVIEW_MODEL)"
+  ok "a typo of a model id is refused" refused "$P" CC_LAND_REVIEW_MODEL claude-opsu-5-5
+  ok "a fake binary among the reviewers is refused" refused "$P" CC_LAND_REVIEWERS "claude-opus-5-5 /tmp/x/codex"
+  ok "a blank reviewer list is refused" refused "$P" CC_LAND_REVIEWERS " "
+  ok "an unknown effort is refused" refused "$P" CC_LAND_REVIEW_EFFORT ultra
+  ok "a key that is not a review key is refused" refused "$P" CC_CLAUDE /tmp/x/claude
+  ok "a flagged claude outside the seat's directory is refused, saying it is perms' call" says "$A" CC_LAND_REVIEW_EFFORT low
+  ok "a caller with no seat above it is refused" refused "" CC_LAND_REVIEW_EFFORT low
+  ok "a flagged process in the seat's directory that is not a claude is refused" refused "$S" CC_LAND_REVIEW_EFFORT low
+  ok "an exported SEAT_PID and SEAT_HOME naming the fixture are ignored" \
+    test "$(env HOME="$H" CC_CONFIG='' SEAT_HOME="$H" SEAT_PID="$P" "$0" CC_LAND_REVIEW_EFFORT low >/dev/null 2>&1; echo $?)" = 2
+  rm -f "$SD/brief.md"; ok "the seat's directory without its brief.md is refused" refused "$P" CC_LAND_REVIEW_EFFORT low
+  ok "no refused call changed the config" test "$(get CC_LAND_REVIEW_EFFORT)" = high
+  [ -n "$P" ] && kill "$P"; [ -n "$A" ] && kill "$A"; [ -n "$S" ] && kill "$S"; rm -rf "${T:?}"
+  echo "cc-review-keys selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]; }
+
+case "${1:-}" in
+  selfcheck) selfcheck;;
+  ""|-h|--help) sed -n 2,3p "$0"; exit 0;;
+  *) [ $# = 2 ] || { echo "usage: cc-review-keys KEY VALUE" >&2; exit 2; }; set_key "$1" "$2";;
+esac
