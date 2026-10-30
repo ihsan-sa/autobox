@@ -87,7 +87,7 @@
 # design (a push, gh, the board, cc-green, the masked checkout, `cc`) on a head this loop has just pushed to origin is
 # answered in the journal — a `- cc-loop:` line and `STATUS: RESUMED` — and the loop carries on, once per run; the worker
 # prompt says the same up front (sandbox_block). Any other BLOCKED, or that one again, stops as below.
-# Exit: 0 done, or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed (a spent GitHub quota it names is waited out and retried first, at most 3 rounds of an hour each): no PR, board `blocked` (the session hears it)
+# Exit: 0 done, or its PR merged while the loop ran (landed), or nothing ran because the row was already done or merged when the loop started (row_closed) | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed (a spent GitHub quota it names is waited out and retried first, at most 3 rounds of an hour each): no PR, board `blocked` (the session hears it)
 #     | 5 errors | 6 a --no-extend bound reached with nothing committed | 10 every model on the chain refused
 #     (7 and 9 are retired: a capped iteration and a runaway no longer stop a loop)
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
@@ -1870,6 +1870,30 @@ EDA
     "$(grep -c 'runaway signal [0-9]*/[0-9]*: committed nothing and left the journal untouched' "$lh/.cc/state/lp/toe/loop.log")" 2
   t '…and a finished iteration keeps the cost its own json reports, unmarked' \
     "$(grep -c 'iter 1 end .*cost=\$1.25 total=' "$lh/.cc/state/lp/it/loop.log")" 1
+  # ── ITS PR MERGED UNDER IT, #2050 replayed ── every iteration leaves a cc-green run going, and the merge ends it with
+  # exit 130. Each track has its own bin: a record holding an open PR, and a gh that answers MERGED once the first
+  # iteration has run (mg; cl is mg with its record closed under the loop) or OPEN throughout (op, whose green is
+  # waited on as before and whose loop runs on).
+  for tk in mg cl op; do lm="$d/lm$tk"; mkdir -p "$lm" "$lh/.cc/state/lp/$tk" "$lh/.cc/worktrees/lp/$tk"; cp "$lb"/* "$lm/"
+    echo "the task" > "$lh/.cc/state/lp/$tk/task.md"
+    git -C "$lh/.cc/worktrees/lp/$tk" init -q; git -C "$lh/.cc/worktrees/lp/$tk" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    c=null; [ "$tk" = cl ] && c='\"2026-10-29T15:56:00Z\"'
+    printf '#!/bin/sh\necho "{\\"closed\\":%s,\\"pr\\":{\\"url\\":\\"https://x/pull/2050\\"}}"\n' "$c" > "$lm/cc-task"
+    printf '#!/bin/sh\n[ %s != op ] && [ -s "%s" ] && echo MERGED || echo OPEN\n' "$tk" "$lm/claude.n" > "$lm/gh"
+    printf '#!/bin/sh\necho x >> "%s"\nexec "%s" "$@"\n' "$lm/claude.n" "$lm/claude" > "$lm/claudec"
+    printf '#!/bin/sh\n[ "$2" = 0 ] && { echo "cc-green: a run is going (pid 1)"; exit 3; }\necho "cc-green: the run (pid 1) has ended (exit 130) — log /x/g.log"; exit 130\n' > "$lm/green"
+    chmod +x "$lm"/*
+    ( env -i PATH="$lm:/usr/bin:/bin" HOME="$lh" CC_CLAUDE="$lm/claudec" CC_GREEN="$lm/green" CC_LAND="$lm/cc-land" CC_FAILURES="$d/lb.fl" \
+        FK_ST="$lh/.cc/state/lp/$tk" FK_LINE='- started cc-green' FK_COMMIT=0 "$lm/cc-loop" lp "$tk" --max-iter 3 --no-extend ) >/dev/null 2>&1
+    echo $? > "$lm/rc"; done
+  t 'a PR that merged while its green ran (exit 130) stops the loop before the next iteration: one model call, exit 0' \
+    "$(wc -l < "$d/lmmg/claude.n")|$(cat "$d/lmmg/rc")" "1|0"
+  t '…and so does one whose task record was closed while the loop ran' \
+    "$(wc -l < "$d/lmcl/claude.n")|$(cat "$d/lmcl/rc")|$(grep -c 'exit 0: merged — https://x/pull/2050 landed after iteration 1' "$lh/.cc/state/lp/cl/loop.log")" "1|0|1"
+  t '…with a merged line in the journal after the interrupted green, and in loop.log' \
+    "$(grep -c -e 'ended while the loop waited on it (exit 130' -e '^- cc-loop: merged — https://x/pull/2050 landed after iteration 1, so the loop stopped$' "$lh/.cc/state/lp/mg/progress.md")|$(grep -c 'exit 0: merged — https://x/pull/2050 landed after iteration 1' "$lh/.cc/state/lp/mg/loop.log")" "2|1"
+  t 'an unmerged PR runs on, its green waited on each time, and nothing says merged' \
+    "$(wc -l < "$d/lmop/claude.n")|$(grep -c 'ended while the loop waited on it (exit 130' "$lh/.cc/state/lp/op/progress.md")|$(grep -c merged "$lh/.cc/state/lp/op/loop.log")" "3|3|0"
   # ── HUNG, NOT LONG (owner 10-20) ── three fixtures, each its own track, with a 2 s silence meaning hung and a 1 s
   # look: hg writes its transcript once and goes silent, so it is killed and counted; lv keeps writing for longer than
   # the silence allowed, so it runs to its own end; bl writes no transcript at all, so the loop cannot see one and
@@ -2702,6 +2726,16 @@ stopped(){ [ -e "$ST/stop" ] || return 1
   "$BOARD" note "$repo" "$track" "loop exit 14: stopped by $ST/stop after iteration $i${why:+ — $why}; $(again) resumes it" >/dev/null 2>&1
   printf -- '- cc-loop: stopped by %s after iteration %s%s\n' "$ST/stop" "$i" "${why:+ — $why}" >> "$ST/progress.md"
   log "exit 14: stopped by $ST/stop after iteration $i${why:+ — $why} (\$$spent); $(again) resumes it"; exit 14; }
+# ITS PR MERGED UNDER IT (raised-a-merged-rows-loop-keeps-restarting-its-green): #2050 merged mid-repair, the merge
+# ended the worker's cc-green run (exit 130), and 16 more iterations each started cc-green again. The board says
+# `running` for as long as a loop lives, so the PR itself is asked, once an iteration and only when the record has one.
+# A record closed under the running loop still holds its PR, so .closed is not read here (review of #2069).
+landed(){ local u; u=$("$BIN/cc-task" show "$repo" "$track" 2>/dev/null | jq -r '.pr.url // empty' 2>/dev/null)
+  [ -n "$u" ] && [ "$(timeout 30 gh pr view "$u" --json state --jq .state 2>/dev/null)" = MERGED ] || return 1
+  "$BOARD" status "$repo" "$track" merged >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop exit 0: its PR merged after iteration $i; nothing more runs" >/dev/null 2>&1
+  printf -- '- cc-loop: merged — %s landed after iteration %s, so the loop stopped\n' "$u" "$i" >> "$ST/progress.md"
+  log "exit 0: merged — $u landed after iteration $i (\$$spent); not starting another"; exit 0; }
 # THE SPEND TIER, the same way but box-wide and only at the iteration boundary: `cc-tier set` signals nothing, so
 # the iteration in flight finishes and the NEXT one asks `cc-tier allows continue` before anything is charged. Under
 # stop no worker goes on; under essential only a row marked critical does. Standing down leaves the board honest
@@ -2777,13 +2811,14 @@ chainend=0   # the end of the cc-model chain is journalled once per loop, not on
 while [ $i -lt "$MAXI" ]; do
   parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
   stopped  # …the stop file, written by a person or a session while the last iteration ran
+  landed   # …and its PR, which a merge may have landed while the last iteration ran
   tiered   # …and the spend tier the same way, for iteration 2 onwards
   worker_account   # whose login this launch runs on, before its limit stamp and its model are read (above, at worker_account)
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     hm=$(sed -n 's/.*until \([0-9][0-9]:[0-9][0-9]\)Z.*/\1/p' <<<"$p")   # status speaks UTC; a person reads local time
     at=$([ -n "$hm" ] && "$BIN/cc-time" slack "$(date -u +%Y-%m-%d)T$hm:00Z" 2>/dev/null || echo "${hm:-later}${hm:+Z}")
     "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: $(again)"
-    parked; stopped; fi   # that wait can be hours: a pause or a stop file written during it is read before anything is charged (review of #541)
+    parked; stopped; landed; fi   # that wait can be hours: a pause, a stop file or a merge during it is read before anything is charged (review of #541)
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   of=""; [ "${NOEXT:-0}" = 1 ] && of=" of $MAXI"   # only a caller's bound is a last iteration; a checkpoint is not
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s%s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$of" "${CC_AGENT_NO:+ You are agent $CC_AGENT_NO, the number the box gave this worker: head your journal entry with it.}")
