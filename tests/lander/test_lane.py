@@ -2676,6 +2676,26 @@ class ReleaseSwitch(Fixture):
         self.land(runner=Runner(), reviewer=Reviewer(V("LAND"), V("LAND")))
         self.assertEqual((self.job(1).state, self.job(2).state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
 
+    def test_a_stop_old_promote_met_between_the_merge_checks_and_the_merge_does_not_merge(self):
+        # Opus read of #2053: a job past its last check before the merge still merged under the old gates
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        stop = os.path.join(self.home, ".cc", "lander", "stop-old")
+
+        def reading(*a):   # the last look before the merge: the promote lands just as it returns
+            if not os.path.islink(stop):
+                os.symlink(self.rels["bbbb"], stop)
+                self.point("bbbb")
+            return "", False
+        with mock.patch.object(R, "perms_reading", reading):
+            self.land(runner=Runner(), reviewer=Reviewer(V("LAND")))
+            self.assertFalse(self.box().get("merges"), "the old release merged #1 after a --stop-old promote")
+            self.assertEqual(self.job(1).state, T.MERGEABLE)
+            self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
+            self.mine = self.rels["bbbb"]   # the lane on the new release merges it
+            self.land(runner=Runner(), reviewer=Reviewer())
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+
     def test_a_pr_submitted_while_a_promote_waits_stays_queued_for_the_new_release_to_plan(self):
         # Opus review of #2025: the old release planned it, and the new lane checked and merged it on the old rules
         self.pr(1, {"a/x": "n\n"})

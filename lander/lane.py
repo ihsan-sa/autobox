@@ -216,7 +216,8 @@ reads in flight finish, a checking job whose checks are all recorded and a merge
 turns, so one whose checks are done is read and merged meanwhile (dispatch #2121, 10-28: green, read
 and adopted, it sat 2 h at stage review while the old lane waited out two full suites at load 58), and a mergeable one
 whose base moved waits for the new release to plan it there; after a promote with --stop-old (jobs.stops_old) none
-takes a turn, so a gate the promote tightened in a hurry holds from the moment `current` moves; once none is in
+takes a turn, and a merge already under way looks again just before it merges, so a gate the promote tightened in a
+hurry holds from the moment `current` moves; once none is in
 flight it records the reads (a read's verdict is saved on its job, and a LAND carries to the new lane through landed_at;
 10-22: #23's read, dropped at two promotes, was bought again each time), lets the lane lock go, starts `lander lane <repo>` detached from the new release, logs `lane-switch` and
 returns. A check in flight finishes on the release it started on; a job partway through its checks keeps its results
@@ -1758,6 +1759,8 @@ class Lane:
                 return self.hold(job, reading, kind="box")
             if reading:
                 return self.query(job, reading, "planning")
+            if J.stops_old(J.stale_release()):   # Opus read of #2053: a --stop-old promote met past the checks above
+                return                             # leaves the merge to the new release's gates
             if self.merge(job) != "moved":
                 return
         self.hold(job, f"{base} kept moving under the merge", kind="box")
