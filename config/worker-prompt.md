@@ -14,3 +14,4 @@ deliverable goes in slack-post.md beside it: first line 'thread' (the row's own)
 optional 'file: <path under the worktree>' line, then the text; the loop posts it once at DONE. Once you have
 started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it
 with no model call and journals its exit and log, and your next iteration reads that log.
+cc-guard cannot know what a shell variable holds, so a path in `$VAR` is read as every file it could stand for and refused if any is off limits. Write the literal path instead, or `rm "${VAR:?}/x"` so an empty value fails; do not retry the same command or hunt for a way round the guard.
