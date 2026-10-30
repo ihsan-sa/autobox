@@ -24,6 +24,16 @@ from lander import review as R  # noqa: E402
 from lander import gh as GH  # noqa: E402
 from lander import manifest as M  # noqa: E402
 from lander import types as T  # noqa: E402
+from lander import git as G  # noqa: E402
+
+
+def setUpModule():   # sealed reads keep their cache in a dir of this run's, never the box's ~/.cc/lander/sealed
+    d = tempfile.TemporaryDirectory(prefix="lander-sealed-cache.")
+    unittest.addModuleCleanup(d.cleanup)
+    p = mock.patch.object(G, "SEALED_CACHE", d.name)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
+
 
 def gh_via_sh(argv, root, token=None, timeout=120, note=True, stdin=None):
     """gh.gh through the case's fake C.sh, so `gh pr view` and `gh pr comment` (a root with no GitHub slug) are

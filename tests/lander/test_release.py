@@ -17,6 +17,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
+from lander import git as G  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import release as RL  # noqa: E402
 from lander import review as R  # noqa: E402
@@ -25,6 +26,14 @@ from lander import types as T  # noqa: E402
 HEAD = "a" * 40
 OLD = "b" * 40
 REAL_FACTS = RL.facts   # setUp swaps RL.facts for a fake; one case reads the real one against stubbed gh and git
+
+
+def setUpModule():   # sealed reads keep their cache in a dir of this run's, never the box's ~/.cc/lander/sealed
+    d = tempfile.TemporaryDirectory(prefix="lander-sealed-cache.")
+    unittest.addModuleCleanup(d.cleanup)
+    p = mock.patch.object(G, "SEALED_CACHE", d.name)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
 
 
 def mark(verdict, by, head=HEAD, own=True):

@@ -80,7 +80,7 @@ record whose PR GitHub says merged and retires it, or one whose PR closed or tha
 (claim_settle in bin/cc), so the claim starts that new task. Nothing here asks GitHub.
 """
 # recurring-defect-ok: pause-hold-missing — this file records claims and launches nothing; `cc --go` checks cc-pause (bin/cc, before repair_reserve) first
-import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
@@ -144,7 +144,10 @@ def retire(repo, row, unmerged=False):
     swap) and a rename-exchange loop swapped it for a link to an owner row of the same name between a path check
     and a path move, 109 times in 300 (Opus read of #1904). Each step opens the one below it with O_NOFOLLOW, and the
     rename runs between those fds, so a link at <repo> or <row> is refused, and a swap after the open moves the
-    member's own record. Only a UUID names a receipt; a record with none gets a fresh one. --unmerged stamps a
+    member's own record. What the rename moved must be the file read, through the fd still held: a member can
+    swap delivery.json for a link in between, and that is taken back out of the receipts. Only a UUID names a
+    receipt; a record with none gets a fresh one. A row over 213 characters is named by its sha256, since the
+    42 characters after it would pass the 255-byte name limit. --unmerged stamps a
     record that never closed as closed unmerged, in the receipt, which only the owner can write."""
     base = Path.home() / ".cc/state"; at = lambda name, fd: os.open(
         name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
@@ -156,12 +159,16 @@ def retire(repo, row, unmerged=False):
         with os.fdopen(regular("delivery.json", os.O_RDONLY, rec)) as f:
             try: d = json.load(f)
             except ValueError: d = None
-        tid = d.get("task_id") if isinstance(d, dict) else None
-        tid = str(uuid.uuid4()) if tid is None else tid
-        if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(tid)):
-            raise ValueError(f"{repo}/{row}'s record names task '{tid}', not a task id — refused")
-        name = f"{row}.{tid}.json"
-        with Lock(None, dir_fd=rec): os.rename("delivery.json", name, src_dir_fd=rec, dst_dir_fd=rc)
+            tid = d.get("task_id") if isinstance(d, dict) else None
+            tid = str(uuid.uuid4()) if tid is None else tid
+            if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(tid)):
+                raise ValueError(f"{repo}/{row}'s record names task '{tid}', not a task id — refused")
+            name = f"{row if len(row) <= 213 else hashlib.sha256(row.encode()).hexdigest()}.{tid}.json"
+            with Lock(None, dir_fd=rec): os.rename("delivery.json", name, src_dir_fd=rec, dst_dir_fd=rc)
+            held, moved = os.fstat(f.fileno()), os.stat(name, dir_fd=rc, follow_symlinks=False)
+            if (moved.st_dev, moved.st_ino) != (held.st_dev, held.st_ino) or not stat.S_ISREG(moved.st_mode):
+                os.unlink(name, dir_fd=rc)
+                raise ValueError(f"{repo}/{row}'s record was swapped for another file before the move — refused")
         if unmerged and isinstance(d, dict) and d.get("closed") is None:
             d["closed"] = {"status": "unmerged", "at": stamp()}
             fd, tmp = tempfile.mkstemp(dir=base / ".receipts" / repo, prefix="receipt.", suffix=".tmp")

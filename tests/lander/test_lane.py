@@ -383,6 +383,9 @@ SHARED = {}
 def setUpModule():
     """The fakes, and one template origin + two clones every case copies (a clone per case costs the most)."""
     d = SHARED["dir"] = tempfile.mkdtemp(prefix="lander-shared-")
+    p = mock.patch.object(G, "SEALED_CACHE", os.path.join(d, "sealed"))   # never the box's ~/.cc/lander/sealed
+    p.start()
+    unittest.addModuleCleanup(p.stop)
     SHARED["bin"] = os.path.join(d, "bin")
     os.makedirs(SHARED["bin"])
     for n in FAKES:

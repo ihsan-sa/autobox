@@ -18,7 +18,8 @@ held across a fetch or the merge's critical section, never across a check or a r
     read_verified(root, rev, path)           a file's bytes at a commit or tree, or None; read VERIFIED
     paths_in(root, rev, paths)               which of the paths are in rev's tree; read VERIFIED
     has_workflows(root, rev)                 rev's GitHub Actions workflow files ([] for none); read VERIFIED
-    sealed(root, *revs)           a scratch repo holding only the revs, fetched from the checkout (see SEALED)
+    sealed(root, *revs)           a scratch repo reading the revs from the lander's cache, fetched from the checkout
+                                  (see SEALED)
     pr_changed(root, base, head)  `diff --name-only --no-renames -z` from the merge-base of base and head to head,
                                   each path as it is, both found sealed
     protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads, sealed
@@ -29,12 +30,20 @@ SEALED is how every read that decides a gate or feeds the review sees a change. 
 shared .git: its objects (a loose object file is the worker's own, so a chmod lets it put the base tree's bytes under
 the head tree's name and the diff lists no paths), refs/replace and grafts (a swapped commit or a moved merge-base),
 a commit-graph, its config (core.worktree with diff.relative empties a diff; diff.external, textconv, a merge driver)
-and its attributes (`* -diff`). sealed() fetches the revs by id from the checkout into an empty bare repo that reads
-no config, attributes or template of anyone's: index-pack re-hashes every object it receives, so an object whose bytes
-do not match its name fails the fetch and the read fails closed, and upload-pack sends the real objects, never a
-replacement.
+and its attributes (`* -diff`). sealed() fetches the revs by id from the checkout into the lander's cache for that
+checkout (sealed_cache: a bare repo under ~/.cc/lander, which only the lander writes, that reads no config, attributes
+or template of anyone's) and reads them in an empty scratch repo whose alternates point at the cache: index-pack
+re-hashes every object the cache receives, so an object whose bytes do not match its name fails the fetch and the read
+fails closed, and upload-pack sends the real objects, never a replacement. The cache's refs/sealed/<id> are the
+fetch's haves, so a read sends only what no earlier read did (kilobytes, where a fresh repo took the whole history),
+and an object a worker swaps after an earlier read fetched it is never fetched again: the read sees the real bytes.
+One fetch at a time runs in a cache, under its lock; a killed fetch's temp packs are removed by the next. A cache is
+made anew past SEALED_KEEP refs, so it holds about one copy of the checkout's history, or when a fetch into it fails,
+but only while no read holds it (sealed_cache).
+Each scratch repo is cc-land.git.<pid>.<rand> in the temp dir, and one whose pid is dead (a run killed or timed out)
+is removed by the next scratch_dir().
 
-VERIFIED is the cheap read for one object or one path, where sealed() would copy the whole history: each object is
+VERIFIED is the cheap read for one object or one path, where sealed() may fetch the whole history: each object is
 read by id from the checkout with `cat-file --batch` (no replace refs) and hashed again here, commit to tree to the
 path, so a swapped or replaced object anywhere on the way raises GitError. A caller never takes that for "absent".
 
@@ -99,6 +108,8 @@ def git(root, *args, check=False, env=None, timeout=300, input=None) -> R:
 
 REMOTES = None   # a test points this at its own file; nothing outside the process can
 ALLOW_LOCAL = False   # a test's bare repos as pinned URLs; nothing outside the process can set it
+SEALED_CACHE = None   # a test points this at its own dir; nothing outside the process can
+SEALED_KEEP = 500   # refs/sealed a cache holds before it is made anew, which bounds it to about one copy of the repo
 GH_PIN_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(?:\.git)?")
 
 
@@ -203,7 +214,7 @@ def borrowed(root):
     at its objects. Git run there with GIT_DIR set to it reads none of the checkout's config, hooks (core.hooksPath,
     a reference-transaction hook), attributes, refs or replace refs. -> its git dir."""
     objects = objects_dir(root)
-    d = tempfile.mkdtemp(prefix="cc-land.git.")
+    d = scratch_dir()
     try:
         rc, err = _sh(["git", "init", "-q", "--bare", "--template=", d], cwd=d, env=blind_env(), timeout=60)
         if rc:
@@ -302,7 +313,8 @@ def merge_tree(root, base, head, env=None):
         tree = lines[0].strip() if p.returncode == 0 else ""
         if not SHA_RE.fullmatch(tree):
             raise GitError(f"git merge-tree {base[:12]} {head[:12]}: {p.stderr.decode(errors='replace')[-300:]}")
-        # only what neither side has: the rest is in the checkout already, which the sealed fetch came from
+        # only what neither side has: the rest the checkout held when a sealed fetch took base and head from it, on
+        # this read or an earlier one (a warm cache asks it nothing), so one it has pruned since leaves the tree short
         new = _bytes(["git", "pack-objects", "--revs", "--stdout", "-q"], senv,
                      input=f"{tree}\n^{out[0]}^{{tree}}\n^{out[1]}^{{tree}}\n".encode())
         if new.returncode:
@@ -823,8 +835,100 @@ def _sh(argv, cwd=None, env=None, timeout=120):
 
 
 @contextlib.contextmanager
+def sealed_cache(common, ids, sh=None):
+    """The bare repo, one per host checkout, holding `ids` (commit ids) and what they reach, fetched from the checkout
+    `common` -> its git dir, for as long as the caller reads it. Under ~/.cc/lander, which the lander alone writes, so
+    every object in it was re-hashed by index-pack on its way in. The fetch runs under <key>.lock, so a fetch waits for
+    one filling the cache and then sends only what it lacks, and every tmp_* and incoming-* in the cache is a killed
+    fetch's and is removed. Each reader holds <key>.readers shared from that fetch to its exit, so the cache is made
+    anew (_remake) only when no read is using it: when it has no config (a killed init), when a fetch into it fails
+    (a cache that lost objects), and past SEALED_KEEP refs. Its cc-checkout file names its checkout, and a cache whose
+    checkout is gone (a test's, a repo taken off the box) is removed here."""
+    sh = sh or _sh
+    top = SEALED_CACHE or os.path.join(os.path.expanduser("~"), ".cc", "lander", "sealed")
+    os.makedirs(top, mode=0o700, exist_ok=True)
+    for name in os.listdir(top):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(top, name, "cc-checkout")) as f:
+                checkout = f.read()
+            if checkout and not os.path.isdir(checkout):   # an empty file is kept: a write not yet done
+                shutil.rmtree(os.path.join(top, name), ignore_errors=True)
+    common = os.path.realpath(common)
+    key = os.path.join(top, hashlib.sha256(common.encode()).hexdigest()[:16])
+    d, env = key + ".git", blind_env()
+
+    def fetch():
+        # the cache's refs are the fetch's haves, so the checkout sends only what the cache lacks
+        rc, err = sh(["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                      "--no-auto-gc", common, *ids], cwd=d, env=dict(env, GIT_DIR=d), timeout=600)
+        for i in ids if not rc else ():
+            sh(["git", "update-ref", f"refs/sealed/{i}", i], cwd=d, env=dict(env, GIT_DIR=d), timeout=60)
+        return rc, err
+
+    with open(key + ".readers", "a") as readers:
+        with open(key + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not os.path.exists(os.path.join(d, "config")):
+                _remake(key, common, sh, force=True)
+            with contextlib.suppress(OSError):
+                if len(os.listdir(os.path.join(d, "refs", "sealed"))) > SEALED_KEEP:
+                    _remake(key, common, sh)   # a live read keeps it over its keep until the next fetch
+            for sub in ("objects", os.path.join("objects", "pack")):
+                for name in os.listdir(os.path.join(d, sub)) if os.path.isdir(os.path.join(d, sub)) else ():
+                    if name.startswith(("tmp_", "incoming-")):
+                        path = os.path.join(d, sub, name)
+                        shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+            rc, err = fetch()
+            if rc and _remake(key, common, sh):
+                rc, err = fetch()
+            if rc:
+                raise GitError(f"git fetch into {d}: {err.strip()[-300:]}")
+            fcntl.flock(readers, fcntl.LOCK_SH)   # taken under the lock, so no remake runs between fetch and read
+        yield d
+
+
+def _remake(key, common, sh, force=False) -> bool:
+    """<key>.git made empty again, under <key>.lock, when no reader holds <key>.readers (or `force`: a cache with no
+    config, which no read can be using). It is renamed aside before it is removed, since a removal takes objects/
+    before config, and the new one is built in <key>.new and renamed into place, so a cache is never half made. ->
+    whether it was made."""
+    with open(key + ".readers", "a") as readers:
+        try:
+            fcntl.flock(readers, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if not force:
+                return False
+        d, new, old = key + ".git", key + ".new", key + ".old"
+        shutil.rmtree(new, ignore_errors=True)
+        shutil.rmtree(old, ignore_errors=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(d, old)
+        shutil.rmtree(old, ignore_errors=True)
+        os.makedirs(new)
+        rc, err = sh(["git", "init", "-q", "--bare", "--template=", new], cwd=new, env=blind_env(), timeout=60)
+        if rc:
+            raise GitError(f"git init {new}: {err.strip()[-300:]}")
+        with open(os.path.join(new, "cc-checkout"), "w") as f:
+            f.write(common)
+        os.rename(new, d)
+        return True
+
+
+def scratch_dir() -> str:
+    """A new cc-land.git.<pid>.<rand> dir in the temp dir, after removing every one whose pid is no live process (a
+    run killed or timed out never reached its finally)."""
+    top = tempfile.gettempdir()
+    for name in os.listdir(top):
+        m = re.fullmatch(r"cc-land\.git\.(\d+)\..+", name)
+        if m and not os.path.exists(f"/proc/{m[1]}"):
+            shutil.rmtree(os.path.join(top, name), ignore_errors=True)
+    return tempfile.mkdtemp(prefix=f"cc-land.git.{os.getpid()}.")
+
+
+@contextlib.contextmanager
 def sealed(root, *revs, sh=None):
-    """A scratch bare repo holding the revs and what they reach, fetched from the checkout (SEALED above) ->
+    """A scratch bare repo reading the revs and what they reach from the lander's cache, which fetches what it lacks
+    from the checkout (SEALED above) ->
     ((rc, out), run). On success rc is 0, out the revs as commit ids, and run(*git_args, timeout=) runs git there
     with blind_env() (run.git_dir is the scratch repo, for a caller that pipes bytes); else run is None and (rc, out)
     says why. `sh(argv, cwd=, env=, timeout=) -> (rc, out)` runs
@@ -841,7 +945,8 @@ def sealed(root, *revs, sh=None):
     # The scratch repo is made before root is judged: it reads nothing of root's, so a refused root still costs one
     # process here and none there. cc-replay's tripwire refuses lander processes it has no stand-in for and names
     # them; with the refusal first, a sealed read on a root that is no checkout failed closed where it saw nothing.
-    scratch = tempfile.mkdtemp(prefix="cc-land.git.")
+    scratch = scratch_dir()
+    stack = contextlib.ExitStack()   # the cache's reader lock, held until the scratch repo is gone
     try:
         rc, err = sh(["git", "init", "-q", "--bare", "--template=", scratch], cwd=scratch, env=env, timeout=60)
         if rc:
@@ -866,17 +971,20 @@ def sealed(root, *revs, sh=None):
             return
         named = iter(lines[1:])
         ids = [r.lower() if SHA_RE.fullmatch(r.lower()) else next(named) for r in revs]
+        try:
+            cache = stack.enter_context(sealed_cache(t.common, list(dict.fromkeys(ids)), sh))
+        except (GitError, OSError) as x:
+            yield (1, str(x)), None
+            return
+        os.makedirs(os.path.join(scratch, "objects", "info"), exist_ok=True)
+        with open(os.path.join(scratch, "objects", "info", "alternates"), "w") as f:
+            f.write(os.path.join(cache, "objects") + "\n")
         env["GIT_DIR"] = scratch
 
         def run(*args, timeout=120):
             return sh(["git", *args], cwd=scratch, env=env, timeout=timeout)
         run.git_dir = scratch
-        rc, err = run("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", lines[0],
-                      *dict.fromkeys(ids), timeout=600)
-        if rc:
-            yield (rc, err), None
-            return
-        # the fetch re-hashed every object, so here an id peels to itself only when it is a commit: a tag's id fails
+        # index-pack re-hashed every object the cache holds, so here an id peels to itself only when it is a commit: a tag's id fails
         rc, got = run("rev-parse", *(f"{i}^{{commit}}" for i in ids), timeout=60)
         if rc or got.splitlines() != ids:
             yield (rc or 1, f"not every id is a commit: {' '.join(ids)}: {got.strip()[-300:]}"), None
@@ -884,6 +992,7 @@ def sealed(root, *revs, sh=None):
         yield (0, ids), run
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        stack.close()
 
 
 NAMES = ("diff", "--name-only", "--no-renames", "--no-relative", "--ignore-submodules=none", "-z")

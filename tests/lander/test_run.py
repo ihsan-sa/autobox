@@ -43,6 +43,15 @@ from lander import sandbox as S  # noqa: E402
 from lander import types as T  # noqa: E402
 from test_plan import git, write  # noqa: E402
 
+
+def setUpModule():   # sealed reads keep their cache in a dir of this run's, never the box's ~/.cc/lander/sealed
+    d = tempfile.TemporaryDirectory(prefix="lander-sealed-cache.")
+    unittest.addModuleCleanup(d.cleanup)
+    p = mock.patch.object(RUN.G, "SEALED_CACHE", d.name)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
+
+
 HAS_BWRAP = S.available() and subprocess.run(["bwrap", "--ro-bind", "/", "/", "true"],
                                              capture_output=True).returncode == 0
 CLI = os.path.join(CORE, "lander", "cli.py")
@@ -500,6 +509,7 @@ class Tree(Env):
             import contextlib, io, sys
             sys.path.insert(0, {CORE!r})
             from lander import check as CK, git as G, plan as P, run as RUN
+            G.SEALED_CACHE = {os.path.join(self.tmp, "sealed")!r}   # never the box's
             print(bool(G.foreign_config({wt!r})), bool(G.foreign_config({os.path.join(wt, "sub")!r})))
             print(RUN.tree_of({wt!r}, "") == "")
             try:
@@ -791,6 +801,7 @@ class Tree(Env):
                     import sys
                     sys.path.insert(0, {CORE!r})
                     from lander import check as CK, git as G, plan as P
+                    G.SEALED_CACHE = {os.path.join(self.tmp, "sealed")!r}   # never the box's
                     real = G.host_tree
                     def racing(root):
                         t = real(root)
@@ -896,8 +907,13 @@ class Tree(Env):
         with RUN.G.fenced(t, bare=True) as env:   # and so did the FENCED reader merge_base ran in
             self.assertEqual(subprocess.run(["git", "merge-base", c2, m1], cwd=env["GIT_DIR"], env=env, text=True,
                                             capture_output=True).stdout.strip(), m1)
-        self.assertEqual(RUN.G.merge_base(t, "HEAD", main), "")   # suppressed: the sealed fetch re-hashes it
-        self.assertEqual(CK.default_base(wt), "")
+        # the lander's cache re-hashed the honest commit on the first read, so the plant never reaches it
+        self.assertEqual(RUN.G.merge_base(t, "HEAD", main), base)
+        self.assertEqual(CK.default_base(wt), base)
+        cold = os.path.join(self.tmp, "cold-cache")
+        with mock.patch.object(RUN.G, "SEALED_CACHE", cold):   # and a cache that never saw it fetches it re-hashed
+            self.assertEqual(RUN.G.merge_base(t, "HEAD", main), "")
+            self.assertEqual(CK.default_base(wt), "")
 
     def test_an_objects_session_that_outlives_its_timer_fails_closed(self):
         wt, gd, base, marks, filt = self.hostile()

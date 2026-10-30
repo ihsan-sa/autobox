@@ -1349,7 +1349,7 @@ def git(root, *args, timeout=120):
 
 
 def blind(root, *revs):
-    """git.sealed(): a scratch bare repo holding only the revs, fetched from the checkout, that reads no config,
+    """git.sealed(): a scratch repo reading the revs from the lander's cache, fetched from the checkout, that reads no config,
     attributes or template of anyone's -> ((rc, out), run).
 
     A worker can write the checkout's shared .git: its objects, its replace refs, its config (diff.external, a
