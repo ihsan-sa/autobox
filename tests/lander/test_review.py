@@ -156,6 +156,9 @@ class Case(unittest.TestCase):
         p = mock.patch.object(R, "box_owner", return_value="owner")   # never the box's real cc-config
         p.start()
         self.addCleanup(p.stop)
+        p = mock.patch.object(R, "DISPATCH_APPROVE", [os.path.join(self.tmp, "no-dispatch-approve")])   # never root's
+        p.start()
+        self.addCleanup(p.stop)
         # the reviewer keys come from the passwd home's config, never the box's real one in a test
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME, R.PERMS_STATE)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")
@@ -3734,6 +3737,81 @@ class TestPermsReads(Case):
         self.assertEqual(out, [""] * len(jobs))
         self.assertEqual(sorted(e["pr"] for e in self.ledger()), list(range(1, 9)))
         self.assertEqual(sorted(os.listdir(self.seat)), sorted([R.PERMS_READS, R.PERMS_READS_LOCK]))
+
+    def approve_stub(self, code=0):
+        """A dispatch-approve that logs its arguments, one line a call, and exits `code`; -> the log's path."""
+        log, stub = os.path.join(self.tmp, "approve.log"), os.path.join(self.tmp, "dispatch-approve")
+        with open(stub, "w") as f:
+            f.write(f'#!/bin/sh\necho "$*" >>{log}\n[ {code} = 0 ] || echo "no sudo" >&2\nexit {code}\n')
+        os.chmod(stub, 0o755)
+        R.DISPATCH_APPROVE = [stub]
+        os.makedirs(os.path.dirname(R.perms_reads_path("dispatch")), mode=0o700)
+        return log
+
+    def test_a_dispatch_verdict_writes_or_takes_back_fx_read_record(self):
+        """Dispatch's release reads root's read record, not perms' ledger (10-26..29: 95 releases refused), so a LAND
+        perms grants on dispatch writes it and a later hold at that head takes it back; another repo writes none."""
+        import types
+        log = self.approve_stub()
+        for repo in ("demo", "dispatch"):
+            job = types.SimpleNamespace(repo=repo, pr=7, head=HEAD, digest=R.change_digest(DIFF))
+            self.assertEqual(R.grant(job, "perms", "perms"), "")
+            self.assertEqual(R.grant(job, "perms", "perms", verdict="HANDBACK"), "")
+        with open(log) as f:
+            self.assertEqual(f.read(), f"read owner/dispatch 7 {HEAD}\nrevoke read owner/dispatch 7 {HEAD}\n")
+
+    def test_release_reads_backfill_writes_each_standing_land_only(self):
+        log = self.approve_stub()
+        path = R.perms_reads_path("dispatch")
+        with open(path, "w") as f:
+            json.dump([{"repo": "dispatch", "pr": 7, "head": HEAD, "verdict": "LAND"},
+                       {"repo": "dispatch", "pr": 8, "head": self.OLD, "verdict": "LAND"},
+                       {"repo": "dispatch", "pr": 8, "head": self.OLD, "verdict": "HANDBACK"},
+                       {"repo": "dispatch", "pr": 9, "head": "b" * 40}], f)
+        os.chmod(path, 0o600)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(R.cmd_perms_release_reads(["dispatch"]), 0)
+        self.assertIn("2 written, 0 failed", out.getvalue())
+        with open(log) as f:
+            self.assertEqual(f.read(), f"read owner/dispatch 7 {HEAD}\nread owner/dispatch 9 {'b' * 40}\n")
+
+    def test_a_failed_release_read_warns_and_keeps_the_ledger_entry(self):
+        """dispatch-approve failing leaves perms' LAND standing in its ledger, and grant() says how to write the record."""
+        import types
+        self.approve_stub(code=1)
+        job = types.SimpleNamespace(repo="dispatch", pr=7, head=HEAD, digest=R.change_digest(DIFF))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(R.grant(job, "perms", "perms"), "")
+        self.assertIn("fx's read record was not updated (no sudo)", err.getvalue())
+        self.assertIn("lander perms-release-reads dispatch", err.getvalue())
+        self.assertEqual([(e["pr"], e["head"], e["verdict"]) for e in R.perms_reads("dispatch")[0]],
+                         [(7, HEAD, "LAND")])
+
+    def test_release_reads_backfill_counts_each_failure_and_exits_1(self):
+        log = self.approve_stub(code=1)
+        path = R.perms_reads_path("dispatch")
+        with open(path, "w") as f:
+            json.dump([{"repo": "dispatch", "pr": 7, "head": HEAD, "verdict": "LAND"}], f)
+        os.chmod(path, 0o600)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(R.cmd_perms_release_reads(["dispatch"]), 1)
+        self.assertIn(f"PR #7 at {HEAD[:12]}: no sudo", out.getvalue())
+        self.assertIn("0 written, 1 failed", out.getvalue())
+        self.assertTrue(os.path.exists(log))
+
+    def test_release_reads_backfill_is_the_perms_seats_only(self):
+        log = self.approve_stub()
+        R.perms_seat_caller = lambda *a, **kw: False   # setUp's cleanup puts the real one back
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(R.cmd_perms_release_reads(["dispatch"]), 1)
+        self.assertIn("only the perms seat writes its reads; nothing written", out.getvalue())
+        self.assertFalse(os.path.exists(log))
+
+    def test_release_reads_backfill_usage(self):
+        for argv in ([], ["dispatch", "extra"], ["../x"]):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(R.cmd_perms_release_reads(argv), 2, argv)
+            self.assertIn("usage: lander perms-release-reads <repo>", out.getvalue())
 
     # the read itself: apart from the window, once per head
     def test_the_read_starts_in_a_session_of_its_own_and_only_once_a_head(self):

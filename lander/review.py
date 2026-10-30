@@ -152,6 +152,9 @@ posted and the ledger is not written. A HANDBACK, LAND-AFTER-FIX or DO-NOT-LAND 
 seat appends an entry with that word as its verdict (no full --head needed: it only holds), so a LAND perms later
 hands back at one head reads as handed back. `perms-adopt` does the same for a finished `perms-read` (read naming its
 file). Both append under a flock on .security-reads.lock beside the file. No other caller writes it.
+For dispatch (RELEASE_REPOS), each such entry also writes fx's own read record through root's dispatch-approve
+(release_read(): `read` for a LAND, `revoke read` for any other word), which fx's release reads instead of this
+file; `lander perms-release-reads <repo>` writes it for every LAND already standing in the ledger.
 With no such record the answer is INCOMPLETE with extra host=True and security=True, which the lane sends to the planning seat as a query, and no read is bought, because none the lander
 buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_READER included, does not merge it.
 With the record, a verdict recorded at this digest stands as on any change (a HANDBACK there still hands it back);
@@ -2827,7 +2830,59 @@ def grant(job, read, model, verdict=T.LAND, since="", refresh=True):
         if tmp:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
+    why = release_read(job.repo, job.pr, job.head, verdict)
+    if why:
+        print(f"lander: perms' {verdict} of PR #{job.pr} is in its ledger, but fx's read record was not updated "
+              f"({why}); run `lander perms-release-reads {job.repo}` from the perms seat", file=sys.stderr)
     return ""
+
+
+# Dispatch's release (fx.py landed()) reads root's /etc/dispatch/approved/read-OWNER.NAME-N-HEAD, never perms' ledger,
+# so each verdict perms puts in the ledger for one of these repos writes that record too (10-26..29: all 95 auto
+# releases were refused for want of it). perms runs dispatch-approve with its own sudo; tests patch these.
+DISPATCH_APPROVE = ["sudo", "-n", "/usr/local/sbin/dispatch-approve"]
+RELEASE_REPOS = ("dispatch",)
+
+
+def release_read(repo, pr, head, verdict):
+    """Write fx's read record of PR `pr` at `head` for a LAND, or take it back for any other verdict, when `repo` is
+    one of RELEASE_REPOS and dispatch-approve is installed. -> why not, or ''."""
+    slug = repo_key(repo)
+    if repo_name(repo) not in RELEASE_REPOS or not slug or "/" not in slug or not os.path.exists(DISPATCH_APPROVE[-1]):
+        return ""
+    verb = ["read"] if verdict == T.LAND else ["revoke", "read"]
+    try:
+        r = subprocess.run([*DISPATCH_APPROVE, *verb, slug, str(pr), head], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+    return "" if r.returncode == 0 else (r.stderr.strip() or f"dispatch-approve exited {r.returncode}")
+
+
+def cmd_perms_release_reads(argv):
+    """perms-release-reads <repo>: write fx's read record (release_read) for each head whose newest entry in perms'
+    ledger stands as a LAND (stands()): the backfill for LANDs recorded before grant() wrote them. Perms seat only."""
+    if len(argv) != 1 or not REPO_RE.match(argv[0]):
+        print("usage: lander perms-release-reads <repo>")
+        return 2
+    if not perms_seat_caller():
+        print("lander perms-release-reads: only the perms seat writes its reads; nothing written")
+        return 1
+    repo, bad, n = argv[0], 0, 0
+    entries, why = perms_reads(repo)
+    if why:
+        print(f"lander perms-release-reads: {why}")
+        return 1
+    for pr in dict.fromkeys(e.get("pr") for e in entries if isinstance(e.get("pr"), int)):
+        newest = newest_reads(entries, repo, pr)
+        for head in newest:
+            if not (SHA40.fullmatch(head) and stands(newest, head)):
+                continue
+            why = release_read(repo, pr, head, T.LAND)
+            bad, n = (bad + 1, n) if why else (bad, n + 1)
+            print(f"PR #{pr} at {head[:12]}: " + (why or "written"))
+    print(f"lander perms-release-reads: {n} written, {bad} failed")
+    return 1 if bad else 0
 
 
 def requeue_held(job, facts):
@@ -3022,4 +3077,5 @@ COMMANDS = {"record": (cmd_record, "record a seat's review verdict on a PR at it
             "perms-read": (cmd_perms_read, "perms: start a security read that outlives the perms window"),
             "perms-hold": (cmd_perms_hold, "perms: hold a PR's merge until its read of it says LAND"),
             "perms-reads": (cmd_perms_reads, "perms: list its read files, running and done"),
-            "perms-adopt": (cmd_perms_adopt, "perms: grant a merge on its finished read of the PR's live head")}
+            "perms-adopt": (cmd_perms_adopt, "perms: grant a merge on its finished read of the PR's live head"),
+            "perms-release-reads": (cmd_perms_release_reads, "perms: write fx's read record of each LAND in its ledger")}
