@@ -1578,7 +1578,7 @@ def around(text, spans, width=AROUND, chars=AROUND_CHARS):
 
 
 BINARY_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".otf", ".ttf", ".woff", ".woff2", ".gpg",
-                ".zip", ".gz", ".tar", ".xz", ".mp4", ".mp3", ".wav"}
+                ".docx", ".zip", ".gz", ".tar", ".xz", ".mp4", ".mp3", ".wav"}
 
 
 def unread_binary(path, mode):

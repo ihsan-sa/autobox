@@ -1232,7 +1232,9 @@ class TestReview(Case):
                                 ("page.html", "100644", "not a known binary type: .html"),
                                 ("x.service", "100644", "not a known binary type: .service"),
                                 ("tool", "100644", "not a known binary type: no extension"),
-                                ("a.png", "100755", "executable"), ("a.png", "100644", ""), ("a.pdf", "100644", "")):
+                                ("a.png", "100755", "executable"), ("a.png", "100644", ""), ("a.pdf", "100644", ""),
+                                ("lab.docx", "100644", ""), ("lab.docx", "100755", "executable"),
+                                ("lab.docm", "100644", "not a known binary type: .docm")):
             with self.subTest(path=path, mode=mode):
                 text = "#!/bin/sh\n#\0\nrm -rf ~\n"
                 box = self.box(claude=claude_says("LAND"), **{"git show": (0, text), "git ls-tree": ls_tree(mode),
