@@ -276,7 +276,7 @@ def selfcheck():
     sec = p3["sections"]["sessions"]
     hl = [ln for ln in home(p3, 80, 24)[0] if ln[0].startswith("SESSIONS")]
     case("a section that fails is marked stale, with the time of its last good pass, and the rest are not",
-         sec["err"] and sec["stale"] and sec["at"] == p["sections"]["sessions"]["at"]
+         sec["err"] and sec["stale"] and sec["at"] == p2["sections"]["sessions"]["at"]
          and p3["sections"]["workers"]["stale"] is False)
     case("the main screen heads a stale block STALE with that time, in warn, within 80 columns",
          hl and hl[0][0].startswith("SESSIONS 3  STALE: as of ") and hl[0][1] == "warn" and len(hl[0][0]) <= 80)
