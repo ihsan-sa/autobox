@@ -23,6 +23,12 @@ if [ "${1:-}" = selfcheck ]; then
   out=$(HOME=$H MANAGERPID=1 "$0" --dry-run "$a")
   ! grep -q 'user-manager-restart' <<<"$out"; k $? "…and not under a manager that has run longer than 5 min (pid 1 here)"
   [ -z "$(ls -A "$H")" ]; k $? "--dry-run wrote nothing under HOME"
+  # the loop itself for 3 s: a stamp lands, and (under strace, when it can trace here) no sync(2) or syncfs(2)
+  if command -v strace >/dev/null && strace -qq -o /dev/null true 2>/dev/null; then
+    HOME=$H strace -f -qq -e trace=sync,syncfs -o "$H/st" timeout 3 "$0" >/dev/null 2>&1
+    ! grep -qE '(^|[] ])(sync|syncfs)\(' "$H/st"; k $? "the loop flushes its own file and dir, never the whole disk (no sync/syncfs)"
+  else HOME=$H timeout 3 "$0" >/dev/null 2>&1; echo "  skip no strace here: the no-sync(2) case is not run"; fi
+  grep -qxE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$H/.cc/state/heartbeat"; k $? "…and its stamp landed"
   echo "cc-heartbeat selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]; exit $?
 fi
@@ -60,10 +66,22 @@ else
   emit "$(date -u +%FT%TZ) boot=$boot last_alive=none (first run)"
 fi
 [ $dry = 1 ] && exit 0
-# fsync the file AND its directory: without the second sync the rename can still be in the dir's
+# fsync the file AND its directory: without the second fsync the rename can still be in the dir's
 # journal-only state when power drops, and the stamp reverts to the previous value (~10 s of extra dark time).
-hbdir=$(dirname "$hb")
-while :; do
-  date -u +%FT%TZ > "$hb.tmp" && sync "$hb.tmp" && mv -f "$hb.tmp" "$hb" && sync "$hbdir"
-  sleep 10
-done
+# fsync(2) per file, never `sync FILE`: uutils sync (0.8.0) calls sync(2) whatever its arguments, so every 10 s it
+# flushed every filesystem, and under heavy writes that held writeback for minutes and locked the box (10-29/10-30).
+exec python3 -c '
+import os, sys, time
+hb = sys.argv[1]; tmp = hb + ".tmp"; d = os.path.dirname(hb)
+def fsync(path, flags):
+    fd = os.open(path, flags)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+while True:
+    try:
+        with open(tmp, "w") as f: f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ\n", time.gmtime()))
+        fsync(tmp, os.O_RDONLY); os.replace(tmp, hb); fsync(d, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        print(f"cc-heartbeat: {e}", file=sys.stderr, flush=True)
+    time.sleep(10)
+' "$hb"
