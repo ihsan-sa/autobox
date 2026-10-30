@@ -12,9 +12,11 @@
     lock(repo)                     one tip run per repo at a time (tick takes it; a second tick skips, never waits)
     green(repo, sha)               the tip run passed at exactly `sha` (deploy.run asks this)
 
-GREEN: every check the plan names over <last green>..<tip> passed. The green sha is recorded, and a deploy of that
-sha is requested and run (deploy.request, deploy.run). UNRUNNABLE (killed, OOM, no result) is never red: the run is
-kept wanted and the next tick retries it.
+GREEN: every check the plan names over <last green>..<tip> passed. Each check main health still holds red
+(health.current) then runs on the tip too, and the green record's "checks" names those that passed, which retires
+their reds; one still red, or unrunnable, neither reddens the tip nor holds its deploy. The green sha is recorded,
+and a deploy of that sha is requested and run (deploy.request, deploy.run). UNRUNNABLE (killed, OOM, no result) is
+never red: the run is kept wanted and the next tick retries it.
 
 RED: the repo's deploy targets are held (deploy.hold), so nothing red is installed, and <repo>.tip-red says why. Then
 each failing check alone is bisected over the first-parent commits since the last green tip. A breaker is PROVEN
@@ -150,13 +152,20 @@ def run(repo, plan, check, targets=None):
         return "retry"
     bad = sorted(n for n, r in results.items() if r.status == T.FAILED)
     if not bad:
-        C.write_json(green_path(repo), {"sha": tip, "at": C.now(), "checks": sorted(results)})
+        # 10-29: a checks=0 green at 28591847 ran nothing of `check`, which main health held red, so the red stood
+        # 4 h more. Main's reds run here too; one that passes is in "checks", the proof health.current takes. Every
+        # red the record holds runs, not just current()'s: a green that left out one the last green retired brought it back.
+        from lander import health as HL
+        held = {n: check(n, tip).status for n, e in HL.load(repo)["checks"].items()
+                if e.get("status") == T.FAILED and n not in results}
+        passed = sorted(results) + sorted(n for n, st in held.items() if st == T.PASSED)
+        C.write_json(green_path(repo), {"sha": tip, "at": C.now(), "checks": passed})
         with contextlib.suppress(OSError):
             os.unlink(red_path(repo))
         os.unlink(want_path(repo))
         for t in targets:
             D.release(t)
-        C.log("tip-green", repo, "tip", tip=tip[:12], checks=len(results))
+        C.log("tip-green", repo, "tip", tip=tip[:12], checks=len(passed))
         D.request(repo, tip, targets)
         D.run(repo, green=green)
         return "green"

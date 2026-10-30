@@ -24,6 +24,7 @@ from lander import cards as C  # noqa: E402
 from lander import events as E  # noqa: E402
 from lander import health as HL  # noqa: E402
 from lander import lane as L  # noqa: E402
+from lander import tip as TP  # noqa: E402
 from lander import types as T  # noqa: E402
 
 STUB = r"""#!/bin/sh
@@ -1311,6 +1312,23 @@ class MainRedAlert(Stubbed):
         self.assertEqual(self.flag([self.held(7)], 3601, newer=True), [])
         self.assertEqual(self.argvs("cc-notify"), [])
 
+    def test_a_red_a_newer_green_tip_outlived_is_not_said(self):
+        # 10-29: dispatch's tip went green at 28591847 with checks=0 and the alert named 3d121183's red for 4 h more
+        self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
+        C.write_json(TP.green_path("demo"), {"sha": "e" * 40, "at": E.stamp(E.epoch_of(Q) + 2400),
+                                             "checks": ["e2e-cc-context"]})
+        self.assertEqual(self.flag([self.held(7)], 3601, newer=True), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_red_while_a_pass_runs_on_a_newer_tip_is_not_said_but_still_stands(self):
+        # Opus read of #2064: a pass that has only started is no proof, so the gate still takes the red
+        self.main_record(T.FAILED, E.stamp(E.epoch_of(Q) + 1800))
+        rec = HL.load("demo")
+        rec["running"] = "e" * 40
+        C.write_json(HL.path("demo"), rec)
+        self.assertEqual(self.flag([self.held(7)], 3601), [])
+        self.assertEqual(set(HL.current("demo")), {"e2e-cc-context"})
+
     def test_a_record_from_a_head_the_job_has_left_is_not_said(self):
         job = self.held(7)
         job.head = "n" * 40   # the branch moved on; the record is the old head's
@@ -1438,6 +1456,18 @@ class StalledLane(Stubbed):
         with mock.patch.object(L, "paused", lambda target: True):   # the box holds it: the lane is not late
             self.assertEqual(self.flag(36000), [])
         self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_draft_held_on_purpose_is_not_a_stall(self):
+        # 10-29: the alarm fired on a draft PR its author kept back
+        self.history([600] * 100)
+        for why in (L.draft_why(7), "PR #7 was turned back into a draft — mark it ready for review"):
+            draft = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                          extra={"queued_at": Q, "why": why, "not_before": Q})
+            self.assertEqual(self.flag(36000, jobs=[draft]), [], why)
+        self.assertEqual(self.argvs("cc-notify"), [])
+        held = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "why": "gh could not read PR #7", "not_before": Q})
+        self.assertEqual(len(self.flag(36000, jobs=[held])), 1)   # any other hold whose time is up still counts
 
 
 if __name__ == "__main__":

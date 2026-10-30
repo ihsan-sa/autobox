@@ -26,7 +26,11 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
     pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way or stopped
                                    on a tip main moved past, or a tick found the lock taken and asked for one more
                                    (want(repo)), since the running pass may be on an older tip.
-    red(repo)                      {name: entry} of every check the record holds red on main, whatever tree, if fresh
+    red(repo)                      {name: entry} of every check current() holds red on main, whatever tree, if fresh
+    current(repo, rec=None)        {name: entry} of each red the record holds that no tip run has outlived: one that
+                                   ran the check (tip.run runs main's reds too), went green after the red was
+                                   recorded, on the red's tip or a descendant of it. The record keeps a retired red,
+                                   so the next pass runs it first.
     at(repo, tree)                 {name: failed} of each check red on exactly `tree` within the last FRESH seconds:
                                    a fresh record of a PR's base, whose red run.judge() takes instead of running a
                                    security check on that base again. An older one is left out, so the base runs as
@@ -75,8 +79,21 @@ def load(repo):
 
 def red(repo, now=None):
     # read of #1309: as at(), only a record younger than FRESH, so a stale red puts no PR first
-    return {n: e for n, e in load(repo)["checks"].items()
-            if e.get("status") == T.FAILED and fresh(e, now)}
+    return {n: e for n, e in current(repo).items() if fresh(e, now)}
+
+
+def current(repo, rec=None):
+    # 10-29: dispatch's tip run went green at 28591847 with checks=0, nothing ran `check` there, and its red at
+    # 3d121183 kept the main-red alert firing for 4 h after main was fixed. Opus read of #2064: only evidence retires
+    # a red, so a pass that has merely started on a newer tip, or a green from an older tip or a seeded one, does not.
+    from lander import deploy as D
+    from lander import tick as TK
+    from lander import tip as TP
+    rec = rec or load(repo)
+    green = C.read_json(TP.green_path(repo), {}) or {}
+    return {n: e for n, e in rec["checks"].items() if e.get("status") == T.FAILED
+            and not (n in (green.get("checks") or []) and (green.get("at") or "") > (e.get("at") or "")
+                     and TK.covers(D.root_of(repo), green.get("sha"), e.get("tip")))}
 
 
 def age(stamp, now=None):

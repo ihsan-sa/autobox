@@ -722,6 +722,38 @@ class Tip(Box):
         self.assertEqual(C.read_json(D.req_path("demo"))["targets"]["demo"]["state"], "verified")
         self.assertFalse(os.path.exists(TP.want_path("demo")))
 
+    def test_a_green_tip_runs_mains_held_reds_and_names_only_those_that_passed(self):
+        # 10-29: a checks=0 green at 28591847 ran nothing of `check`, and main health's red for it stood 4 h more
+        from lander import health as HL
+        self.tipbox()
+        D.record_applied("demo", OLD)
+        reds = {n: {"status": T.FAILED, "tip": OLD, "at": "2000-01-01T00:00:00Z"} for n in ("mended", "still")}
+        C.write_json(HL.path("demo"), {"tip": OLD, "checks": reds})
+        TP.kick("demo")
+        runs = []
+        out = TP.run("demo", plan=lambda *a: T.Plan(checks=["unit"]),
+                     check=lambda n, s: runs.append((n, s)) or self.result(T.FAILED if n == "still" else T.PASSED))
+        self.assertEqual(out, "green", "main's own red neither reddens the tip nor holds its deploy")
+        self.assertEqual(sorted(runs), [("mended", NEW), ("still", NEW), ("unit", NEW)])
+        self.assertEqual(C.read_json(TP.green_path("demo"))["checks"], ["unit", "mended"])
+        self.assertEqual(set(HL.current("demo")), {"still"})
+
+    def test_a_red_one_green_retired_stays_retired_on_the_next_green(self):
+        # Opus and security reads of #2064: the second green left out the check the first retired, so it came back
+        from lander import health as HL
+        self.tipbox()
+        D.record_applied("demo", OLD)
+        C.write_json(HL.path("demo"), {"tip": OLD, "checks": {"mended": {"status": T.FAILED, "tip": OLD,
+                                                                         "at": "2000-01-01T00:00:00Z"}}})
+        for tip in (NEW, "e" * 40):
+            self.tipbox(tip=tip)
+            TP.kick("demo")
+            runs = []
+            out = TP.run("demo", plan=lambda *a: T.Plan(checks=[]),
+                         check=lambda n, s: runs.append(n) or self.result(T.PASSED))
+            self.assertEqual((out, runs), ("green", ["mended"]), tip)
+            self.assertEqual(HL.current("demo"), {}, tip)
+
     def test_unrunnable_is_a_retry_not_red(self):
         self.tipbox()
         D.record_applied("demo", OLD)

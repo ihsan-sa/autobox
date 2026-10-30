@@ -137,6 +137,12 @@ class Ended(unittest.TestCase):
         self.assertNotIn("demo#1 merged", self.log())
         self.assertIn("[demo] PR #1: its repo lands it itself — held -> done", lines)
 
+    def test_a_silent_cc_config_lets_no_open_job_go(self):
+        self.heads = None
+        self.job(1, T.HELD)
+        self.gh = {1: {"state": "OPEN", "headRefName": "x/1"}}
+        self.assertEqual((TK.sweep_ended(), J.load("demo", 1).state), ([], T.HELD))
+
     def test_the_sweep_runs_at_most_once_a_window_per_repo(self):
         self.job(1, T.QUERY)
         self.gh = {1: {"state": "OPEN"}}

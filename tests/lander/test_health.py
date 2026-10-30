@@ -86,6 +86,8 @@ class Case(unittest.TestCase):
             return 0, "\0".join(self.files.get(sub[-1], [])) + "\0"
         if sub[:1] == ["log"]:
             return 0, f"change at {sub[-1][:4]} (#7)\n"
+        if sub[:2] == ["merge-base", "--is-ancestor"]:   # TIP1 <- TIP2 <- TIP3
+            return (0 if sub[2] <= sub[3] else 1), ""
         return 1, ""
 
     def go(self, tip, files, red=()):
@@ -426,6 +428,39 @@ class At(Case):
         rec["checks"]["app"]["at"] = "not a stamp"
         C.write_json(HL.path("demo"), rec)
         self.assertEqual(HL.red("demo"), {})
+
+
+class Current(Case):
+    """10-29: dispatch's tip run went green at 28591847 with checks=0, nothing ran `check` there, and its red at
+    3d121183 kept the main-red alert firing for 4 h."""
+
+    def test_a_tip_run_green_after_the_red_retires_it_and_one_before_does_not(self):
+        self.go(TIP1, ["app/x.py"], red={"app"})
+        C.write_json(TP.green_path("demo"), {"sha": TIP2, "at": "2000-01-01T00:00:00Z", "checks": ["app"]})
+        self.assertEqual(set(HL.current("demo")), {"app"})
+        C.write_json(TP.green_path("demo"), {"sha": TIP2, "at": "2999-01-01T00:00:00Z", "checks": ["app"]})
+        self.assertEqual(HL.current("demo"), {})
+        self.assertEqual(HL.red("demo"), {})
+        self.assertEqual(HL.load("demo")["checks"]["app"]["status"], T.FAILED, "the record keeps it")
+
+    def test_only_a_later_green_that_ran_the_check_on_the_reds_tip_or_after_retires_it(self):
+        # Opus read of #2064: a slow tip run on an older commit, or a seeded green, cleared a newer red
+        self.go(TIP2, ["app/x.py"], red={"app"})
+        later = "2999-01-01T00:00:00Z"
+        for green in ({"sha": TIP1, "at": later, "checks": ["app"]},     # older than the red's tip
+                      {"sha": TIP3, "at": later, "checks": []},          # checks=0: nothing ran app
+                      {"sha": TIP3, "at": later, "seeded": True}):        # nothing ran at all
+            C.write_json(TP.green_path("demo"), green)
+            self.assertEqual(set(HL.current("demo")), {"app"}, green)
+
+    def test_a_pass_on_a_newer_tip_that_could_not_run_it_keeps_it_and_the_next_runs_it_first(self):
+        self.go(TIP1, ["app/x.py"], red={"app"})
+        self.tip, self.files[TIP2] = TIP2, []
+        HL.run("demo", lambda n, s: T.Result(check=n, tree=s, status=T.UNRUNNABLE))
+        self.assertEqual(set(HL.current("demo")), {"app"}, "nothing ran it, so nothing retires it")
+        _, asked = self.go(TIP3, [], red={"app"})
+        self.assertEqual(asked[0], ("app", TIP3))
+        self.assertEqual(set(HL.current("demo")), {"app"})
 
 
 class Judge(unittest.TestCase):

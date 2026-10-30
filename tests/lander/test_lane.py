@@ -555,8 +555,9 @@ class Fixture(unittest.TestCase):
         path = HL.path(repo)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump({"tip": self.origin_rev("main"),
-                       "checks": {n: {"status": T.FAILED, "at": E.stamp(time.time())} for n in names}}, f)
+            tip = self.origin_rev("main")
+            json.dump({"tip": tip, "checks": {n: {"status": T.FAILED, "tip": tip, "at": E.stamp(time.time())}
+                                              for n in names}}, f)
 
 
 # --- the cases -----------------------------------------------------------------------------------------------------
@@ -4336,6 +4337,25 @@ class Tick(Fixture):
         TK.sweep_handed()
         self.assertFalse(os.path.exists(J.handed_path("demo", 2)))
         self.assertIn("handed-end demo#2", self.log())
+
+    def test_a_handed_watch_on_a_head_its_repo_lands_itself_ends(self):
+        # 10-30: watches on the Hive's own heads re-queued each push it made, and every handback woke a seat
+        J.write_atomic(J.handed_path("demo", 3), {"repo": "demo", "pr": 3, "head": "x", "branch": "hive/a",
+                                                  "until": E.stamp(time.time() + 3600)})
+        with mock.patch.object(TK, "self_merge_heads", lambda repo: ["hive/"]):
+            self.assertEqual(TK.sweep_handed(), ["[demo] PR #3: its repo lands it itself; the watch ends"])
+        self.assertFalse(os.path.exists(J.handed_path("demo", 3)))
+        self.assertEqual(J.requests("demo"), [])
+
+    def test_a_handed_watch_waits_while_cc_config_is_silent(self):
+        # a busy boot: no answer must neither end the watch nor re-queue a push the repo lands itself
+        J.write_atomic(J.handed_path("demo", 3), {"repo": "demo", "pr": 3, "head": "x", "branch": "hive/a",
+                                                  "until": E.stamp(time.time() + 3600)})
+        with mock.patch.object(TK, "self_merge_heads", lambda repo: None), \
+                mock.patch.object(G, "remote_head", lambda *a, **k: "y"):
+            self.assertEqual(TK.sweep_handed(), [])
+        self.assertTrue(os.path.exists(J.handed_path("demo", 3)))
+        self.assertEqual(J.requests("demo"), [])
 
     def test_tick_runs_lanes_and_backoff_skips(self):
         self.pr(1, {"a/x": "n\n"})

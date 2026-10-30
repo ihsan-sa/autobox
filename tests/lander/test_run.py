@@ -12,6 +12,7 @@ import dataclasses
 import datetime
 import fcntl
 import io
+import itertools
 import os
 import pathlib
 import re
@@ -299,6 +300,46 @@ class Cap(unittest.TestCase):
         self.assertTrue(capped)
         gap = int(re.search(r"after (\d+)s with no output", RUN.read_log(self.log)).group(1))
         self.assertLess(gap, 6)   # its cap would be 6 s or more
+
+    def scope(self):
+        d = os.path.join(self.tmp, "lander-t.scope")
+        os.makedirs(d)
+        for kind in ("cpu", "io", "memory"):   # pressure far past anything a calm run books; execute() must not count it as work
+            with open(os.path.join(d, f"{kind}.pressure"), "w") as f:
+                f.write("some avg10=90.00 avg60=90.00 avg300=90.00 total=900000000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        return os.path.join(d, "memory.stat")
+
+    def scoped(self, script, cpu, cap=3):
+        """execute() on a one-second window with the scope's CPU seconds read from `cpu`, so no timing of the shell counts;
+        a cap of 3 s leaves the window 2 s to close before it, however slowly the run starts."""
+        with mock.patch.object(RUN, "SILENT", 1), mock.patch.object(RUN, "CEILING", 1000), \
+                mock.patch.object(RUN, "_cpu", side_effect=cpu):
+            return RUN.execute(["/bin/sh", "-c", script], self.tmp, dict(os.environ), cap, self.log, mem=self.scope())
+
+    def test_a_check_idle_in_its_scope_is_ended_past_its_cap_though_it_prints(self):
+        # lessons #449, 10-28: three checks started 30 s after a reboot held slots 1-3 for 1 to 2 h on 1.5 to 11 CPU-min
+        t0 = time.monotonic()
+        rc, _, _, capped, _ = self.scoped("while :; do echo retry; sleep 0.2; done", lambda _: 5.0)
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(capped, "idle")
+        self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped idle"))
+        self.assertRegex(RUN.read_log(self.log), r"lander: stopped at \d+s, idle: it ran for under 10% of a CPU for 1s")
+
+    def test_a_check_starved_in_its_scope_is_idle_too(self):
+        # 10-28 at load 81-118 on 20 CPUs: the post-boot checks stalled far more than they ran; a stall is not work
+        rc, _, _, capped, _ = self.scoped("while :; do echo retry; sleep 0.2; done", lambda _: 5.0)   # scope()'s pressure is high
+        self.assertEqual(RUN.status_of(rc, "", capped), (T.UNRUNNABLE, "stopped idle"))
+
+    def test_a_check_idle_in_its_scope_inside_its_cap_goes_on(self):
+        # dispatch #2142, 10-29: 1776 s on 25 CPU-s, waiting on disk; an idle end is a try toward the lane's query
+        rc, _, _, capped, _ = self.scoped("sleep 2; echo 1 passed", lambda _: 5.0, cap=30)
+        self.assertEqual((rc, capped), (0, False))
+
+    def test_a_check_working_in_its_scope_is_not_idle(self):
+        ticks = itertools.count()   # a CPU-second more at every poll: silence past its cap ends it, never idleness
+        rc, _, _, capped, _ = self.scoped("sleep 60", lambda _: float(next(ticks)))
+        self.assertIs(capped, True)
+        self.assertRegex(RUN.read_log(self.log), r"past its cap of 3s, after \d+s with no output")
 
     def test_a_check_that_deletes_its_own_log_still_reaches_its_verdict(self):
         rc, _, _, capped, _ = self.execute(f"rm {self.log}; sleep 0.6; echo 1 passed", 30)
@@ -2414,6 +2455,33 @@ class Admission(unittest.TestCase):
         self.assertEqual(len(err.getvalue().splitlines()), 2, err.getvalue())
         self.assertIn("memory.stat anon does not read, so only what running checks reserved counts", err.getvalue())
         self.assertIn("MemoryHigh ('') does not read, so no memory bound holds a check", err.getvalue())
+
+    def test_a_check_its_starter_left_running_is_killed_before_room_is_weighed(self):
+        # hardening: a scope outlives the lane that started it, and nothing else would cap it or free its memory
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        sl = os.path.join(st, "lander.slice")
+        os.makedirs(os.path.join(st, "slots"))
+        p = subprocess.Popen(["true"])
+        p.wait()   # its pid names nobody now
+        with mock.patch.object(A, "scope_available", lambda: True):
+            unit = next(a for a in A.wrap(T.Check(name="t", run="true"), ["true"])[0] if a.startswith("--unit="))
+        live = unit[len("--unit="):] + ".scope"
+        orphan, old = f"lander-t-p{p.pid}-0123abcd.scope", "lander-t-12345678-0123abcd.scope"
+        for name in (live, orphan, old):
+            os.makedirs(os.path.join(sl, name))
+            open(os.path.join(sl, name, "cgroup.kill"), "w").close()
+        with open(os.path.join(sl, "memory.stat"), "w") as f:
+            f.write("anon 0\n")
+        said = []
+        with mock.patch.object(A, "SLICE_DIR", sl), mock.patch.object(A, "SLICE_HIGH", "6G"), \
+                mock.patch.object(A.E, "line", said.append), mock.patch.object(A, "_reaped", set()):
+            self.assertEqual(A.room(os.path.join(st, "slots"), 1 << 20), "")
+            self.assertEqual(A.room(os.path.join(st, "slots"), 1 << 20), "")   # the next poll: systemd has not collected it
+        kills = {n: open(os.path.join(sl, n, "cgroup.kill")).read() for n in (live, orphan, old)}
+        self.assertEqual(kills, {live: "", orphan: "1", old: ""})   # its starter lives; a name from before ORPHANS
+        self.assertEqual(len(said), 1)   # killed and said once, not on every poll
+        self.assertIn(f"pid {p.pid}) is gone", said[0])
 
     def test_a_check_that_fits_passes_a_head_short_of_room_and_never_starves_it(self):
         # 2026-10-26: dispatch's check in slot 1 reserved 3.4G and its next, at the queue's head, wanted 3.4G more of

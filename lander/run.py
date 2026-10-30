@@ -44,7 +44,7 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   member   `cc-sandbox member <h> <t> --tree <head> -- env … /bin/sh -c <run>`, the workspace's own boundary (B5).
 
 THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite that says "1 failed" failed whatever
-it exited with). unrunnable — never red: killed past the check's cap once silent (execute), killed by a signal or the scope's MemoryMax
+it exited with). unrunnable — never red: killed past the check's cap once silent or idle (under IDLE of a CPU, starved or not, in its scope) (execute), killed by a signal or the scope's MemoryMax
 (exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork) from a run that exited non-zero (a
 passing check may quote that text itself), a sandbox that did not start (its stub not installed included), a mount
 that is not there, a tree that did not reproduce. failed: anything else. On the box, setup says it started OUT OF
@@ -140,6 +140,7 @@ TAIL = 40
 STARVED = 1.5   # starved(): wall time this many times the CPU time
 SILENT = 600   # execute(): past its cap, a run silent this long (or its cap, if shorter) is ended
 CEILING = 3    # execute(): past this many times its cap, a run is ended even while it still prints
+IDLE = 0.1     # execute(): a scoped run that ran for less than this much of one CPU is idle
 LOG_KEEP, LOG_DAYS = 200, 7   # a red's kept log (keep_log): at most this many, none older than this many days
 BLOCKED = "blocked-by-main"
 # run_plan(caged=True), `lander check --caged-only`: a check that would run anywhere but the default bwrap on this box
@@ -397,7 +398,13 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     The cap catches a hung check, not a slow one: past it, a run whose log grew in the last min(cap, SILENT) seconds
     goes on (dispatch #1984, 10-25: held at 2404 s of a 2400 s cap at load 40-117, twice, for 15 h), and one that
     went that long without a line is ended, with a last line in its log saying so; so is one still printing at CEILING
-    times its cap (a test retrying forever), so a slow check gets room but no run holds its slot for good.
+    times its cap (a test retrying forever), so a slow check gets room but no run holds its slot for good. Past its
+    cap, a run in a scope (`mem`) that spent its last min(cap, SILENT) seconds idle is ended though it prints: running
+    for under IDLE of one CPU, starved or not (lessons #449, 10-28: three checks started 30 s after a reboot held slots
+    1-3 for up to 2 h, printing on 1.5 to 11 CPU-min, at load 81-118 on 20 CPUs). Inside its cap an idle run goes
+    on: each such end is a try toward the lane's query, and a check slow on disk reads as idle (dispatch #2142,
+    10-29: 1776 s on 25 CPU-s at 90% IO stall). capped is then "idle", which status_of() reports as such. The stop
+    line goes into the log once the run is reaped, since the run's own fd, opened without append, would write over it.
     keep: fds the run inherits (the started pipe's write end); execute closes them once the run has its copy, or
     when it starts nothing, so only the run holds them: a host check (same user, no pid namespace) could otherwise
     write STARTED through /proc/<lander>/fd/N.
@@ -405,7 +412,8 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
     stopped plan starts nothing more: rc -SIGTERM, which status_of calls unrunnable, never red.
     Two gaps, named: a grandchild that calls setsid leaves the group, so the group kill never reaches it (the check's
     cage or the unit's cgroup ends it; a check that runs one is its own to clean up); and the lander installs no
-    SIGTERM handler, so a SIGTERM to the lane skips the finally above (the unit's cgroup kill covers it)."""
+    SIGTERM handler, so a SIGTERM to the lane skips the finally above: the check's scope is not in the lane's
+    unit, so the next admission's reap() kills it (admission ORPHANS)."""
     t0 = time.monotonic()
     try:
         if stopped():
@@ -420,6 +428,7 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             with contextlib.suppress(OSError):   # one that fails to close must not strand the group Popen started
                 os.close(fd)
     capped, ru, held, size, grew = False, None, 0, 0, t0
+    scope, mark, idle = os.path.dirname(mem), (t0, None), False
     try:
         while True:
             if mem:
@@ -434,11 +443,16 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
                 if os.path.getsize(log) > size:
                     size, grew = os.path.getsize(log), now
             silent = now - grew > min(cap, SILENT)
-            if (now - t0 > cap and silent) or now - t0 > CEILING * cap or stopped():
-                capped = not stopped()
-                if capped:
-                    with contextlib.suppress(OSError), open(log, "a") as out:
-                        out.write(f"\nlander: stopped at {now - t0:.0f}s, past its cap of {cap}s, after"
+            w = _cpu(scope) if scope else None
+            if w is None or mark[1] is None:
+                mark = (now, w)
+            elif now - mark[0] >= min(cap, SILENT):
+                idle, mark = w - mark[1] < IDLE * (now - mark[0]), (now, w)
+            if (now - t0 > cap and (silent or idle)) or now - t0 > CEILING * cap or stopped():
+                capped = not stopped() and ("idle" if idle else True)
+                said = capped and (f"\nlander: stopped at {now - t0:.0f}s, idle: it ran for under"
+                                  f" {IDLE:.0%} of a CPU for {min(cap, SILENT)}s\n" if idle else
+                                  f"\nlander: stopped at {now - t0:.0f}s, past its cap of {cap}s, after"
                                   f" {now - grew:.0f}s with no output\n" if silent else
                                   f"\nlander: stopped at {now - t0:.0f}s, past {CEILING} times its cap of {cap}s,"
                                   f" still printing\n")
@@ -449,6 +463,9 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
                         pass
                     time.sleep(2)
                 _, status, ru = os.wait4(p.pid, 0)
+                if said:   # once the run is gone: its own fd ("wb", no append) wrote over a line added while it lived
+                    with contextlib.suppress(OSError), open(log, "a") as out:
+                        out.write(said)
                 rc = os.waitstatus_to_exitcode(status)
                 break
             time.sleep(0.2)
@@ -462,6 +479,15 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None, kee
             p.wait()
     cpu = (ru.ru_utime + ru.ru_stime) if ru else 0.0
     return rc, time.monotonic() - t0, cpu, capped, max(held, ru.ru_maxrss * 1024 if ru else 0)
+
+
+def _cpu(scope: str) -> float | None:
+    """Seconds a scope's cgroup has run (cpu.stat usage_usec); None when that does not read."""
+    try:
+        with open(os.path.join(scope, "cpu.stat")) as f:
+            return next(int(ln.split()[1]) for ln in f if ln.startswith("usage_usec ")) / 1e6
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
 
 
 def starved(secs: float, cpu: float) -> bool:
@@ -487,7 +513,7 @@ def status_of(rc: int, text: str, capped: bool = False, started: bool | None = N
     net: the check is a live-network one, so a failed name lookup near the end of a failed run while the box's
     resolver is down (flap_in) is unrunnable, which the lane holds and runs again rather than handing back."""
     if capped:
-        return T.UNRUNNABLE, "stopped at its cap"
+        return T.UNRUNNABLE, "stopped idle" if capped == "idle" else "stopped at its cap"
     if rc < 0 or rc in KILLED:
         return T.UNRUNNABLE, f"killed (exit {rc})"
     m = BOX_STATE_RE.search(text) if rc else None

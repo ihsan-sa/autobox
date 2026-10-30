@@ -147,6 +147,11 @@ privilege): it is the only lander run then, and it should finish rather than yie
 runs among themselves only; lander.slice sits beside the sessions' scopes and gets its own share of the CPU either
 way. With no user systemd bus (or LANDER_SCOPE=0) the scope is dropped and the run says so in its runner string,
 never silently.
+ORPHANS. A scope is its own cgroup, outside the unit of the lane or cc-green run that started it, so that process's
+death (a restart, a kill) would leave the check running, past its cap, which only its starter enforced, and its
+memory counted against the slice in room(). wrap() names the scope with its starter's pid, and room() first kills
+(cgroup.kill) every scope whose starter is gone (reap()), once, saying so in queue.log. A live starter ends a check
+that holds its slot while idle itself (run.execute, IDLE).
 
 TIMING checks race the clock: they run before the merge only while loaded() is false (PSI only, not the load average); otherwise the run is
 unrunnable ("box busy") and the lane tries again.
@@ -383,6 +388,28 @@ def slice_used() -> int | None:
         return None
 
 
+_reaped: set = set()   # reap(): scopes killed, which stay until systemd collects them
+
+
+def reap() -> list:
+    """Kill each scope in lander.slice whose run outlived the process that started it (ORPHANS), named in its unit
+    by wrap() as `-p<pid>-`; -> the scopes killed. A scope named before that, or whose pid now names another
+    process, is left alone, and one killed before is not killed or said again."""
+    killed = []
+    with contextlib.suppress(OSError):
+        for name in os.listdir(SLICE_DIR):
+            m = re.fullmatch(r"lander-.*-p([0-9]+)-[0-9a-f]{8}\.scope", name)
+            if not m or name in _reaped or os.path.exists(f"/proc/{m.group(1)}"):
+                continue
+            with contextlib.suppress(OSError):
+                with open(os.path.join(SLICE_DIR, name, "cgroup.kill"), "w") as f:
+                    f.write("1")
+                _reaped.add(name)
+                killed.append(name)
+                E.line(f"orphan lander killed {name}: the process that started it (pid {m.group(1)}) is gone")
+    return killed
+
+
 def anon(stat: str) -> int:
     """The `anon` bytes a cgroup's memory.stat file says it holds; raises when that does not read."""
     with open(stat) as f:
@@ -484,7 +511,8 @@ def _held(d: str) -> tuple:
 
 def room(d: str, need: int) -> str:
     """"" when a check that needs `need` bytes fits in lander.slice now (MEMORY), else what it waits for. Always ""
-    while no slot is held, so a check always gets to run."""
+    while no slot is held, so a check always gets to run. A scope its starter left running is killed first (ORPHANS)."""
+    reap()
     high = slice_high()
     if high is None:
         return ""
@@ -889,7 +917,8 @@ def wrap(check: T.Check, argv: list, label: str = "", busy: bool = False) -> tup
         pre = ["nice", "-n", "10"] if check.klass in (T.HERMETIC, T.STATIC) else []
     if not scope_available():
         return pre + argv, "noscope"
-    unit = f"lander-{''.join(c if c.isalnum() else '-' for c in (label or check.name))[:60]}-{uuid.uuid4().hex[:8]}"
+    label = ''.join(c if c.isalnum() else '-' for c in (label or check.name))[:60]
+    unit = f"lander-{label}-p{os.getpid()}-{uuid.uuid4().hex[:8]}"   # the pid: reap() kills it once that is gone
     return (["systemd-run", "--user", "--scope", "--quiet", "--collect", "--slice=lander.slice", f"--unit={unit}",
              "-p", f"CPUWeight={CPU_WEIGHT}", "-p", f"MemoryMax={MEM_MAX}", "-p", f"MemorySwapMax={SWAP_MAX}", "--"]
             + pre + argv), "scope"

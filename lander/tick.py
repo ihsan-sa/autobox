@@ -3,7 +3,8 @@
   lanes     each repo with a job or an inbox request (or just R) whose lane is not running: run it here, or with
             --detach start `lander lane <repo>` detached. A lane already running re-reads the queue itself.
   handed    each handed-back watch (handed/<repo>-<pr>.json; R's only, when named): past `until` -> removed,
-            `handed-end`; the PR merged or closed -> removed, `handed-end`; the branch head moved (ls-remote, under the
+            `handed-end`; the PR merged or closed, or its branch on a LANDER_SELF_MERGE_HEADS_<repo> prefix (its repo
+            lands it) -> removed, `handed-end`; the branch head moved (ls-remote, under the
             member's token for a member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the
             inbox, `handed-pushed`, removed. The prior verdict is not carried: the reviewer finds it among the box's
             own PR markers.
@@ -27,8 +28,8 @@
             next sweep.
             Also left: a head on a LANDER_SELF_MERGE_HEADS_<repo> prefix (cc-config, unset by default, such as
             `dispatch/`), whatever its base or files: that repo lands, reviews and secures those itself (10-24: a
-            repo with no security list had every such PR queued while a security-path test stood). An unread setting
-            names no prefix, so its PRs queue as before.
+            repo with no security list had every such PR queued while a security-path test stood). When cc-config
+            does not answer, the repo's sweep stops there and the next one looks again.
   ended     for each repo with a job stopped in query (rest/) or held, at most every $LANDER_ENDED_SECS (900) per repo:
             GitHub is asked what became of each such PR, with no lock held. A held job the lane itself tried to
             merge (merge_attempt set, or held from past queued/planned/checking) is left to the lane, which proves it.
@@ -56,11 +57,14 @@
             since=) began more than cards.WAIT_FLAG_SECS ago -> one planner request (cards.main_red) naming the
             check and main's failing cases, at most once an hour per repo and check, whichever PRs it holds. A
             hold main's own record (health) has since seen pass on main, or seen pass on a tip newer than the
-            hold's base, says nothing: main went green on it. Nor does one from a head the job has left.
-  stalled   each repo with a due job whose lane has moved no job on (no verdict, hold, handback, query or merge
-            line) for over STALL_TIMES (3) times the p90 of its own last STALL_HISTORY (100) gaps between those, or
-            the box's when it has fewer than STALL_GAPS (20) -> one request to its seat (cards.stalled) per stall, at
-            most hourly per repo (owner, 10-22: a Hive queue sat 65 min unseen while new PRs kept coming in).
+            hold's base, says nothing: main went green on it. Nor does one whose red a later green tip run
+            outlived (health.current) or that health's pass on a newer tip is running again, or one from a head
+            the job has left.
+  stalled   each repo with a due job (none held as a draft) whose lane has moved no job on (no verdict, hold,
+            handback, query or merge line) for over STALL_TIMES (3) times the p90 of its own last STALL_HISTORY
+            (100) gaps between those, or the box's when it has fewer than STALL_GAPS (20) -> one request to its seat
+            (cards.stalled) per stall, at most hourly per repo (owner, 10-22: a Hive queue sat 65 min unseen while new
+            PRs kept coming in).
   cards     each repo (those above, and each with a queued-card record) with no lane running whose queued card
             waits on a last edit the box-wide cap or a Slack 429 held (cards.left_held): cards.positions on its queue, so the edit goes once a slot is free; the rearm
             step arms a tick for when it will be (cards.edit_wait). A running lane hands its queue over itself.
@@ -158,6 +162,12 @@ def sweep_handed(only="") -> list:
         if job is not None and job.state != T.DONE:
             end("queued again by hand")
             continue
+        heads = self_merge_heads(repo)
+        if heads is None:   # cc-config did not answer: the watch neither ends nor re-queues until it does
+            continue
+        if any(str(w.get("branch") or "").startswith(x) for x in heads):
+            end("its repo lands it itself")
+            continue
         h = M.member_of(repo)[0]
         genv = M.env(h, repo) if h else None
         root = J.repo_root(repo)
@@ -211,17 +221,25 @@ def self_lands(repo) -> bool:
         return False
 
 
-def self_merge_heads(repo) -> list:
+HEADS: dict = {}   # repo -> self_merge_heads' answer, read once per tick (cmd_tick clears it)
+
+
+def self_merge_heads(repo) -> list | None:
     """LANDER_SELF_MERGE_HEADS_<repo> (cc-config, whitespace-separated branch namespaces, each ending in "/", such
     as `dispatch/`): the head prefixes the repo merges on its own read. Kept on the box, so a repo cannot switch off
-    its own sweep; [] when unset, when cc-config did not answer, or when any word is not such a namespace or lies
-    under track/ (cc-loop's own heads). Each character of the name past [A-Za-z0-9] is written _XX (its hex), so
-    a-b (a_2Db) and a_b (a_5Fb) keep keys of their own."""
+    its own sweep; [] when unset or when any word is not such a namespace or lies under track/ (cc-loop's own
+    heads); None when cc-config did not answer (10-30: at a busy boot that read as no prefix, and the stray sweep
+    queued 16 of the Hive's own PRs). Each character of the name past [A-Za-z0-9] is written _XX (its hex), so
+    a-b (a_2Db) and a_b (a_5Fb) keep keys of their own. Asked once per repo per tick: a 30 s timeout per watch
+    or PR stalled a busy tick for minutes."""
+    if repo in HEADS:
+        return HEADS[repo]
     key = "LANDER_SELF_MERGE_HEADS_" + re.sub(r"[^A-Za-z0-9]", lambda m: f"_{ord(m.group()):02X}", repo)
     rc, out, _ = L.run([f"{J.bin_dir()}/cc-config", "get", key], timeout=30)
     heads = out.split() if rc == 0 else []
-    return heads if all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) and not h.startswith("track/")
-                        for h in heads) else []
+    ok = all(re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+", h) and not h.startswith("track/") for h in heads)
+    HEADS[repo] = None if rc not in (0, 1) else heads if ok else []
+    return HEADS[repo]
 
 
 def default_base(root, slug) -> tuple:
@@ -268,7 +286,7 @@ def sweep_strays(repos) -> list:
         if prs is None:
             lines.append(f"[{repo}] strays: gh could not list the open PRs — {why}")
             continue
-        now, seen, heads, parents = time.time(), None, None, {}
+        now, seen, parents = time.time(), None, {}
         for p in prs:
             if not isinstance(p, dict) or not isinstance(p.get("number"), int):
                 continue
@@ -283,7 +301,10 @@ def sweep_strays(repos) -> list:
             seen = logged_prs(repo) if seen is None else seen
             if n in seen:   # landed, refused, stopped or handed back once: what happens next is a person's call
                 continue
-            heads = self_merge_heads(repo) if heads is None else heads
+            heads = self_merge_heads(repo)
+            if heads is None:
+                lines.append(f"[{repo}] strays: cc-config did not say which heads the repo lands itself — next sweep")
+                break
             if any(head.startswith(h) for h in heads):
                 continue    # the repo lands it itself
             buf = io.StringIO()
@@ -395,7 +416,7 @@ def settle_ended(repo, prs, by="outside", wait=False) -> list:
     hand) instead of skipping."""
     h = M.member_of(repo)[0]
     token = M.gh_token(h, repo) if h else None
-    root, lines, ended, heads = J.repo_root(repo), [], {}, None
+    root, lines, ended = J.repo_root(repo), [], {}
     for pr in prs:
         if not watched(J.load(repo, pr)):
             continue
@@ -404,8 +425,7 @@ def settle_ended(repo, prs, by="outside", wait=False) -> list:
             lines.append(f"[{repo}] PR #{pr}: gh could not say whether it merged — {why}")
             continue
         if facts.get("state") not in ("MERGED", "CLOSED"):
-            heads = self_merge_heads(repo) if heads is None else heads
-            if not any(str(facts.get("headRefName") or "").startswith(x) for x in heads):
+            if not any(str(facts.get("headRefName") or "").startswith(x) for x in self_merge_heads(repo) or []):
                 continue
         ended[pr] = facts
     if not ended:
@@ -848,17 +868,21 @@ def flag_main_red(repos, cards, now=None) -> list:
     A hold whose check main's own record (health) passed at or after its since=, or passed on a tip newer than its
     base, is skipped: a held job keeps extra.main_red until its own run of the check, so without this main going
     green left the hold aging into an alert (10-19: "red on main for 203 min" sent 21 min after main-health logged it
-    passed on the tip; 10-27: #2107 held on a base older than the tip health had passed 50 min before). So is a record
-    from a head the job has left (lane drops it when it plans the new head).
+    passed on the tip; 10-27: #2107 held on a base older than the tip health had passed 50 min before). So is one
+    whose check's red on main a later green tip run outlived (health.current; 10-29: the alert
+    fired for 4 h after a checks=0 green tip), or while health's pass on a newer tip runs it again (that silences
+    only this alert: the gate still takes the red until the pass records it), and a record from a head the job has
+    left (lane drops it when it plans the new head).
     `cards` is the installed cards unit; with none, or in a GitHub backoff, nothing is flagged."""
     lines, t = [], int(now if now is not None else time.time())
     for r in (repos if cards and not GH.backoff() else []):
         try:
             oldest = {}
             try:
-                rec = HL.load(r)["checks"]
+                whole = HL.load(r)
+                rec, live = whole["checks"], HL.current(r, whole)
             except (TypeError, ValueError, AttributeError):  # a wrong-shape health file reads as no record
-                rec = {}
+                rec, live = {}, {}
             for j in J.lane_jobs(r):
                 mr = j.extra.get("main_red")
                 at = E.epoch_of(mr.get("since") or "") if isinstance(mr, dict) else 0
@@ -867,6 +891,9 @@ def flag_main_red(repos, cards, now=None) -> list:
                 if mr.get("head") != j.head:
                     continue   # an old head's record: the lane drops it when it plans the new head
                 main = rec.get(mr.get("check"))
+                if isinstance(main, dict) and main.get("status") == T.FAILED and (
+                        mr.get("check") not in live or whole["running"] not in ("", main.get("tip"))):
+                    continue   # a green tip run outlived main's red (health.current), or a newer tip's pass runs it
                 if isinstance(main, dict) and main.get("status") == T.PASSED and (
                         E.epoch_of(main.get("at")) >= at or main.get("tip") not in (None, "", mr.get("base"))
                         and covers(J.repo_root(r), main.get("tip"), mr.get("base"))):
@@ -921,6 +948,15 @@ def move_gaps(lines) -> tuple:
     return gaps, last
 
 
+# security read of #2064: the hold reason starts so, since one that only quotes such text elsewhere is no draft
+DRAFTED = re.compile(L.DRAFT.pattern + r"|PR #\d+ was turned back into a draft — ")
+
+
+def drafted(job) -> bool:
+    """Held because its PR is a draft (lane.draft_why, or turned back into one): someone keeps it back on purpose."""
+    return job.state == T.HELD and bool(DRAFTED.match(job.extra.get("why") or ""))
+
+
 def flag_stalled(repos, cards, now=None) -> list:
     """A LANE WHOSE QUEUE HAS STOPPED MOVING (owner, 10-22: "should have been caught automatically", after 18 Hive PRs
     sat at review about 65 min while a hung read held the lane's one slot). For each repo with a due job (Lane.due),
@@ -929,8 +965,9 @@ def flag_stalled(repos, cards, now=None) -> list:
     box's when it has fewer than STALL_GAPS (a young lane): over STALL_TIMES times their p90 -> cards.stalled, said
     once per stall and at most hourly per repo. Quiet counts from the latest of that move and when its oldest due job
     became due (as flag_waited's age: queued, let go by a hold, or a box hold the tick last saw, so the moment a
-    usage wall lifts is not a stall). A lane that never moved a job, or whose oldest due job the box holds
-    (L.box_hold, as flag_waited), is not judged. `cards` is the installed cards unit; with none, or in a GitHub
+    usage wall lifts is not a stall). A job held as a draft is not due here (10-29: the alarm fired on a draft held on
+    purpose). A lane that never moved a job, or whose oldest due job the box holds (L.box_hold, as flag_waited), is
+    not judged. `cards` is the installed cards unit; with none, or in a GitHub
     backoff, nothing is flagged."""
     lines, t = [], int(now if now is not None else time.time())
     times = stage_times() if cards and repos and not GH.backoff() else {}
@@ -940,7 +977,7 @@ def flag_stalled(repos, cards, now=None) -> list:
         try:
             gaps, last = moves.get(r, ([], 0))
             gaps = gaps[-STALL_HISTORY:] if len(gaps) >= STALL_GAPS else box
-            due = [j for j in J.lane_jobs(r) if L.Lane.due(j, t)]
+            due = [j for j in J.lane_jobs(r) if L.Lane.due(j, t) and not drafted(j)]
             if len(gaps) < STALL_GAPS or not last or not due:
                 continue
             job = min(due, key=lambda j: j.extra.get("queued_at") or "")
@@ -999,6 +1036,7 @@ def cmd_tick(argv) -> int:
     if extra or (repo and not J.REPO_RE.fullmatch(repo)):
         return L.refuse("usage: lander tick [--repo R] [--detach] [--rearm]")
     lines = []
+    HEADS.clear()
     wait = GH.backoff()
     repos = [repo] if repo else J.all_repos()
     if wait:

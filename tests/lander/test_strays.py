@@ -188,6 +188,15 @@ class Strays(Fixture):
         TK.sweep_strays(["other"])
         self.assertEqual((self.queued, self.asked), ([("other", 6)], []))
 
+    def test_a_silent_cc_config_queues_none_of_the_repo_s_strays(self):
+        # 10-30: at a busy boot cc-config timed out, read as no prefix, and 16 of the Hive's own PRs were queued
+        self.heads["other"] = None
+        self.open["other"] = [pr(5, branch="hive/a"), pr(6)]
+        self.open["demo"] = [pr(7)]
+        lines = TK.sweep_strays(["other", "demo"])
+        self.assertEqual(self.queued, [("demo", 7)])
+        self.assertIn("[other] strays: cc-config did not say", lines[0])
+
     def test_self_merge_heads_reads_the_repo_key_on_the_box(self):
         answers = {"LANDER_SELF_MERGE_HEADS_dispatch": (0, "dispatch/ hive/\n", ""),
                    "LANDER_SELF_MERGE_HEADS_a_2Eb": (1, "", ""), "LANDER_SELF_MERGE_HEADS_a_2Db": (0, "hive/\n", ""),
@@ -195,15 +204,19 @@ class Strays(Fixture):
                    "LANDER_SELF_MERGE_HEADS_deep": (0, "hive/runs/\n", "")}
         bad = ["dispatch", "dispatch/ d", "*/", "/", "../", "dispatch/ -x/", "a//", "track/", "hive/ track/x/"]
         answers.update({f"LANDER_SELF_MERGE_HEADS_bad{i}": (0, v, "") for i, v in enumerate(bad)})
+        TK.HEADS.clear()
+        self.addCleanup(TK.HEADS.clear)
         with mock.patch.object(L, "run", lambda argv, timeout=60: answers[argv[2]]):
             self.assertEqual(SELF_MERGE_HEADS("dispatch"), ["dispatch/", "hive/"])
             self.assertEqual(SELF_MERGE_HEADS("deep"), ["hive/runs/"])
             self.assertEqual(SELF_MERGE_HEADS("a.b"), [])     # unset
             self.assertEqual(SELF_MERGE_HEADS("a-b"), ["hive/"])   # a key of its own, not a.b's or a_b's
             self.assertEqual(SELF_MERGE_HEADS("a_b"), [])
-            self.assertEqual(SELF_MERGE_HEADS("slow"), [])    # cc-config did not answer: queue as before
+            self.assertIsNone(SELF_MERGE_HEADS("slow"))       # cc-config did not answer: no reading at all
             for i, v in enumerate(bad):                       # one word that is no namespace voids the whole setting
                 self.assertEqual(SELF_MERGE_HEADS(f"bad{i}"), [], v)
+        with mock.patch.object(L, "run", lambda argv, timeout=60: (0, "x/\n", "")):
+            self.assertIsNone(SELF_MERGE_HEADS("slow"))       # asked once per tick, a silent answer too
 
 
 
