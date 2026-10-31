@@ -2498,6 +2498,14 @@ class Lanes(Fixture):
         self.assertEqual(read(), before)
         self.assertEqual(u["runner"].calls, [])
         self.assertIn("tier", lines[0])
+        # …and a mergeable one, whose re-check when main moves is a sealed read
+        j = self.job()
+        j.state = T.MERGEABLE
+        J.save(j)
+        before = read()
+        u, lines = self.land()
+        self.assertEqual(read(), before)
+        self.assertIn("tier", lines[0])
         # the tier lets a job past its merge go on
         j = self.job()
         j.state = T.MERGED

@@ -91,7 +91,8 @@ only a doc."): a queued job is planned at its turn whatever the other jobs chang
 with main (CONFLICT below) stops it. Each turn of the loop first records the checks that finished, so a freed slot
 is seen while queued jobs keep the turn list full, and a job held during the pass has a turn again once its
 not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
-`cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
+`cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds every job not merged yet,
+mergeable ones too.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a fork's PR (isCrossRepository: the lane reads
              heads from origin's branches only) -> query; a draft -> held 15 min; a conflict -> CONFLICT
              below (GitHub's CONFLICTING with no file git names -> held 15 min). Under
@@ -608,12 +609,13 @@ class BoardRules:
 
 def box_hold(target, job):
     """Why the box holds `job` from its turn ("" when it does not): `target` (the member, else the repo) paused, or a
-    spend tier stop for a job not merged yet. The lane says it per turn; the tick's age flag (tick.flag_waited) skips
-    a held job, since nothing in the queue is late while the box itself holds it."""
+    spend tier stop for a job not merged yet, a mergeable one too, since its re-check when main moves is a sealed read
+    and stop means nothing lands. The lane says it per turn; the tick's age flag (tick.flag_waited) skips a held job,
+    since nothing in the queue is late while the box itself holds it."""
     if paused(target):
         return f"{target} is paused — still queued, lands after `cc-pause off {target}`"
-    pre = job.state in PRE_MERGE or (job.state == T.HELD and job.extra.get("held_from", T.QUEUED) in PRE_MERGE)
-    if pre and tier_stop():
+    state = job.extra.get("held_from", T.QUEUED) if job.state == T.HELD else job.state
+    if state in PRE_MERGE + (T.MERGEABLE,) and tier_stop():
         return "spend tier stop — still queued, its checks run after `cc-tier set` a wider tier"
     return ""
 

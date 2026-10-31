@@ -4075,6 +4075,28 @@ def home_suborchs(panes=None, live=None):
             out.append({"repo": repo, "alias": alias})
     return out
 
+HOME_READS = {}                                # (reader, path, args) -> (the file's stat, what the reader made of it)
+
+def home_unchanged(fn):
+    """fn(path, ...), read again only once the file's size, mtime or inode moves: the dashboard rebuilds every few
+    seconds, and re-reading every agent's transcript each time kept the disk busy for the whole box (2026-10-30)."""
+    def run(path, *a, **kw):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return fn(path, *a, **kw)
+        key, now = (fn.__name__, path, a, tuple(sorted(kw.items()))), (st.st_size, st.st_mtime_ns, st.st_ino)
+        hit = HOME_READS.get(key)
+        if hit and hit[0] == now:
+            return hit[1]
+        if len(HOME_READS) > 4096:
+            HOME_READS.clear()                 # agents come and go; this is a cache, not a record
+        out = fn(path, *a, **kw)
+        HOME_READS[key] = (now, out)
+        return out
+    return run
+
+@home_unchanged
 def home_agent_task(path, n=HOME_AGENT_LINE):
     """The first line of what a subagent was asked, nothing else: the harness writes the prompt as the first
     record of the file `.output` links to — a bounded head read; the rest of the transcript isn't the dashboard's business."""
@@ -4111,31 +4133,47 @@ def home_session_file(link, sid):
             break
     return ""
 
+HOME_NAMES = {}                                # (transcript, cap) -> (inode, offset read to, {agent id: (offset, name, prompt)})
+
 def home_agent_names(path, cap=HOME_AGENT_SPAWN):
     """{agent id: (what the session called it, what it asked it)}, read off the session's transcript, not the
     agent's own. The agent's own transcript opens with just the prompt and is indistinguishable from any
-    other agent's. Only the last `cap` bytes are read, and only id-bearing lines parsed, since these
-    transcripts run to tens of megabytes. An agent this misses falls back to its prompt, not to nothing."""
-    out = {}
+    other agent's. Only launch records in the last `cap` bytes count, and only id-bearing lines are parsed,
+    since these transcripts run to tens of megabytes. Each call reads only the bytes added since the last
+    one (HOME_NAMES): a full tail read per rebuild was most of the daemon's disk reads. An agent this misses
+    falls back to its prompt, not to nothing."""
+    seen, size = {}, 0
     try:
         with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - cap))
-            if size > cap:
-                f.readline()                   # the seek landed mid-record: that record is in the part we dropped
+            st = os.fstat(f.fileno())
+            size = st.st_size
+            ino, at, seen = HOME_NAMES.get((path, cap), (None, 0, {}))
+            if ino != st.st_ino or at > size or at < size - cap:
+                f.seek(max(0, size - cap))     # new, replaced or fallen behind: start from the tail again
+                if size > cap:
+                    f.readline()               # the seek landed mid-record: that record is in the part we dropped
+                at, seen = f.tell(), {}
+            else:
+                f.seek(at)
+                seen = dict(seen)              # the slow-refresh thread may be reading the one in HOME_NAMES
             for raw in f:
+                if not raw.endswith(b"\n"):
+                    break                      # a record caught mid-write: read it whole next time
+                pos, at = at, at + len(raw)
                 if b'"agentId"' not in raw:
                     continue
                 try:
                     r = (json.loads(raw.decode("utf-8", "replace")) or {}).get("toolUseResult")
                 except Exception:
-                    continue                   # a record caught mid-write names nobody
+                    continue                   # a broken record names nobody
                 if isinstance(r, dict) and r.get("agentId"):
-                    out[str(r["agentId"])] = (str(r.get("description") or ""), str(r.get("prompt") or ""))
+                    seen[str(r["agentId"])] = (pos, str(r.get("description") or ""), str(r.get("prompt") or ""))
+            if len(HOME_NAMES) > 256:
+                HOME_NAMES.clear()
+            HOME_NAMES[(path, cap)] = (st.st_ino, at, seen)
     except OSError:
         pass                                   # no transcript (a session started outside this harness): no names
-    return out
+    return {k: (d, p) for k, (pos, d, p) in seen.items() if size <= cap or pos > size - cap}
 
 def home_agent_mark(prompt, said, n=HOME_SHORT):
     """The PR or board row a subagent's prompt names (`#243` or `landing-is-fast`), or "" if `said` already
@@ -4169,6 +4207,7 @@ def home_agent_dir(proj, home=None, dev=None):
             return d
     return ""
 
+@home_unchanged
 def home_agent_target(path, n=HOME_AGENT_HEAD):
     """Where a subagent runs, mapped onto the same target (repo or member handle) every other band keys on.
     Its transcript opens with `cwd` like a session's, so this is another bounded head read, not a new mechanism."""
@@ -4236,6 +4275,7 @@ def home_session_live(sid):
     except Exception:
         return False
 
+@home_unchanged
 def home_agent_done(path, tail=HOME_AGENT_TAIL):
     """Has this subagent finished? Its last transcript record says so: a final report is an `assistant` record
     with text and no `tool_use`, or the harness's answer to the agent's `SubagentHandback` call (home_handed_back:

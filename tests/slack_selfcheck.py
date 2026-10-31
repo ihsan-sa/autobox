@@ -6514,6 +6514,37 @@ def run_selfcheck():
     finally:
         shutil.rmtree(hagd, ignore_errors=True)
         shutil.rmtree(locals().get("hhome") or "/nonexistent", ignore_errors=True)
+    hrd = tempfile.mkdtemp(prefix="cc-slack-selfcheck-rereads-")
+    try:
+        hrread = lambda: int(re.search(r"^rchar: (\d+)", open("/proc/self/io").read(), re.M).group(1))
+        hrspawn = lambda aid: json.dumps({"type": "user", "toolUseResult": {"agentId": aid, "description": f"Do {aid}"}}) + "\n"
+        hrs = f"{hrd}/-home-x-dev-abox/s1"
+        os.makedirs(f"{hrs}/tasks"); os.makedirs(f"{hrs}/subagents")
+        with open(f"{hrs}.jsonl", "w") as fh:  # a long session: a megabyte of chatter between its launch records
+            fh.write(hrspawn("r1") + (json.dumps({"type": "user", "message": {"content": "x" * 1000}}) + "\n") * 1000
+                     + hrspawn("r2"))
+        for aid, age in (("r1", 0), ("r2", 4000)):    # r2 is quiet, so its last record is read too
+            jl = f"{hrs}/subagents/agent-{aid}.jsonl"
+            open(jl, "w").write(json.dumps({"type": "user", "message": {"content": "go"}}) + "\n" + json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}) + "\n")
+            os.symlink(jl, f"{hrs}/tasks/{aid}.output")
+            os.utime(jl, (time.time() - age,) * 2)
+        hrbuild = lambda: home_subagents(root=hrd, live=lambda sid: True, target=lambda f: "abox")
+        hr0 = hrread(); hrfirst = hrbuild(); hr1 = hrread(); hrsecond = hrbuild(); hr2 = hrread()
+        open(f"{hrs}.jsonl", "a").write(hrspawn("r3"))
+        os.symlink(f"{hrs}/subagents/agent-r1.jsonl", f"{hrs}/tasks/r3.output")
+        hr3 = hrread(); hrthird = hrbuild(); hr4 = hrread()
+        hrnames = home_agent_names(f"{hrs}.jsonl"); HOME_NAMES.clear(); HOME_READS.clear()
+        check("home_subagents: a second dashboard build with nothing changed reads (nearly) nothing — the first reads "
+              "the session's transcript, the second only stats files, and after one new launch record the third reads "
+              "about that record, not the transcript again; each shows what a fresh read would (2026-10-30: rebuilding "
+              "every few seconds re-read megabytes of transcripts and kept the box's disk saturated)",
+              hr1 - hr0 > 1_000_000 and hr2 - hr1 < 1024 and hr4 - hr3 < 8192
+              and hrfirst == hrsecond and [a["task"] for a in hrsecond] == ["Do r1", "Do r2"]
+              and {a["task"] for a in hrthird} == {"Do r1", "Do r2", "Do r3"}
+              and hrnames == home_agent_names(f"{hrs}.jsonl") and hrthird == hrbuild())
+    finally:
+        shutil.rmtree(hrd, ignore_errors=True)
     _homeT = globals()["HOME"]
     htd = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pr-title-")
     try:
