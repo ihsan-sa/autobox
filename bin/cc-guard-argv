@@ -97,6 +97,9 @@ Rules for both gated roles:
   or worker chmod/chown/chgrp
   whose target is a PARENT of an existing ~/.cc/state/<x>/perms or handoff seat file, of ~/dev, or of a write-fence
   place (`rm -rf ~/.cc`, `mv ~/.cc/state x`); unless GUARD_PSEAT                                     -> never
+- rm -r of a computed word, or of a path outside GUARD_ROOT, ~/dev/<mws>, ~/.cc/state, ~/.cc/tmp, ~/.cache (/tmp,
+  /var/tmp outside HOME); a member's ~/.cc/state only below a track dir of its own repo (<mws>, else its tree's),
+  resolved, and never a record the box keeps there (STATEREC, *.lock)                                -> never
 - a `$X` verb is the literal value of an earlier X= / export / declare in the same command; any other `$X` /
   `$(..)` verb passes unless a word of that command (or of the text an X=$(..) was built from), read with its quotes and backslashes taken off
   (`$X re''boot` is reboot), is a hard-limit verb name (a member's too: cc-config, cc-loop) (-> never), or its arguments would be refused as
@@ -215,6 +218,8 @@ def makepaths(a):   # [(kind, value, as typed)] for each -C (C), makefile (f) or
     return out
 HANDLE = re.compile(r'[a-z0-9][a-z0-9-]*')
 AWKS = {'awk', 'gawk', 'mawk', 'nawk', 'busybox-awk'}
+STATEREC = {'task.md', 'progress.md', 'pr-body.md', 'slack-post.md', 'loop.log', 'loop.pid', 'delivery.json', 'runs', 'github',
+            'orch', 'pushed', 'failures', 'narrowing-notice.md'}   # what the box keeps in a track's state dir, and any *.lock (ownstate)
 SEATLAB = "the permission seat's state"
 FW = {'iptables', 'ip6tables', 'iptables-nft', 'iptables-legacy', 'ip6tables-nft', 'ip6tables-legacy',
       'iptables-restore', 'ip6tables-restore', 'nft', 'ufw', 'firewall-cmd', 'ebtables', 'arptables'}
@@ -563,6 +568,18 @@ class Guard:
             if not HANDLE.fullmatch(h) or not os.path.isdir(d) or h == g.mws: continue
             for r in (H + '/dev/' + h, H + '/.cc/worktrees/' + h):
                 g.mtrees += [(r, h)] + ([(os.path.realpath(r), h)] if os.path.realpath(r) != r else [])
+
+    def ownstate(g, w, cwd):   # a member's recursive delete in ~/.cc/state: only inside a track dir of its own repo (owner, 10-30)
+        # Its repo is the workspace (GUARD_MWS) or its tree's path (~/.cc/worktrees/<repo>/… or ~/dev/<repo>), never a file
+        # it writes. Resolved, so no link or .. walks out; never the repo's dir or a track's dir whole, nor a record the box
+        # keeps in one (STATEREC). A glob counts from the last whole directory before its wildcard, so `<track>/d*` could
+        # reach delivery.json and is refused.
+        m = re.match(re.escape(g.home) + r'/(?:\.cc/worktrees|dev)/([^/:]+)/', g.root.split(':')[0] + '/')
+        repo = g.mws or (m.group(1) if m else '')
+        p = re.split(r'[*?[]', w.v)[0] if w.glob else w.v
+        if w.glob: p = p[:p.rfind('/') + 1]
+        r = os.path.relpath(os.path.realpath(g.absp(p, cwd)), os.path.realpath(g.home + '/.cc/state/' + repo)).split('/')
+        return bool(repo) and len(r) >= 2 and r[0] != '..' and r[1] not in STATEREC and not r[1].endswith('.lock')
 
     def ownchans(g):   # the box's channels and this worktree's repo's, each with its -threads and -updates lanes. The
         # repo is read off the worktree's path (~/.cc/worktrees/<repo>/<track>), never its .cc/track, which the worker
@@ -1434,6 +1451,7 @@ class Guard:
                 inside = any(q.startswith(d.rstrip('/') + '/') and not (w.glob and q == d.rstrip('/')) for d in g.allow)
                 free = any(q.startswith(d + '/') for d in ((g.home + '/.cc/state', g.home + '/.cc/tmp', g.home + '/.cache') if (q + '/').startswith(g.home + '/')
                                                            else ('/tmp', '/var/tmp')))
+                if free and g.role == 'member' and q.startswith(g.home + '/.cc/state/'): free = g.ownstate(w, R['cwd'])
                 if w.dyn or not (inside or free):
                     return 'never', f'recursive delete outside the worktree ({w.v})'
         h = g.secread(R, mem)
@@ -1879,6 +1897,27 @@ def selfcheck():
             for role in ('worker', 'pf'):
                 if (judge(cmd, dict(base, GUARD_ROLE=role)) is not None) != refuse: fail(f'seat glob {role}: {cmd!r} (want {"refuse" if refuse else "pass"})')
                 else: ok += 1
+        # a member's worker clears folders inside its own repo's state (owner 10-30, a member's post drafts on 10-24), in a
+        # home of its own: bob's workspace, with a link in his track dir that points at another repo's state
+        with tempfile.TemporaryDirectory(prefix='cc-guard-argv-ms.') as M:
+            M = os.path.realpath(M); s = M + '/.cc/state/bob/posts'
+            os.makedirs(s + '/drafts/old'); os.makedirs(M + '/.cc/state/other/x'); os.symlink(M + '/.cc/state/other', s + '/out')
+            wt = M + '/.cc/worktrees/bob/posts'
+            menv = {'HOME': M, 'GUARD_ROLE': 'member', 'GUARD_MWS': 'bob', 'GUARD_CWD': wt, 'GUARD_ROOT': wt + ':' + M + '/dev/bob'}
+            for cmd, refuse in [(f'rm -rf {s}/drafts', False), (f'rm -rf ~/.cc/state/bob/posts/drafts/*', False),
+                                (f'cd {s} && rm -rf drafts/old', False), (f'rm -rf {s}/drafts/../drafts/old', False),
+                                (f'rm -rf {M}/.cc/state/bob', True), (f'rm -rf {s}', True),   # the state dir, a track's dir whole
+                                (f'rm -rf {s}/task.md', True), (f'rm -rf {s}/runs', True), (f'rm -rf {s}/task.md.lock', True),
+                                (f'rm -rf {M}/.cc/state/bob/failures', True), (f'rm -rf {s}/d*', True),   # a glob that reaches delivery.json
+                                (f'rm -rf {M}/.cc/state/other/x', True), (f'rm -rf {s}/out', True), (f'rm -rf {s}/out/x', True),
+                                (f'rm -rf {s}/../../other/x', True), (f'rm -rf {s}/$D', True)]:
+                if (judge(cmd, menv) is not None) != refuse: fail(f'member state: {cmd!r} (want {"refuse" if refuse else "pass"})')
+                else: ok += 1
+            for root in (wt, M + '/dev/bob'):   # no workspace: its repo is its worktree's, and a seat's is its ~/dev/<repo>
+                if judge(f'rm -rf {s}/drafts', dict(menv, GUARD_MWS='', GUARD_ROOT=root)) is not None: fail(f'member state: {root} lost its own state')
+                else: ok += 1
+            if judge(f'rm -rf {s}/drafts', dict(menv, GUARD_MWS='', GUARD_ROOT='/srv/bob')) is None: fail('member state: no repo, yet it passed')
+            else: ok += 1
         for cmd in ("echo 'unclosed", 'echo "$(date', 'ls )', 'echo `date', 'cat <<E\ngh pr merge 1'):
             if (judge(cmd, base) or ('',))[0] != 'never': fail(f'unit {cmd!r}: an unparseable command was not refused')
             else: ok += 1
