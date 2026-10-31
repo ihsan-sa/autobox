@@ -77,7 +77,7 @@ RESTORE: it takes ~/.cc/recover/.lock without waiting and holds it to the end, s
 (cc-tmux-ledger's watcher after a tmux crash and the detector, say, or `cc-tmux-ledger restore` by hand) the second
 logs that and does nothing. It marks itself running before it reads the saved set, so no tick drops anything from that set until it ends. Then
 the tmux server (cc-boot), then the network (up to 15 min by the wall clock: claude needs it), then each saved
-session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone; a window left as a bare shell is not live, and is closed and relaunched. Each
+session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone; a window left as a bare shell is not live, and is closed and relaunched. An orch that ended on purpose (it exited 0, or orchs.json has none of its channels live) stays down, here and in a bring-up. Each
 non-worker gets a catch-up message once its claude is up (cc-msg; a track or member track by `cc <repo> <track> --say`); a worker
 keeps its own journal and gets none. The result goes to restore.log and one cc-notify line. The saved set is a file,
 so no record is trusted: one whose names are not from a safe charset, whose repo is not a directory under ~/dev, whose
@@ -132,6 +132,7 @@ CLAUDE = os.path.join(HOME, ".local/bin/claude")       # the one claude a restor
 PROC = os.environ.get("CC_RECOVER_PROC") or "/proc"
 TMUX = os.environ.get("CC_RECOVER_TMUX") or "tmux"
 BIN = os.environ.get("CC_RECOVER_BIN") or os.path.dirname(os.path.realpath(__file__))
+SLACK = os.environ.get("CC_SLACK_DIR") or os.path.join(HOME, ".cc/slack")   # cc's orch-ended/ markers, cc-slack's orchs.json
 ORDER = ["seat", "orch", "member", "track", "worker"]
 SID_RE = re.compile(r"/claude-\d+/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
 TICK_GAP = 180          # a tick later than this after the last one restarts every streak
@@ -962,6 +963,24 @@ def under_stop(sessions, logname="restore.log"):
     return keep
 
 
+def ended(rec):
+    """Why an orch ended on purpose, or "": cc marks a clean exit (orch-ended/<window>, cleared when it starts again;
+    a seat marks an orch closed by writing the same file, as dispatch@hive-public needed, idle and closed since 10-24),
+    and orchs.json has its channels and none of them live (archived by that exit, `retire` or by hand). A saved set
+    from before the end still names it, and relaunching it undoes the finish (10-30: dispatch@hive-lite)."""
+    if rec.get("kind") != "orch":
+        return ""
+    if os.path.exists(os.path.join(SLACK, "orch-ended", rec["window"])):
+        return "it exited 0 or was marked closed"
+    try:
+        with open(os.path.join(SLACK, "orchs.json")) as f:
+            chans = [e for e in json.load(f).values()
+                     if isinstance(e, dict) and e.get("target") == rec["repo"] and e.get("alias") == rec["alias"]]
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return "its channel is archived" if chans and all(e.get("archived") for e in chans) else ""
+
+
 def paused(repo):
     """`cc-pause is <repo>` exits 0 when paused; a cc-pause that cannot answer is "go", as it is for cc-loop."""
     try:
@@ -991,6 +1010,11 @@ def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=Tr
         if live(rec):
             already.append(w)
             log(logname, f"{w}: already live")
+            continue
+        done = ended(rec)
+        if done:
+            already.append(w)
+            log(logname, f"{w}: ended on purpose ({done}) — left down")
             continue
         if paused(rec["repo"]):   # a paused project spends nothing the box starts on its own (cc-pause)
             already.append(w)
@@ -1297,7 +1321,7 @@ def status():
 # ---- selftest ----
 
 def selfcheck():
-    global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, ROLES, HERE
+    global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, ROLES, HERE, SLACK
     fails, passed, made = [], [0], []
 
     def check(name, cond):
@@ -1309,13 +1333,13 @@ def selfcheck():
 
     def fixture():
         """A fresh state dir, fake /proc, fake tmux and fake bin of its own: no case reads another's leftovers."""
-        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, CCSTATE, MEMBERS, ROLES, HERE
+        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, CCSTATE, MEMBERS, ROLES, HERE, SLACK
         d = tempfile.mkdtemp(prefix="cc-recover-st.")
         made.append(d)
         ROLES, HERE = f"{d}/roles", "here"   # no roles file: the hub is here, as on a box that never moved
         STATE, PROC, BIN, DEV, CLAUDE = f"{d}/state", f"{d}/proc", f"{d}/bin", f"{d}/dev", "/c/claude"
         LOCK = f"{d}/lock/.lock"   # never the real ~/.cc/recover/.lock: a selfcheck must not stop a real restore
-        CCSTATE, MEMBERS = f"{d}/ccstate", f"{d}/members"
+        CCSTATE, MEMBERS, SLACK = f"{d}/ccstate", f"{d}/members", f"{d}/slack"
         for x in (PROC, BIN, f"{PROC}/sys/kernel/random", f"{PROC}/net", *(f"{DEV}/{r}" for r in ("r1", "r2", "r3", "m1"))):
             os.makedirs(x, exist_ok=True)
         open(f"{PROC}/sys/kernel/random/boot_id", "w").write("boot-1\n")
@@ -1735,6 +1759,15 @@ def selfcheck():
         check("restore: a paused project stays down while the rest come back",
               not any(c.startswith("cc|m1|") for c in calls) and any(c.startswith("cc|r1|") for c in calls)
               and "m1 is paused" in open(path("restore.log")).read())
+        # an orch that ended on purpose after the set was saved stays down (10-30: dispatch@hive-lite relaunched on its old sid)
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        os.makedirs(f"{SLACK}/orch-ended"); open(f"{SLACK}/orch-ended/r1@ops", "w").close()
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: an orch that exited 0 since the set was saved stays down while the rest come back",
+              not any(c.startswith("cc|r1|--orch|") for c in calls) and "cc|r1|" in calls
+              and "r1@ops: ended on purpose (it exited 0 or was marked closed)" in open(path("restore.log")).read())
         # tier stop: the first tick under it marks what runs; a session started after that, and the worker, stay
         # down; the rest come back on their own conversations and nobody is handed a catch-up turn
         d = fixture(); live_box(d)
@@ -2042,6 +2075,15 @@ def selfcheck():
               and "r3: excluded, still paused" in blog and "r3: excluded, left as it is" in blog
               and "relaunched: r2, r1@ops, m1, r1/job, r1/wait" in blog and rc == 0 and not os.path.exists(path("restoring")))
         globals()["claude_pid"] = real["claude_pid"]
+        d = fixture(); bringup_box(d)
+        os.makedirs(SLACK)
+        json.dump({"C1": {"target": "r1", "alias": "ops", "archived": True}, "C2": {"target": "r1", "alias": "x", "archived": False}},
+                  open(f"{SLACK}/orchs.json", "w"))
+        bringup(["--here"])
+        cc_calls = [c for c in open(f"{d}/calls").read().splitlines() if c.startswith("cc|")]
+        check("bringup: an orch whose every channel is archived stays down; the others still come back",
+              not any(c.startswith("cc|r1|--orch|ops|") for c in cc_calls) and "cc|r2|CC_CLAUDE=" in cc_calls
+              and "r1@ops: ended on purpose (its channel is archived)" in open(path("bringup.log")).read())
         d = fixture(); bringup_box(d)
         store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": ""})
         rc = bringup(["--here"])

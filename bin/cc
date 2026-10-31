@@ -149,6 +149,11 @@ inbound_args(){ [ "${CC_ROLE:-}" = member ] && return 0; member_facing "$DEV/$1"
                                 # plain-folder seat, a member-facing seat or a member workspace: none of them call this, and the first line
                                 # refuses the member ones even when named.
 worker_model(){ "$BIN/cc-loop" worker-model "${1:-}"; }   # what a --go worker will run on; cc-loop owns that order (--model, then the override, then CC_WORKER_MODEL) and this only names it
+orch_start(){ rm -f "${CC_SLACK_DIR:-$HOME/.cc/slack}"/orch-{crashed,ended}/"$1@$2"; }   # an orch at $1@$2 is live again (__runorch, and __runnext for an orch)
+orch_exit(){ local d="${CC_SLACK_DIR:-$HOME/.cc/slack}"   # $1 repo $2 alias $3 claude's status: see __runorch's exit
+  if [ "$3" = 0 ]; then mkdir -p "$d/orch-ended" && date -u +%FT%TZ > "$d/orch-ended/$1@$2"; [ -f "$SLACKON" ] && ! member_workspace "$1" && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$1" "$2" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
+  else mkdir -p "$d/orch-crashed" && echo "$3 $(date -u +%FT%TZ)" > "$d/orch-crashed/$1@$2"
+       echo; echo "[claude ended with status $3 — not a finish, so $2@$1 keeps its Slack channel]"; fi; return 0; }
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
 start_check(){ ( "$BIN/cc-started" "$@" >/dev/null 2>&1 & ); return 0; }   # …and reads the pane back a minute later: a popup is
                                 # pressed through, a first message that never landed is drained in, a login screen reaches the owner (cc-started).
@@ -1437,6 +1442,19 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
     CC_HANDOFF_DIR="$T/no-handoff" bash "$S" __runnext r1 h9 s9 </dev/null >/dev/null 2>&1
   rc=0; [ "$(cat "$T/pane3" 2>/dev/null)" = %43 ] || rc=1
   t "…and so does a handoff successor (__runnext), which marks rows like any seat" "$rc"
+  # AN ORCH'S SUCCESSOR KEEPS THE ORCH'S EXIT RECORD (orch-ended/, which cc-recover reads): one that starts clears what
+  # its predecessor's exit left, and one that exits 0 is a finish a later restore leaves down.
+  mkdir -p "$T/.cc/slack/orch-ended"; : > "$T/.cc/slack/orch-ended/r1@a1"
+  printf '#!/usr/bin/env bash\n[ -e "$HOME/.cc/slack/orch-ended/r1@a1" ] && : > "$CC_ARGV"; exit 1\n' > "$T/bin/claude-ended"; chmod +x "$T/bin/claude-ended"
+  HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude-ended" CC_ARGV="$T/ended1" CC_HANDOFF_DIR="$T/no-handoff" \
+    bash "$S" __runnext r1@a1 h10 s10 </dev/null >/dev/null 2>&1
+  rc=0; [ -e "$T/ended1" ] && rc=1; [ -e "$T/.cc/slack/orch-ended/r1@a1" ] && rc=1
+  t "an orch's handoff successor clears orch-ended/ when it starts, and a crash exit writes none" "$rc"
+  rm -f "$T/.cc/slack/orch-ended/r1@a1"; HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude" CC_ARGV="$T/ended2" CC_HANDOFF_DIR="$T/no-handoff" \
+    bash "$S" __runnext r1@a1 h11 s11 </dev/null >/dev/null 2>&1
+  rc=0; [ -e "$T/.cc/slack/orch-ended/r1@a1" ] || rc=1
+  t "…and one that exits 0 leaves orch-ended/, so cc-recover keeps it down" "$rc"
+  rm -f "$T/.cc/slack/orch-ended/r1@a1"
   # …AND THE PLAIN-FOLDER SESSION IS TOLD TOO. A channel minted for a folder that is no repo starts through
   # __runplain, which hands claude no system prompt at all unless the folder is member-facing — so the three text
   # cases above cannot see this kind, and it was the one a person would most likely ask for a mail in. The same
@@ -2527,6 +2545,7 @@ PY
     # PREDECESSOR (harmless — it is long past its dialog) and left this session parked on its own.
     mapfile -t CH < <(chan_args "$target"); mapfile -t MO < <(model_args); chan_accept "${CC_HANDOFF_WINDOW:-$target}"
     start_check "${CC_HANDOFF_WINDOW:-$target}" --quiet   # --quiet: cc-handoff's kick is already waiting this window out and alerts on it
+    orch=""; [ -n "$alias" ] && [ -z "$track" ] && { orch=1; orch_start "$repo" "$alias"; }   # a live successor clears what an earlier exit left
     if member_workspace "$repo"; then
       # A MEMBER WORKSPACE'S SUCCESSOR BOOTS THE WAY __runmember BOOTS: inside `cc-sandbox member`, on CC_MEMBER_MODEL,
       # no --remote-control. Until 2026-09-18 this branch ran it BARE — the member's channel wired to a claude on the
@@ -2534,12 +2553,13 @@ PY
       # (CC_HANDOFF, ~/.cc/state/handoff) is not bound inside, so a member successor is not gated by it and cannot
       # run --ready itself: the host cuts over with `cc-handoff --ready <handle> --forced` once its pane is up.
       sp="$sp $MEMBER_WS_SP"; mapfile -t MO < <(member_model_args)
-      "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --session-id "$sid" "${CH[@]}" "${MO[@]}"
+      "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --session-id "$sid" "${CH[@]}" "${MO[@]}"; orc=$?
     else
       IN=(); [ -z "$track$alias" ] && mapfile -t IN < <(inbound_args "$repo")   # the planning seat's successor only, as __runmain
-      EF=(); [ -n "$alias" ] && [ -z "$track" ] && { mapfile -t EF < <(orch_effort_args "$alias"); mapfile -t MO < <(orch_model_args "$repo" "$alias"); }   # an orch's successor keeps its pinned effort and model, as __runorch
-      "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --name "$target" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}" "${EF[@]}"
+      EF=(); [ -n "$orch" ] && { mapfile -t EF < <(orch_effort_args "$alias"); mapfile -t MO < <(orch_model_args "$repo" "$alias"); }   # an orch's successor keeps its pinned effort and model, as __runorch
+      "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --name "$target" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}" "${EF[@]}"; orc=$?
     fi
+    [ -n "$orch" ] && orch_exit "$repo" "$alias" "$orc"   # an orch's successor ends the way __runorch does: a clean exit is a finish restore leaves down
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
@@ -2555,7 +2575,7 @@ PY
     export CC_SLACK_ALIAS="$alias" CC_ORCH_REPO="$repo"   # cc-loop keys a dispatched worker's STOP/DONE to <this repo>@<alias>
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(orch_model_args "$repo" "$alias"); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
-    crashed="${CC_SLACK_DIR:-$HOME/.cc/slack}/orch-crashed/$repo@$alias"; rm -f "$crashed"   # a restarted orch is live again
+    orch_start "$repo" "$alias"
     if member_workspace "$repo"; then   # a MEMBER orch boots the way __runmember boots: inside `cc-sandbox member` (which carries
       # CC_SLACK_ALIAS in), on CC_MEMBER_MODEL, no --remote-control and no owner effort pin; the socket takes its alias
       # only because orchs.json gives <h>@<alias> a channel of the workspace's own
@@ -2569,9 +2589,8 @@ PY
     # otherwise read as a finished orch and archive ORCH_IDLE later. A crashed orch's channel is never archived by
     # the janitor; restarting the orch clears the marker, and only a clean exit archives.
     # A member orch's channel is the member's own lane (#<h>--<alias>, maybe one they made), so no exit archives it.
-    if [ "$orc" = 0 ]; then [ -f "$SLACKON" ] && ! member_workspace "$repo" && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
-    else mkdir -p "${crashed%/*}" && echo "$orc $(date -u +%FT%TZ)" > "$crashed"
-         echo; echo "[claude ended with status $orc — not a finish, so $alias@$repo keeps its Slack channel]"; fi
+    # A clean exit also leaves orch-ended/<repo>@<alias>: cc-recover never relaunches a finished orch from an older saved set.
+    orch_exit "$repo" "$alias" "$orc"
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
