@@ -2409,6 +2409,34 @@ def selfcheck():
            "skipped it, nor on the pass after that, at --repeat 0", (n1, n2, n3) == (1, 1, 1))
         shutil.rmtree(owt); opass(0); os.makedirs(owt)
         ok("…and once its directory has gone, a worktree made again at that path is told again", opass(0) == 2)
+    # CLOSED ONCE (raised-watchdog-repeats-old-closed-prs): dispatch #1439 and #1551 closed on 10-21, their rows were
+    # set `closed`, and the watchdog still woke the seat about each on 10-30 and 10-31. Own fixture: a gh that answers
+    # CLOSED for every PR, then fails on the middle pass, which reads the PR as unknown as a spent lookup budget does.
+    with tempfile.TemporaryDirectory() as th:
+        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
+                   CC_SLACK_DIR=f"{th}/.cc/slack", CC_RECONCILE_INJECT=f"{th}/inj", PATH=f"{th}:{os.environ['PATH']}")
+        repo = f"selfcheckclosed{os.getpid()}"
+        open(f"{th}/inj", "w").write(f'#!/bin/sh\necho "$@" >> {th}/inj.log\n'); os.chmod(f"{th}/inj", 0o755)
+
+        def cb(*a):
+            return subprocess.run([f"{BIN}/cc-board", *a], env=env, capture_output=True, text=True, timeout=30)
+        cb("init", repo, f"{th}/dev/{repo}", "main")
+        for t, st, n in (("ended-c-row", "closed", 81), ("fresh-c-row", "review", 82)):
+            cb("add", repo, t, f"pr {n}", ""); cb("set", repo, t, "status", st)   # `status` takes no `closed`
+            cb("set", repo, t, "pr", f"https://github.com/o/r/pull/{n}")
+
+        def cpass(answer):
+            open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('CLOSED')}'\n" if answer else "#!/bin/sh\nexit 1\n")
+            os.chmod(f"{th}/gh", 0o755)
+            subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--notify", "--grace", "0", "--repeat", "0"],
+                           env=env, capture_output=True, text=True, timeout=120)
+            told = open(f"{th}/inj.log").read().splitlines() if os.path.exists(f"{th}/inj.log") else []
+            return tuple(sum(f"{repo}/{t} " in ln and CLOSED_WHY in ln for ln in told) for t in ("ended-c-row", "fresh-c-row"))
+        seen = [cpass(True), cpass(False), cpass(True), cpass(True)]
+        ok("CLOSED ONCE: a row already set `closed` whose PR closed long ago is never told, over four passes at --repeat 0",
+           [e for e, _ in seen] == [0, 0, 0, 0])
+        ok("…while a row whose PR has just closed without merging is told on the first pass and never again, even after "
+           "a pass that could not read the PR", [c for _, c in seen] == [1, 1, 1, 1])
     # (b1) OWNER-HELD (brief C6): "a row that is waiting on an open owner ask, held for his yes, or noted as parked on
     # purpose wakes its seat once and not every day. When a wake does fire, it says an owner ask is already pending."
     T = now()

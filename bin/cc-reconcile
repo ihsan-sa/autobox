@@ -63,7 +63,9 @@ beside it, an unpushed branch, still goes out (--no-net never asks, so never dro
 reported. An unpushed branch is not told while the row's loop or window is alive (the worker may push yet), and
 once the loop has ended it is told once while it stands, not every --repeat. A worktree with no board entry is told
 once while its directory stands: its memo outlives a pass that skips it (a fresh mtime, an OPEN PR read, the PR-lookup
-budget landing elsewhere), since dropping it there made the next pass call it news. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
+budget landing elsewhere), since dropping it there made the next pass call it news. A PR closed without merging is
+told once per row the same way, its memo kept while the row stands and no newer PR of it is open or merged, and never
+on a row a person set `closed`. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
 A finished track with an open PR nobody is landing is offered once per PR and alerted once, ever, past the
 4 h window — unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
 
@@ -1164,6 +1166,7 @@ def idle_session(f, idle=IDLE):
 
 
 UNPUSHED = "its branch is not pushed"   # told once while it stands, not every --repeat
+CLOSED_WHY = "its PR was closed without merging"   # told once per row, at the close, never again
 
 
 def decide(f):
@@ -1234,7 +1237,7 @@ def decide(f):
             if not has_pr:
                 out.append(("ask", None, "it finished but no PR was ever opened"))
             elif pr == "CLOSED":
-                out.append(("ask", None, "its PR was closed without merging"))
+                out.append(("ask", None, CLOSED_WHY))
         elif jk == "DONE" and has_pr:
             out.append(("fix", "review", "it finished and its PR is open"))
         elif jk == "DONE":
@@ -1255,8 +1258,8 @@ def decide(f):
             out.append(("fix", "merged", "its PR merged"))
         elif pr == "OPEN" and st in TERMINAL:
             out.append(("fix", "review", "its PR is still open"))
-        elif pr == "CLOSED" and st not in TERMINAL:
-            out.append(("ask", None, "its PR was closed without merging"))
+        elif pr == "CLOSED" and st not in TERMINAL + ("closed",):   # `closed`: a person already ended the row
+            out.append(("ask", None, CLOSED_WHY))
         elif pr == "?":
             out.append(("info", None, "could not read its PR state"))
     if st == "review" and not has_pr and f.get("has_remote") and not f.get("landed"):
@@ -3418,7 +3421,7 @@ def main(argv):
             f = row_facts.get(f"{r['repo']}/{r['track']}") or {}
             r["owner"] = owner_held(r["repo"], r["track"], f.get("notes"), owner_asks, repo_channels(r["repo"])) if r["kind"] == "ask" else ""
         fresh = [r for k, r in keys.items()
-                 if (not old.get(k) if r["owner"] or r["why"] in (UNPUSHED, ORPHAN_WHY)   # "alert once, not on every pass"
+                 if (not old.get(k) if r["owner"] or r["why"] in (UNPUSHED, ORPHAN_WHY, CLOSED_WHY)   # "alert once, not on every pass"
                      else t0 - float(old.get(k, 0) or 0) >= repeat)
                  and not merge_answers(r)]   # merged since the run began: the next pass fixes the row
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
@@ -3476,6 +3479,13 @@ def main(argv):
         # planning seat again, about every 12 min all night. The memo stays until the directory is gone.
         keep.update({x: v for x, v in old.items() if x.endswith(f": {ORPHAN_WHY}") and x not in keys
                      and os.path.isdir(f"{WTS}/{x[:-len(ORPHAN_WHY) - 2]}")})
+        # A CLOSED PR IS TOLD ONCE (raised-watchdog-repeats-old-closed-prs, 2026-10-31): an old PR is read only when
+        # the pass's lookup budget reaches it, so a pass that saw it as unknown dropped its memo, and the next pass
+        # that read it CLOSED called it news, on rows a person had already set `closed` (dispatch #1439 and #1551, 10 days after they closed). The memo stays
+        # while the row is on the board and no newer PR of it is open or merged.
+        keep.update({x: v for x, v in old.items() if x.endswith(f": {CLOSED_WHY}") and x not in keys
+                     and x[:-len(CLOSED_WHY) - 2] in row_facts
+                     and row_facts[x[:-len(CLOSED_WHY) - 2]].get("pr_state") not in ("OPEN", "MERGED")})
         if keys or keep or old:   # only findings that are still true survive the write: one that comes back is news again
             new = ledger(path, dict({k: (t0 if k in told else old.get(k, 0)) for k in keys}, **keep))
             # …and a nag that just went away is held against the authoritative state at the time it went out: one
