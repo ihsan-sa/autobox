@@ -2700,8 +2700,10 @@ class ReleaseSwitch(Fixture):
             self.land(runner=Runner(), reviewer=Reviewer())
         self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
 
-    def test_a_pr_submitted_while_a_promote_waits_stays_queued_for_the_new_release_to_plan(self):
-        # Opus review of #2025: the old release planned it, and the new lane checked and merged it on the old rules
+    def test_a_pr_submitted_while_a_promote_waits_is_queued_at_once_and_left_for_the_new_release_to_plan(self):
+        # Opus review of #2025: the old release planned it, and the new lane checked and merged it on the old rules.
+        # 10-29: five queued PRs sat in jobs/new/ for 40 min and more while the old lane waited out long gate runs, so
+        # neither the queue view nor the lane's backlog showed them: the old lane drains the request, and only that
         self.pr(1, {"a/x": "n\n"})
         self.pr(2, {"b/y": "n\n"})
         J.submit("demo", 1)
@@ -2709,12 +2711,13 @@ class ReleaseSwitch(Fixture):
 
         def hook(name, _):
             self.point("bbbb")
+            time.sleep(0.3)   # the lane has looked at POLL and met the promote before the request comes
             J.submit("demo", 2)
-            time.sleep(0.5)   # the lane loops at POLL meanwhile: a drain would take and plan #2 now
+            time.sleep(0.5)   # the lane loops at POLL meanwhile: it drains #2, and must not plan it
             seen["two"] = (getattr(self.job(2), "state", None), getattr(self.job(2), "plan", None))
         with mock.patch.object(L, "POLL", 0.05):
             self.land(runner=Runner(hook=hook), reviewer=Reviewer(V("LAND")))
-        self.assertIn(seen["two"][0], (None, T.QUEUED))
+        self.assertEqual(seen["two"][0], T.QUEUED, "the request sat in the inbox while the gate ran")
         self.assertIsNone(seen["two"][1], "the old release planned a PR submitted after the promote")
         self.assertIsNone(getattr(self.job(2), "plan", None))
 

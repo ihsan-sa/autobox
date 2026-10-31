@@ -211,7 +211,9 @@ mark cleared, an unknown row named; a symlinked board file is refused.
 
 A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
 it runs from with what ~/.cc/lander/current names now (jobs.stale_release; a lander run from a checkout never
-switches). When they differ it drains no request, plans no job and starts no check, but while the checks and review
+switches). When they differ it still drains the inbox, so a queued PR shows in the queue at once (on 10-29 five PRs sat
+40 min and more in jobs/new/ while the old lane waited out two long gate runs), but it plans no job and starts
+no check, and while the checks and review
 reads in flight finish, a checking job whose checks are all recorded and a mergeable or merged one still take their
 turns, so one whose checks are done is read and merged meanwhile (dispatch #2121, 10-28: green, read
 and adopted, it sat 2 h at stage review while the old lane waited out two full suites at load 58), and a mergeable one
@@ -719,7 +721,7 @@ class Lane:
             if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
                 self.reap(0)   # a finished check is recorded (its slot freed) even while queued jobs keep todo full
                 continue       # and a promote that came while it ran is seen before any job moves on
-            for ln in ([] if moved else J.drain(self.repo)):   # a request waits for the new release to plan it
+            for ln in J.drain(self.repo):   # after a promote too: the job it makes waits for the new release to plan it
                 self.say(ln)
             moved = self.moved = J.stale_release()   # again: a promote before a request this drain took leaves it queued
             jobs = self.jobs = J.lane_jobs(self.repo)
