@@ -282,6 +282,14 @@ def selfcheck():
     rc, out = say("stopped", "qk")
     ok("…so the wake line never carries it", "stopped" not in out and "1 of 1 queued row could start now" in out)
 
+    # ── A ROW WITH NO BRIEF IS NEVER OFFERED: a worker launched on it had only the go note and no bounds
+    # (raised-a-row-dispatched-without-its-brief).
+    board({"nobrief": {"status": "queued"}, "qk": {"status": "queued"}})
+    brief_of("nobrief", "\n" + MARK_A + "\nIN FLIGHT (from the board, 1999-01-01T00:00Z):\n  held.txt — one [review]\n" + MARK_B + "\n")
+    brief_of("qk", "GOAL: other.txt is wrong.\n")
+    ok("a queued row whose brief is empty is not offered, even when named",
+       ready(repo, net=False)[0] == ["qk"] and ready(repo, only=["nobrief", "qk"], net=False)[0] == ["qk"])
+
     board({"one": {"status": "review", "branch": "track/one"}, "q2": {"status": "queued"}})
     brief_of("q2", "GOAL: other.txt says the wrong thing.\n\n" + MARK_A +
              "\nIN FLIGHT (from the board, 1999-01-01T00:00Z):\n  held.txt — one [review]\n" + MARK_B + "\n")

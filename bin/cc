@@ -796,6 +796,15 @@ NARROW_BRIEF='
 OWNER'"'"'S DESIGN: this row cites an owner message, and the owner has been shown each item above as a narrowing of his design. Build each item as its own commit, its subject naming the item, so he can drop any he declines without touching the rest.'
 dispatch_brief(){   # the --go launch's brief: a repair reserved first, then narrow_brief
   local pr=""
+  # A ROW WITH NO BRIEF STARTS NOTHING: on a row filed on the board and never opened (FILEDROW, from ensure_track),
+  # the go note alone is not a goal, and a worker launched on it had no bounds (raised-a-row-dispatched-without-its-
+  # brief). Any other track takes a go note as its brief, as `cc <repo> <track> --go "<brief>"` always has; a --go
+  # with no note needs a brief either way. The IN FLIGHT block is the tool's own writing and does not count.
+  if [ -n "${FILEDROW:-}" ] || [ -z "$text" ]; then
+    "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
+    sed '/<!-- cc-brief:inflight -->/,/<!-- \/cc-brief:inflight -->/d' "$st/task.md" 2>/dev/null | grep -q '[^[:space:]]' \
+      || { echo "cc: $repo/$track has no brief — put one on the row first: cc board set $repo $track instructions \"<the goal, bounds and what done is>\""; exit 1; }
+  fi
   if [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && pr=$(repair_pr) && [ -n "$pr" ]; then repair_reserve; else pr=""; fi
   narrow_brief "$pr"; }
 # Both doors that write a --go brief come through here: dispatch_brief's launch and a FIX added to a repair already
@@ -1014,11 +1023,11 @@ add_worktree(){  # $1 repo $2 branch $3 wt $4 base -> 0 once $3 is a worktree on
   return 1
 }
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
-  local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base lk
+  local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base lk fresh=""
   valid_name "$repo"; valid_name "$track"
   git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "cc: ~/dev/$repo is not a git repo — tracks need git"; exit 1; }
   git "${GITNH[@]}" -C "$DEV/$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "cc: '$branch' is not a usable branch name"; exit 1; }
-  if [ ! -d "$wt" ]; then
+  if [ ! -d "$wt" ]; then fresh=1
     mkdir -p "$WTBASE/$repo"
     git "${GITNH[@]}" -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")   # outside the lock: the network is the slow part
     gcd=$(git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$repo/.git")
@@ -1037,7 +1046,8 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
   fi
   state_dir_ok "$repo" "$track" || exit 1   # the same walls write_brief uses: this is the mkdir they are checked before
   "$BOARD" json "$repo" >/dev/null 2>&1 || "$BOARD" init "$repo" "$DEV/$repo" "$(default_branch "$DEV/$repo")" >/dev/null
-  [ -n "$("$BOARD" get "$repo" "$track" branch 2>/dev/null)" ] || "$BOARD" add "$repo" "$track" "$track" "" >/dev/null
+  if [ -n "$("$BOARD" get "$repo" "$track" branch 2>/dev/null)" ]; then [ -n "$fresh" ] && FILEDROW=1   # filed on the board, never opened
+  else "$BOARD" add "$repo" "$track" "$track" "" >/dev/null; fi
   "$BOARD" set "$repo" "$track" worktree "$wt"
   [ -n "$("$BOARD" get "$repo" "$track" session_id)" ] || "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"
 }
@@ -1845,6 +1855,14 @@ PY
     && grep -qx '• limit the grant to read-only' <<<"$n1" && [ "$(grep -c '^• ' <<<"$n1")" = 2 ] \
     && grep -q '^post --route r/own narrowing --id narrowing:r/own:' "$T/nw/posts" && grep -q "OWNER'S DESIGN: .*its own commit" "$T/nw/r/own/task.md"; rc=$?
   t "cc --repair: a FIX on an owner-designed row writes the notice, one line per narrowing, posts it to the row's thread, and asks the brief for a commit per item" "$rc"
+  # A ROW WITH NO BRIEF IS NOT LAUNCHED (raised-a-row-dispatched-without-its-brief): the go note alone is no goal.
+  FILEDROW=1 nwgo nobrief '' 'go ahead' 0
+  ! grep -q '[^[:space:]]' "$T/nw/r/nobrief/task.md"; rc=$?
+  t "cc --go: a row whose brief is empty is refused, and the go note is not written as its brief" "$rc"
+  nwgo bare '' '' 0
+  ! grep -q '[^[:space:]]' "$T/nw/r/bare/task.md"; t "…and so is a --go with no note on any row with an empty brief" $?
+  nwgo opened '' 'do this one thing' 0
+  eq "$(cat "$T/nw/r/opened/task.md")" $'\ndo this one thing'; t "…but a track that is not a filed row takes its note as the brief" $?
   nwgo plain 'GOAL: tidy the lander log lines.' "$FIXT" 1
   [ ! -e "$T/nw/r/plain/narrowing-notice.md" ] && [ ! -s "$T/nw/posts" ] && ! grep -q "OWNER'S DESIGN" "$T/nw/r/plain/task.md"; rc=$?
   t "…a FIX repair on a plain row writes none" "$rc"

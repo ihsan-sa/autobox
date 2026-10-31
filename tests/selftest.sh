@@ -1454,6 +1454,8 @@ rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
 # Every case above stopped AT the gate; the raises below go through it, on to `cc-task claim` and the (stub) window,
 # so the track needs the worktree `cc` makes rather than the plain dir the forged-marker cases planted at alice/todo.
 rm -rf "$GH/.cc/worktrees/alice/todo"
+# …and a brief, since `cc` refuses to launch a filed row whose task.md is empty (raised-a-row-dispatched-without-its-brief).
+mkdir -p "$GH/.cc/state/alice/todo"; echo "GOAL: the todo app." > "$GH/.cc/state/alice/todo/task.md"
 # THE CAP IS A TELL-LINE AND THE BOX RAISES IT ITSELF, UNDER THE OWNER'S CEILING (owner 2026-09-08; a member workspace sat capped
 # overnight on 2026-09-09 with its Odoo run queued because a refusal only asked him). Cap $5, ceiling $30, a dispatch
 # asking $8: not refused — today's cap becomes $8 in the ledger, the $8 is charged, and one line goes to -updates and
