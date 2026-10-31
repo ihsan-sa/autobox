@@ -1470,6 +1470,33 @@ def run_selfcheck():
               "while the owner is shown the tick that says it arrived",
               ra == "delivered" and sent6 == [("parked", {"type": "permission", "content": "yes kqmtr"})]
               and len(dm6b.queues["parked"]) == 1)
+        # …NOR THE OWNER'S OWN WORD (owner_word marks it): a pause parks the box's spending, not his channel. His
+        # message is handed to the live seat, and with no seat up it starts one; a member's still queues.
+        sent6.clear()
+        ow = owner_word({"type": "message", "content": "tutor is down", "meta": {"role": "owner"}}, {"role": "owner"})
+        mw = owner_word({"type": "message", "content": "member here", "meta": {"role": "member"}}, {"role": "member"})
+        ro, rm = dm6b.deliver("parked", ow), dm6b.deliver("parked", mw)
+        dm6b.subs["parked"], typer6 = [], dm6b.type_into_pane
+        dm6b.type_into_pane = lambda *a, **k: None
+        rs = dm6b.deliver("parked", dict(ow))
+        dm6b.subs["parked"], dm6b.type_into_pane = [cp], typer6
+        check("deliver: the owner's own message reaches a paused project's seat, and starts it when none is up; a "
+              "member's message to the same paused target is still queued",
+              ro == "delivered" and sent6 == [("parked", ow)] and rm == "paused" and rs == "starting"
+              and dm6b.started == ["parked"] and [p_["content"] for _, p_, _a in dm6b.queues["parked"]]
+              == ["while it is parked", "member here", "tutor is down"])
+        dm6b.queues["parked"].pop(); dm6b.queues["parked"].pop(); dm6b.started.clear()
+        # …and the seat he started takes only his words at hello; the member's waits for `!resume`.
+        dmP = Daemon(use_slack=False); dmP.queues.clear()
+        dmP.queues["parked"].extend([(time.time(), mw, None), (time.time(), ow, None)])
+        aP, bP = socket.socketpair()
+        aP.sendall(json.dumps({"hello": "parked", "pid": 1}).encode() + b"\n"); aP.shutdown(socket.SHUT_WR)
+        dmP.handle_conn(bP)
+        flushedP = [json.loads(l).get("content") for l in aP.makefile("rb").read().splitlines() if l.strip()]
+        aP.close()
+        check("hello: a seat coming up on a paused project is handed the owner's queued message and not a member's, "
+              "which stays queued for resume",
+              flushedP == ["tutor is down"] and [p_["content"] for _, p_, _a in dmP.queues["parked"]] == ["member here"])
         sent6.clear()
         rr = dm6b.deliver("running", {"type": "message", "content": "business as usual"})
         check("deliver: …and another project's session is delivered to exactly as before — per project, never box-wide",
@@ -8427,10 +8454,10 @@ def run_selfcheck():
             dmP.queues["myrepo"].clear(); dmP.queues["myrepo"].append(heldE)
             dmP.on_event(evP("CENGR", "still there?", "5.5"))
             expE = dmP.expire_queues()
-            dmP.on_event(evP("CREPO", "queued?", "5.6"))
+            dmP.on_event(dict(evP("CREPO", "queued?", "5.6"), user="UMEMBER"))   # a member's: the owner's own word goes through a pause
             qE = [p.get("content") for _, p, _ in dmP.queues["myrepo"]]
             check("engine: a paused project keeps its queue — the list adds nothing to it and drops nothing from it, "
-                  "the TTL sweep spares it, and a paused channel off the list still queues its message",
+                  "the TTL sweep spares it, and a paused channel off the list still queues a member's message",
                   not expE and qE[0] == "held for unpause" and len(qE) == 2 and "queued?" in (qE[1] or ""))
         finally:
             globals()["paused"] = real_pausedE

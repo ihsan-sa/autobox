@@ -1943,7 +1943,7 @@ def paused(target):
 
 def stopped():
     """The spend tier is stop (`cc-tier allows pulse` exits 1): nothing the box does on its own may wake a session.
-    Unlike a pause it is box-wide, and the owner's own word still goes through — stop is when he steers — so the
+    Unlike a pause it is box-wide; under both the owner's own word still goes through — stop is when he steers — so the
     payload he wrote carries `steer` (owner_word) and nothing else does. Any other exit, or a cc-tier that cannot
     run, is "go", the reading cc-broker and cc-reconcile take of the same dial."""
     try:
@@ -1953,7 +1953,7 @@ def stopped():
         return False
 
 def owner_word(payload, meta):
-    """Marks a message the owner typed in Slack, so it reaches his seat under tier stop (stopped). A top-level key,
+    """Marks a message the owner typed in Slack, so it reaches his seat under tier stop (stopped) or a pause. A top-level key,
     never meta: meta is shown to the session, and the queue keeps the payload whole, so the mark survives a wait."""
     if meta.get("role") == "owner":
         payload["steer"] = True
@@ -5848,7 +5848,7 @@ class Daemon:
                 hid = first.get("handoff") or None       # a SIDE of an open handoff, not an alias: no join notice, not @-addressable
                 conn = Conn(c, target, {"pid": first.get("pid"), "since": time.time(), "alias": alias, "handoff": hid, "member": member,
                                    "peer": peer and peer[0], "agent_no": first.get("agent_no") or None})
-                stop = stopped() if self.queues.get(target) else False   # asked outside the lock: it is a subprocess
+                stop = (stopped() or paused(target)) if self.queues.get(target) else False   # asked outside the lock: subprocesses
                 with self.lock:
                     self.subs[target].append(conn)
                     q = self.queues.get(target)
@@ -5856,7 +5856,7 @@ class Daemon:
                     # each entry waits for its own alias (main's backlog isn't an orch's); the muted half of a
                     # handoff gets none of it — that goes to the promoted conn once the live session is gone.
                     backlog = [e for e in (q or []) if e[2] == alias] if conn in self.live_conns(target, peers) and alias != DEAF_ALIAS else []
-                    if stop:   # under tier stop a seat coming up hears the owner, and the rest waits
+                    if stop:   # under tier stop or a pause a seat coming up hears the owner, and the rest waits
                         backlog = [e for e in backlog if e[1].get("steer")]
                     for e in backlog:
                         q.remove(e)
@@ -6123,8 +6123,10 @@ class Daemon:
 
     def _deliver(self, target, payload, autostart=True, alias=None):
         # Parked project's message goes to the durable queue (save_queues), exempt from TTL sweep.
-        # `!resume` is a command, never delivered, so it still works. A permission answer still delivers (a modal can't wait).
-        if paused(target) and payload.get("type") != "permission":
+        # `!resume` is a command, never delivered, so it still works. A permission answer still delivers (a modal can't wait),
+        # and so does the owner's own word (owner_word), which may start the seat he wrote to: a pause parks the box's
+        # own spending, never him (2026-10-30, his message to a paused repo sat queued while he waited on it).
+        if paused(target) and payload.get("type") != "permission" and not payload.get("steer"):
             with self.lock:
                 self.queues[target].append((time.time(), payload, alias)); self.save_queues()
             return "paused"
