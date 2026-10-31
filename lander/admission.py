@@ -338,11 +338,17 @@ def config_slots(name: str = "LANDER_SLOTS") -> int | None:
     """`name` (LANDER_SLOTS, or the lane's LANDER_REVIEW_SLOTS) as cc-config reads it, when it is a whole number of at
     least 1 (ASCII digits: '²' is a digit to isdigit()), and no more than the box's cores (leading zeros dropped, and a
     number too long for int(), which refuses past 4300 digits, taken as above them); None when it is unset, not such
-    a number, or cc-config did not answer."""
+    a number, or cc-config did not answer.
+    PAST THE DENY: a worker's cc-green check runs with CC_CONFIG_DENY on the live ~/.cc/config, which kept K from this
+    read and left the host's (5 on the tower, by memory) while the lanes took LANDER_SLOTS' 8, so on 2026-10-31 worker
+    checks waited on slots 1-5 with 6-8 free. Only these two names are read past it, and only a whole number comes
+    back, so no credential does."""
     from lander import jobs as J   # here: jobs imports events, and admission is imported by the runner's every caller
+    env = ({k: v for k, v in os.environ.items() if k != "CC_CONFIG_DENY"}
+           if name in ("LANDER_SLOTS", "LANDER_REVIEW_SLOTS") else None)
     try:
         p = subprocess.run([f"{J.bin_dir()}/cc-config", "get", name], capture_output=True, text=True,
-                           timeout=10, stdin=subprocess.DEVNULL)
+                           timeout=10, stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
     v = p.stdout.strip()

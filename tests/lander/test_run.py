@@ -2454,6 +2454,23 @@ class Admission(unittest.TestCase):
             with mock.patch.object(A, "SLOTS", 9):
                 self.assertEqual(A.slots(now=9001.0), 9)                       # a caller's fixed K wins
 
+    def test_k_reads_past_a_green_runs_config_deny(self):
+        # 2026-10-31: a worker's cc-green check runs with CC_CONFIG_DENY on the live config, so its K fell to the
+        # host's 5 while the lanes took LANDER_SLOTS' 8, and worker checks waited on slots 1-5 with 6-8 free
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        cfg = os.path.join(d, "config")
+        write(d, {"config": "LANDER_SLOTS=7\nLANDER_REVIEW_SLOTS=2\nA_KEY=3\n"})
+        env = {k: v for k, v in os.environ.items() if k != "LANDER_SLOTS"}
+        env.update(CC_CONFIG=cfg, CC_CONFIG_DENY=cfg, CC_BIN=os.path.join(os.path.dirname(A.__file__), "..", "bin"))
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(A, "_read", (None, 0.0)), \
+                mock.patch.object(A, "SLOTS", None), mock.patch.object(A, "host_slots", lambda *a, **k: 4), \
+                mock.patch("os.cpu_count", return_value=8):
+            self.assertEqual(A.slots(now=1000.0), 7)                           # the config's K, not the host's
+            self.assertEqual(A.config_slots("LANDER_REVIEW_SLOTS"), 2)
+            self.assertIsNone(A.config_slots("A_KEY"))                         # any other name stays denied
+            self.assertEqual(os.environ["CC_CONFIG_DENY"], cfg)                # the caller's env is left as it was
+
     def test_a_cc_config_missing_or_timing_out_leaves_the_host_k(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
