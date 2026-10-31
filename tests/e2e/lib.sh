@@ -58,6 +58,13 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case. Red once is run 
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
 export CC_WORKER_SANDBOX=0   # the fence is on for every worker now, and a fixture loop's stub claude lives under $T, which the fence does not bind ("timeout: failed to execute process", #751); cc-sandbox's selfcheck tests the fence itself
+# NO FIXTURE LOOP STARTS A REAL SCOPE. This run's tmux server has the user bus, so every fixture --go scoped itself on
+# the host's systemd --user, and each launch wrote two "Started …scope" lines to syslog (about 3 MB a minute at its
+# worst, 10-26..10-29). CC_WORKER_SCOPE=0 keeps them off the bus; the shim records and refuses any that still asks,
+# and the check at the end of this file turns the run red on one.
+export CC_WORKER_SCOPE=0
+mkdir -p "$T/noscope"; printf '#!/bin/sh\ncase "$*" in *--unit=cc-worker-*) echo "$*" >> "%s/scopes"; exit 1;; esac\nexec /usr/bin/systemd-run "$@"\n' "$T" > "$T/noscope/systemd-run"
+chmod +x "$T/noscope/systemd-run"; export PATH="$T/noscope:$PATH"
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc-room: a fixture --go never queues behind the box's real loops or its five-hour pace, and never takes one of its slots
 # …nor behind the box's LOAD: cc-room also asks the lander's overloaded(), and at a load of twice the cores every
@@ -208,6 +215,8 @@ box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identica
 # in their path, so this looks for the path. The trap removes it either way; this is what turns the run red.
 [ ! -e ~/.cc/members/$REPO ] && ok "…and no ~/.cc/members/$REPO: every member record a case writes stays under its own fixture root" \
   || bad "a case wrote the box's real ~/.cc/members/$REPO: $(find ~/.cc/members/$REPO 2>/dev/null | head -5 | tr '\n' ' ')"
+[ ! -s "$T/scopes" ] && ok "…and no fixture loop asked the host's systemd for a worker scope" \
+  || bad "a fixture loop asked the host's systemd for a worker scope: $(head -3 "$T/scopes" | tr '\n' ' ')"
 box_flags > "$T/flags.after"
 flagdiff=$(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]'); cfgdiff=$(grep '^[<>] config ' <<<"$flagdiff")
 if [ -n "$cfgdiff" ] && ! grep -q -e "$REPO" -e "selftest-$RUN" ~/.cc/config 2>/dev/null; then

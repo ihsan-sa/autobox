@@ -1762,12 +1762,12 @@ CG
   : > "$d/sr.argv"; wsc wo "$d/srb:/usr/bin:/bin" 0
   t '…and with CC_WORKER_SCOPE=0 it is not, but its setsid grandchild runs at nice 19 and IO 7, and loop.log warns' \
     "$(grep -c . "$d/sr.argv")/$(cat "$lh/.cc/state/lp/wo/ni")/$(grep -c 'WARNING: worker runs unscoped (CC_WORKER_SCOPE=0)' "$lh/.cc/state/lp/wo/loop.log")" "0/19 best-effort: prio 7/1"
-  printf '#!/bin/sh\nexit 1\n' > "$d/srb/systemd-run"; wsc wf "$d/srb:/usr/bin:/bin" 1
-  t '…and where there is no user bus, claude still runs, at nice 19 and IO 7, and loop.log warns' \
-    "$(cat "$lh/.cc/state/lp/wf/ni")/$(grep -c 'WARNING: worker runs unscoped (no user systemd bus)' "$lh/.cc/state/lp/wf/loop.log")" "19 best-effort: prio 7/1"
-  printf '#!/bin/sh\ncase "$*" in *" -- echo ok") echo ok; exit 0;; esac\necho "Failed to start transient scope unit" >&2; exit 1\n' > "$d/srb/systemd-run"; wsc wr "$d/srb:/usr/bin:/bin" 1
-  t '…and where the probe passes but the scoped launch fails before claude starts, the same iteration runs it at nice 19 and IO 7, and loop.log warns' \
-    "$(cat "$lh/.cc/state/lp/wr/ni")/$(grep -c 'WARNING: worker runs unscoped (the scoped launch failed before claude started, rc 1: Failed to start transient scope unit)' "$lh/.cc/state/lp/wr/loop.log")" "19 best-effort: prio 7/1"
+  printf '#!/bin/sh\necho "Failed to connect to bus" >&2; exit 1\n' > "$d/srb/systemd-run"; wsc wf "$d/srb:/usr/bin:/bin" 1
+  t '…and where the scoped launch fails before claude starts (no user bus), the same iteration runs it at nice 19 and IO 7, and loop.log warns' \
+    "$(cat "$lh/.cc/state/lp/wf/ni")/$(grep -c 'WARNING: worker runs unscoped (the scoped launch failed before claude started, rc 1: Failed to connect to bus)' "$lh/.cc/state/lp/wf/loop.log")" "19 best-effort: prio 7/1"
+  printf '#!/bin/sh\nexit 0\n' > "$d/srb/systemd-run"; wsc wr "$d/srb:/usr/bin:/bin" 1
+  t '…and a systemd-run that only records a start and exits 0 never swallows claude: it runs at nice 19 and IO 7' \
+    "$(cat "$lh/.cc/state/lp/wr/ni")/$(grep -c 'WARNING: worker runs unscoped (the scoped launch failed before claude started, rc 0' "$lh/.cc/state/lp/wr/loop.log")" "19 best-effort: prio 7/1"
   printf '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; "$@"; exit 1\n' > "$d/srb/systemd-run"; wsc wn "$d/srb:/usr/bin:/bin" 1
   t '…but a scoped launch that fails after claude started is not run again' "$(grep -c 'scoped launch failed' "$lh/.cc/state/lp/wn/loop.log")/$([ -s "$lh/.cc/state/lp/wn/cg" ] && echo ran)" 0/ran
   if timeout 10 systemd-run --user --scope --quiet --collect -- true </dev/null >/dev/null 2>&1; then
@@ -2779,21 +2779,20 @@ fw=$("$BIN/cc-sandbox" probe 2>&1) || stop 2 "cannot get the fence" "the worker 
 # alone on the box a worker gets all of it. The slice's weight is a runtime drop-in (set-property --runtime), gone at
 # the user manager's restart, so wscope sets it again at every launch rather than once. cc-green's ask (green_kick)
 # is started by this loop, outside the scope.
-# wscope probes at each launch, so a bus gone mid-run costs no iteration. Where no scope can be had (no user bus, the
-# probe or the weight refused, or CC_WORKER_SCOPE=0), claude still runs, but at nice 19 and best-effort IO priority 7
+# Where no scope can be had (no user bus, the weight refused, the scoped launch failed, or CC_WORKER_SCOPE=0), claude
+# still runs, but at nice 19 and best-effort IO priority 7
 # (not the idle class, which can starve it) inside the loop's own cgroup, and loop.log says why with a WARNING, so no
 # path runs a worker at the landing checks' weight. That fallback is weaker than the slice: nice ranks only within one
-# cgroup, so it yields to the sessions beside it but not to lander.slice. The probe must see its command run, so a
-# fixture's systemd-run stub that only records a start (e2e
-# step-limit) is no bus (2026-10-21: it swallowed claude). The unit name carries a per-launch nonce, since a
-# usage-limit rerun keeps $i and a scope the last run left behind would refuse the name. If systemd-run still fails
-# after a good probe, the scope's first act is to write $out.go, so a failure with no .go never started claude, and the
-# same iteration runs it in the nice fallback; a claude that started is never run twice.
+# cgroup, so it yields to the sessions beside it but not to lander.slice. No probe scope first: each one wrote two
+# syslog lines per launch. The unit name carries a per-launch nonce, since a usage-limit rerun keeps $i and a scope
+# the last run left behind would refuse the name. The scope's first act is to write $out.go, so a launch that ends
+# with no .go never started claude, whatever its exit (no bus, or a fixture's systemd-run stub that only records a
+# start and swallowed claude, 2026-10-21), and the same iteration runs it in the nice fallback; a claude that started
+# is never run twice.
 # Brief: "everything a worker loop starts ... runs at a lower CPU and IO weight than the lander's lanes and checks".
 WORKER_WEIGHT=20
 wscope(){ local why
   if [ "${CC_WORKER_SCOPE:-1}" != 1 ]; then why="CC_WORKER_SCOPE=0"
-  elif [ "$(timeout 10 systemd-run --user --scope --quiet --collect --slice=worker.slice -- echo ok </dev/null 2>/dev/null)" != ok ]; then why="no user systemd bus"
   elif ! timeout 10 systemctl --user set-property --runtime worker.slice "CPUWeight=$WORKER_WEIGHT" "IOWeight=$WORKER_WEIGHT" </dev/null >/dev/null 2>&1; then why="worker.slice refused its weight"
   else SCOPE=(systemd-run --user --scope --quiet --collect --slice=worker.slice --unit="cc-worker-$repo-$track-$$-$i-$RANDOM$RANDOM" -- sh -c ': > "$0" && exec "$@"' "$out.go"); return; fi
   wnice "$why"; }
@@ -2855,7 +2854,7 @@ while [ $i -lt "$MAXI" ]; do
   ( cd "$WT" && exec "${SCOPE[@]}" env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "${SPENV[@]}" "${GAENV[@]}" "$BIN/cc-nosignal" -- "$BIN/cc-sandbox" "$repo" "$track" -- "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # no wall clock: hung_watch kills it only when its transcript stops growing; cc-sandbox wraps it in bwrap, and only CC_WORKER_SANDBOX=0 execs that line untouched; cc-nosignal: claude and every Bash run it makes signal only what they started
   child=$!; rm -f "$out.hung"; hung_watch "$out.hung" "$out.blind" & hw=$!
   wait "$child"; rc=$?; kill "$hw" 2>/dev/null; wait "$hw" 2>/dev/null; child=""
-  [ "$rc" != 0 ] && [ "${SCOPE[0]}" = systemd-run ] && [ ! -e "$out.go" ] || break   # .go: the scope ran its command, so claude started and is never run twice
+  [ "${SCOPE[0]}" = systemd-run ] && [ ! -e "$out.go" ] || break   # .go: the scope ran its command, so claude started and is never run twice
   wnice "the scoped launch failed before claude started, rc $rc: $(tail -n 1 "$out.err" 2>/dev/null)"; done; rm -f "$out.go"
   hungs=""; [ -s "$out.hung" ] && { hungs=$(cat "$out.hung"); rc=124; }   # killed as hung: the code `timeout` gave, so every reader of rc=124 still holds
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
