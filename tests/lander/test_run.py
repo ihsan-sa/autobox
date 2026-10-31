@@ -384,6 +384,16 @@ class Tree(Env):
         self.assertTrue(os.access(os.path.join(head, "core/bin/tool"), os.X_OK))
         self.assertEqual(git(head, "status", "--porcelain"), "")
 
+    def test_the_check_repo_holds_one_pack_and_never_repacks(self):
+        # a loose object per file, then a commit, detached a full repack in every check of a tree past gc.auto's
+        # 6700 objects, and those held the box's disk busy all day (2026-10-29)
+        run_dir, head = RUN.materialise(self.repo, self.tree)
+        self.addCleanup(lambda: shutil.rmtree(run_dir, ignore_errors=True))
+        objs = git(head, "count-objects", "-v").splitlines()
+        self.assertEqual((objs[0], objs[3]), ("count: 1", "packs: 1"))   # the one loose object is the commit
+        self.assertEqual(git(head, "config", "gc.auto"), "0")
+        self.assertEqual(git(head, "config", "maintenance.auto"), "false")
+
     def test_the_base_tree_rides_along_as_a_ref_so_a_check_can_diff_against_main(self):
         # the guard's differential (tests/guard-replay.sh) reads main's bin/cc-guard out of this ref: the check repo
         # has no origin/main, so without it every landing skipped the differential (#1221's guard cut landed so)

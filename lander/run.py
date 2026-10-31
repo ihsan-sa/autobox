@@ -166,8 +166,8 @@ class Unrunnable(RuntimeError):
 
 def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: str = "") -> tuple:
     """-> (run_dir, head_dir). Raises Unrunnable when the tree cannot be written out exactly. base_tree, when it is
-    another tree: the head repo also holds it as the commit BASE_REF (only the objects the head lacks are copied in,
-    none written out), so a check can compare against main without an origin/main (tests/guard-replay.sh)."""
+    another tree: the head repo also holds it as the commit BASE_REF (its objects are copied in, none written out), so
+    a check can compare against main without an origin/main (tests/guard-replay.sh)."""
     if not re.fullmatch(r"[0-9a-f]{40}", tree or ""):
         raise Unrunnable(f"not a tree id: {tree!r}")
     if base_tree and not re.fullmatch(r"[0-9a-f]{40}", base_tree):
@@ -177,6 +177,14 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
         gates = tempfile.mkdtemp(prefix=f"cc-land.gates.{label}.", dir=run_dir)
         head = os.path.join(gates, "head")
         os.mkdir(head)
+        # the new repo's own git reads no config but these two and its own, and no attributes of anyone's. Its own
+        # turns off gc, since in a tree of more than gc.auto's 6700 objects the commit below detached a full repack
+        # in every check (the box's disk sat 75% busy, 2026-10-29), and fsync, which a scratch repo has no use for
+        g = ["git", "-C", head, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
+        henv = G.blind_env()
+        subprocess.run(g + ["init", "-q", "--template="], env=henv, check=True, capture_output=True)
+        with open(os.path.join(head, ".git", "config"), "a") as f:
+            f.write("[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n[core]\n\tfsync = none\n")
         with G.borrowed(repo_root) as scratch:
             # borrowed: the checkout's attributes, config (a filter's smudge, run as the lander) and replace refs
             # are not read; its objects are, through alternates, and write-tree below proves what came out of them
@@ -191,12 +199,18 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
             # runnable)
             ls = subprocess.run(["git", "ls-tree", "-r", "-z", tree], env=genv, cwd=scratch, capture_output=True,
                                 text=True)
+            # the tree's objects (and the base's) go in as one pack, so `add` below finds each blob there and only
+            # hashes the file, where it wrote one loose object per file
+            with subprocess.Popen(["git", "pack-objects", "--revs", "--stdout", "-q"], env=genv, cwd=scratch,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as pack:
+                pack.stdin.write("".join(f"{t}\n" for t in (tree, base_tree) if t).encode())
+                pack.stdin.close()
+                idx = subprocess.run(g + ["index-pack", "--stdin"], env=henv, stdin=pack.stdout, capture_output=True)
+                err = pack.stderr.read() + idx.stderr
+            if pack.returncode or idx.returncode:
+                raise Unrunnable(f"could not copy the tree's objects in: {err.decode(errors='replace')[-300:]}")
         if ls.returncode:
             raise Unrunnable(f"could not list the tree: {ls.stderr.strip()[-300:]}")
-        # the new repo's own git reads no config but these two, and no attributes of anyone's
-        g = ["git", "-C", head, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
-        henv = G.blind_env()
-        subprocess.run(g + ["init", "-q", "--template="], env=henv, check=True, capture_output=True)
         subprocess.run(g + ["add", "-A", "-f"], env=henv, check=True, capture_output=True)
         for ent in ls.stdout.split("\0"):
             meta, _, path = ent.partition("\t")
@@ -208,14 +222,6 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
             raise Unrunnable(f"the tree written out is {got or 'none'}, not {tree}")
         subprocess.run(g + ["commit", "-qm", f"tree {tree}", "--no-verify"], env=henv, check=True, capture_output=True)
         if base_tree and base_tree != tree:
-            with G.borrowed(repo_root) as scratch:
-                benv = dict(G.blind_env(), GIT_DIR=scratch, GIT_NO_REPLACE_OBJECTS="1")
-                pack = subprocess.run(["git", "pack-objects", "--revs", "--stdout", "-q"], env=benv, cwd=scratch,
-                                      input=f"{base_tree}\n^{tree}\n".encode(), capture_output=True)
-            if pack.returncode:
-                raise Unrunnable(f"could not copy the base tree in: {pack.stderr.decode(errors='replace')[-300:]}")
-            subprocess.run(g + ["index-pack", "--stdin"], env=henv, input=pack.stdout, check=True,
-                           capture_output=True)
             base = subprocess.run(g + ["commit-tree", base_tree, "-m", f"base {base_tree}"], env=henv, check=True,
                                   capture_output=True, text=True).stdout.strip()
             subprocess.run(g + ["update-ref", BASE_REF, base], env=henv, check=True, capture_output=True)
