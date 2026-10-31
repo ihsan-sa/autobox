@@ -44,6 +44,10 @@ the box's own permission seat fresh from its brief and its journal's START HERE 
 no prompt, argument or model. cc-perms decides everything else: it lets only this unit and the restore unit call it
 (by cgroup), does nothing while a seat is live, waits longer between tries for a seat that keeps going down (never leaving it
 down), and tells the owner once, with a line to paste, when it refuses or starts backing off. The tick logs each outcome to decisions.log on a change only, and
+A perms seat that is up but stuck on a permission prompt is down in all but name: each tick runs `cc-perms-dialog tick`,
+which answers the prompt through a tools-free judge, and when it says the prompt box stood unchanged 10 minutes
+(exit 3) the tick closes window perms so the revive above starts it fresh. A usage-limit wait is not a prompt here.
+The unit's TimeoutStartSec (300) covers that call's own cap of 120 s plus the rest of the tick.
 CC_RECOVER_PERMS=off stops both callers, and a host ~/.cc/roles says is not the hub asks nothing. Bring-up runs in a unit of its own, which cc-perms refuses, so it leaves perms
 to the next tick and says so.
 A healthy tick rewrites the file, so it is never older than a minute or two while the box runs. A tick drops
@@ -617,6 +621,15 @@ def revive_perms():
     return rc, (out.splitlines() or [""])[-1][:240]
 
 
+def perms_stuck():
+    """The reason perms is stuck on a prompt, from `cc-perms-dialog tick` (which answers what it can), or None."""
+    ws = windows()
+    if cfg("CC_RECOVER_PERMS", "on") == "off" or not ws or not perms_live(ws):
+        return None
+    rc, out = run([os.path.join(BIN, "cc-perms-dialog"), "tick"], timeout=120)   # judge 60 s + card 20 s + tmux
+    return (out.splitlines() or ["stuck"])[-1][:240] if rc == 3 else None
+
+
 def tick():
     st = load("detector.json", {})
     t = now()
@@ -657,6 +670,10 @@ def tick():
         decide("tmux server back")
     # perms: a seat that went down outside a full restore comes back here, on the hub only (see PERMS)
     if status != "tmux-down" and not hub:
+        why = perms_stuck()
+        if why:   # down in all but name: close its window so cc-perms revive starts it fresh
+            tmux("kill-window", "-t", "main:=perms")
+            decide(f"perms stuck: {why}; window closed for cc-perms revive")
         pr = revive_perms()
         if pr is not None and (pr[0] == 0 or st.get("perms_said") != pr[1]):
             st["perms_said"] = pr[1]
@@ -1726,6 +1743,18 @@ def selfcheck():
         os.remove(f"{d}/windows.tsv"); tick(); clock[0] += 60
         check("tick: CC_RECOVER_PERMS=off, a host that is not the hub, or the tmux server down, asks nothing of cc-perms",
               n_off == 3 and n_hub == 3 and len(perms_calls(d)) == 3)
+        # 5d. perms stuck on a prompt: cc-perms-dialog answers what it can; its exit 3 closes the window for the revive
+        d = fixture(); live_box(d); globals()["net_probe"] = lambda: "up"
+        with open(f"{BIN}/cc-perms-dialog", "w") as f:
+            f.write(f"#!/bin/sh\necho dialog >> {d}/calls\n[ -f {d}/stuck ] && {{ echo 'the prompt still stood after 10 min'; exit 3; }}\nexit 0\n")
+        os.chmod(f"{BIN}/cc-perms-dialog", 0o755)
+        tick(); clock[0] += 60
+        calm = open(f"{d}/calls").read()
+        open(f"{d}/stuck", "w").close(); tick(); clock[0] += 60
+        calls = open(f"{d}/calls").read()
+        check("tick: a live perms gets cc-perms-dialog each tick; a stuck verdict closes main:perms and is logged with its reason",
+              calm.count("dialog") == 1 and "kill-window" not in calm and "tmux|kill-window|tmux|-t|tmux|main:=perms|" in calls
+              and "perms stuck: the prompt still stood after 10 min; window closed" in open(path("decisions.log")).read())
 
         # 6. tmux down: cc-boot at 3 min, reboot due at 15
         d = fixture(); live_box(d); os.environ["CC_RECOVER_REBOOT"] = "off"
