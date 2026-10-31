@@ -22,7 +22,8 @@
         "green", "red", "pending", "starved" (every red is an Actions job GitHub cancelled because no hosted runner
         took it, and none is still running; their run ids go into the caller's `runs` list, never parsed from
         detail), "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
-        (unreadable). The lane merges on green or none only.
+        (unreadable). The lane merges on green or none only. A Netlify deploy preview's check (its link on
+        app.netlify.com) is not CI and is left out.
     workflows_on(root, paths) -> bool: any of the base tree's workflow `paths` is one GitHub lists as active; the tree's
         own answer (any paths at all) when GitHub cannot be read. Cached per repo for WORKFLOWS_TTL.
     rerun(root, run_id) -> (ok, text): `gh run rerun <run_id> --failed [-R <slug>]`, which reruns the cancelled jobs.
@@ -396,6 +397,9 @@ def update_branch(root, pr, head, token=None):
 
 
 CI_GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+# a deploy preview's checks say whether the host built the site, not whether the change is sound: lessons' Netlify
+# previews all failed in 0 s once the team's build minutes ran out (10-30) and held every lessons PR as red CI
+PREVIEW_RE = re.compile(r"^https://app\.netlify\.com/")
 
 
 def ci_state(root, pr, pin, token=None, workflows=False, runs=None):
@@ -411,7 +415,8 @@ def ci_state(root, pr, pin, token=None, workflows=False, runs=None):
         return "", why
     if (j.get("headRefOid") or "") != pin:
         return "pending", f"GitHub reports head {(j.get('headRefOid') or '?')[:12]}, not {pin[:12]}"
-    rows = [r for r in j.get("statusCheckRollup") or [] if isinstance(r, dict)]
+    rows = [r for r in j.get("statusCheckRollup") or [] if isinstance(r, dict)
+            and not PREVIEW_RE.match(r.get("detailsUrl") or r.get("targetUrl") or "")]
     if not rows:
         return ("unregistered", "no check has registered yet, though the base has workflows") if workflows \
             else ("none", "")

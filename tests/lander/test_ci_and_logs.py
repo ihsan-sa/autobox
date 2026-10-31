@@ -367,6 +367,11 @@ class CIState(unittest.TestCase):
                  ({"headRefOid": pin, "statusCheckRollup": [ctx("s", "EXPECTED")]}, "pending"),
                  # GitHub's checks belong to another head than the one the merge pins: they say nothing about it
                  ({"headRefOid": "b" * 40, "statusCheckRollup": [run_("t")]}, "pending"),
+                 # a Netlify deploy preview is the host's build, not CI: its failure holds nothing
+                 ({"headRefOid": pin, "statusCheckRollup": [
+                     run_("t"), run_("Pages changed", conclusion="FAILURE", url="https://app.netlify.com/sites/s/d/1"),
+                     {**ctx("netlify/s/deploy-preview", "FAILURE"), "targetUrl": "https://app.netlify.com/sites/s/d/1"}]},
+                  "green"),
                  (None, "")]
         for j, want in cases:
             with self.subTest(j=j), self.facts(j):
