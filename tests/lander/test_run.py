@@ -1780,6 +1780,33 @@ class HostAndRunners(Env):
         self.assertEqual((r.status, r.extra["why"]), (T.UNRUNNABLE, "stopped at its cap"))
         self.assertEqual(os.listdir(os.environ["TMPDIR"]), [])
 
+    def test_rm_run_removes_the_cc_land_t_dir_its_tmp_links_to(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        run_dir, t = os.path.join(root, "run"), os.path.join(root, "cc-land.t.x")
+        os.mkdir(run_dir)
+        os.mkdir(t)
+        open(os.path.join(t, "f"), "w").close()
+        os.symlink(t, os.path.join(run_dir, "tmp"))
+        RUN.rm_run(run_dir)
+        self.assertEqual(os.listdir(root), [])
+
+    def test_rm_run_leaves_a_tmp_link_to_anywhere_else_and_says_so(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        run_dir = os.path.join(root, "run")
+        os.mkdir(run_dir)
+        for other in (os.path.join(root, "keep"), os.path.join(root, "sub", "cc-land.t.x")):   # wrong name, wrong dir
+            os.makedirs(other)
+            open(os.path.join(other, "f"), "w").close()
+            os.symlink(other, os.path.join(run_dir, "tmp"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                RUN.rm_run(run_dir)
+            self.assertEqual((os.listdir(other), os.path.exists(run_dir)), (["f"], False))
+            self.assertIn("so it was left", err.getvalue())
+            os.mkdir(run_dir)
+
     def test_a_host_checks_tmpdir_leaves_room_for_cc_sandboxs_fence_socket(self):
         # cc-sandbox's fence case: a HOME at mktemp -d $TMPDIR/ccsbxfence-XXXXXX, its egress proxy's socket at
         # $fh/.cc/sandbox/.egress/<16hex>/sock. The lander's TMPDIR here is as long as this box's (~/.cc/tmp)

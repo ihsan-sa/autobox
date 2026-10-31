@@ -766,8 +766,14 @@ def host_tmp(run_dir):
 
 
 def rm_run(run_dir):
-    """run_dir and its host checks' TMPDIR."""
-    shutil.rmtree(host_tmp(run_dir), ignore_errors=True)
+    """run_dir and its host checks' TMPDIR: the cc-land.t.* beside it that run_dir/tmp links to (materialise). A link
+    anywhere else is left, and said on stderr (perms' read of #2088: rm_run never follows a link it did not make)."""
+    t = host_tmp(run_dir)
+    if t != os.path.join(run_dir, "tmp"):
+        if os.path.dirname(t) == os.path.dirname(run_dir) and os.path.basename(t).startswith("cc-land.t."):
+            shutil.rmtree(t, ignore_errors=True)
+        else:
+            print(f"lander: {run_dir}/tmp links to {t}, not a cc-land.t.* beside it, so it was left", file=sys.stderr)
     shutil.rmtree(run_dir, ignore_errors=True)
 
 
