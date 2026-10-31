@@ -5,7 +5,9 @@
   cc-recover save             save the live set once and print it
   cc-recover restore [--boot] bring back every saved session that is not live: resumed on its own conversation,
                               then handed a catch-up turn (cc-recover-restore.service runs it at every boot);
-                              a session whose project `cc-pause is <repo>` calls paused is left down and logged
+                              a session whose project `cc-pause is <repo>` calls paused is left down and logged,
+                              a worker handed to `cc-pause keep` so `cc-pause off` starts it; a track cc refuses
+                              as landed is left down, not counted as failed
   cc-recover bringup [--except <repo>...]
                               the owner's "bring it all back up", in one detached run (a transient user unit; --here
                               runs it in place): see BRING-UP below
@@ -1019,8 +1021,13 @@ def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=Tr
         if paused(rec["repo"]):   # a paused project spends nothing the box starts on its own (cc-pause)
             already.append(w)
             held.append(w)
-            log(logname, f"{w}: {rec['repo']} is paused — left down")
-            continue
+            # cc-pause off restarts only the loops it stopped, and this one died before the pause, so hand it over
+            kept = rec["kind"] == "worker" and run([os.path.join(BIN, "cc-pause"), "keep", *launch_argv(rec)[1:]], env=env)[0] == 0
+            if kept or rec["kind"] != "worker" or paused(rec["repo"]):
+                log(logname, f"{w}: {rec['repo']} is paused — left down{', cc-pause off starts it' if kept else ''}")
+                continue
+            already.remove(w)
+            held.remove(w)   # the pause lifted between the check and keep: launch it like any other
         e = dict(env)
         if rec["kind"] in ("seat", "orch") and rec.get("sid"):
             try:
@@ -1031,6 +1038,9 @@ def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=Tr
                 continue
         rc, out = run(launch_argv(rec), env=e, timeout=110 if rec["kind"] == "worker" else 90)
         log(logname, f"{w}: {rec['kind']} launch rc={rc}{' sid=' + rec['sid'] if rec.get('sid') else ''} {out[-160:]}")
+        if rc != 0 and f"{rec['repo']}/{rec.get('track')} has landed — no session opened" in out:   # cc refuses a finished row: nothing to bring back, and nothing failed
+            already.append(w)
+            continue
         if rc != 0:
             failed.append(w)
             continue
@@ -1359,7 +1369,8 @@ def selfcheck():
             f.write("#!/bin/sh\necho \"$4\"\n")
         with open(f"{BIN}/cc-pause", "w") as f:   # paused when the fixture made {d}/paused-<repo>; `off` removes it and is logged
             f.write(f"#!/bin/sh\ncase \"$1\" in\n is) [ -f {d}/paused-$2 ];;\n list) for f in {d}/paused-*; do [ -f \"$f\" ] && echo \"${{f##*/paused-}}\"; done; exit 0;;\n"
-                    f" off) printf '%s|' cc-pause \"$@\" >> {d}/calls; echo >> {d}/calls; rm -f {d}/paused-$2;;\nesac\n")
+                    f" off) printf '%s|' cc-pause \"$@\" >> {d}/calls; echo >> {d}/calls; rm -f {d}/paused-$2;;\n"
+                    f" keep) [ -f {d}/paused-$2 ] && printf '%s|' cc-pause \"$@\" >> {d}/calls && echo >> {d}/calls;;\nesac\n")
         for x in os.listdir(BIN):
             os.chmod(f"{BIN}/{x}", 0o755)
         return d
@@ -1759,6 +1770,34 @@ def selfcheck():
         check("restore: a paused project stays down while the rest come back",
               not any(c.startswith("cc|m1|") for c in calls) and any(c.startswith("cc|r1|") for c in calls)
               and "m1 is paused" in open(path("restore.log")).read())
+        # a worker of a paused project is handed to cc-pause, whose `off` restarts only what it stopped itself
+        # (10-30: 12 workers that died in a freeze sat down 3 h after the pause lifted); a session is not
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(f"{d}/paused-r1", "w").close()
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: a paused project's worker is kept for cc-pause off, its sessions are not",
+              [c for c in calls if c.startswith("cc-pause|keep|")] == ["cc-pause|keep|r1|job|--go||--loop|3|--budget|8|--resume-last|"]
+              and "r1/job: r1 is paused — left down, cc-pause off starts it" in open(path("restore.log")).read())
+        # the pause lifts between restore's check and its keep: the worker is launched, not stranded
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(f"{d}/paused-r1", "w").close()
+        with open(f"{BIN}/cc-pause", "w") as f:
+            f.write(f"#!/bin/sh\ncase \"$1\" in\n is) [ -f {d}/paused-$2 ];;\n keep) rm -f {d}/paused-$2; exit 1;;\nesac\n")
+        restore(boot=True)
+        check("restore: a worker whose pause lifted before keep is launched",
+              any(c.startswith("cc|r1|job|") for c in open(f"{d}/calls").read().splitlines()))
+        # a track cc refuses because it has landed is not a failure (10-30: two landed tracks failed the restore unit)
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        with open(f"{BIN}/cc", "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s|' cc \"$@\" >> {d}/calls; echo >> {d}/calls\n"
+                    "[ \"$2\" = fix ] && { echo \"cc: $1/$2 has landed — no session opened\" >&2; exit 1; }; exit 0\n")
+        rc = restore(boot=True)
+        check("restore: a track that has landed is left down and the restore still exits 0",
+              rc == 0 and "cc|r1|fix|" in open(f"{d}/calls").read().splitlines() and "did not come up" not in open(path("restore.log")).read())
         # an orch that ended on purpose after the set was saved stays down (10-30: dispatch@hive-lite relaunched on its old sid)
         d = fixture(); live_box(d); save({})
         open(f"{d}/windows.tsv", "w").write("box\t160\n")

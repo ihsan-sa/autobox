@@ -20,6 +20,8 @@
 #   cc-pause status [<repo>]                          one line per paused project, or just this one
 #   cc-pause list                                     paused repo names, one per line (nothing when none are)
 #   cc-pause children <repo>                          every project declared under it, one per line
+#   cc-pause keep <repo> <track> <cc args…>           while paused, `off` also runs `cc <repo> <track> <cc args…>`: cc-recover's
+#                                                     restore hands it a worker that died before the pause
 #   cc-pause selfcheck                                pause, resume, the reboot case and the cascade
 #
 # WHAT IS UNDER IT GOES WITH IT (owner, 2026-09-05, after a parked project's tool repository kept spending).
@@ -67,6 +69,9 @@ SKIPPERS="cc-reconcile (sweep and wake), cc-broker, cc-publish, board nags, the 
 # `is` takes a TARGET, not only a repo: cc-broker keys on `repo/track`, cc-reconcile's wake on `repo@alias`, and every one
 # of them means the same project. Deriving the repo here is the whole reason there is one command to ask.
 repo_of(){ local t="${1:-}"; t="${t%%/*}"; echo "${t%%@*}"; }
+# keep and off hold this per project, so a kept worker is never written back after off has read and removed the flag
+lock(){ mkdir -p "$STATE/$1"; exec {LOCKFD}>"$STATE/$1/paused.lock"; flock "$LOCKFD"; }
+
 paused(){ local r; r=$(repo_of "${1:-}"); [ -n "$r" ] && [ -e "$(flag "$r")" ]; }
 
 # A running loop's own command line, so `off` can put back exactly what `on` stopped. The supervisor is the
@@ -250,11 +255,16 @@ cmd_off(){
   esac; done
   msg=$(valid_repo "$repo") || die "$msg"
   local f; f=$(flag "$repo")
-  local started=0 since="" failed=()
+  local started=0 since="" failed=() was=""
+  lock "$repo"
   if paused "$repo"; then
+    was=1
     mapfile -t cmds < <(jq -r '.loops[]? // empty' "$f" 2>/dev/null)
     since=$(jq -r '.at // ""' "$f" 2>/dev/null)
     rm -f "$f"   # the flag goes before the re-dispatch: cc-loop's own pre-flight would refuse a worker for a repo still paused
+  fi
+  exec {LOCKFD}>&-
+  if [ -n "$was" ]; then
     for c in "${cmds[@]}"; do
       [ -n "$c" ] || continue
       if eval "\"$B/cc\" $c" >/dev/null 2>&1; then started=$((started+1)); else failed+=("cc $c"); fi
@@ -284,6 +294,17 @@ cmd_off(){
   [ "$q" -gt 0 ] && echo "$q landing job(s) waited for this: \`cc-land work\` lands them."
   [ ${#failed[@]} -gt 0 ] && printf 'could not restart: %s\n' "${failed[@]}" >&2
   return 0
+}
+
+cmd_keep(){   # <repo> <track> <cc args…>; exit 1 when not paused, so the caller starts it itself
+  local repo="${1:-}" track="${2:-}" f c msg; shift
+  msg=$(valid_repo "$repo") || die "$msg"
+  f=$(flag "$repo"); lock "$repo"
+  paused "$repo" || return 1
+  # a loop `on` stopped is already here under its own quoting: a second line would make `off` start it twice
+  c=$(printf '%q ' "$repo" "$track"); jq -e --arg p "$c" 'any(.loops[]?; startswith($p))' "$f" >/dev/null && return 0
+  c=$(printf '%q ' "$repo" "$@")
+  jq --arg c "${c% }" '.loops = ((.loops // []) + [$c])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
 cmd_status(){
@@ -377,6 +398,21 @@ STUB
   t "off re-dispatches exactly what on stopped, options and all" \
     "$(cat "$h/cc.calls" 2>/dev/null)" "$R w1 --go  --loop 3 --budget 8 --model claude-opus-5"
   kill "$op" 2>/dev/null; wait "$op" 2>/dev/null
+
+  # A worker already dead when the pause began (a freeze, then a restore under the pause) has no loop to record,
+  # so restore hands it over with `keep` and `off` starts it with the rest (2026-10-30: 12 workers sat down 3 h).
+  box keep
+  P keep $R w2 --go "" --loop 1; t "keep on a project that is not paused says so" "$?" 1
+  P on $R > /dev/null 2>&1
+  P keep $R w2 --go "" --loop 1 --resume-last
+  P off $R > /dev/null 2>&1
+  t "off also starts a worker that restore kept while paused" "$(cat "$h/cc.calls" 2>/dev/null)" "$R w2 --go  --loop 1 --resume-last"
+
+  box keeptwice
+  mkdir -p "$h/.cc/state/$R"
+  printf '{"at":"2020-05-05T05:05:05Z","loops":["%s w1 --go \\"\\" --loop 3"]}\n' "$R" > "$h/.cc/state/$R/paused"
+  P keep $R w1 --go "" --loop 3 --resume-last
+  t "keep adds nothing for a loop the pause already recorded" "$(jq '.loops | length' "$h/.cc/state/$R/paused")" 1
 
   box twice
   mkdir -p "$h/.cc/state/$R"
@@ -523,9 +559,10 @@ case "${1:-}" in
   off)       shift; cmd_off "$@";;
   is)        paused "${2:-}";;   # exit status IS the answer: no output, so a caller can `if cc-pause is "$t"; then`
   status)    shift; cmd_status "${1:-}";;
+  keep)      shift; cmd_keep "$@";;
   children)  first_visit "${2:-}"; descendants "${2:-}";;   # every project under this one, each once
   list)      for f in "$STATE"/*/paused; do [ -e "$f" ] && basename "$(dirname "$f")"; done; true;;
   selfcheck) selfcheck;;
-  ""|-h|--help) sed -n '2,35p' "$0"; exit 0;;
-  *)         die "unknown command '${1}' — cc-pause on|off|is|status|list|children|selfcheck";;
+  ""|-h|--help) sed -n '2,37p' "$0"; exit 0;;
+  *)         die "unknown command '${1}' — cc-pause on|off|is|keep|status|list|children|selfcheck";;
 esac
