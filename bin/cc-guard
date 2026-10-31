@@ -293,6 +293,18 @@ FSTUB
   if [ "$hit" = 2 ] && [ "$mine" = 0 ] && [ "$miss" = 0 ] && kill -0 "$mark" 2>/dev/null; then r=0; else r=1; fi
   ok "a worker's pkill -f is refused when it resolves outside its subtree, allowed when it resolves inside it, and allowed when it resolves to nothing" $r
 
+  # 6b. A PATTERN HIT GONE BEFORE THE FENCE LOOKS IS NOTHING TO REFUSE (10-30: a member's `pkill -f build_site.py`, with no
+  #     such process, refused twice on a pid that had already vanished). A pgrep on PATH reports a pid this case reaped,
+  #     for this pattern alone; the pkill, the xargs hunt and the substitution pass, and a kill naming that pid is still refused.
+  gm=gone$$; mkdir -p "$T/pg6b"; sleep 0 & gp=$!; wait "$gp"
+  printf '#!/bin/sh\ncase "$*" in *%s*) echo %s;; *) exec /usr/bin/pgrep "$@";; esac\n' "$gm" "$gp" > "$T/pg6b/pgrep"; chmod +x "$T/pg6b/pgrep"
+  r=0
+  for x in "pkill -f $gm" "pgrep -f $gm | xargs kill" "kill \$(pgrep -f $gm)"; do
+    [ "$(g Bash "{\"command\":\"$x\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$ PATH="$T/pg6b:$PATH")" = 0 ] || { r=1; echo "      $x was refused on a hit that had gone"; }
+  done
+  [ "$(g Bash "{\"command\":\"kill $gp\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$ PATH="$T/pg6b:$PATH")" = 2 ] || { r=1; echo "      kill of the gone pid itself was let through"; }
+  ok "a pattern kill whose pgrep hit has gone by the time the fence looks passes, while a kill naming that gone pid is still refused" $r
+
   # 7. HUNT, THEN KILL. `pgrep -f <name> | xargs kill -9` is what the worker actually typed on 11:15Z, and
   #    it is the shape the target loop cannot see: the kill carries no pid of its own. Its own marked
   #    process, asked about from both roots, plus a feed that is no pgrep at all. The mark is minted per run
@@ -7183,6 +7195,11 @@ case "$tool" in
         kabove "$1" && never "killing pid $1 ($2) — that is this session's own process or one above it, and a worker that ends one ends itself"
         kdesc "$1" "$me" || kcwd "$1" || never "killing pid $1 ($2) — it is outside this worker's own process subtree and is no detached run standing in its worktree, so it is somebody else's; a worker ends only what it started"
       }
+      # A HIT THAT HAS ALREADY GONE IS NO TARGET. kfence refuses a gone pid because a NAMED pid could be anybody's by the
+      # time the signal lands; a pattern is resolved again by pkill (or the feeding pgrep) when the command runs, so a pid
+      # it found here and lost a moment later is never signalled. Fencing it refused `pkill -f build_site.py` on every
+      # try with no build_site.py running, naming a short-lived process that matched the pattern and was gone (09-20, 10-10, 10-30).
+      kgone(){ [ ! -d "/proc/$1" ]; }
       me=$(kroot) || me=""
       [ -n "$me" ] || never "killing a process — this worker cannot find its own session process, so it cannot tell its children from anybody else's"
       kresolve(){   # $1 = a `pgrep …` invocation, $2 = how to name it. Fences everything it would find.
@@ -7196,7 +7213,7 @@ case "$tool" in
         case "$pat" in *'$'*|*'`'*) return 1;; esac    # named by a variable: unresolvable
         if [ -n "$full" ]; then hits=$(pgrep -f -- "$pat" 2>/dev/null) || hits=""
         else hits=$(pgrep -- "$pat" 2>/dev/null) || hits=""; fi
-        for x in $hits; do kfence "$x" "$why"; done     # no match = nothing to refuse
+        for x in $hits; do kgone "$x" || kfence "$x" "$why"; done     # no match = nothing to refuse
         return 0
       }
       # HUNT, THEN KILL — the incident's own shape, and the one the target loop below cannot see. In
@@ -7268,7 +7285,7 @@ case "$tool" in
           if [ "$v" = killall ]; then hits=$(pgrep -x -- "$pat" 2>/dev/null) || hits=""
           elif [ -n "$fflag" ]; then hits=$(pgrep -f -- "$pat" 2>/dev/null) || hits=""
           else hits=$(pgrep -- "$pat" 2>/dev/null) || hits=""; fi
-          for x in $hits; do kfence "$x" "$v $pat"; done   # no match = nothing to refuse
+          for x in $hits; do kgone "$x" || kfence "$x" "$v $pat"; done   # no match = nothing to refuse
         fi
       done < <(grep -oE "$AT"'([^ ]*/)?(kill|pkill|killall)[[:space:]]+[^;&|]*' <<<"$cmd")
     fi
