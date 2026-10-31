@@ -38,16 +38,16 @@ def selfcheck():
     base = tempfile.mkdtemp(prefix="cc-usage-poll-sc.")
     secret = "sk-ant-oat01-SELFCHECK-NOT-A-TOKEN"
     os.makedirs(f"{base}/claude")
-    keep = {k: os.environ.get(k) for k in ("CC_USAGE_DIR", "CLAUDE_CONFIG_DIR", "CC_USAGE_TIMEOUT")}
+    keep = {k: os.environ.get(k) for k in ("CC_USAGE_DIR", "CLAUDE_CONFIG_DIR", "CC_USAGE_TIMEOUT", "WORKER_CLAUDE_LOGIN_COPY")}
     errs = io.StringIO()
 
     def creds(expires_in):
         json.dump({"claudeAiOauth": {"accessToken": secret, "expiresAt": int((time.time() + expires_in) * 1000)}},
                   open(f"{base}/claude/.credentials.json", "w"))
 
-    def run():
+    def run(*a):
         with contextlib.redirect_stderr(errs), contextlib.redirect_stdout(errs):
-            return poll()
+            return poll(*a)
 
     def read(name):
         try:
@@ -129,6 +129,22 @@ def selfcheck():
         creds(-60)
         k = len(seen)
         t("an expired token is a failure and asks nothing", (run(), len(seen) - k), (1, 0))
+        # PLANS: each listed copy of a plan's login is read into a file of its own, and the box's stays as it was
+        with contextlib.suppress(OSError):
+            os.unlink(f"{base}/usage/error.json")   # this case's own start: no error.json left by another
+        creds(3600)
+        cp = f"{base}/claude-login.max1.json"
+        shutil.copy(f"{base}/claude/.credentials.json", cp)
+        os.environ["WORKER_CLAUDE_LOGIN_COPY"] = f"{cp} {base}/gone.json"
+        t("PLANS: copies() lists what cc-config lists, in order", copies(), [cp, f"{base}/gone.json"])
+        before = open(f"{base}/usage/now.json").read()
+        reply[0] = (200, json.dumps({"seven_day": {"utilization": 40, "resets_at": None}}), {})
+        t("PLANS: a copy's read lands in login-<name>.json and leaves now.json alone",
+          (run(cp, "login-claude-login.max1"), (read("login-claude-login.max1.json") or {}).get("seven_day"),
+           open(f"{base}/usage/now.json").read()), (0, {"used_percentage": 40.0, "resets_at": None}, before))
+        t("PLANS: a missing copy fails into its own error file, not error.json",
+          (run(f"{base}/gone.json", "login-gone"), (read("login-gone.error.json") or {}).get("error"),
+           os.path.exists(f"{base}/usage/error.json")), (1, "FileNotFoundError", False))
         files = "".join(open(os.path.join(dp, f)).read() for dp, _, fs in os.walk(f"{base}/usage") for f in fs)
         t("the token is never printed or written", secret in errs.getvalue() + files, False)
     finally:

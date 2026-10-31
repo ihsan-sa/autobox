@@ -509,8 +509,24 @@ def selfcheck():
            "same-owner control",
            rcs5 == ["00"] and reserved5["claim"]["phase"] == "repair"
            and not same_owner(reserved5["claim"]["owner"], owner())
-           and while_alive.returncode != 0 and once_gone.returncode != 0
-           and answer(run(*reserve2)).get("launch") is False)
+           and while_alive.returncode != 0 and once_gone.returncode != 0)
+        # D5b: …but THAT DEAD LAUNCH'S HEAD IS LAUNCHED AGAIN by the next reservation (raised-repair-refused-on-handed-
+        # back-pr: its claim was never ended, so `cc --repair` was told to adopt it and every retry was refused as
+        # delivery-pending). Once, on --relaunch (cc asks it after it saw no loop in the window), and adopted by this
+        # owner's claim; D5 is the live-owner control and R2's restart control the plain reservation's.
+        delivered(); first5 = answer(run(*reserve2)); run("claim", "r", "t2", "--executor", "worker")   # launched, adopted
+        before5 = json.loads(record2.read_text()); before5["claim"]["owner"]["boot_id"] = "previous-boot"   # …and died open
+        record2.write_text(json.dumps(before5))
+        plain = answer(run(*reserve2, "--generation", str(before5["claim"]["generation"])))
+        regrant = answer(run(*reserve2, "--generation", str(before5["claim"]["generation"]), "--relaunch"))
+        took5 = run("claim", "r", "t2", "--executor", "worker")
+        after5 = json.loads(record2.read_text())
+        ok("D5b: a repair reservation whose owner died with its claim open is relaunched at that head, once, "
+           "and this owner's claim adopts it",
+           plain.get("launch") is False and regrant.get("launch") is True and regrant["repair"]["relaunch_of"] == first5["execution_id"]
+           and took5.returncode == 0
+           and after5["executions"][-1]["repair"]["adopted_at"]
+           and answer(run(*reserve2, "--generation", str(after5["claim"]["generation"]), "--relaunch")).get("launch") is False)
 
         # B1-B5: the runtime payload is the only agent identity. The helper is a hook stand-in, kept in
         # this fixture; no CLI accepts an agent id. Both children have this selfcheck as their parent.

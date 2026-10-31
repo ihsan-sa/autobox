@@ -199,6 +199,20 @@ e6=$(jq -r '.executions[-1].execution_id' < "$d6")
   && ok "…and a second --repair at that same head, once its worker is gone with nothing pushed, relaunches it on the same task" \
   || bad "a stopped repair at one head could not be relaunched: rc=$p6 $(cat "$T/c6rp2.out")"
 for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
+# A LAUNCH THAT DIED HOLDING ITS REPAIR CLAIM DOES NOT SHUT THE DOOR (raised-repair-refused-on-handed-back-pr, 2026-10-31):
+# dispatch's #1966 was handed back with the last round's repair claim still open under a process long gone and no
+# lander job left, and every --repair was refused as delivery-pending, naming --repair as the way in. That record,
+# shaped here: the last claim reopened in the repair phase under a pid that has exited.
+e6=$(jq -r '.executions[-1].execution_id' < "$d6"); g6=$(jq -r .claim.generation < "$d6"); gone=$(sh -c 'echo $$')
+jq --argjson p "$gone" '.claim.ended_at = null | .claim.phase = "repair" | .claim.reason = null
+  | .claim.owner.process.pid = $p | .claim.launcher = null' "$d6" > "$T/c6orphan.json" && cp "$T/c6orphan.json" "$d6"
+"$B/cc" $REPO c6 --go "" --repair >"$T/c6rp4.out" 2>&1; p6=$?
+{ [ "$p6" = 0 ] && ! grep -q 'delivery-pending' "$T/c6rp4.out" && [ -n "$(wins "$REPO/c6")" ] \
+  && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] && [ "$(jq -r .claim.generation < "$d6")" = $((g6 + 1)) ] \
+  && [ "$(jq -r '.executions[-1].repair.relaunch_of' < "$d6")" = "$e6" ]; } \
+  && ok "…and a --repair onto a handed-back PR whose last launch died with its repair claim open starts a worker at that head" \
+  || bad "a dead launch's open repair claim refused --repair: rc=$p6 $(cat "$T/c6rp4.out")"
+for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
 # a worker still running that head, shaped as cc opens one: the pane's shell with the loop UNDER it. pane_kind skips
 # the pane's own pid, so a lone `bash -c 'exec -a cc-loop …'` (bash execs it in place) read as an empty window.
 tmux new-window -d -t main -n "$REPO/c6" "bash -c 'exec -a cc-loop sleep 300'; exec bash"

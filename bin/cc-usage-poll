@@ -2,7 +2,7 @@
 """cc-usage-poll — the account's plan usage, read live from Anthropic, with no model call.
 
   cc-usage-poll             one GET of the OAuth usage endpoint -> ~/.cc/state/usage/now.json; exit 0 (or a
-                            Retry-After skip), else 1
+                            Retry-After skip), else 1. Then one more per workers' login copy (PLANS below)
   cc-usage-poll selfcheck
 
 WHY (owner, 2026-10-18): the box's only five-hour reading was the `rate_limits` block cc-statusline writes when a
@@ -27,9 +27,14 @@ other origin is _TEST_ORIGIN, a global only the selfcheck sets, in this process;
 ON ANY FAILURE now.json stays as it was and error.json beside it names the exception's type (and an HTTP status),
 never its message; a good read removes it. A 429's Retry-After (seconds or a date, at most RETRY_CAP) is kept there
 as `retry_after`, and every run before it skips without a request.
+PLANS (2026-10-31, the owner pays for four and the box ran one to its weekly wall). `cc-config get
+WORKER_CLAUDE_LOGIN_COPY` may list several copies of the plans' logins, space-separated. Each is read the same way,
+into login-<its name>.json (login-claude-login.max1.json for claude-login.max1.json) and login-<name>.error.json,
+and cc-sandbox starts each worker on the listed copy with the least of its week used.
+
 Env: CC_USAGE_DIR (~/.cc/state/usage) · CC_USAGE_TIMEOUT
 """
-import datetime, email.utils, json, os, sys, time, urllib.error, urllib.request
+import datetime, email.utils, json, os, subprocess, sys, time, urllib.error, urllib.request
 
 URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"   # Claude Code's own OAuth beta header value
@@ -42,9 +47,9 @@ def usage_dir():
     return os.environ.get("CC_USAGE_DIR") or os.path.expanduser("~/.cc/state/usage")
 
 
-def token():
+def token(cred=None):
     d = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    o = json.load(open(os.path.join(d, ".credentials.json")))["claudeAiOauth"]
+    o = json.load(open(cred or os.path.join(d, ".credentials.json")))["claudeAiOauth"]
     exp = o.get("expiresAt")
     if isinstance(exp, (int, float)) and exp / 1000 <= time.time():
         raise RuntimeError("the login's OAuth token has expired; a Claude Code session refreshes it")
@@ -102,10 +107,18 @@ def retry_after(v, now):
     return min(max(t, now), now + RETRY_CAP)
 
 
-def poll():
+def copies():
+    """the workers' login copies cc-config lists (PLANS), as cc-sandbox reads them"""
+    cfg = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-config")
+    r = subprocess.run([cfg, "get", "WORKER_CLAUDE_LOGIN_COPY"], capture_output=True, text=True)
+    return [os.path.expanduser(c) for c in r.stdout.split()]
+
+
+def poll(cred=None, name="now"):
     now = time.time()
+    errf = "error.json" if name == "now" else f"{name}.error.json"
     try:
-        until = json.load(open(os.path.join(usage_dir(), "error.json"))).get("retry_after")
+        until = json.load(open(os.path.join(usage_dir(), errf))).get("retry_after")
     except (OSError, ValueError, AttributeError):
         until = None
     if isinstance(until, (int, float)) and now < until:
@@ -113,7 +126,7 @@ def poll():
     err = {"at": now}
     try:
         op, url = opener()
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}", "anthropic-beta": BETA,
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token(cred)}", "anthropic-beta": BETA,
                                                    "Content-Type": "application/json",
                                                    "User-Agent": "cc-usage-poll"})
         with op.open(req, timeout=float(os.environ.get("CC_USAGE_TIMEOUT") or 10)) as r:
@@ -125,14 +138,14 @@ def poll():
             if e.code == 429:
                 err["retry_after"] = retry_after(e.headers.get("Retry-After"), now)
     else:
-        write("now.json", rec)
+        write(f"{name}.json", rec)
         try:
-            os.unlink(os.path.join(usage_dir(), "error.json"))
+            os.unlink(os.path.join(usage_dir(), errf))
         except OSError:
             pass
         return 0
-    write("error.json", err)
-    print(f"cc-usage-poll: {err['error']}" + (f" {err['status']}" if "status" in err else ""), file=sys.stderr)
+    write(errf, err)
+    print(f"cc-usage-poll: {name}: {err['error']}" + (f" {err['status']}" if "status" in err else ""), file=sys.stderr)
     return 1
 
 
@@ -146,4 +159,5 @@ def selfcheck(*a, **k):
 
 
 if __name__ == "__main__":
-    sys.exit(selfcheck() if sys.argv[1:2] == ["selfcheck"] else poll())
+    sys.exit(selfcheck() if sys.argv[1:2] == ["selfcheck"] else
+             max([poll()] + [poll(c, "login-" + os.path.basename(c).removesuffix(".json")) for c in copies()]))

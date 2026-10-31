@@ -261,7 +261,8 @@
 #   so once dispatch-login refreshes the workers' login itself, this launch must not. While /etc/dispatch/login-refresh
 #   is a regular file owned by root (not a symlink, not this user's) and WORKER_CLAUDE_CREDENTIALS is set, a worker's
 #   login is the copy dispatch-login writes for the workers, at `cc-config get WORKER_CLAUDE_LOGIN_COPY` (empty →
-#   /var/lib/dispatch-login-workers/claude-login.json): an access token and its expiry, no refresh token. In that mode
+#   /var/lib/dispatch-login-workers/claude-login.json; several, space-separated, and each launch takes the one whose
+#   plan has the most of its week left, PLANS at refresher_copy): an access token and its expiry, no refresh token. In that mode
 #   this never refreshes ~/.claude-workers, never takes its lock and never reads the key's file. The copy is READ LIVE:
 #   a stripped copy of that one file (claudeAiOauth, every refreshToken taken out) sits alone in a dir of the launch's
 #   own under ~/.cc/sandbox/.login, bound ro at ~/.cc/worker-login, and ~/.claude/.credentials.json is a link into it.
@@ -766,9 +767,24 @@ refresher_flag(){   # true while the host refresher (dispatch-login) is the one 
   # worker's green runs where root is unmapped and a root-owned file is not root's. Host-only: build unsets both inside.
   local f="${CC_SANDBOX_TEST_REFRESH_FLAG:-/etc/dispatch/login-refresh}" u="${CC_SANDBOX_TEST_REFRESH_UID:-0}"
   [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %u -- "$f")" = "$u" ]; }
-refresher_copy(){   # → the host refresher's copy of the workers' login, or return 2 with the reason on stderr
-  local c d why="" perm left
-  c=$("$BIN/cc-config" get WORKER_CLAUDE_LOGIN_COPY 2>/dev/null); c="${c/#\~/$H}"; c="${c:-/var/lib/dispatch-login-workers/claude-login.json}"
+refresher_copy(){   # → the host refresher's copy of the workers' login, or return 2 with each copy's reason on stderr.
+  # PLANS (2026-10-31: the owner pays for four plans and the box ran one to its weekly wall). The key may list several
+  # copies, one per plan, space-separated. Each launch takes the usable one with the least of its week used, as
+  # cc-usage-poll last read it into login-<name>.json (a reading over 15 min old, or none, goes last, in the listed
+  # order), so the plans share the work and one nearing its wall stops getting new workers while another has room.
+  local a c u err="" out
+  read -ra a <<<"$("$BIN/cc-config" get WORKER_CLAUDE_LOGIN_COPY 2>/dev/null)"
+  [ ${#a[@]} -gt 0 ] || a=(/var/lib/dispatch-login-workers/claude-login.json)
+  while IFS=$'\t' read -r u c; do
+    if out=$(one_copy "${c/#\~/$H}" </dev/null 2>&1); then echo "$out"; return 0; fi
+    err+="$out"$'\n'
+  done < <(for c in "${a[@]}"; do
+    u=$(jq -r --argjson now "$(date +%s)" 'if (.at // 0) > $now - 900 then .seven_day.used_percentage // 101 else 101 end' \
+      -- "${CC_USAGE_DIR:-$H/.cc/state/usage}/login-$(basename -- "$c" .json).json" 2>/dev/null) || u=101
+    printf '%s\t%s\n' "${u:-101}" "$c"; done | sort -s -t$'\t' -k1,1g)
+  printf '%s' "$err" >&2; return 2; }
+one_copy(){   # $1 one listed copy → echoed when a worker may start on it, else its reason on stderr and 2
+  local c="$1" d why="" perm left
   d=$(dirname -- "$c")
   # THE DIRECTORY IS NOT BOUND (login_mirror): only a stripped copy of this one file goes in, so the files beside it
   # (dispatch-login keeps other logins' copies there) never reach a worker. It must still be the copy's alone to write.
@@ -787,7 +803,7 @@ refresher_copy(){   # → the host refresher's copy of the workers' login, or re
   # cycle stalls ~40 min. The renewal revokes the old token; a worker already running reads the new one through the bind.
   elif left=$(cred_left "$c") && [ "$left" -lt 1500 ]; then
     if [ "$left" -le 0 ]; then why=expired; else why="expiring within 25 min ($((left / 60)) min left)"; fi; fi
-  [ -z "$why" ] || { echo "cc-sandbox: the host refresher's copy of the workers' login ${c/#"$H"/\~} is $why — nothing was started. dispatch-login refreshes that login (/etc/dispatch/login-refresh is set), so this neither refreshes it nor falls back to another." >&2; return 2; }
+  [ -z "$why" ] || { echo "cc-sandbox: the host refresher's copy of the workers' login ${c/#"$H"/\~} is $why — nothing was started. dispatch-login refreshes that login (/etc/dispatch/login-refresh is set), so this neither refreshes it nor falls back to the box's own." >&2; return 2; }
   echo "$c"; }
 worker_cred(){   # → the credentials file a WORKER's stripped copy is made from: the box's own, or the workers' login (WORKERS' LOGIN in the header)
   local box="$H/.claude/.credentials.json" k w d why="" perm sr
@@ -3924,6 +3940,17 @@ f="$CLAUDE_CONFIG_DIR/.credentials.json"\njq ".claudeAiOauth.accessToken = \\"wk
   fi
   out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$wf" CC_SANDBOX_TEST_REFRESH_FLAG="$fl" CC_SANDBOX_TEST_REFRESH_UID="$me" WORKER_CLAUDE_LOGIN_COPY="$cf" "$SELF" worker-cred 2>/dev/null)
   t "host refresher: worker-cred names the copy" "$out" "$cf"
+  # PLANS: several copies listed → the usable one with the least of its week used, by cc-usage-poll's fresh readings
+  cp "$cf" "$fh/dl/p1.json"; cp "$cf" "$fh/dl/p2.json"; mkdir -p "$fh/usage"
+  wu(){ printf '{"at": %s, "seven_day": {"used_percentage": %s}}' "$2" "$3" > "$fh/usage/login-$1.json"; }
+  pick(){ env HOME="$fh" CC_USAGE_DIR="$fh/usage" CC_WORKER_SANDBOX=1 WORKER_CLAUDE_CREDENTIALS="$wf" CC_SANDBOX_TEST_REFRESH_FLAG="$fl" CC_SANDBOX_TEST_REFRESH_UID="$me" WORKER_CLAUDE_LOGIN_COPY="$fh/dl/p1.json $fh/dl/p2.json" "$SELF" worker-cred 2>/dev/null; }
+  wu p1 "$(date +%s)" 96; wu p2 "$(date +%s)" 10
+  t "plans: two copies listed → worker-cred names the one with more of its week left" "$(pick)" "$fh/dl/p2.json"
+  wu p2 0 10
+  t "plans: …a reading over 15 min old counts as none, so the freshly read one with room comes first" "$(pick)" "$fh/dl/p1.json"
+  wu p2 "$(date +%s)" 10; mv "$fh/dl/p2.json" "$fh/dl/p2.gone"
+  t "plans: …and the emptiest one unusable (here missing) → the next one, not a refusal" "$(pick)" "$fh/dl/p1.json"
+  rm -rf "$fh/dl/p1.json" "$fh/dl/p2.gone" "$fh/usage"
   # REFUSALS: each starts the launch with the flag set and a copy it cannot use, and the probe must not run at all
   refused(){ out=$(RF="$fl" RU="$me" RC="$cf" run "$wf")
     t "host refresher: a copy that is $1 → the launch refuses and says so, nothing runs, nothing refreshes" \
