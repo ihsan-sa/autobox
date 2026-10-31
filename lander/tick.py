@@ -77,11 +77,11 @@
             commit by U2's runner (make_check). Green deploys that sha (deploy.run); red holds the targets, bisects
             and reverts a proven breaker. Then deploy.run again, for a request whose tip is already green (a retry).
             Then, with the tip lock let go and the repo's jobs settled (below), on a tip the run looked at (green or
-            red) or when a pass is owed (health.pending: one killed part-way or stopped, or asked for while another
+            red) or when a pass is owed (health.pending: one killed part-way, or asked for while another
             ran), health.run under the repo's health lock (a second tick skips it and asks for one more pass): the
             blocking checks the merged range reaches and every check main is red on, run on the tip and kept as
             main's own record (the lane plans by it), each result written as it finishes; a check that turns red is
-            said once on the tip run's route; a pass stops once main moves on, owed to the newest tip; a job held
+            said once on the tip run's route; a pass that finds main moved carries on at the newest tip; a job held
             main-red on a check it finds green is asked again. It holds no deploy, reverts nothing, and never holds
             the tip lock, so the next merge's tip run and deploy start while it runs.
   nightly   for each repo the tip step runs for, at most once every nightly.NIGHTLY_SECS (a day) and only once
@@ -770,7 +770,7 @@ def main_health(repo, looked, fb) -> list:
     """Main's own record of its blocking checks (health.py), after the tip lock is let go and the jobs are settled.
     brief: "a merge's tip run and deploy never wait on main health": it holds its own lock, so the next tick's tip
     run starts while it runs. It runs on a tip the run just looked at (green or red), or when a pass is owed (one
-    killed part-way, one stopped because main moved on, or one asked for while another held the lock). A job held
+    killed part-way, or one asked for while another held the lock). A job held
     main-red on a check the pass found green is asked again (who=main-health, whose hold jobs.drain makes due now):
     10-27, #1976 sat out its hold 2 h after main passed the check. Its fault is logged, never the tick's end."""
     try:

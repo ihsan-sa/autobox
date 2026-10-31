@@ -290,28 +290,36 @@ class Run(Case):
         self.assertEqual(said, [f"land:demo:main-health-gave-up@{TIP2[:12]}"], "the next tick sends it, once")
         self.assertEqual(HL.load("demo")["gave_up"], TIP2)
 
-    def test_a_pass_that_finds_main_moved_stops_and_the_next_runs_on_the_newest_tip(self):
-        """10-27: a pass on 5fadc4da ran three hours past five newer merges, and its stale red held PRs main-red."""
+    def test_a_tip_moving_under_a_running_pass_takes_the_pass_to_the_new_tip(self):
+        """10-27: a pass on 5fadc4da ran three hours past five newer merges; 10-30: one ran 39 checks on 0d6fc10a for
+        seven hours after #2068 fixed check-sh on main, and the red it held kept PRs main-red."""
         # the red is lib, which sorts after app by name, so only the reds-first order puts it first
         self.go(TIP1, ["lib/x.py"], red={"lib"})
-        self.tip, self.files[TIP2], asked = TIP2, ["lib/z.py", "app/y.py"], []
+        self.tip, self.files[TIP2], self.files[TIP3], asked = TIP2, ["lib/z.py", "app/y.py"], [], []
 
         def check(name, sha):
             asked.append((name, sha))
-            self.tip = TIP3   # main moves while the first check runs
-            return T.Result(check=name, tree=sha, status=T.FAILED if name == "lib" else T.PASSED)
-        self.assertEqual(HL.run("demo", check), {"lib": T.FAILED})
-        self.assertEqual(asked, [("lib", TIP2)], "main's red runs first, and nothing more runs on the old tip")
+            self.tip = TIP3   # main moves (the fix merges) while the first check runs
+            return T.Result(check=name, tree=sha, status=T.FAILED if sha == TIP2 else T.PASSED)
+        self.assertEqual(HL.run("demo", check), {"lib": T.PASSED, "app": T.PASSED})
+        self.assertEqual(asked, [("lib", TIP2), ("lib", TIP3), ("app", TIP3)],
+                         "the red runs first, then the pass goes on at the new tip: the red again, then what was left")
+        self.assertEqual(HL.red("demo"), {}, "the new tip cleared the red in the same pass")
         rec = HL.load("demo")
-        self.assertEqual((rec["tip"], rec["running"]), (TIP1, TIP2), "the range stays owed")
-        self.assertTrue(HL.pending("demo"))
-        self.assertEqual(len(self.said), 1, "still red: no second alert")
-        ran, asked = self.go(TIP3, ["lib/z.py", "app/y.py"])
-        self.assertEqual(ran, {"app": T.PASSED, "lib": T.PASSED})
-        self.assertEqual(asked, [("lib", TIP3), ("app", TIP3)])
-        self.assertEqual(HL.red("demo"), {}, "the newer tip cleared the red")
-        self.assertEqual((HL.load("demo")["tip"], HL.load("demo")["running"]), (TIP3, ""))
+        self.assertEqual((rec["tip"], rec["running"]), (TIP3, ""))
         self.assertFalse(HL.pending("demo"))
+        self.assertEqual(len(self.said), 1, "lib was red already on TIP1: no second alert")
+
+    def test_a_check_the_new_range_reaches_runs_again_on_the_new_tip(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2], self.files[TIP3], asked = TIP2, ["app/y.py", "lib/y.py"], ["app/z.py"], []
+
+        def check(name, sha):
+            asked.append((name, sha))
+            self.tip = TIP3
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        HL.run("demo", check)
+        self.assertEqual(asked, [("app", TIP2), ("app", TIP3), ("lib", TIP3)])
 
     def test_a_job_held_main_red_is_tried_now_once_the_newer_tip_passes_the_check(self):
         from lander import jobs as J
@@ -351,12 +359,6 @@ class Run(Case):
         self.assertEqual(J.not_before_left(J.load("demo", 9)), 0, "main passes lib")
         self.assertGreater(J.not_before_left(J.load("demo", 10)), 0, "a main-red record that is no dict frees nothing")
 
-    def test_a_bad_moved_count_reads_as_none(self):
-        """Perms' read of #2019: a hand-edited or torn record must not crash the pass."""
-        for bad in ("x", [1], None):
-            C.write_json(HL.path("demo"), {"moved": bad})
-            self.assertEqual(HL.load("demo")["moved"], 0, repr(bad))
-
     def test_an_empty_tip_read_is_not_main_moving(self):
         self.go(TIP1, ["app/x.py"])
         self.tip, self.files[TIP2], asked = TIP2, ["app/y.py", "lib/y.py"], []
@@ -368,27 +370,87 @@ class Run(Case):
         self.assertEqual(HL.run("demo", check), {"app": T.PASSED, "lib": T.PASSED})
         self.assertEqual((HL.load("demo")["tip"], HL.load("demo")["running"]), (TIP2, ""))
 
+    def test_a_tip_origin_will_not_give_runs_nothing_and_says_so(self):
+        log = mock.patch.object(C, "log").start()
+        self.addCleanup(mock.patch.stopall)
+        self.tip = ""
+        HL.want("demo")
+        self.assertEqual(HL.run("demo", lambda n, s: self.fail("ran a check with no tip")), {})
+        self.assertIn("unfetched", [c.args[2] for c in log.call_args_list if c.args[:1] == ("main-health",)])
+        self.assertTrue(HL.pending("demo"), "the want stays: the pass it asked for is still owed")
+
     def test_a_main_that_moves_on_every_pass_gets_a_whole_record_after_tries(self):
-        tips = [str(d) * 40 for d in range(4, 5 + HL.TRIES)]
-        p = mock.patch.dict(PARENT, zip(tips, [TIP1] + tips))
+        """Security read of #2084: a main that merges during every check must not keep one pass from ever ending."""
+        tips = [str(d) * 40 for d in range(4, 4 + HL.TRIES)]
+        p = mock.patch.dict(PARENT, zip(tips, [TIP2] + tips))
         p.start()
         self.addCleanup(p.stop)
         self.go(TIP1, ["app/x.py"])
-        log = mock.patch.object(C, "log").start()
-        self.addCleanup(mock.patch.stopall)
-        for k, t in enumerate(tips):
-            self.tip, self.files[t] = t, ["app/y.py", "lib/y.py"]
+        self.tip, asked, nxt = TIP2, [], dict(zip([TIP2] + tips, tips + ["9" * 40]))
+        for t in [TIP2] + tips:
+            self.files[t] = ["app/y.py", "lib/y.py"]
 
-            def check(name, sha, nxt=(tips + [""])[k + 1]):
-                self.tip = nxt or self.tip + "x"   # main moves while every check runs
-                return T.Result(check=name, tree=sha, status=T.PASSED)
-            ran = HL.run("demo", check)
-            self.assertEqual(len(ran), 1 if k < HL.TRIES else 2, f"pass {k}")
+        def check(name, sha):
+            asked.append((name, sha))
+            self.tip = nxt[sha]   # main moves while every check runs
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        self.assertEqual(HL.run("demo", check), {"app": T.PASSED, "lib": T.PASSED})
+        self.assertEqual(asked, [("app", t) for t in [TIP2] + tips] + [("lib", tips[-1])],
+                         "after TRIES moves the pass finishes on the tip it reached")
         rec = HL.load("demo")
-        self.assertEqual((rec["tip"], rec["running"], rec["moved"]), (tips[-1], "", 0))
+        self.assertEqual((rec["tip"], rec["running"]), (tips[-1], ""))
         self.assertFalse(HL.pending("demo"))
-        # Opus read of #2019: the pass that finishes anyway says so, once
-        self.assertEqual([c.args[2] for c in log.call_args_list if c.args[:1] == ("main-health",)].count("finish"), 1)
+
+    def test_a_check_first_red_on_a_tip_reached_after_a_move_alerts_on_that_tip(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2], self.files[TIP3], asked = TIP2, ["app/y.py", "lib/y.py"], ["lib/z.py"], []
+
+        def check(name, sha):
+            asked.append((name, sha))
+            self.tip = TIP3
+            return T.Result(check=name, tree=sha, status=T.FAILED if (name, sha) == ("lib", TIP3) else T.PASSED)
+        HL.run("demo", check)
+        self.assertEqual(asked, [("app", TIP2), ("lib", TIP3), ("lib", TIP2)],
+                         "the red's cause is read on the new tip's own parent")
+        e = HL.load("demo")["checks"]["lib"]
+        self.assertEqual((e["since"], e["cause"]), (TIP3, "code"))
+        self.assertEqual(len(self.said), 1)
+        self.assertIn(TIP3[:12], self.said[0])
+        self.assertIn("broke it", self.said[0])
+
+    def test_a_pass_killed_mid_chase_resumes_on_the_tip_it_had_reached(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2], self.files[TIP3] = TIP2, ["app/y.py", "lib/y.py"], ["app/z.py", "lib/z.py"]
+
+        def killed(name, sha):
+            self.tip = TIP3
+            if (name, sha) == ("lib", TIP3):
+                raise KeyboardInterrupt("killed")
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        with self.assertRaises(KeyboardInterrupt):
+            HL.run("demo", killed)
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"], rec["checks"]["app"]["tip"]), (TIP1, TIP3, TIP3))
+        self.assertTrue(HL.pending("demo"))
+        ran, asked = self.go(TIP3, ["app/z.py", "lib/z.py"])
+        self.assertEqual(asked, [("lib", TIP3)], "only what the killed pass had not reached on TIP3 runs")
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"]), (TIP3, ""))
+
+    def test_a_check_the_new_tips_manifest_retired_is_not_run_or_written_back(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2], self.files[TIP3], asked = TIP2, ["app/y.py", "lib/y.py"], ["app/z.py"], []
+        old, new = manifest(), manifest()
+        del new.checks["lib"], new.cwd["lib"]
+
+        def check(name, sha):
+            asked.append((name, sha))
+            self.tip = TIP3
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        with mock.patch.object(M, "load", lambda root, tip, **k: new if tip == TIP3 else old):
+            HL.run("demo", check)
+        self.assertEqual(asked, [("app", TIP2), ("app", TIP3)])
+        self.assertNotIn("lib", HL.load("demo")["checks"])
 
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])

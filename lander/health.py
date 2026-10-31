@@ -7,11 +7,12 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    checks nightly.py moved out) that the range since the last checked tip reaches, and
                                    every check the record holds red, run once on the tip by `check(name, sha)`
                                    (tick.make_check), the checks the record holds red first. Before each check after
-                                   the first, origin's tip is read again (a read that comes back empty is not a move);
-                                   once main has moved the pass stops, owed (pending), so the next tick's pass runs on
-                                   the newest tip. After TRIES passes in a row stopped so, the next one finishes on the
-                                   tip it started on whatever main does, so a main that moves on every pass still gets
-                                   a whole record, one tip behind at worst. Each result is
+                                   the first, origin's tip is read again; once main has moved, the pass moves with it
+                                   and runs on the new tip what it had not reached, what the new range reaches and the
+                                   record's reds, so no record waits on a tip main has left. After TRIES moves in one
+                                   pass it finishes on the tip it has reached without reading origin again, so a main
+                                   that merges during every check still gets a whole record. A tip origin will not give
+                                   (a failed fetch) logs `unfetched` and is not a move. Each result is
                                    recorded. A check that turns red sends ONE alert on the tip run's route, naming the
                                    check, the merge, and whether the merge's parent passes it (code: the merge broke
                                    it) or fails it too (machine). -> {name: status}
@@ -23,8 +24,8 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    "running", stamps the tip in "gave_up" and runs nothing more on it; a send that
                                    raises writes nothing, so the pass stays pending and the next tick sends the card.
     lock(repo)                     the health lock: True when held, False when another pass holds it (never waits)
-    pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way or stopped
-                                   on a tip main moved past, or a tick found the lock taken and asked for one more
+    pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way, or a tick
+                                   found the lock taken and asked for one more
                                    (want(repo)), since the running pass may be on an older tip.
     red(repo)                      {name: entry} of every check current() holds red on main, whatever tree, if fresh
     current(repo, rec=None)        {name: entry} of each red the record holds that no tip run has outlived: one that
@@ -43,8 +44,7 @@ PR that owned none of its paths was planned without it, and a red case it added 
 or, where neither run names a case, when it fails no more of them than main's tree.
 
 THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked in full, "running": the tip a
-pass is on ("" between passes), "tries": [tip, passes started on it], "moved": passes in a row stopped because main
-moved (0 once one finishes), "gave_up": the last tip given up on (its
+pass is on ("" between passes), "tries": [tip, passes started on it], "gave_up": the last tip given up on (its
 range stays owed to the next tip's pass, since "tip" is not moved), "checks": {name: {"status", "tree", "tip",
 "at", "since", "cause"}}}. since and cause are kept from the run that turned the check red until it is green again.
 An unrunnable result is never recorded, as red or green. Nothing here holds a deploy or reverts a merge: the tip run
@@ -63,7 +63,7 @@ from lander import types as T
 
 PR_RE = re.compile(r"\(#(\d+)\)$")
 FRESH = 2 * 3600   # seconds a record of a base tree stands in for a run on it
-TRIES = 3          # passes started on one tip before an unfinished one stops being owed
+TRIES = 3          # passes started on one tip before an unfinished one stops being owed; moves within one pass
 
 
 def path(repo):
@@ -73,7 +73,7 @@ def path(repo):
 def load(repo):
     rec = C.read_json(path(repo), {}) or {}
     return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "tries": list(rec.get("tries") or []),
-            "moved": m if isinstance(m := rec.get("moved"), int) else 0, "gave_up": rec.get("gave_up") or "",
+            "gave_up": rec.get("gave_up") or "",
             "checks": dict(rec.get("checks") or {})}
 
 
@@ -170,12 +170,15 @@ def run(repo, check, fallback=""):
     from lander import nightly as NG
     from lander import run as RUN
     from lander import tip as TP
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(want_path(repo))   # this pass answers any want made before it read origin's tip
     root, base = D.root_of(repo), D.base_of(repo)
     tip = TP.origin_tip(root, base)
     rec = load(repo)
-    if not tip or tip in (rec["tip"], rec["gave_up"]):
+    if not tip:   # the want stays: the pass it asked for is still owed
+        C.log("main-health", repo, "unfetched", base=base)
+        return {}
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(want_path(repo))   # this pass answers any want made before it read origin's tip
+    if tip in (rec["tip"], rec["gave_up"]):
         return {}
     resume = rec["running"] == tip
     # Opus read of #1326: a check that raises on every try kept "running" set and ran again every tick. Counted before
@@ -192,53 +195,64 @@ def run(repo, check, fallback=""):
         C.write_json(path(repo), rec)
         return {}
     C.write_json(path(repo), rec)
-    rc, parent = git(root, "rev-parse", "--verify", "-q", f"{tip}^1")
-    parent = parent if rc == 0 else ""
-    last = rec["tip"] or parent
-    rc, out = git(root, "diff", "--name-only", "--no-renames", "-z", last, tip) if last else (1, "")
-    files = [f for f in out.split("\0") if f] if rc == 0 else []
-    m = MF.load(root, tip, fallback=fallback, strict=False)
-    # 2026-10-14: #1286 retired the cc-member-* checks, and their FAILED entries stayed red here for good. A tip
-    # manifest that read empty is no word on what main retired, so it prunes nothing.
-    for n in [n for n in rec["checks"] if m.checks and n not in m.checks]:
-        del rec["checks"][n]
-    plan =T.Plan(checks=sorted(select(m, files)), klass=T.LEAF)
-    names = set(NG.trim(repo, m, plan).checks) | {n for n in rec["checks"] if n in m.checks and
-                                                  rec["checks"][n].get("status") == T.FAILED}
-    # brief: "a killed or interrupted run keeps what it already learned and the next run picks up from there"
-    if resume:
-        names = {n for n in names if (rec["checks"].get(n) or {}).get("tip") != tip}
-    tree = RUN.tree_of(root, tip)
-    rc, subject = git(root, "log", "-1", "--format=%s", tip)
-    merge = subject if rc == 0 and subject else tip[:12]
-    done = {}
-    # 10-27: a pass on 5fadc4da ran three hours after main had moved five merges on, and the red it held kept PRs
-    # main-red after the newer tip passed. Main's reds run first, and a tip that moved stops the pass: "running" stays
-    # set and "tip" unmoved, so the next tick's pass is owed and covers this range on the newest tip.
-    first = sorted(names, key=lambda n: ((rec["checks"].get(n) or {}).get("status") != T.FAILED, n))
-    if rec["moved"] >= TRIES:   # Opus read of #2019: the pass that finishes on this tip whatever main does says so
-        C.log("main-health", repo, "finish", tip=tip[:12], moved=rec["moved"])
-    for i, name in enumerate(first):
-        if i and rec["moved"] < TRIES and TP.origin_tip(root, base) not in ("", tip):
-            rec["moved"] += 1   # perms' read of #2012: bounded, so a main moving on every pass still gets a record
-            C.write_json(path(repo), rec)
-            C.log("main-health", repo, "moved", tip=tip[:12], times=rec["moved"])
-            return done
-        r = check(name, tip)
-        if r.status == T.UNRUNNABLE:
-            continue
-        done[name] = r.status
-        was = rec["checks"].get(name) or {}
-        e = {"status": r.status, "tree": tree, "tip": tip, "at": C.now()}
-        if r.status == T.FAILED and was.get("status") == T.FAILED:
-            e.update(since=was.get("since", ""), cause=was.get("cause", ""))
-        elif r.status == T.FAILED:
-            e.update(since=tip, cause=cause(check(name, parent).status if parent else T.UNRUNNABLE))
-            alert(repo, base, name, tip, merge, e["cause"])
-        rec["checks"][name] = e
-        C.write_json(path(repo), rec)   # as it finishes: a killed pass keeps what it learned
-        C.log("main-health", repo, "tip", tip=tip[:12], check=name, ok=r.status)
-    rec["tip"], rec["running"], rec["moved"] = tip, "", 0
+    last, names, done, moved = rec["tip"], set(), {}, 0
+    while True:
+        rc, parent = git(root, "rev-parse", "--verify", "-q", f"{tip}^1")
+        parent = parent if rc == 0 else ""
+        rc, out = git(root, "diff", "--name-only", "--no-renames", "-z", last or parent, tip) if last or parent \
+            else (1, "")
+        files = [f for f in out.split("\0") if f] if rc == 0 else []
+        m = MF.load(root, tip, fallback=fallback, strict=False)
+        # 2026-10-14: #1286 retired the cc-member-* checks, and their FAILED entries stayed red here for good. A tip
+        # manifest that read empty is no word on what main retired, so it prunes nothing.
+        for n in [n for n in rec["checks"] if m.checks and n not in m.checks]:
+            del rec["checks"][n]
+        plan = T.Plan(checks=sorted(select(m, files)), klass=T.LEAF)
+        names |= set(NG.trim(repo, m, plan).checks) | {n for n in rec["checks"] if n in m.checks and
+                                                       rec["checks"][n].get("status") == T.FAILED}
+        if m.checks:   # a check the new tip's manifest retired is not run on it, nor written back
+            names &= m.checks.keys()
+        # brief: "a killed or interrupted run keeps what it already learned and the next run picks up from there"
+        if resume:
+            names, resume = {n for n in names if (rec["checks"].get(n) or {}).get("tip") != tip}, False
+        tree = RUN.tree_of(root, tip)
+        rc, subject = git(root, "log", "-1", "--format=%s", tip)
+        merge = subject if rc == 0 and subject else tip[:12]
+        new = ""
+        # 10-27: a pass on 5fadc4da ran three hours after main had moved five merges on; 10-30: one ran 39 checks
+        # on 0d6fc10a for seven hours while #2068's fix sat on main. Main's reds run first, and a tip that moved takes
+        # the pass with it: what is left, what the new range reaches and main's reds run on the newest tip.
+        for i, name in enumerate(sorted(names, key=lambda n: ((rec["checks"].get(n) or {}).get("status") != T.FAILED,
+                                                              n))):
+            if i and moved < TRIES:   # security read of #2084: a main merging during every check never ends a pass
+                now = TP.origin_tip(root, base)
+                if not now:
+                    C.log("main-health", repo, "unfetched", tip=tip[:12])
+                elif now != tip:
+                    new = now
+                    break
+            names.discard(name)
+            r = check(name, tip)
+            if r.status == T.UNRUNNABLE:
+                continue
+            done[name] = r.status
+            was = rec["checks"].get(name) or {}
+            e = {"status": r.status, "tree": tree, "tip": tip, "at": C.now()}
+            if r.status == T.FAILED and was.get("status") == T.FAILED:
+                e.update(since=was.get("since", ""), cause=was.get("cause", ""))
+            elif r.status == T.FAILED:
+                e.update(since=tip, cause=cause(check(name, parent).status if parent else T.UNRUNNABLE))
+                alert(repo, base, name, tip, merge, e["cause"])
+            rec["checks"][name] = e
+            C.write_json(path(repo), rec)   # as it finishes: a killed pass keeps what it learned
+            C.log("main-health", repo, "tip", tip=tip[:12], check=name, ok=r.status)
+        if not new:
+            break
+        C.log("main-health", repo, "moved", tip=tip[:12], to=new[:12])
+        last, tip, moved = tip, new, moved + 1
+        rec["running"], rec["tries"] = tip, [tip, 1]
+        C.write_json(path(repo), rec)
+    rec["tip"], rec["running"] = tip, ""
     C.write_json(path(repo), rec)
     return done
 
