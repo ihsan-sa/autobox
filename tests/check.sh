@@ -564,6 +564,14 @@ for f in $(grep -lsE '(\$HOME|\$H|\{HOME\}|home \+ .)/\.cc/member-facing|"~/\.cc
   grep -qE 'member-facing" \] && ! \[ -x|os\.X_OK' "$f" || {
     echo "check.sh: $f reads the host's member-facing record but never treats a record dir it can't search as recorded"
     echo "  Copy the test cc-guard's mfrec uses, so an unreadable record fails closed."; exit 1; }
+  [ "$f" = bin/lander-self ] && continue   # lander-self's own row adds root's record there (only lander-self may change it)
+  grep -q '"/var/lib/cc/member-facing"\|in /var/lib/cc/member-facing ' "$f" || {   # …and root's record (cc-mf-record), the one no session running as the owner can delete from
+    echo "check.sh: $f reads ~/.cc/member-facing but not root's record, which a session can't delete from"
+    echo "  Copy cc-guard's mfroot, so a deleted ~/.cc/member-facing record or a link swapped in fails closed."; exit 1; }
+done
+for f in $(grep -lsE 'CC_MF_ROOT:-|get(env)?\("CC_MF_ROOT", ' bin/* lib/* 2>/dev/null); do   # …which a session's CC_MF_ROOT only adds to,
+  echo "check.sh: $f lets CC_MF_ROOT replace root's record, so any session can set it to a missing dir and read every repo as the owner's"
+  echo "  Copy cc-guard's mfroot: root's dir always, and CC_MF_ROOT only beside it."; exit 1   # never stands in for, in any file
 done
 
 # AND THE PROMPT MUST TEACH A COMMAND THAT ACTUALLY REACHES HIM. Every track and planning session is told in its

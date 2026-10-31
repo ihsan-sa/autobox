@@ -6004,13 +6004,25 @@ def run_selfcheck():
         os.chmod(f"{hF}/.cc/member-facing", 0); lockF = (members_read("mfnone"), member_facing_here())
         os.chmod(f"{hF}/.cc/member-facing", 0o755)
         os.chdir(_cwdF)
+        def _mfrecF(cmd, **kw):   # a stand-in for cc-mf-record, which only ever sudoes to root's copy
+            os.makedirs(f"{hF}/mfroot", exist_ok=True); open(f"{hF}/mfroot/{cmd[2]}", "a").close()
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        _runF, EFFECTS.run_impl, os.environ["CC_MF_ROOT"] = EFFECTS.run_impl, _mfrecF, f"{hF}/mfroot"
         record_mf("mfnew")
         seedF = sorted(os.listdir(f"{hF}/.cc/member-facing"))
         os.unlink(f"{hF}/.cc/member-facing/mfmark")             # the record of a marker-only repo, gone
         record_mf("mfnone")
         seedF2 = sorted(os.listdir(f"{hF}/.cc/member-facing"))
+        mfRootF = sorted(os.listdir(f"{hF}/mfroot")); os.chmod(f"{hF}/mfroot", 0o555)   # root's, as far as we can tell
+        os.unlink(f"{hF}/.cc/member-facing/mfnone"); delF = members_read("mfnone")   # a session deletes the old record
+        os.rename(f"{hF}/mfroot", f"{hF}/mfgone"); os.makedirs(f"{hF}/empty"); os.symlink(f"{hF}/empty", f"{hF}/mfroot")
+        swapF = (members_read("mfnone"), members_read("mfrec"))   # …or could swap a link in, if root's dir let it
+        os.unlink(f"{hF}/mfroot"); os.makedirs(f"{hF}/mfroot"); ownF = members_read("mfnone")   # …or a dir of its own
+        os.rmdir(f"{hF}/mfroot"); goneF = members_read("mfnone")   # no root's record at all: install.sh --etc never ran
+        os.chmod(f"{hF}/mfgone", 0o755)
     finally:
         os.chdir(_cwdF); globals()["HOME"], globals()["DEV"] = _homeF, _devF
+        EFFECTS.run_impl = _runF; os.environ.pop("CC_MF_ROOT", None)
         subprocess.run(["rm", "-rf", hF], check=False)
     check("the host's record ~/.cc/member-facing/<repo> with no marker makes a repo member-facing (members_read, and "
           "member_facing_here in its checkout); a repo with neither is not",
@@ -6020,6 +6032,11 @@ def run_selfcheck():
     check("…record_member_facing's first write seeds a record for every marked repo, the named one and .seeded; a "
           "later write seeds nothing again, so a deleted record of a marker-only repo stays deleted",
           seedF == [".seeded", "mfmark", "mfnew", "mfrec"] and seedF2 == [".seeded", "mfnew", "mfnone", "mfrec"])
+    check("…and each write records the repo in root's record too (cc-mf-record), which no session running as the owner can "
+          "delete from", mfRootF == ["mfnew", "mfnone"])
+    check("…so a repo whose ~/.cc/member-facing record a session deleted stays member-facing by root's record, and root's "
+          "dir swapped for a link or a dir the reader can write reads as every repo recorded; absent, only the old record counts",
+          delF is True and swapF == (True, True) and ownF is True and goneF is False)
     # …and through the REAL home_state, not a stub: the method `!needs` calls exists under that name and carries
     # the owner-asks table as "asks". Every costly input is pre-cached, so nothing outside the fixture runs.
     del dmS.home_state

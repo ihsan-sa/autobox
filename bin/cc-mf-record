@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# cc-mf-record — the host's record of which repos are member-facing, which only the box's own tooling writes.
+#   cc-mf-record add <repo>        record ~/dev/<repo> member-facing: /var/lib/cc/member-facing/<repo>
+#   cc-mf-record sudoers <user>    the one sudoers line install.sh --etc writes: <user> may run the root copy, nothing else
+#   cc-mf-record selfcheck         (check.sh runs every tool's `selfcheck`, so a repo is only ever recorded by `add`)
+# The dir is root's, so a session running as the owner can't delete a record from it, rename it or swap in a link,
+# whatever spelling it uses; ~/.cc/member-facing (#1889) could be removed by any of them. Add-only: no verb here
+# removes a record, so only root by hand does. Run as the owner it re-runs the root-owned copy in /usr/local/bin
+# through sudo, which is the copy the sudoers line names. A name that isn't a plain repo name (a path, `..`, a dotfile,
+# an option) is refused before sudo, and the copy checks it again as root.
+# Readers (cc, cc-guard, cc-sandbox, cc-notify, cc-refusals, cc-perms, cc-slack, cc-pulse, cc-reconcile, lander-self,
+# cc-lib) count <repo> member-facing when its file is there, or when the dir is anything but a real dir they can search
+# and not write (a link, a file, a chmod, a dir someone made in its place). While the dir is absent, before perms has
+# run install.sh --etc, they read ~/.cc/member-facing alone, as before. A test's CC_MF_ROOT only adds a dir of its own
+# to what they read, so no session can make root's record read as absent. A worker or member may not record a repo
+# (CC_ROLE): that only tightens, but it is the owner's tooling's call.
+set -eu
+ROOTCOPY=/usr/local/bin/cc-mf-record
+D=/var/lib/cc/member-facing
+
+name(){ [[ ${1:-} =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$ ]] || { echo "cc-mf-record: '${1:-}' is not a repo name" >&2; return 2; }; }
+record(){ name "$1" && mkdir -p "$D" && : > "$D/$1"; }   # into $D, which only the selfcheck points elsewhere
+
+selfcheck(){
+  local T p=0 f=0 n bad=""; T=$(mktemp -d); trap 'rm -rf "${T:?}"' RETURN
+  ok(){ if [ "$2" = "$3" ]; then p=$((p+1)); else f=$((f+1)); echo "FAIL: $1 (got '$2', want '$3')"; fi; }
+  D="$T/rec"
+  record ok-repo_1.x; ok "a plain repo name is recorded" "$([ -f "$T/rec/ok-repo_1.x" ] && echo y)" y
+  for n in ../x a/b .seeded .. . -rf '' 'x y' "$(printf 'x\ny')" "../../$T/esc" --selfcheck --sudoers; do
+    ( record "$n" ) 2>/dev/null && bad="${bad}[$n]"; done
+  ok "a forged name (a path, .., a dotfile, an option, blank, a newline) is refused" "$bad" ""
+  ok "…and nothing but the plain name was written" "$(cd "$T" && find . -mindepth 1 | sort | tr '\n' ' ')" "./rec ./rec/ok-repo_1.x "
+  if command -v visudo >/dev/null || [ -x /usr/sbin/visudo ]; then
+    sudoers alice > "$T/s"; ok "the sudoers line parses" "$(PATH=$PATH:/usr/sbin visudo -cf "$T/s" >/dev/null 2>&1 && echo y)" y
+  fi
+  ok "the sudoers line names the root copy alone" "$(sudoers alice)" "alice ALL=(root) NOPASSWD: $ROOTCOPY"
+  ok "a repo named selfcheck, sudoers or add reaches the record step through add, not a verb" \
+    "$(for r in selfcheck sudoers add; do CC_ROLE=worker "$0" add "$r" 2>&1 | grep -c 'may not record'; done | tr -d '\n')" 111
+  ok "…and add records them as plain repos" "$(for r in selfcheck sudoers add; do record "$r" && [ -f "$T/rec/$r" ] && echo -n y; done)" yyy
+  ok "a bare name is no verb: it fails and never reaches sudo" "$("$0" somerepo 2>&1 | grep -c "^sudo")$("$0" somerepo >/dev/null 2>&1; echo $?)" 02
+  ok "a worker or member is refused, and a CC_MF_ROOT never stands in for root's dir" \
+    "$(for r in worker member; do CC_ROLE=$r CC_MF_ROOT="$T/fake" "$0" add x 2>/dev/null; echo -n $?; done; [ -e "$T/fake" ] && echo wrote)" 22
+  echo "cc-mf-record selfcheck: $p passed, $f failed"; [ "$f" = 0 ]
+}
+
+sudoers(){ [[ ${1:-} =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "cc-mf-record: '${1:-}' is not a user name" >&2; return 2; }
+  echo "$1 ALL=(root) NOPASSWD: $ROOTCOPY"; }
+
+case "${1:-}" in
+  selfcheck) selfcheck ;;
+  sudoers) sudoers "${2:-}" ;;
+  add) case ${CC_ROLE:-} in worker|member) echo "cc-mf-record: a $CC_ROLE may not record a repo member-facing" >&2; exit 2;; esac
+     if [ "$(id -u)" = 0 ]; then record "${2:-}"; else name "${2:-}" || exit 2; exec sudo -n "$ROOTCOPY" add "$2"; fi ;;
+  -h|--help|"") sed -n '2,4p' "$0" ;;
+  *) sed -n '2,4p' "$0" >&2; exit 2 ;;
+esac

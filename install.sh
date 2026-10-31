@@ -274,6 +274,17 @@ if [ "$etc" = 1 ]; then
     sudo rm -rf "$k"
     sudo install -D -m 644 "$E/claude-bwrap-path.json" "$ms"   # bwrapPath is honoured from managed settings only
   fi
+  # ROOT'S RECORD OF MEMBER-FACING REPOS (cc-mf-record): a root-owned copy of the helper, the one sudoers line that
+  # lets this user run that copy and nothing else (checked by visudo before it goes in), and the root-owned dir, seeded
+  # from ~/.cc/member-facing and today's markers. No session running as this user can then delete a record.
+  s=$(mktemp); "$R/bin/cc-mf-record" sudoers "$(id -un)" > "$s"
+  visudo -cf "$s" >/dev/null || { rm -f "$s"; echo "install.sh: visudo rejected the cc-mf-record sudoers line — nothing installed for it" >&2; exit 1; }
+  sudo install -m 755 "$R/bin/cc-mf-record" /usr/local/bin/cc-mf-record
+  sudo install -m 440 "$s" /etc/sudoers.d/cc-mf-record; rm -f "$s"
+  sudo install -d -m 755 /var/lib/cc /var/lib/cc/member-facing
+  for m in ~/.cc/member-facing/* ~/dev/*/.cc/member-facing; do
+    [ -e "$m" ] || continue; m=${m%/.cc/member-facing}; m=${m##*/}   # a name the helper refuses (a dotfile, a space) is skipped
+    [[ $m =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$ ]] || continue; sudo /usr/local/bin/cc-mf-record add "$m"; done
   echo "/etc configs installed (sshd -t passed)"
 fi
 # git rerere, for every clone on the box. A track branch is a chain of wip checkpoints, so rebasing one onto a moved
