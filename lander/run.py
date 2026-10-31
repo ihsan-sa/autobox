@@ -14,7 +14,7 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   box      by class — static, hermetic, timing and every host check the laptop may take in the bwrap profile
            (sandbox.py), as the laptop's cage runs them: a PR head is code a worker wrote, never run as the box's
            user (manifest.on_host; perms' reviewer, 10-19). Box checks and the host checks that need this host
-           (bare, or no laptop in `where`; on a PR head, only after perms' LAND at it, lane.Lane.host_unread) on the host with the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
+           (bare, or no laptop in `where`; on a PR head, only after perms' LAND at it, lane.Lane.host_unread) on the host with the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set, TMPDIR a short cc-land.t.<rand> of the run's own, beside its directory),
            under cc-nosignal, so a check signals only what it started (the user manager went down on 2026-10-02).
            A check that says bare = true runs without it: its cases read what cc-nosignal's Landlock domain hides
            (cc-member-v2 reading a live sandbox's /proc/<pid>/fd, cc-fence's no_new_privs case), and nothing leaves
@@ -177,6 +177,10 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
         gates = tempfile.mkdtemp(prefix=f"cc-land.gates.{label}.", dir=run_dir)
         head = os.path.join(gates, "head")
         os.mkdir(head)
+        # A HOST CHECK'S TMPDIR (_box_argv), beside run_dir, not in it: cc-sandbox's fence case binds a socket 60
+        # bytes under its TMPDIR, and under check.sh's own dir too, so a run_dir/tmp went over the 108-byte sun_path.
+        # run_dir/tmp links to it, and rm_run removes both (with a dead lander, cc-tmp-reap's age rule takes it)
+        os.symlink(tempfile.mkdtemp(prefix="cc-land.t.", dir=os.path.dirname(run_dir)), os.path.join(run_dir, "tmp"))
         # the new repo's own git reads no config but these two and its own, and no attributes of anyone's. Its own
         # turns off gc, since in a tree of more than gc.auto's 6700 objects the commit below detached a full repack
         # in every check (the box's disk sat 75% busy, 2026-10-29), and fsync, which a scratch repo has no use for
@@ -227,7 +231,7 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0", base_tree: s
             subprocess.run(g + ["update-ref", BASE_REF, base], env=henv, check=True, capture_output=True)
         return run_dir, head
     except (Unrunnable, OSError, subprocess.CalledProcessError, G.GitError) as e:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        rm_run(run_dir)
         raise e if isinstance(e, Unrunnable) else Unrunnable(f"could not write the tree out: {e}") from None
 
 
@@ -342,7 +346,7 @@ def pinned_head(repo_root: str, tree: str, label: str, base_tree: str, files: di
             raise Unrunnable(f"the tree with main's pinned files laid over is {got}, not {want}")
         return run_dir, head
     except (Unrunnable, OSError, subprocess.CalledProcessError) as e:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        rm_run(run_dir)
         raise e if isinstance(e, Unrunnable) else Unrunnable(f"could not lay main's pinned files over: {e}") from None
 
 
@@ -755,6 +759,18 @@ def read_started(fd: int) -> bool:
         return False
 
 
+def host_tmp(run_dir):
+    """A host check's TMPDIR: the dir run_dir/tmp links to (materialise)."""
+    t = os.path.join(run_dir, "tmp")
+    return os.readlink(t) if os.path.islink(t) else t
+
+
+def rm_run(run_dir):
+    """run_dir and its host checks' TMPDIR."""
+    shutil.rmtree(host_tmp(run_dir), ignore_errors=True)
+    shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def _box_argv(check, head, cwd, run_dir, env_extra, started_fd=None):
     """started_fd: the write end that sandbox.started() says STARTED on, innermost: after cc-nosignal or bwrap's
     setup, before the check's own shell. sandbox.pin() moves it to sandbox.FD first, outermost, since dash takes no
@@ -762,8 +778,10 @@ def _box_argv(check, head, cwd, run_dir, env_extra, started_fd=None):
     pin, said = (S.pin(started_fd), S.started(S.FD)) if started_fd is not None else ([], [])
     if M.on_host(check):
         scope = [] if check.bare else [os.path.join(BIN, "cc-nosignal"), "--"]
+        # TMPDIR the run's own (materialise), which goes after the check (and with a dead lander, by cc-tmp-reap): a host
+        # check's own temp dirs used to land in the box's TMPDIR, and a selfcheck that never removes them left them
         return (pin + scope + said + ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
-                clean_env(env_extra), "host")
+                clean_env({**(env_extra or {}), "TMPDIR": host_tmp(run_dir)}), "host")
     if not S.available():
         raise Unrunnable("bwrap is not installed, so a sandboxed check has nowhere to run")
     if check.klass == T.TIMING and A.loaded():
@@ -931,7 +949,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
     try:
         pinned = pins(repo_root, check, cwd, base_tree, tree_sha)
     except (OSError, G.GitError) as e:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        rm_run(run_dir)
         return res(T.UNRUNNABLE, f"could not read main's pinned files: {e}")
 
     def attempt(head: str, run_dir: str) -> T.Result:
@@ -1003,7 +1021,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         return res(T.UNRUNNABLE, str(e))
     finally:
         for d in dirs:
-            shutil.rmtree(d, ignore_errors=True)
+            rm_run(d)
 
 
 def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane,

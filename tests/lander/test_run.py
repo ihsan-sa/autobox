@@ -15,6 +15,7 @@ import io
 import itertools
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import subprocess
@@ -1771,6 +1772,28 @@ class HostAndRunners(Env):
             self.assertEqual((r.status, calls), (T.PASSED, []))
             r = self.run_(chk(klass=T.HOST), lane=True)
             self.assertEqual((r.status, calls), (T.PASSED, [(False, True)]))
+
+    def test_a_host_checks_temp_dirs_go_with_its_run_whether_it_ends_or_is_stopped(self):
+        leak = "python3 -c 'import tempfile; print(tempfile.mkdtemp())'"   # a selfcheck that never removes its own
+        self.assertEqual(self.run_(chk(run=leak, klass=T.HOST)).status, T.PASSED)
+        r = self.run_(chk(run=leak + "; sleep 30", klass=T.HOST, cap=1))
+        self.assertEqual((r.status, r.extra["why"]), (T.UNRUNNABLE, "stopped at its cap"))
+        self.assertEqual(os.listdir(os.environ["TMPDIR"]), [])
+
+    def test_a_host_checks_tmpdir_leaves_room_for_cc_sandboxs_fence_socket(self):
+        # cc-sandbox's fence case: a HOME at mktemp -d $TMPDIR/ccsbxfence-XXXXXX, its egress proxy's socket at
+        # $fh/.cc/sandbox/.egress/<16hex>/sock. The lander's TMPDIR here is as long as this box's (~/.cc/tmp)
+        box = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".cc", "tmp")
+        root = tempfile.mkdtemp(dir="/tmp")   # a short root, so the pad below works under any system TMPDIR
+        self.addCleanup(shutil.rmtree, root, True)
+        base = os.path.join(root, "t" * max(1, len(box) - len(root) - 1))
+        os.mkdir(base)
+        bind = ('fh=$(mktemp -d "$TMPDIR/ccsbxfence-XXXXXX") && d="$fh/.cc/sandbox/.egress/0123456789abcdef" && '
+                'mkdir -p "$d" && python3 -c "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1]); '
+                'print(len(sys.argv[1]))" "$d/sock"')
+        with mock.patch.dict(os.environ, TMPDIR=base):
+            r = self.run_(chk(run=bind, klass=T.HOST))
+        self.assertEqual(r.status, T.PASSED, r.extra)
 
     def test_host_and_box_checks_are_wrapped_in_cc_nosignal(self):
         for klass in (T.HOST, T.BOX):

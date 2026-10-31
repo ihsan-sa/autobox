@@ -90,7 +90,8 @@ def selfcheck():
         run_dead = mk("cc-land.run.999999999.dead1234", ("cc-land.gates.r.1.x",))
         run_live = mk("cc-land.run.PID.live1234")
         run_kept = mk("cc-land.run.999999998.kept1234", (KEPT, "cc-land-gate-x.log"))
-        lander_scr = [mk("lander-job.ab12cd34"), mk("lander-self.check.ab12cd34"), mk("lander-self.shadow.ab12cd34")]
+        lander_scr = [mk("lander-job.ab12cd34"), mk("lander-self.check.ab12cd34"), mk("lander-self.shadow.ab12cd34"),
+                      mk("cc-land.t.ab12cd34")]
         s_dead = mk(f"claude-{uid}/-home-u-dev-r/{sid_dead}/scratchpad")
         s_argv = mk(f"claude-{uid}/-home-u-dev-r/{sid_argv}/scratchpad")
         s_env = mk(f"claude-{uid}/-home-u-dev-r/{sid_env}/tasks")
@@ -222,7 +223,7 @@ def selfcheck():
         ok("…and one whose pid is the new lander (python3 -P …/core/lander/cli.py) or lander-self stays",
            run_new not in dry and run_self not in dry)
         ok("…while a live pid that is no lander keeps nothing", run_other in dry)
-        ok("old lander-job.* / lander-self.check.* / lander-self.shadow.* scratch goes", set(lander_scr) <= dry)
+        ok("old lander-job.* / lander-self.check.* / lander-self.shadow.* / cc-land.t.* scratch goes", set(lander_scr) <= dry)
         ok("…and one with the .kept marker stays for 72 h", run_kept not in dry)
         ok("…and goes after them", run_kept in reap(False, when=now + 3 * 86400)[0])
         ok("a session's scratch whose id no process names goes", os.path.dirname(s_dead) in dry)

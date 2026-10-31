@@ -57,6 +57,11 @@ export CC_AGENT_LEDGER="$GD/agent-numbers.jsonl"   # a selfcheck that starts a s
 # GD_TRAP is the trap's text, single-quoted where it is set, so $GD still expands when it fires.
 # shellcheck disable=SC2064
 trap "$GD_TRAP" EXIT
+# EVERY SELFCHECK'S TEMP DIRS LIVE IN GD, so they go with it: one that never removes its own (a bare mkdtemp, a killed
+# TemporaryDirectory) used to leave it in the box's TMPDIR for good.
+# Not under the lander, whose host check's TMPDIR is its run's own already: cc-sandbox's fence binds a socket 60 bytes
+# under TMPDIR, and a second level of scratch put it past the 108-byte sun_path (lander/run.py materialise).
+case ${TMPDIR:-} in */cc-land.t.*) ;; *) mkdir "$GD/tmp"; export TMPDIR="$GD/tmp";; esac
 if part_here shellcheck; then
 bash -n "${sh[@]}"
 # SHELLCHECK EVERY FILE, $JOBS AT A TIME. One call over all of bin/ was 38 s of this gate on one core — the largest

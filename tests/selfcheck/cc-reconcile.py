@@ -2817,6 +2817,16 @@ def selfcheck():
         ok("…and a read's shadow holds COPIES of the refs, the planted link skipped, never followed",
            not os.path.islink(f"{sd}/refs") and not os.path.lexists(f"{sd}/refs/remotes/origin/track")
            and os.path.isfile(f"{sd}/refs/remotes/origin/main") and not os.path.islink(f"{sd}/objects"))
+        # STOPPED MID-READ: a shadow is removed by atexit, which a SIGTERM (a unit's stop, `timeout`) skips unless
+        # git_shadow's handler turns it into an exit. A process of its own, in a TMPDIR of its own
+        stmp = tempfile.mkdtemp(dir=tm2)
+        drv = ("import runpy, sys, time; g = runpy.run_path(sys.argv[1], run_name='probe'); "
+               "print(g['git_shadow'](sys.argv[2]), flush=True); time.sleep(60)")
+        pr = subprocess.Popen([sys.executable, "-c", drv, os.path.realpath(__file__), mb], stdout=subprocess.PIPE,
+                              text=True, env=dict(os.environ, TMPDIR=stmp))
+        made = pr.stdout.readline().strip(); there = os.path.isdir(made)
+        pr.terminate(); rc = pr.wait(30)
+        ok("…and a read stopped by SIGTERM still removes its shadow", there and rc == 143 and os.listdir(stmp) == [])
         os.remove(f"{mb}/.cc/member-workspace"); os.makedirs(f"{tm2}/.cc/members/mb")
         globals().update(HOME=tm2)
         ok("MEMBER CHECKOUT: the host-side ~/.cc/members/<repo> marks a member workspace when the checkout's own marker "
