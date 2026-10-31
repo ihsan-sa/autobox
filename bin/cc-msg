@@ -35,7 +35,8 @@
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
 # A window whose name has an open handoff record (~/.cc/state/handoff) is not typed into: the text goes to
-# `cc-slack inject`, which hands it to the live side of the overlap ("queued" when it holds it for that side).
+# `cc-slack inject`, which hands it to the live side of the overlap ("queued" when it holds it for that side, and a
+# "NOT reached" line on stderr when it holds it because neither side has a channel and the live one's pane took nothing).
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
 # again later are a second message and are queued as one.
 # Never types at a TRACK window with no interactive `claude` under it: a headless --go worker's pane is a shell, and the
@@ -1021,14 +1022,17 @@ sweep(){
   done < <(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null)
 }
 
-handoff_relay(){   # $1 window  $2 text → rc 0 and cc-slack's word (delivered|held) when an open handoff record for the
+handoff_relay(){   # $1 window  $2 text → rc 0 and cc-slack's word (delivered|held|typed|spooled) when an open handoff record for the
   # window took the text to cc-slack for the live side; rc 1 when there is no record or cc-slack did not take it (type it)
   local hr res
   hr="${CC_HANDOFF_DIR:-$STATE/handoff}/${1//\//--}.json"
   case "${CC_MSG_FROM:-}" in slack:*) return 1;; esac
   [ -f "$hr" ] || return 1
   res=$("$BIN/cc-slack" inject --no-start "$1" "$2" 2>/dev/null) || return 1
-  case "$res" in delivered|held) echo "$res"; return 0;; esac
+  # HELD IS NOT HEARD (2026-10-31): neither side has a channel up and the live one's pane took nothing, so say so —
+  # a successor that read "queued" waited out two overlaps for answers its predecessor never saw
+  [ "$res" != held ] || echo "cc-msg: $1 is mid-handoff and NOT reached: its live side has no Slack channel and its pane took nothing — held for whoever is live next; journal your questions or run cc-handoff --ready" >&2
+  case "$res" in delivered|held|typed|spooled) echo "$res"; return 0;; esac
   return 1                                         # anything else (daemon down, paused): the keyboard, as before
 }
 # ── A WINDOW ON ANOTHER HOST ─────────────────────────────────────────────────────────────────────────────────
@@ -1168,9 +1172,9 @@ send(){    # $1 window  $2 text — THE contract: delivered, or queued and repor
   # relay typed into the retiring `lessons` seat was never acted on, and its successor never saw it. With an open
   # overlap record for this name the text goes to cc-slack instead, which hands it to the live side and, at the
   # cutover, re-hands the successor what the predecessor never answered. cc-slack's own typing (CC_MSG_FROM
-  # slack:…) never comes back through here: during an overlap it holds a message, it does not type it.
+  # slack:…) never comes back through here, so a live predecessor's pane it types for want of a channel is typed once.
   if res=$(handoff_relay "$1" "$2"); then
-    [ "$res" = held ] && echo queued               # held for the live side: queued, in this file's own word
+    case $res in held|spooled) echo queued;; esac  # held for the live side, or spooled at its pane: queued, in this file's own word
     return 0
   fi
   id=$(win_id "$1") || true
@@ -1635,8 +1639,11 @@ STUB
   # side, and nothing is typed; held there reads "queued"; no record, or cc-slack's own typing, is the keyboard
   reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(msg "relay mid-handoff")
   k "$(t sh -c "[ -z '$out' ] && grep -qF 'inject --no-start $W relay mid-handoff' '$T/calls' && ! grep -qF 'relay mid-handoff' '$T/keys'")" "a name mid-handoff: the text is handed to cc-slack for the live side, not typed into whichever pane holds the name"
-  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(CC_FAKE_INJECT=held msg "held one")
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(CC_FAKE_INJECT=held msg "held one" 2>"$T/err")
   k "$(t sh -c "[ '$out' = queued ] && ! grep -qF 'held one' '$T/keys'")" "…held by cc-slack for a live side not yet subscribed, it says queued"
+  k "$(t grep -qF "$W is mid-handoff and NOT reached: its live side has no Slack channel" "$T/err")" "…and says on stderr that nobody has it, so a successor does not wait out the overlap on it (2026-10-31)"
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(CC_FAKE_INJECT=typed msg "typed one" 2>"$T/err")
+  k "$(t sh -c "[ -z '$out' ] && [ ! -s '$T/err' ] && ! grep -qF 'typed one' '$T/keys'")" "…typed by cc-slack into a live side with no channel: taken, silent, and not typed a second time here"
   reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; CC_MSG_FROM=slack:C1:1.1 msg "from the daemon" >/dev/null
   k "$(t sh -c "grep -qF 'from the daemon' '$T/keys' && ! grep -q '^inject' '$T/calls'")" "…but cc-slack's own typing is never sent back to cc-slack"
   reset; scr "$FREE"; msg "no overlap" >/dev/null

@@ -2787,11 +2787,37 @@ def run_selfcheck():
         dmH6, gotH6 = two_sides()
         rec_write("r", "predecessor")
         dmH6.subs["r"] = [c for c in dmH6.subs["r"] if c.info.get("handoff")]   # the live session's conn is gone
-        dmH6.queues.clear()
+        dmH6.queues.clear(); dmH6.type_into_pane = lambda *a, **k: None   # the live side's pane takes nothing either
         resH6 = dmH6.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
         check("handoff: the muted side is never promoted, even as the last conn standing — its every reply would be "
-              "refused — so the message is held for the live side, not typed into a pane or started over — H6",
+              "refused — so with the live side's pane taking nothing the message is held, not started over — H6",
               gotH6 == [] and resH6 == "held" and len(dmH6.queues["r"]) == 1)
+        # H6b THE LIVE PREDECESSOR LOST ITS CHANNEL (2026-10-31: two overlaps lapsed on questions held
+        # here): it is still at its own keyboard, so the successor's question is typed into the seat's own window —
+        # `<repo>@<alias>` for an orch — and nothing is held for a hello that never comes
+        for alias in (None, "ai"):
+            dmH6b, gotH6b = two_sides()
+            rec_write(f"r@{alias}" if alias else "r", "predecessor")
+            dmH6b.subs["r"] = [c for c in dmH6b.subs["r"] if c.info.get("handoff")]
+            dmH6b.queues.clear(); typedH6b = []
+            dmH6b.type_into_pane = lambda t, p, a=None, w=None: typedH6b.append((t, a, w)) or "typed"
+            resH6b = dmH6b.deliver("r", {"type": "message", "content": "a question"}, autostart=False, alias=alias)
+            check(f"handoff: a live predecessor with no channel{' (an orch)' if alias else ''} has the message typed "
+                  "into its own window, nothing held, the muted successor given nothing — H6b",
+                  resH6b == "typed" and typedH6b == [("r", alias, f"r@{alias}" if alias else "r")]
+                  and gotH6b == [] and not dmH6b.queues["r"])
+            if alias:
+                os.remove(f"{hdir}/r@ai.json")
+        dmH6c, gotH6c = two_sides()
+        rec_write("r", "successor")
+        dmH6c.subs["r"] = [c for c in dmH6c.subs["r"] if not c.info.get("handoff")]   # the live successor's conn is gone
+        dmH6c.queues.clear(); typedH6c = []
+        dmH6c.type_into_pane = lambda *a, **k: typedH6c.append(a) or "typed"
+        resH6c = dmH6c.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: once the successor is live no pane is typed — the name may still be the retiring one's — "
+              "and the message is held for the successor's hello — H6c",
+              resH6c == "held" and typedH6c == [] and gotH6c == [] and len(dmH6c.queues["r"]) == 1)
+        rec_write("r", "predecessor")                     # H7 reads the overlap as H6 left it
         dmH7 = Daemon(use_slack=False); dmH7.queues.clear()   # an earlier case's save_queues() is in this run's scratch DIR
         liveH7 = Conn(None, "r", {"alias": None, "handoff": None, "since": 1.0}); liveH7.send = lambda p: None
         dmH7.subs["r"] = [liveH7]

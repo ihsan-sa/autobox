@@ -6003,9 +6003,9 @@ class Daemon:
         """One channel, one voice: during a handoff overlap, only the conn the record calls live gets delivery.
         The muted one could double-answer or steal a permission answer, and whatever it is handed sits in a pane
         whose every reply is refused. So the muted side is NEVER promoted, not even when it is the only conn left:
-        with the live side unsubscribed the unaliased side gets nobody here, and deliver() holds the message for
-        it (the brief, 2026-09-24: "it is queued and delivered to the successor at --ready … never left sitting in
-        a muted pane"). Each alias is its own seat with its own record: the repo's is `<target>`, an orch's is
+        with the live side unsubscribed the unaliased side gets nobody here, and deliver() types a live predecessor's
+        own window or holds the message for the live side (the brief, 2026-09-24: "it is queued and delivered to the
+        successor at --ready … never left sitting in a muted pane"). Each alias is its own seat with its own record: the repo's is `<target>`, an orch's is
         `<target>@<alias>` (cc-handoff hands an orch off like any seat), so the repo's handoff never mutes an orch."""
         keep = set()
         for alias in dict.fromkeys((c.info.get("alias") or None) for c in conns):
@@ -6154,9 +6154,16 @@ class Daemon:
                         self.subs[target].remove(conn)
         if sent:
             return "delivered"
-        if payload.get("type") == "message" and handoff_record(handoff_key(target, alias)) is not None:
-            # mid-handoff with no live side subscribed: never the keyboard of whichever pane holds the name, never
-            # a third session — held for the live side, which handoff_sweep or its own hello hands it to
+        rec = handoff_record(handoff_key(target, alias)) if payload.get("type") == "message" else None
+        if rec is not None:
+            # mid-handoff with no live side subscribed: never a third session. A live PREDECESSOR whose channel dropped
+            # is still at its own keyboard (until the cutover its window keeps the name): on 2026-10-31 a seat's
+            # successors' questions were held here for a hello that never came, and two overlaps lapsed unanswered
+            typed = rec.get("live") != "successor" and self.type_into_pane(target, payload, alias, seat_name(target, alias))
+            if typed:
+                return typed
+            # …otherwise held for the live side, which handoff_sweep or its own hello hands it to
+            log(f"deliver {seat_name(target, alias)}: mid-handoff, no live side subscribed and its pane took nothing — held")
             with self.lock:
                 self.queues[target].append((time.time(), payload, alias)); self.save_queues()
             return "held"
@@ -6169,22 +6176,24 @@ class Daemon:
             return self.autostart(target)
         return "queued"
 
-    def type_into_pane(self, target, payload, alias=None):
+    def type_into_pane(self, target, payload, alias=None, win=None):
         """Last resort with no subscriber: `cc-msg` types the pane, answers safe prompts, spools, never drops.
         Returns "typed", "spooled" (a 90s-killed cc-msg still counts if its spool holds the text; a window on another
         host is always this, since cc-msg carries it there), or None.
-        None: no window, idle leftover, startup dialog, a refused pane, or a session seconds old. Text only."""
-        if alias is not None:                          # an orch's window is <repo>@<alias>, not window_for(target):
+        None: no window, idle leftover, startup dialog, a refused pane, or a session seconds old. Text only.
+        `win` names the window outright (deliver's live predecessor mid-handoff, an orch's `<repo>@<alias>` too)."""
+        if alias is not None and win is None:          # an orch's window is <repo>@<alias>, not window_for(target):
             return None                                # its message waits in the alias-keyed queue, never main's pane
+        win = win or window_for(target)
         if payload.get("type") == "permission" or not payload.get("content"):
             return None
-        far = remote_host(window_for(target))
+        far = remote_host(win)
         if not far:                                    # a window on another host is cc-msg's to carry there (its door
             if workspace_of(target):                   # types it on that host): nothing below reads this host's tmux
                 return None                            # THE BOUNDARY (autostart's "no-sandbox"): a member's target is
             if time.time() - self.starting.get(target, 0) < 90:   # never a pane on the host, so nothing to type into
                 return None
-            wid, _ = tmux_window(window_for(target))
+            wid, _ = tmux_window(win)
             if not wid or pane_idle(wid):
                 return None
             rc, pane = tmux("capture-pane", "-p", "-t", wid)
@@ -6196,13 +6205,13 @@ class Daemon:
         meta = payload.get("meta") or {}
         env = dict(os.environ, CC_MSG_FROM=f"slack:{meta.get('chat_id') or target}:{meta.get('ts') or ''}")
         try:
-            r = EFFECTS.run([f"{BIN}/cc-msg", window_for(target), payload["content"]], env=env,
+            r = EFFECTS.run([f"{BIN}/cc-msg", win, payload["content"]], env=env,
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
         except subprocess.TimeoutExpired:
             # A timeout is not a refusal: cc-msg writes the spool line first, so text is almost always taken.
             # Check the spool for a line THIS run wrote; not found (hung tmux, stale copy) → queue as a refusal.
             log(f"type_into_pane {target}: cc-msg timed out")
-            return "spooled" if spooled_already(window_for(target), payload["content"],
+            return "spooled" if spooled_already(win, payload["content"],
                                                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))) else None
         except Exception as e:
             log(f"type_into_pane {target}: {e!r}"); return None
@@ -12595,7 +12604,8 @@ def main(argv):
         if len(rest) < 2:
             print("cc-slack inject [--no-start] <target> \"text\"", file=sys.stderr); return 2
         try:
-            r = sock_request({"inject": rest[0], "content": " ".join(rest[1:]), "start": start})
+            r = sock_request({"inject": rest[0], "content": " ".join(rest[1:]), "start": start},
+                             timeout=100)   # the daemon may type the pane first (type_into_pane waits up to 90 s)
         except Exception as e:
             print(f"daemon not running ({e.__class__.__name__}) — cc slack on", file=sys.stderr); return 1
         print(r.get("result") or r.get("error")); return 0 if r.get("ok") else 1
