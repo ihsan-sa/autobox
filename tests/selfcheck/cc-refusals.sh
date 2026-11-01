@@ -26,8 +26,8 @@ selfcheck(){
   chmod +x "$d/claude"
   ps_(){ local i=0 nest=() self; self=$(realpath "$0"); [ -n "${PS_NEST:-}" ] && nest=("$d/claude" --dangerously-skip-permissions)
     rm -f "$d/ps.rc" "$d/ps.out"
-    ( cd "${PS_AT:-$d/state/repo/perms}" && CC_REFUSALS_ROOT=$d/state CC_REFUSALS_WINDOW=perms \
-        setsid -f "$d/claude" --dangerously-skip-permissions "${nest[@]}" "$self" "$@" >"$d/ps.out" 2>"$d/ps.err" </dev/null )
+    ( cd "${PS_AT:-$d/state/repo/perms}" && CC_REFUSALS_ROOT=${PS_ROOT:-$d/state} CC_REFUSALS_WINDOW=perms \
+        setsid -f "${PS_BIN:-$d/claude}" --dangerously-skip-permissions "${nest[@]}" "$self" "$@" >"$d/ps.out" 2>"$d/ps.err" </dev/null )
     while [ ! -s "$d/ps.rc" ] && [ "$i" -lt 300 ]; do sleep 0.05; i=$((i+1)); done
     cat "$d/ps.out" 2>/dev/null; return "$(cat "$d/ps.rc" 2>/dev/null || echo 9)"; }
   # 1. the seat's refusal is written, a line with the tool, input and reason; the hook prints nothing and exits 0
@@ -328,6 +328,14 @@ STUB
           CC_REFUSALS_ROOT="$d/state" "$d/bin/cc-refusals" ask "$@" ); }
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s"\nexit ${NOTIFY_RC:-0}\n' "$d/notify.args" > "$d/his-notify"; chmod +x "$d/his-notify"
   nt(){ CC_REFUSALS_NOTIFY=$d/his-notify ps_ "$@"; }
+  # a refusal's seat is read from the process like an ask's: CC_REFUSALS_WINDOW names only its window
+  rs(){ ev "$d/dev/repo/sub" "$1" | ( cd "$d" && CC_ROLE='' CC_REFUSALS_WINDOW=repo CC_REFUSALS_ROOT=$d/state CC_REFUSALS_DEV=$d/dev "$d/bin/cc-refusals" record ); }
+  fresh; seatis "" 1; rs "echo forged"
+  k "$(t jq -e 'select(.input | contains("echo forged")) | select(.window == "repo" and .seat == "box")' "$lg")" "a process no seat owns that sets CC_REFUSALS_WINDOW to the repo files window repo, seat box"
+  seatis "repo@orch" 0; rs "echo orch seat"
+  k "$(t jq -e 'select(.input | contains("echo orch seat")) | select(.window == "repo" and .seat == "")' "$lg")" "…another seat that sets it has no seat on the record"
+  seatis repo 0; rs "echo real seat"
+  k "$(t jq -e 'select(.input | contains("echo real seat")) | select(.seat == "repo")' "$lg")" "…and the planning seat's own refusal has its seat"
   fresh; seatis "" 1; local a1 a2 a3 rc
   a1=$(sa repo --title "repo approval" --run "systemctl --user restart x.service" --id "land:x" -- "restart x")
   a2=$(sa repo --title "repo approval" --run "systemctl --user restart x.service" --id "land:x" -- "restart x")
@@ -335,6 +343,10 @@ STUB
   k "$(t test -n "$a1" -a "$a1" = "$a2" -a "$(grep -c '"approval"' "$lg")" = 2)" "an ask prints its id; the same ask while open is one record, another is its own"
   k "$(t grep -q "^$a1 .*\[box\] approval: systemctl --user restart x.service — restart x" <<<"$(sc open repo)")" \
     "open lists an approval ask with its command and text, from the box's own hand (no seat) as [box]"
+  # an ask's key holds its seat, so the seat's ask and a worker's with the same words never share a verdict
+  fresh; seatis repo 0; a1=$(sa repo --from repo -- "same want"); a2=$(SA_CWD=$d/wt sa repo --from repo -- "same want")
+  k "$(t test -n "$a1" -a -n "$a2" -a "$a1" != "$a2" -a "$(jq -r 'select(.kind == "ask") | .key' "$lg" | sort -u | wc -l)" = 2)" "the same words from the seat and from a worker are two asks with two keys"
+  a3=$(SA_CWD=$d/wt sa repo --from repo -- "same want"); k "$(t test "$a3" = "$a2")" "…and the worker asking again while open is still its first ask"
   # WHO MAY ASK (review of #904): a forged caller files nothing, least of all a command for the owner's 👍
   fresh; seatis "repo" 0; sa repo --title t -- "seat ask" >/dev/null
   k "$(t jq -e 'select(.kind == "refusal" and .reason == "seat ask" and .window == "repo")' "$lg")" "the control seat's own ask is filed, stamped with the seat the daemon named"
@@ -474,6 +486,53 @@ STUB
   id=$(CC_REFUSALS_NOTIFY=$d/notify sa repo --title "repo deploy" --run "systemctl --user restart y.service" -- 'deploy with perms up' 2>"$d/err")
   k "$(t jq -e --arg id "$id" 'select(.id == $id and .source == "approval")' "$lg")" "perms up: an approval ask is filed"
   k "$(t test ! -e "$d/notified" -a ! -s "$d/err")" "…and nobody is told anything, nor does the caller hear of it"
+  # THE WARDEN UNIT (wseat): cc-warden.service's cgroup with no claude above it claims, releases and decides as
+  # "warden"; any other caller, its own model run under a claude included, is refused and writes nothing
+  local wcg hs; wcg="/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/cc-warden.service"
+  cp "$d/claude" "$d/unit"   # the same detached runner, named unit: no claude above what it runs
+  ws_(){ CC_ROLE='' PS_BIN=$d/unit CC_REFUSALS_CG=$wcg ps_ "$@"; }
+  fresh; seat "echo warden one"; id=$(idof "echo warden one")
+  k "$(t test "$(CC_ROLE='' PS_BIN=$d/unit ps_ warden repo "$id" claim 'a run starts' >/dev/null 2>&1; echo $?)" = 2 -a -z "$(jq -c 'select(.kind == "warden")' "$lg")")" "a caller outside the warden's cgroup can't claim, and nothing is written"
+  ws_ warden repo "$id" claim 'a run starts' >/dev/null
+  k "$(t jq -e --arg id "$id" 'select(.kind == "warden" and .id == $id and .state == "claim")' "$lg")" "the warden unit's claim is one ledger line"
+  k "$(t grep -q "^$id .*(a warden holds it)\$" <<<"$(sc open repo)")" "…and open marks the id as a warden's"
+  k "$(t test "$(ws_ warden repo rnope claim x >/dev/null 2>&1; echo $?)" = 1)" "a claim on an id that is not open is refused"
+  k "$(t test "$(CC_ROLE='' CC_REFUSALS_CG=$wcg ps_ warden repo "$id" release x >/dev/null 2>&1; echo $?)" = 2)" "a claude above the caller (the warden's own model run) can't release"
+  fresh; seat "echo warden two"; id=$(idof "echo warden two")
+  ws_ warden repo "$id" claim 'a run starts' >/dev/null; ws_ warden repo "$id" release 'tribunal' >/dev/null
+  k "$(t test -z "$(sc open repo | grep 'a warden holds it')" -a -n "$(sc open repo | grep "^$id ")")" "a release hands the id back: still open, no longer marked"
+  ws_ decide repo "$id" decline 'a warden declined it' >/dev/null
+  k "$(t test "$(decided "$lg")" = "$id" -a "$(jq -r 'select(.kind == "decision") | .by' "$lg")" = warden)" "the warden unit's decision is signed, counts, and is recorded by warden"
+  # CC_REFUSALS_CG never stands in against a ledger under the live state dir, read from the password database and
+  # resolved: cg_ is asked in this shell, against paths it only resolves, so no live ledger is touched
+  hs=$(getent passwd "$(id -u)" | cut -d: -f6)/.cc/state; ln -s "$hs" "$d/lnk"
+  k "$(t test "$(HOME=$d/home ROOT=$hs CC_REFUSALS_CG=$wcg cg_ repo)" = "$(sed -n 's/^0:://p' /proc/self/cgroup)")" "CC_REFUSALS_CG is ignored against the live state root with HOME moved"
+  k "$(t test "$(ROOT=$d/lnk CC_REFUSALS_CG=$wcg cg_ repo)" = "$(sed -n 's/^0:://p' /proc/self/cgroup)")" "…and against a root that is a symlink to it"
+  k "$(t test "$(ROOT=$d/state CC_REFUSALS_CG=$wcg cg_ repo)" = "$wcg")" "…and stands in against a fixture root"
+  # wseat itself, in a detached process as the unit would run it (no claude above, CC_ROLE empty, HOME moved): the
+  # stand-in is refused against the live root and a symlink to it, so a revert to a $HOME check goes red. A plain fixture
+  # root is the control: there the stand-in holds by design. Only paths are resolved, and no ledger is read or written
+  { printf '#!/usr/bin/env bash\n'; declare -f ledger cg_ ppid_ wseat; printf 'wseat "$1"\n'; } > "$d/wseat-only"; chmod +x "$d/wseat-only"
+  wsd_(){ local i=0; rm -f "$d/ps.rc"
+    ( export ROOT=$1 HOME=$d/home CC_ROLE='' CC_REFUSALS_CG=$wcg; setsid -f "$d/unit" x "$d/wseat-only" repo >/dev/null 2>&1 </dev/null )
+    while [ ! -s "$d/ps.rc" ] && [ "$i" -lt 300 ]; do sleep 0.05; i=$((i+1)); done; cat "$d/ps.rc" 2>/dev/null; }
+  k "$(t test "$(wsd_ "$hs")" = 1)" "wseat, detached with HOME moved, refuses the stand-in against the live root"
+  k "$(t test "$(wsd_ "$d/lnk")" = 1)" "…and against a symlink to it"
+  k "$(t test "$(wsd_ "$d/state")" = 0)" "…and takes it against a fixture root"
+  # a member's ask and an approval ask are the permission session's: the warden unit can't decide them
+  fresh
+  jq -cn '{kind:"ask", id:"qm1", at:"x", repo:"repo", window:"aya", member:true, ask:"permission", key:"km1"}' >> "$lg"
+  jq -cn '{kind:"refusal", id:"ap1", at:"x", source:"approval", window:"repo", tool:"approval", input:"x", reason:"y", key:"ka1"}' >> "$lg"
+  k "$(t test "$(ws_ decide repo qm1 decline 'no' >/dev/null 2>&1; echo $?)" = 2 -a -z "$(decided "$lg")")" "the warden unit can't decide a member's ask, and nothing is written"
+  k "$(t test "$(ws_ decide repo ap1 his 'his' >/dev/null 2>&1; echo $?)" = 2 -a -z "$(decided "$lg")")" "…nor an approval ask"
+  # decisions prints the signed lines alone, each with the key of its id's first record: an unsigned line and one with a
+  # wrong signature, on asks of their own, are left out, because a warden shares a verdict from this list
+  fresh; seat "echo dec signed"; seat "echo dec unsigned"; seat "echo dec badsig"
+  id=$(idof "echo dec signed"); ps_ decide repo "$id" decline 'signed' >/dev/null
+  jq -cn --arg i "$(idof "echo dec unsigned")" '{kind:"decision", id:$i, at:"2026-11-01T00:00:00Z", decision:"decline", by:"warden", note:"planted"}' >> "$lg"
+  jq -cn --arg i "$(idof "echo dec badsig")" '{kind:"decision", id:$i, at:"2026-11-01T00:00:00Z", decision:"decline", by:"warden", note:"planted", sig:"0000"}' >> "$lg"
+  out=$(jq -r 'select(.kind == "refusal" and .id == "'"$id"'") | .key' "$lg")
+  k "$(t test -n "$out" -a "$(sc decisions repo | jq -r '"\(.id) \(.key) \(.note)"')" = "$id $out signed")" "decisions prints the signed line alone, with its ask's key"
   rm -rf "$d"
   echo "cc-refusals selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]
 }

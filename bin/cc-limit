@@ -112,7 +112,7 @@
 # call. No Claude turn can tell him then, so this does: the moment the box parks (`check` sees the second run, or
 # `record` finds a limited session) tell() reads $DUE and, for whatever falls due before the named reset, sends him
 # one cc-notify line, once per episode ($TOLD holds the reset and login of the episode he was told about, and moves out with
-# it, so a reset that moves later in the same episode tells him nothing more).
+# it, so a reset that moves later in the same episode tells him nothing more; after a `clear`, another reset is a new episode).
 # An episode with no promise in it says nothing: a limit is routine, and the box resumes by itself.
 # A pane line alone is not proof — this box's own docs and briefs say "usage limit" too — so a record needs the line
 # AND corroboration: the shared stamp is live, or cc-model itself judged a limit recently — a live
@@ -329,7 +329,8 @@ tell(){   # $1 = the reset the box is parked until. See A PROMISE THE LIMIT WILL
   # later reset moves the marker out. Another login's marker is another episode, as another login's stamp is (a
   # weekly wall told on Monday must not silence a real limit on Tuesday after the box moved account), and the
   # marker goes with a stamp disbelieve() drops. `clear` leaves it, because every run that reaches the API clears,
-  # a fallback run in mid-episode too, and the pane recorded next would be told again. Nothing
+  # a fallback run in mid-episode too, and the pane recorded next would be told again; it touches $S.cleared instead, so
+  # past a clear the reset he was told of is still his episode and any other reset is a new one, as it is to check. Nothing
   # here is a pane's own sighting or a stamp's first-seen: two panes on one unstamped limit, a pane recorded twice, a
   # record and then a check all name the same reset (review of #1910). The read of $TOLD to its write is held under a
   # lock, so two callers at once tell him once; the send runs after the lock is let go, so a hung cc-notify never
@@ -338,14 +339,17 @@ tell(){   # $1 = the reset the box is parked until. See A PROMISE THE LIMIT WILL
   due=$( { flock -w 30 9 || exit 0; local at words due="" told tacc me; me=$(account)
   IFS=$'\t' read -r told tacc < <(cat "$TOLD" 2>/dev/null); [[ "$told" =~ ^[0-9]+$ ]] || told=0
   [ "$tacc" = "$me" ] || told=0
-  if [ "$told" -gt $((now - 900)) ]; then [ "$1" -gt "$told" ] && printf '%s\t%s\n' "$1" "$me" > "$TOLD"; exit 0; fi
+  if [ "$told" -gt $((now - 900)) ] && { [ ! "$S.cleared" -nt "$TOLD" ] || [ "$1" = "$told" ]; }; then [ "$1" -gt "$told" ] && printf '%s\t%s\n' "$1" "$me" > "$TOLD"; exit 0; fi
   [ -n "${2:-}" ] && exit 0   # quiet: a check that keeps the episode alive without parking the box only moves the marker
   while IFS=$'\t' read -r at words; do
     [[ "$at" =~ ^[0-9]+$ ]] && [ "$at" -gt "$now" ] && [ "$at" -le "$1" ] && due+="${due:+; }$words (due $(date -d "@$at" +%H:%M))"
   done < <(cat "$DUE" 2>/dev/null)
   # $TOLD is written BEFORE cc-notify runs, on purpose: once per episode, so a send that fails is not retried.
   [ -n "$due" ] && printf '%s\t%s\n' "$1" "$me" > "$TOLD"; printf '%s' "$due"; } 9>>"$TOLD.lock" )
-  [ -n "$due" ] && "$BIN/cc-notify" --heading "This won't come on time: $due" \
+  # cc-notify's own key ignores the heading and strips digits, so every notice reads as one and any kind with a window
+  # holds back the next episode. So: `boot`, the one row at rung 4 with no window, and the event's own name, which
+  # cc-slack posts once ever, so two panes on two resets taking turns past clears tell each reset once.
+  [ -n "$due" ] && "$BIN/cc-notify" --kind boot --id "limit-told:$1:$(account)" --heading "This won't come on time: $due" \
     "The box hit its usage limit and every session is parked until $(date -d "@$1" +%H:%M), when it carries on by itself." >/dev/null 2>&1
   return 0; }
 
@@ -507,7 +511,7 @@ selfcheck(){   # the cases are tests/selfcheck/cc-limit.sh beside this bin/; sou
   selfcheck "$@"; }
 
 case "${1:-}" in
-  clear) rm -f "$S" "$DISB"; exit 0 ;;
+  clear) rm -f "$S" "$DISB"; touch "$S.cleared" 2>/dev/null; exit 0 ;;
   status) if ! believe; then echo clear
       # …and a model the account cannot run right now (usage credits, the spend cap) is not a limit and holds nobody,
       # but a person reading `status` should still hear it — stderr, so a caller's "clear" is unchanged.

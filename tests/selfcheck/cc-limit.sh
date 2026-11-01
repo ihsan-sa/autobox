@@ -640,7 +640,7 @@ EOF
   t 'promise: an episode with nothing due in it says nothing' "$(calls '^notify ')" 0
   # ONE EPISODE IS ONE NOTICE, WHOEVER SEES IT (review of #1910). Each case its own fixture: no stamp, a model.log
   # switch to corroborate the panes, two panes naming the same clock reset, and one promise due before it.
-  ep(){ rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/limit-interrupted" \
+  ep(){ rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/claude-limit.cleared" "$d/.cc/state/limit-interrupted" \
       "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"; : > "$d/calls"
     printf '%s\t%s\tswitch\t%s\t%s\n' iso "$(($1 - 60))" claude-opus-5 "2 session(s); test" > "$d/.cc/state/model.log"
     for p in @1 @2; do printf 'Claude usage limit reached. Your limit will reset at %s\n> \n' \
@@ -667,6 +667,39 @@ EOF
   ep "$t9"; me "$t9" record @1 alpha >/dev/null 2>&1; me $((t9 + 600)) clear >/dev/null 2>&1
   me $((t9 + 900)) record @1 alpha >/dev/null 2>&1
   t 'promise: a clear between two records of one pane tells him nothing more' "$(calls '^notify ')" 1
+  # A clear inside a told episode, then runs naming a reset: the one he was told of is the same episode, any other a new
+  # one, told once. Each case its own fixture: told at t9 of a reset at t9+7200, cleared ten minutes on, $1 the next reset.
+  cl(){ ep "$t9"; rm -f "$d/panes/@2"; me "$t9" record @1 alpha >/dev/null 2>&1; rm -f "$d/panes/@1"
+    ag $((t9 + 600)) "$1"; }
+  ag(){ me "$1" clear >/dev/null 2>&1   # $1 when, $2 the reset the next two runs name
+    printf '{"is_error":true,"result":"Claude usage limit reached. Your limit will reset at %s"}\n' \
+      "$(date -u -d "@$2" '+%F %H:%MZ')" > "$d/run10.json"
+    OBS=worker-a; me $(($1 + 60)) check "$d/run10.json" >/dev/null 2>&1; OBS=worker-b; me $(($1 + 120)) check "$d/run10.json" >/dev/null 2>&1; }
+  cl $((t9 + 7200))
+  t 'promise: a clear, then two runs on the reset he was told of, tells him nothing more' "$(calls '^notify ')" 1
+  cl $((t9 + 10800))
+  t 'promise: a clear, then a new reset inside the told window, tells him of the new episode' "$(calls '^notify ')" 2
+  cl $((t9 + 10800)); OBS=worker-c; me $((t9 + 780)) check "$d/run10.json" >/dev/null 2>&1
+  t 'promise: a third run on that new episode tells him nothing more' "$(calls '^notify ')" 2
+  # THE SAME, THROUGH THE REAL cc-notify (perms' read of #2138): the stub above can't see its dedup, which dropped the
+  # second episode's notice. Only its sender is stubbed: a cc-slack that logs each post and keeps the --id ledger.
+  mv "$d/bin/cc-notify" "$d/cc-notify.stub"
+  printf '#!/usr/bin/env bash\nexec env -u CC_NOTIFY_LOG_ONLY -u CC_MEMBER_SANDBOX -u CC_ROLE -u SLACK_WEBHOOK -u NTFY_TOPIC -u CC_BOX SLACK_BOT_TOKEN=xoxb-test CC_NOTIFY_LOG="$HOME/.cc/notify.log" "%s" "$@"\n' \
+    "$(dirname "$SELF")/cc-notify" > "$d/bin/cc-notify"
+  cat > "$d/bin/cc-slack" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  sent) [ -e "$HOME/sent-$2" ]; exit;;
+  post) printf 'post %s\n' "$*" >> "$CC_FAKE_CALLS"
+    while [ $# -gt 0 ]; do [ "$1" = --id ] && : > "$HOME/sent-$2"; shift; done; echo 1.1;;
+esac
+EOF
+  chmod +x "$d/bin/cc-notify" "$d/bin/cc-slack"
+  cl $((t9 + 10800))
+  t 'promise, real cc-notify: a second episode inside its window reaches Slack' "$(calls '^post ')" 2
+  rm -f "$d"/sent-*; rm -rf "$d/.cc/notify-seen"; cl $((t9 + 10800)); ag $((t9 + 900)) $((t9 + 7200)); ag $((t9 + 1200)) $((t9 + 10800))
+  t 'promise, real cc-notify: two resets taking turns past clears tell each reset once' "$(calls '^post ')" 2
+  rm -f "$d/bin/cc-slack" "$d"/sent-*; rm -rf "$d/.cc/notify-seen" "$d/.cc/notify.log"; mv "$d/cc-notify.stub" "$d/bin/cc-notify"
   # A backoff that extends the episode (review of #1910): told of a two-hour reset, then past it a run names no
   # time (a backoff, which tells nobody), then a run names a later reset with a promise due before it. One episode.
   ep "$t9"; rm -f "$d/panes/@1" "$d/panes/@2"
