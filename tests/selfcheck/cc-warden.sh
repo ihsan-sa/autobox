@@ -85,7 +85,7 @@ EOF
   # the guard: logs each call, and blocks one the allow list lets through, as cc-guard does
   printf '#!/bin/sh\ni=$(cat); printf "%%s\\n" "$i" >> %s/guard.log; case "$i" in *guard-blocks-this*) echo blocked >&2; exit 2;; esac\n' "$d" > "$H/bin/cc-guard"
   chmod +x "$H/bin/"*
-  local yes=("cc-refusals show repo q30" "cc-lib ask x" "cc-board show repo" "cc-infer decide --ask x" "cc-infer decide --ask 'Bash(git push *)'")
+  local yes=("cc-refusals show repo q30" "cc-lib ask x" "cc-board show repo" "cc-infer decide --ask 'x'" "cc-infer decide --ask \"it's x\"" "cc-infer decide --ask 'Bash(git push *)'")
   local no=("cat $sec" "cat < $sec" "cat ~/.claude/.credentials.json" "cd $H/.claude && cat .credentials.json" "echo \$(cat $sec)" "head -1 $sec" \
             "sed -n 1p $sec" "ls $H/.claude" "grep -r SECRET $H/.claude" "find $H/.claude -type f" "cat /proc/self/environ" "env" "printenv ANTHROPIC_API_KEY" \
             'echo $ANTHROPIC_API_KEY' "cc-board show repo; cat $sec" "git --version" "git log --output=$d/planted" "python3 -c print(1)" "curl --version" \
@@ -94,13 +94,16 @@ EOF
             "cc-board show repo | wc --files0-from=$sec" "cc-board show \$(du --files0-from=$sec)" "cc-board show \`du --files0-from=$sec\`" \
             "cc-board show <(du --files0-from=$sec)" "cc-board show repo > $d/planted" "cc-board show < $sec" "cc-board show repo"$'\n'"du --files0-from=$sec" \
             "du $sec"$'\n'"cc-board show repo" \
-            "cc-board show repo\\"$'\n'"; du $sec" "X=1 cc-board show repo" "env cc-board show repo" " cc-board show repo" "cc-board showx" "cc-boardx show repo")
+            "cc-board show repo\\"$'\n'"; du $sec" "X=1 cc-board show repo" "env cc-board show repo" " cc-board show repo" "cc-board showx" "cc-boardx show repo" \
+            "cc-infer decide --json $sec" "cc-infer decide --json -" "cc-infer decide --record --ask 'x'" "cc-infer decide --ask 'x' --record" "cc-infer decide --ask x --record" \
+            "cc-infer decide --ask 'x' '--record'" "cc-infer decide --ask 'x' --re'cord'" "cc-infer decide --ask 'x' --{record,y}" "cc-infer decide --ask --record" "cc-infer digest")
   # the hook itself, from settings() as the run gets it, on the JSON Claude Code sends it: 0 lets a call on, 2 refuses
   lbl(){ local s=${1//$d/\$d}; printf "%s" "${s//$'\n'/\\n}"; }
   local only; only=$(settings | jq -r '.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[0].command')
   hook(){ jq -cn --arg c "$1" '{session_id:"s", transcript_path:"/x", cwd:"/", permission_mode:"dontAsk", hook_event_name:"PreToolUse", tool_name:"Bash", tool_input:{command:$c, description:"d"}, tool_use_id:"t"}' | sh -c "$only" >/dev/null 2>&1; echo $?; }
   for c in "${yes[@]}"; do k "$(t test "$(hook "$c")" = 0)" "the hook passes $c"; done
   for c in "${no[@]}"; do k "$(t test "$(hook "$c")" = 2)" "the hook refuses $(lbl "$c")"; done
+  k "$(t test "$(hook "cc-infer decide --ask '--record'")" = 0 -a "$("$BIN/cc-infer" decide --ask --record >/dev/null 2>&1; echo $?)" = 2)" "--record as the one quoted ask passes the hook, and cc-infer stops at its usage line with nothing written"
   k "$(t test "$(echo 'not json' | sh -c "$only" 2>/dev/null; echo $?)" = 2)" "the hook refuses when its input isn't JSON"
   k "$(t test "$(echo '{"tool_input":{}}' | sh -c "$only" 2>/dev/null; echo $?)" = 2)" "…or names no command"
   k "$(t test "$(echo '{"tool_input":{"command":"cc-board show repo"}}' | PATH=/nonexistent /bin/sh -c "$only" 2>/dev/null; echo $?)" = 2)" "…or jq can't run"
