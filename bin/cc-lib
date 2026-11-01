@@ -192,7 +192,11 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   member's board, ~/.cc/boards/<h>.json to its board under ~/.cc/members/<h>; a file whose name says secret,
   credential, password or .env, or token unless it is a .md (a memory file is named after its rule); a file over 4 MiB, except a board, read up to 64 MiB (cc-board's
   own cap; a member's up to 8 MiB), and the landing queue, which only the box writes and is read from its newest 64 MiB.
+  A hard link is read: st_nlink says a file has a second name, not which name was planted, and a sandbox's link across its
+  binds fails with EXDEV, so it reaches nothing the worker could not already read.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
+  Text a source no longer holds leaves the index file's bytes as well as its answers (db's scrub); a -wal keeps its old
+  frames until the sweep's checkpoint.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
 
@@ -610,9 +614,12 @@ def registry():
     srcs = []
     seen = set()
 
+    def readable(p):
+        return not linked(unlinked(p)) and os.path.isfile(p) and not quarantine_of(p)   # QUARANTINE: indexed nowhere
+
     def add(p, skind, repo="", track=""):
         p = os.path.abspath(p)
-        if p in seen or linked(unlinked(p)) or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
+        if p in seen or not readable(p):
             return
         seen.add(p)
         srcs.append((p, skind, repo, track))
@@ -656,6 +663,7 @@ def registry():
             # every worktree under ~/.cc/worktrees/<repo>/ and then the primary; of the copies of one relative path
             # the newest by mtime is read (a tie goes to the worktree, first in the order) and the others are not —
             # the design's "a newer copy in a worktree wins over the primary", and a seat left behind by main loses.
+            # Only a copy add() would take competes: a link in a worktree must not knock the primary's file out.
             trees = [(t, os.path.basename(t)) for t in sorted(glob.glob(os.path.join(H, ".cc", "worktrees", repo, "*")))
                      if os.path.isdir(t) and not os.path.islink(t)] + [(proj, "")]
             claimed = set()   # a path a REPO_SOURCES pattern placed (its primary copy too) is not read again as a plain doc
@@ -663,6 +671,8 @@ def registry():
                 best = {}   # relative path -> (mtime, path, track)
                 for tree, track in trees:
                     for p in sorted(glob.glob(os.path.join(tree, pat))):
+                        if not readable(p):
+                            continue
                         try:
                             mt = os.stat(p).st_mtime_ns
                         except OSError:
@@ -1281,6 +1291,25 @@ def fts5_available():
 SCHEMA_V = "4"
 
 
+def scrub(c):
+    """Text this index deletes leaves the file's bytes, since a worker can read those. secure_delete zeroes what a table
+    frees (per connection, so db sets it) and FTS5's secure-delete takes a deleted row's terms out of its segments, where
+    they would otherwise stay until a merge; about 1.5 ms more per replaced record on 383k records, against rewriting 360 MB
+    with a rebuild and VACUUM on every pass. A file without the flag has old bytes, so it is cleaned once, in place, with
+    every source kept (5 s or so): VACUUM drops the dirty free pages, then the terms are rebuilt from the records. No
+    schema bump, which would empty every worker's `ask` until a full re-read. A writer in the way leaves it for the next open."""
+    if not c.execute("SELECT 1 FROM fts_config WHERE k='secure-delete'").fetchone():
+        try:
+            c.execute("VACUUM")
+            c.execute("INSERT INTO fts(fts) VALUES ('rebuild')")
+            c.execute("INSERT INTO fts(fts, rank) VALUES ('secure-delete', 1)")
+            c.execute("DELETE FROM meta WHERE k='workspace'")   # build_ws renames a copy it finds no such row in, so the clean one lands
+            c.commit()
+        except sqlite3.OperationalError:
+            c.rollback()
+    return c
+
+
 def db(path=None, wal=True):
     """The index is a cache: one whose schema is not this version is dropped and rebuilt, never migrated. Inside a
     member's boundary the file is the host's: read-only, and immutable for the life of the connection (db_ro)."""
@@ -1292,14 +1321,15 @@ def db(path=None, wal=True):
         c = sqlite3.connect(path, timeout=5)
         c.execute("PRAGMA journal_mode=" + ("WAL" if wal else "DELETE"))
         c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA secure_delete=ON")
         c.executescript(SCHEMA)
         v = c.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
         if v and v[0] == SCHEMA_V:
-            return c
+            return scrub(c)
         if not v and not c.execute("SELECT 1 FROM sources LIMIT 1").fetchone():
             c.execute("INSERT INTO meta(k, v) VALUES ('schema', ?)", (SCHEMA_V,))
             c.commit()
-            return c
+            return scrub(c)
         c.close()
         for suf in ("", "-wal", "-shm"):
             try:
@@ -1527,8 +1557,8 @@ def build_shared(c):   # recurring-defect-ok: pause-hold-missing — copies the 
     member-facing repo in place of the aggregate. Since #1600 a worker reads the aggregate, and a worker on a repo a
     member talks to writes where that member reads, so another member's records must not be in reach there at all, not
     just asked to stay out of its output. Copied from the aggregate (c, current after the full pass) into a FRESH file
-    rather than pruned from a copy of it: deleted text lingers in free pages and FTS segments, and a worker can read the
-    raw bytes. Built only when the owner's sources moved since the last copy, so between full passes (five minutes) it
+    rather than pruned from a copy of it, so the text it leaves out was never in the file, and a worker can read the raw
+    bytes. Built only when the owner's sources moved since the last copy, so between full passes (five minutes) it
     may lag a hook's --touch; renamed in like a workspace's file, so a reader holds a whole one.
     AN ALLOWLIST, NOT EVERY OWNER RECORD: ws_of tags member workspaces only, so ws='' alone still carries the box's own
     talk with every member (perms-38, from its reads of #1649 and #1665). In: an owner repo's board and its tracks'
@@ -3376,6 +3406,7 @@ def selfcheck():
         selfcheck_perms(th, ok, run, w)
         selfcheck_sources(th, ok, run, w)
         selfcheck_links(th, ok, run, w)
+        selfcheck_scrub(th, ok, run, w)
         selfcheck_ranking(th, ok, run, w)
         selfcheck_quarantine(ok, run)
     finally:
@@ -4646,10 +4677,86 @@ def selfcheck_links(th, ok, run, w):
     run("index")
     ok("any other directory on a source's path counts the same: a track's state directory that is a link is no source, a plain one is",
        not found("lnkcanarystate") and found("lnkcontrolstate"))
+    # the mtime pick: a link's newer target must not push the primary's own file out of the index
+    primary = w("dev/lessons/lessons/lnkpick/COURSE.md", "# course\n\nlnkcontrolprimary\n")
+    w("lnkvault/pick.md", "# course\n\nlnkcanarypick\n")
+    os.makedirs(os.path.join(tree, "lnkpick"))
+    os.symlink(os.path.join(th, "lnkvault", "pick.md"), os.path.join(tree, "lnkpick", "COURSE.md"))
+    w("dev/lessons/lessons/lnknewer/COURSE.md", "# course\n\nlnkcontrololdprimary\n")
+    newer = w(".cc/worktrees/lessons/lnkseat/lessons/lnknewer/COURSE.md", "# course\n\nlnkcontrolnewerseat\n")
+    for f, t in ((primary, 1000), (os.path.join(th, "lnkvault", "pick.md"), 3000000000), (newer, 3000000000)):
+        os.utime(f, (t, t))
+    run("index")
+    ok("a link in a worktree with a newer target leaves the primary's file indexed, and its target unread",
+       found("lnkcontrolprimary") and indexed(primary) and not found("lnkcanarypick"))
+    ok("a real newer copy in a worktree still wins over the primary, as the design says",
+       found("lnkcontrolnewerseat") and not found("lnkcontrololdprimary"))
+    shutil.rmtree(os.path.join(th, "dev", "lessons", "lessons"))
     os.remove(os.path.join(th, ".cc", "boards", "lessons.json"))
     os.remove(pdir)
     for d in (".cc/state/lessons", ".cc/worktrees/lessons", ".claude/projects/-lnkroot", ".claude/projects/-lnkplain"):
         shutil.rmtree(os.path.join(th, d))
+    run("index")
+
+
+def selfcheck_scrub(th, ok, run, w):
+    """Text a source no longer holds leaves the raw bytes of the owner's file and a member's, and a file from before the
+    flag is cleaned once and keeps its records. The words are searched by their tail, as FTS5 shares a term's head."""
+    owner = os.path.join(th, ".cc", "library", "owner", "index.sqlite")
+
+    def inbytes(word, *files):
+        out = 0
+        for f in files:
+            if os.path.isfile(f):
+                with open(f, "rb") as fh:
+                    out += fh.read().count(word.encode())
+        return out
+
+    def plant_old(path, word):
+        """What a file looks like before scrub: no flag, a plain connection's delete, its text left in the bytes."""
+        c = sqlite3.connect(path)
+        c.execute("DELETE FROM fts_config WHERE k='secure-delete'")
+        c.execute("INSERT INTO records(source_id, rid, title, text) VALUES (1, 'scrubold', 'old', ?)", (f"zzz{word}",))
+        c.commit()
+        c.execute("DELETE FROM records WHERE rid='scrubold'")
+        c.commit()
+        c.close()
+
+    w(".cc/boards/scrubm.json", json.dumps({"repo": "scrubm", "log": [], "tracks": {}}))
+    w("dev/scrubm/.cc/member-workspace", "")
+    edited = w("dev/scrubm/docs/edited.md", "# edited\n\nscrubkeptword scrubeditedcanary\n")
+    gone = w("dev/scrubm/docs/gone.md", "# gone\n\nscrubgonecanary\n")
+    run("index")
+    wid = workspaces()["scrubm"]
+    wsf = os.path.join(th, ".cc", "library", "ws", wid, "index.sqlite")
+    files = (owner, owner + "-wal", wsf)
+    words = ("scrubeditedcanary", "scrubgonecanary")
+    before = [inbytes(x, *files) > 0 for x in words]
+    with open(edited, "w") as f:
+        f.write("# edited\n\nscrubkeptword\n")
+    os.remove(gone)
+    run("index")
+    ok("text edited out of a source and a source removed leave the bytes of the owner's file and a member's",
+       all(before) and not any(inbytes(x, *files) for x in words))
+
+    def kept(path):
+        c = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        n = c.execute("SELECT COUNT(*) FROM records JOIN fts ON fts.rowid=records.id WHERE fts MATCH 'scrubkeptword'").fetchone()[0]
+        c.close()
+        return n
+
+    plant_old(wsf, "scruboldcanary")
+    planted = inbytes("scruboldcanary", wsf) > 0
+    run("index")
+    ok("a member's file from before the flag is cleaned though no source moved, and the new file lands with its records",
+       planted and not inbytes("scruboldcanary", wsf) and kept(wsf) == 1)
+    plant_old(owner, "scruboldcanary")
+    planted = inbytes("scruboldcanary", owner, owner + "-wal") > 0
+    run("index")
+    ok("the owner's file from before the flag is cleaned by its next pass and keeps its records",
+       planted and not inbytes("scruboldcanary", owner, owner + "-wal") and kept(owner) == 1)
+    os.remove(os.path.join(th, ".cc", "boards", "scrubm.json"))
+    shutil.rmtree(os.path.join(th, "dev", "scrubm"))
     run("index")
 
 
