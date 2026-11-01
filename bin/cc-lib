@@ -195,8 +195,9 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   A hard link is read: st_nlink says a file has a second name, not which name was planted, and a sandbox's link across its
   binds fails with EXDEV, so it reaches nothing the worker could not already read.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
-  Text a source no longer holds leaves the index file's bytes as well as its answers (db's scrub); a -wal keeps its old
-  frames until the sweep's checkpoint.
+  Text a source no longer holds leaves the index's answers and nearly all of the file's bytes (db's scrub). What stays: a
+  page separator in fts_idx keeps the head of a deleted term, rarely all of it, until a merge rewrites that page, and a
+  -wal keeps its old frames until the sweep's checkpoint.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
 
@@ -1292,12 +1293,15 @@ SCHEMA_V = "4"
 
 
 def scrub(c):
-    """Text this index deletes leaves the file's bytes, since a worker can read those. secure_delete zeroes what a table
-    frees (per connection, so db sets it) and FTS5's secure-delete takes a deleted row's terms out of its segments, where
-    they would otherwise stay until a merge; about 1.5 ms more per replaced record on 383k records, against rewriting 360 MB
-    with a rebuild and VACUUM on every pass. A file without the flag has old bytes, so it is cleaned once, in place, with
-    every source kept (5 s or so): VACUUM drops the dirty free pages, then the terms are rebuilt from the records. No
-    schema bump, which would empty every worker's `ask` until a full re-read. A writer in the way leaves it for the next open."""
+    """Text this index deletes leaves nearly all of the file's bytes, since a worker can read those. secure_delete zeroes
+    what a table frees (per connection, so db sets it) and FTS5's secure-delete takes a deleted row's terms out of its
+    leaf pages, where they would otherwise stay until a merge; about 1.5 ms more per replaced record on 383k records,
+    against rewriting 360 MB with a rebuild and VACUUM on every pass. It leaves fts_idx alone: a page separator keeps the
+    head of a deleted term, rarely all of it, with no record or source beside it, until a merge rewrites that page. An
+    optimize clears them only until the next delete, so none runs, and a token shape was never stored. A file without the
+    flag has old bytes, so it is cleaned once, in place, with every source kept (5 s or so): VACUUM drops the dirty free
+    pages, then the terms are rebuilt from the records. No schema bump, which would empty every worker's `ask` until a
+    full re-read. A writer in the way leaves it for the next open."""
     if not c.execute("SELECT 1 FROM fts_config WHERE k='secure-delete'").fetchone():
         try:
             c.execute("VACUUM")
@@ -4700,8 +4704,9 @@ def selfcheck_links(th, ok, run, w):
 
 
 def selfcheck_scrub(th, ok, run, w):
-    """Text a source no longer holds leaves the raw bytes of the owner's file and a member's, and a file from before the
-    flag is cleaned once and keeps its records. The words are searched by their tail, as FTS5 shares a term's head."""
+    """Words a source no longer holds leave the raw bytes of the owner's file and a member's, and a file from before the
+    flag is cleaned once and keeps its records. The words are searched by their tail, as FTS5 shares a term's head. A page
+    separator can still keep a term's head (scrub says so); these words land on none."""
     owner = os.path.join(th, ".cc", "library", "owner", "index.sqlite")
 
     def inbytes(word, *files):
@@ -4736,7 +4741,7 @@ def selfcheck_scrub(th, ok, run, w):
         f.write("# edited\n\nscrubkeptword\n")
     os.remove(gone)
     run("index")
-    ok("text edited out of a source and a source removed leave the bytes of the owner's file and a member's",
+    ok("the words of text edited out of a source and of a source removed leave the bytes of the owner's file and a member's",
        all(before) and not any(inbytes(x, *files) for x in words))
 
     def kept(path):

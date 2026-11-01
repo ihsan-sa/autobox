@@ -22,9 +22,11 @@ or parallel runs with each item it reads (from stdin, -a f, --arg-file=f, `< f`,
 each line, -I/-i/--replace[=] swapped in; a lone `parallel {}` runs each item as the command), `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
 literals of an interpreter's -c/-e code (python perl ruby node php…: each literal, and all of them joined by blanks,
 so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
-does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
+does not parse is data, but on a `word (` in it the lines before that one are still judged, because bash runs those).
+Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
 reads an interpreter's -c/-e (or stdin heredoc) body and awk/sed program text.
-A `$D` or `$D/x` whose D this command set once, to a literal with no blank or glob in it, is that path to the recursive
+A `$D` or `$D/x` whose D this command assigns once and names nowhere else outside its heredoc bodies but as a plain
+`$D` or `${D}`, to a literal with no blank or glob in it, is that path to the recursive
 delete rule and to view; every other rule still reads it as computed. What a
 compound or a function reads on stdin (`{ bash; } <<EOF`, `… | while read l; do bash -c "$l"; done`, `f <<EOF`) is fed to
 each statement inside it, and a shell -c, eval or verb that is only a `$` beside fed text runs that text.
@@ -248,7 +250,7 @@ CMDVAR = re.compile(r'(GIT_)?(SSH_COMMAND|SSH|PAGER|EDITOR|SEQUENCE_EDITOR|ASKPA
 CMDCFG = re.compile(r'core\.(pager|editor|sshcommand|askpass|fsmonitor)|pager\..*|sequence\.editor|(diff|merge)\..*\.(command|cmd)|'
                     r'(gpg|credential)\.(program|helper)|.*\.(textconv|clean|smudge|process)', re.I)
 READERS = {'cat', 'tac', 'nl', 'head', 'tail', 'sed', 'cut', 'grep', 'tee', 'sort', 'uniq'} | AWKS   # print a file's lines
-SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash'}
+SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash', 'fish', 'csh', 'tcsh'}
 OPENER = {'{': '}', 'if': 'fi', 'while': 'done', 'until': 'done', 'for': 'done', 'select': 'done', 'case': 'esac'}
 # run what sits in the directory they are pointed at (the cwd, -C/--prefix/--cwd or a path argument): a member's build
 # files and tests are its code
@@ -563,7 +565,7 @@ class Guard:
         g._mp = None
         g.written, g.alias, g.funcs = {}, {}, {}   # files this command writes (path -> text), its aliases, its functions (name -> tokens)
         g.cfgs = set()   # where this command copies or links cc-config to
-        g.vset = {}   # how many times this command sets each variable
+        g.said = ''   # the whole command less its heredoc bodies, which once() reads
         g.vsrc = {}   # a variable set from a substitution: its source text, read as a computed verb's words
         nt = env.get('GUARD_NEVER_TOUCH') or os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'config', 'never-touch.txt')
         g.nt = set()
@@ -666,10 +668,13 @@ class Guard:
     def script(g, text, cwd, nested, depth):
         if depth > 8: raise ParseError('nested too deep')
         start, toks, cmds, stack, k = len(g.out), text if isinstance(text, list) else lex(text, g.home), [], [], 0
+        if not depth:
+            g.said = text
+            for a, b in sorted((t[1]['span'] for t in toks if t[0] == 'R' and t[1].get('span')), reverse=True): g.said = g.said[:a] + g.said[b:]
         # a redirect on a compound's closer is the stdin of each statement in it: `{ bash; } <<EOF`, `done <<EOF`
         toks = inject(toks, [(a, b, rs) for a, b in compounds(toks)
                              for rs in [stdinrs(r[1] for r in itertools.takewhile(lambda t: t[0] == 'R', toks[b + 1:]))] if rs])
-        cwdl, cur = [cwd], {'words': [], 'redirs': [], 'pipe': None}
+        cwdl, cur, line = [cwd], {'words': [], 'redirs': [], 'pipe': None}, start
         def end(pipe=False):
             nonlocal cur
             idx = None
@@ -678,6 +683,7 @@ class Guard:
             cur = {'words': [], 'redirs': [], 'pipe': idx if pipe else None}
         while k < len(toks):
             t = toks[k]; k += 1; top = stack[-1] if stack else None
+            if t == ('OP', '\n'): end(); line = len(g.out)
             if top and top[0] == 'casepat':   # case patterns are data up to their `)`
                 if t[0] == 'W' and t[1].v == 'esac' and not t[1].q: stack.pop()
                 elif t == ('OP', ')'): top[0] = 'casecmd'
@@ -703,7 +709,8 @@ class Guard:
             elif t[1] == '(':
                 if (nested or '').endswith(' code') and cur['words'] and toks[k:k + 1] != [('OP', ')')] \
                         and cur['words'][-1].v not in KW and cur['words'][-1].v not in ('for', 'time'):
-                    raise ParseError('a word before (')   # a syntax error in bash, so a string like this (a JS regex, a call) is data
+                    # a syntax error in bash, so a string like this (a JS regex, a call) is data; bash ran the lines before this one
+                    del g.out[line:]; return g.out[start:]
                 if cur['words'] and k < len(toks) and toks[k] == ('OP', ')'):   # f() { ..; }: the name goes
                     k += 1; g.funcdef(cur['words'][-1], toks, k); cur['words'] = []; continue
                 end(); stack.append(['sub', cwdl[0]])
@@ -725,9 +732,13 @@ class Guard:
         for a, b in compounds(toks):
             if a == k: g.funcs[name.v] = toks[a:b + 1]
 
+    def once(g, n):   # the one word naming n that isn't a plain `$n` or `${n}` is its assignment, so nothing here can change it,
+        # even a write a loop brings back round: `read D`, `printf -v D`, `N=D`, `${D:=x}`, a second `D=`
+        return len(re.findall(r'(?<![\w./~$-])(?<!\$\{)%s(?![\w.-])|\$\{%s(?!\})' % (n, n), g.said)) == 1
+
     def lit(g, w):   # `D=/tmp/x; rm -rf $D/y`: a word that is a variable this command set to a plain literal is that path
         m = LITVAR.fullmatch(w.raw) if w.dyn and not w.subs else None
-        val = g.vars.get(m.group(2)) if m and g.vset.get(m.group(2)) == 1 else None
+        val = g.vars.get(m.group(2)) if m and g.once(m.group(2)) else None
         if val and val.startswith('~/'): val = g.home + val[1:]   # bash expands it in the assignment
         if val and not re.search(r'[\s*?[\]{}$`~]', val): w.known = val + (m.group(3) or '')
 
@@ -750,7 +761,6 @@ class Guard:
             for w in ws[i - len(assigns):i]:
                 k, _, val = w.v.partition('=')
                 g.vars[k.rstrip('+')] = None if (w.dyn or w.glob or k.endswith('+')) else val
-                g.vset[k.rstrip('+')] = g.vset.get(k.rstrip('+'), 0) + 1
                 if w.dyn: g.vsrc[k.rstrip('+')] = w.raw.partition('=')[2]   # `X=$(echo docker)`: the text it is built from
                 if w.dyn and w.subs and re.fullmatch(r'"?\$\(.*\)"?', w.raw.partition('=')[2], re.S) and depth < 8:
                     try: sv = ' '.join(g.data(r) for sub in w.subs for r in g.script(sub, cwdl[0], '$()', depth + 1))
@@ -1901,13 +1911,14 @@ def parse(text, env):
 
 # THE TEXT A COMMAND NEVER RUNS, CUT OUT, for cc-guard's text rules (the seat's state, the sandbox key), which have no parser
 # of their own. Nothing is cut from a command that holds anything able to run or reach that text: a shell, interpreter,
-# wrapper, computed verb or word, verb named by a path, a function, or an assignment on PATH and the like. Otherwise a
+# wrapper, computed verb or word, verb named by a path, a function, hash, a tool that takes its paths from a list or a patch
+# (tar, rsync, patch, git apply), or an assignment on PATH and the like. Otherwise a
 # heredoc body fed to cat, tee, git, gh or the box's own tools, the words of echo and printf, what a read-only tool names, a quoted phrase given to git's
 # message verbs, gh or the box's own tools, and the file gh api --input reads are all data. Every write target stays, and judge
 # reads each of them whatever this cuts.
 VIEWREAD = {'cat', 'head', 'tail', 'grep', 'egrep', 'ls', 'stat', 'wc', 'jq', 'diff', 'cmp', 'realpath', 'readlink', 'test', '[',
             'md5sum', 'sha256sum', 'file', 'du', 'cc-lib', 'basename', 'dirname', 'cut', 'tr', 'nl'}
-VIEWRUN = SHELLS | AWKS | set(WRAP) | {'eval', 'source', '.', 'exec', 'find', 'ssh', 'tmux', 'make', 'alias', 'trap', 'at', 'batch', 'crontab', 'script'}
+VIEWRUN = SHELLS | AWKS | set(WRAP) | {'eval', 'source', '.', 'exec', 'find', 'ssh', 'tmux', 'make', 'alias', 'trap', 'at', 'batch', 'crontab', 'script', 'hash', 'tar', 'patch', 'rsync'}
 
 def view(text, env):
     g = Guard(dict(env, GUARD_ROLE='pf'))
@@ -1919,6 +1930,7 @@ def view(text, env):
         v = R['verb']
         words = R['argw'] + [r['w'] for r in R['redirs'] if r['op'] not in ('<<', '<<-')]
         if v is None or v in VIEWRUN or INTERP.fullmatch(v) or R['via'] or (v and R['assigns']) or '/' in (R['raw'] or [''])[0] \
+                or (v == 'git' and gitparse(R['argw'])[1] in ('apply', 'am')) \
                 or any((w.dyn and not w.known) or w.subs for w in words): return text
         sedread = v == 'sed' and R['args'][:1] == ['-n'] and re.fullmatch(r'[\d,$;p\s]+', ''.join(R['args'][1:2]))
         if v == 'sed' and not sedread: return text
