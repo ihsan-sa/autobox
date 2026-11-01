@@ -106,6 +106,15 @@ for l in ({"input":" "*5000},{"input":" "*3000},{"input":" \n"*2500},{"input":"\
   k "$(t test ! -s "$lg" -a "$(grep -c 'nothing filed' <<<"$out")" = 2)" "a hook payload with no tool_input, or a null one, files nothing and says so"
   fresh; hk '{"tool_input":{}}' >/dev/null
   k "$(t jq -e 'select(.tool == "Bash" and .input == "{}")' "$lg")" "…and a tool_input of {} is filed"
+  # a tool_input that parses to a blank command has no input, however it arrives; a real command or no command at all does
+  fresh; out=$(hk '{"tool_input":{"command":"   ","description":"d"}}'; hk '{"tool_input":{"command":"\n\u0001\t"}}'; hk '{"tool_input":"  "}'
+               hk "$(jq -cn '{tool_input:{command:(" "*5000)}}')")
+  k "$(t test ! -s "$lg" -a "$(grep -c 'nothing filed' <<<"$out")" = 4)" "a hook's tool_input whose command parses to blank, short or long, files nothing and says so"
+  fresh; hk '{"tool_input":{"command":"ls -l"}}' >/dev/null; hk '{"tool_input":{"file_path":"/x"}}' >/dev/null
+  k "$(t test "$(jq -r .input "$lg" | tr '\n' ' ')" = '{"command":"ls -l"} {"file_path":"/x"} ')" "…while a real command and a tool with no command are filed"
+  fresh; { jq -cn '{tool:"Bash", input:"{\"command\":\"  \"}", reason:"r"}'; jq -cn '{tool:"Bash", input:"{\"command\":\"kept\"}", reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
+  out=$(CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 2>&1)
+  k "$(t test "$(jq -r .input "$lg")" = '{"command":"kept"}' -a "$(grep -c 'nothing filed' <<<"$out")" = 1)" "…and a spooled line whose command parses to blank is dropped the same way"
   # a spool line that isn't a JSON object is dropped aloud, and the next one is still filed
   fresh; { echo 'not json'; echo '[1]'; jq -cn '{tool:"Bash", input:"after junk", reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
   out=$(CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 2>&1)

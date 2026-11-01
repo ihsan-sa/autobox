@@ -134,8 +134,11 @@ true" needs evidence in the read's inputs, not the author's word (delta.md says 
 prior blocker left unresolved is carried into the verdict as a blocking row with the prior row's own text and its
 kind tag in front, "[security] still open from the earlier read: …" (carried()), whatever the reader's verdict
 word and whether or not it named new blockers, so pinned() finds the [security] row again in the round after, and
-every round. A name in `unresolved` that is no prior row (a first read has none; #2137's was the reader's own
-sentence calling it advice) is an advisory row on a LAND, and is carried as written on a HANDBACK.
+every round. Only a bare number names a prior row (row_number()). Anything else in `unresolved` (a first read has no
+row to name) is carried as written, whatever the verdict word, so a sentence there holds the PR (perms' read of
+#2160); advice goes in `advisory`, or for a prior row in `moot`, and a hold on one the reader meant as advice (#2137)
+is the planning seat's or perms' to release (carried_hold()). A row the read calls moot lands on the read's word, as
+one it leaves out does: only another read could say the head still has it and blocks on it.
 
 A SECURITY PATH needs perms' security read (perms, after #1265: a tunnel unit and the Cloudflare door merged with
 no security read, and the read after found a HIGH). When the plan names a changed file on the base's
@@ -695,8 +698,7 @@ def parse(answer, digest, model="", tokens=0):
     """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff), and so
     is a HANDBACK that names no blocker and leaves no prior one unresolved: it asks a fix nobody can make, and a
     re-queue at that head would meet it again (#919), so it is retried as a silent read. Its unresolved prior
-    blockers become blocking rows only once _buy() has run carried() on it, which also decides a name that is no
-    prior row."""
+    blockers become blocking rows only once _buy() has run carried() on it."""
     try:
         j = json.loads(answer)
     except (TypeError, ValueError):
@@ -748,9 +750,10 @@ def pinned(v, prior):
 
 def row_number(name):
     """A prior row's number as a read names it ('2', '#2', 'blocker 2'), or None (Opus read of #1227: a bare match
-    lost '#2' its [security] tag)."""
-    m = re.search(r"\d+", str(name))
-    return m.group(0) if m else None
+    lost '#2' its [security] tag). Nothing else names a row: 'x.py:1 is only advice' once cleared security row 1
+    (perms' read of #2160)."""
+    m = re.fullmatch(r"\s*(?:#|blocker)?\s*(\d+)\s*", str(name), re.I)
+    return m.group(1) if m else None
 
 
 STILL_OPEN = "still open from the earlier read: "
@@ -762,19 +765,13 @@ def carried(v, prior):
     the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
     still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
     as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
-    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it on a HANDBACK; on a
-    LAND it blocks nothing, because no row is open and the reader said so, and it stays as an advisory row. `prior`
-    is the prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
+    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. `prior` is the
+    prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
     rows = list(prior or [])
     out = []
-    for x in list(v.unresolved):
+    for x in v.unresolved:
         n = row_number(x)
-        on_row = n and 1 <= int(n) <= len(rows)
-        if not on_row and v.verdict == T.LAND:
-            v.unresolved.remove(x)
-            v.advisory.append(x)
-            continue
-        row = rows[int(n) - 1] if on_row else x
+        row = rows[int(n) - 1] if n and 1 <= int(n) <= len(rows) else x
         m = KIND_TAG.match(row)
         tag, row = (m.group(0), row[m.end():]) if m else ("", row)
         row = row[len(STILL_OPEN):] if row.startswith(STILL_OPEN) else row
@@ -2176,7 +2173,7 @@ def _buy(job, template, diff, more, prior=None, light=False):
             v.extra.update(stood_in_for=model, stood_in_why=why[:300])
         if v is None:
             return _silent(job, j, model, why)
-        v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` goes through it too
+        v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` holds it too
         reads.append((sub or model, v))
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)

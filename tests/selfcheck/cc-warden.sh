@@ -220,6 +220,26 @@ EOF
   k "$(t test "$(dec q5)" = "decline warden")" "a decline is recorded by warden"
   k "$(t test -z "$(dec q6)" -a -n "$(isopen q6)" -a -z "$(isopen q6 | grep 'a warden holds it')")" "a tribunal stays open for perms, released"
 
+  # 4b. a cut ask: no grant on it reaches cc-approve, by a run or a shared verdict; a decline and a hand-back still work
+  echo 'lynx {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
+  ask q70 repo 'Bash: cc-board show repo, the lynx case …(cut)'; : > "$d/approve.log"; tk
+  k "$(t test -z "$(dec q70)" -a -n "$(isopen q70)" -a -z "$(isopen q70 | grep 'a warden holds it')" -a ! -s "$d/approve.log" -a "$(grep -c 'warden:q70' "$d/settings.log")" = 0)" "a grant on a cut ask goes back to perms, open, and never reaches cc-approve or cc-settings"
+  k "$(t grep -q '^ok: handed back to perms: the ask was cut when it was filed' "$A/q70/1/done")" "…and the hand-back says why"
+  # the marker the real cc-refusals files, on a real long refusal, is the one apply() looks for
+  echo 'tapir {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
+  mkdir -p "$st/repo/t8"; python3 -I -c 'import json; print(json.dumps({"tool":"Bash","reason":"r","input":"cc-board show repo, the tapir case "+"x"*3000}))' > "$st/repo/t8/refusals.spool.jsonl"
+  CC_REFUSALS_ROOT=$st "$d/t/cc-refusals" collect repo t8 >/dev/null 2>&1; local cr; cr=$(jq -r 'select(.window == "worker:t8") | .id' "$lg"); : > "$d/approve.log"; tk
+  k "$(t test -n "$cr" -a -z "$(dec "$cr")" -a ! -s "$d/approve.log" -a -n "$(grep '^ok: handed back to perms: the ask was cut' "$A/$cr/1/done")")" "…and so does a grant on a refusal cc-refusals itself cut when it filed it"
+  # a shared grant takes the same door: the verdict is on an ask that wasn't cut, under one key
+  echo 'mole {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
+  ask q71 repo 'Bash: cc-board show repo, the mole case' kcutshare; tk; : > "$d/approve.log"; : > "$d/claude.argv"
+  ask q72 repo 'Bash: cc-board show repo, the vole case …(cut)' kcutshare; tk
+  k "$(t test "$(dec q71)" = "grant warden" -a -z "$(dec q72)" -a -n "$(isopen q72)" -a ! -s "$d/approve.log" -a ! -s "$d/claude.argv" -a -n "$(grep -F 'the ask was cut' "$A/q72/handback")")" "a shared grant on a cut ask goes back to perms too, with no run and nothing asked of cc-approve"
+  printf '%s\n' 'seal {"decision":"decline","note":"not needed"}' 'wolf {"decision":"his","note":"his call"}' > "$d/replies"
+  ask q73 repo 'Bash: cc-board show repo, the seal case …(cut)'; ask q74 repo 'Bash: cc-board show repo, the wolf case …(cut)'; tk
+  k "$(t test "$(dec q73)" = "decline warden")" "a decline on a cut ask is still recorded"
+  k "$(t test -z "$(dec q74)" -a -n "$(isopen q74)" -a -n "$(grep '^his: his call' "$A/q74/handback")")" "…and a hand-back on one still goes back with its own note"
+
   # 5. the same want within the hour shares the first verdict, with no second run
   echo 'pig {"decision":"decline","note":"not needed"}' > "$d/replies"; ask q15 repo 'Bash: cc-board show repo, the pig case' kpig; tk
   : > "$d/claude.argv"; ask q7 repo 'Bash: cc-board show repo, the hen case' kpig; ask q16 repo 'Bash: cc-board show repo, the pig case' kother; tk

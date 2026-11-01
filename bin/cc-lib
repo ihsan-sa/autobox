@@ -76,9 +76,11 @@ boundary reads one file, its own workspace's, and can reach no other.
         prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn. A sandboxed
         worker can write these dirs and the host runs this, so it follows no link: a dir whose memory/, MEMORY.md or
         MEMORY-facts.md is a link or not a regular file is left alone, said on stderr, exit 1, and the other dirs still
-        run; a linked note, or a line naming a path out of the dir, counts as untyped; a note is read for its first 4096
-        bytes only; writes go to a new temp file of a random name, so a planted MEMORY.md.tmp is never opened. Each dir is
+        run; a linked note, or a line naming a path out of the dir or a NUL, counts as untyped; a note is read for its first
+        4096 bytes only, and an index or facts file over 1 MiB is left alone the same way; writes go to a new temp file of a random name, so a planted MEMORY.md.tmp is never opened. Each dir is
         opened once and everything goes through that descriptor, so swapping memory/ for a link mid-pass reaches nothing.
+        A pass flocks that descriptor and skips a dir another pass holds, and writes the facts file first, so a moved line
+        is never in neither file.
   cc-lib index --cold [<days>] [--json]
         WHAT WOULD LEAVE THE HOT INDEX, and nothing leaves (P3, decision 8: dry-run until a person has read it): the
         records of closed bodies — a board row in merged|done|dropped|closed: its journal, its task, its notes, and
@@ -201,6 +203,7 @@ TICKET. One line per call in ~/.cc/library/owner/tickets.log (a member's: its se
 """
 import calendar
 import contextlib
+import fcntl
 import glob
 import hashlib
 import json
@@ -269,6 +272,7 @@ ID_CHAN = re.compile(r"\bC0[A-Z0-9]{8,10}\b")
 ID_SLACK = re.compile(r"^[CDG]0[A-Z0-9]{8,10}$|^\d{10}\.\d{6}$")   # a chat id or a message ts, as --object
 MEM_LINE = re.compile(r"^- \[[^\]]*\]\(([^)]+\.md)\)")   # one MEMORY.md line: `- [Title](file.md) — hook`
 MEM_FACTS = "MEMORY-facts.md"
+MEM_INDEX_CAP = 1 << 20   # bytes: an index or facts file past this was not written by any session
 MEM_POINTER = ("- Facts (project and reference memories) are not loaded: `cc-lib ask --need history \"<words>\"` finds them; "
                "the list is memory/" + MEM_FACTS + ".")
 VIEW_CAP = 8192        # a checkpoint view (cc-handoff's slice, the worker prompt's journal block), at most
@@ -2605,22 +2609,32 @@ def view(argv):
     return 0
 
 
-def mem_read(name, dfd, cap=None):
-    """The text of a regular file in the open directory dfd, opened without following a link or waiting on a FIFO, and
-    only its first `cap` bytes when one is given; OSError for anything else."""
-    with open(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), encoding="utf-8", errors="replace") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-            raise OSError("not a regular file")
-        return f.read() if cap is None else f.buffer.read(cap).decode("utf-8", "replace")
+def mem_read(name, dfd, cap):
+    """The first `cap` bytes of a regular file in the open directory dfd, opened without following a link or waiting on
+    a FIFO; OSError for anything else."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file")
+    with open(fd, "rb") as f:
+        return f.read(cap)
+
+
+def mem_index(name, dfd):
+    """The text of an index file in dfd; OSError past MEM_INDEX_CAP, since a cut index would lose the lines past the cut."""
+    raw = mem_read(name, dfd, MEM_INDEX_CAP + 1)
+    if len(raw) > MEM_INDEX_CAP:
+        raise OSError(f"{name} is over {MEM_INDEX_CAP} bytes")
+    return raw.decode("utf-8", "replace")
 
 
 def mem_type(name, dfd):
     """The `type:` in the first 4096 bytes of a memory file in dfd, so a huge note can't hold the pass open, or '' when the
-    file is missing, a link, unreadable, says none, or is named by a path that would leave dfd."""
-    if "/" in name:
+    file is missing, a link, unreadable, says none, or is named by a path that would leave dfd or no path at all (a NUL)."""
+    if "/" in name or "\0" in name:
         return ""
     try:
-        head = mem_read(name, dfd, 4096)
+        head = mem_read(name, dfd, 4096).decode("utf-8", "replace")
     except OSError:
         return ""
     m = re.search(r"^\s*type:\s*(\w+)", head, re.M)
@@ -2642,7 +2656,11 @@ def memory(argv):
     there would write through to a host file or copy one into text the worker reads (as in cc-memory-dream's dream_dir).
     HOLDS ITS DIRECTORY: the pass opens
     memory/ once, refusing a link, and every read, write, rename and remove goes through that descriptor, so swapping
-    memory/ for a link mid-pass can't turn the pass onto another folder's index (a seat's, perms' included)."""
+    memory/ for a link mid-pass can't turn the pass onto another folder's index (a seat's, perms' included).
+    ONE PASS AT A TIME: every Stop runs this, so a pass flocks the descriptor and a dir already held is skipped, not waited
+    on: the next Stop does it. Unlocked, a pass that read between another's two writes saw a moved line in neither file
+    and then removed the facts file the other had just written. The facts file is written first, so a pass that dies
+    between the writes leaves a line in both files, which the next pass settles, and never in neither."""
     dry = "--dry-run" in argv
     rc = 0
     for mi in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "MEMORY.md"))):
@@ -2654,7 +2672,11 @@ def memory(argv):
             rc = 1
             continue
         try:
+            if not dry:
+                fcntl.flock(dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             rc |= memory_dir(mdir, dfd, dry)
+        except BlockingIOError:
+            print(f"cc-lib memory: {tilde(mdir)}: another pass holds it, skipped")
         finally:
             os.close(dfd)
     return rc
@@ -2663,9 +2685,9 @@ def memory(argv):
 def memory_dir(mdir, dfd, dry):
     """One pass of memory() on the directory open at dfd; mdir only names it in what is printed. The exit code."""
     try:
-        cur_loaded = mem_read("MEMORY.md", dfd)
+        cur_loaded = mem_index("MEMORY.md", dfd)
         try:
-            cur_facts, has_facts = mem_read(MEM_FACTS, dfd), True
+            cur_facts, has_facts = mem_index(MEM_FACTS, dfd), True
         except FileNotFoundError:
             cur_facts, has_facts = "", False
     except OSError as e:
@@ -2714,7 +2736,7 @@ def memory_dir(mdir, dfd, dry):
         print(what + " · unchanged, nothing written")
         return 0
     try:
-        for name, txt in (("MEMORY.md", new_loaded_t), (MEM_FACTS, new_facts_t)):
+        for name, txt in ((MEM_FACTS, new_facts_t), ("MEMORY.md", new_loaded_t)):
             if not txt:
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(name, dir_fd=dfd)   # only ever the facts file: the loaded text is never empty (its own lines, or the pointer)
@@ -2827,6 +2849,52 @@ def selfcheck_memory_links(th, ok, run):
          lambda rc, err, d: rc == 0 and "[A]" in (t := open(os.path.join(d, "MEMORY.md")).read()) and "[B]" in t
          and not os.path.lexists(os.path.join(d, MEM_FACTS)))
 
+    def nul(d, o):
+        put(os.path.join(d, "MEMORY.md"), "- [N](a\0b.md) — n\n- [F](fact.md) — fact\n")
+    case("a line naming a file with a NUL in it counts as untyped and stays, and the rest of the pass runs", SECRET, nul,
+         lambda rc, err, d: rc == 0 and "[N]" in (t := open(os.path.join(d, "MEMORY.md")).read()) and "[F]" not in t
+         and "[F]" in open(os.path.join(d, MEM_FACTS)).read())
+
+    def fds():
+        return len(os.listdir("/proc/self/fd"))
+    open_before = []
+
+    def named_dirs(d, o):
+        os.mkdir(os.path.join(d, "sub.md"))
+        put(os.path.join(d, "MEMORY.md"), "- [D](sub.md) — d\n" * 50)
+        open_before.append(fds())
+    case("a line naming a directory leaves no descriptor open however many lines name it", SECRET, named_dirs,
+         lambda rc, err, d: rc == 0 and fds() == open_before[0] and "[D]" in open(os.path.join(d, "MEMORY.md")).read())
+
+    held = []
+
+    def hold(d, o):
+        held.append(os.open(d, os.O_RDONLY))
+        fcntl.flock(held[0], fcntl.LOCK_EX)
+
+    def second_pass(rc, err, d):
+        skipped = rc == 0 and not err and "[F]" in open(os.path.join(d, "MEMORY.md")).read() and not os.path.lexists(os.path.join(d, MEM_FACTS))
+        os.close(held[0])
+        return skipped and run("memory")[0] == 0 and "[F]" in open(os.path.join(d, MEM_FACTS)).read()
+    case("a dir another pass holds is skipped untouched, not waited on, the next dir runs, and it moves once the hold ends", SECRET, hold, second_pass)
+
+    replace = os.replace
+
+    def second_write_fails(d, o):
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(a)
+            if len(calls) == 2:
+                os.replace = replace
+                raise OSError("disk full")
+            return replace(*a, **k)
+        os.replace = flaky
+
+    def both(rc, err, d):
+        return rc == 1 and "disk full" in err and "[F]" in open(os.path.join(d, "MEMORY.md")).read() and "[F]" in open(os.path.join(d, MEM_FACTS)).read()
+    case("a pass that fails between its two writes leaves a moved line in both files, never in neither", SECRET, second_write_fails, both)
+
     def swapped(what, plant, check):
         """Mid-pass, at its first note, memory/ is moved aside and a link to another folder takes its place. The other folder
         holds its own index and a fact.md of another type, so its files must stay as they were and the line's type must come
@@ -2882,6 +2950,22 @@ def selfcheck_memory_links(th, ok, run):
     ok("a 64 MB note is read only for its first 4096 bytes: the pass holds no more than a few MB, and its type still counts",
        rc == 0 and peak < 4 << 20 and "[F]" in open(os.path.join(big, MEM_FACTS)).read())
     shutil.rmtree(os.path.dirname(big))
+
+    for name in ("MEMORY.md", MEM_FACTS):
+        note(big, "fact.md", "project")
+        put(os.path.join(big, "MEMORY.md"), "- [F](fact.md) — fact\n")
+        put(os.path.join(big, MEM_FACTS), "- [G](g.md) — g\n")
+        os.truncate(os.path.join(big, name), 64 << 20)
+        err = io.StringIO()
+        tracemalloc.start()
+        with contextlib.redirect_stderr(err):
+            rc, _ = run("memory")
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        ok(f"a 64 MB {name} is not read whole: the dir is left alone and said on stderr, and the pass holds no more than a few MB",
+           rc == 1 and "left alone" in err.getvalue() and peak < 4 << 20 and os.path.getsize(os.path.join(big, name)) == 64 << 20
+           and "[G]" in open(os.path.join(big, MEM_FACTS), errors="replace").read(100))
+        shutil.rmtree(os.path.dirname(big))
 
 
 def bench(argv):

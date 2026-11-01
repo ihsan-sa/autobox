@@ -604,15 +604,15 @@ class TestReview(Case):
         self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
         self.assertIn("(input: b)", v.blocking[0])
 
-    def test_a_first_reads_land_with_advice_in_unresolved_lands(self):
-        # #2137: the brief named an earlier finding, the reader's LAND said "non-blocking advice" in `unresolved`, and
-        # carried() stopped the landing on a row that never existed
-        said = "The suggested guard remains unimplemented; this remains non-blocking advice."
-        answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
-            "verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": [said]}}))
-        self.box(claude=answer)
-        v = R.review(self.job(), comments=[])
-        self.assertEqual((v.verdict, v.blocking, v.unresolved, v.advisory), (T.LAND, [], [], [said]))
+    def test_a_first_reads_land_with_a_sentence_in_unresolved_hands_back(self):
+        # perms' read of #2160: on a LAND these went to `advisory`, even the [security] one; advice goes there itself
+        for said, row in (("x.py loses data", "still open from the earlier read: x.py loses data"),
+                          ("[security] y.py leaks", "[security] still open from the earlier read: y.py leaks")):
+            answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
+                "verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": [said]}}))
+            self.box(claude=answer)
+            v = R.review(self.job(), comments=[])
+            self.assertEqual((v.verdict, v.blocking, v.advisory), (T.HANDBACK_VERDICT, [row], []), said)
 
     def test_a_first_reads_handback_with_a_sentence_in_unresolved_stays_a_handback(self):
         answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
@@ -648,9 +648,25 @@ class TestReview(Case):
 
     def test_a_delta_reads_land_keeps_a_named_row_open_beside_a_stray_sentence(self):
         v = self.delta(["1. [correctness] x.py — still wrong"], unresolved=["1", "a thought on y.py"])
-        self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["1"]))
-        self.assertEqual(v.blocking, ["[correctness] still open from the earlier read: x.py — still wrong"])
-        self.assertEqual(v.advisory, ["a thought on y.py"])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        self.assertEqual(v.blocking, ["[correctness] still open from the earlier read: x.py — still wrong",
+                                      "still open from the earlier read: a thought on y.py"])
+
+    def test_a_delta_reads_land_with_only_a_sentence_in_unresolved_hands_back(self):
+        v = self.delta(["1. [scope] x.py — add a guard"], resolved=["1"], unresolved=["[security] y.py leaks"])
+        self.assertEqual((v.verdict, v.blocking),
+                         (T.HANDBACK_VERDICT, ["[security] still open from the earlier read: y.py leaks"]))
+
+    def test_a_sentence_with_a_digit_names_no_row(self):
+        # perms' read of #2160: the number was read out of the sentence, so this cleared security row 1
+        rows = ["1. [security] x.py — the token leaks"]
+        pin = ["[security] still open from the earlier read: x.py — the token leaks"]
+        for said in ({"resolved": ["x.py:1 is only advice"]}, {"resolved": ["row 1"]}, {"moot": ["x.py:1 is moot"]}):
+            v = self.delta(rows, **said)
+            self.assertEqual((v.verdict, v.blocking, v.unresolved[-1]), (T.HANDBACK_VERDICT, pin, "1"), said)
+        for name in ("1", " 1 ", "#1", "# 1", "blocker 1", "Blocker 1"):   # and what does name it clears it
+            self.assertEqual(self.delta(rows, resolved=[name]).verdict, T.LAND, name)
+        self.assertIsNone(R.row_number("x.py:1 is only advice"))
 
     def test_a_security_row_called_advice_stays_pinned(self):
         v = self.delta(["1. [security] x.py — the token leaks"], moot=["1"],
