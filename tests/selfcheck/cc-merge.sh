@@ -46,6 +46,13 @@ run(){   # → cc-merge's exit code; its output in $T/out. RUNIN: the cwd it sta
   ( export CC_MERGE_TEST=1 HOME="$T/home" CC_DEV="$T/dev" CC_MERGE_BIN="$T/fb" CC_MERGE_CORE="$HERE" CC_MERGE_CHECK="${CHECK-$T/check}" \
       CC_MERGE_SETTLE=0 PATH="${PFX:-}$T/fb:$PATH" CC_MERGE_PATH="${DPATH:-$T/fb:/usr/local/bin:/usr/bin:/bin}" GH_TOKEN=secret
     cd "${RUNIN:-.}" && "$HERE/bin/cc-merge" r 7 ) > "$T/out" 2>&1; echo $?; }
+# catch-up: the tick's call. Nothing of the lander runs here (cc-land would log a call), so this is a hand merge with no tick.
+cu(){ ( export CC_MERGE_TEST=1 HOME="$T/home" CC_DEV="$T/dev" CC_MERGE_BIN="$T/fb" CC_MERGE_CORE="$HERE" CC_MERGE_SETTLE=0 PATH="$T/fb:$PATH" CC_MERGE_PATH="$T/fb:/usr/local/bin:/usr/bin:/bin"
+    "$HERE/bin/cc-merge" catch-up r ) > "$T/out" 2>&1; echo $?; }
+hand_merge(){   # $1 case name → an installer on main, deployed, then a hand merge on origin the checkout has not seen
+  fx "$1"; (cd "$T/dev/r" && mkdir -p core/bin && printf '#!/bin/sh\n' > core/bin/cc-units && printf '#!/bin/sh\necho installed >> "%s/calls"\n' "$T" > inst.sh && chmod +x inst.sh core/bin/cc-units && printf 'installer = "inst.sh"\n' > tests/LANDING-deploy.toml \
+    && git add -A && git commit -qm i && git push -q origin main)
+  git clone -q "$T/o/r.git" "$T/hand" 2>/dev/null; (cd "$T/hand" && echo h > h.txt && git add h.txt && git commit -qm hand && git push -q origin main); }
 calls(){ cat "$T/calls" 2>/dev/null | grep -c "^$1"; }
 tip(){ git --git-dir="$T/o/r.git" rev-parse "$1"; }
 
@@ -346,5 +353,16 @@ lg=$(HOME="$T/home" BOARD="$T/board" CC_MERGE="$T/redrun" CC_MERGE_WAIT=0 PATH="
 t 'a hand run that ends red after cc done returned goes on the row, with the reason and the log' "$(cat "$T/notes" 2>/dev/null)" "note r x cc-merge ended 1 on PR #7: cc-merge: NOT MERGED — lander check is red (log $lg)"
 : > "$T/notes"; lg=$(HOME="$T/home" BOARD="$T/board" CC_MERGE="$T/okrun" CC_MERGE_WAIT=0 PATH="$T/fb:$PATH" queue_pr r x "$T/dev/r" 7 | sed -n 's/.*; log //p'); for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -s "$lg.rc" ] && break; sleep 1; done
 t '…and one that ends well writes no note' "$(cat "$lg.rc"):$(wc -c < "$T/notes")" 0:0
+
+hand_merge catch-up-hand
+t 'a hand merge with no lander tick reaches the checkout and runs the installer once, and the lander is never asked' \
+  "$(cu):$(git -C "$T/dev/r" rev-parse HEAD):$(cat "$T/dev/r/h.txt"):$(calls installed):$(calls cc-land)" "0:$(tip main):h:1:0"
+t '…and a second catch-up with nothing moved runs no installer' "$(cu):$(calls installed):$(cat "$T/out")" '0:1:'
+hand_merge catch-up-branch; git -C "$T/dev/r" checkout -q -b mine
+t 'catch-up: a checkout a person moved off main is refused loudly and nothing runs' "$(cu):$(grep -c 'DEPLOY REFUSED' "$T/out"):$(calls installed):$(git -C "$T/dev/r" branch --show-current)" '1:1:0:mine'
+hand_merge catch-up-dirty; echo mine > "$T/dev/r/h.txt"
+t 'catch-up: a local file in the way is refused and kept: fast-forward only' "$(cu):$(grep -c 'DEPLOY REFUSED' "$T/out"):$(calls installed):$(cat "$T/dev/r/h.txt")" '1:1:0:mine'
+hand_merge catch-up-nogrant; echo 1 > "$T/lands.rc"; was=$(git -C "$T/dev/r" rev-parse HEAD)
+t 'catch-up: a repo without the grant is left alone, silently' "$(cu):$(git -C "$T/dev/r" rev-parse HEAD):$(calls installed):$(cat "$T/out")" "0:$was:0:"
 
 echo "cc-merge selfcheck: $((n - f))/$n passed"; [ "$f" = 0 ]

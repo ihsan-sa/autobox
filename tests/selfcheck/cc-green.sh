@@ -110,31 +110,33 @@ EOS
       && CC_GREEN_DIR="$D2" "$SELF" wait 120 >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -e "$D/stale.args")" "…and a worker on the host (sandbox off) still starts its own run"
   rm -rf "$D2"
-  # 1d A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the pinned lander, caged checks only, and none of
-  # the tree's own code: the fixture's core/lander/cli.py writes <name>.args when it runs, so its absence is the proof.
-  printf '#!/bin/sh\necho "$*" > "%s/pinned.args"\necho "lander check: fake pinned"\n' "$D" > "$D/pinned"; chmod +x "$D/pinned"
+  # 1d A RUN THE HOST STARTS FOR A WORKER (CC_GREEN_FOR_WORKER=1) runs the deployed checkout's lander, the one beside this
+  # bin, caged checks only, and none of the tree's own code: the fixture's core/lander/cli.py writes <name>.args when it
+  # runs, so its absence is the proof. $DC is that deployed core: a copy of this tool beside a fake cli.py. Beside them,
+  # the real `lander` wrapper and a pinned release in $D/pinhome, which writes pin.ran if anything ever reaches it.
+  DC="$D/dc"; mkdir -p "$DC/bin" "$DC/tests" "$DC/lander" "$DC/config" "$D/pinhome/.cc/lander/releases/x/core/lander"
+  cp "$SELF" "$BIN/cc-nosignal" "$BIN/lander" "$DC/bin/"; cp "$CORE"/tests/green.sh "$CORE"/tests/recurring_defects.py "$DC/tests/"; cp "$CORE/config/recurring-defects.json" "$DC/config/"
+  printf 'import sys\nopen("%s/deployed.args", "w").write(" ".join(sys.argv[1:]))\nprint("lander check: fake deployed")\n' "$D" > "$DC/lander/cli.py"
+  printf 'open("%s/pin.ran", "w").close()\n' "$D" > "$D/pinhome/.cc/lander/releases/x/core/lander/cli.py"
+  ln -s "$D/pinhome/.cc/lander/releases/x" "$D/pinhome/.cc/lander/current"
   D2=$(mktemp -d); R=$(newrepo forw)
-  ( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/pinned" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 0 -a "$(cat "$D/pinned.args" 2>/dev/null)" = "check --caged-only $(git -C "$R" rev-parse --show-toplevel)")" \
-    "for a worker, the run is the pinned lander's \`check --caged-only <root>\`, exit 0"
+  ( cd "$R" && HOME="$D/pinhome" CC_GREEN_FOR_WORKER=1 CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$DC/bin/cc-green" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a "$(cat "$D/deployed.args" 2>/dev/null)" = "check --caged-only $(git -C "$R" rev-parse --show-toplevel)")" \
+    "for a worker, the run is the deployed checkout's \`check --caged-only <root>\`, exit 0"
+  k "$(nt test -e "$D/pin.ran")" "…the release at ~/.cc/lander/current never ran"
   k "$(nt test -e "$D/forw.args")" "…and the worktree's own core/lander/cli.py never ran"
   k "$(t grep -qx caged=1 "$D2"/*.verdict)" "…its verdict carries caged=1 though pid 1 is not bwrap"
-  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
+  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_DIR="$D2" "$DC/bin/cc-green" 2>&1 )
   k "$(t grep -q 'green   lander check — passed on this tree at .* (caged checks only)' <<<"$out")" "…and its green line says caged checks only"
-  # A pinned release older than --caged-only refuses it as an unknown option: said loudly, no verdict, nothing else run.
-  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo forwold)
-  printf '#!/bin/sh\necho "lander check: unknown option --caged-only" >&2\nexit 2\n' > "$D/oldpin"; chmod +x "$D/oldpin"
-  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/oldpin" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -ne 0 -a ! -e "$D/forwold.args" -a -n "$(grep 'PINNED LANDER PREDATES' <<<"$out")" -a -n "$(grep 'no verdict (exit 3' <<<"$out")")" \
-    "for a worker, a pinned lander without --caged-only fails loudly with no verdict, and the tree's own never runs"
-  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo forwnone)
-  ( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/absent" CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
-  k "$(t test "$rc" -ne 0 -a ! -e "$D/forwnone.args")" "for a worker with no pinned lander: no verdict, and still not the tree's own"
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo forwnone); mv "$DC/lander/cli.py" "$D/dc-cli.py"
+  ( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$DC/bin/cc-green" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -ne 0 -a ! -e "$D/forwnone.args")" "for a worker with no deployed lander: no verdict, and still not the tree's own"
+  mv "$D/dc-cli.py" "$DC/lander/cli.py"
   # …and no suite, on a fixture whose suite HEAD tracks, so suite_ok alone would let it run (the control below does).
   rm -rf "$D2"; D2=$(mktemp -d); mkdir -p "$R/tests"
   printf '#!/bin/sh\ntouch "%s/forwsuite.ran"\n' "$D" > "$R/tests/check-x.sh"; chmod +x "$R/tests/check-x.sh"
   git -C "$R" add tests/check-x.sh && git -C "$R" commit -qm suite
-  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_LANDER="$D/pinned" CC_GREEN_DIR="$D2" "$SELF" run -- tests/check-x.sh 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_FOR_WORKER=1 CC_GREEN_DIR="$D2" "$SELF" run -- tests/check-x.sh 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2 -a ! -e "$D/forwsuite.ran" -a -n "$(grep 'a run for a worker is lander check only, never a suite' <<<"$out")")" \
     "for a worker, -- SUITE is refused (exit 2) and the suite never ran"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run -- tests/check-x.sh >/dev/null 2>&1 ); rc=$?
@@ -181,16 +183,15 @@ EOS
   done
   k "$(t test -z "$(find "$CC_FAILURES" -name '*.jsonl' -size +0 2>/dev/null)")" "a red check writes nothing to the failures ledger"
 
-  # 3 WHICH LANDER. No core/lander in the worktree: the `lander` on PATH, given `check <root>`. Neither: no verdict,
-  # exit 1 — never a green, and never the pinned release's absence mistaken for a pass.
-  D2=$(mktemp -d); R=$(newrepo onpath)
+  # 3 WHICH LANDER. No core/lander in the worktree: the deployed checkout's, given `check <root>`, and no pin. Neither: no
+  # verdict, exit 1 — never a green.
+  D2=$(mktemp -d); R=$(newrepo onpath); rm -f "$D/deployed.args" "$D/pin.ran"
   ( cd "$R" && git rm -rq core/lander && git commit -qm nolander )
-  mkdir -p "$D/pbin"; printf '#!/bin/sh\necho "$*" > "%s"\nexit 0\n' "$D/onpath.pathargs" > "$D/pbin/lander"; chmod +x "$D/pbin/lander"
-  ( cd "$R" && PATH="$D/pbin:$PATH" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 0 -a "$(cat "$D/onpath.pathargs" 2>/dev/null)" = "check $(git -C "$R" rev-parse --show-toplevel)")" "a worktree with no core/lander runs the lander on PATH, \`check <root>\`"
-  np=$(tr ':' '\n' <<<"$PATH" | while read -r p; do [ -x "$p/lander" ] || printf '%s:' "$p"; done); np=${np%:}
-  out=$( cd "$R" && PATH="$np" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no lander here' <<<"$out")")" "…and with none on PATH either, the run says so and is not green, exit 1"
+  ( cd "$R" && HOME="$D/pinhome" PATH="$DC/bin:$PATH" CC_GREEN_DIR="$D2" "$DC/bin/cc-green" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a "$(cat "$D/deployed.args" 2>/dev/null)" = "check $(git -C "$R" rev-parse --show-toplevel)" -a ! -e "$D/pin.ran")" "a worktree with no core/lander runs the deployed checkout's, \`check <root>\`, not the pinned one on PATH"
+  mv "$DC/lander/cli.py" "$D/dc-cli.py"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$DC/bin/cc-green" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no lander here' <<<"$out")")" "…and with none there either, the run says so and is not green, exit 1"
   rm -rf "$D2"
 
   # 4 A CHECK THAT MOVES THE TREE leaves a verdict for content this checkout no longer holds. That is the one way

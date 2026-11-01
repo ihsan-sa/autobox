@@ -66,8 +66,12 @@ once while its directory stands: its memo outlives a pass that skips it (a fresh
 budget landing elsewhere), since dropping it there made the next pass call it news. A PR closed without merging is
 told once per row the same way, its memo kept while the row stands and no newer PR of it is open or merged, and never
 on a row a person set `closed`. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
-A finished track with an open PR nobody is landing is offered once per PR and alerted once, ever, past the
-4 h window — unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
+STUCK PRS: workers merge their own PRs, so a hold-up is an open PR whose row has no live worker. Each is listed in the
+report and, with --notify (the timer's run, and the only part of this report a seat sees: the digest is not posted),
+offered to the repo's session once per PR with its last red or conflict line (board notes, journal), and alerted once,
+ever, past the 4 h window — unless the row itself waits on a person, which is somebody having picked it up: that one
+raises neither. A PR with a job in the lander's queue is not stuck, and that counts a job at rest in `query`, where a
+kept PR waits on its read.
 
 RUNAWAY: a headless worker with no cc-loop above it is ended on sight; a worker alive with journal, loop log and
 worktree untouched for 3 h, seen by two passes, is ended too, never during a usage limit. --no-stop reports only.
@@ -81,6 +85,10 @@ THE TICK (--apply, unfiltered): after the reconcile it runs, in order,
     left queued, relaunched in their old place) (each its own tool; this gives it a turn)
   · the fixture rule (sweep rule 6) every tick; the full sweep of CC_JANITOR_REPOS once per 24 h
   · the hold pass (HOLDS, below)
+  · the catch-up, with the network: `cc-merge catch-up <repo>` for each repo with a checkout that is neither a member's
+    nor parked, so a hand merge reaches ~/dev/<repo> and runs its installer whether or not the lander's tick runs. The
+    lander's own catch-up may run too: both take the repo's git lock, and a checkout already at the tip is one both
+    leave alone. A refused deploy is offered to the repo's session, once per reason
   · the wake, per repo with a board, only while CC_WAKE=on (~/.cc/config) — off by default, the owner's switch
   · the failure investigation (THE INVESTIGATION, below)
   · cc-ideas-judge run: each logged idea past its revisit date judged held or not held from its measure (its own
@@ -1301,8 +1309,21 @@ def effective(f, recs):
 
 
 def pending(f, state):
-    """Pure: finished, PR open, nobody landed it. A board that says `waiting` is a person's word and never pending."""
-    return state == "review" and (f.get("pr_state") or "") == "OPEN" and f["status"] != "waiting"
+    """Pure: PR open and no live worker on its row. A board that says `waiting` is a person's word and never pending,
+    a person closed a `closed` row, a launch waiting in cc-room is a worker on its way, and a `session` row is a seat's."""
+    return ((f.get("pr_state") or "") == "OPEN" and state not in (*TERMINAL, "closed") and f["status"] != "waiting"
+            and (f.get("kind") or "track") != "session" and not (f["live"] or f.get("agent_live") or f.get("room")))
+
+
+def stuck_line(repo, track, f):
+    """What a seat reads about a stuck PR: its row, the last red or conflict on its board notes or journal, and its link."""
+    try:
+        body = open(f"{STATE}/{repo}/{track}/progress.md", errors="replace").read().splitlines()
+    except OSError:
+        body = []
+    why = next((m.group(1) for m in map(NOT_MERGED.search, reversed(body + list(f.get("notes") or []))) if m),
+               "no red or conflict on record")
+    return f"{repo}/{track}: PR open with no live worker, not merged — {trim(why, 300)}" + (f" ({f['pr']})" if f.get("pr") else "")
 
 
 # The old tool's argv, the shim's (same words), or the lander's own: `python3 -P …/core/lander/cli.py queue r 7`
@@ -1312,6 +1333,10 @@ LAND_ARGV = re.compile(r"(?:^|[\s/])(?:cc-land|lander(?:/cli\.py)?)\s+(?:queue\s
 
 
 LAND_IDLE = ("done", "handback", "handed", "query")   # a job's state/stage the lander is no longer working on
+LAND_OVER = ("done", "handback", "handed")            # …and of those, the ones not waiting on a read or a decision
+# the why in cc-loop's journal line and board note, and in the note `cc done` leaves after a merge running on its own
+NOT_MERGED = re.compile(r"(?:was not merged, so the task goes on: |not merged, one more iteration: |cc-merge ended \d+ on PR #\d+: (?:cc-merge: )?)"
+                        r"(.*?)(?:\. Fix it, run your green again.*)?$")
 
 
 def pr_number(url):
@@ -1319,18 +1344,19 @@ def pr_number(url):
     return int(m.group(1)) if m else None
 
 
-def landing():
+def landing(idle=LAND_IDLE):
     """{(repo, pr)} somebody is landing: a job under ~/.cc/state/land/ that is not at rest with the seat (the lander
     keeps a job file after it finishes: state done, handback or query — stage done, handed or query — is nobody's
     landing, so a handed-back PR is nagged like any other), a spend record under land/root/ touched inside
-    BETWEEN_ROUNDS, or a live lander argv naming the PR (a session's prompt quoting it does not count)."""
+    BETWEEN_ROUNDS, or a live lander argv naming the PR (a session's prompt quoting it does not count). `idle` says
+    which job words are at rest."""
     out = set()
     for path in glob.glob(f"{STATE}/land/*.json") + glob.glob(f"{STATE}/land/root/*.json"):
         try:
             if "/root/" in path and now() - os.path.getmtime(path) > BETWEEN_ROUNDS:
                 continue
             j = json.load(open(path))
-            if "/root/" not in path and (j.get("state") in LAND_IDLE or j.get("stage") in LAND_IDLE):
+            if "/root/" not in path and (j.get("state") in idle or j.get("stage") in idle):
                 continue
             if j.get("repo") and j.get("pr"):
                 out.add((j["repo"], int(j["pr"])))
@@ -3186,6 +3212,27 @@ def holds_cmd(argv):
     return 0
 
 
+def catch_up_pass():
+    """THE TICK's catch-up (its docstring above): each repo's hand merge deployed by cc-merge, a refusal told once."""
+    path, inj = f"{STATE}/catch-up.json", os.environ.get("CC_RECONCILE_INJECT") or sib("cc-slack")
+    told, keep = ledger(path), {}
+    for fn, d in boards():
+        repo = (d or {}).get("repo") or os.path.basename(fn)[:-5]
+        if d is None or member_ws(repo) or paused(repo) or not os.path.isdir(f"{DEV}/{repo}"):
+            continue
+        p = sh(sib("cc-merge"), "catch-up", repo, timeout=1800)
+        out = (p.stdout or "").strip() if p is not None else ""
+        if out:
+            print(out)
+        m = re.search(r"DEPLOY REFUSED — (.*)", out)
+        if m:
+            said = told.get(repo) == m.group(1)
+            q = None if said else sh(inj, "inject", "--no-start", repo, f"board watchdog: {repo}: main moved but did not deploy — {m.group(1)}", timeout=30)
+            if said or (q is not None and q.returncode == 0):
+                keep[repo] = m.group(1)
+    ledger(path, keep)
+
+
 def tick(snap, net):
     """What rides the --apply pass after the reconcile: the fixture rule, the daily sweep, the wake, the daily digest,
     the failure investigation, and the planner requests the broker has not taken yet (core/docs/comms-contract.md:
@@ -3217,6 +3264,8 @@ def tick(snap, net):
         open(sw, "w").close()
     for ln in holds_pass(net):                         # before the wake, so a row it frees is offered this same tick
         print(ln)
+    if net:
+        catch_up_pass()
     wake = setting("CC_WAKE") == "on"
     for fn, d in boards():
         if d is not None:
@@ -3370,6 +3419,11 @@ def main(argv):
                                      f"{len(asks)} needs you", f"{held} held" if held else "",
                                      f"{info} unknown") if x) + f"  ({tracks} tracks)"
               if recs else f"the board matches reality ({tracks} tracks)")
+        stuck = [x for x in snaprows if pending(x[2], x[3]) and x[4] != "person" and not x[2].get("held")]
+        busy = landing(LAND_OVER) if stuck else ()
+        for repo, track, f, *_ in stuck:
+            if (repo, pr_number(f.get("pr"))) not in busy:
+                print(f"  stuck      {stuck_line(repo, track, f)}")
     if notify:
         path = f"{STATE}/reconcile.seen.json"
         old, t0 = ledger(path), now()
@@ -3427,7 +3481,7 @@ def main(argv):
                  and not merge_answers(r)]   # merged since the run began: the next pass fixes the row
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         keep, busy = {}, None
-        for repo, track, f, state, who, _ in snaprows:  # pending: finished, PR open, nobody landing it
+        for repo, track, f, state, who, _ in snaprows:  # pending: PR open, no live worker, nobody landing it
             # A ROW WAITING ON A PERSON HAS BEEN PICKED UP: its seat stood down and asked, and the answer is that
             # person's. "review and land it" is then a full context read the seat can do nothing with (career/
             # positioning PR #4 was offered one every ~2 h while it sat there), and "nobody has picked it up" is
@@ -3441,7 +3495,7 @@ def main(argv):
                 if state == "review" and f.get("pr_state") == "?":   # one failed poll keeps the clocks
                     keep.update({x: old[x] for x in (k, ak, ok_) if old.get(x)})
                 continue
-            busy = landing() if busy is None else busy
+            busy = landing(LAND_OVER) if busy is None else busy
             if (repo, pr_number(f.get("pr"))) in busy or refused(repo, f.get("pr"), net):
                 continue
             first = float(old.get(k) or 0) or t0
@@ -3468,8 +3522,7 @@ def main(argv):
                 keep[ak] = last
             if old.get(ok_):
                 keep[ok_] = old[ok_]
-            elif offer(repo, f"board watchdog: {repo}/{track}: finished, PR open, not landed — review and land it"
-                             + (f" ({f['pr']})" if f.get("pr") else "")):
+            elif offer(repo, f"board watchdog: {stuck_line(repo, track, f)}"):
                 keep[ok_] = t0
         if repos:                                       # a filtered run drops no other repo's entries
             keep.update({x: v for x, v in old.items() if x.split(": ")[0].removeprefix("pending ")

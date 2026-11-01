@@ -910,7 +910,7 @@ def selfcheck():
         seenp = f"{th}/.cc/state/reconcile.seen.json"
 
         def offered():
-            return sum("not landed" in ln for ln in open(f"{th}/inj.log").read().splitlines())
+            return sum("not merged" in ln for ln in open(f"{th}/inj.log").read().splitlines())
 
         def alerted():
             return sum(ln.startswith("alerts") for ln in open(f"{th}/notify.log").read().splitlines())
@@ -1206,7 +1206,7 @@ def selfcheck():
            "t7" not in inj6 and not any("t7" in k for k in led6))
         ok("end to end: …while the row beside it whose PR still reads OPEN at send time is offered exactly as "
            "before — the re-read drops a merged PR, not the nag",
-           sum(f"{repo}/t8: finished, PR open, not landed" in ln for ln in inj6.splitlines()) == 1
+           sum(f"{repo}/t8: PR open with no live worker, not merged" in ln for ln in inj6.splitlines()) == 1
            and f"offered {repo}/t8 https://github.com/o/r/pull/78" in led6)
         ok("end to end: …and a NEEDS-YOU finding about a PR — 'closed without merging' — is re-read the same way: "
            "merged by send time it is not sent, and the row beside it whose PR is still closed is",
@@ -1219,6 +1219,36 @@ def selfcheck():
            "that changed were each asked twice, and the two that did not, no more than the run's own read",
            all(int(open(f"{th}/gh{n}.n").read()) - heads_read(n) == 2 for n in (77, 79)))
         for tr in ("t7", "t8", "t9", "t10"):
+            cb("rm", repo, tr)
+        # STUCK PRS: a row with no live worker whose PR stays open is listed with its last red, whatever its word; a kept
+        # PR at rest in `query`, waiting on its read, is not. Each on its own rows, PRs and journal.
+        open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
+        for tr, n in (("s1", 91), ("s2", 92), ("s3", 93)):
+            cb("add", repo, tr, f"pr {n}", "")
+            cb("status", repo, tr, "blocked")
+            cb("set", repo, tr, "pr", f"https://github.com/o/r/pull/{n}")
+            os.makedirs(f"{th}/.cc/state/{repo}/{tr}", exist_ok=True)
+            open(f"{th}/.cc/state/{repo}/{tr}/progress.md", "w").write(
+                "- 2026-11-01T00:00:00Z cc-loop: PR u was not merged, so the task goes on: an older red. Fix it, run your green again, then write STATUS: DONE.\n"
+                f"- 2026-11-01T01:00:00Z cc-loop: PR u was not merged, so the task goes on: track/{tr} conflicts with main; merge main in and fix it. Fix it, run your green again, then write STATUS: DONE.\n")
+        os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
+        json.dump({"repo": repo, "pr": 92, "state": "query", "stage": "query"}, open(f"{th}/.cc/state/land/{repo}-92.json", "w"))
+        open(f"{th}/inj.log", "w").close()
+        out7 = subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120).stdout
+        inj7 = open(f"{th}/inj.log").read()
+        ok("STUCK: an open PR on a `blocked` row with no worker reaches the seat, once, with its last conflict line and its link",
+           f"{repo}/s1: PR open with no live worker, not merged — track/s1 conflicts with main; merge main in and fix it (https://github.com/o/r/pull/91)" in inj7
+           and "an older red" not in inj7)
+        ok("…and the report lists it too", f"stuck      {repo}/s1: PR open with no live worker" in out7)
+        ok("…a kept PR at rest in the lander's `query`, waiting on its read, is not stuck in either",
+           f"{repo}/s2:" not in inj7 and f"{repo}/s2:" not in out7)
+        os.remove(f"{th}/.cc/state/{repo}/s3/progress.md")
+        ok("…and with no red on record it says so", "no red or conflict on record" in stuck_line(repo, "s3", {}))
+        ok("…and a red in a board note is read as the journal's is",
+           NOT_MERGED.search("cc-merge ended 1 on PR #7: cc-merge: NOT MERGED — lander check is red (log /x)").group(1)
+           == "NOT MERGED — lander check is red (log /x)")
+        os.remove(f"{th}/.cc/state/land/{repo}-92.json")
+        for tr in ("s1", "s2", "s3"):
             cb("rm", repo, tr)
         open(f"{th}/gh", "w").write(f"#!/bin/sh\necho '{pulled('OPEN')}'\n")
         json.dump({}, open(seenp, "w"))
@@ -3011,6 +3041,59 @@ def selfcheck():
            and "*Waiting on you*" in digest_text(snap, phone=True))
     finally:
         restore(); shutil.rmtree(tf, ignore_errors=True)
+    # ── the catch-up: a hand merge reaches the checkout through the real cc-merge, with no lander tick anywhere ──
+    tu = tempfile.mkdtemp(prefix="cc-reconcile-catchup-")
+    try:
+        g = lambda *a, d=None: subprocess.run(["git", *(["-C", d] if d else []), "-c", "user.name=s", "-c", "user.email=s@e", *a], capture_output=True, text=True)
+        fake = f"{tu}/fb"
+        scratch(tu, dict(NOOP, **{"cc-merge": f'CC_MERGE_TEST=1 CC_DEV={tu}/dev CC_MERGE_BIN={fake} CC_MERGE_PATH={fake}:/usr/local/bin:/usr/bin:/bin CC_MERGE_CORE={os.path.dirname(BIN)} exec {BIN}/cc-merge "$@"'}))
+        os.makedirs(fake)
+        for name, body in (("cc", '[ "$2" != nog ]'), ("cc-board", ":"), ("cc-gh-token", ":"), ("cc-units", ":"), ("systemctl", ":")):
+            open(f"{fake}/{name}", "w").write(f"#!/bin/sh\n{body}\n"); os.chmod(f"{fake}/{name}", 0o755)
+        inj = f"{tu}/inj"
+        open(inj, "w").write(f'#!/bin/sh\necho "$*" >> {tu}/inj.log\n'); os.chmod(inj, 0o755)
+        os.environ["CC_RECONCILE_INJECT"] = inj
+        def hand(repo):
+            """A checkout with an installer, and a merge on origin it has not seen."""
+            co, o = f"{tu}/dev/{repo}", f"{tu}/{repo}.git"
+            g("init", "-q", "--bare", "-b", "main", o); g("clone", "-q", o, co)
+            os.makedirs(f"{co}/tests")
+            open(f"{co}/inst.sh", "w").write(f"#!/bin/sh\necho {repo} >> {tu}/installed\n"); os.chmod(f"{co}/inst.sh", 0o755)
+            open(f"{co}/tests/LANDING-deploy.toml", "w").write('installer = "inst.sh"\n')
+            g("add", "-A", d=co); g("commit", "-qm", "i", d=co); g("push", "-q", "origin", "main", d=co)
+            g("clone", "-q", o, f"{tu}/h-{repo}")
+            open(f"{tu}/h-{repo}/h.txt", "w").write("h\n")
+            g("add", "-A", d=f"{tu}/h-{repo}"); g("commit", "-qm", "hand", d=f"{tu}/h-{repo}"); g("push", "-q", "origin", "main", d=f"{tu}/h-{repo}")
+            json.dump({"repo": repo, "tracks": {}}, open(f"{tu}/.cc/boards/{repo}.json", "w"))
+            return co
+        co, cn, cm = hand("hm"), hand("nog"), hand("mem")
+        os.makedirs(f"{cm}/.cc"); open(f"{cm}/.cc/member-workspace", "w").close()
+        quietly(catch_up_pass)
+        inst = lambda: open(f"{tu}/installed").read().split() if os.path.exists(f"{tu}/installed") else []
+        ok("CATCH-UP: the tick brings a hand merge to the checkout and runs its installer once, with no lander tick",
+           os.path.exists(f"{co}/h.txt") and inst() == ["hm"])
+        ok("…a repo without the grant and a member's checkout are left where they were",
+           not os.path.exists(f"{cn}/h.txt") and not os.path.exists(f"{cm}/h.txt"))
+        quietly(catch_up_pass)
+        ok("…and the next tick, with nothing moved, does not run the installer again", inst() == ["hm"])
+        g("checkout", "-qb", "mine", d=co)
+        open(f"{tu}/h-hm/h2.txt", "w").write("h\n"); g("add", "-A", d=f"{tu}/h-hm"); g("commit", "-qm", "h2", d=f"{tu}/h-hm"); g("push", "-q", "origin", "main", d=f"{tu}/h-hm")
+        said = [quietly(catch_up_pass) for _ in range(2)]
+        told = open(f"{tu}/inj.log").read().splitlines()
+        ok("…a refused deploy is printed each tick and offered to the seat once per reason",
+           all("DEPLOY REFUSED" in x for x in said) and len(told) == 1 and "inject --no-start hm" in told[0] and "is not on main" in told[0])
+        # the tick itself calls the pass, and only with the network; everything else it runs is stood in for here
+        calls, names = [], ("sweep_fixtures", "retry_requests", "investigate", "deep_fix", "ideas_judge", "holds_pass", "wake_repo", "catch_up_pass")
+        _t = {n: globals()[n] for n in names}
+        globals().update({n: (lambda *a, **k: []) for n in names}, catch_up_pass=lambda: calls.append(1))
+        try:
+            quietly(tick, {}, False); no_net = len(calls)
+            quietly(tick, {}, True)
+        finally:
+            globals().update(_t)
+        ok("…and the tick runs the pass, only with the network", no_net == 0 and len(calls) == 1)
+    finally:
+        restore(); os.environ.pop("CC_RECONCILE_INJECT", None); shutil.rmtree(tu, ignore_errors=True)
     # ── the failure investigation: inert without the setting, held by the tier or a running one, one claim, one launch ──
     ti = tempfile.mkdtemp(prefix="cc-reconcile-inv-")
     _ie = {k: os.environ.get(k) for k in ("HOME", "CC_CONFIG", "CC_FAILURES", "CC_RECONCILE_LAUNCH", "CC_RECONCILE_PROC",
