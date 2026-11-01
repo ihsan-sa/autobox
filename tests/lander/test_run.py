@@ -2400,17 +2400,31 @@ class Admission(unittest.TestCase):
         # the 10-24 tenant: system `some` at 57, but `full` low, because the rest of the box kept running
         d = A.box_cgroup(*self.box(0.2))
         with mock.patch.object(A, "SYS_PSI", self.psi_dir(57.0, 1.0, full=0.5)):
-            self.assertEqual(A.short(), "")
+            self.assertEqual(A.short(d), "")
             self.assertFalse(A.loaded(d))
             self.assertEqual(A.slots_now(d, 3, self.calm_load), 3)
 
-    def test_box_wide_full_pressure_holds(self):
-        # members, Hive or a system unit thrashing the whole box, which the user manager's cgroup does not see
-        d = A.box_cgroup(*self.box(0.2))
+    def test_box_wide_full_pressure_the_box_feels_holds(self):
+        # a real shortage: the whole box stalls and the box's own work stalls with it, below PSI_MEM on its own
+        d = A.box_cgroup(*self.box(5.0))
         with mock.patch.object(A, "SYS_PSI", self.psi_dir(30.0, 1.0, full=A.PSI_FULL)):
             self.assertTrue(A.loaded(d))
             self.assertEqual(A.slots_now(d, 3, self.calm_load), 1)
             self.assertIn("PSI full", A.overloaded(d, self.calm_load))
+            self.assertIn("PSI full", A.short(A.SYS_PSI))   # no box cgroup: /proc/pressure's own `some` decides
+
+    def test_a_tenant_thrashing_in_its_own_cap_with_box_full_admits(self):
+        # 2026-10-31: Hive thrashed at its own MemoryHigh, box-wide `full` 80, user@1000 stalled 0.03%, ~6G available
+        d = A.box_cgroup(*self.box(0.03))
+        with mock.patch.object(A, "SYS_PSI", self.psi_dir(85.0, 1.0, full=80.0)), \
+                mock.patch.object(A, "MEMINFO", self.meminfo(31918896, 6 * 1024 ** 2)):
+            self.assertEqual(A.short(d), "")
+            self.assertFalse(A.loaded(d))
+            self.assertEqual(A.slots_now(d, 3, self.calm_load), 3)
+            self.assertEqual(A.overloaded(d, self.calm_load), "")
+        with mock.patch.object(A, "SYS_PSI", self.psi_dir(85.0, 1.0, full=80.0)), \
+                mock.patch.object(A, "MEMINFO", self.meminfo(31918896, 1024 ** 2)):
+            self.assertIn("1024 MiB available", A.short(d))   # the same tenant with the box's memory gone holds
 
     def test_memavailable_under_the_floor_holds(self):
         d = A.box_cgroup(*self.box(0.2))

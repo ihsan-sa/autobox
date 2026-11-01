@@ -32,10 +32,13 @@ cgroup ancestor, so it shows here too. CPU is read from the same cgroup for the 
 own quota does not slow the box, one contending for the cores does. That cgroup does not see members, Hive, system
 units or SSH sessions, so a shortage of the whole box is read too, by short(): SYS_PSI's (/proc/pressure, or
 LANDER_PSI_DIR) memory `full avg10` at or above PSI_FULL (LANDER_PSI_FULL, default 10), or /proc/meminfo's MemAvailable
-below MEM_FLOOR (LANDER_MEM_FLOOR, default 2G). `full` counts only while every task stalls at once, so one capped
-tenant's own stall stays out of it. An unreadable file counts as calm, the same as PSI_DIR's, and says so once per
-process on stderr and in queue.log (_unread), since a dead signal otherwise looks like a calm box, and a lane started
-detached sends its stderr to /dev/null. A LANDER_MEM_FLOOR of `infinity` sets no floor. When memory `some avg10`
+below MEM_FLOOR (LANDER_MEM_FLOOR, default 2G). `full` counts only while PSI_DIR's own memory `some avg10` is at
+least PSI_OWN (1): on 2026-10-31 Hive thrashed against its own MemoryHigh, held most of the box's runnable tasks and
+lifted box-wide `full` to 77-87 while user@1000.service stalled 0.03%, with ~6G available, and every worker and
+landing waited. A real shortage stalls the box's own work too, or runs MemAvailable under the floor. With no box
+cgroup PSI_DIR is /proc/pressure, whose `some` is never under its `full`, so `full` alone decides there. An
+unreadable file counts as calm, the same as PSI_DIR's, and says so once per process on stderr and in queue.log
+(_unread), since a dead signal otherwise looks like a calm box, and a lane started detached sends its stderr to /dev/null. A LANDER_MEM_FLOOR of `infinity` sets no floor. When memory `some avg10`
 reaches PSI_MEM (default 20) or short() says so, the box is mem_loaded(); when it is, or cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
@@ -181,6 +184,7 @@ MEMINFO = "/proc/meminfo"
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
 PSI_FULL = float(os.environ.get("LANDER_PSI_FULL", "10"))
+PSI_OWN = 1.0   # the box's own memory `some avg10` box-wide `full` needs before it counts (short())
 LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
@@ -266,10 +270,10 @@ def _unread(what: str, so: str = "it counts as calm") -> None:
     E.line(f"unread lander {what} does not read, so {so}")
 
 
-def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
-    """"" unless the whole box runs short of memory, else one line saying how."""
+def short(root: str | None = None, sys_psi: str | None = None, meminfo: str | None = None) -> str:
+    """"" unless the whole box runs short of memory, else one line saying how. `root` is the box's own cgroup."""
     full, avail = psi("memory", sys_psi or SYS_PSI, "full"), _meminfo("MemAvailable:", meminfo)
-    if full >= PSI_FULL:
+    if full >= PSI_FULL and psi("memory", root or PSI_DIR) >= PSI_OWN:
         return f"box-wide memory pressure (PSI full) at {full:.0f}"
     floor = _bytes(MEM_FLOOR)
     if floor is None and MEM_FLOOR.strip().lower() != "infinity":
@@ -280,7 +284,7 @@ def short(sys_psi: str | None = None, meminfo: str | None = None) -> str:
 
 
 def mem_loaded(root: str = PSI_DIR) -> bool:
-    return psi("memory", root) >= PSI_MEM or bool(short())
+    return psi("memory", root) >= PSI_MEM or bool(short(root))
 
 
 def loaded(root: str = PSI_DIR) -> bool:
@@ -300,7 +304,7 @@ def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
     """"" when the box is not overloaded, else one line saying why: loaded(), or the 1-minute load average at or
     above LOAD_FACTOR x cores. An unreadable load average counts as calm."""
     if loaded(root):
-        return short() or f"memory or cpu pressure (PSI) at {psi('memory', root):.0f}/{psi('cpu', root):.1f}"
+        return short(root) or f"memory or cpu pressure (PSI) at {psi('memory', root):.0f}/{psi('cpu', root):.1f}"
     n, l1 = os.cpu_count() or 1, load1(loadavg)
     if l1 is None:
         return ""

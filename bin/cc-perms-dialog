@@ -19,7 +19,8 @@ and the command as quoted data. It answers yes (press 1), no (Esc) or owner: a h
 owner as one card that does not quote the command. The answer is saved before anything is pressed, and the pane is read
 again first: a key goes only to the same prompt the judge saw. A prompt is judged once and never re-pressed. Any change
 to the prompt box restarts its clock; a box that stands unchanged 10 minutes is exit 3, and cc-recover closes the window
-and runs `cc-perms revive`. Each answer, skip and stuck verdict is one line in ~/.cc/state/perms/dialog.jsonl.
+and runs `cc-perms revive`. The second revive on the same prompt is a restart loop: one --ask to the planning seat
+names the prompt and the count, and later revives on it send nothing more. Each answer, skip and stuck verdict is one line in ~/.cc/state/perms/dialog.jsonl.
 Only cc-recover.service may run a tick (read from /proc/self/cgroup, as cc-perms does), so no pane can press for perms.
 """
 # recurring-defect-ok: pause-hold-missing — one tool-less judgement per perms prompt; it launches no worker and writes no board
@@ -174,6 +175,19 @@ def tick():
         f"though the judge answered {a}" if a else "and the judge gave no answer" if cmd else "with no command the box can read")
     ledger({"decided": "revive", "command": cmd[:600], "why": why})
     os.remove(sf)
+    try:
+        n = json.load(open(f"{STATE}/revives.json"))
+    except (OSError, ValueError):
+        n = {}
+    n[key] = n.get(key, 0) + 1
+    json.dump(n, open(f"{STATE}/revives.json", "w"))
+    if n[key] == 2:   # "after the second restart on the same unjudged prompt, raise one alert ... then no repeat"
+        subprocess.run([NOTIFY, "--ask", "-t", "perms", "--heading", "Perms is in a restart loop on one prompt",
+                        "--id", f"perms-dialog-loop:{key}",
+                        f"The box has restarted the perms seat {n[key]} times on the same unanswered permission prompt "
+                        f"({key}): {cmd[:300] or 'a prompt with no command the box can read'}. It will keep restarting "
+                        "it; see ~/.cc/state/perms/dialog.jsonl."],
+                       capture_output=True, timeout=20)
     print(why)
     return 3
 
@@ -276,6 +290,14 @@ def selfcheck():
         open(f"{d}/pane", "w").write(ASK.replace("sort | tail", "sort"))
         check("any change to the prompt box restarts its clock: no revive", tick() == 0 and "revive" not in read(f"{d}/st/dialog.jsonl"))
     with tempfile.TemporaryDirectory() as d:
+        fixture(d, ASK, None)
+        tick(); age(d); one = tick() == 3 and not read(f"{d}/cards")
+        tick(); age(d); two = tick() == 3 and read(f"{d}/cards").count("--ask") == 1
+        tick(); age(d); three = tick() == 3 and read(f"{d}/cards").count("--ask") == 1
+        c = read(f"{d}/cards")
+        check("one revive sends no alert; the second on the same prompt sends one --ask naming it and the count, the third none",
+              one and two and three and "2 times" in c and prompt(ASK)[0] in c and "sudo bash" in c)
+    with tempfile.TemporaryDirectory() as d:
         fixture(d, ASK, "yes", caller=False)
         check("a tick from outside cc-recover.service is refused and presses nothing",
               tick() == 1 and not read(f"{d}/keys") and not read(f"{d}/judged"))
@@ -292,7 +314,7 @@ def selfcheck():
     check("only cc-recover.service's cgroup may tick: a pane, a scope under the unit, no cgroup or CC_ROLE is refused", all(ok))
     check("the command is read from the box, borders and blank lines dropped",
           prompt(ASK)[1] == "sudo bash -lc 'for p in /proc/[0-9]*; do cat $p/io; done | sort | tail'\nSample write bytes per process")
-    print(f"cc-perms-dialog selfcheck: {13 - len(bad)} passed, {len(bad)} failed")
+    print(f"cc-perms-dialog selfcheck: {14 - len(bad)} passed, {len(bad)} failed")
     return 1 if bad else 0
 
 
