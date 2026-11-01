@@ -49,8 +49,8 @@
             (review.perms_recorded; no gh call): a request to the inbox, so this tick's lane runs it again. Any
             writer of the ledger counts, since the ledger is what the host check itself runs on.
   waited    each repo with a job (no gh call; none at all in a GitHub backoff): the oldest due job (Lane.due) queued
-            more than cards.WAIT_FLAG_SECS (60 min) ago and not held by the box (lane.box_hold: paused, a tier
-            stop; or a lane "box" hold) -> one planner request (cards.waited), once per queuing and at most one per
+            more than cards.WAIT_FLAG_SECS (60 min) ago and not held by the box (lane.box_hold: paused or its check failed, a
+            tier stop; or a lane "box" hold) -> one planner request (cards.waited), once per queuing and at most one per
             repo, or per member across its lanes, per hour; marked sent only once cc-notify took it. A box hold is
             noted (cards.held), and the age counts from the hold's end (the last hold seen, or the job's unheld_at).
   main-red  each repo (none in a GitHub backoff): a check red on main whose oldest hold on a job (extra.main_red
@@ -68,8 +68,8 @@
   cards     each repo (those above, and each with a queued-card record) with no lane running whose queued card
             waits on a last edit the box-wide cap or a Slack 429 held (cards.left_held): cards.positions on its queue, so the edit goes once a slot is free; the rearm
             step arms a tick for when it will be (cards.edit_wait). A running lane hands its queue over itself.
-  deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
-            deploy.request not yet made — only when those units are installed.
+  deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) (a no-op for a member
+            lane) and a deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
             repo's tip lock (a second tick skips it, never waits): tip.catchup at most every $LANDER_CATCHUP_SECS
             (900) per repo — origin's main past <repo>.applied kicks a tip run, a first sight seeds .applied; then
@@ -579,7 +579,8 @@ def waits(repo) -> list:
     pending = any(j.state in (T.DEPLOY_PENDING, T.DEPLOYED) for j in jobs)
     # HL.pending: a killed pass or a want a skipped tick left; health.TRIES bounds how long a pass stays owed. An inbox
     # request: one main_health or lift_limits wrote after this tick's lanes ran waits for the next tick's
-    if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))) \
+    # A member lane's want is ignored: it gets no tip run, so nothing would ever clear it
+    if ("--" not in repo and os.path.exists(TP.want_path(repo))) or ((requested or pending) and not os.path.exists(TP.red_path(repo))) \
             or HL.pending(repo) or J.requests(repo):
         out.append(TICK_SECS)
     if glob.glob(f"{J.handed_dir()}/{repo}-*.json"):   # its handed watches: only its own tick sweeps them

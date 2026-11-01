@@ -14,7 +14,8 @@ is the owner's own uid (SLACK_OWNER_ID): `refused <repo>#<pr> protected:<file>`,
 "door"), exit 1. With his 👍 queue writes the approval record (jobs.approve: his uid and the head gh names — a
 head gh cannot name refuses); the inbox request carries no approval, because anyone may write the inbox and drain
 takes only chat/ts/who from it. The request goes to the inbox (jobs.submit); `queued` is logged only for a PR
-with no job yet (drain logs `again` or `requeued` for the rest, so `times` is not restarted). A paused project keeps the request and says so (exit 0); --no-start
+with no job yet (drain logs `again` or `requeued` for the rest, so `times` is not restarted). A paused project, or a
+pause check that failed, keeps the request and says which (exit 0); --no-start
 says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached (with only an allow-list of
 the caller's environment: tick_env), and a start that fails is
 exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc done <repo> <row> --json`, `cc lands`
@@ -91,7 +92,7 @@ only a doc."): a queued job is planned at its turn whatever the other jobs chang
 with main (CONFLICT below) stops it. Each turn of the loop first records the checks that finished, so a freed slot
 is seen while queued jobs keep the turn list full, and a job held during the pass has a turn again once its
 not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
-`cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds every job not merged yet,
+`cc-pause is <repo or handle>` holds everything unless it exits 1, its clean "not paused" (paused()); `cc-tier allows gates` exit 1 holds every job not merged yet,
 mergeable ones too.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a fork's PR (isCrossRepository: the lane reads
              heads from origin's branches only) -> query; a draft -> held 15 min; a conflict -> CONFLICT
@@ -395,8 +396,16 @@ def landed_at(job, pv) -> bool:
                                                                                  {job.digest})
 
 
-def paused(target) -> bool:
-    return run([f"{J.bin_dir()}/cc-pause", "is", str(target)], timeout=10)[0] == 0
+def paused(target) -> str:
+    """Why `target` is held by cc-pause, "" when it is not. Only its clean "not paused" (exit 1) lets a job go. Any other
+    answer (a hang, a missing binary, a kill, a crash) could be hiding a flag, so it holds the same way and says the
+    check failed; the flag is not read here, so cc-pause stays the one definition of paused."""
+    rc = run([f"{J.bin_dir()}/cc-pause", "is", str(target)], timeout=10)[0]
+    if rc == 1:
+        return ""
+    if rc == 0:
+        return f"{target} is paused — still queued, lands after `cc-pause off {target}`"
+    return f"the pause check for {target} failed (exit {rc}) — still queued, asked again next turn"
 
 
 def tier_stop() -> bool:
@@ -608,12 +617,13 @@ class BoardRules:
 
 
 def box_hold(target, job):
-    """Why the box holds `job` from its turn ("" when it does not): `target` (the member, else the repo) paused, or a
-    spend tier stop for a job not merged yet, a mergeable one too, since its re-check when main moves is a sealed read
+    """Why the box holds `job` from its turn ("" when it does not): `target` (the member, else the repo) paused or its
+    pause check failed (paused), or a spend tier stop for a job not merged yet, a mergeable one too, since its re-check when main moves is a sealed read
     and stop means nothing lands. The lane says it per turn; the tick's age flag (tick.flag_waited) skips a held job,
     since nothing in the queue is late while the box itself holds it."""
-    if paused(target):
-        return f"{target} is paused — still queued, lands after `cc-pause off {target}`"
+    why = paused(target)
+    if why:
+        return why
     state = job.extra.get("held_from", T.QUEUED) if job.state == T.HELD else job.state
     if state in PRE_MERGE + (T.MERGEABLE,) and tier_stop():
         return "spend tier stop — still queued, its checks run after `cc-tier set` a wider tier"
@@ -2177,9 +2187,9 @@ def cmd_queue(argv):
     print(f"[{repo}] PR #{pr} queued — its checks run first, then the merge, then the deploy")
     if light:   # brief 10-13: "Print why a PR doesn't qualify, naming the protected path"
         print(f"lander: {light_word(repo, root, pr, token, genv)}")
-    if paused(handle or repo):
-        print(f"lander: {handle or repo} is paused — nothing lands until `cc-pause off {handle or repo}`, "
-              f"and this request waits for it")
+    why = paused(handle or repo)
+    if why:
+        print(f"lander: {why}")
         return 0
     where = place(repo, pr)
     if not start:

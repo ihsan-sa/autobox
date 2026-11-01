@@ -1,7 +1,8 @@
 """The tip run: after merges, the checks the merged changes reach run once on main's tip, and only a green tip deploys.
 
     kick(repo)                     a merge happened; the next tick runs the tip. Idempotent: ten merges before the
-                                   tick are one run over all ten (COALESCED since the last green tip)
+                                   tick are one run over all ten (COALESCED since the last green tip). A member
+                                   lane has no tip run, so it writes nothing
     run(repo, plan, check)         the tick's call. `plan(root, base, head, files) -> Plan` is U2's planner and
                                    `check(name, sha) -> Result` runs one named check on one commit (the tick builds it
                                    from U2's runner). Answers "green", "red", "retry", "wait" or "idle".
@@ -78,6 +79,8 @@ def lock(repo):
 
 
 def kick(repo):
+    if "--" in repo:   # a member lane gets no tip run (tick.tip_and_deploy), so nothing would ever clear its want
+        return
     if not os.path.exists(want_path(repo)):
         C.write_json(want_path(repo), {"at": C.now()})
 

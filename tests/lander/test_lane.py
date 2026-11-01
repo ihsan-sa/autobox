@@ -2464,6 +2464,99 @@ class Repair(Fixture):
         self.assertIn("1 held on a conflict made due: demo#3", o.getvalue())
 
 
+class PauseCheck(Fixture):
+    """`cc-pause is` through CC_BIN: exit 0 holds, exit 1 goes, and every failure of the check holds and says so."""
+
+    def setUp(self):
+        super().setUp()
+        d = os.path.join(self.tmp, "pausebin")
+        os.mkdir(d)
+        for name in FAKES:
+            if name != "cc-pause":
+                os.symlink(os.path.join(self.bindir, name), os.path.join(d, name))
+        self.pausebin = os.environ["CC_BIN"] = d
+        self.pr(1, {"a/x": "n\n"})
+        self.tip = self.origin_rev("main")
+
+    def fake(self, body):
+        p = os.path.join(self.pausebin, "cc-pause")
+        with open(p, "w") as f:
+            f.write(f"#!/bin/sh\n{body}\n")
+        os.chmod(p, 0o755)
+
+    def real(self):
+        os.symlink(os.path.join(CORE, "bin", "cc-pause"), os.path.join(self.pausebin, "cc-pause"))
+
+    def flag(self):
+        os.makedirs(f"{self.home}/.cc/state/demo")
+        open(f"{self.home}/.cc/state/demo/paused", "w").close()
+
+    def assert_held(self, says, says_not):
+        """A queued job with a paid plan: its turn moves no stage, runs no check, buys no review and merges nothing."""
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        with open(J.job_path("demo", 1)) as f:
+            before = f.read()
+        u, lines = self.land(planner=Planner(paid=True), reviewer=Reviewer(T.Verdict(T.LAND, "ok")))
+        with open(J.job_path("demo", 1)) as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual((u["planner"].calls, u["runner"].calls, u["reviewer"].calls), ([], [], []))
+        self.assertEqual(self.origin_rev("main"), self.tip)
+        self.assertIn(says, lines[0])
+        self.assertNotIn(says_not, lines[0])
+
+    def assert_check_failed_holds(self):
+        self.flag()
+        self.assert_held("pause check for demo failed", "is paused")
+
+    def test_a_hang_holds(self):
+        self.fake("exec sleep 30")
+        real = L.run
+        with mock.patch.object(L, "run", lambda argv, timeout=60, **kw: real(argv, timeout=0.2, **kw)):
+            self.assert_check_failed_holds()
+
+    def test_a_missing_binary_holds(self):
+        self.assert_check_failed_holds()
+
+    def test_a_kill_holds(self):
+        self.fake("kill -9 $$")
+        self.assert_check_failed_holds()
+
+    def test_any_other_exit_holds(self):
+        self.fake("exit 2")
+        self.assert_check_failed_holds()
+
+    def test_a_failed_check_with_no_flag_waits_a_turn_then_lands(self):
+        self.fake("exit 2")
+        self.assert_held("pause check for demo failed", "is paused")
+        os.unlink(os.path.join(self.pausebin, "cc-pause"))
+        self.real()
+        self.land()
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+
+    def test_a_failed_check_keeps_the_request_and_says_the_check_failed(self):
+        self.fake("exit 2")
+        with mock.patch.object(L, "spawn_tick", side_effect=AssertionError("started")):
+            rc, out, _ = self.queue("demo", "1")
+        self.assertEqual(rc, 0)
+        self.assertIn("pause check for demo failed", out)
+        self.assertNotIn("is paused", out)
+        self.assertEqual(len(J.requests("demo")), 1)
+
+    def test_the_real_check_with_the_flag_holds_and_says_paused(self):
+        self.real()
+        self.flag()
+        self.assert_held("demo is paused", "failed")
+
+    def test_the_real_check_with_no_flag_holds_nothing(self):
+        self.real()
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertNotEqual(self.origin_rev("main"), self.tip)
+
+
 class Lanes(Fixture):
     def test_second_lane_stands_down(self):
         self.pr(1, {"a/x": "n\n"})

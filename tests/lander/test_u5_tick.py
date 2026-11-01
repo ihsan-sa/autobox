@@ -302,6 +302,17 @@ class Tick(unittest.TestCase):
         self.tick()                                                               # deployed and settled: no timer
         self.assertFalse(os.path.exists(self.arms))
 
+    def test_a_member_lane_neither_writes_a_tip_want_nor_rearms_on_one(self):
+        TP.kick("h--demo")
+        self.assertFalse(os.path.exists(TP.want_path("h--demo")))
+        C.write_json(TP.want_path("h--demo"), {"at": C.now()})     # one an older lander left: nothing ever clears it
+        self.assertEqual(TK.waits("h--demo"), [])
+
+    def test_a_repo_tip_want_still_rearms(self):
+        TP.kick("demo")
+        self.assertTrue(os.path.exists(TP.want_path("demo")))
+        self.assertEqual(TK.waits("demo"), [TK.TICK_SECS])
+
     def test_a_held_last_card_edit_is_retried_by_the_tick_and_a_running_lane_is_left_to_it(self):
         """Opus read of #1275: a last edit the cap or a 429 held was never retried once its lane had ended."""
         calls, held = [], {"demo"}
