@@ -1881,31 +1881,36 @@ PY
   : > "$T/rc/stop3"; wait "$sp"
   rc=0; for f in "$R"/.receipts/r/f.*.json; do [ -d "$f" ] && rc=1; done; compgen -G "$R/.receipts/r/f.*.json" >/dev/null || rc=1
   t "…and a record the member swaps for a folder just before the move never leaves a folder in the receipts" "$rc"
-  # perms' read of #2099: the folder went back into the member's row dir, so a member that removes that dir mid-retire
-  # made the rename back fail and left its folder in the receipts. Each turn waits for the move, then removes r/g.
-  mkdir -p "$R/r/g"
+  # perms' read of #2099: a member can make every cleanup of a swapped-in folder fail by putting a mode-000 subdir in
+  # it and removing its row dir before the move back. The stub runs that swap inside retire's own rename, every time.
+  mkdir -p "$R/r/g"; printf '{}\n' > "$R/r/g/delivery.json"
   cat > "$T/rc/swapgone.py" <<'PY'
-import ctypes, os, sys
-libc = ctypes.CDLL(None, use_errno=True); d, stop = sys.argv[1:3]; rec, dr = f"{d}/delivery.json", f"{d}/dir.tmp"
-while not os.path.exists(stop):
-    try:
-        os.makedirs(dr, exist_ok=True)
-        if not os.path.lexists(rec): open(rec, "w").write('{}\n')
-        if not os.path.exists(f"{d}/delivery.lock"): continue
-        libc.renameat2(-100, rec.encode(), -100, dr.encode(), 2)
-        for _ in range(2000):
-            if not os.path.lexists(rec): break
-        for n in ("dir.tmp", "delivery.lock"):
-            try: os.unlink(f"{d}/{n}")
-            except OSError: pass
-        os.rmdir(d)
-    except OSError: pass
+import os, runpy, sys
+real, d = os.rename, sys.argv.pop(1)
+def swap(src, dst, **kw):
+    if src != "delivery.json": return real(src, dst, **kw)
+    real(f"{d}/delivery.json", f"{d}/keep.json"); os.makedirs(f"{d}/delivery.json/x"); os.chmod(f"{d}/delivery.json/x", 0)
+    real(src, dst, **kw)
+    for n in ("keep.json", "delivery.lock"): os.unlink(f"{d}/{n}")
+    os.rmdir(d)
+os.rename = swap; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")
 PY
-  python3 "$T/rc/swapgone.py" "$R/r/g" "$T/rc/stop4" & sp=$!
-  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=g; for _ in $(seq 200); do retire; done ) >/dev/null 2>&1
-  : > "$T/rc/stop4"; wait "$sp"
-  rc=0; [ -z "$(find "$R/.receipts/r" -maxdepth 1 -name 'g.*' \( -type d -o -type l \))" ] || rc=1
-  t "…and a member removing its row dir mid-retire still leaves no link and no folder in the receipts" "$rc"
+  HOME="$T/rc/h" python3 "$T/rc/swapgone.py" "$R/r/g" "$BIN/cc-task" retire r g >/dev/null 2>"$T/rc/g.err"
+  rc=0; [ -z "$(find "$R/.receipts/r" -maxdepth 1 \( -name 'g.*' -o -name '.quarantine.*' \))" ] || rc=1
+  [ ! -d "$R/r/g" ] && grep -q 'swapped for another file' "$T/rc/g.err" || rc=1   # the stub fired, and retire refused
+  chmod -R u+rwx "$R/.receipts/r"
+  t "…and a swapped-in folder whose cleanup a member makes fail (a mode-000 subdir, its row dir gone) never stays in the receipts" "$rc"
+  # A link or a folder left over at a receipt name is never taken as the receipt: the move replaces a link (and
+  # leaves what it pointed at alone), and a folder there refuses the move, so the record stays in the row dir.
+  mkdir -p "$R/r/lk" "$R/r/dk/x"; printf '{}\n' > "$R/own/kept"; ln -s "$R/own/kept" "$R/.receipts/r/lk.$(csid 15).json"
+  printf '{"task_id":"%s"}\n' "$(csid 15)" > "$R/r/lk/delivery.json"; printf '{"task_id":"%s"}\n' "$(csid 16)" > "$R/r/dk/delivery.json"
+  mkdir -p "$R/.receipts/r/dk.$(csid 16).json/x"
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=lk; retire ) 2>/dev/null; a=$?
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=dk; retire ) 2>/dev/null; b=$?
+  f="$R/.receipts/r/lk.$(csid 15).json"; [ "$a" = 0 ] && [ -f "$f" ] && [ ! -L "$f" ] && grep -q "$(csid 15)" "$f" && [ "$(cat "$R/own/kept")" = '{}' ]
+  t "…and a link left over at a receipt name is replaced by the record, never read through to what it points at" $?
+  [ "$b" != 0 ] && grep -q "$(csid 16)" "$R/r/dk/delivery.json"
+  t "…and a folder left over at a receipt name refuses the move, so the record stays in its row" $?
   # perms' read of #2099 again: the member keeps an fd on the folder it swaps in and makes it 0555 (it holds a file)
   # or 000 the moment retire has moved it, so neither a move back nor rmtree can take it out of the receipts. The
   # driver holds the row lock to park retire between its open and its move, swaps, then releases; 30 turns a mode.
