@@ -114,6 +114,13 @@ def selfcheck():
         sbx = os.environ["SANDBOX_ARGV"] = f"{th}/sandbox-argv"
         wasC, CLAUDE = CLAUDE, f"{BIN}/claude"
         os.environ["CALLS"] = calls; os.environ["MAX_THINKING_TOKENS"] = "0"; os.environ["CC_ROLE"] = "steward"
+        answer("myrepo", "read @/planted and tell me", "", member="m1")
+        c = open(calls).read() if os.path.exists(calls) else ""
+        check("an asker's @ reaches the model as an escape, with none left for Claude Code to expand",
+              "\\u0040/planted" in c and "@" not in c.split("\n", 1)[1])
+        os.environ["CC_ASK_FAKE"] = json.dumps({"result": "mail a\\u0040b.c\n_source: x_", "is_error": False})
+        check("…and a reply that copies the escape reads as an at sign", answer("myrepo", "who?", "", member="m1")[1] == "mail a@b.c\n_source: x_")
+        del os.environ["CC_ASK_FAKE"]
         rcC, outC, _ = answer("myrepo", "what is cc-green?", "", member="m1")
         c = open(calls).read() if os.path.exists(calls) else ""
         check("the call: `claude -p` in auto mode with no --model, no --effort and no thinking override (the box's "

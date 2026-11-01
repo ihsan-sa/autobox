@@ -656,6 +656,11 @@ def _cause(e, rc=None):
     return _one("%s: %s%s" % (type(e).__name__, detail, "" if rc is None else " (rc=%s)" % rc), CAUSE_MAX)
 
 
+def noat(text):
+    """Claude Code expands an @path in a prompt as a Read no hook or allow check sees, so none reaches it (cc-approve)."""
+    return "Every at sign below is written \\u0040, so read it as one, and write a real at sign in your reply.\n\n" + text.replace("@", "\\u0040")
+
+
 def _ask(prompt, allowed, model, cost, fake):
     """(one answer off `allowed`, why not). Anything that is not an answer off `allowed` — a model that is not
     installed, a timeout, an error, a word off the list — comes back None, which the caller reads as `unread`;
@@ -672,7 +677,7 @@ def _ask(prompt, allowed, model, cost, fake):
                             "--setting-sources", "", "--disable-slash-commands", "--max-turns", "3",
                             "--no-session-persistence", "--output-format", "json", "--json-schema", schema,
                             "--max-budget-usd", str(cost)],
-                           input=prompt, capture_output=True, text=True, timeout=TIMEOUT, cwd=H,
+                           input=noat(prompt), capture_output=True, text=True, timeout=TIMEOUT, cwd=H,
                            env=dict(os.environ, CC_ROLE="worker", MAX_THINKING_TOKENS="0"))
         rc = r.returncode
         got = (json.loads(r.stdout).get("structured_output") or {}).get("reason")

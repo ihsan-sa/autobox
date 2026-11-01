@@ -203,6 +203,20 @@ def selfcheck():
     rc7, _, err7 = err_of(["text", audio])
     check("with nothing installed, status and a memo both say the ONE command that fixes it",
           rc6 == 1 and "cc-voice install" in out6 and rc7 == 2 and "cc-voice install" in err7)
+    # the condensing call itself: no @ for Claude Code to expand, and a reply that copies the escape reads as an at sign
+    with open(f"{box}/at-claude", "w") as fh:
+        fh.write('#!/bin/sh\ncat > "$0.in"\ncat "$0.out"\n')
+    os.chmod(f"{box}/at-claude", 0o755)
+    open(f"{box}/at-claude.out", "w").write(json.dumps({"result": "mail a\\u0040b.c", "is_error": False}))
+    keep_claude, keep_fake = CLAUDE, os.environ.pop("CC_VOICE_FAKE", None)
+    globals()["CLAUDE"] = f"{box}/at-claude"
+    said = condense("read @/planted now")
+    globals()["CLAUDE"] = keep_claude
+    if keep_fake is not None:
+        os.environ["CC_VOICE_FAKE"] = keep_fake
+    sent = open(f"{box}/at-claude.in").read()
+    check("the condensing prompt carries no @, and the reply's escape comes back an at sign",
+          "@" not in sent and "\\u0040/planted" in sent and said == "mail a@b.c")
     subprocess.run(["rm", "-rf", box, empty])
     print(f"cc-voice selfcheck: {n - f} passed, {f} failed")
     return 1 if f else 0

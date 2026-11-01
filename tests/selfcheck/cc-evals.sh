@@ -117,7 +117,7 @@ selfcheck(){
   # suite that spent real money to check its own plumbing would be a suite nobody runs.
   cat > "$d/fakeclaude" <<'FAKE'
 #!/bin/sh
-cat >/dev/null
+cat > "$FAKE_CALLS.in"
 echo call >> "$FAKE_CALLS"
 printf '%s\n' "$*" > "$FAKE_ARGV"
 printf '%s\n' "$FAKE_JSON"
@@ -141,6 +141,10 @@ FAKE
     "the call carries its whole wall: no tools, no settings file, no MCP server, and the escape hatches named — \`Bash\` alone is not enough, a probe once reached the shell through \`Monitor\`"
   k "$(t sh -c '! grep -qE -- "--max-(turns|budget-usd)" "$1"' sh "$d/argv")" \
     "…and no turn cap and no dollar cap: CC_EVALS_BUDGET is a notice figure, never on the call"
+  # A probe's words: no @ for Claude Code to expand, in a process that holds the real home; a reply's escape reads as an at sign
+  out=$(A '{"is_error":false,"result":"a\\u0040b.c","total_cost_usd":0}' ask <<<'read @/planted')
+  k "$(t sh -c '! grep -q @ "$1" && grep -qF "\u0040/planted" "$1"' sh "$d/calls.in")" "ask's prompt carries no @ for Claude Code to expand"
+  k "$(t test "$out" = a@b.c)" "…and a reply that copies the escape reads as an at sign"
   # THE NOTICE, on its own fixture: a question that cost $0.90 against a $0.50 figure still answers, and says so once
   : > "$d/calls"; : > "$d/argv"
   out=$(A '{"is_error":false,"result":"PRICEY","total_cost_usd":0.90}' ask <<<'q')

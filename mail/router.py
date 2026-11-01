@@ -795,6 +795,11 @@ def _cause(e, rc=None):
     return " ".join(line.split())[:CAUSE_MAX]
 
 
+def noat(text):
+    """Claude Code expands an @path in a prompt as a Read no hook or allow check sees, so none reaches it (cc-approve)."""
+    return "Every at sign below is written \\u0040, so read it as one, and write a real at sign in your reply.\n\n" + text.replace("@", "\\u0040")
+
+
 def classify(msg, places):
     """(one channel name off the list, why not). The name is None for unsure; `why` is one short line when the
     read FAILED rather than answered, and route() puts it in the mirror thread's offer — a classifier that
@@ -819,7 +824,7 @@ def classify(msg, places):
                             "--tools", "", "--strict-mcp-config", "--setting-sources", "",
                             "--disable-slash-commands", "--max-turns", "3", "--no-session-persistence",
                             "--output-format", "json", "--json-schema", schema, "--max-budget-usd", "0.05"],
-                           input=_prompt(places[:MAX_PLACES], msg), capture_output=True, text=True,
+                           input=noat(_prompt(places[:MAX_PLACES], msg)), capture_output=True, text=True,
                            timeout=CLASSIFY_TIMEOUT, cwd=H,
                            env=dict(os.environ, CC_ROLE="worker", MAX_THINKING_TOKENS="0"))
         rc = r.returncode

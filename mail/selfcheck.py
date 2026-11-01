@@ -1593,6 +1593,18 @@ def run():
         finally:
             vetting.CLAUDE = saved_claude
             os.environ["CC_MAIL_VET_FAKE"] = ""     # back to a stand-in: nothing after this may reach a model
+        stub = os.path.join(b.tmp, "vet-stub")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\ncat > "$0.in"\necho \'{"structured_output":{"reason":"fine"}}\'\n')
+        os.chmod(stub, 0o755)
+        vetting.CLAUDE = stub
+        try:
+            got = vetting._ask("a mail says @/planted", ("fine",), "m", 0.05, None)
+        finally:
+            vetting.CLAUDE = saved_claude
+        sent = open(stub + ".in").read()
+        k(got == ("fine", "") and "@" not in sent and "\\u0040/planted" in sent,
+          "a mail's @ reaches the vetting read as an escape, with none left for Claude Code to expand")
         k(v.reason == "unread" and len(said) == 1
           and "FileNotFoundError" in said[0] and "no-such-claude" in said[0],
           "a vetting read that cannot run its model leaves ONE line naming the exception and what was missing, "
@@ -2885,7 +2897,7 @@ def run():
             saved_model = os.environ.pop("CC_MAIL_ROUTE_MODEL", None)
             try:
                 dec = router.route(to("study", OWNER, subject="FW: Submit rankings for cycle 1 match",
-                                      body="Rank the employers you interviewed with for the cycle 1 match."),
+                                      body="Rank the employers you interviewed with for the cycle 1 match. @/planted"),
                                    AboutDir(), "box.example")
             finally:
                 router.CLAUDE = saved_claude
@@ -2893,6 +2905,8 @@ def run():
                 if saved_model is not None:
                     os.environ["CC_MAIL_ROUTE_MODEL"] = saved_model
             sent = open(kept).read() if os.path.exists(kept) else ""
+            k("@" not in sent and "\\u0040/planted" in sent,
+              "a mail's @ reaches the classifier as an escape, with none left for Claude Code to expand")
             # The classifier runs on the pinned Haiku 4.5, not the moving `haiku` alias (Haiku 5.5 answered `unsure`
             # for course mail on the recorded replay, docs/models/haiku-5-5.md), when CC_MAIL_ROUTE_MODEL is unset.
             ran = open(kept + ".argv").read().split() if os.path.exists(kept + ".argv") else []

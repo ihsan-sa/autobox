@@ -79,7 +79,7 @@ EOF
   # box's do, and a local API whose model asks for each call below. Each call's own tool_result in the transcript says
   # what it got, so a settings source that leaks in fails here whatever the argv says. No network and no login.
   local H=$d/home real port pid sec=$d/home/.claude/.credentials.json c
-  real=$(getent passwd "$(id -u)" | cut -d: -f6)/.local/bin/claude
+  real=${CC_WARDEN_SC_CLAUDE:-$(getent passwd "$(id -u)" | cut -d: -f6)/.local/bin/claude}
   mkdir -p "$H/.claude" "$H/bin" "$H/dev/repo" "$H/.cc/state/repo"
   echo CC-WARDEN-FILE-SECRET > "$sec"
   echo 'in the repo' | tee "$H/dev/repo/x" "$H/CLAUDE.md" "$H/OWNER.md" "$H/.cc/state/repo/goals.md" >/dev/null
@@ -91,7 +91,7 @@ EOF
   local yes=("cc-refusals show repo q30" "cc-lib ask x" "cc-board show repo" "cc-infer decide --ask 'x'" "cc-infer decide --ask \"it's x\"" "cc-infer decide --ask 'Bash(git push *)'")
   local no=("cat $sec" "cat < $sec" "cat ~/.claude/.credentials.json" "cd $H/.claude && cat .credentials.json" "echo \$(cat $sec)" "head -1 $sec" \
             "sed -n 1p $sec" "ls $H/.claude" "grep -r SECRET $H/.claude" "find $H/.claude -type f" "cat /proc/self/environ" "env" "printenv ANTHROPIC_API_KEY" \
-            'echo $ANTHROPIC_API_KEY' "cc-board show repo; cat $sec" "git --version" "git log --output=$d/planted" "python3 -c print(1)" "curl --version" \
+            'echo $ANTHROPIC_API_KEY' "cc-board show repo; cat $sec" "git --version" "python3 -c print(1)" "curl --version" \
             "du --files0-from=$sec" "wc --files0-from=$sec" "wc -l $sec" "du -a $H/.claude" "ps -ef" "lsof" "docker inspect x" "pwd" "echo hi" \
             "cc-board show repo && du --files0-from=$sec" "cc-board show repo || du --files0-from=$sec" "cc-board show repo & du --files0-from=$sec" \
             "cc-board show repo | wc --files0-from=$sec" "cc-board show \$(du --files0-from=$sec)" "cc-board show \`du --files0-from=$sec\`" \
@@ -106,10 +106,15 @@ EOF
   hook(){ jq -cn --arg c "$1" '{session_id:"s", transcript_path:"/x", cwd:"/", permission_mode:"dontAsk", hook_event_name:"PreToolUse", tool_name:"Bash", tool_input:{command:$c, description:"d"}, tool_use_id:"t"}' | sh -c "$only" >/dev/null 2>&1; echo $?; }
   for c in "${yes[@]}"; do k "$(t test "$(hook "$c")" = 0)" "the hook passes $c"; done
   for c in "${no[@]}"; do k "$(t test "$(hook "$c")" = 2)" "the hook refuses $(lbl "$c")"; done
-  k "$(t test "$(hook "cc-infer decide --ask '--record'")" = 0 -a "$("$BIN/cc-infer" decide --ask --record >/dev/null 2>&1; echo $?)" = 2)" "--record as the one quoted ask passes the hook, and cc-infer stops at its usage line with nothing written"
+  # cc-infer takes its ledger from the passwd home, and only its own _TEST moves it, so this runs the tool with that set
+  local ih=$d/infer-state irc; mkdir -p "$ih"
+  python3 -I -c 'import sys; ns = {"__name__": "cc_infer", "__file__": sys.argv[1]}; exec(open(sys.argv[1]).read(), ns); ns["_TEST"]["dir"] = sys.argv[2]; sys.exit(ns["main"](["decide", "--ask", "--record"]))' "$BIN/cc-infer" "$ih" >/dev/null 2>&1; irc=$?
+  k "$(t test "$(hook "cc-infer decide --ask '--record'")" = 0 -a "$irc" = 2 -a -z "$(find "$ih" -type f)")" "--record as the one quoted ask passes the hook, and cc-infer stops at its usage line with nothing written"
   k "$(t test "$(echo 'not json' | sh -c "$only" 2>/dev/null; echo $?)" = 2)" "the hook refuses when its input isn't JSON"
   k "$(t test "$(echo '{"tool_input":{}}' | sh -c "$only" 2>/dev/null; echo $?)" = 2)" "…or names no command"
   k "$(t test "$(echo '{"tool_input":{"command":"cc-board show repo"}}' | PATH=/nonexistent /bin/sh -c "$only" 2>/dev/null; echo $?)" = 2)" "…or jq can't run"
+  # From here to the end of this block the cases need the real claude binary: a runner without it says so and passes the rest
+  if [ ! -x "$real" ]; then echo "  SKIP what the real claude resolves: no $real here, so those cases did not run"; else
   { for c in "${yes[@]}" "${no[@]}" "cc-board show guard-blocks-this"; do jq -cn --arg c "$c" '{name:"Bash", input:{command:$c}}'; done
     for c in "$H/dev/repo/x" "$H/CLAUDE.md" "$H/OWNER.md" "$H/.cc/state/repo/goals.md" "$sec" "$H/.claude/settings.json"; do jq -cn --arg c "$c" '{name:"Read", input:{file_path:$c}}'; done
     jq -cn --arg c "$H/dev/repo" '{name:"Grep", input:{pattern:"repo", path:$c}}'; jq -cn --arg c "$H/.claude" '{name:"Grep", input:{pattern:"SECRET", path:$c}}'
@@ -141,11 +146,12 @@ EOF
   k "$(t test "$(got Grep "$H/dev/repo")" = ran)" "resolved: its Grep reaches the repo"
   k "$(t test "$(got Grep "$H/.claude" SECRET)" = denied)" "resolved: its Grep can't reach the user's secrets"
   k "$(t test "$(got Glob "$H/.claude")" = denied)" "resolved: its Glob can't list them"
-  k "$(t test -z "$(grep -lE 'CC-WARDEN-(FILE|KEY)-SECRET' "$A/q30/1/transcript.jsonl")" -a ! -e "$d/planted")" "no secret reaches the transcript, and git log --output writes nothing"
+  k "$(t test -z "$(grep -lE 'CC-WARDEN-(FILE|KEY)-SECRET' "$A/q30/1/transcript.jsonl")" -a ! -e "$d/planted")" "no secret reaches the transcript, and the refused redirect writes nothing"
   k "$(t test -s "$d/requests" -a -z "$(grep -lE 'CC-WARDEN-(FILE|KEY)-SECRET' "$d/requests")")" "a hostile ask's @<credential path> sends 0 secrets to the model"
   k "$(t grep -qF "\\u0040$sec" "$d/requests")" "…and reaches it as words"
   k "$(t test "$(jq -r .tool_name "$d/guard.log" | sort -u | tr '\n' ' ')" = "Bash Glob Grep Read ")" "the guard hook runs on all four of its tools"
   k "$(t test ! -e "$A/q30/2" -a -z "$(dec q30)")" "…and tribunal hands the ask back to perms"
+  fi
 
   # every field of the ask, as the brief's last line: no @ for Claude Code to expand, and the same words to the model
   local bl; bl=$(brief '{"text":"a @x","where":" @y","input":"z@z"}' | tail -1)

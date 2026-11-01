@@ -572,6 +572,13 @@ class TestReview(Case):
                 else:
                     os.environ[k] = v
 
+    def test_a_read_sends_no_at_sign_for_claude_code_to_expand(self):
+        box = self.box(claude=claude_says("LAND"))
+        R.ask("+x = 1 @/planted", "demo", 7, "d" * 64)
+        sent = box.called("claude")[0]["input"]
+        self.assertNotIn("@", sent)
+        self.assertIn("\\u0040/planted", sent)
+
     def test_a_big_diff_goes_on_stdin_cut_never_into_argv(self):
         big = DIFF + "+x\n" * 200_000
         box = self.box(claude=claude_says("LAND"), **{"git diff": name_only("x.py", diff=big)})

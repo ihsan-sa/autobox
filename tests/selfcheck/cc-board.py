@@ -907,6 +907,15 @@ def selfcheck():
                "zebrafish handover" in o and "note" in o and "st" in o and "OUTCOME answered" in o and "re-read" not in o)
         finally:
             shutil.rmtree(th2, ignore_errors=True)
+        # a repo name that isn't one: `show` with a path neither prints a .json file's fields nor says whether it exists
+        with open(os.path.join(th, "planted.json"), "w") as f:
+            json.dump({"repo": "PLANTED-A", "tracks": {"r": {"title": "PLANTED-B", "status": "running"}}}, f)
+        hit, miss = run("show", "../../planted"), run("show", "../../absent")
+        ok("cc-board show refuses a path, with the same words whether the file exists or not",
+           hit.returncode != 0 and "PLANTED" not in hit.stdout + hit.stderr and "is not a repo name" in hit.stderr
+           and miss.returncode != 0 and "is not a repo name" in miss.stderr)
+        run("init", "Ab1.c_d-e", "/x", "main")
+        ok("…and shows any name a board can really have", "Ab1.c_d-e" in run("show", "Ab1.c_d-e").stdout)
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")

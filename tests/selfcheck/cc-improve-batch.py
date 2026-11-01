@@ -230,6 +230,17 @@ def selfcheck():
 
         notes = {}
         six = [{"title": f"idea {i}", "cost": 1, "freq": 1} for i in range(6)]
+        stub = os.path.join(h, "stub")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\ncat > "$0.in"\ncat "$0.out"\n')
+        os.chmod(stub, 0o755)
+        with open(stub + ".out", "w") as f:
+            f.write('{"result": "[]", "total_cost_usd": 0}')
+        real_claude, os.environ["CC_CLAUDE"] = os.environ["CC_CLAUDE"], stub
+        Models(1.0, h).ask("nudges", "a session wrote @/planted")
+        os.environ["CC_CLAUDE"] = real_claude
+        sent = open(stub + ".in").read()
+        case("the model's prompt carries no @ for Claude Code to expand", "@" not in sent and "\\u0040/planted" in sent)
         got = pass_ideas(Fake({"ideas": six}), found, [], notes, {})
         case("ideas: six returned, four kept, and the note says both", len(got) == 4 and notes["ideas"] == "4 ideas kept of 6 returned")
         notes = {}

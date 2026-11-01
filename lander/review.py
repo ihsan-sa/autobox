@@ -1274,6 +1274,11 @@ def streamed(out):
     return result, answer, "\n".join(said)
 
 
+def noat(text):
+    """Claude Code expands an @path in a prompt as a Read no hook or allow check sees, so none reaches it (cc-approve)."""
+    return "Every at sign below is written \\u0040, so read it as one, and write a real at sign in your reply.\n\n" + text.replace("@", "\\u0040")
+
+
 def ask(text, repo, pr, digest, model=None):
     """One tool-less read. -> (Verdict | None, usd, why). Verdict None and why starting 'limit' is a usage limit;
     'wall' is the read's own budget cap; 'fault' is a read that cannot run as asked (fault()); any other None is a
@@ -1292,7 +1297,7 @@ def ask(text, repo, pr, digest, model=None):
     run, cwd = scratch(repo, pr)
     env = dict(clean_env(), DISABLE_PROMPT_CACHING="1")   # one call: a cache write is paid and never read
     try:
-        rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=env, started=lambda pid: C.sh(
+        rc, out = C.sh(argv, cwd=cwd, input=noat(text), timeout=READ_TIMEOUT, env=env, started=lambda pid: C.sh(
             [os.path.join(BIN, "cc-agent-number"), "next", "review", f"{repo}#{pr}", str(pid)], timeout=10))
     finally:
         shutil.rmtree(run, ignore_errors=True)
