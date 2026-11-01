@@ -676,6 +676,24 @@ class TestReview(Case):
         self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, [f"still open from the earlier read: {huge}"]))
         self.assertEqual(self.delta(["1. [scope] x.py — add a guard"], moot=[huge]).verdict, T.LAND)
 
+    def test_a_padded_unresolved_name_keeps_the_rows_security_tag(self):
+        # perms' read of #2171: past row_number()'s digits this carried bare, and a seat could release the hold
+        rows = ["1. [security] x.py — the token leaks"]
+        pin = ["[security] still open from the earlier read: x.py — the token leaks"]
+        for name in ("01", "0000000001", "#0000000001", "blocker 0000000001", "0" * 5000 + "1"):
+            v = self.delta(rows, resolved=["1"], unresolved=[name])
+            self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, pin), name[:20])
+            self.assertFalse(R.carried_hold(v), name[:20])
+        v = self.delta(rows + ["2. [scope] b"] * 9 + ["11. [scope] c"], resolved=["1"], unresolved=["10", "0"])
+        self.assertEqual(v.blocking, ["[scope] still open from the earlier read: b",   # a real zero is not padding
+                                      "still open from the earlier read: 0"])
+
+    def test_a_padded_resolved_name_still_clears_nothing(self):
+        # the padding is only read to keep a tag: it must not turn a hold into a LAND
+        rows = ["1. [security] x.py — the token leaks"]
+        for name in ("01", "0000000001", "#01", "0" * 5000 + "1"):
+            self.assertEqual(self.delta(rows, resolved=[name]).verdict, T.HANDBACK_VERDICT, name[:20])
+
     def test_a_sentence_in_resolved_or_moot_leaves_the_row_out(self):
         # what delta.md says it does: the row counts as left out, so only a [security] one stays open
         for said in ({"resolved": ["x.py:1 is only advice"]}, {"moot": ["x.py:1 is moot"]}):

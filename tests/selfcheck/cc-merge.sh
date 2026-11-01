@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cc-merge's selfcheck: each case builds its own fixture (a bare remote, the deployed checkout cloned from it, a track
 # branch for PR 7) and runs cc-merge against a fake gh and fake box tools; never a real GitHub.
-#   bash core/tests/selfcheck/cc-merge.sh      exit 0 when every case passes
+#   bash core/tests/selfcheck/cc-merge.sh      exit 0 when every case passes (`cc-merge selfcheck` runs it, for tests/check.sh)
 set -uo pipefail
 HERE=$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)   # core/
 n=0 f=0
@@ -339,7 +339,7 @@ fx log-prune; echo 1 > "$T/check.rc"; for _ in 1 2 3 4 5 6 7; do run >/dev/null;
 t 'only the last few check logs are kept' "$(ls "$T/home/.cc/state/r"/merge-*.log | wc -l)" 5
 
 # cc's hand `cc done` call, queue_pr, lifted out of core/bin/cc: the merge runs detached and the line names its log
-fx detach; eval "$(sed -n '/^queue_pr(){/,/^  \[ -n "\$lo" \]/p' "$HERE/bin/cc")"; pr_slug(){ echo o/r; }
+fx detach; export BIN=$T/fb; eval "$(sed -n '/^queue_pr(){/,/^  \[ -n "\$lo" \]/p' "$HERE/bin/cc")"; pr_slug(){ echo o/r; }
 printf '#!/bin/sh\nsleep 3\necho "cc-merge: merged PR #$2"\n' > "$T/slow"; chmod +x "$T/slow"
 s0=$SECONDS; out=$(HOME="$T/home" BOARD=false CC_MERGE="$T/slow" CC_MERGE_WAIT=1 PATH="$T/fb:$PATH" queue_pr r x "$T/dev/r" 7); s=$((SECONDS - s0))
 lg=$(sed -n 's/^merging: PR #7 — cc-merge runs on its own; log //p' <<<"$out")
@@ -353,6 +353,7 @@ lg=$(HOME="$T/home" BOARD="$T/board" CC_MERGE="$T/redrun" CC_MERGE_WAIT=0 PATH="
 t 'a hand run that ends red after cc done returned goes on the row, with the reason and the log' "$(cat "$T/notes" 2>/dev/null)" "note r x cc-merge ended 1 on PR #7: cc-merge: NOT MERGED — lander check is red (log $lg)"
 : > "$T/notes"; lg=$(HOME="$T/home" BOARD="$T/board" CC_MERGE="$T/okrun" CC_MERGE_WAIT=0 PATH="$T/fb:$PATH" queue_pr r x "$T/dev/r" 7 | sed -n 's/.*; log //p'); for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -s "$lg.rc" ] && break; sleep 1; done
 t '…and one that ends well writes no note' "$(cat "$lg.rc"):$(wc -c < "$T/notes")" 0:0
+t '…and a note that wrote leaves the failure ledger alone' "$(calls cc-failures)" 0
 
 hand_merge catch-up-hand
 t 'a hand merge with no lander tick reaches the checkout and runs the installer once, and the lander is never asked' \
@@ -365,4 +366,55 @@ t 'catch-up: a local file in the way is refused and kept: fast-forward only' "$(
 hand_merge catch-up-nogrant; echo 1 > "$T/lands.rc"; was=$(git -C "$T/dev/r" rev-parse HEAD)
 t 'catch-up: a repo without the grant is left alone, silently' "$(cu):$(git -C "$T/dev/r" rev-parse HEAD):$(calls installed):$(cat "$T/out")" "0:$was:0:"
 
-echo "cc-merge selfcheck: $((n - f))/$n passed"; [ "$f" = 0 ]
+# a board that will not take the note (no row, a fault): the failure still reaches the ledger, unless the PR is in the queue
+qpr(){ printf '#!/bin/sh\nexit 1\n' > "$T/board"; printf '#!/bin/sh\necho "cc-merge: %s"\nexit %s\n' "$1" "$2" > "$T/end"; chmod +x "$T/board" "$T/end"
+  lg=$(HOME="$T/home" BOARD="$T/board" CC_MERGE="$T/end" CC_MERGE_WAIT=15 PATH="$T/fb:$PATH" queue_pr r x "$T/dev/r" 7 >/dev/null; ls "$T/home/.cc/state/r"/cc-merge-7-*.rc); lg=${lg%.rc}; }
+fx lost-note; BIN=$T/fb; qpr 'NOT MERGED — red' 1
+t 'a red end whose note will not write is recorded with the reason and the log, and the run still ends' \
+  "$(cat "$lg.rc"):$(grep '^cc-failures' "$T/calls")" "1:cc-failures record --scope r --kind worker-loop/done-undelivered --observed cc-merge ended 1 on PR #7: cc-merge: NOT MERGED — red (log $lg)"
+fx lost-kept; BIN=$T/fb; qpr 'waits in the queue' 3
+t 'a kept PR whose note will not write is no failure: it is in the queue, and nothing is recorded' "$(cat "$lg.rc"):$(calls cc-failures)" 3:0
+
+# the deploy's restart list: a repo whose cc-units says what $T/units holds, and a systemctl that fails on a unit in $T/unit.fail
+unitfx(){ fx "$1"; (cd "$T/dev/r" && mkdir -p core/bin && printf '#!/bin/sh\n[ ! -f "%s/plan.no" ] || exit 2\ncat "%s/units"\n' "$T" "$T" > core/bin/cc-units && chmod +x core/bin/cc-units \
+  && printf '#!/bin/sh\necho installed >> "%s/calls"\n[ ! -f "%s/inst.no" ]\n' "$T" "$T" > inst.sh && chmod +x inst.sh && printf 'installer = "inst.sh"\n' > tests/LANDING-deploy.toml && git add -A && git commit -qm i && git push -q origin main)
+  printf 'a.service\trestart\nb.timer\trearm\nc.service\towner\ntmux-main.service\trestart\n' > "$T/units"; PEND=$T/home/.cc/state/r/deploy-restarts
+  printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls"\n[ "$2" = restart ] && grep -qx "$3" "%s/unit.fail" 2>/dev/null && exit 1\nexit 0\n' "$T" "$T" > "$T/fb/systemctl"; chmod +x "$T/fb/systemctl"; }
+nextpr(){ (cd "$T/dev/r" && git fetch -q origin && git checkout -q -B track/x origin/track/x && echo y > y.txt && git add -A && git commit -qm y && git push -q origin track/x && git checkout -q main); : > "$T/units"; }
+sys(){ calls "systemctl --user restart $1"; }
+pend(){ if [ -e "$PEND" ]; then tr '\n' ' ' < "$PEND"; else echo gone; fi; }
+unitfx units-all-up; rc=$(run)
+t 'a deploy with every unit restarted: restart and rearm only, never tmux-main, and no list left' \
+  "$rc:$(sys a.service):$(sys b.timer):$(sys c.service):$(sys tmux-main):$(grep -c 'DEPLOY REFUSED' "$T/out"):$(pend)" '0:1:1:0:0:0:gone'
+unitfx unit-not-last; echo a.service > "$T/unit.fail"; rc=$(run)
+t 'a unit that fails, though not the last: named, the deploy reported failed and recorded, and only it stays on the list' \
+  "$rc:$(sys b.timer):$(tail -1 "$T/out" | grep -c 'merged, but the deploy was refused: did not restart: a.service,'):$(calls 'cc-failures record'):$(pend)" '0:1:1:1:a.service '
+rm "$T/unit.fail"; nextpr; rc=$(run)
+t '…and the next deploy restarts it, though its own change names no unit, and clears the list' \
+  "$rc:$(sys a.service):$(sys b.timer):$(grep -c 'DEPLOY REFUSED' "$T/out"):$(pend)" '0:2:1:0:gone'
+unitfx units-all-fail; printf 'a.service\nb.timer\n' > "$T/unit.fail"; run >/dev/null
+t 'every unit that fails is named' "$(tail -1 "$T/out" | grep -c 'did not restart: a.service b.timer,'):$(pend)" '1:a.service b.timer '
+unitfx inst-fails; touch "$T/inst.no"; rc=$(run)
+t 'a failed installer: reported, nothing restarted, and the list is on disk with only what should restart' \
+  "$rc:$(tail -1 "$T/out" | grep -c 'deploy was refused: inst.sh failed'):$(calls 'systemctl --user'):$(pend)" '0:1:0:a.service b.timer '
+rm "$T/inst.no"; nextpr; rc=$(run)
+t '…and the next deploy finishes that list once, and clears it' "$rc:$(sys a.service):$(sys b.timer):$(pend)" '0:1:1:gone'
+unitfx plan-fails; touch "$T/plan.no"; rc=$(run)
+t 'a cc-units that will not answer is a refused deploy naming the files, not a silent no-restart' \
+  "$rc:$(tail -1 "$T/out" | grep -c 'cc-units would not say what restarts for: x.txt'):$(calls installed)" '0:1:0'
+
+# the gates: tests/check.sh runs what its discovery finds, judged by the tally; lander check selects by the manifest
+eval "$(sed -n '/^tally_line(){/p;/^tally_ok(){/p;/^ships_selfcheck(){/,/; }$/p' "$HERE/tests/check.sh")"
+tally=$(sed -n 's/; \[ "$f" = 0 \]$//; /^echo "cc-merge selfcheck: /p' "$(realpath "$0")")
+t 'tests/check.sh discovers both selfchecks, and reads this one'"'"'s tally: 0 failed is green, 1 failed is red' \
+  "$(ships_selfcheck "$HERE/bin/cc-merge" && echo m):$(ships_selfcheck "$HERE/bin/cc-perms-dialog" && echo p):$(tally_ok cc-merge "$(n=3 f=0; eval "$tally")" && echo g):$(tally_ok cc-merge "$(n=3 f=1; eval "$tally")" || echo r)" 'm:p:g:r'
+fx dispatch; mkdir -p "$T/c/bin" "$T/c/tests/selfcheck"; cp "$HERE/bin/cc-merge" "$T/c/bin/"; printf 'exit 5\n' > "$T/c/tests/selfcheck/cc-merge.sh"
+t 'cc-merge selfcheck runs the case file and passes on its exit' "$("$T/c/bin/cc-merge" selfcheck >/dev/null 2>&1; echo $?)" 5
+t 'lander check selects both from the manifest, when the tool changes' "$(python3 -I -c '
+import sys, tomllib
+for c in tomllib.load(open(sys.argv[1], "rb"))["check"]:
+    for name, tool in (("selfcheck-cc-merge", "bin/cc-merge"), ("selfcheck-cc-perms-dialog", "bin/cc-perms-dialog")):
+        if c["name"] == name and tool in c["paths"]:
+            print(c["run"])' "$HERE/tests/LANDING.toml" | tr '\n' ';')" 'bash tests/selfcheck/cc-merge.sh;bin/cc-perms-dialog selfcheck;'
+
+echo "cc-merge selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]

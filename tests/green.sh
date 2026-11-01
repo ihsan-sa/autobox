@@ -236,11 +236,13 @@ PART_BOX_TOOLS='
 cc-sandbox
 cc-fence
 cc-member-v2
+cc-merge
 '
 # cc-sandbox   real bwrap and unprivileged user namespaces; it returns 1 rather than skipping, which is correct
 # cc-fence     runs its cases against the KERNEL's Landlock and exits 77 — reported as skipped, printed green —
 #              where there is none. Off-box that is a pass by absence, which is what this split must not create.
 # cc-member-v2 its cases run inside cc-sandbox's canary gate, so they need what cc-sandbox needs
+# cc-merge     its box-list cases read config/merge-kept.txt, beside core/, which core's own tree does not ship
 part_of_tool(){ case " $(echo $PART_BOX_TOOLS) " in *" $1 "*) echo box;; *) echo portable;; esac; }
 part_caps(){   # what a `portable` run must NOT quietly do without. The box half is allowed to find something
                # missing and say so; the portable half is where a tool that is simply absent looks exactly like a

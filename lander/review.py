@@ -770,12 +770,14 @@ def carried(v, prior):
     the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
     still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
     as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
-    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. `prior` is the
-    prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
+    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. Zero padding is
+    dropped here and only here: '0000000001' keeps row 1's [security] tag, so carried_hold() can't release it (perms'
+    read of #2171), while in `resolved` a padded name still clears nothing. `prior` is the prior verdict's blocking
+    rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
     rows = list(prior or [])
     out = []
     for x in v.unresolved:
-        n = row_number(x)
+        n = row_number(re.sub(r"(?<!\d)0+(?=\d)", "", x))
         row = rows[int(n) - 1] if n and 1 <= int(n) <= len(rows) else x
         m = KIND_TAG.match(row)
         tag, row = (m.group(0), row[m.end():]) if m else ("", row)

@@ -2,6 +2,7 @@
 # cc-merge — a PR lands itself once its own checks pass: what the lander did, in one host script.
 #
 #   cc-merge <repo> <pr>     check and merge one PR, then deploy it
+#   cc-merge selfcheck       its cases (tests/selfcheck/cc-merge.sh), so tests/check.sh finds them
 #   cc-merge catch-up <repo> origin's default branch moved with no cc-merge (a hand merge, another box): deploy it, step 6's
 #                            deploy alone. cc-reconcile's tick calls this. Silent, with exit 0, for no grant, no origin, an
 #                            unread tip or a checkout already at the tip, so no installer runs when nothing moved. Exit 1 a refused deploy.
@@ -27,7 +28,9 @@
 #   6. AFTER. The board row goes merged, the landed card is posted (cc-slack post-approval --landed, what the lander
 #      ran), and the deploy runs: under the repo's git lock (the file the lander and cc-publish lock), ~/dev/<repo>
 #      fast-forwards to origin/<base> and refuses loudly when the checkout was moved; then the installer tests/LANDING-deploy.toml names, a user
-#      daemon-reload and a restart of what `cc-units restart-for` names. tmux-main.service is never restarted. All that runs
+#      daemon-reload and a restart of what `cc-units restart-for` names, which ~/.cc/state/<repo>/deploy-restarts holds
+#      from before the installer until each has restarted. A failed installer or a unit that did not restart is a refused
+#      deploy that names it, and the next deploy restarts what the file still holds. tmux-main.service is never restarted. All that runs
 #      after the fetch has a fixed PATH and no credential-shaped name in its env: the installer links core/bin and
 #      bin-private into ~/bin, so a name a PR added there would otherwise be what the next bare command runs.
 # Every tree that is tested or deployed, and the file list the restarts come from, is read from a sealed fetch (tree_out), never the shared objects: git does
@@ -47,6 +50,7 @@
 # beside core/). CC_MERGE_SETTLE (the retry pause) is read always.
 # Member workspaces stay on the lander for now: cc-loop never calls this inside a workspace's boundary.
 set -uo pipefail
+[ "${1:-}" != selfcheck ] || exec bash "$(dirname "$(realpath "$0")")/../tests/selfcheck/cc-merge.sh"
 [ "${CC_MERGE_TEST:-}" = 1 ] || unset CC_MERGE_BIN CC_MERGE_CORE CC_MERGE_CHECK CC_MERGE_CI_LIMIT CC_MERGE_KEPT CC_MERGE_PATH CC_DEV   # the test hooks, for tests only
 BIN=${CC_MERGE_BIN:-$(dirname "$(realpath "$0")")}
 DEV=${CC_DEV:-$HOME/dev}
@@ -150,7 +154,7 @@ if rc:
     print(tree) if tree else sys.exit(3)' "$CORE" "$@"; }
 
 deploy(){   # $1 repo $2 base → 0 deployed; 1 refused, said loudly
-  local co="$DEV/$1" lock old tip u how inst n cred=() files=()
+  local co="$DEV/$1" lock old tip u inst n pend plan cred=() files=() bad=()
   lock="$(cd "$co" && realpath -m "$("${G[@]}" rev-parse --git-common-dir)")/cc-land.lock" || { say "DEPLOY REFUSED — no checkout at $co"; return 1; }
   mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$("${G[@]}" -C "$co" remote get-url origin)" 2>/dev/null)
   (
@@ -164,12 +168,20 @@ deploy(){   # $1 repo $2 base → 0 deployed; 1 refused, said loudly
     say "deployed $1 to $("${G[@]}" -C "$co" rev-parse --short HEAD)"
     inst=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb")).get("installer", ""))' "$co/tests/LANDING-deploy.toml" 2>/dev/null)
     [ -n "$inst" ] || exit 0   # the repo names no installer (tests/LANDING-deploy.toml, as the lander reads it): pulled only
-    (cd "$co" && "./$inst") >/dev/null || { say "DEPLOY REFUSED — $inst failed"; exit 1; }
+    # what must restart is written down before the installer runs, and a unit leaves the list only once it has restarted,
+    # so the next deploy finishes what a failed installer or a failed restart left
+    pend=$HOME/.cc/state/$1/deploy-restarts; mkdir -p "${pend%/*}"
+    if [ ${#files[@]} != 0 ] && [ -x "$co/core/bin/cc-units" ]; then
+      plan=$("$co/core/bin/cc-units" restart-for --root "$co" "${files[@]}") || { say "DEPLOY REFUSED — cc-units would not say what restarts for: ${files[*]}"; exit 1; }
+      awk -F'\t' '($2 == "restart" || $2 == "rearm") && $1 != "tmux-main.service" { print $1 }' <<<"$plan" >> "$pend"
+    fi
+    (cd "$co" && "./$inst") >/dev/null || { say "DEPLOY REFUSED — $inst failed, and $pend keeps the restarts for the next deploy"; exit 1; }
     systemctl --user daemon-reload
-    [ ${#files[@]} = 0 ] || "$co/core/bin/cc-units" restart-for --root "$co" "${files[@]}" \
-      | while IFS=$'\t' read -r u how; do
-          case "$how" in restart|rearm) [ "$u" = tmux-main.service ] || { systemctl --user restart "$u" && say "restarted $u"; } ;; esac
-        done
+    [ -f "$pend" ] && while read -r u; do
+      if systemctl --user restart "$u"; then say "restarted $u"; else bad+=("$u"); fi
+    done < <(awk '!s[$0]++' "$pend")
+    [ ${#bad[@]} = 0 ] || { printf '%s\n' "${bad[@]}" > "$pend"; say "DEPLOY REFUSED — did not restart: ${bad[*]}, and $pend keeps them for the next deploy"; exit 1; }
+    rm -f "$pend"
   ) 8>"$lock"; }
 
 if [ $# = 2 ] && [ "$1" = catch-up ]; then
