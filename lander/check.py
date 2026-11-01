@@ -1,19 +1,26 @@
 """`lander check`: a worker's own green, by the plan (review: cc-green's use of GATES moves here); `lander sweep`: every
 check once, the nightly full run and the sandbox acceptance table (B2d).
 
-    lander check [WORKTREE] [--base REV] [--manifest FILE] [--only NAME]… [--caged-only]
+    lander check [WORKTREE] [--base REV] [--head SHA] [--manifest FILE] [--only NAME]… [--caged-only]
         Plans the worktree's change against its base (default: the merge-base with origin/HEAD, origin/main or main)
         — the working copy as it stands, untracked files included — and runs each check the plan selects, the same
         way the lane will: same runner, same sandbox, same red-vs-base rule. Box-class checks are listed, not run:
         they run on main's tip after the merge. Nothing is stored and nothing goes to the failures ledger: a
         worker's own red is its work. Exit 0 green (a check red on the base too is main's, and is said, not held
         against the change), 1 some check red — each red with its tail, the line that names its cause and the path
-        of its full log, which outlives the run (run.keep_log) — 3 no verdict (a check could not run), 2 usage. A repo that ships no
+        of its full log, which outlives the run (run.keep_log) — 3 no verdict (a check could not run), 2 usage, 4 held
+        (only with --head, below). A repo that ships no
         manifest is checked by the release's tests/landing-repos/<repo>.toml (manifest.host_fallback), as the lane
         does; --manifest FILE names another. --caged-only runs only the checks that run whole in the bwrap profile on
         this box: a host- or box-class check, or one that needs the network, a mount or another runner, is not run
         and is said as `deferred — runs at landing`, never as passed, and the last line says the green is not a full
-        one. A check that may leave goes to a runner's cage while this box is full, on the lane's terms (run.judge). cc-green's run for a fenced worker always passes it (the tree is one the worker wrote).
+        one. --head SHA, for a tree written from that commit, a PR head nobody has read: the changed files are read
+        sealed instead of diffed in the shared objects, and a plan that selects a check the box runs only on the host
+        (manifest.on_host, as lane.Lane.host_unread holds) runs nothing and exits 4, its last line naming those checks,
+        because an unread head never runs as the box's user. With --head a check the ratchet refused (`main-red`:
+        a security check, one the PR touches, new failing cases) exits 1 with a last line naming it, since a head that
+        merges on exit 0 has no lane to wait in (lane.py: such a job "is never kept and merged"); without --head it
+        stays said and not held, as cc-green and cc-try read it. A check that may leave goes to a runner's cage while this box is full, on the lane's terms (run.judge). cc-green's run for a fenced worker always passes it (the tree is one the worker wrote).
 
     lander sweep [--repo DIR] [--rev REV] [--manifest FILE] [--only NAME]… [--sandbox] [--jobs N]
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
@@ -40,7 +47,7 @@ from lander import plan as P
 from lander import run as RUN
 from lander import types as T
 
-EXIT_GREEN, EXIT_RED, EXIT_USAGE, EXIT_NONE = 0, 1, 2, 3
+EXIT_GREEN, EXIT_RED, EXIT_USAGE, EXIT_NONE, EXIT_HELD = 0, 1, 2, 3, 4
 
 
 def _opts(argv, flags, multi=("--only",), bools=()):
@@ -104,7 +111,7 @@ def cmd_check(argv):
     if hasattr(sys.stdout, "reconfigure"):   # a worker's log (cc-green) shows each line as it is said, not at exit
         sys.stdout.reconfigure(line_buffering=True)
     try:
-        a, pos = _opts(argv, ("--base", "--manifest", "--only"), bools=("--caged-only",))
+        a, pos = _opts(argv, ("--base", "--head", "--manifest", "--only"), bools=("--caged-only",))
     except ValueError as e:
         print(f"lander check: {e}", file=sys.stderr)
         return usage(1)
@@ -138,7 +145,9 @@ def cmd_check(argv):
         print(f"lander check: the base's manifest does not parse: {e}", file=sys.stderr)
         return EXIT_NONE
     try:
-        files = P.changed(wt, base, "")
+        # --head, for a caller that wrote this tree from that commit (cc-merge): the list is read sealed, since the base's
+        # subtrees in the shared objects are a worker's to swap, which would take a file off the list and deselect its check
+        files = G.pr_changed(wt, base, a["--head"]) if a["--head"] else P.changed(wt, base, "")
     except G.GitError as e:
         print(f"lander check: no change list could be taken of {wt}: {e}", file=sys.stderr)
         return EXIT_NONE
@@ -151,10 +160,19 @@ def cmd_check(argv):
         print(f"  tip      {n} — runs on main's tip after the merge")
     for f in plan.extra.get("faults", []):
         print(f"  fault    {f}")
+    held = [n for n in plan.checks if n != M.BUILTIN and n in m.checks and M.on_host(m.checks[n])]
+    if a["--head"] and held:
+        print(f"lander check: host only: {', '.join(held)}")
+        return EXIT_HELD
     outs = RUN.run_plan(wt, m, plan, files, head_tree, base_tree, only=a["--only"] or None, record_reds=False,
                         quarantine_text=RUN.quarantine_text(wt, base), fallback=fb,
                         caged=caged)
-    return report(outs)
+    rc = report(outs)
+    blocked = sorted(n for n, o in outs.items() if o.status == RUN.BLOCKED)
+    if a["--head"] and blocked:
+        print(f"lander check: red, and the ratchet would not call it main's: {', '.join(blocked)}")
+        return EXIT_RED
+    return rc
 
 
 def report(outs: dict) -> int:

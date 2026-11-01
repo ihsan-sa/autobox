@@ -65,8 +65,8 @@
 # $CC_ROLE standing in the primary checkout ~/dev/<repo> (the planning seat in window <repo> or <repo>~next, an orch,
 # any other window there), and a worker or track (CC_ROLE worker|track, or none) in its worktree
 # ~/.cc/worktrees/<repo>/<track>, recorded under window `worker:<track>`. The ledger is that repo's when it has a
-# permission session (~/.cc/state/<repo>/perms/ exists), else the control repo's — the repo this copy lives in, as in
-# cc-notify — with the asking repo in the record. A worker inside the sandbox sees no ledger, so its hook spools the
+# permission session (~/.cc/state/<repo>/perms/ exists and <repo> is no member workspace), else the control repo's — the
+# repo this copy lives in, as in cc-notify — with the asking repo in the record. A worker inside the sandbox sees no ledger, so its hook spools the
 # refusal into its own state dir (~/.cc/state/<repo>/<track>/refusals.spool.jsonl) and `collect` moves it in from the
 # host; collect names the window and repo itself, so a spooled line cannot pass for another session's.
 # WHAT IS NOT. A member (CC_ROLE member) records nothing: a member's ask never gains authority by passing through the
@@ -93,7 +93,11 @@ command -v jq >/dev/null 2>&1 || { echo "cc-refusals: jq is missing" >&2; exit 2
 
 ledger(){ printf '%s/%s/perms/refusals.jsonl' "$ROOT" "$1"; }
 name_ok(){ [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
-okrepo(){ name_ok "$1" && [ -d "$ROOT/$1/perms" ]; }
+# A MEMBER'S STATE IS NEVER A LEDGER (perms' read of #2144): ~/.cc/state/<handle> is rw inside the member's boundary, so a
+# perms dir there is the member's own, whatever it holds. Told the way cc's member_workspace() tells it: the marker, or
+# the host's record, which no bind reaches, for a member who deleted the marker.
+member_ws(){ [ -f "$DEV/$1/.cc/member-workspace" ] || [ -e "$HOME/.cc/members/$1/member-workspace" ] || [ -e "$HOME/.cc/members/$1/credentials.json" ]; }
+okrepo(){ name_ok "$1" && [ -d "$ROOT/$1/perms" ] && ! member_ws "$1"; }
 # the repo whose ledger takes <repo>'s items: its own when it has a permission session, else the control repo's
 target(){ if okrepo "$1"; then printf '%s' "$1"; elif [ -n "$CTL" ] && okrepo "$CTL"; then printf '%s' "$CTL"; else return 1; fi; }
 # is the permission session up? Its window is `perms` (cc-handoff PERMS). CC_REFUSALS_PERMS_LIVE=1|0 answers for a fixture.
@@ -123,12 +127,24 @@ line(){ jq -r "$CLEAN"' select(.kind == "refusal" or .kind == "ask") | . as $r
 open_key(){ [ -f "$1" ] && jq -e -s --arg k "$2" --arg kd "$3" '(map(select(.kind == "decision") | .id)) as $d
         | any(.[]; .kind == $kd and .key == $k and ((.id | IN($d[])) | not))' "$1" >/dev/null 2>&1; }
 
+# THE LEDGER AND ITS LOCK ARE OPENED FOLLOWING NO LINK, AND NEVER TRUNCATED (perms' read of #2144). lopen <ledger>, in the
+# subshell that writes: fd 7 is the ledger's dir, refused unless it resolves to <root>/<repo>/perms, so no link above it
+# counts; fd 9 is the lock. dd opens both files through fd 7 with O_NOFOLLOW and O_APPEND, making them if absent, and
+# bash opens the lock read-only, which can change nothing, and checks what it got. A link is refused: exit 4, and said.
+lopen(){ local d=${1%/*} n=${1##*/}
+  { { exec 7<"$d"; } 2>/dev/null && [ "$(readlink /proc/self/fd/7)" = "$(realpath -- "$ROOT")/${d#"$ROOT"/}" ] \
+    && lapp "$n" </dev/null && lapp "$n.lock" </dev/null && exec 9<"/proc/self/fd/7/$n.lock" \
+    && [ "$(readlink /proc/self/fd/9)" = "$(readlink /proc/self/fd/7)/$n.lock" ]; } 2>/dev/null \
+    || { echo "cc-refusals: a link or something else stands in the way of $1 or its lock — nothing written" >&2; exit 4; }; }
+# lapp <ledger or lock>: stdin appended, in one write (a reader's jq -s fails on half a line), inside lopen's subshell
+lapp(){ dd oflag=append,nofollow conv=notrunc bs=1M iflag=fullblock of="/proc/self/fd/7/${1##*/}" status=none 2>/dev/null; }
+
 # put(<ledger>, <json object with key>): append it under the ledger's lock unless the same key is still open
 put(){ local lg=$1 obj=$2
-  ( flock -w "${CC_REFUSALS_LOCK_WAIT:-5}" 9 || exit 1
+  ( lopen "$lg"; flock -w "${CC_REFUSALS_LOCK_WAIT:-5}" 9 || exit 1
     # the same call refused again while its first record is still open is the same question: one line, one wake-up
     open_key "$lg" "$(jq -r .key <<<"$obj")" "$(jq -r .kind <<<"$obj")" && exit 3
-    printf '%s\n' "$obj" >> "$lg" ) 9>"$lg.lock" 2>/dev/null; }
+    printf '%s\n' "$obj" | lapp "$lg" ); }
 
 # refusal(<repo> <window> <session> <tool> <input> <reason> <tool_use_id> <at> [<seat>]): the record, every field cleaned and cut
 refusal(){ local tool inp why key
@@ -165,7 +181,7 @@ record(){
   fld(){ jq -r "$1 // \"\"" <<<"$in" 2>/dev/null; }
   obj=$(refusal "$repo" "$win" "$(fld .session_id)" "$(fld .tool_name)" "$(jq -c '.tool_input // {}' <<<"$in" 2>/dev/null)" \
                 "$(fld .reason)" "$(fld .tool_use_id)" "$(date -u +%FT%TZ)" "$seat") || return 0
-  if tg=$(target "$repo") && lg=$(ledger "$tg") && [ -w "${lg%/*}" ]; then put "$lg" "$obj"; return 0; fi
+  if tg=$(target "$repo") && lg=$(ledger "$tg") && [ -w "${lg%/*}" ]; then put "$lg" "$obj" 2>/dev/null; return 0; fi
   # no ledger in sight — a worker inside the sandbox: spool it in its own state dir, for collect on the host
   [ -n "$track" ] && [ -d "$ROOT/$repo/$track" ] && printf '%s\n' "$obj" >> "$ROOT/$repo/$track/refusals.spool.jsonl"
   return 0
@@ -283,6 +299,7 @@ ask_question(){ local repo=$1 from='' where='' member=false akind='' seat='' tex
   put "$lg" "$obj"; rc=$?
   if [ "$rc" = 3 ]; then     # the same ask, still open: its first id
     id=$(jq -r --arg k "$key" 'select(.kind == "ask" and .key == $k) | .id' "$lg" | tail -1)
+  elif [ "$rc" = 4 ]; then exit 1
   elif [ "$rc" != 0 ]; then echo "cc-refusals: the ledger is locked" >&2; exit 1; fi
   echo "$id"
   perms_down "$tg"; }
@@ -401,7 +418,7 @@ open_(){ local lg held; lg=$(ledger "$1"); [ -f "$lg" ] || return 0
                    | select(.state == "claim") | .id' "$lg" 2>/dev/null | tr '\n' ' ')
   jq -c --slurpfile d <(decided "$lg" | jq -R . ) 'select((.kind == "refusal" or .kind == "ask") and (.id | type == "string") and ((.id | IN($d[])) | not))' "$lg" | line \
     | awk -v h=" $held" '{ print index(h, " " $1 " ") ? $0 " (a warden holds it)" : $0 }'; }
-watch_(){ local lg; lg=$(ledger "$1"); touch "$lg" || exit 2
+watch_(){ local lg; lg=$(ledger "$1"); ( lopen "$lg" ) || exit 2
   # tail from the end: what is already there is `open`'s to print. One line per refusal, flushed as it comes.
   tail -n0 -F "$lg" 2>/dev/null | while IFS= read -r l; do printf '%s\n' "$l" | jq -c 'select(.id | type == "string")' 2>/dev/null | line 2>/dev/null; done; }
 show(){ local lg; lg=$(ledger "$1"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $1" >&2; exit 1; }
@@ -449,7 +466,7 @@ ask_approval(){ local repo=$1 title="" heading="" run="" cid="" text key id lg n
   lg=$(ledger "$repo"); now=$(date -u +%FT%TZ)
   id=a$(printf '%s\n%s\n%s' "$key" "$now" "$$" | sha1sum | cut -c1-8)
   (
-    flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
+    lopen "$lg"; flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
     # the same ask filed again while its record is open (a retried deploy, a seat re-running its line) is one ask
     old=$([ -f "$lg" ] && jq -r -s --arg k "$key" '(map(select(.kind == "decision") | .id)) as $d
         | [.[] | select(.kind == "refusal" and .key == $k and ((.id | IN($d[])) | not)) | .id][0] // empty' "$lg" 2>/dev/null)
@@ -457,9 +474,9 @@ ask_approval(){ local repo=$1 title="" heading="" run="" cid="" text key id lg n
     jq -cn --arg id "$id" --arg at "$now" --arg w "$win" --arg i "$run" --arg r "$text" --arg k "$key" \
        --arg t "$title" --arg h "$heading" --arg c "$cid" \
        '{kind:"refusal", id:$id, at:$at, source:"approval", window:$w, session:"", tool:"approval", input:$i, reason:$r,
-         key:$k, title:$t, heading:$h, card_id:$c}' >> "$lg" || exit 1
+         key:$k, title:$t, heading:$h, card_id:$c}' | lapp "$lg" || exit 1
     echo "$id"
-  ) 9>"$lg.lock" || exit 1
+  ) || exit 1
   perms_down "$repo"; }
 
 # WHO MAY DECIDE (security read #2 of #904): the permission seat alone, read from the processes the way cc-guard's
@@ -510,9 +527,9 @@ warden(){ local repo=$1 id=$2 st=$3 note=$4 lg
   case $st in claim|release) ;; *) echo "$USAGE" >&2; exit 2;; esac
   wseat "$repo" || { echo "cc-refusals: only the warden unit claims or releases — nothing written" >&2; exit 2; }
   lg=$(ledger "$repo"); open_ "$repo" | awk -v i="$id" '$1 == i { f = 1 } END { exit !f }' || { echo "cc-refusals: $id is not open" >&2; exit 1; }
-  ( flock -w 5 9 || exit 1
+  ( lopen "$lg"; flock -w 5 9 || exit 1
     jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" --arg s "$st" --arg n "$note" \
-      '{kind:"warden", id:$id, at:$at, state:$s, note:$n}' >> "$lg" ) 9>"$lg.lock"; }
+      '{kind:"warden", id:$id, at:$at, state:$s, note:$n}' | lapp "$lg" ); }
 
 # mkkey <key file>: the signing key, made by the seat's first decision or freeze
 mkkey(){ [ -L "$1" ] && { echo "cc-refusals: $1 is a symlink — nothing written" >&2; return 1; }
@@ -526,7 +543,7 @@ freeze(){ local repo=$1 lg c id out; shift
   pseat "$repo" || { echo "cc-refusals: only $repo's permission session freezes — nothing written" >&2; exit 2; }
   lg=$(ledger "$repo"); [ -f "$lg" ] || { echo "cc-refusals: no ledger for $repo" >&2; exit 1; }
   (
-    flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
+    lopen "$lg"; flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
     c=$(counted "$lg" cand) || { echo "cc-refusals: could not read $lg — nothing written" >&2; exit 1; }
     if [ $# = 0 ]; then
       [ -n "$c" ] || { echo "cc-refusals: no unsigned decision from before signing landed"; exit 0; }
@@ -542,9 +559,9 @@ freeze(){ local repo=$1 lg c id out; shift
     mkkey "$(sigkey "$repo")" || exit 1
     out=$(counted "$lg" sign "$@") && [ "$(grep -c . <<<"$out")" = $# ] \
       || { echo "cc-refusals: could not sign them — nothing written" >&2; exit 1; }
-    { printf '%s\n' "$out"; jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"frozen", at:$at}'; } >> "$lg" || exit 1
+    { printf '%s\n' "$out"; jq -cn --arg at "$(date -u +%FT%TZ)" '{kind:"frozen", at:$at}'; } | lapp "$lg" || exit 1
     jq -r '"cc-refusals: signed \(.id)"' <<<"$out"
-  ) 9>"$lg.lock"; }
+  ); }
 
 decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
   case $what in grant|decline|his) ;; *) echo "$USAGE" >&2; exit 2;; esac
@@ -566,7 +583,7 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
     echo "cc-refusals: $id is already decided" >&2; exit 1; fi
   if [ -z "$prior" ]; then
     (
-      flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
+      lopen "$lg"; flock -w 5 9 || { echo "cc-refusals: the ledger is locked" >&2; exit 1; }
       decided "$lg" | grep -qxF -- "$id" && { echo "cc-refusals: $id is already decided" >&2; exit 1; }
       local key at sig b; key=$(sigkey "$repo"); at=$(date -u +%FT%TZ); b=$(box)
       [ -n "$b" ] || { echo "cc-refusals: this box has no name (CC_BOX, else hostname -s) to sign with — nothing written" >&2; exit 1; }
@@ -575,8 +592,8 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
          '{kind:"decision", id:$id, at:$at, decision:$d, note:$n, by:$b}')
       sig=$(sign "$key" "$b" "$rec" <<<"$dl") && [ -n "$sig" ] \
         || { echo "cc-refusals: could not sign the decision (a field carrying a newline is never signed) — nothing written" >&2; exit 1; }
-      jq -c --arg s "$sig" '. + {sig:$s}' <<<"$dl" >> "$lg" || exit 1
-    ) 9>"$lg.lock" || exit 1
+      jq -c --arg s "$sig" '. + {sig:$s}' <<<"$dl" | lapp "$lg" || exit 1
+    ) || exit 1
   fi
   if [ "$card" = 1 ]; then
     local a=(--approval --his "$id" -t "$(jq -r '.title // ""' <<<"$rec")")
@@ -587,8 +604,8 @@ decide(){ local repo=$1 id=$2 what=$3 note=$4 lg rec prior card=0
     [ -n "$(jq -r '.card_id // ""' <<<"$rec")" ] && a+=(--id "$(jq -r '.card_id' <<<"$rec"):$id")
     "${CC_REFUSALS_NOTIFY:-$HOME/bin/cc-notify}" "${a[@]}" -- "$(jq -r '.reason' <<<"$rec")" >/dev/null \
       || { echo "cc-refusals: $id is ruled the owner's, but the card did not post — run the same decide again to post it" >&2; exit 1; }
-    ( flock -w 5 9 || exit 1
-      jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" '{kind:"posted", id:$id, at:$at}' >> "$lg" ) 9>"$lg.lock" \
+    ( lopen "$lg"; flock -w 5 9 || exit 1
+      jq -cn --arg id "$id" --arg at "$(date -u +%FT%TZ)" '{kind:"posted", id:$id, at:$at}' | lapp "$lg" ) \
       || echo "cc-refusals: the card for $id went out, but the ledger did not take that it did" >&2
   fi
   case $what in his) echo "cc-refusals: $id is the owner's";; *) echo "cc-refusals: $id ${what%e}ed";; esac; }

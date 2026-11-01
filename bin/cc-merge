@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# cc-merge — a PR lands itself once its own checks pass: what the lander did, in one host script.
+#
+#   cc-merge <repo> <pr>     check and merge one PR, then deploy it
+#
+# The owner, 2026-10-31: "we're getting rid of stuff like the lander … agents just do everything themselves", "SUPER
+# simple". cc-loop runs it on the host after `cc done` opens the PR, and a seat may run it by hand on any PR. In order:
+#   1. KEPT LIST. A PR changing a path the lander would never land light (light.path_hit on origin/<base>'s manifest,
+#      policy and security lists, never the PR's tree, plus CC_PROTECTED_PATHS), or one kept() adds, is handed to
+#      `cc-land queue` for perms' read. Exit 3. The changed names (git.pr_changed) and the lists are read sealed, never
+#      from the shared checkout, and a read that fails keeps the PR. Only an open PR into the default branch of a repo
+#      `cc lands` grants.
+#   2. CATCH UP. origin/<base> not in the head: a merge of it into the branch, built sealed (git.merge_tree), and a plain
+#      push, never forced. The kept check runs again on the new head, since a merge can land the PR's change on a kept path.
+#   3. CHECKS. The full `lander check` with every class, on exactly that tree, by the deployed main checkout's runner
+#      ($CORE, never the PR's own copy), with every credential-shaped name stripped from the env as cc-green does. Its
+#      file list is read sealed too (--head), so a swapped subtree cannot deselect a check. An unread head never runs on
+#      the host: a plan selecting a check that runs only there (manifest.on_host, bare or not) runs nothing and goes to
+#      `cc-land queue` for perms' read like a kept path, which narrows "workers merge their own" for such a PR. The plan
+#      is of the final head, so this holds after a catch-up. A check the ratchet refused (main-red) is red here: there
+#      is no lane for this head to wait in, so it goes back to the worker.
+#   4. CI. A repo with GitHub workflows: wait on the PR's checks, for an hour (the lander's CI_WAITS), then back to the worker.
+#   5. MERGE. A squash over REST, pinned to the head that was checked.
+#   6. AFTER. The board row goes merged, the landed card is posted (cc-slack post-approval --landed, what the lander
+#      ran), and the deploy runs: under the repo's git lock (the file the lander and cc-publish lock), ~/dev/<repo>
+#      fast-forwards to origin/<base> and refuses loudly when the checkout was moved; then the installer tests/LANDING-deploy.toml names, a user
+#      daemon-reload and a restart of what `cc-units restart-for` names. tmux-main.service is never restarted. All that runs
+#      after the fetch has a fixed PATH and no credential-shaped name in its env: the installer links core/bin and
+#      bin-private into ~/bin, so a name a PR added there would otherwise be what the next bare command runs.
+# Every tree that is tested or deployed, and the file list the restarts come from, is read from a sealed fetch (tree_out), never the shared objects: git does
+# not re-hash a subtree or a blob it reads there, so a swapped one would reach the check or the installer, and git's own
+# checkout and merge there would run a filter or driver from the shared config. What will not read sealed holds the PR.
+# Exit 0 merged (a refused deploy is a last line "merged, but the deploy was refused: …", recorded with cc-failures);
+# 1 not merged, and why (a red check, a conflict, a refused merge): back to the worker as one more iteration; 3 handed
+# to the lander's queue (a kept path, a host-only check, or GitHub or the fetch still failing after retries); 4 the lander refused to
+# queue it, its reason on the last line; 2 usage, a repo without the grant, a PR that is not open, one into another
+# branch than the default, or one from a fork.
+# A GitHub read that fails is retried and never taken for "nothing": a workflows count that will not read waits on CI.
+# The token: git authenticates with `cc-gh-token gitargs` (config args, not env; no workspace, so the box's own push)
+# and gh with the box's login, so no token is put in the env here, and any the caller had is stripped while tested
+# code runs.
+# Test hooks, read only under CC_MERGE_TEST=1: CC_MERGE_BIN (the box tools), CC_MERGE_CORE, CC_MERGE_CHECK (the check
+# command), CC_MERGE_CI_LIMIT (seconds on the CI wait), CC_MERGE_PATH (the deploy's PATH), CC_DEV, CC_MERGE_KEPT (the box's per-repo kept globs, "<repo> <glob>" lines, default config/merge-kept.txt
+# beside core/). CC_MERGE_SETTLE (the retry pause) is read always.
+# Member workspaces stay on the lander for now: cc-loop never calls this inside a workspace's boundary.
+set -uo pipefail
+[ "${CC_MERGE_TEST:-}" = 1 ] || unset CC_MERGE_BIN CC_MERGE_CORE CC_MERGE_CHECK CC_MERGE_CI_LIMIT CC_MERGE_KEPT CC_MERGE_PATH CC_DEV   # the test hooks, for tests only
+BIN=${CC_MERGE_BIN:-$(dirname "$(realpath "$0")")}
+DEV=${CC_DEV:-$HOME/dev}
+CORE=${CC_MERGE_CORE:-$(cd "$BIN/.." && pwd)}   # the deployed core this script is linked from, never the PR's copy
+say(){ printf 'cc-merge: %s\n' "$*"; }
+back(){ say "NOT MERGED — $*"; exit 1; }
+die(){ say "$*" >&2; exit 2; }
+try(){ local i; for i in 1 2 3; do "$@" && return 0; [ $i = 3 ] || sleep "${CC_MERGE_SETTLE:-20}"; done; return 1; }   # a brief GitHub or network fault
+hand(){   # $1 why → the lander's queue (exit 3), or its own refusal passed through (exit 4)
+  local q l; q=$("$BIN/cc-land" queue "$repo" "$pr" --who cc-merge 2>&1) || { say "NOT QUEUED — $1, and the lander refused it: $(tail -1 <<<"$q")"; exit 4; }
+  l=$(grep '^lander: ' <<<"$q" | tail -1)   # queued, but paused or no tick started: the lander says so with exit 0
+  say "$1, so it waits in the lander's queue${l:+ (${l#lander: })}"; exit 3; }
+G=(git -c core.hooksPath=/dev/null)   # no hook of a checkout runs here
+# A branch's commit is what the fetch itself reports (--porcelain -v, as git.py's fetch), never origin/<b> read back: a tag
+# named origin/main outranks that name, and a worker can move refs/remotes/origin/<b> in the shared .git after the fetch.
+sent(){ awk -v r="refs/remotes/origin/$1" '$NF == r { s = $(NF-1) } END { print s }'; }   # $1 branch, the report on stdin
+secret_names(){   # the same list cc-green strips (secret_names there)
+  env | cut -d= -f1 | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' \
+    | grep -E '(_TOKEN|_KEY|_SECRET|_CREDS|_WEBHOOK|_PASSWORD)$|^(ANTHROPIC_API_KEY|OPENAI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|GH_TOKEN|GITHUB_TOKEN)$'; }
+# Kept beyond the base's lists: the lander while it lives and this script (named here too, for a repo whose policy does
+# not), the installer's toml in every repo, a name new to core/bin or bin-private (the installer puts it on ~/bin, ahead
+# of a real command of that name), and the box's per-repo globs (CC_MERGE_KEPT: say a repo's publishing
+# code, since a leaked private detail cannot be pulled back; no file keeps none).
+kept(){   # $1 checkout $2 base sha $3 head sha $4 repo → the kept files, one per line
+  # the lander's own rule for a light landing (light.path_hit on the base's manifest, policy and security lists, and
+  # CC_PROTECTED_PATHS through cc-config, itself on gate_first): a file on any list is kept. The names and the lists are
+  # read sealed (git.py's SEALED), because a worker can rewrite the shared checkout's objects and show a diff with no
+  # kept file while GitHub merges the real sha. A read that raises, a base that will not load, or a config that will
+  # not answer, keeps everything.
+  # cc-config exits 1 for an unset key and for a file it could not read, so "unset" counts only when it printed the default
+  # and `list` shows it did read keys from the file. Anything else is a failed read: prot "?" keeps every file.
+  local prot rc; prot=$("$BIN/cc-config" get "CC_PROTECTED_PATHS_${4//[^A-Za-z0-9]/_}" '?' 2>/dev/null); rc=$?
+  [ $rc = 1 ] && [ "$prot" = '?' ] && [ -n "$("$BIN/cc-config" list 2>/dev/null)" ] && { prot=""; rc=0; }
+  [ $rc = 0 ] || prot='?'
+  python3 -I -c '
+import os, sys
+core, root, base, head, repo, prot, extra = sys.argv[1:8]
+sys.path.insert(0, core)
+from lander import git as G, manifest as M, light as L
+def policy():
+    with G.sealed(root, base) as ((rc, out), run):
+        if run is None:
+            raise G.GitError(str(out))
+        rc, names = run("ls-tree", "-r", "-z", "--name-only", base)
+        if rc:
+            raise G.GitError(names)
+        def read(path):
+            if path not in names.split("\0"):
+                return None
+            rc, body = run("show", f"{base}:{path}")
+            if rc:
+                raise G.GitError(body)
+            return body
+        return M.load(root, base, fallback=M.host_fallback(repo), read=read).policy, set(names.split("\0"))
+try:
+    files = G.pr_changed(root, base, head)
+    if not files:
+        raise G.GitError("no changed file")   # as the lane reads it: an empty answer is a doubt
+    pol, onbase = policy()
+except Exception as e:
+    print(f"every file, since its changes or the base lists would not read sealed: {type(e).__name__}")
+    sys.exit()
+globs = ["core/lander/**", "core/bin/lander", "core/bin/lander-self", "core/bin/cc-land", "core/bin/cc-merge", M.DEPLOY]
+globs += [w[1] for w in (l.split("#")[0].split() for l in open(extra).read().splitlines()) if len(w) == 2 and w[0] == repo] if os.path.exists(extra) else []
+protected = None if prot == "?" else prot.split()
+print("\n".join(f for f in files if M.match(globs, f) or (os.path.dirname(f) in ("core/bin", "bin-private") and f not in onbase) or L.path_hit(pol, [f], protected)))' "$CORE" "$1" "$2" "$3" "$4" "$prot" "${CC_MERGE_KEPT:-$CORE/../config/merge-kept.txt}"; }
+
+tree_out(){   # $1 checkout $2 where to write (the checkout, or its linked worktree) $3 old commit ("" for none) $4 new commit → the files old→new, NUL-separated
+  python3 -I -c '
+import sys
+core, co, top, old, new = sys.argv[1:6]
+sys.path.insert(0, core)
+from lander import git as G
+t = G.taken(top)
+with G.sealed(co, *filter(None, [old, new])) as ((rc, out), run):
+    if run is None:
+        sys.exit(str(out))
+    if old and run("merge-base", "--is-ancestor", old, new)[0]:
+        sys.exit(f"{old[:12]} is not below {new[:12]}")
+    env = G.hookless_env(GIT_DIR=run.git_dir, GIT_WORK_TREE=t.work_tree, GIT_INDEX_FILE=t.git_dir + "/index")
+    names = G._names(run, *out) if old else []
+    if old:
+        G._sh(["git", "update-index", "-q", "--refresh"], cwd=top, env=env, timeout=600)   # a stat change alone is not dirt
+    rc, err = G._sh(["git", "read-tree", "-m", "-u", *out], cwd=top, env=env, timeout=600)   # refuses over local changes
+    print("\0".join(names), end="")
+    sys.exit(rc and err)' "$CORE" "$@"; }
+catch_up(){   # $1 checkout $2 base $3 head → prints the merged tree (nothing when the base is in the head); exit 3 a conflict
+  python3 -I -c '
+import sys
+core, co, base, head = sys.argv[1:5]
+sys.path.insert(0, core)
+from lander import git as G
+with G.sealed(co, base, head) as ((rc, out), run):
+    if run is None:
+        sys.exit(str(out))
+    rc = run("merge-base", "--is-ancestor", base, head)[0]
+    if rc not in (0, 1):
+        sys.exit(f"git merge-base: {rc}")
+if rc:
+    tree = G.merge_tree(co, base, head)[0]
+    print(tree) if tree else sys.exit(3)' "$CORE" "$@"; }
+
+deploy(){   # $1 repo $2 base → 0 deployed; 1 refused, said loudly
+  local co="$DEV/$1" lock old tip u how inst n cred=() files=()
+  lock="$(cd "$co" && realpath -m "$("${G[@]}" rev-parse --git-common-dir)")/cc-land.lock" || { say "DEPLOY REFUSED — no checkout at $co"; return 1; }
+  mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$("${G[@]}" -C "$co" remote get-url origin)" 2>/dev/null)
+  (
+    flock 8
+    [ "$("${G[@]}" -C "$co" symbolic-ref -q --short HEAD)" = "$2" ] || { say "DEPLOY REFUSED — $co is not on $2, so nothing moved; a person put it there"; exit 1; }
+    old=$("${G[@]}" -C "$co" rev-parse HEAD)
+    tip=$("${G[@]}" "${cred[@]}" -C "$co" fetch --porcelain -v --no-tags origin "+refs/heads/$2:refs/remotes/origin/$2" | sent "$2")
+    [ -n "$tip" ] && { mapfile -d '' -t files < <(tree_out "$co" "$co" "$old" "$tip"); wait $!; } && "${G[@]}" -C "$co" update-ref "refs/heads/$2" "$tip" "$old" \
+      || { say "DEPLOY REFUSED — $co would not fast-forward to origin/$2 (a moved or dirty checkout); nothing else ran"; exit 1; }
+    export PATH=${CC_MERGE_PATH:-/usr/local/bin:/usr/bin:/bin}; while read -r n; do unset "$n"; done < <(secret_names)   # root's own dirs, no credential
+    say "deployed $1 to $("${G[@]}" -C "$co" rev-parse --short HEAD)"
+    inst=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb")).get("installer", ""))' "$co/tests/LANDING-deploy.toml" 2>/dev/null)
+    [ -n "$inst" ] || exit 0   # the repo names no installer (tests/LANDING-deploy.toml, as the lander reads it): pulled only
+    (cd "$co" && "./$inst") >/dev/null || { say "DEPLOY REFUSED — $inst failed"; exit 1; }
+    systemctl --user daemon-reload
+    [ ${#files[@]} = 0 ] || "$co/core/bin/cc-units" restart-for --root "$co" "${files[@]}" \
+      | while IFS=$'\t' read -r u how; do
+          case "$how" in restart|rearm) [ "$u" = tmux-main.service ] || { systemctl --user restart "$u" && say "restarted $u"; } ;; esac
+        done
+  ) 8>"$lock"; }
+
+[ $# = 2 ] && [[ $2 =~ ^[0-9]+$ ]] || die "usage: cc-merge <repo> <pr>"
+repo=$1 pr=$2 co="$DEV/$1"
+"$BIN/cc" lands "$repo" >/dev/null 2>&1 || die "$repo does not hold the standing grant (cc lands): its PRs land through the lander"
+url=$("${G[@]}" -C "$co" remote get-url origin 2>/dev/null) || die "no checkout with an origin at $co"
+slug=$(sed -E 's#\.git$##; s#/$##; s#.*[:/]([^/]+/[^/]+)$#\1#' <<<"$url")
+IFS=$'\t' read -r ref base state hrepo dflt title < <(try gh api "repos/$slug/pulls/$pr" --jq '[.head.ref, .base.ref, .state, .head.repo.full_name, .base.repo.default_branch, .title] | @tsv' 2>/dev/null)
+[ -n "${state:-}" ] || hand "GitHub would not say what PR #$pr is"
+[ "$state" = open ] || die "PR #$pr in $slug is not open ($state)"
+[ "$base" = "$dflt" ] || die "PR #$pr is into $base, not $dflt: only a PR into the default branch merges here"
+[ "$hrepo" = "$slug" ] || die "PR #$pr comes from $hrepo, not $slug: a fork's branch is never merged or caught up here"
+mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$url" 2>/dev/null)
+got=$(try "${G[@]}" "${cred[@]}" -C "$co" fetch --porcelain -v --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base" "+refs/heads/$ref:refs/remotes/origin/$ref") \
+  || hand "could not fetch $base and $ref"
+head=$(sent "$ref" <<<"$got") bsha=$(sent "$base" <<<"$got")
+[ -n "$head" ] && [ -n "$bsha" ] || hand "the fetch did not report $base and $ref"
+
+# 1. the kept list, on the PR's own change, from the base's list
+hits=$(kept "$co" "$bsha" "$head" "$repo") || die "could not read the kept list"
+if [ -n "$hits" ]; then
+  hand "it changes a kept path (${hits//$'\n'/, }), which perms reads first"
+fi
+
+# 2. catch up with the base, merged sealed; the new head is kept-checked too
+tree=$(catch_up "$co" "$bsha" "$head"); rc=$?
+[ $rc = 3 ] && back "$ref conflicts with $base; merge $base in and fix it"
+[ $rc = 0 ] || hand "the merge of $base into $ref would not read sealed"
+if [ -n "$tree" ]; then
+  new=$("${G[@]}" -C "$co" commit-tree -p "$head" -p "$bsha" -m "Merge branch '$base' into $ref" "$tree") || hand "could not commit the merge of $base into $ref"
+  "${G[@]}" "${cred[@]}" -C "$co" push -q origin "$new:refs/heads/$ref" || back "the catch-up merge of $base would not push to $ref"
+  head=$new; say "merged $base into $ref (now ${head:0:12})"
+  hits=$(kept "$co" "$bsha" "$head" "$repo") || die "could not read the kept list"
+  [ -z "$hits" ] || hand "its catch-up merge changes a kept path (${hits//$'\n'/, }), which perms reads first"
+fi
+
+# a throwaway worktree at that head, its files from the sealed fetch
+mkdir -p "$HOME/.cc/worktrees/$repo"; wt=$(mktemp -d "$HOME/.cc/worktrees/$repo/merge-$pr-XXXXXX")   # one per run
+"${G[@]}" -C "$co" worktree add -q --detach --no-checkout "$wt" "$head" || hand "could not make a worktree at ${head:0:12}"
+trap '"${G[@]}" -C "$co" worktree remove --force "$wt" 2>/dev/null' EXIT
+why=$(tree_out "$co" "$wt" "" "$head" 2>&1) || hand "the tree at ${head:0:12} would not read sealed (${why//$'\n'/ })"
+
+# 3. the full check on this tree, by the deployed runner, with no credential in the env
+log="$HOME/.cc/state/$repo/${wt##*/}.log"; mkdir -p "$(dirname "$log")"
+ls -t "$HOME/.cc/state/$repo"/merge-*.log 2>/dev/null | tail -n +5 | xargs -r -d '\n' rm -f --   # the last few runs' logs
+chk=(python3 -P "$CORE/lander/cli.py" check); [ -n "${CC_MERGE_CHECK:-}" ] && chk=("$CC_MERGE_CHECK")
+scrub=(); while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
+(cd "$wt" && env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" "${chk[@]}" --base "$bsha" --head "$head" "$wt") </dev/null >"$log" 2>&1; rc=$?
+[ $rc = 4 ] && hand "it selects a check that runs only on the host ($(sed -n 's/^lander check: host only: //p' "$log")), and an unread head never runs there, so perms reads it first"
+[ $rc = 0 ] || back "lander check is red on ${head:0:12}: $(grep -v '^[[:space:]]*$' "$log" | tail -3 | tr '\n' ' ')(log $log)"
+say "lander check green on ${head:0:12}"
+
+# 4. GitHub's own checks, where the repo has workflows
+wf=$(try gh api "repos/$slug/actions/workflows" --jq .total_count 2>/dev/null) || wf=unknown   # never "none" on a fault
+if [ "$wf" != 0 ]; then
+  sleep "${CC_MERGE_SETTLE:-20}"   # a push a moment ago has no check runs yet
+  lim=${CC_MERGE_CI_LIMIT:-3600}
+  out=$(timeout -k 10 "$lim" gh pr checks "$pr" -R "$slug" --watch --fail-fast 2>&1); rc=$?
+  case $rc in 124|137) back "GitHub checks had not finished after ${lim}s, so nothing merged; run your green again to retry" ;; esac
+  [ $rc = 0 ] || [[ $out == *"no checks reported"* ]] \
+    || back "GitHub checks are red: $(grep -iE 'fail' <<<"$out" | head -3 | tr '\n' ' ')"
+fi
+
+# 5. the merge, pinned to the head that was checked
+m=$(gh api -X PUT "repos/$slug/pulls/$pr/merge" -f merge_method=squash -f sha="$head" -f commit_title="$title (#$pr)" --jq .merged 2>&1)
+[ "$m" = true ] || back "GitHub refused the merge: ${m//$'\n'/ }"
+say "merged PR #$pr ($slug) at ${head:0:12}"
+
+# 6. after the merge
+case "$ref" in track/*) "$BIN/cc-board" status "$repo" "${ref#track/}" merged >/dev/null 2>&1 || say "board: could not set ${ref#track/} merged" ;; esac
+"$BIN/cc-slack" post-approval --landed "$repo" "$pr" >/dev/null 2>&1 || say "the landed card did not post"
+# merged is merged: a refused deploy is not a red merge, but it is said last and loudly, and recorded
+dout=$(deploy "$repo" "$base") && { printf '%s\n' "$dout"; exit 0; }
+printf '%s\n' "$dout"; why=$(grep 'DEPLOY REFUSED' <<<"$dout" | tail -1); why=${why#*— }
+"$BIN/cc-failures" record --scope "$repo" --kind CONTRACT/DEPLOY --observed "PR #$pr merged, deploy refused: ${why:-no reason}" >/dev/null 2>&1
+say "merged, but the deploy was refused: ${why:-see above}"; exit 0

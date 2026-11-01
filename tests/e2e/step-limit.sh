@@ -286,13 +286,13 @@ printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://g
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
 printf '#!/bin/sh\ncase "$1" in post-approval) echo "CAPPR 1788000000.000100";; esac\nexit 0\n' > "$T/slackstub"; chmod +x "$T/ghbin8/gh" "$T/landstub" "$T/slackstub"
 : > "$T/land.calls"
-CC_SELF_LAND_EXCEPT= CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
+CC_SELF_LAND_EXCEPT= CC_MERGE="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" ]; } \
+{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "$REPO 77" ]; } \
   && ok "the grant end to end: a DONE track on a granted repo has its PR queued by the cc done its loop runs, once, carrying the #approvals card cc done just posted, so a stopped landing answers that card (P9)" \
   || bad "the loop did not queue with the card: rc=$rc calls=[$(cat "$T/land.calls")]"
 : > "$T/land.calls"
-CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
+CC_MERGE="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1
 [ ! -s "$T/land.calls" ] \
   && ok "…and a repo named as an exception (the suite's own CC_SELF_LAND_EXCEPT) is left exactly as it was: the loop queues nothing and the PR waits for a 👍 (P9b)" \
@@ -300,11 +300,11 @@ CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T
 # P9p: a granted repo's PR on a PROTECTED path still reaches the queue from the loop's DONE: cc-land's refusal is what
 # raises the 🔐 card in #approvals, so a cc done that only printed the door would leave a PR nothing ever asks about.
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin9p"; mkdir -p "$T/ghbin9"; mv "$T/ghbin9p" "$T/ghbin9/gh"
-printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "protected path: learn-fetch/foo.py"; exit 1\n' "$T" > "$T/landrefuse"; chmod +x "$T/ghbin9/gh" "$T/landrefuse"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "cc-merge: it changes a kept path (learn-fetch/foo.py), which perms reads first, so it waits in the landing queue"; exit 3\n' "$T" > "$T/landrefuse"; chmod +x "$T/ghbin9/gh" "$T/landrefuse"
 : > "$T/land.calls"
-env CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND="$T/landrefuse" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin9:$PATH" \
+env CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_MERGE="$T/landrefuse" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin9:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
-{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" ]; } \
+{ [ "$rc" = 0 ] && [ "$(cat "$T/land.calls")" = "$REPO 77" ]; } \
   && ok "…and a granted repo's PR touching a PROTECTED path is still handed to the queue by the loop's cc done, whose refusal raises the 🔐 card (P9p)" \
   || bad "the loop never asked the queue about a protected-path PR: rc=$rc calls=[$(cat "$T/land.calls")]"
 # P9c-P9j: managed host delivery. Own HOME, board, state and Git remote; systemd-run only records a start.
@@ -363,6 +363,7 @@ cat > "$D/bin/host-queue" <<'SH'
 echo "$*" >> "$D/host.calls"
 exec "$D/bin/cc-land" "$@"
 SH
+printf '#!/bin/sh\necho "$*" >> "$D/merge.calls"\n' > "$D/bin/cc-merge"   # the loop merges its PR with cc-merge (its own selfcheck)
 printf '#!/bin/sh\necho "$*" >> "$D/starts"\nexit 0\n' > "$D/bin/systemd-run"
 printf '#!/bin/sh\necho "$*" >> "$D/notices"\n' > "$D/bin/cc-notify"
 printf '#!/bin/sh\n[ "$1" = probe ] && exit 0\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$D/bin/cc-sandbox"
@@ -396,10 +397,10 @@ fold_r; first_job=$(cat "$q" 2>/dev/null)
 "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; loop_rc=$?
 fold_r
 { [ "$first_rc" = 0 ] && [ "$loop_rc" = 0 ] && [ "$(cat "$q")" = "$first_job" ] \
-  && [ "$(wc -l < "$D/creates")" = 1 ] && grep -qx 'queue --task r row' "$D/host.calls" \
+  && [ "$(wc -l < "$D/creates")" = 1 ] && [ "$(cat "$D/merge.calls")" = 'r 77' ] \
   && jq -e '.chat == "fixture" and .ts == "123.456"' "$q" >/dev/null \
   && jq -e '.landing.status == "queued"' "$D/receipt" >/dev/null; } \
-  && ok "P9c: planner and loop reach one queue job and one PR with the receipt's approval card" \
+  && ok "P9c: planner and loop reach one queue job and one PR with the receipt's approval card, and the loop hands that PR to cc-merge" \
   || bad "P9c: first=$first_rc loop=$loop_rc $(cat "$D/err" "$D/loop.out")"
 rm -f "$q" "$HOME/.cc/state/land/rest/r-77.json"; : > "$D/starts"
 CC_SELF_LAND_EXCEPT=r "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
@@ -416,13 +417,13 @@ for projection in board card; do
   # The same PR, with its announcement pending. A board/card outage is never the missing-PR page.
   jq --arg p "$projection" '.pending[$p] = (if $p == "board" then {pr:.pr.url,status:"review"} else {url:.pr.url} end) | if $p == "card" then .card=null else . end' \
     "$st/delivery.json" > "$D/record"; mv "$D/record" "$st/delivery.json"
-  touch "$D/$projection.fail"; : > "$D/notices"
+  touch "$D/$projection.fail"; : > "$D/notices"; : > "$D/merge.calls"
   "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
   fold_r
-  { [ "$rc" = 0 ] && [ -e "$q" ] && ! grep -q 'finished, but opened no PR' "$D/notices" \
+  { [ "$rc" = 0 ] && [ "$(cat "$D/merge.calls")" = 'r 77' ] && ! grep -q 'finished, but opened no PR' "$D/notices" \
     && grep -q "delivery projection pending: $projection" "$st/loop.log" \
     && [ "$("$B/cc-board" get r row status)" != blocked ]; } \
-    && ok "P9f $projection: pending projection over a real PR logs a note, queues, and never blocks or pages" || bad "P9f $projection: rc=$rc $(cat "$D/loop.out")"
+    && ok "P9f $projection: pending projection over a real PR logs a note, hands the PR to cc-merge, and never blocks or pages" || bad "P9f $projection: rc=$rc $(cat "$D/loop.out")"
   rm "$D/$projection.fail"
   "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"
   jq -e '.pending == {} and .errors == []' "$D/receipt" >/dev/null \
@@ -445,7 +446,7 @@ fold_r
   && grep -q 'finished, but opened no PR' "$D/notices" && grep -q 'push failed' "$st/loop.log" && [ ! -s "$D/gh.calls" ]; } \
   && ok "P9h: no PR after a failed push keeps exit 4, blocked and the existing page; P9f is its control" || bad "P9h: rc=$rc $(cat "$D/loop.out")"
 rm "$D/remote.git/hooks/pre-receive"; : > "$D/notices"
-CC_LAND=/bin/true "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+CC_DONE=/bin/true "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
 { [ "$rc" = 12 ] && [ "$("$B/cc-board" get r row status)" = blocked ] && grep -q 'delivery unconfirmed' "$D/notices" \
   && ! grep -q 'finished, but opened no PR' "$D/notices"; } \
   && ok "P9i: an empty host response uses exit 12 and says delivery is unconfirmed; P9c's receipt is its control" || bad "P9i: rc=$rc $(cat "$D/loop.out")"

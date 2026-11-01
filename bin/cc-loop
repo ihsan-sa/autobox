@@ -456,6 +456,8 @@ sp_worker(){   # $1 the base branch → the whole system prompt a headless worke
   local p; p=$(sed 's/[[:space:]]*$//' "$WORKER_PROMPT" 2>/dev/null | tr '\n' ' ') && [ -n "${p// /}" ] || return 1
   p=${p% }; p=${p//\{track\}/"$track"}; p=${p//\{repo\}/"$repo"}; p=${p//\{state\}/"$ST"}; p=${p//\{base\}/"$1"}
   printf %s "$p$(onto_block)$(issue_block)$(sandbox_block)$(dispatch_block)$(worker_writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(ask_block)$(selfrev_block "$1")"; }
+journal_cut(){   # $1 a line number: it comes out of the journal, by way of a fresh temp, since a fixed name in $ST is the worker's to plant a link at (cc-sandbox binds $ST read-write)
+  local t; t=$(mktemp "$ST/.progress.XXXXXX") && awk -v n="$1" 'NR!=n' "$ST/progress.md" > "$t" && chmod --reference="$ST/progress.md" "$t" && mv -f "$t" "$ST/progress.md"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -562,13 +564,12 @@ complete_task(){   # → the completion receipt on stdout (the JSON delivery_end
   # pushes on the workspace's token and opens the PR in the project's repository — and the HOST queues the landing:
   # cc-checkpoint --sweep, within five minutes, as <h>--<track> (docs/design-member-workspaces.md, Landing). So in
   # there the receipt is cc done's own, with a landing line that says who queues it; nothing in here can.
-  if inside_boundary; then
-    local r; r=$(env "${HG[@]}" "${CC_DONE:-$BIN/cc}" done "$repo" "$track" --json 2>>"$LOG")   # CC_DONE: test hook
-    # the landing line only on a receipt that names a PR: a failed one has nothing for the sweep to pick up
-    jq -ce 'if type == "object" and (.pr_url // "") != "" then .landing = {status: "host", message: "The box picks it up from here: if this workspace lands its own PRs, its sweep queues the PR within five minutes."} else . end' <<<"$r" 2>/dev/null || printf '%s\n' "$r"
-  else
-    env "${HG[@]}" "${CC_LAND:-$BIN/cc-land}" queue --task "$repo" "$track" 2>>"$LOG"   # CC_LAND: test hook
-  fi; }
+  # ON THE HOST the receipt is the same `cc done --json`, and the DONE branch then merges the PR with cc-merge (the
+  # owner, 2026-10-31: workers merge their own PRs; the lander's queue keeps only the kept list).
+  local r; r=$(env "${HG[@]}" "${CC_DONE:-$BIN/cc}" done "$repo" "$track" --json 2>>"$LOG")   # CC_DONE: test hook
+  inside_boundary || { printf '%s\n' "$r"; return; }
+  # the landing line only on a receipt that names a PR: a failed one has nothing for the sweep to pick up
+  jq -ce 'if type == "object" and (.pr_url // "") != "" then .landing = {status: "host", message: "The box picks it up from here: if this workspace lands its own PRs, its sweep queues the PR within five minutes."} else . end' <<<"$r" 2>/dev/null || printf '%s\n' "$r"; }
 delivery_end(){   # $1 host receipt → outcome. A real PR survives a failed board/card projection.
   jq -er '
     if type != "object" or (.task_id | type) != "string" or (.errors | type) != "array" then "unknown"
@@ -1669,7 +1670,7 @@ down still leaves the board write, which is the half of this that must never be 
   t '…and a track the board has no row for says its own name rather than nothing at all' \
     "$(repo=titled track=nosuch BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" nosuch
   t 'neither done line spends the reader on an iteration count and a dollar figure' \
-    "$(grep -c '^      done_card "\$(' "$0")" 2
+    "$(grep -c '^      done_card "\$' "$0")" 2
   t '…and a track the board has no title for is named in words, not by its hyphenated name' \
     "$(repo=titled track=no-such-row BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" "no such row"
   dc(){ ( log(){ :; }; repo=titled track=t1 ST="$d/nost" BOARD="$BIN/cc-board" HOME="$d/bh" BIN="$d/dcbin" WT="$d/nowt"; done_card "$@" ) >/dev/null; cat "$d/dc.args"; }
@@ -1709,12 +1710,17 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   sed -i '1a printf "%s\\n" "${CC_GREEN_ASK-UNSET}" > "$FK_ST/gask"' "$lb/claude"   # where a fenced cc-green start would ask
   sed -i '1a printf "%s/%s\\n" "${CC_LIMIT_STAMP-UNSET}" "${CC_MODEL_CRED-UNSET}" > "$FK_ST/acct"' "$lb/claude"   # whose limit stamp and model record it ran under
   printf '#!/bin/sh\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/9\\",\\"landing\\":{\\"message\\":\\"It is queued to land.\\"}}"\n' > "$lb/cc-land"
+  # cc-merge: one line per call into lb.merge; it answers with the next exit code in $FK_MRC ("1 0": red, then merged)
+  # and the last line $FK_MOUT, or a fake red
+  printf '#!/bin/sh\necho "$*" >> "%s"\nn=$(wc -l < "%s")\nset -- ${FK_MRC:-0}; shift $((n - 1)) 2>/dev/null || set -- 0\necho "${FK_MOUT:-cc-merge: NOT MERGED — a fake red ($n)}"\nexit ${1:-0}\n' "$d/lb.merge" "$d/lb.merge" > "$lb/ccmerge"
+  # …and a red (1) pushes a catch-up commit to the branch, as the real cc-merge does: origin/track/<c> one ahead
+  sed -i '$i [ "${1:-0}" = 1 ] \&\& w=$(echo "$FK_ST" | sed s#/state/#/worktrees/#) \&\& git -C "$w" update-ref "refs/remotes/origin/track/${w##*/}" "$(git -C "$w" -c user.name=t -c user.email=t@t commit-tree "HEAD^{tree}" -p HEAD -m catchup)"' "$lb/ccmerge"
   chmod +x "$lb"/*
   lrun(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"
     git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     [ "$c" = dn ] && echo '{}' > "$lh/.cc/state/lp/$c/delivery.json"
     : > "$d/lb.n"
-    ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" ${lgreen:+CC_GREEN=$lgreen} \
+    ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" ${lgreen:+CC_GREEN=$lgreen} ${FK_MRC:+FK_MRC="$FK_MRC"} ${FK_MOUT:+FK_MOUT="$FK_MOUT"} \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
   lrun it '- did one step, more to do' 0 --max-iter 1 --no-extend
@@ -1729,14 +1735,14 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
   mkdir -p "$lh/.cc/state/lp/ceil" "$lh/.cc/worktrees/lp/ceil"; echo "the task" > "$lh/.cc/state/lp/ceil/task.md"
   git -C "$lh/.cc/worktrees/lp/ceil" init -q; git -C "$lh/.cc/worktrees/lp/ceil" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   : > "$d/lb.n"
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/ceil" FK_LINE="" FK_COMMIT=0 CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=9999 \
       CLAUDE_CODE_SHELL_PREFIX=/caller/prefix "$lb/cc-loop" lp ceil --max-iter 1 --no-extend ) >/dev/null 2>&1
   t 'a dispatcher that already set the ceiling is not overridden' "$(cat "$lh/.cc/state/lp/ceil/bgceil" 2>/dev/null)" 9999
   t '…nor is a shell prefix the caller set: its claude still runs under cc-nosignal' "$(cat "$d/lb.ns" 2>/dev/null)" /caller/prefix
   mkdir -p "$lh/.cc/state/lp/sbx" "$lh/.cc/worktrees/lp/sbx"; echo "the task" > "$lh/.cc/state/lp/sbx/task.md"
   git -C "$lh/.cc/worktrees/lp/sbx" init -q; git -C "$lh/.cc/worktrees/lp/sbx" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/sbx" FK_LINE="" FK_COMMIT=0 CC_WORKER_SANDBOX=0 "$lb/cc-loop" lp sbx --max-iter 1 --no-extend ) >/dev/null 2>&1
   t '…and with the sandbox off (CC_WORKER_SANDBOX=0), each of its Bash calls is handed a scope of its own' "$(cat "$d/lb.ns" 2>/dev/null)" "$lb/cc-nosignal-shell"
   # ── WORKERS YIELD TO LANDINGS ── each case its own track and its own claude stub, which setsids a grandchild that
@@ -1754,7 +1760,7 @@ CG
   chmod +x "$lb/claude-cg" "$d/srb/systemd-run" "$d/srb/systemctl"
   wsc(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-    ( env -i PATH="$2" HOME="$lh" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} CC_CLAUDE="$lb/claude-cg" CC_LAND="$lb/cc-land" \
+    ( env -i PATH="$2" HOME="$lh" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} CC_CLAUDE="$lb/claude-cg" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" \
         CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" CC_WORKER_SCOPE="$3" "$lb/cc-loop" lp "$1" --max-iter 1 --no-extend ) >/dev/null 2>&1; }
   wsc ws "$d/srb:/usr/bin:/bin" 1
   t "a worker's claude is started in a scope of its own in worker.slice, the slice set to CPU and IO weight 20, and its setsid grandchild ran" \
@@ -1785,7 +1791,7 @@ CG
   printf '#!/bin/sh\n[ "$1 $2" = "get WORKER_CLAUDE_CREDENTIALS" ] && { echo "$FK_KEY"; exit 0; }\nexit 1\n' > "$lb/cc-config"; chmod +x "$lb/cc-config"
   wacct(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" \
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" FK_ST="$lh/.cc/state/lp/$1" \
         FK_LINE="" FK_COMMIT=0 FK_KEY="$lh/.claude-workers/.credentials.json" FK_CRED="$2" "$lb/cc-loop" lp "$1" --max-iter 1 --no-extend ) >/dev/null 2>&1
     cat "$lh/.cc/state/lp/$1/acct" 2>/dev/null; }
   t "the workers' login in use → its own limit stamp and model record" "$(wacct wa "$lh/.claude-workers/.credentials.json")" "$lh/.cc/state/claude-limit.workers/workers"
@@ -1800,7 +1806,7 @@ CG
   printf '#!/bin/sh\n[ "$1" = probe ] && { echo "bwrap is not installed (fixture)" >&2; exit 2; }\nexit 0\n' > "$lb/cc-sandbox"; chmod +x "$lb/cc-sandbox"
   mkdir -p "$lh/.cc/state/lp/nf" "$lh/.cc/worktrees/lp/nf"; echo "the task" > "$lh/.cc/state/lp/nf/task.md"
   git -C "$lh/.cc/worktrees/lp/nf" init -q; git -C "$lh/.cc/worktrees/lp/nf" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       FK_ST="$lh/.cc/state/lp/nf" FK_LINE="" FK_COMMIT=0 "$lb/cc-loop" lp nf --max-iter 1 --no-extend ) >/dev/null 2>&1; c=$?
   t 'a box where the fence cannot start runs no worker: exit 2 before iteration 1, the reason in loop.log, claude never ran' \
     "$c/$(grep -c 'exit 2: the worker sandbox cannot start.*bwrap is not installed (fixture)' "$lh/.cc/state/lp/nf/loop.log" 2>/dev/null)/$(grep -c 'iter 1/' "$lh/.cc/state/lp/nf/loop.log" 2>/dev/null)/$([ -e "$lh/.cc/state/lp/nf/bgceil" ] && echo ran || echo none)" \
@@ -1821,7 +1827,7 @@ KILL
   chmod +x "$lb/claudekill" "$lb/cc-spend"
   mkdir -p "$lh/.cc/state/lp/kl" "$lh/.cc/worktrees/lp/kl"; echo "the task" > "$lh/.cc/state/lp/kl/task.md"
   git -C "$lh/.cc/worktrees/lp/kl" init -q; git -C "$lh/.cc/worktrees/lp/kl" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudekill" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudekill" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       "$lb/cc-loop" lp kl --max-iter 1 --no-extend ) >/dev/null 2>&1
   t 'an iteration killed as hung logs the spend its transcript shows since it started (not a resumed session'"'"'s older records), marked as priced from it' \
     "$(grep -c 'iter 1 end rc=124 .*cost=\$1.0000~transcript total=\$1.0000' "$lh/.cc/state/lp/kl/loop.log")" 1
@@ -1837,7 +1843,7 @@ TO
   for tk in toc ton; do
     mkdir -p "$lh/.cc/state/lp/$tk" "$lh/.cc/worktrees/lp/$tk"; echo "the task" > "$lh/.cc/state/lp/$tk/task.md"
     git -C "$lh/.cc/worktrees/lp/$tk" init -q; git -C "$lh/.cc/worktrees/lp/$tk" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
         FK_COMMIT="$([ "$tk" = toc ] && echo 1 || echo 0)" "$lb/cc-loop" lp "$tk" --max-iter 2 --no-extend ) >/dev/null 2>&1
   done
   t 'two timed-out iterations that each committed are not failures: no error line, no errored stop' \
@@ -1859,9 +1865,9 @@ EDA
     mkdir -p "$lh/.cc/state/lp/$tk" "$lh/.cc/worktrees/lp/$tk"; echo "the task" > "$lh/.cc/state/lp/$tk/task.md"
     git -C "$lh/.cc/worktrees/lp/$tk" init -q; git -C "$lh/.cc/worktrees/lp/$tk" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
   done
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_GREEN="$lb/greenlive" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_GREEN="$lb/greenlive" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       FK_COMMIT=0 "$lb/cc-loop" lp tog --max-iter 2 --no-extend ) >/dev/null 2>&1
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeeda" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeeda" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
       FK_EDA="$d/eda.pids" "$lb/cc-loop" lp toe --max-iter 2 --no-extend ) >/dev/null 2>&1
   for p in $(cat "$d/eda.pids" 2>/dev/null); do kill "$p" 2>/dev/null; done
   t 'two timed-out iterations whose own cc-green run was still going are not failures: no error line, no errored stop' \
@@ -1913,7 +1919,7 @@ HG
   chmod +x "$lb/claudehung"
   hrun(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudehung" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" CC_LOOP_HUNG_SECS=2 CC_LOOP_HUNG_POLL=1 \
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudehung" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" CC_LOOP_HUNG_SECS=2 CC_LOOP_HUNG_POLL=1 \
         FK_LIVE="$2" FK_SLEEP="$3" FK_BLIND="$4" FK_LINK="${5:-}" "$lb/cc-loop" lp "$1" --once ) >/dev/null 2>&1; }
   hrun hg 0 30 0; hrun lv 5 0 0; hrun bl 0 4 1
   mkdir -p "$lh/elsewhere" "$lh/.claude/projects"   # sl: lv again, its project dir a symlink to a dir elsewhere
@@ -1936,7 +1942,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns"
 ID
   chmod +x "$lb/claudeidle"; mkdir -p "$lh/.cc/state/lp/ra" "$lh/.cc/worktrees/lp/ra"; echo "the task" > "$lh/.cc/state/lp/ra/task.md"
   git -C "$lh/.cc/worktrees/lp/ra" init -q; git -C "$lh/.cc/worktrees/lp/ra" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
-  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeidle" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" CC_LOOP_RUNAWAY_N=2 \
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeidle" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" CC_LOOP_RUNAWAY_N=2 \
       FK_ST="$lh/.cc/state/lp/ra" "$lb/cc-loop" lp ra --max-iter 2 ) >/dev/null 2>&1; c=$?
   t 'a loop that commits nothing passes its checkpoints and its runaway notice, told again on a doubling stride, and ends on the stop file a person wrote' \
     "$c/$(wc -l < "$lh/.cc/state/lp/ra/calls")/$(grep -c 'checkpoint at [0-9]* iterations' "$lh/.cc/state/lp/ra/loop.log")/$(grep -o 'runaway notice at [0-9]* barren' "$lh/.cc/state/lp/ra/loop.log" | grep -o '[0-9]*' | tr '\n' ' ')" '14/5/2/2 3 5 '
@@ -1960,7 +1966,7 @@ ID
   lrunp(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"
     git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     git -C "$lh/.cc/worktrees/lp/$c" update-ref "refs/remotes/origin/track/$c" HEAD; : > "$d/lb.n"   # what a push the checkpoint made leaves
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT=0 "$lb/cc-loop" lp "$c" --max-iter 3 ) >/dev/null 2>&1; }
   lrunp vp 'STATUS: BLOCKED: git push failed (no credential) and ~/dev/lp looks deleted — the box is broken?'
   t 'a BLOCKED on a push failure, with its head already on origin, is answered in the journal and the loop runs on' \
@@ -2000,9 +2006,11 @@ ID
       po) l="STATUS: BLOCKED: merge $s cannot be pushed from the sandbox; push from the host to track/other-row";;
       *) l="STATUS: BLOCKED: merge $s is committed locally but cannot be pushed from the sandbox; push from the host";; esac
     : > "$d/lb.n"
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+    [ "$c" = pp ] && { echo keep > "$d/victim-ask"; ln -s "$d/victim-ask" "$lh/.cc/state/lp/pp/progress.md.tmp"; }
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$l" FK_COMMIT=0 "$lb/cc-loop" lp "$c" --max-iter 1 --no-extend ) >/dev/null 2>&1
   done
+  t 'clearing a BLOCKED push ask writes nothing through a link planted at the old temp name' "$(cat "$d/victim-ask")" keep
   t 'a BLOCKED push ask for a sha origin already holds stops nothing: no exit 3, its STATUS line gone from the journal, and the journal and loop.log say why' \
     "$(grep -c '^[^ ]* exit 3: STATUS: BLOCKED' "$lh/.cc/state/lp/pp/loop.log")/$(grep -c '^STATUS: BLOCKED' "$lh/.cc/state/lp/pp/progress.md")/$(grep -c 'cc-loop: the BLOCKED line asked for a push, but [0-9a-f]* on origin/track/pp (tip [0-9a-f]*) already' "$lh/.cc/state/lp/pp/progress.md")/$(grep -c 'BLOCKED push ask cleared' "$lh/.cc/state/lp/pp/loop.log")" 0/0/1/1
   t '…but one naming a commit origin does not have still stops as needs-you, its line kept' \
@@ -2146,6 +2154,22 @@ ID
   t '…and the worker ran told where a fenced cc-green start asks' "$(cat "$lh/.cc/state/lp/dg/gask" 2>/dev/null)" "$lh/.cc/state/lp/dg/green.ask"
   lrun dn 'STATUS: DONE' 0 --max-iter 3 --no-extend
   t 'a DONE posts exactly one card' "$(slackn)" 1
+  t '…and the loop asked cc-merge to merge its PR, by repo and number' "$(cat "$d/lb.merge")" 'lp 9'
+  : > "$d/lb.merge"; rm -f "$lh/.cc/state/lp/dn/progress.md"
+  mkdir -p "$lh/dev/lp/.git/hooks"; printf '#!/bin/sh\ntouch "%s/hook.ran"\n' "$d" > "$lh/dev/lp/.git/hooks/post-merge"; chmod +x "$lh/dev/lp/.git/hooks/post-merge"   # where HG points
+  mkdir -p "$lh/.cc/state/lp/dn"; echo keep > "$d/victim-tmp"; echo keep > "$d/victim-snap"; ln -s "$d/victim-tmp" "$lh/.cc/state/lp/dn/progress.md.tmp"; rm -f "$lh/.cc/state/lp/dn/.progress.snap"; ln -s "$d/victim-snap" "$lh/.cc/state/lp/dn/.progress.snap"
+  FK_MRC='1 0' lrun dn 'STATUS: DONE' 0 --max-iter 3 --no-extend
+  t 'a link planted at the journal temp or the snapshot is not written through, and the journal keeps its mode' \
+    "$(cat "$d/victim-tmp"):$(cat "$d/victim-snap"):$(stat -c %a "$lh/.cc/state/lp/dn/progress.md")" "keep:keep:$(stat -c %a "$lh/.cc/state/lp/dn/task.md")"
+  t 'the catch-up a red cc-merge pushed is fast-forwarded into the worktree with no hook run at all' \
+    "$(git -C "$lh/.cc/worktrees/lp/dn" merge-base --is-ancestor refs/remotes/origin/track/dn HEAD && echo ff):$(test -e "$d/hook.ran" && echo ran)" 'ff:'
+  rm -rf "$lh/dev/lp"
+  t 'a PR cc-merge did not merge goes back to the worker: its DONE line comes out, the why goes in, and the next DONE merges' \
+    "$(wc -l < "$d/lb.merge"):$(grep -c 'was not merged, so the task goes on: NOT MERGED — a fake red (1)' "$lh/.cc/state/lp/dn/progress.md"):$(grep -cx 'STATUS: DONE' "$lh/.cc/state/lp/dn/progress.md"):$(slackn)" '2:1:1:1'
+  : > "$d/lb.merge"; rm -f "$lh/.cc/state/lp/dn/progress.md"; : > "$d/lb.n"
+  FK_MOUT='cc-merge: merged, but the deploy was refused: ~/dev/lp is not on main' lrun dn 'STATUS: DONE' 0 --max-iter 1 --no-extend
+  t 'a merge whose deploy was refused says so on the card'"'"'s landing line, not "It'"'"'s merged."' \
+    "$(grep -c "It's merged, but the deploy was refused: ~/dev/lp is not on main\." "$d/lb.n")" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
 limit wait, a model fallback or restore, or a reminder has no post of its own' \
     "$(grep -E '^[^#]*"\$BIN/cc-notify" ' "$0" | grep -oE 'done_card|--id "done:|--ask|--decision' | tr '\n' ' ')" '--id "done: --ask --decision '
@@ -2156,7 +2180,7 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   # "cc-checkpoint adopt" and nothing pushed, and that refusal, at 3 or at 1, must stop 4 with no DONE card and never
   # exit 0 (review of #635, findings 1 and 6). FK_DOUT is the line the stub cc done prints.
   local lr="$d/lr"; mkdir -p "$lr"; cp "$lb"/* "$lr/"
-  printf '#!/bin/sh\n[ "$1" = done ] || exit 1\necho "${FK_DOUT:-cc: no live planning turn took it; filed as a request}"; exit "$FK_DRC"\n' > "$lr/cc"; chmod +x "$lr/cc"
+  printf '#!/bin/sh\n[ "$1" = done ] || exit 1\necho "${CC_MERGE_WAIT-unset}" > "$FK_ST/mwait"\necho "${FK_DOUT:-cc: no live planning turn took it; filed as a request}"; exit "$FK_DRC"\n' > "$lr/cc"; chmod +x "$lr/cc"
   drun(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
     git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init; : > "$d/lb.n"
     ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lr/claude" CC_LAND="$lr/cc-land" CC_FAILURES="$d/lr.fl" FK_DRC="$2" FK_DOUT="${3:-}" \
@@ -2165,6 +2189,8 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     "$(drun ds 7)|$(grep -c 'opened no PR' "$lh/.cc/state/lp/ds/loop.log")|$(grep -c '^--ask|' "$d/lb.n")|$(grep -c 'the ready-to-land note was filed as a request' "$lh/.cc/state/lp/ds/loop.log")" "rc=0|0|0|1"
   t '…while a cc done that fails any other way still stops 4, "opened no PR"' \
     "$(drun df 2)|$(grep -c 'cc done failed (rc 2)' "$d/lb.n")" "rc=4|1"
+  t 'the loop'"'"'s own cc done waits a day for the merge, and a merge still running is on the card' \
+    "$(drun dm 0 'merging: PR #9 — cc-merge runs on its own; log /x.log')|$(cat "$lh/.cc/state/lp/dm/mwait")|$(grep -c "It's merging on its own: cc-merge runs on its own; log /x.log" "$d/lb.n")" "rc=0|86400|1"
   lease="cc: not pushed — track/lt diverged from its remote and the host holds no lease saying what it last put there, so nothing was forced and nothing overwritten. One way on: 'cc-checkpoint adopt lp lt' says what the remote holds. No PR opened."
   for x in 3 1; do
     t "the t7 shape (diverged branch, member-written .cc/pushed): a lease refusal at rc $x is no DONE — stop 4, no DONE card, never rc 0" \
@@ -2190,8 +2216,8 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
   t '…its one card names the PR cc done opened' "$(cut -d'|' -f1-2 "$d/lb.n")" "--id|done:lp/mi:pr5"
   t '…and its receipt, which names a PR, carries the line saying the host queues the landing' \
     "$(grep '^{' "$lh/.cc/state/lp/mi/loop.log" | jq -r 'select(has("errors")) | .landing.status // "none"' 2>/dev/null | tail -1)" host
-  t 'control, on the host: the lander is asked, cc done is not, and no receipt is still exit 12' \
-    "$(mrun mh)|$(grep -c . "$d/mi.done")|$(grep -c . "$d/mi.land")" "12|0|1"
+  t 'control, on the host: cc done is asked too, and the lander'"'"'s queue is not (cc-merge merges the PR)' \
+    "$(mrun mh)|$(grep -c '^done|' "$d/mi.done")|$(grep -c . "$d/mi.land")" "0|1|0"
   # ── A DONE ON A PEER HOST (CC_PEER_SPOOL set by the hub's launch) ── no lander and no Slack here: the DONE goes to
   # `cc-peer spool land` and the loop exits 0 on its receipt; the lander is never asked and no DONE card is posted.
   printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"\necho "{\\"task_id\\":\\"lp/pd\\",\\"errors\\":[],\\"pending\\":{\\"landing\\":\\"hub\\"}}"\n' "$d/pd.peer" > "$lb/cc-peer"
@@ -2823,7 +2849,7 @@ while [ $i -lt "$MAXI" ]; do
     at=$([ -n "$hm" ] && "$BIN/cc-time" slack "$(date -u +%Y-%m-%d)T$hm:00Z" 2>/dev/null || echo "${hm:-later}${hm:+Z}")
     "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: $(again)"
     parked; stopped; landed; fi   # that wait can be hours: a pause, a stop file or a merge during it is read before anything is charged (review of #541)
-  i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
+  i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp --remove-destination "$ST/progress.md" "$SNAP"   # never through a link planted there
   of=""; [ "${NOEXT:-0}" = 1 ] && of=" of $MAXI"   # only a caller's bound is a last iteration; a checkpoint is not
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s%s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$of" "${CC_AGENT_NO:+ You are agent $CC_AGENT_NO, the number the box gave this worker: head your journal entry with it.}")
   if said=$(say_take "$ST"); then prompt=$(printf '# MESSAGES FROM YOUR DISPATCHER (arrived after the last iteration stopped reading — they come first)\n%s\n\n%s' "$said" "$prompt"); log "iter $i opens with the message(s) sent while the last one ran"; fi
@@ -2902,10 +2928,9 @@ while [ $i -lt "$MAXI" ]; do
       log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?; printf '%s\n' "$dout" >> "$LOG"
       [ "$drc" = 0 ] || stop 4 "finished, but cc done failed" "the worker wrote STATUS: DONE, but cc done failed (rc $drc) — see $LOG"
       log "exit 0: throwaway repo, done on track/$track"; exit 0; fi
-    # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND (complete_task; inside a member workspace's boundary,
-    # where there is no lander, it is that boundary's `cc done --json` instead). `cc-land queue --task` completes the task and,
-    # where the standing grant holds, puts the PR on the same numeric queue a 👍 uses; the loop decides from the
-    # RECEIPT it prints, never from an exit code — a board or card projection that could not be written used to
+    # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND (complete_task: `cc done --json`, on the host or inside
+    # a member workspace's boundary), and where the standing grant holds the loop then merges the PR with cc-merge;
+    # the loop decides from the RECEIPT cc done prints, never from an exit code — a board or card projection that could not be written used to
     # turn a real PR into "finished, but opened no PR". The branch below is the legacy one, for a row that has no
     # record; milestone 7 removes it with the rest.
     # A WORKER THE HUB PLACED ON A PEER HOST (cc-peer; CC_PEER_SPOOL is set by that launch and nothing else) has no
@@ -2922,7 +2947,7 @@ while [ $i -lt "$MAXI" ]; do
       # the command that finishes it by hand. Inside a member's boundary there is no lander and nothing to push to
       # but the workspace's origin, so it is the HOST's `cc done` (review of #965), never one typed in there.
       rec=$(complete_task); while [ "$(delivery_end "$rec")" = failed ] && quota_wait "cc: $(jq -r '[.errors[]?.message] | last // ""' <<<"$rec")"; do rec=$(complete_task); done
-      retry="cc-land queue --task $repo $track"; redo="cc done $repo $track"
+      retry="cc done $repo $track"; redo=$retry
       inside_boundary && { retry="cc done $repo $track on the host"; redo=$retry; }
       printf '%s\n' "$rec" >> "$LOG"
       case "$(delivery_end "$rec")" in
@@ -2935,11 +2960,30 @@ while [ $i -lt "$MAXI" ]; do
       # WHAT FINISHED, not how many turns it took to finish it: the iteration count and the dollar figure are the
       # loop's own bookkeeping and are in the board note and the log above. A person reading #<repo>-updates wants
       # the row (comms audit 2026-09-07).
-      done_card "$(jq -r '.pr_url // ""' <<<"$rec")" "$(jq -r '.landing.message // ""' <<<"$rec")"
+      pr=$(jq -r '.pr_url // ""' <<<"$rec"); landing=$(jq -r '.landing.message // ""' <<<"$rec")
+      # THE LOOP MERGES ITS OWN PR (cc-merge) where the repo holds the standing grant (`cc lands`, as the lander's
+      # queue asked it): merged, kept for perms' read, or back to the worker as one more iteration
+      if ! inside_boundary && [[ ${pr##*/} =~ ^[0-9]+$ ]] && "${CC_DONE:-$BIN/cc}" lands "$repo" >/dev/null 2>&1; then
+        mout=$(env "${HG[@]}" "${CC_MERGE:-$BIN/cc-merge}" "$repo" "${pr##*/}" 2>&1); mrc=$?; printf '%s\n' "$mout" >> "$LOG"   # CC_MERGE: test hook
+        mlast=$(grep -v '^[[:space:]]*$' <<<"$mout" | tail -1); mlast=${mlast#cc-merge: }
+        case "$mrc" in
+          0) landing="It's merged."; [[ $mlast == "merged, but "* ]] && landing="It's ${mlast}." ;;   # a refused deploy, loud
+          3) landing="It isn't merged yet: ${mlast}." ;;   # a kept path for perms' read, or GitHub still failing
+          1) # this iteration's STATUS: DONE comes out of the journal and the why goes in; a catch-up merge cc-merge
+             # pushed is fast-forwarded into the worktree (they share the repo's refs), so the next commit is no divergence
+             journal_cut "$(grep -nx 'STATUS: DONE' "$ST/progress.md" | tail -1 | cut -d: -f1)"
+             git -c core.hooksPath=/dev/null -C "$WT" merge -q --ff-only "origin/track/$track" >/dev/null 2>&1   # no hook at all: nothing is committed here
+             printf '\n%s cc-loop: PR %s was not merged, so the task goes on: %s. Fix it, run your green again, then write STATUS: DONE.\n' "$(date -u +%FT%TZ)" "$pr" "$mlast" >> "$ST/progress.md"
+             log "not merged, back to the worker: $mlast"; "$BOARD" note "$repo" "$track" "not merged, one more iteration: $mlast" >/dev/null 2>&1
+             continue ;;
+          *) landing="It isn't merged: $mlast." ;;
+        esac
+      fi
+      done_card "$pr" "$landing"
       exit 0
     else
       log "DONE"   # dout captured, never `| tail -1`: the pipe dropped the status
-      while dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?; [ "$drc" != 0 ] && [ "$drc" != 7 ] && quota_wait "$dout"; do :; done
+      while dout=$(env "${HG[@]}" CC_MERGE_WAIT="${CC_MERGE_WAIT:-86400}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?; [ "$drc" != 0 ] && [ "$drc" != 7 ] && quota_wait "$dout"; do :; done
       printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
       # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
       # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).
@@ -2952,9 +2996,13 @@ while [ $i -lt "$MAXI" ]; do
       [ "$drc" = 0 ] || stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed (rc $drc): ${dlast:-no output}. Fix the cause, then: cc done $repo $track"
       # THE STANDING GRANT is spent by `cc done` itself, which queued the PR above where the repo holds it (`cc lands`), the row
       # is not held and the PR is not a draft (queue_pr); its `queued:` / `not queued: … — <why>` line becomes the one sentence on the landing.
+      # cc done waits for cc-merge's own end here (CC_MERGE_WAIT, a day), so a red check or a refused merge is on the card.
       landed=""
-      ql=$(printf '%s\n' "$dout" | grep -E '^(not )?queued: ' | tail -1)
+      ql=$(printf '%s\n' "$dout" | grep -E '^((not )?queued|(not )?merged|merging): ' | tail -1)
       case "$ql" in
+        "merged: "*) landed="It's merged."; [[ $ql == *" — but "* ]] && landed="It's merged, ${ql#* — }." ;;
+        "merging: "*) landed="It's merging on its own: ${ql#* — }." ;;
+        "not merged: "*) landed="Not merged: ${ql#* — }." ;;
         "queued: "*) landed="It's queued to land, no 👍 needed." ;;
         "not queued: "*) landed="Not queued: ${ql#* — }." ;;   # held, a draft, or the queue refused it (a protected path's 🔐 card)
       esac
@@ -2964,7 +3012,7 @@ while [ $i -lt "$MAXI" ]; do
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ] && ap=$(already_pushed "$q"); then
     # a push ask the remote already answered: the STATUS line comes out of the journal (only this iteration's, matched
     # whole and last), the journal says why for the next fresh context, and the loop goes on instead of paging the seat
-    awk -v n="$(grep -nxF -- "$q" "$ST/progress.md" | tail -1 | cut -d: -f1)" 'NR!=n' "$ST/progress.md" > "$ST/progress.md.tmp" && mv -f "$ST/progress.md.tmp" "$ST/progress.md"
+    journal_cut "$(grep -nxF -- "$q" "$ST/progress.md" | tail -1 | cut -d: -f1)"
     printf '\n%s cc-loop: the BLOCKED line asked for a push, but %s already: pushed from the host after the iteration. The line is cleared; carry on with the task, and never stop to ask for a push (the loop pushes after every iteration).\n' "$(date -u +%FT%TZ)" "$ap" >> "$ST/progress.md"
     log "iter $i: BLOCKED push ask cleared — $ap"; "$BOARD" note "$repo" "$track" "a BLOCKED push ask was already pushed ($ap): cleared, still running" >/dev/null 2>&1
     q=""; fi

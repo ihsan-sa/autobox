@@ -538,6 +538,78 @@ STUB
   jq -cn --arg i "$(idof "echo dec badsig")" '{kind:"decision", id:$i, at:"2026-11-01T00:00:00Z", decision:"decline", by:"warden", note:"planted", sig:"0000"}' >> "$lg"
   out=$(jq -r 'select(.kind == "refusal" and .id == "'"$id"'") | .key' "$lg")
   k "$(t test -n "$out" -a "$(sc decisions repo | jq -r '"\(.id) \(.key) \(.note)"')" = "$id $out signed")" "decisions prints the signed line alone, with its ask's key"
+  # A MEMBER'S STATE IS NEVER A LEDGER, whatever perms dir stands in it (perms' read of #2144): the ask goes to the control
+  # repo's ledger, and what a member planted at the lock and the ledger is never opened
+  victim=$d/victim; kept(){ [ "$(cat "$victim")" = keep ]; }
+  mem(){ HOME=$d CC_REFUSALS_DEV=$d/dev CC_REFUSALS_CTL=${MCTL:-repo} sc "$@"; }
+  memstate(){ fresh; printf keep > "$victim"; rm -rf "$d/state/mem"; mkdir -p "$d/state/mem/perms"
+    ln -s "$victim" "$d/state/mem/perms/refusals.jsonl"; ln -s "$victim" "$d/state/mem/perms/refusals.jsonl.lock"; }
+  mkdir -p "$d/dev/mem/.cc"; : > "$d/dev/mem/.cc/member-workspace"
+  memstate; id=$(mem ask mem --from mem --member --kind permission)
+  k "$(t jq -e --arg id "$id" 'select(.id == $id and .kind == "ask" and .member == true and .repo == "mem" and .window == "mem")' "$lg")" \
+    "a member's ask with a perms dir planted in its state lands in the control repo's ledger, its id printed"
+  k "$(t kept)" "…and the file its planted lock and ledger point at is untouched"
+  # the marker is the member's to delete, so the host's record counts alone, in either form
+  rm -f "$d/dev/mem/.cc/member-workspace"
+  for rf in member-workspace credentials.json; do mkdir -p "$d/.cc/members/mem"; : > "$d/.cc/members/mem/$rf"
+    memstate; mem ask mem --from mem --member >/dev/null 2>&1
+    k "$(t jq -e 'select(.member == true and .repo == "mem")' "$lg")" "…told by the host's record ($rf) with the marker deleted"
+    k "$(t kept)" "…and the planted links stay unopened"; rm -f "$d/.cc/members/mem/$rf"; done
+  : > "$d/dev/mem/.cc/member-workspace"
+  # with no control repo's ledger to go to, it is refused
+  memstate; out=$(MCTL=nobody mem ask mem --from mem --member 2>&1); rc=$?
+  k "$(t test "$rc" = 1 -a ! -e "$lg")" "a member's ask with no control ledger is refused, nothing written"
+  k "$(t grep -q 'no permission session' <<<"$out")" "…saying why"; k "$(t kept)" "…and the planted links stay unopened"
+  rc=$(mem open mem >/dev/null 2>&1; echo $?); k "$(t test "$rc" = 2)" "open takes no member's state as a ledger"
+  # a repo that is not a member's keeps its own ledger, so this is no blanket refusal
+  mkdir -p "$d/state/own/perms"; id=$(HOME=$d CC_REFUSALS_DEV=$d/dev sc ask own --from own --member)
+  k "$(t jq -e --arg id "$id" 'select(.id == $id)' "$d/state/own/perms/refusals.jsonl")" "a repo with no member marker or record keeps its own ledger"
+  # A LINK AT THE LOCK OR THE LEDGER IS REFUSED, said, by every writer, and what it points at keeps its bytes. plant <suffix>:
+  # the ledger holds one open refusal, $id; the victim a copy of it; the link stands at the ledger<suffix>
+  plant(){ fresh; seat "echo planted"; id=$(idof "echo planted"); cp "$lg" "$victim"; rm -f "$lg.lock"
+    [ -n "$1" ] || rm -f "$lg"; ln -s "$victim" "$lg$1"; sum=$(cksum < "$victim"); }
+  same(){ [ "$sum" = "$(cksum < "$victim")" ]; }
+  says(){ grep -q 'stands in the way' "$1"; }
+  seatis "" 0
+  for sf in "" .lock; do w="a link at the ledger$sf"
+    plant "$sf"; out=$(sc ask repo --from repo -- 'a seat asks' 2>&1); rc=$?
+    k "$(t test "$rc" = 1)" "$w: ask refuses it"; k "$(t grep -q 'stands in the way' <<<"$out")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; rc=$(sc ask repo --from aya --member 2>/dev/null >&2; echo $?); k "$(t test "$rc" = 1)" "$w: a member's ask refuses it"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; rc=$(SA_CWD=$d sa repo --title t --run "curl x" -- "approval $sf" 2>"$d/err" >/dev/null; echo $?)
+    k "$(t test "$rc" = 1)" "$w: an approval ask refuses it"; k "$(t says "$d/err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; ps_ decide repo "$id" decline 'no' >/dev/null; rc=$?
+    k "$(t test "$rc" = 1)" "$w: decide refuses it"; k "$(t says "$d/ps.err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; ws_ warden repo "$id" claim 'mine' >/dev/null; rc=$?
+    k "$(t test "$rc" = 4)" "$w: a warden's claim refuses it"; k "$(t says "$d/ps.err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; ps_ freeze repo >/dev/null; rc=$?
+    k "$(t test "$rc" = 4)" "$w: freeze refuses it"; k "$(t says "$d/ps.err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; rc=$(timeout 5 bash -c '"$@"' _ env CC_REFUSALS_ROOT="$d/state" CC_REFUSALS_WINDOW=perms "$0" watch repo 2>"$d/err" >/dev/null; echo $?)
+    k "$(t test "$rc" = 2)" "$w: watch refuses it"; k "$(t says "$d/err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; out=$(ev "$d/dev/repo" "echo hooked" | CC_ROLE='' CC_REFUSALS_WINDOW=repo rec 2>&1); rc=$?
+    k "$(t test "$rc" = 0 -a -z "$out")" "$w: the hook still exits 0 and prints nothing"; k "$(t same)" "…and its target keeps its bytes"
+    plant "$sf"; mkdir -p "$d/state/repo/t2"; jq -cn '{tool:"Bash", input:"echo spooled", reason:"r"}' > "$d/state/repo/t2/refusals.spool.jsonl"; sc collect repo t2 >/dev/null 2>"$d/err"
+    k "$(t grep -q 'echo spooled' "$d/state/repo/t2/refusals.spool.jsonl")" "$w: collect keeps the record in the spool"; k "$(t says "$d/err")" "…saying so"; k "$(t same)" "…and its target keeps its bytes"
+    rm -f "$d/state/repo/t2/refusals.spool.jsonl"
+    # a card goes out, then a link stands there before its posted line is written
+    fresh; SA_CWD=$d sa repo --title t --run "curl y" -- "card $sf" >/dev/null 2>&1; id=$(jq -r 'select(.source == "approval") | .id' "$lg")
+    cp "$lg" "$victim"; sum=$(cksum < "$victim")
+    printf '#!/bin/sh\nrm -f "%s%s"; ln -s "%s" "%s%s"\n' "$lg" "$sf" "$victim" "$lg" "$sf" > "$d/notify-plant"; chmod +x "$d/notify-plant"
+    CC_REFUSALS_NOTIFY=$d/notify-plant ps_ decide repo "$id" his 'yours' >/dev/null
+    k "$(t says "$d/ps.err")" "$w: the posted line refuses it, saying so"; k "$(t same)" "…and its target keeps its bytes"
+    # a dangling link makes nothing at its target
+    fresh; rm -f "$d/nowhere"; ln -s "$d/nowhere" "$lg$sf"; sc ask repo --from repo -- 'dangling' >/dev/null 2>&1
+    k "$(t test ! -e "$d/nowhere")" "$w, dangling: nothing is made at its target"
+  done
+  # a link at the perms dir, or at the repo's state dir above it, is refused the same way
+  fresh; mkdir -p "$d/real/perms" "$d/state/lnk"; ln -s "$d/real/perms" "$d/state/lnk/perms"; ln -s "$d/real" "$d/state/lnk2"
+  out=$(sc ask lnk --from lnk -- 'via a linked dir' 2>&1); rc=$?
+  k "$(t test "$rc" = 1 -a -z "$(ls "$d/real/perms")")" "a link at the perms dir is refused, nothing written where it points"; k "$(t grep -q 'stands in the way' <<<"$out")" "…saying so"
+  out=$(sc ask lnk2 --from lnk2 -- 'via a linked state dir' 2>&1); rc=$?
+  k "$(t test "$rc" = 1 -a -z "$(ls "$d/real/perms")")" "a link at the repo's state dir is refused too"
+  # a root that is itself a link (a moved home) is not a planted one, and a regular lock keeps its bytes: no truncation
+  fresh; ln -s "$d/state" "$d/stlnk"; printf 'lockbytes' > "$lg.lock"; id=$(CC_REFUSALS_ROOT=$d/stlnk CC_REFUSALS_WINDOW=perms "$0" ask repo --from repo -- 'through a linked root')
+  k "$(t jq -e --arg id "$id" 'select(.id == $id)' "$lg")" "a state root reached through a link still files"
+  k "$(t test "$(cat "$lg.lock")" = lockbytes)" "…and a lock file with bytes in it is not truncated"
   rm -rf "$d"
   echo "cc-refusals selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]
 }

@@ -10428,7 +10428,11 @@ def run_selfcheck():
         # …and a member's PERMISSION question goes to the permission session's ledger, marked as a member's, with nobody
         # mentioned; left undeclared, a permission-shaped one is not posted at all
         root_mp = tempfile.mkdtemp(prefix="cc-slack-selfcheck-perms-"); os.makedirs(f"{root_mp}/ctlx/perms")
-        env_mp = dict(os.environ, CC_REFUSALS_ROOT=root_mp, CC_REFUSALS_CTL="ctlx", CC_REFUSALS_PERMS_LIVE="1", CC_REFUSALS_NOTIFY="/bin/false")
+        # carol is a member with a perms dir planted in her state (perms' read of #2144): links at its lock and ledger
+        os.makedirs(f"{root_mp}/carol/perms"); os.makedirs(f"{root_mp}/dev/carol/.cc"); open(f"{root_mp}/dev/carol/.cc/member-workspace", "w").close()
+        with open(f"{root_mp}/victim", "w") as vf: vf.write("keep")
+        for lk in ("refusals.jsonl", "refusals.jsonl.lock"): os.symlink(f"{root_mp}/victim", f"{root_mp}/carol/perms/{lk}")
+        env_mp = dict(os.environ, CC_REFUSALS_ROOT=root_mp, CC_REFUSALS_DEV=f"{root_mp}/dev", CC_REFUSALS_CTL="ctlx", CC_REFUSALS_PERMS_LIVE="1", CC_REFUSALS_NOTIFY="/bin/false")
         ran_mp = []
         # cc-refusals runs for real on the fixture root; cc-notify (the planning seat's request) is stubbed, never the live queue
         EFFECTS.run_impl = lambda cmd, **kw: ran_mp.append(list(cmd)) or (
@@ -10446,6 +10450,7 @@ def run_selfcheck():
         mp_posted = postedRQ[n_mp:]; del postedRQ[n_mp:]
         lg_mp = f"{root_mp}/ctlx/perms/refusals.jsonl"
         mp_lines = [json.loads(l) for l in open(lg_mp).read().splitlines()] if os.path.exists(lg_mp) else []
+        mp_victim = open(f"{root_mp}/victim").read()
         subprocess.run(["rm", "-rf", root_mp])
         # …and NEITHER of the two handles this dir hands the daemon may park it. The dir is bound rw inside the
         # member's boundary, so she can plant a FIFO at .queries.lock (a blocking open never returns) or simply hold
@@ -10549,6 +10554,9 @@ def run_selfcheck():
           and f"lists it as {mp_qid} with no text" in ran_mp[1][-1]
           and [p[1] for p in mp_posted] == [inj_mp]
           and r_mp_und.get("ok") is False and "permission:true" in r_mp_und.get("error", ""))
+    check("MEMBER socket: a member's permission reply, through the real cc-refusals on a fixture root, files in the control "
+          "repo's ledger and returns its id, and links planted at the lock and ledger in the member's own perms dir are never opened",
+          mp_victim == "keep" and len(mp_lines) == 1 and mp_lines[0].get("repo") == "carol" and f"lists it as {mp_lines[0].get('id')} " in ran_mp[1][-1])
     # member_perms_ask's other branches, on stubs: cc-refusals giving no id (failed, or exit 0 with nothing printed) and
     # cc-notify not taking the planning seat's request. And in every branch the member's words are fenced: the box's note
     # comes first and each line she wrote is quoted, so her line shaped like that note reads as hers (perms' read of #1585).

@@ -421,14 +421,14 @@ public=https://github.com/fixture/repo.git; git -C "$wt" config --add "url.$D/re
 "$B/cc-board" set r "$row" pr https://github.com/fixture/repo/pull/7 >/dev/null
 printf '{"url":"https://github.com/fixture/repo/pull/7","state":"OPEN","isCrossRepository":false,"headRefName":"dispatch/7"}\n' > "$D/onto"
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\n' "$D" > "$D/bin/landstub"; chmod +x "$D/bin/landstub"; : > "$D/land.calls"
-CC_SELF_LAND_EXCEPT= CC_LAND="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
-{ [ "$rc" = 0 ] && [ "$(cat "$D/land.calls")" = "queue r 7 --who cc done" ] && [ ! -s "$D/creates" ] \
-  && [ "$(git -C "$D/remote.git" rev-parse dispatch/7)" = "$(git -C "$wt" rev-parse HEAD)" ] && grep -q '^queued: PR #7 ' "$D/onto.out"; } \
+CC_SELF_LAND_EXCEPT= CC_MERGE="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(cat "$D/land.calls")" = "r 7" ] && [ ! -s "$D/creates" ] \
+  && [ "$(git -C "$D/remote.git" rev-parse dispatch/7)" = "$(git -C "$wt" rev-parse HEAD)" ] && grep -q '^merged: PR #7$' "$D/onto.out"; } \
   && ok "P24: a repair pushed onto another branch's open PR queues that PR, once, and opens no second PR" || bad "P24: rc=$rc calls=[$(cat "$D/land.calls")] $(cat "$D/onto.out")"
 : > "$D/land.calls"; newdone onto2; rm "$st/delivery.json"; touch "$D/legacy"; echo "$public" > "$D/public-url"
 "$B/cc-board" set r "$row" pr https://github.com/fixture/repo/pull/7 >/dev/null; "$B/cc-board" set r "$row" held "kept back" >/dev/null
 printf '{"url":"https://github.com/fixture/repo/pull/7","state":"OPEN","isCrossRepository":false,"headRefName":"dispatch/8"}\n' > "$D/onto"
-CC_SELF_LAND_EXCEPT= CC_LAND="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
+CC_SELF_LAND_EXCEPT= CC_MERGE="$D/bin/landstub" "$D/bin/cc" done r "$row" > "$D/onto.out" 2>&1; rc=$?
 { [ "$rc" = 0 ] && [ ! -s "$D/land.calls" ] && grep -q 'onto dispatch/8' "$D/onto.out" && grep -q '^not queued: PR #7 — the row is on hold (kept back)' "$D/onto.out"; } \
   && ok "P24 control: the same push on a held row pushes but queues nothing, and says why" || bad "P24 control: rc=$rc calls=[$(cat "$D/land.calls")] $(cat "$D/onto.out")"
 newdone local; git -C "$HOME/dev/r" remote remove origin; mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-workspace"
@@ -473,13 +473,13 @@ chmod +x "$T/ghbin8/gh" "$T/landstub"; : > "$T/land.calls"
 "$B/cc" $REPO w18 >/dev/null 2>&1; sleep 1
 for id in $(wins "$REPO/w18"); do tmux kill-window -t "$id"; done
 echo "the grant" > ~/.cc/worktrees/$REPO/w18/g.txt
-done8(){ env SLACK_BOT_TOKEN= CC_LAND="$T/landstub" PATH="$T/ghbin8:$PATH" "$@" "$B/cc" done $REPO w18 2>&1; }
+done8(){ env SLACK_BOT_TOKEN= CC_MERGE="$T/landstub" PATH="$T/ghbin8:$PATH" "$@" "$B/cc" done $REPO w18 2>&1; }
 o8a=$(done8)
 { [ ! -s "$T/land.calls" ] && grep -q 'land it with:  cc-land' <<<"$o8a"; } \
   && ok "cc done: a repo named as an exception waits for a 👍, and it says how to land it (P8a)" \
   || bad "cc done on an ungranted repo: $(cat "$T/land.calls") $o8a"
 o8b=$(done8 CC_SELF_LAND_EXCEPT="other")
-{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^queued: PR #77 — no 👍 needed" <<<"$o8b"; } \
+{ [ "$(cat "$T/land.calls")" = "$REPO 77" ] && grep -q "^merged: PR #77$" <<<"$o8b"; } \
   && ok "cc done: a repo that holds the grant has its PR queued by cc done itself, once, as a seat would by hand (P8b)" \
   || bad "cc done did not queue a granted PR: $(cat "$T/land.calls") $o8b"
 : > "$T/land.calls"; "$B/cc-board" set $REPO w18 held "kept back" >/dev/null
@@ -518,10 +518,10 @@ r8g=$(CC_SELF_LAND_EXCEPT= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
 # protected_hit before saying that, rather than reading CC_PROTECTED_PATHS a second time.
 printf '#!/usr/bin/env bash\ncase "$*" in *"-X POST "*"/pulls"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
 # …and it still CALLS the queue: cc-land's own refusal is what raises that 🔐 card (the stub refuses, as cc-land does).
-printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "protected path: learn-fetch/foo.py"; exit 1\n' "$T" > "$T/landrefuse"; chmod +x "$T/landrefuse"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "cc-merge: it changes a kept path (learn-fetch/foo.py), which perms reads first, so it waits in the landing queue"; exit 3\n' "$T" > "$T/landrefuse"; chmod +x "$T/landrefuse"
 : > "$T/land.calls"
-o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_LAND="$T/landrefuse")
-{ [ "$(cat "$T/land.calls")" = "queue $REPO 77 --who cc done" ] && grep -q "^not queued: PR #77 — protected path: learn-fetch/foo.py$" <<<"$o8f" \
+o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/ CC_MERGE="$T/landrefuse")
+{ [ "$(cat "$T/land.calls")" = "$REPO 77" ] && grep -q "^queued: PR #77 — it changes a kept path" <<<"$o8f" \
   && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
   && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
   && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \

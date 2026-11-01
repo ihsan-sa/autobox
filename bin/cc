@@ -867,17 +867,28 @@ onto_pr(){   # $1 repo $2 track $3 worktree → "<branch> <url>" for a row whose
   v=$(cd / && timeout -k 5 30 gh pr view "$pr" --json url,state,isCrossRepository,headRefName 2>/dev/null) || return 1
   onto_pr_branch "track/$2" "$(default_branch "$DEV/$1")" "$slug" <<<"$v"; }
 
-queue_pr(){   # $1 repo $2 track $3 worktree $4 PR number $5 card "<chat> <ts>" — queues the PR as a seat would by hand, unless the
-  # row is held or the PR is a draft (brief, 2026-10-13); the lane still gates and reviews, and refuses a protected path
-  # itself with the 🔐 card, whose words (or any other refusal's) are the why. Prints one `queued: PR #N — …` or
-  # `not queued: PR #N — <why>` line, which cc-loop reads.
-  local held lo w lchat lts lq=()
+queue_pr(){   # $1 repo $2 track $3 worktree $4 PR number — merges the PR with cc-merge as a seat would by hand, unless the
+  # row is held or the PR is a draft (brief, 2026-10-13). Prints one `merged: PR #N`, `queued: PR #N — …` (a kept-list
+  # PR, which cc-merge hands to the lander's queue for perms' read), `merging: PR #N — … log <path>`, `not merged: PR #N
+  # — <why>` or `not queued: PR #N — <why>` line, which cc-loop reads. cc-merge runs DETACHED (the full check alone took
+  # about 28 min on #2125, past a seat's Bash timeout): what it ends with inside CC_MERGE_WAIT seconds (10; cc-loop,
+  # which has no timeout, sets a day) is said here; otherwise the line says where its log is.
+  local held lo w
   if held=$("$BOARD" get "$1" "$2" held 2>/dev/null) && [ -n "$held" ]; then echo "not queued: PR #$4 — the row is on hold ($held)"; return 0; fi
   [ "$(cd "$3" && gh api "repos/$(pr_slug "$3")/pulls/$4" -q .draft 2>/dev/null)" = true ] && { echo "not queued: PR #$4 — it is a draft"; return 0; }
-  read -r lchat lts <<<"${5:-}"; [ -n "${lts:-}" ] && lq=(--chat "$lchat" --ts "$lts")
-  if lo=$("${CC_LAND:-$BIN/cc-land}" queue "$1" "$4" --who "cc done" ${lq[@]+"${lq[@]}"} 2>&1); then echo "queued: PR #$4 — no 👍 needed"   # CC_LAND: test hook
-  else w=${lo%$'\n'}; w=${w##*$'\n'}; echo "not queued: PR #$4 — ${w#*is not queued — }"; fi   # the lander's own why, never a card it did not send
-  [ -n "$lo" ] && echo "landing queue: ${lo//$'\n'/ }"; return 0; }
+  # THE PR MERGES ITSELF (cc-merge, the owner 2026-10-31): only a kept-list PR goes to the lander's queue (exit 3)
+  local lrc lg i; mkdir -p "$HOME/.cc/state/$1"; lg=$(mktemp "$HOME/.cc/state/$1/cc-merge-$4-XXXXXX.log")   # one per run
+  # any non-zero end goes on the row's notes (`cc board show`): nobody may be left reading this line by then
+  setsid -f sh -c '"$0" "$1" "$2" > "$3" 2>&1 < /dev/null; r=$?; [ $r = 0 ] || "$4" note "$1" "$5" "cc-merge ended $r on PR #$2: $(tail -n 1 "$3") (log $3)" > /dev/null 2>&1; echo $r > "$3.rc"' "${CC_MERGE:-$BIN/cc-merge}" "$1" "$4" "$lg" "$BOARD" "$2" > /dev/null 2>&1 < /dev/null   # CC_MERGE: test hook; no fd of the caller's held
+  for ((i = 0; i < ${CC_MERGE_WAIT:-10} * 5; i++)); do [ -s "$lg.rc" ] && break; sleep 0.2; done
+  [ -s "$lg.rc" ] || { echo "merging: PR #$4 — cc-merge runs on its own; log $lg"; return 0; }
+  lrc=$(cat "$lg.rc"); lo=$(cat "$lg"); w=${lo%$'\n'}; w=${w##*$'\n'}; w=${w#cc-merge: }
+  case "$lrc" in
+    0) [[ $w == "merged, but "* ]] && echo "merged: PR #$4 — ${w#merged, }" || echo "merged: PR #$4" ;;
+    3) echo "queued: PR #$4 — $w" ;;
+    *) echo "not merged: PR #$4 — $w" ;;
+  esac
+  [ -n "$lo" ] && echo "cc-merge: ${lo//$'\n'/ }"; return 0; }
 # CC DONE ASKS GITHUB OVER REST (raised-graphql-hour-spent-stalls-landing, 2026-10-19): `gh pr list/create` spend the
 # login's GraphQL hour, which the lander's passes had used up at 18:1xZ while REST still held 4815 of 5000, so two
 # finished tracks ended "open PR lookup failed — no PR created". The lookups and the create are `gh api` on
