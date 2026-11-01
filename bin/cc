@@ -1862,6 +1862,80 @@ PY
     "$BIN/cc-task" > "$T/rc/cc-task-nocheck"; chmod +x "$T/rc/cc-task-nocheck"
   rc=1; [ "$(lswap "$T/rc/cc-task-nocheck" sw-nocheck)" = link ] && rc=0
   t "…and without retire's inode check that same swap does leave a link there, so the case above can fail" "$rc"
+  # perms' read of #2044: a folder swapped in the same way cannot be unlinked, so it went back to the member instead.
+  mkdir -p "$R/r/f"
+  cat > "$T/rc/swapdir.py" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True); d, stop = sys.argv[1:3]; rec, dr = f"{d}/delivery.json".encode(), f"{d}/dir.tmp".encode()
+while not os.path.exists(stop):
+    try:
+        if not os.path.lexists(rec): open(rec, "w").write('{}\n')
+        if not (os.path.isdir(rec) or os.path.isdir(dr)):
+            if os.path.lexists(dr): os.unlink(dr)
+            os.mkdir(dr)
+    except OSError: pass
+    libc.renameat2(-100, rec, -100, dr, 2)
+PY
+  python3 "$T/rc/swapdir.py" "$R/r/f" "$T/rc/stop3" & sp=$!
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=f; for _ in $(seq 200); do retire; done ) >/dev/null 2>&1
+  : > "$T/rc/stop3"; wait "$sp"
+  rc=0; for f in "$R"/.receipts/r/f.*.json; do [ -d "$f" ] && rc=1; done; compgen -G "$R/.receipts/r/f.*.json" >/dev/null || rc=1
+  t "…and a record the member swaps for a folder just before the move never leaves a folder in the receipts" "$rc"
+  # perms' read of #2099: the folder went back into the member's row dir, so a member that removes that dir mid-retire
+  # made the rename back fail and left its folder in the receipts. Each turn waits for the move, then removes r/g.
+  mkdir -p "$R/r/g"
+  cat > "$T/rc/swapgone.py" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True); d, stop = sys.argv[1:3]; rec, dr = f"{d}/delivery.json", f"{d}/dir.tmp"
+while not os.path.exists(stop):
+    try:
+        os.makedirs(dr, exist_ok=True)
+        if not os.path.lexists(rec): open(rec, "w").write('{}\n')
+        if not os.path.exists(f"{d}/delivery.lock"): continue
+        libc.renameat2(-100, rec.encode(), -100, dr.encode(), 2)
+        for _ in range(2000):
+            if not os.path.lexists(rec): break
+        for n in ("dir.tmp", "delivery.lock"):
+            try: os.unlink(f"{d}/{n}")
+            except OSError: pass
+        os.rmdir(d)
+    except OSError: pass
+PY
+  python3 "$T/rc/swapgone.py" "$R/r/g" "$T/rc/stop4" & sp=$!
+  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=g; for _ in $(seq 200); do retire; done ) >/dev/null 2>&1
+  : > "$T/rc/stop4"; wait "$sp"
+  rc=0; [ -z "$(find "$R/.receipts/r" -maxdepth 1 -name 'g.*' \( -type d -o -type l \))" ] || rc=1
+  t "…and a member removing its row dir mid-retire still leaves no link and no folder in the receipts" "$rc"
+  # perms' read of #2099 again: the member keeps an fd on the folder it swaps in and makes it 0555 (it holds a file)
+  # or 000 the moment retire has moved it, so neither a move back nor rmtree can take it out of the receipts. The
+  # driver holds the row lock to park retire between its open and its move, swaps, then releases; 30 turns a mode.
+  cat > "$T/rc/swaplock.py" <<'PY'
+import ctypes, fcntl, glob, os, subprocess, sys, time
+libc = ctypes.CDLL(None, use_errno=True); cctask, home, row, mode, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4], 8), int(sys.argv[5])
+d = f"{home}/.cc/state/r/{row}"; rec, dr = f"{d}/delivery.json", f"{d}/dir.tmp"
+def held(pid):
+    try: return any(os.readlink(f).endswith("delivery.lock") for f in glob.glob(f"/proc/{pid}/fd/*"))
+    except OSError: return False
+for _ in range(n):
+    subprocess.run(["rm", "-rf", rec, dr]); os.makedirs(d, exist_ok=True); open(rec, "w").write('{}\n')
+    lk = open(f"{d}/delivery.lock", "a"); fcntl.flock(lk, fcntl.LOCK_EX)   # parks retire between its open and its move
+    p = subprocess.Popen([cctask, "retire", "r", row], env={**os.environ, "HOME": home}, stderr=subprocess.DEVNULL)
+    for _ in range(300):
+        if held(p.pid): break
+        time.sleep(0.01)
+    os.mkdir(dr); open(f"{dr}/x", "w").close(); fd = os.open(dr, os.O_PATH)
+    libc.renameat2(-100, rec.encode(), -100, dr.encode(), 2); lk.close()
+    for _ in range(10**5):   # the folder's own fd: lock it down the moment retire has moved it
+        try:
+            if os.stat(rec, follow_symlinks=False).st_ino != os.fstat(fd).st_ino: break
+        except OSError: break
+    os.chmod(f"/proc/self/fd/{fd}", mode); os.close(fd); p.wait()
+PY
+  for m in 555 000; do
+    python3 "$T/rc/swaplock.py" "$BIN/cc-task" "$T/rc/h" "m$m" "$m" 30 >/dev/null 2>&1; chmod -R u+rwx "$R/.receipts/r" "$R/r/m$m"
+    rc=0; [ -z "$(find "$R/.receipts/r" -maxdepth 1 -name "m$m.*" -type d)" ] || rc=1
+    t "…and a folder the member makes $m once it is moved never stays under a receipt name" "$rc"
+  done
   # A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design). Each case is
   # its own row under $T/nw, with a stub cc-slack that logs its posts; the reservation and the brief writer are stubbed.
   mkdir -p "$T/nw"; printf '#!/bin/bash\necho "$*" >> %q/nw/posts\n' "$T" > "$T/nw/slack"; chmod +x "$T/nw/slack"

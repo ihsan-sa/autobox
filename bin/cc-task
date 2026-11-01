@@ -138,6 +138,17 @@ def save(state, record):
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
+def unlock(name, fd):
+    """Give the folder <name> under <fd>, and every folder in it, u+rwx, through fds and never through a link, so a
+    0555 or 000 folder a member swapped in cannot block its own removal (O_PATH needs no read permission)."""
+    p = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    try:
+        os.chmod(f"/proc/self/fd/{p}", 0o700); d = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=p)
+        try: subs = [e.name for e in os.scandir(d) if e.is_dir(follow_symlinks=False)]
+        finally: os.close(d)
+        for e in subs: unlock(e, p)
+    finally: os.close(p)
+
 def retire(repo, row, unmerged=False):
     """Move <row>'s record to ~/.cc/state/.receipts/<repo>/<row>.<task id>.json, as `cc rm` and `cc --go` retire it.
     BY FILE DESCRIPTOR, because a member owns the <row> entry in its own <repo> dir (that dir is a bind it cannot
@@ -145,7 +156,10 @@ def retire(repo, row, unmerged=False):
     and a path move, 109 times in 300 (Opus read of #1904). Each step opens the one below it with O_NOFOLLOW, and the
     rename runs between those fds, so a link at <repo> or <row> is refused, and a swap after the open moves the
     member's own record. What the rename moved must be the file read, through the fd still held: a member can
-    swap delivery.json for a link in between, and that is taken back out of the receipts. Only a UUID names a
+    swap delivery.json for a link or a folder in between. A link or file is unlinked. A folder is first renamed within
+    the receipts dir to .quarantine.<uuid>, which needs no write on the folder and which no receipt reader matches,
+    then opened up (unlock) and removed through fds; if the member's modes still block that, only the quarantine
+    name is left, so no swapped entry stays under a receipt name. Only a UUID names a
     receipt; a record with none gets a fresh one. A row over 213 characters is named by its sha256, since the
     42 characters after it would pass the 255-byte name limit. --unmerged stamps a
     record that never closed as closed unmerged, in the receipt, which only the owner can write."""
@@ -167,7 +181,11 @@ def retire(repo, row, unmerged=False):
             with Lock(None, dir_fd=rec): os.rename("delivery.json", name, src_dir_fd=rec, dst_dir_fd=rc)
             held, moved = os.fstat(f.fileno()), os.stat(name, dir_fd=rc, follow_symlinks=False)
             if (moved.st_dev, moved.st_ino) != (held.st_dev, held.st_ino) or not stat.S_ISREG(moved.st_mode):
-                os.unlink(name, dir_fd=rc)
+                if not stat.S_ISDIR(moved.st_mode): os.unlink(name, dir_fd=rc)
+                else:
+                    q = f".quarantine.{uuid.uuid4()}"; os.rename(name, q, src_dir_fd=rc, dst_dir_fd=rc)
+                    try: unlock(q, rc); shutil.rmtree(q, dir_fd=rc)
+                    except OSError: pass
                 raise ValueError(f"{repo}/{row}'s record was swapped for another file before the move — refused")
         if unmerged and isinstance(d, dict) and d.get("closed") is None:
             d["closed"] = {"status": "unmerged", "at": stamp()}
