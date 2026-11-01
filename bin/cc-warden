@@ -32,9 +32,10 @@
 # crosses a hard line, a refer, a decision the ledger won't take and an ask given up on are released back to perms, open,
 # with the note on the ledger. The end of each tick sends perms' window one message for everything released since the
 # last one that went, whether a run or the tick released it, so a burst of releases is one wake. A tick stopped by the
-# usage limit or a pause sends nothing and the next one does. The message holds only a count and ids: perms skips
-# permissions, so no word of the ask or the model is typed at it. A send cc-msg fails is tried again on the next tick, and
-# meanwhile the asks are open and unmarked in `cc-refusals open`. A release the ledger doesn't take stays marked, and
+# usage limit or a pause sends nothing and the next one does. The message holds only counts and ids: perms skips
+# permissions, so no word of the ask or the model is typed at it. It names 20 ids, those ruled his first, and says how many
+# it left out. A send cc-msg fails is tried again after 1, 2, 4… minutes, an hour at most, and from the 5th failure in a row
+# the owner gets one card a day; meanwhile the asks are open and unmarked in `cc-refusals open`. A release the ledger doesn't take stays marked, and
 # each tick tries it again with no model run. An attempt's done file says what happened, not what the model answered.
 # FAILURE. A run over 20 min is killed and counts as failed; a malformed decision counts as failed; a run parked on a
 # usage limit doesn't count, and no run starts while cc-limit says the limit binds or `cc-pause is <repo>`. After 3 failed attempts or 24 h the
@@ -65,12 +66,24 @@ release(){ local note; note=$(one "$2"); mkdir -p "$W/$1"; printf '%s\n' "$note"
 # hand <id> <note>: release, and did says what became of it, for the attempt's done file
 hand(){ local note; note=$(one "$2")
   if release "$1" "$note"; then did="handed back to perms: $note"; else did="the ledger did not take the handback: $note"; return 1; fi; }
-# wake: one message for every ask waiting to be told, and only a send that worked clears the ones it counted
-wake(){ local f ids
+# wake: one message for every ask waiting to be told, and only a send that worked clears the ones it counted. .wake-fails
+# holds the failures in a row, and its mtime is when the last one was.
+wake(){ local f p ids his left fails=0 pause
   mapfile -t f < <(find "$W" -mindepth 2 -maxdepth 2 -name wake 2>/dev/null); [ "${#f[@]}" -gt 0 ] || return 0
-  ids=$(printf '%s\n' "${f[@]%/wake}" | sed 's|.*/||' | sort | head -20 | tr '\n' ' ')
-  "$T/cc-msg" perms "Wardens handed ${#f[@]} permission ask(s) back to you, among them $ids- the ones still open are in: cc-refusals open $REPO" >/dev/null 2>&1 \
-    && rm -f -- "${f[@]}"; }
+  [ -f "$W/.wake-fails" ] && fails=$(cat "$W/.wake-fails")
+  if [ "$fails" -gt 0 ]; then
+    pause=$(( fails > 6 ? 3600 : 60 << (fails - 1) ))
+    [ $(( $(date +%s) - $(stat -c %Y "$W/.wake-fails") )) -ge "$pause" ] || return 0; fi
+  # a handback starting "his:" is an ask apply() ruled his; those sort first
+  ids=$(for p in "${f[@]%/wake}"; do
+          if grep -q '^his: ' "$p/handback" 2>/dev/null; then echo "0 ${p##*/}"; else echo "1 ${p##*/}"; fi; done | LC_ALL=C sort)
+  his=$(grep -c '^0 ' <<<"$ids"); left=$(( ${#f[@]} > 20 ? ${#f[@]} - 20 : 0 ))
+  ids=$(cut -d' ' -f2 <<<"$ids" | head -20 | tr '\n' ' ')
+  if "$T/cc-msg" perms "Wardens handed ${#f[@]} permission ask(s) back to you, $his ruled his, named first: $ids- $left not named. The ones still open are in: cc-refusals open $REPO" >/dev/null 2>&1; then
+    rm -f -- "${f[@]}" "$W/.wake-fails"; return 0; fi
+  fails=$((fails + 1)); echo "$fails" > "$W/.wake-fails"
+  [ "$fails" -lt 5 ] || card "The wardens can't reach the permission session" "wake:$(date -u +%F)" \
+    "${#f[@]} permission ask(s) went back to perms, and telling it has failed $fails times in a row. They wait open in its ledger, and the wardens keep trying."; }
 why(){ jq -r '.reasons | join("; ")' <<<"$1"; }               # every reason cc-infer gave, since one can hide another
 card(){ "$T/cc-notify" --owner -t warden --heading "$1" --id "warden:$2" -- "$3" >/dev/null 2>&1; }
 SCHEMA='{"type":"object","additionalProperties":false,"required":["decision","note"],"properties":{"decision":{"enum":["grant","decline","his","tribunal"]},"line":{"type":"string"},"note":{"type":"string"}}}'

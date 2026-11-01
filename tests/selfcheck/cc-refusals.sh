@@ -69,6 +69,49 @@ selfcheck(){
   { jq -cn '{tool:"Bash", input:"one\ntwo\u001b[31m", reason:"r"}'; jq -cn '{tool:"Bash", input:{command:"three"}, reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
   sc collect repo t2 >/dev/null
   k "$(t test "$(jq -r 'select(.kind == "refusal") | .input | select(([explode[] | select(. < 32)] == []) and (contains("one") or contains("three")))' "$lg" | wc -l)" = 2)" "collect cleans control characters out of a spooled input, in both shapes"
+  # 3d'. a big input, a dash input: each reaches the ledger as the text it was, and two big ones are two records
+  big(){ python3 -I -c 'import json,sys; print(json.dumps({"session_id":"s1","cwd":sys.argv[1],"tool_name":"Write","tool_use_id":"t"+sys.argv[2],"reason":"r","tool_input":{"file_path":sys.argv[2],"content":sys.argv[3]*int(sys.argv[4])}}))' "$d/dev/repo" "$@" | CC_ROLE='' CC_REFUSALS_WINDOW=repo rec; }
+  fresh; big /a x 140000; big /b x 140000
+  k "$(t test "$(jq -r 'select(.kind == "refusal") | .input | select(startswith("{\"file_path\":\"/") and endswith("…(cut)") and length > 2000)' "$lg" | wc -l)" = 2)" "two refused Writes over 131072 bytes are two records, each holding its cut text"
+  fresh; big /c x 300000
+  k "$(t jq -e 'select(.tool == "Write" and .reason == "r" and (.input | startswith("{\"file_path\":\"/c\"") and endswith("…(cut)")))' "$lg")" "hook JSON over 200000 bytes is read whole, not filed empty"
+  fresh; for i in -h --help -x -- ; do jq -cn --arg i "$i" '{tool:"Bash", input:$i, reason:"r"}'; done > "$d/state/repo/t2/refusals.spool.jsonl"
+  jq -cn '{tool:"-h", input:"tool dash", reason:"-h"}' >> "$d/state/repo/t2/refusals.spool.jsonl"
+  CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 >/dev/null 2>&1
+  k "$(t test "$(jq -r 'select(.kind == "refusal" and .tool == "Bash") | .input' "$lg" | tr '\n' ' ')" = "-h --help -x -- ")" "a spooled input of -h and other dash inputs are filed as themselves"
+  k "$(t jq -e 'select(.tool == "-h" and .reason == "-h" and .input == "tool dash")' "$lg")" "…and so are a tool and a reason of -h"
+  fresh; python3 -I -c 'import json; print(json.dumps({"tool":"t"*140000,"session":"s"*140000,"input":"i"*140000,"reason":"r"*140000}))' > "$d/state/repo/t2/refusals.spool.jsonl"
+  CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 >/dev/null 2>&1
+  k "$(t jq -e 'select(.kind == "refusal" and (.tool | startswith("ttt")) and (.input | startswith("iii") and endswith("…(cut)")) and (.reason | startswith("rrr")) and (.session | length) == 200)' "$lg")" "every field of a spooled line over 131072 bytes reaches the ledger, cut"
+  fresh; python3 -I -c 'import json; print(json.dumps({"tool":"Bash","input":"a\n"*75000,"reason":"r"}))' > "$d/state/repo/t2/refusals.spool.jsonl"
+  local bt0; bt0=$SECONDS; CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 >/dev/null 2>&1
+  k "$(t test "$((SECONDS - bt0))" -lt 10 -a -s "$lg")" "150 KB of newlines is cut before it is cleaned, so jq doesn't stall on it (22 s uncut)"
+  # 3d''. what can't be read or cleaned is not filed as if it had worked, and says so
+  fresh; out=$(printf '{"cwd":"%s","tool_name":"Bash","tool_input":{"comm' "$d/dev/repo" | CC_ROLE='' CC_REFUSALS_WINDOW=repo rec 2>&1 >/dev/null)
+  k "$(t test ! -s "$lg" -a -n "$(grep 'nothing filed' <<<"$out")")" "hook JSON that doesn't parse files nothing, and stderr says so"
+  fresh; { jq -cn '{tool:"Bash", reason:"r"}'; jq -cn '{input:"no tool", reason:"r"}'; jq -cn '{tool:"Bash", input:" \u0001 ", reason:"r"}'; jq -cn '{tool:"Bash", input:"kept", reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
+  out=$(CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 2>&1)
+  k "$(t test "$(jq -r .input "$lg" | tr '\n' ' ')" = "kept " -a "$(wc -l < "$lg")" = 1 -a "$(grep -c 'nothing filed' <<<"$out")" = 3)" "a spooled line with no input, a blank one or no tool is not filed, says so, and the next line still is"
+  # …however long the blank is: over 4000 characters, under 4000 but past the cut, control characters, a blank tool, and
+  # text that starts only after the 2000 a warden would read. Real text past the same lengths is still filed.
+  fresh; python3 -I -c 'import json
+for l in ({"input":" "*5000},{"input":" "*3000},{"input":" \n"*2500},{"input":"\u0001"*5000},{"tool":" "*5000,"input":"blank tool"},{"input":" "*2500+"late"},{"input":"y"*5000},{"input":" "*1000+"z"}):
+    print(json.dumps({"tool":"Bash","reason":"r",**l}))' > "$d/state/repo/t2/refusals.spool.jsonl"
+  out=$(CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 2>&1)
+  k "$(t test "$(wc -l < "$lg")" = 2 -a "$(grep -c 'nothing filed' <<<"$out")" = 6)" "a spooled blank over 2000 or 4000 characters, in any form, is not filed and says so"
+  k "$(t jq -se '(.[0].input | startswith("yyy") and endswith("…(cut)")) and (.[1].input | endswith("z"))' "$lg")" "…while long text and text after a short blank are filed"
+  # a hook payload with no tool_input or a null one has no input; a real {} from a tool with no arguments has one
+  hk(){ jq -cn --arg c "$d/dev/repo" --argjson i "$1" '{session_id:"s1", cwd:$c, tool_name:"Bash", tool_use_id:"t", reason:"r"} + $i' | CC_ROLE='' CC_REFUSALS_WINDOW=repo rec 2>&1; }
+  fresh; out=$(hk '{}'; hk '{"tool_input":null}')
+  k "$(t test ! -s "$lg" -a "$(grep -c 'nothing filed' <<<"$out")" = 2)" "a hook payload with no tool_input, or a null one, files nothing and says so"
+  fresh; hk '{"tool_input":{}}' >/dev/null
+  k "$(t jq -e 'select(.tool == "Bash" and .input == "{}")' "$lg")" "…and a tool_input of {} is filed"
+  # a spool line that isn't a JSON object is dropped aloud, and the next one is still filed
+  fresh; { echo 'not json'; echo '[1]'; jq -cn '{tool:"Bash", input:"after junk", reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
+  out=$(CC_REFUSALS_ROOT=$d/state "$0" collect repo t2 2>&1)
+  k "$(t test "$(grep -c "isn't a JSON object" <<<"$out")" = 2 -a "$(jq -r .input "$lg")" = "after junk")" "collect says when it drops a line that isn't a JSON object, and files the next"
+  out=$( ( CLEAN='def clean: error("boom");'; refusal repo w s Bash x r t at ) 2>&1 ); local crc=$?
+  k "$(t test "$crc" != 0 -a "$(grep -c 'nothing filed' <<<"$out")" = 1 -a -z "$(grep kind <<<"$out")")" "jq failing to clean gives no record and says so"
   # 3e. a record the ledger did not take (its lock held past the wait) stays in the spool for the next collect
   fresh; jq -c . "$d/sbx/repo/t2/refusals.spool.jsonl" > "$d/state/repo/t2/refusals.spool.jsonl"
   ( exec 9>"$lg.lock"; flock 9; exec sleep 30 ) & local hold=$!

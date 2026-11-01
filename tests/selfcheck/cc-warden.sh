@@ -55,6 +55,7 @@ EOF
   isopen(){ CC_REFUSALS_ROOT=$st "$d/t/cc-refusals" open repo | grep "^$1 "; }
   msgs(){ grep -c "^perms .*\b$1\b" "$d/msg.log"; }   # the messages to the perms window that name this ask
   A=$st/repo/perms/wardens
+  due(){ touch -d '2 hours ago' "$A/.wake-fails" 2>/dev/null; }   # the backoff has passed
   echo WARDEN_PER_HOUR=100 > "$d/config"   # a high cap, so only case 8 meets it
 
   # 1. a grant: claimed before the run, the run's flags, the floor asked, the one door written, decided by warden
@@ -291,10 +292,13 @@ EOF
   touch "$d/msg.fail"; echo 'tern {"decision":"his","note":"his"}' > "$d/replies"
   ask q41 repo 'Bash: cc-board show repo, the tern case'; tk; tk
   k "$(t test -e "$A/q41/released" -a -e "$A/q41/wake" -a -n "$(isopen q41)" -a -z "$(isopen q41 | grep 'a warden holds it')" -a ! -e "$A/q41/2")" "a wake that isn't delivered is kept, and the ask is open and unmarked"
-  local tries; tries=$(msgs q41); tk; rm -f "$d/msg.fail"
+  # …and backing off, so the second of those two ticks didn't send
+  k "$(t test "$(msgs q41)" = 1 -a "$(cat "$A/.wake-fails")" = 1)" "…and a tick inside the backoff sends nothing"
+  k "$(t grep -qE '1 permission ask.* 1 ruled his, named first: q41 - 0 not named' "$d/msg.log")" "…and an ask the model ruled his is named as his"
+  local tries; tries=$(msgs q41); due; tk; rm -f "$d/msg.fail"
   k "$(t test "$(msgs q41)" -gt "$tries")" "…and each later tick tries it again"
-  tries=$(msgs q41); tk
-  k "$(t test "$(msgs q41)" = "$((tries + 1))" -a ! -e "$A/q41/wake")" "…until a send works, which clears it"
+  tries=$(msgs q41); due; tk
+  k "$(t test "$(msgs q41)" = "$((tries + 1))" -a ! -e "$A/q41/wake" -a ! -e "$A/.wake-fails")" "…until a send works, which clears it and the failure count"
   tries=$(msgs q41); tk
   k "$(t test "$(msgs q41)" = "$tries")" "…and then it is not sent again"
   # the real cc-msg with no perms window, in a fixture home with no tmux server: it says so with rc 1, so the wake is kept
@@ -303,7 +307,7 @@ EOF
   echo 'hare {"decision":"his","note":"his"}' > "$d/replies"
   ask q49 repo 'Bash: cc-board show repo, the hare case'; tk; tk
   k "$(t test -e "$A/q49/released" -a -e "$A/q49/wake")" "the real cc-msg, with no window to reach, fails and the wake is kept"
-  mv "$d/cc-msg.stub" "$d/t/cc-msg"; tk
+  mv "$d/cc-msg.stub" "$d/t/cc-msg"; due; tk
   k "$(t test ! -e "$A/q49/wake" -a "$(msgs q49)" = 1)" "…and the next send that works clears it"
 
   # 10. a release the ledger doesn't take is tried again with no model run, and reaches perms once it takes
@@ -365,6 +369,35 @@ EOF
   CC_REFUSALS_ROOT=$st "$d/t/cc-refusals" collect repo t9 >/dev/null; tk
   k "$(t test "$(jq -r 'select(.kind == "refusal" and .window == "worker:t9" and (.input | contains("\n") | not)) | .id' "$lg" | wc -l)" = 3)" "collect leaves no newline in a spooled input"
   k "$(t test "$(jq -r 'select(.kind == "refusal" and .window == "worker:t9") | .id' "$lg" | while read -r i; do dec "$i"; done | sort -u)" = "decline warden" -a ! -s "$d/msg.log")" "…so each is declined and signed, and perms is not woken"
+
+  # 17. of 26 released asks perms gets 20 names, the one ruled his first though it sorts last, and how many it didn't get
+  : > "$d/msg.log"; local i26
+  for i26 in $(seq 10 34); do mkdir -p "$A/n$i26"; echo "tribunal: x" > "$A/n$i26/handback"; : > "$A/n$i26/wake"; done
+  mkdir -p "$A/zhis"; echo "his: x" > "$A/zhis/handback"; : > "$A/zhis/wake"; tk
+  k "$(t grep -qE 'handed 26 permission ask.* 1 ruled his, named first: zhis n10 ' "$d/msg.log")" "the ask ruled his is named first, though its id sorts last"
+  k "$(t test "$(grep -oE '\bn[0-9]+\b' "$d/msg.log" | wc -l)" = 19)" "…with 19 others, so 20 ids in all"
+  k "$(t grep -q ' - 6 not named' "$d/msg.log")" "…and the wake says it didn't name 6"
+  k "$(t test ! -e "$A/n34/wake" -a ! -e "$A/zhis/wake")" "…and a send that worked clears the unnamed ones too"
+
+  # 18. a wake that keeps failing backs off, keeps its files, and from the 5th failure in a row tells the owner once a day
+  : > "$d/msg.log"; : > "$d/notified"; touch "$d/msg.fail"; mkdir -p "$A/nb"; echo "tribunal: x" > "$A/nb/handback"; : > "$A/nb/wake"
+  tk; tk; tk
+  k "$(t test "$(msgs nb)" = 1 -a "$(cat "$A/.wake-fails")" = 1 -a -e "$A/nb/wake")" "three ticks in a row try a failing wake once"
+  touch -d '50 seconds ago' "$A/.wake-fails"; tk
+  k "$(t test "$(msgs nb)" = 1)" "…and not again 50 seconds after the failure"
+  touch -d '70 seconds ago' "$A/.wake-fails"; tk
+  k "$(t test "$(msgs nb)" = 2 -a "$(cat "$A/.wake-fails")" = 2)" "…but after a minute it does"
+  touch -d '70 seconds ago' "$A/.wake-fails"; tk
+  k "$(t test "$(msgs nb)" = 2)" "…and the second failure waits two minutes, not one"
+  due; tk; due; tk
+  k "$(t test "$(msgs nb)" = 4 -a ! -s "$d/notified")" "four failures in a row tell nobody"
+  due; tk
+  k "$(t test "$(grep -c 'warden:wake:' "$d/notified")" = 1)" "the fifth tells the owner"
+  k "$(t test -e "$A/nb/wake" -a "$(cat "$A/.wake-fails")" = 5)" "…and the unsent wake is still not marked sent"
+  echo 50 > "$A/.wake-fails"; touch -d '59 minutes ago' "$A/.wake-fails"; tries=$(msgs nb); tk
+  k "$(t test "$(msgs nb)" = "$tries")" "the wait never goes past an hour, and hasn't passed yet at 59 minutes"
+  touch -d '61 minutes ago' "$A/.wake-fails"; rm -f "$d/msg.fail"; tk
+  k "$(t test "$(msgs nb)" = "$((tries + 1))" -a ! -e "$A/nb/wake" -a ! -e "$A/.wake-fails")" "…and past an hour it tries, and a send that works clears it all"
 
   rm -rf "${d:?}"
   echo "cc-warden selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]

@@ -156,7 +156,7 @@ GUARD_CHECKS = ("selfcheck-dashboard", "py-compile-cc-slack", "selfcheck-cc-slac
                 "selfcheck-cc-broker", "selfcheck-cc-msg", "selfcheck-cc-mail", "selfcheck-cc-publish",
                 "selfcheck-cc-loop", "e2e-say-go-loop", "selfcheck-cc-gh-org", "shellcheck-gh",
                 "selfcheck-cc-refusals", "selfcheck-cc-tmp-reap",
-                "selfcheck-cc-subagent-bound")
+                "selfcheck-cc-subagent-bound", "selfcheck-cc-warden")
 
 
 class Guards(unittest.TestCase):
@@ -172,7 +172,7 @@ class Guards(unittest.TestCase):
         # the overlay's own Cloudflare tool, found by its path so core/ never names the box
         cloudflare = [n for n, c in m.checks.items() if any(M.match(["bin-private/*cloudflare*"], p) for p in c.paths)]
         self.assertTrue(cloudflare, "no check covers the overlay's Cloudflare tool")
-        missing = [n for n in GUARD_CHECKS if n not in m.checks]
+        missing = [n for n in GUARD_CHECKS + ("shellcheck-cc-warden",) if n not in m.checks]
         self.assertEqual(missing, [], "a guarding check was renamed: update GUARD_CHECKS")
         rec = {"first": 1, "runs": {n: NG.MIN_RUNS for n in m.checks}, "pr_reds": {}, "nightly_reds": {}}
         out = NG.moved("box", m, rec, NOW)

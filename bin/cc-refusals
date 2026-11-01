@@ -2,10 +2,12 @@
 # cc-refusals — the ledger a repo's permission session reads: what the auto-mode classifier refused a session, the
 # permission questions sessions asked, and what the permission session decided about each one.
 #   cc-refusals record              THE PermissionDenied HOOK (config/claude-managed.json). Reads the hook's JSON on
-#                                   stdin and appends one refusal line, or nothing. Always exits 0 and prints nothing,
-#                                   so it can never turn a denial into a retry or fail a turn.
+#                                   stdin and appends one refusal line, or nothing. Always exits 0 and prints nothing
+#                                   on stdout, so it can never turn a denial into a retry or fail a turn. A refusal it
+#                                   can't read or clean, or whose tool or input is blank, is not filed, and stderr says so.
 #   cc-refusals collect <repo> <track>   moves what a sandboxed worker's hook spooled into the ledger (cc-loop runs it
-#                                   after each iteration, on the host)
+#                                   after each iteration, on the host). A line it can't read or clean, or whose tool or input is
+#                                   blank, is dropped, and stderr says so.
 #   cc-refusals ask <repo> --from <who> [--where <link>] -- <text>
 #   cc-refusals ask <repo> --from <workspace> --member [--kind <word>]
 #                                   A PERMISSION QUESTION (a permission, approval, refusal, credential or settings ask):
@@ -146,24 +148,33 @@ put(){ local lg=$1 obj=$2
     open_key "$lg" "$(jq -r .key <<<"$obj")" "$(jq -r .kind <<<"$obj")" && exit 3
     printf '%s\n' "$obj" | lapp "$lg" ); }
 
-# refusal(<repo> <window> <session> <tool> <input> <reason> <tool_use_id> <at> [<seat>]): the record, every field cleaned and cut
+# field <text>: its first 2000 characters, cleaned, ending …(cut) when there was more, or nothing when those are blank,
+# since a blank that gains a marker reads as text. It reaches jq on stdin, where no size fails the exec and nothing reads
+# as an option (`-h` on argv filed jq's usage text), and cut first, because jq's gsub is quadratic in its matches: 150 KB
+# of newlines took 22 s.
+field(){ local s; s=$(printf '%s' "${1:0:4000}" | jq -Rrs "$CLEAN"' clean') || { echo "cc-refusals: jq could not clean a refusal's field — nothing filed" >&2; return 1; }
+  local c=${s:0:2000}; [ -n "${c// }" ] || return 0
+  if [ "${#s}" -gt 2000 ] || [ "${#1}" -gt 4000 ]; then s="$c …(cut)"; fi
+  printf '%s' "$s"; }
+
+# refusal(<repo> <window> <session> <tool> <input> <reason> <tool_use_id> <at> [<seat>]): the record, every field cleaned
+# and cut, or nothing and exit 1: no warden rules on a refusal whose tool or input is blank in what it would read
 refusal(){ local tool inp why key
-  tool=$(jq -rn "$CLEAN"' $ARGS.positional[0] | clean' --args "$4")
-  why=$(jq -rn "$CLEAN"' $ARGS.positional[0] | clean' --args "$6")
+  tool=$(field "$4") && why=$(field "$6") || return 1
   # a spool's input is the worker's to write, and a decision on a command holding a newline can't be signed
-  inp=$(jq -rn "$CLEAN"' $ARGS.positional[0] | clean' --args "$5")
-  [ "${#inp}" -gt 2000 ] && inp="${inp:0:2000} …(cut)"
-  [ "${#why}" -gt 2000 ] && why="${why:0:2000} …(cut)"
+  inp=$(field "$5") || return 1
+  [ -n "${tool// }" ] && [ -n "${inp// }" ] || { echo "cc-refusals: a refusal from $2 has no tool or no input — nothing filed" >&2; return 1; }
   # the repo is in the key: two repos sharing the control repo's ledger can be refused the same command, and each is its own
   key=$(printf '%s\n%s\n%s' "$1" "$tool" "$inp" | sha1sum | cut -c1-12)
   jq -cn --arg id "r$(printf '%s\n%s\n%s\n%s' "$key" "$8" "$7" "$2" | sha1sum | cut -c1-8)" --arg at "$8" --arg rp "$1" \
-     --arg w "$2" --arg s "$3" --arg t "$tool" --arg i "$inp" --arg r "$why" --arg k "$key" --arg st "${9:-}" \
+     --arg w "$2" --arg s "${3:0:200}" --arg t "$tool" --arg i "$inp" --arg r "$why" --arg k "$key" --arg st "${9:-}" \
      '{kind:"refusal", id:$id, at:$at, source:"classifier", repo:$rp, window:$w, seat:$st, session:$s, tool:$t, input:$i, reason:$r, key:$k}'; }
 
 record(){
   local in cwd repo track='' win rel role=${CC_ROLE:-} lg tg obj seat=
-  in=$(head -c 200000) || return 0
+  in=$(cat) || return 0
   case $role in ''|worker|track) ;; *) return 0;; esac               # a member (or anything else): nothing
+  jq -e 'type == "object"' <<<"$in" >/dev/null 2>&1 || { echo "cc-refusals: the hook's JSON doesn't parse — nothing filed" >&2; return 0; }
   cwd=$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null); [ -n "$cwd" ] || cwd=$PWD
   cwd=$(readlink -f "$cwd" 2>/dev/null) || return 0
   rel=${cwd#"$(readlink -f "$DEV")"/}
@@ -179,7 +190,7 @@ record(){
   fi
   name_ok "$repo" || return 0
   fld(){ jq -r "$1 // \"\"" <<<"$in" 2>/dev/null; }
-  obj=$(refusal "$repo" "$win" "$(fld .session_id)" "$(fld .tool_name)" "$(jq -c '.tool_input // {}' <<<"$in" 2>/dev/null)" \
+  obj=$(refusal "$repo" "$win" "$(fld .session_id)" "$(fld .tool_name)" "$(jq -c '.tool_input | select(. != null)' <<<"$in" 2>/dev/null)" \
                 "$(fld .reason)" "$(fld .tool_use_id)" "$(date -u +%FT%TZ)" "$seat") || return 0
   if tg=$(target "$repo") && lg=$(ledger "$tg") && [ -w "${lg%/*}" ]; then put "$lg" "$obj" 2>/dev/null; return 0; fi
   # no ledger in sight — a worker inside the sandbox: spool it in its own state dir, for collect on the host
@@ -205,8 +216,8 @@ SPOOL_MAX_LINES=${CC_REFUSALS_SPOOL_MAX_LINES:-500} SPOOL_MAX_BYTES=2000000
 # collect <repo> <track>: the spooled refusals into the ledger. Window and repo are named here, not read from the spool.
 # A record leaves the spool only once the ledger took it or already holds it open; one the ledger did not take (its
 # lock held past the wait) goes back into the spool for the next collect. At most SPOOL_MAX_LINES lines and
-# SPOOL_MAX_BYTES bytes are read; the rest is dropped and said.
-collect(){ local repo=$1 track=$2 sp tg lg l n=0 kept=0 rc tmp keep more
+# SPOOL_MAX_BYTES bytes are read; the rest is dropped and said. A record refusal() won't file is dropped, and it says so.
+collect(){ local repo=$1 track=$2 sp tg lg l n=0 kept=0 rc tmp keep more obj
   name_ok "$track" || { echo "$USAGE" >&2; exit 2; }
   sp=$ROOT/$repo/$track/refusals.spool.jsonl; [ -e "$sp" ] || [ -L "$sp" ] || return 0
   if ! tg=$(target "$repo"); then    # no permission session anywhere: nothing will ever drain it, so it is not kept
@@ -221,9 +232,10 @@ collect(){ local repo=$1 track=$2 sp tg lg l n=0 kept=0 rc tmp keep more
     [ "$(stat -c %s -- "$tmp")" -gt "$SPOOL_MAX_BYTES" ] || [ "$(head -c "$SPOOL_MAX_BYTES" -- "$tmp" | wc -l)" -gt "$SPOOL_MAX_LINES" ] &&
       echo "cc-refusals: the spool from $repo/$track is over $SPOOL_MAX_LINES lines or $SPOOL_MAX_BYTES bytes — only that much was read" >&2
     while IFS= read -r l; do
-      jq -e 'type == "object"' <<<"$l" >/dev/null 2>&1 || continue
-      put "$lg" "$(refusal "$repo" "worker:$track" "$(jq -r '.session // ""' <<<"$l")" "$(jq -r '.tool // ""' <<<"$l")" \
-           "$(jq -r '.input // ""' <<<"$l")" "$(jq -r '.reason // ""' <<<"$l")" "spool" "$(date -u +%FT%TZ)")"; rc=$?
+      jq -e 'type == "object"' <<<"$l" >/dev/null 2>&1 || { echo "cc-refusals: a line of the spool from $repo/$track isn't a JSON object — dropped" >&2; continue; }
+      obj=$(refusal "$repo" "worker:$track" "$(jq -r '.session // ""' <<<"$l")" "$(jq -r '.tool // ""' <<<"$l")" \
+           "$(jq -r '.input // ""' <<<"$l")" "$(jq -r '.reason // ""' <<<"$l")" "spool" "$(date -u +%FT%TZ)") || continue
+      put "$lg" "$obj"; rc=$?
       case $rc in 0) n=$((n+1));; 3) ;; *) printf '%s\n' "$l" >> "$keep"; kept=$((kept+1));; esac
     done < <(head -c "$SPOOL_MAX_BYTES" -- "$tmp" | head -n "$SPOOL_MAX_LINES")
   fi

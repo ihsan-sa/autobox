@@ -54,6 +54,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `shellcheck-cc-publish` | static | reads one file: bash -n and shellcheck |
 | `shellcheck-cc-rc` | static | reads one file: bash -n and shellcheck |
 | `shellcheck-cc-refusals` | static | reads one file: bash -n and shellcheck |
+| `shellcheck-cc-warden` | static | reads one file: bash -n and shellcheck |
 | `shellcheck-cc-sandbox` | static | reads one file: bash -n and shellcheck |
 | `shellcheck-cc-settings` | static | reads one file: bash -n and shellcheck |
 | `shellcheck-cc-skills` | static | reads one file: bash -n and shellcheck |
@@ -155,6 +156,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `selfcheck-cc-publish` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-reconcile` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-refusals` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
+| `selfcheck-cc-warden` | hermetic | a stub model and stub tools against a fixture ledger; a check a head adds starts here |
 | `selfcheck-cc-rename` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-replay` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-sandbox` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |

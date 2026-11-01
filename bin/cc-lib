@@ -59,7 +59,8 @@ boundary reads one file, its own workspace's, and can reach no other.
         under one header — `checkpoint view: N of M entries of <path>[, 1 cut] · older entries: cc-lib ask --object
         <r/track> --need history` — so the reader knows what it was not shown and the one call that reaches it. The
         first entry that does not fit is cut at a line and says so (an older entry keeps its head; the newest, when it
-        alone is over the cap, keeps its tail, where its STATUS lines are). --from starts the view at the LAST entry
+        alone is over the cap, keeps its tail, where its STATUS lines are). A link at <journal> is refused (exit 1),
+        because the worker prompt carries this; /dev/fd/N, a file the caller opened itself, is read. --from starts the view at the LAST entry
         whose heading matches (cc-handoff: `journal at N%`, the marked entry a successor is told to read); no match,
         no effect. Read from the file, never the index, so never stale. cc-handoff --brief carries this instead of a
         64 KiB tail, cc-loop's iteration prompt instead of `tail -c 6000`; both fall back to the tail without cc-lib.
@@ -185,8 +186,9 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               (a course seat's checkout, the track its name) and then the project path: one copy of a relative path
               is read, the newest by mtime, a tie going to the worktree — a seat writes there and merges at
               milestones, so a search that saw only the primary would miss the current state.
-  Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
-  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board, read up to 64 MiB (cc-board's
+  Never read: anything not listed; a path with a link on it, at the file's name or any directory above it, but for a
+  member's board, ~/.cc/boards/<h>.json to its board under ~/.cc/members/<h>; a file whose name says secret,
+  credential, password or .env, or token unless it is a .md (a memory file is named after its rule); a file over 4 MiB, except a board, read up to 64 MiB (cc-board's
   own cap; a member's up to 8 MiB), and the landing queue, which only the box writes and is read from its newest 64 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
@@ -206,6 +208,7 @@ import math
 import os
 import re
 import resource
+import shutil
 import signal
 import sqlite3
 import stat
@@ -214,7 +217,7 @@ import sys
 import tempfile
 import time
 
-H = os.path.expanduser("~")
+H = os.path.realpath(os.path.expanduser("~"))   # real, so a link in a source's path is one a source could have planted (linked())
 PAGE = 8192            # one returned record page, at most
 SPAN = 6144            # a long entry is split at paragraphs into spans of at most this
 ASK_CAP = 24576        # one ask's answer, at most (a per-read bound, like PAGE; a question's turns are not summed)
@@ -503,10 +506,21 @@ def unlinked(path):
     return want if linked else path
 
 
+def linked(path):
+    """Whether a link stands anywhere on path, at its own name or at a directory above it: $proj/memory or a worktree's
+    lessons/x linked out of a worker's tree must not put the files behind it in `ask`, any more than a linked file may."""
+    return os.path.realpath(path) != path
+
+
 def open_regular(path):
     """A binary file object on unlinked(path), opened O_NOFOLLOW|O_NONBLOCK|O_NOCTTY and refused unless fstat says a regular
-    file: a link raises OSError, and a FIFO a member puts at its board or a source neither blocks the reader nor is read."""
-    f = os.fdopen(os.open(unlinked(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY), "rb")
+    file: a link raises OSError, at the name or (by the name the open descriptor has) at a directory above it, and a FIFO a
+    member puts at its board or a source neither blocks the reader nor is read."""
+    want = unlinked(path)
+    f = os.fdopen(os.open(want, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY), "rb")
+    if os.readlink(f"/proc/self/fd/{f.fileno()}") != want:
+        f.close()
+        raise OSError("a linked directory on the path")
     if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
         f.close()
         raise ValueError("not a regular file")
@@ -587,13 +601,14 @@ def boards():
 
 def registry():
     """[(path, skind, repo, track)] — every file this tool may read. Anything not produced here is never opened. A link at a
-    source's own name is not produced (unlinked() has the one exception), so reconcile drops whatever it had indexed there."""
+    source's name or at a directory above it is not produced (unlinked() has the one exception), so reconcile drops
+    whatever it had indexed there."""
     srcs = []
     seen = set()
 
     def add(p, skind, repo="", track=""):
         p = os.path.abspath(p)
-        if p in seen or os.path.islink(unlinked(p)) or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
+        if p in seen or linked(unlinked(p)) or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
             return
         seen.add(p)
         srcs.append((p, skind, repo, track))
@@ -606,7 +621,7 @@ def registry():
     for repo, (bp, proj) in B.items():
         if repo in QUAR:   # QUARANTINE: nothing of it is a source but its numbers-only results file
             rp = os.path.join(H, ".cc", "state", repo, RESULTS)
-            if os.path.isfile(rp) and not os.path.islink(rp):
+            if os.path.isfile(rp) and not linked(rp):
                 seen.add(rp)
                 srcs.append((rp, "results", repo, ""))
             continue
@@ -715,7 +730,7 @@ def slack_twins(path):
                                            glob.escape(os.path.basename(path))))):
         try:
             if not os.path.basename(os.path.dirname(os.path.dirname(p))).startswith("_") and not quarantine_of(p) \
-                    and not excluded(p) and os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= MAX_SOURCE:
+                    and not excluded(p) and os.path.isfile(p) and not linked(p) and os.path.getsize(p) <= MAX_SOURCE:
                 out.append(p)
         except OSError:
             pass
@@ -2539,8 +2554,8 @@ def view(argv):
         return 2
     p = os.path.abspath(os.path.expanduser(path))
     try:
-        with open(p, "rb") as f:
-            f.seek(max(0, os.path.getsize(p) - MAX_SOURCE))
+        with os.fdopen(os.open(p, os.O_RDONLY | (0 if p.startswith("/dev/fd/") else os.O_NOFOLLOW)), "rb") as f:   # a worker can plant a link at its journal, and this goes in its prompt; /dev/fd/N is cc-handoff-v2's own open, already refused a link
+            f.seek(max(0, os.fstat(f.fileno()).st_size - MAX_SOURCE))
             text = f.read().decode("utf-8", "replace")
     except OSError as e:
         print(f"cc-lib view: {e}", file=sys.stderr)
@@ -3346,6 +3361,9 @@ def selfcheck_p3(th, ok, run, w):
         m = re.search(r"^OUTCOME (\S+)", out, re.M)
         return m.group(1) if m else "?"
     # ---- the checkpoint view: cc-handoff's slice and the worker prompt's journal block read this, not a byte tail
+    w("secret-for-view", "a FAKE-SECRET the box holds\n"); os.symlink(os.path.join(th, "secret-for-view"), os.path.join(th, "planted-view.md"))
+    rc, o = run("view", os.path.join(th, "planted-view.md"))
+    ok("view: a link at the journal is refused, not followed, so the secret never reaches a prompt", rc == 1 and "FAKE-SECRET" not in o)
     jv = w(".cc/state/r1/t3/progress.md", "# t3\n\n## 2026-09-10T10:00Z iter 1\nOLD-ENTRY-REACHABLE the first step.\n\n"
            "## 2026-09-10T11:00Z iter 2\n" + "a middle line of the second entry, MIDDLE-HEAD first\n" * 40
            + "\n## 2026-09-10T12:00Z iter 3\nNEWEST-ENTRY the last step.\n```\n## not a heading, fenced\n```\n"
@@ -4506,6 +4524,49 @@ def selfcheck_links(th, ok, run, w):
     ok("a board name linked straight at a host file is no source", not found("lnkcanarychained") and not indexed(other))
     for p in (planted, was, bj, other, mb):
         os.remove(p)
+    # a linked root: the same refusal one level up, for a memory directory and a course in a lessons worktree
+    w("lnkroot/note.md", "# note\n\nlnkcanarymemroot\n")
+    mem = os.path.join(th, ".claude", "projects", "-lnkroot", "memory")
+    os.makedirs(os.path.dirname(mem))
+    os.symlink(os.path.join(th, "lnkroot"), mem)
+    plainroot = w(".claude/projects/-lnkplain/memory/note.md", "# note\n\nlnkcontrolmemroot\n")
+    run("index")
+    ok("a memory directory linked out of its tree: the note behind it is no source, and a plain memory directory's is found",
+       not found("lnkcanarymemroot") and not indexed(os.path.join(mem, "note.md")) and found("lnkcontrolmemroot") and indexed(plainroot))
+    ok("open_regular refuses a directory swapped for a link after add()'s check, and still opens a plain one",
+       refuses(open_regular, os.path.join(mem, "note.md")) and refuses(parse, os.path.join(mem, "note.md"), "doc", "", "", {})
+       and not refuses(lambda: open_regular(plainroot).close()))
+    pdir = os.path.dirname(plainroot)
+    os.rename(pdir, pdir + ".old")
+    os.symlink(os.path.join(th, "lnkroot"), pdir)
+    run("index")
+    ok("a memory directory indexed and now a link: its old rows go and the file behind it is not read",
+       not found("lnkcontrolmemroot") and not found("lnkcanarymemroot") and not indexed(plainroot))
+    w(".cc/boards/lessons.json", json.dumps({"repo": "lessons", "path": os.path.join(th, "dev", "lessons"), "tracks": {}, "log": []}))
+    w("lnkcourse/COURSE.md", "# course\n\nlnkcanarycourse\n")
+    w("lnkcourse/claude_lessons/l1/server/chat.log", "[2026-09-16T10:52:30.632Z] [CHAT_START] chatNum=1 msg=1 message=lnkcanarychatlog\n")
+    tree = os.path.join(th, ".cc", "worktrees", "lessons", "lnkseat", "lessons")
+    plain = w(".cc/worktrees/lessons/lnkseat/lessons/lnkplain/COURSE.md", "# course\n\nlnkcontrolcourse\n")
+    plainlog = w(".cc/worktrees/lessons/lnkseat/lessons/lnkplain/claude_lessons/l1/server/chat.log",
+                 "[2026-09-16T10:52:30.632Z] [CHAT_START] chatNum=1 msg=1 message=lnkcontrolchatlog\n")
+    os.symlink(os.path.join(th, "lnkcourse"), os.path.join(tree, "x"))
+    run("index")
+    ok("a course in a lessons worktree linked out of its tree: neither its .md nor its chat.log is a source",
+       not found("lnkcanarycourse") and not found("lnkcanarychatlog")
+       and not indexed(os.path.join(tree, "x", "COURSE.md")) and not indexed(os.path.join(tree, "x", "claude_lessons", "l1", "server", "chat.log")))
+    ok("a plain course in that worktree is found, its .md and its chat.log",
+       found("lnkcontrolcourse") and found("lnkcontrolchatlog") and indexed(plain) and indexed(plainlog))
+    w("lnkstate/progress.md", "# j\n\nlnkcanarystate\n")
+    w(".cc/state/lessons/lnkreal/progress.md", "# j\n\nlnkcontrolstate\n")
+    os.symlink(os.path.join(th, "lnkstate"), os.path.join(th, ".cc", "state", "lessons", "lnktrack"))
+    run("index")
+    ok("any other directory on a source's path counts the same: a track's state directory that is a link is no source, a plain one is",
+       not found("lnkcanarystate") and found("lnkcontrolstate"))
+    os.remove(os.path.join(th, ".cc", "boards", "lessons.json"))
+    os.remove(pdir)
+    for d in (".cc/state/lessons", ".cc/worktrees/lessons", ".claude/projects/-lnkroot", ".claude/projects/-lnkplain"):
+        shutil.rmtree(os.path.join(th, d))
+    run("index")
 
 
 def selfcheck_ranking(th, ok, run, w):
