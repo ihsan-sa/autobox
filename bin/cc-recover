@@ -6,7 +6,8 @@
   cc-recover restore [--boot] bring back every saved session that is not live: resumed on its own conversation,
                               then handed a catch-up turn (cc-recover-restore.service runs it at every boot);
                               a session whose project `cc-pause is <repo>` calls paused is left down and logged,
-                              a worker handed to `cc-pause keep` so `cc-pause off` starts it; a track cc refuses
+                              a worker handed to `cc-pause keep` so `cc-pause off` starts it (a keep that fails counts
+                              as failed, and one that finds the pause lifted launches it); a track cc refuses
                               as landed is left down, not counted as failed
   cc-recover bringup [--except <repo>...]
                               the owner's "bring it all back up", in one detached run (a transient user unit; --here
@@ -989,8 +990,8 @@ def ended(rec):
     or by hand). A saved set from before the end still names it, and relaunching it undoes the finish (10-30: dispatch@hive-lite)."""
     if rec.get("kind") != "orch":
         return ""
-    # the orch-closed case is what keeps an orch closed but never exited, channel still live (dispatch@hive-public),
-    # down across restores; the selfcheck case "restore: an orch that ended since the set was saved (it was marked closed)" covers that shape
+    # the orch-closed case keeps an orch closed but never exited, channel still live (dispatch@hive-public), down across
+    # restores, but only once a seat or a person has written its orch-closed/<window> mark, as nothing here does; the selfcheck case "restore: an orch that ended since the set was saved (it was marked closed)" covers that shape
     for mark, why in (("orch-ended", "it exited 0"), ("orch-closed", "it was marked closed")):
         if os.path.exists(os.path.join(SLACK, mark, rec["window"])):
             return why
@@ -1039,15 +1040,19 @@ def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=Tr
             log(logname, f"{w}: ended on purpose ({done}) — left down")
             continue
         if paused(rec["repo"]):   # a paused project spends nothing the box starts on its own (cc-pause)
-            already.append(w)
-            held.append(w)
             # cc-pause off restarts only the loops it stopped, and this one died before the pause, so hand it over
-            kept = rec["kind"] == "worker" and run([os.path.join(BIN, "cc-pause"), "keep", *launch_argv(rec)[1:]], env=env)[0] == 0
-            if kept or rec["kind"] != "worker" or paused(rec["repo"]):
-                log(logname, f"{w}: {rec['repo']} is paused — left down{', cc-pause off starts it' if kept else ''}")
+            worker = rec["kind"] == "worker"
+            rc = run([os.path.join(BIN, "cc-pause"), "keep", *launch_argv(rec)[1:]], env=env)[0] if worker else 0
+            if rc == 0:
+                already.append(w)
+                held.append(w)
+                log(logname, f"{w}: {rec['repo']} is paused — left down{', cc-pause off starts it' if worker else ''}")
                 continue
-            already.remove(w)
-            held.remove(w)   # the pause lifted between the check and keep: launch it like any other
+            if rc != 1:
+                failed.append(w)
+                log(logname, f"{w}: cc-pause keep failed (rc={rc}) — left down, and cc-pause off will not start it")
+                continue
+            # 1 is the pause lifted between the check and keep: launch it like any other (cc refuses it if a new pause began)
         e = dict(env)
         if rec["kind"] in ("seat", "orch") and rec.get("sid"):
             try:
@@ -1425,13 +1430,14 @@ def selfcheck():
     def end_orch(how):
         """r1@ops ends on purpose the way `how` (one of ENDS) records: a marker cc or a seat writes, or every channel archived."""
         os.makedirs(SLACK, exist_ok=True)
+        chans = json.load(open(f"{SLACK}/orchs.json")) if os.path.exists(f"{SLACK}/orchs.json") else {}
         if how == "archived":
-            with open(f"{SLACK}/orchs.json", "w") as f:
-                json.dump({"C1": {"target": "r1", "alias": "ops", "archived": True}, "C2": {"target": "r1", "alias": "x", "archived": False}}, f)
+            chans.update({"C1": {"target": "r1", "alias": "ops", "archived": True}, "C2": {"target": "r1", "alias": "x", "archived": False}})
         else:
             os.makedirs(f"{SLACK}/{how}", exist_ok=True); open(f"{SLACK}/{how}/r1@ops", "w").close()
-            with open(f"{SLACK}/orchs.json", "w") as f:  # the channel stays live: only the mark keeps it down
-                json.dump({"C1": {"target": "r1", "alias": "ops", "archived": False}}, f)
+            chans["C1"] = {"target": "r1", "alias": "ops", "archived": False}  # the channel stays live: only the mark keeps it down
+        with open(f"{SLACK}/orchs.json", "w") as f:
+            json.dump(chans, f)
 
     real = {"now": globals()["now"], "net_probe": globals()["net_probe"], "claude_pid": globals()["claude_pid"], "sleep": time.sleep}
     clock = [1_000_000.0]
@@ -1848,6 +1854,16 @@ def selfcheck():
         restore(boot=True)
         check("restore: a worker whose pause lifted before keep is launched",
               any(c.startswith("cc|r1|job|") for c in open(f"{d}/calls").read().splitlines()))
+        # keep fails while the pause holds: the worker is down and nothing will start it, so that is a failure, not "left down"
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(f"{d}/paused-r1", "w").close()
+        with open(f"{BIN}/cc-pause", "w") as f:
+            f.write(f"#!/bin/sh\ncase \"$1\" in\n is) [ -f {d}/paused-$2 ];;\n keep) exit 2;;\nesac\n")
+        rc = restore(boot=True)
+        rlog = open(path("restore.log")).read()
+        check("restore: a worker whose keep failed under a pause is reported as failed, not launched",
+              rc == 1 and "r1/job: cc-pause keep failed (rc=2)" in rlog and "did not come up: r1/job" in rlog)
         # a track cc refuses because it has landed is not a failure (10-30: two landed tracks failed the restore unit)
         d = fixture(); live_box(d); save({})
         open(f"{d}/windows.tsv", "w").write("box\t160\n")

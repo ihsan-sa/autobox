@@ -21,7 +21,8 @@
 #   cc-pause list                                     paused repo names, one per line (nothing when none are)
 #   cc-pause children <repo>                          every project declared under it, one per line
 #   cc-pause keep <repo> <track> <cc args…>           while paused, `off` also runs `cc <repo> <track> <cc args…>`: cc-recover's
-#                                                     restore hands it a worker that died before the pause
+#                                                     restore hands it a worker that died before the pause. Exit 1 when
+#                                                     not paused, 2 when it could not record the worker
 #   cc-pause selfcheck                                pause, resume, the reboot case and the cascade
 #
 # WHAT IS UNDER IT GOES WITH IT (owner, 2026-09-05, after a parked project's tool repository kept spending).
@@ -69,8 +70,9 @@ SKIPPERS="cc-reconcile (sweep and wake), cc-broker, cc-publish, board nags, the 
 # `is` takes a TARGET, not only a repo: cc-broker keys on `repo/track`, cc-reconcile's wake on `repo@alias`, and every one
 # of them means the same project. Deriving the repo here is the whole reason there is one command to ask.
 repo_of(){ local t="${1:-}"; t="${t%%/*}"; echo "${t%%@*}"; }
-# keep and off hold this per project, so a kept worker is never written back after off has read and removed the flag
-lock(){ mkdir -p "$STATE/$1"; exec {LOCKFD}>"$STATE/$1/paused.lock"; flock "$LOCKFD"; }
+# on, keep and off hold this per project around their read and write of the flag, so a kept worker is neither written
+# back after off has removed the flag nor lost to a second on rewriting it
+lock(){ { mkdir -p "$STATE/$1" && exec {LOCKFD}>"$STATE/$1/paused.lock" && flock "$LOCKFD"; } || die "could not lock $1"; }
 
 paused(){ local r; r=$(repo_of "${1:-}"); [ -n "$r" ] && [ -e "$(flag "$r")" ]; }
 
@@ -203,7 +205,7 @@ cmd_on(){
     -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
   esac; done
   msg=$(valid_repo "$repo") || die "$msg"
-  local f; f=$(flag "$repo"); mkdir -p "$(dirname "$f")"
+  local f; f=$(flag "$repo"); lock "$repo"
   local already=""; paused "$repo" && already=$(jq -r '.at // ""' "$f" 2>/dev/null)
 
   # STOP THE LOOPS FIRST, then write the flag? No: the flag goes first. A loop signalled before the flag exists
@@ -228,6 +230,7 @@ cmd_on(){
   fi
   jq -n --arg at "${already:-$(now)}" --arg by "$by" --arg note "$note" --arg via "$via" --argjson loops "$loops" \
      '{at:$at, by:$by, note:$note, via:$via, loops:$loops}' > "$f" || die "could not write $f"
+  exec {LOCKFD}>&-
 
   for pid in $(loop_pids "$repo"); do kill -TERM "$pid" 2>/dev/null; done   # cc-loop's own trap kills its claude and stands down
 
@@ -296,15 +299,15 @@ cmd_off(){
   return 0
 }
 
-cmd_keep(){   # <repo> <track> <cc args…>; exit 1 when not paused, so the caller starts it itself
+cmd_keep(){   # <repo> <track> <cc args…>; exit 1 when not paused, so the caller starts it itself, and 2 on any failure
   local repo="${1:-}" track="${2:-}" f c msg; shift
   msg=$(valid_repo "$repo") || die "$msg"
   f=$(flag "$repo"); lock "$repo"
   paused "$repo" || return 1
-  # a loop `on` stopped is already here under its own quoting: a second line would make `off` start it twice
-  c=$(printf '%q ' "$repo" "$track"); jq -e --arg p "$c" 'any(.loops[]?; startswith($p))' "$f" >/dev/null && return 0
+  # a loop `on` stopped is already here: a second line would make `off` start it twice
+  jq -e --arg p "$repo $track " 'any(.loops[]?; startswith($p))' "$f" >/dev/null && return 0
   c=$(printf '%q ' "$repo" "$@")
-  jq --arg c "${c% }" '.loops = ((.loops // []) + [$c])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  { jq --arg c "${c% }" '.loops = ((.loops // []) + [$c])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; } || die "could not write $f"
 }
 
 cmd_status(){
@@ -413,6 +416,34 @@ STUB
   printf '{"at":"2020-05-05T05:05:05Z","loops":["%s w1 --go \\"\\" --loop 3"]}\n' "$R" > "$h/.cc/state/$R/paused"
   P keep $R w1 --go "" --loop 3 --resume-last
   t "keep adds nothing for a loop the pause already recorded" "$(jq '.loops | length' "$h/.cc/state/$R/paused")" 1
+
+  box keepfail
+  mkdir -p "$h/.cc/state/$R/paused.tmp"
+  printf '{"at":"2020-05-05T05:05:05Z","loops":[]}\n' > "$h/.cc/state/$R/paused"
+  P keep $R w2 --loop 1 2>/dev/null; t "keep that cannot write the flag exits 2, not the 1 that means not paused" "$?" 2
+
+  # Two writers at once, in a set order. The first stalls inside the jq whose text is $1, the second starts while it
+  # sits there, then both finish. The second waits on the lock, and without the lock it overtakes the first.
+  race(){ mkdir -p "$h/shim"; local a b _
+    printf '#!/usr/bin/env bash\ncase "$*" in *"$STALL"*) : > "%s/held"; until [ -e "%s/go" ]; do sleep 0.05; done;; esac\nexec %s "$@"\n' \
+      "$h" "$h" "$(command -v jq)" > "$h/shim/jq"; chmod +x "$h/shim/jq"
+    # shellcheck disable=SC2086  # $2 and $3 are the words of one command each
+    STALL="$1" PATH="$h/shim:$PATH" P $2 >/dev/null 2>&1 & a=$!
+    for _ in {1..200}; do [ -e "$h/held" ] && break; sleep 0.05; done
+    # shellcheck disable=SC2086
+    P $3 >/dev/null 2>&1 & b=$!
+    sleep 0.5; : > "$h/go"; wait "$a" "$b"; }
+
+  box keepoff
+  P on $R > /dev/null 2>&1
+  race '.loops = ' "keep $R w2 --loop 1" "off $R"
+  P is $R; t "off that arrives during a keep's write leaves the flag removed" "$?" 1
+  t "…and starts the kept worker once" "$(cat "$h/cc.calls" 2>/dev/null)" "$R w2 --loop 1"
+
+  box onkeep
+  P on $R > /dev/null 2>&1
+  race '{at:$at' "on $R" "keep $R w2 --loop 1"
+  t "keep that arrives during a second on's write is not lost" "$(jq '.loops | length' "$h/.cc/state/$R/paused")" 1
 
   box twice
   mkdir -p "$h/.cc/state/$R"
@@ -563,6 +594,6 @@ case "${1:-}" in
   children)  first_visit "${2:-}"; descendants "${2:-}";;   # every project under this one, each once
   list)      for f in "$STATE"/*/paused; do [ -e "$f" ] && basename "$(dirname "$f")"; done; true;;
   selfcheck) selfcheck;;
-  ""|-h|--help) sed -n '2,37p' "$0"; exit 0;;
+  ""|-h|--help) sed -n '2,38p' "$0"; exit 0;;
   *)         die "unknown command '${1}' — cc-pause on|off|is|keep|status|list|children|selfcheck";;
 esac
