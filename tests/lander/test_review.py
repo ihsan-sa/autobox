@@ -604,13 +604,23 @@ class TestReview(Case):
         self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
         self.assertIn("(input: b)", v.blocking[0])
 
-    def test_land_with_an_unresolved_prior_blocker_is_a_handback(self):
+    def test_a_first_reads_land_with_advice_in_unresolved_lands(self):
+        # #2137: the brief named an earlier finding, the reader's LAND said "non-blocking advice" in `unresolved`, and
+        # carried() stopped the landing on a row that never existed
+        said = "The suggested guard remains unimplemented; this remains non-blocking advice."
         answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
-            "verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": ["1"]}}))
+            "verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": [said]}}))
         self.box(claude=answer)
         v = R.review(self.job(), comments=[])
-        self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["1"]))
-        self.assertIn("still open", v.blocking[0])
+        self.assertEqual((v.verdict, v.blocking, v.unresolved, v.advisory), (T.LAND, [], [], [said]))
+
+    def test_a_first_reads_handback_with_a_sentence_in_unresolved_stays_a_handback(self):
+        answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
+            "verdict": "HANDBACK", "blocking": [], "advisory": [], "resolved": [], "unresolved": ["x.py loses data"]}}))
+        self.box(claude=answer)
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.blocking),
+                         (T.HANDBACK_VERDICT, ["still open from the earlier read: x.py loses data"]))
 
     def delta(self, prior_rows, **said):
         """A delta read of this job against a prior HANDBACK with `prior_rows`, the reader answering `said`."""
@@ -625,6 +635,28 @@ class TestReview(Case):
                        resolved=[], moot=["1", "2"])
         self.assertEqual((v.verdict, v.blocking, v.unresolved), (T.LAND, [], []))
         self.assertEqual(sorted(v.resolved), ["1", "2"])
+
+    def test_a_delta_read_lands_on_a_row_it_calls_advice(self):
+        # the reader's way to say "still true, but advice": moot, with the row kept in `advisory`
+        advice = {"where": "x.py", "what": "the guard is still missing, and nothing reaches it"}
+        v = self.delta(["1. [scope] x.py — add a guard"], moot=["1"], advisory=[advice])
+        self.assertEqual((v.verdict, v.blocking, v.unresolved), (T.LAND, [], []))
+        self.assertEqual(v.advisory, ["x.py — the guard is still missing, and nothing reaches it"])
+        delta = R.load_prompt("delta.md")
+        self.assertIn("still true but below step 3's bar, so it blocks nothing", delta)
+        self.assertIn("A prior `[security]` blocker is never moot", delta)
+
+    def test_a_delta_reads_land_keeps_a_named_row_open_beside_a_stray_sentence(self):
+        v = self.delta(["1. [correctness] x.py — still wrong"], unresolved=["1", "a thought on y.py"])
+        self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["1"]))
+        self.assertEqual(v.blocking, ["[correctness] still open from the earlier read: x.py — still wrong"])
+        self.assertEqual(v.advisory, ["a thought on y.py"])
+
+    def test_a_security_row_called_advice_stays_pinned(self):
+        v = self.delta(["1. [security] x.py — the token leaks"], moot=["1"],
+                       advisory=[{"where": "x.py", "what": "still true, but advice"}])
+        self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["1"]))
+        self.assertEqual(v.blocking, ["[security] still open from the earlier read: x.py — the token leaks"])
 
     def test_a_real_still_open_blocker_stays_beside_a_moot_one(self):
         v = self.delta(["1. [scope] PR title — moot now", "2. [correctness] x.py — still wrong"],
@@ -2457,6 +2489,37 @@ class TestRecord(Case):
         box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. x"], by="claude-fable-5-1")])})
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "claude-fable-5-1"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
+
+    def test_the_planning_seat_releases_a_bought_hold_that_only_carries_rows(self):
+        # #2120: a read of its own said the carried [scope] row did not hold, and record refused the release
+        # the lander's own markers: one reader's name, and two readers' joined with a hyphen, as #2120's was
+        d = R.change_digest(DIFF)
+        self.seat(self.home("dev", "demo"))
+        held = self.comment("HANDBACK", d, ["1. [scope] still open from the earlier read: x.py — y"],
+                            by="claude-opus-5-5-gpt-6-astra")
+        box = self.box(**{"gh pr view": self.facts([held])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "demo", "--head", HEAD), 0)
+        self.assertIn("verdict=LAND by=demo", box.called("gh pr comment")[0]["input"])
+
+    def test_a_carried_hold_stays_when_it_is_security_new_or_the_caller_no_overseer(self):
+        d = R.change_digest(DIFF)
+        carried = "1. [scope] still open from the earlier read: x.py — y"
+        for rows, by, cwd in (
+                (["1. [security] still open from the earlier read: x.py — leak"], "demo", ("dev", "demo")),
+                ([carried, "2. [correctness] z.py — a new blocker"], "demo", ("dev", "demo")),
+                ([carried], "seat", (".cc", "worktrees", "demo", "seat"))):   # a track never releases its own stop
+            self.seat(self.home(*cwd))
+            box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, rows, by="claude-fable-5-1")])})
+            self.assertEqual(self.run_record("demo", "7", "LAND", "--by", by, "--head", HEAD), 1, rows)
+            self.assertEqual(box.called("gh pr comment"), [])
+        self.seat(self.home("dev", "demo"))   # perms' own hold is perms' to release
+        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, [carried], by="perms-security-read")])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "demo", "--head", HEAD), 1)
+        self.assertEqual(box.called("gh pr comment"), [])
+        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, [carried], by="claude-fable-5-1",
+                                                                 head="a" * 40)])})
+        self.seat(self.home("dev", "demo"))   # a hold at an earlier head is not this head's
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "demo", "--head", HEAD), 1)
 
     def test_record_refuses_when_the_change_digest_cannot_be_computed(self):
         """A transient git failure once made the digest '' and a marker with 'change= ' was posted, which lander-self

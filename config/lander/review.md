@@ -63,6 +63,8 @@ ANSWER with the JSON object the schema asks for and nothing else:
   stays inside the change's own feature and a follow-up fixes it), `where` (`<path>:<line>`),
   `what` (what is wrong, one sentence), `input` (the input, state or quoted brief line that shows it), `fix` (what
   the author does about it). Ten at most.
+- `resolved`, `moot`, `unresolved` — when the schema asks for them, empty lists: this is a first read, so no blocker
+  is earlier than it, and an earlier finding the brief names that you still see is a `blocking` or `advisory` one.
 - `advisory` — one object per advisory finding: `where`, `what`. Ten at most; leave out anything you would phrase
   as "it might be worth".
 

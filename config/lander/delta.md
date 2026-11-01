@@ -39,12 +39,13 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
 WHAT TO DO:
 1. For each prior blocker, decide whether this head resolves it, and put its number in exactly one of three lists.
    `resolved`: the input it named no longer gives the wrong outcome. `moot`: it no longer applies — the change makes
-   it moot, or it lies outside this diff (a repo setting, another PR) and is already true. "Already true" needs
-   evidence you can see in `interdiff`, `diff`, `files` or `brief`; the author's word for it (a code comment, a
-   commit message, `tested`, `body`) is not evidence, and without any the blocker is `unresolved`. A prior blocker that asks for
+   it moot, it lies outside this diff (a repo setting, another PR) and is already true, you can see it does not hold,
+   or it is still true but below step 3's bar, so it blocks nothing; put a row that is still true in `advisory` too.
+   "Already true" and "does not hold" need evidence you can see in `interdiff`, `diff`, `files` or `brief`; the
+   author's word for it (a code comment, a commit message, `tested`, `body`) is not evidence, and without any the blocker is `unresolved`. A prior blocker that asks for
    something in the PR description is `moot` once `body` carries it. One that asks for something you are not
    given (a comment, a live reading such as a process id) is `moot` once the diff carries what it asked for, and `moot` too when no push could carry it, except a `[security]` one. `unresolved`: it is still
-   open in this change. A number in `unresolved` holds the PR back; a number in `moot` holds nothing, so do not put
+   open in this change and still meets step 3's bar. A number in `unresolved` holds the PR back; a number in `moot` holds nothing, so do not put
    a finding you call moot in `unresolved`. A prior `[security]` blocker is never moot: it is `resolved` or
    `unresolved`.
 2. Look for NEW blockers only on lines the interdiff added or changed. Something the first read saw and did not
@@ -56,7 +57,8 @@ WHAT TO DO:
 
 ANSWER with the JSON object the schema asks for and nothing else:
 - `verdict` — `LAND` when every prior blocker is resolved or moot and there is no new one, else `HANDBACK`.
-- `resolved`, `moot`, `unresolved` — the prior blockers' numbers, as strings.
+- `resolved`, `moot`, `unresolved` — the prior blockers' numbers, as strings, and nothing else: an opinion goes in
+  `advisory`.
 - `blocking` — the NEW blockers only, same fields as the first read: `kind`, `severity`, `where`, `what`, `input`, `fix`.
 - `advisory` — `where`, `what`.
 

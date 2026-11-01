@@ -5,9 +5,11 @@
                                      LAND also goes in perms' ledger: "a security path"); refused if --head moved,
                                      if it is looser than a HANDBACK already standing (old words map as below) that
                                      is not this --by's own at this head (a seat releases its own hold, run from
-                                     that seat's own directory, seat_home(); perms' own, from the perms seat), or
-                                     if the head, the base or the change digest cannot be worked out right now (a
-                                     marker with an empty change= matches no reader, so nothing is posted)
+                                     that seat's own directory, seat_home(); perms' own, from the perms seat; the
+                                     planning seat or perms, too, one that only carries non-security rows,
+                                     carried_hold()), or if the head, the base or the change digest cannot be worked
+                                     out right now (a marker with an empty change= matches no reader, so nothing is
+                                     posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
     lander perms-read <repo> <pr>    perms only: start its security read of the PR's head in a session of its own, so
                                      a hand-off of the perms window does not end it ("perms' own reads", below)
@@ -124,15 +126,16 @@ how cc-spend puts its cost on `<repo>/review`, and every read's cost is also add
 
 A handback's re-read is delta_review(): the interdiff between the head the prior read saw and this head, the prior
 blockers numbered; it answers resolved/unresolved/moot and new blockers on added lines only. It counts as a read.
-A prior blocker the read lists as moot (the change makes it no longer apply, or it lies outside the diff and is
-already true) holds nothing and counts as resolved; one it lists as both moot and unresolved stays unresolved, and an
-unresolved one is a HANDBACK whatever the verdict word says. A prior [security] blocker is never moot (pinned()): it
+A prior blocker the read lists as moot (the change makes it no longer apply, it lies outside the diff and is
+already true, it does not hold, or it is still true but blocks nothing) holds nothing and counts as resolved; one it
+lists as both moot and unresolved stays unresolved, and an unresolved one is a HANDBACK whatever the verdict word says. A prior [security] blocker is never moot (pinned()): it
 stays unresolved, named or left out of every list, and the HANDBACK stands, until a read resolves it. "Already
 true" needs evidence in the read's inputs, not the author's word (delta.md says so; no code can check it). Each
 prior blocker left unresolved is carried into the verdict as a blocking row with the prior row's own text and its
 kind tag in front, "[security] still open from the earlier read: …" (carried()), whatever the reader's verdict
 word and whether or not it named new blockers, so pinned() finds the [security] row again in the round after, and
-every round.
+every round. A name in `unresolved` that is no prior row (a first read has none; #2137's was the reader's own
+sentence calling it advice) is an advisory row on a LAND, and is carried as written on a HANDBACK.
 
 A SECURITY PATH needs perms' security read (perms, after #1265: a tunnel unit and the Cloudflare door merged with
 no security read, and the read after found a HIGH). When the plan names a changed file on the base's
@@ -692,7 +695,8 @@ def parse(answer, digest, model="", tokens=0):
     """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff), and so
     is a HANDBACK that names no blocker and leaves no prior one unresolved: it asks a fix nobody can make, and a
     re-queue at that head would meet it again (#919), so it is retried as a silent read. Its unresolved prior
-    blockers become blocking rows only once _buy() has run carried() on it."""
+    blockers become blocking rows only once _buy() has run carried() on it, which also decides a name that is no
+    prior row."""
     try:
         j = json.loads(answer)
     except (TypeError, ValueError):
@@ -758,13 +762,19 @@ def carried(v, prior):
     the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
     still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
     as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
-    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. `prior` is the
-    prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
+    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it on a HANDBACK; on a
+    LAND it blocks nothing, because no row is open and the reader said so, and it stays as an advisory row. `prior`
+    is the prior verdict's blocking rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
     rows = list(prior or [])
     out = []
-    for x in v.unresolved:
+    for x in list(v.unresolved):
         n = row_number(x)
-        row = rows[int(n) - 1] if n and 1 <= int(n) <= len(rows) else x
+        on_row = n and 1 <= int(n) <= len(rows)
+        if not on_row and v.verdict == T.LAND:
+            v.unresolved.remove(x)
+            v.advisory.append(x)
+            continue
+        row = rows[int(n) - 1] if on_row else x
         m = KIND_TAG.match(row)
         tag, row = (m.group(0), row[m.end():]) if m else ("", row)
         row = row[len(STILL_OPEN):] if row.startswith(STILL_OPEN) else row
@@ -773,6 +783,14 @@ def carried(v, prior):
         v.verdict = T.HANDBACK_VERDICT
         v.blocking = out + [b for b in v.blocking if b not in out]   # no cap: a cut would drop a [security] pin
     return v
+
+
+def carried_hold(v):
+    """True when a HANDBACK holds the PR only on rows carried from an earlier read, none [security], and is not
+    perms': the planning seat or perms may release it with a read of its own (#2120), which cmd_record checks. Not
+    bought(): a two-reader marker signs by=a-b, which names no reader."""
+    return not v.model.lower().startswith("perms") and bool(v.blocking) and all(
+        re.match(rf"({KIND_TAG.pattern})?{STILL_OPEN}", r) and "[security]" not in r for r in v.blocking)
 
 
 def _row(f, hard):
@@ -2158,7 +2176,7 @@ def _buy(job, template, diff, more, prior=None, light=False):
             v.extra.update(stood_in_for=model, stood_in_why=why[:300])
         if v is None:
             return _silent(job, j, model, why)
-        v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` holds it too
+        v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` goes through it too
         reads.append((sub or model, v))
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)
@@ -2414,9 +2432,12 @@ def cmd_record(argv):
             v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
             if v and v.digest == job.digest:
                 holds = holds + [v] if v.verdict == T.HANDBACK_VERDICT else []
-        if any(h.model != who or bought(h) or not job.head.startswith(h.extra.get("head") or "-") for h in holds):
+        overseer = perms_name or who == repo_name(repo)
+        if any(not ((h.model == who and not bought(h)) or (overseer and carried_hold(h)))
+               or not job.head.startswith(h.extra.get("head") or "-") for h in holds):
             print("lander record: HANDBACK stands for this change and LAND is looser; only the reader that "
-                  "recorded it can release it, at the head it held; push the fix instead")
+                  "recorded it can release it, at the head it held (the planning seat or perms, too, when it only "
+                  "carries non-security rows); push the fix instead")
             return 1
         # perms' own holds (perms-security-read among them) are the perms seat's, which perms_seat_caller() found
         home, caller = os.path.realpath(seat_home(who, repo)), caller_seat()
