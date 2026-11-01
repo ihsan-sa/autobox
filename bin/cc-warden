@@ -28,10 +28,13 @@
 #     claude above it (wseat there), so the model run in this same cgroup can't decide from its Bash tool.
 # CLAIMED ONCE. Before a run starts, the unit writes a claim line in the ledger (`cc-refusals warden … claim`), and
 # `cc-refusals open` marks that id "(a warden holds it)" for the perms seat to leave. his, tribunal, a grant line that
-# crosses a hard line, a refer and an ask given up on are released back to perms, open, with the note on the ledger.
+# crosses a hard line, a refer, a decision the ledger won't take and an ask given up on are released back to perms, open,
+# with the note on the ledger and one message to its window. That message names only the id: perms skips permissions, so
+# no word of the ask or the model is typed at it, and if it isn't delivered the ask is still open and unmarked in
+# `cc-refusals open`. A release the ledger doesn't take stays marked, and each tick tries it again with no model run.
 # FAILURE. A run over 20 min is killed and counts as failed; a malformed decision counts as failed; a run parked on a
 # usage limit doesn't count, and no run starts while cc-limit says the limit binds or `cc-pause is <repo>`. After 3 failed attempts or 24 h the
-# ask is released and the owner gets one card. The same want (the ledger's key) asked again within the hour shares the
+# ask is released and the owner gets one card, still if the release didn't take. The same want (the ledger's key) asked again within the hour shares the
 # first verdict, read only from its signed ledger decision (`cc-refusals decisions`), never from a file here; a shared
 # grant sends the same line through the same floor again. cc-config keys: WARDEN_PER_HOUR (runs started an hour, default 12), WARDEN_BUDGET (dollars a run,
 # default 3), WARDEN_MODEL (default claude-opus-5-5).
@@ -50,8 +53,13 @@ USAGE="usage: cc-warden tick | attempt <id> <n> | selfcheck"
 cfg(){ local v; v=$("$T/cc-config" get "$1" "" 2>/dev/null); printf '%s\n' "${v:-$2}"; }
 rf(){ "$T/cc-refusals" "$@"; }
 one(){ tr '\n\r' '  ' <<<"$1" | cut -c1-500; }               # a ledger note is one line (cc-refusals signs no newline)
-# release <id> <note>: the ask goes back to the perms seat, and no warden runs it again
-release(){ mkdir -p "$W/$1" && touch "$W/$1/released"; rf warden "$REPO" "$1" release "$(one "$2")"; }
+# release <id> <note>: the ask goes back to the perms seat, and no warden runs it again. handback holds the note for the
+# tick to try again until the ledger takes it; only then is the ask released and perms told.
+release(){ local note; note=$(one "$2"); mkdir -p "$W/$1"; printf '%s\n' "$note" > "$W/$1/handback"
+  rf warden "$REPO" "$1" release "$note" || return 1
+  touch "$W/$1/released"
+  "$T/cc-msg" perms "A warden handed permission ask $1 back to you, and it's open: cc-refusals show $REPO $1" >/dev/null 2>&1 || true; }
+why(){ jq -r '.reasons | join("; ")' <<<"$1"; }               # every reason cc-infer gave, since one can hide another
 card(){ "$T/cc-notify" --owner -t warden --heading "$1" --id "warden:$2" -- "$3" >/dev/null 2>&1; }
 SCHEMA='{"type":"object","additionalProperties":false,"required":["decision","note"],"properties":{"decision":{"enum":["grant","decline","his","tribunal"]},"line":{"type":"string"},"note":{"type":"string"}}}'
 # what a run may do, all of it: the session loads no settings file (--setting-sources ""), so the guard hook is named
@@ -80,8 +88,8 @@ apply(){ local id=$1 dec=$2 line=$3 note; note=$(one "$4")
     local v who frm
     v=$("$T/cc-infer" decide --ask "$line" 2>/dev/null)
     who=$(jq -r '"\(.verdict) \(.who // "")"' <<<"$v" 2>/dev/null)
-    case $who in "ASK-OWNER owner") dec=his note="cc-infer: the grant crosses a hard line ($(one "$(jq -r '.reasons[0]' <<<"$v")"))";;
-                 REFUSE*) dec=decline note="cc-infer: $(one "$(jq -r '.reasons[0]' <<<"$v")")";; esac
+    case $who in "ASK-OWNER owner") dec=his note="cc-infer: the grant crosses a hard line ($(one "$(why "$v")"))";;
+                 REFUSE*) dec=decline note="cc-infer: $(one "$(why "$v")")";; esac
   fi
   case $dec in
     grant) # only a planning seat's ask or refusal can pass cc-approve: its seat, which cc-refusals read from the asker
@@ -92,10 +100,12 @@ apply(){ local id=$1 dec=$2 line=$3 note; note=$(one "$4")
              || { release "$id" "cc-approve referred $line: $(jq -r '.reason // "no answer"' <<<"$v" 2>/dev/null)"; return 0; }
            "$T/cc-settings" grant allow "$line" --by warden --card "warden:$id" >/dev/null 2>&1 \
              || { release "$id" "cc-settings did not write $line"; return 1; }
-           rf decide "$REPO" "$id" grant "$(one "$line — $note")" ;;
-    decline) rf decide "$REPO" "$id" decline "$note" ;;
-    *) release "$id" "$dec: $note" ;;
-  esac >/dev/null; }
+           note="$line — $note" ;;
+    decline) ;;
+    *) release "$id" "$dec: $note"; return ;;
+  esac
+  rf decide "$REPO" "$id" "$dec" "$(one "$note")" >/dev/null \
+    || { release "$id" "the ledger did not take this decision, so a grant's line is written but unrecorded: $dec: $note"; return 1; }; }
 
 attempt(){ local id=$1 n=$2 a rec sc out res dec line note
   a=$W/$id/$n; [ -d "$a" ] || exit 2; rec=$(ask_of "$id"); [ -n "$rec" ] || { echo "failed: not open" > "$a/done"; exit 0; }
@@ -119,7 +129,8 @@ attempt(){ local id=$1 n=$2 a rec sc out res dec line note
   { [ -z "$dec" ] || [ -z "$note" ] || { [ "$(jq -r .decision <<<"$dec")" = grant ] && ! grep -qE "$RULE" <<<"$line"; }; } \
     && { echo "failed: malformed decision" > "$a/done"; exit 0; }
   printf '%s\n' "$dec" > "$a/decision.json"
-  apply "$id" "$(jq -r .decision <<<"$dec")" "$line" "$note" "$rec"; echo "ok: $(jq -r .decision <<<"$dec")" > "$a/done"; }
+  if apply "$id" "$(jq -r .decision <<<"$dec")" "$line" "$note" "$rec"; then echo "ok: $(jq -r .decision <<<"$dec")" > "$a/done"
+  else echo "failed: the decision did not take" > "$a/done"; fi; }
 
 # Claude Code expands ' @path' in a prompt as a Read that no hook or allow check sees, and this brief is the prompt. So every @ of
 # the ask goes in as its JSON escape: the model reads the same words, and Claude Code finds no @ to expand.
@@ -159,7 +170,7 @@ same(){ rf decisions "$REPO" 2>/dev/null | jq -c -s --arg k "$1" --arg id "$2" -
   | . + {line: (if .decision == "grant" then (.note | capture("^(?<l>[A-Za-z][A-Za-z0-9_]*[(][^()]*[)]) — ").l? // "") else "" end)}
   | select(.decision != "grant" or .line != "")] | last // empty'; }
 
-tick(){ local id rec d last n k f now per started v who hit
+tick(){ local id rec d last n k f now per started v who hit gave back s
   [ -d "$ROOT/$REPO/perms" ] || exit 0
   mkdir -p "$W" || exit 1; exec 9>"$W/.tick.lock"; flock -n 9 || exit 0
   "$T/cc-limit" status >/dev/null 2>&1 && exit 0             # parked on a usage limit: start nothing
@@ -175,18 +186,20 @@ tick(){ local id rec d last n k f now per started v who hit
     if [ -n "$last" ] && [ ! -e "$d/$last/done" ]; then
       live "$d/$last" "$id" && continue
       echo "failed: the run ended with no result" > "$d/$last/done"; fi
-    if [ "$(grep -l '^failed' "$d"/*/done 2>/dev/null | wc -l)" -ge 3 ] || \
-       { [ -f "$d/1/brief.md" ] && [ $((now - $(stat -c %Y "$d/1/brief.md"))) -ge 86400 ]; }; then   # brief: "After three failed attempts or 24 hours, the owner gets one card"
-      release "$id" "the wardens gave up on it after 3 failed attempts or a day" >/dev/null 2>&1
-      card "The wardens couldn't decide a permission ask" "$id" \
-        "Permission ask $id failed three warden runs or waited a day, so it's back with perms."
+    gave=0; if [ "$(grep -l '^failed' "$d"/*/done 2>/dev/null | wc -l)" -ge 3 ] || \
+       { [ -f "$d/1/brief.md" ] && [ $((now - $(stat -c %Y "$d/1/brief.md"))) -ge 86400 ]; }; then gave=1; fi   # brief: "After three failed attempts or 24 hours, the owner gets one card"
+    back=$(cat "$d/handback" 2>/dev/null); [ "$gave" = 1 ] && back=${back:-the wardens gave up on it after 3 failed attempts or a day}
+    if [ -n "$back" ]; then   # a handback waiting on the ledger is tried again here, and never gets a model
+      if release "$id" "$back" >/dev/null 2>&1; then s="so it's back with perms"; else s="and the ledger didn't take its release, so it still shows as a warden's"; fi
+      [ "$gave" = 1 ] && card "The wardens couldn't decide a permission ask" "$id" \
+        "Permission ask $id failed three warden runs or waited a day, $s."
       continue; fi
     # a REFUSE is code's, before any model; a hard line only tells the model what fired
     v=$("$T/cc-infer" decide --ask "$(want "$rec")" 2>/dev/null); who=$(jq -r '"\(.verdict) \(.who // "")"' <<<"$v" 2>/dev/null)
     hit=""
     case $who in
-      "ASK-OWNER owner") hit=$(jq -r '.reasons[0]' <<<"$v");;
-      REFUSE*) apply "$id" decline "" "cc-infer: $(jq -r '.reasons[0]' <<<"$v")" "$rec"; continue;; esac
+      "ASK-OWNER owner") hit=$(why "$v");;
+      REFUSE*) apply "$id" decline "" "cc-infer: $(why "$v")" "$rec"; continue;; esac
     # the same want within the hour shares one verdict, from the signed ledger
     k=$(jq -r '.key // ""' <<<"$rec")
     f=$([ -n "$k" ] && same "$k" "$id" "$now")

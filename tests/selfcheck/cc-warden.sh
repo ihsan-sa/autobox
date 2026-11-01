@@ -1,6 +1,6 @@
 # shellcheck shell=bash disable=SC2154,SC2034
 # cc-warden's selfcheck cases. bin/cc-warden sources this file and calls selfcheck() in its own shell, so BIN and
-# SELF are that tool's. A stub model, stub tools (cc-approve, cc-settings, cc-notify, cc-limit) and a fixture ledger;
+# SELF are that tool's. A stub model, stub tools (cc-approve, cc-settings, cc-notify, cc-msg, cc-limit) and a fixture ledger;
 # the real cc-refusals, cc-infer and cc-config run against fixture paths. The live ledger is never read.
 
 selfcheck(){
@@ -11,14 +11,16 @@ selfcheck(){
   st=$d/state; lg=$st/repo/perms/refusals.jsonl; mkdir -p "$st/repo/perms" "$d/t"
   wcg="/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/cc-warden.service"
   # the real ledger tool, standing in the warden unit's cgroup against the fixture root
-  printf '#!/bin/sh\nCC_REFUSALS_CG=%s CC_REFUSALS_PERMS_LIVE=1 CC_BOX=box1 CC_REFUSALS_CTL=nobody CC_REFUSALS_NOTIFY=%s/t/cc-notify exec %s/cc-refusals "$@"\n' \
-    "$wcg" "$d" "$BIN" > "$d/t/cc-refusals"
+  # …whose release fails while release.fail exists
+  printf '#!/bin/sh\n[ "$1$4" = wardenrelease ] && [ -e %s/release.fail ] && exit 1\nCC_REFUSALS_CG=%s CC_REFUSALS_PERMS_LIVE=1 CC_BOX=box1 CC_REFUSALS_CTL=nobody CC_REFUSALS_NOTIFY=%s/t/cc-notify exec %s/cc-refusals "$@"\n' \
+    "$d" "$wcg" "$d" "$BIN" > "$d/t/cc-refusals"
   printf '#!/bin/sh\nexec %s/cc-infer "$@"\n' "$BIN" > "$d/t/cc-infer"
   printf '#!/bin/sh\nCC_CONFIG=%s/config exec %s/cc-config "$@"\n' "$d" "$BIN" > "$d/t/cc-config"
   # cc-approve applies a line listed in approve.ok asked by a planning seat, and refers the rest
   printf '#!/bin/sh\necho "$*" >> %s/approve.log\necho "pin=$APPROVER_REPO" >> %s/approve.env\ncase "$5" in */*) echo "{\\"verdict\\":\\"refer\\",\\"reason\\":\\"not a planning seat\\"}"; exit 1;; esac\ngrep -qxF -- "$3" %s/approve.ok 2>/dev/null && { echo "{\\"verdict\\":\\"apply\\"}"; exit 0; }\necho "{\\"verdict\\":\\"refer\\",\\"reason\\":\\"no grant\\"}"; exit 1\n' "$d" "$d" "$d" > "$d/t/cc-approve"
   printf '#!/bin/sh\necho "$*" >> %s/settings.log\n' "$d" > "$d/t/cc-settings"
   printf '#!/bin/sh\necho "$*" >> %s/notified\n' "$d" > "$d/t/cc-notify"
+  printf '#!/bin/sh\necho "$*" >> %s/msg.log\n[ ! -e %s/msg.fail ]\n' "$d" "$d" > "$d/t/cc-msg"
   printf '#!/bin/sh\n[ -e %s/paused ]\n' "$d" > "$d/t/cc-pause"
   printf '#!/bin/sh\ncase $1 in status) [ -e %s/limited ];; check) grep -q "usage limit" "$2";; *) exit 1;; esac\n' "$d" > "$d/t/cc-limit"
   # THE STUB MODEL: logs its argv, then answers by the word in the ask (replies: <word> <what>): a JSON decision,
@@ -50,6 +52,7 @@ EOF
       sleep 0.05; i=$((i+1)); done; }
   dec(){ jq -r --arg id "$1" 'select(.kind == "decision" and .id == $id) | "\(.decision) \(.by)"' "$lg"; }
   isopen(){ CC_REFUSALS_ROOT=$st "$d/t/cc-refusals" open repo | grep "^$1 "; }
+  msgs(){ grep -c "^perms .*\b$1\b" "$d/msg.log"; }   # the messages to the perms window that name this ask
   A=$st/repo/perms/wardens
   echo WARDEN_PER_HOUR=100 > "$d/config"   # a high cap, so only case 8 meets it
 
@@ -176,6 +179,8 @@ EOF
   : > "$d/claude.argv"; tk
   k "$(t test ! -e "$A/r22/2" -a ! -e "$A/q22/2" -a ! -s "$d/claude.argv")" "…and no warden runs it again"
   k "$(t test ! -s "$d/notified")" "no card is posted on any of these"
+  k "$(t test "$(msgs r22)" = 1 -a "$(msgs q22)" = 1)" "…and perms gets exactly one message naming each, over two ticks"
+  k "$(t test -z "$(grep 'real money' "$d/msg.log")")" "…which carries no word of the model's"
   # a REFUSE is still a decline in code, with no model
   : > "$d/claude.argv"; ask q23 repo 'copy the api token into a public log'; tk
   k "$(t test "$(dec q23)" = "decline warden" -a ! -e "$A/q23" -a ! -s "$d/claude.argv")" "a REFUSE is declined with no model run"
@@ -271,6 +276,43 @@ EOF
   k "$(t test ! -e "$A/q14" -a -n "$(isopen q14)")" "WARDEN_PER_HOUR reached: no new run starts"
   echo WARDEN_PER_HOUR=100 > "$d/config"; tk
   k "$(t test "$(dec q14)" = "decline warden")" "…and below it the ask runs"
+
+  # 9. a message perms doesn't get: the ask stays open and unmarked, with no second message and no second run
+  touch "$d/msg.fail"; echo 'tern {"decision":"his","note":"his"}' > "$d/replies"
+  ask q41 repo 'Bash: cc-board show repo, the tern case'; tk; tk; rm -f "$d/msg.fail"
+  k "$(t test -e "$A/q41/released" -a -n "$(isopen q41)" -a -z "$(isopen q41 | grep 'a warden holds it')" -a "$(msgs q41)" = 1 -a ! -e "$A/q41/2")" "a message that isn't delivered leaves the ask open and unmarked, tried once"
+
+  # 10. a release the ledger doesn't take is tried again with no model run, and reaches perms once it takes
+  touch "$d/release.fail"; echo 'wren {"decision":"his","note":"the wren note"}' > "$d/replies"
+  ask q42 repo 'Bash: cc-board show repo, the wren case'; tk; tk
+  k "$(t test ! -e "$A/q42/released" -a ! -e "$A/q42/2" -a "$(msgs q42)" = 0)" "a failed release isn't taken for done, tells perms nothing yet and runs no model again"
+  rm -f "$d/release.fail"; tk
+  k "$(t test -n "$(isopen q42)" -a -z "$(isopen q42 | grep 'a warden holds it')" -a "$(msgs q42)" = 1 -a ! -e "$A/q42/2")" "…the next tick's release unmarks it for perms, with one message"
+  k "$(t test -n "$(jq -r 'select(.id == "q42" and .kind == "warden" and .state == "release") | .note | select(test("the wren note"))' "$lg")")" "…and the model's note on the ledger"
+  # while it stays failed, the day's limit still sends the card, and it says the ask is still marked
+  touch "$d/release.fail"; echo 'mole {"decision":"his","note":"his"}' > "$d/replies"
+  ask q43 repo 'Bash: cc-board show repo, the mole case'; tk; touch -d '2 days ago' "$A/q43/1/brief.md"; tk; rm -f "$d/release.fail"
+  k "$(t test -n "$(grep 'warden:q43.*still shows' "$d/notified")" -a ! -e "$A/q43/2")" "a release that fails for a day still gets its card, with no run"
+
+  # 11. a decision the ledger won't sign (the command it decides holds a newline) isn't ok, goes back to perms and never runs again
+  printf '%s\n' 'lynx {"decision":"grant","line":"Bash(cc-board show *)","note":"reads the board"}' 'stag {"decision":"decline","note":"no"}' > "$d/replies"
+  rfl q44 repo $'cc-board show repo,\nthe lynx case'; rfl q45 repo $'cc-board show repo,\nthe stag case'; tk; tk; tk
+  local fd; for fd in q44 q45; do
+    k "$(t test -z "$(dec "$fd")" -a "$(cat "$A/$fd/1/done")" = "failed: the decision did not take")" "$fd: a failed decide is no decision and isn't recorded as ok"
+    k "$(t test ! -e "$A/$fd/2" -a "$(msgs "$fd")" = 1 -a -n "$(isopen "$fd")" -a -z "$(isopen "$fd" | grep 'a warden holds it')")" "…no run follows, and it goes back to perms with one message"
+  done
+  k "$(t test "$(grep -c 'warden:q44' "$d/settings.log")" = 1)" "…and the grant is written once"
+
+  # 12. every reason reaches the model: a decoy word can't hide the line beside it
+  echo 'koala {"decision":"decline","note":"no"}' > "$d/replies"
+  ask q47 repo 'Bash: charge the card and mail the list, the koala case'; tk
+  k "$(t grep -F "on 'charge'" "$A/q47/1/brief.md")" "the brief names the first hard line"
+  k "$(t grep -F "on 'mail'" "$A/q47/1/brief.md")" "…and the one behind it"
+
+  # 13. the floor would pass this line and the second read catches it
+  echo 'Bash(git push *)' >> "$d/approve.ok"; echo 'puma {"decision":"grant","line":"Bash(git push *)","note":"needs to push"}' > "$d/replies"
+  ask q48 repo 'Bash: cc-board show repo, the puma case'; tk
+  k "$(t test -z "$(dec q48)" -a -z "$(grep 'git push' "$d/settings.log")" -a -n "$(isopen q48)" -a "$(msgs q48)" = 1)" "a grant the floor passes but cc-infer's second read catches is never written, and goes back to perms"
 
   rm -rf "${d:?}"
   echo "cc-warden selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]
