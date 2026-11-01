@@ -60,7 +60,7 @@ EOF
   me(){ local at="$1"; shift; HOME="$d" PATH="$d/bin:$PATH" CC_LIMIT_BIN="$d/bin" CC_LIMIT_ARM="$d/bin/arm" \
     CC_LIMIT_STAMP="$d/.cc/state/claude-limit" CC_LIMIT_RECORD="$d/.cc/state/limit-interrupted" \
     CC_LIMIT_NUDGED="$d/.cc/state/limit-nudged" CC_LIMIT_SEEN="$d/.cc/state/limit-seen" \
-    CC_LIMIT_RESUMED="$d/.cc/state/limit-resumed" \
+    CC_LIMIT_RESUMED="$d/.cc/state/limit-resumed" CC_LIMIT_DUE="$d/.cc/state/owner-due" \
     CC_FAKE_PANES="$d/panes" CC_FAKE_CALLS="$d/calls" CC_FAKE_PANELIST="$d/panes.list" \
     CC_LIMIT_OBSERVER="$OBS" CC_LIMIT_MIN_WAIT='' CC_LIMIT_MAX_WAIT='' CC_LIMIT_SETTLE=0 \
     CC_LIMIT_NOW="$at" bash "$SELF" "$@"; }
@@ -599,6 +599,110 @@ EOF
   rm -f "$d/bin/cc-tier"
   me $((t0 + 91000)) resume >/dev/null 2>&1
   t 'tier stop: …and the first resume after it lifts nudges it' "$(calls '^msg alpha ')" 1
+
+  # A PROMISE THE LIMIT WILL MISS (2026-10-23). Own fixture: no stamp, no record, no ledger, no session list, and
+  # a promise file with one line due before the reset and one after it.
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/limit-interrupted" "$d/panes.list"
+  : > "$d/calls"; t9=$((t0 + 400 * 86400))
+  printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t9 + 7200))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run5.json"
+  printf '%s\tHive report\n%s\tafter the reset\n' "$((t9 + 3600))" "$((t9 + 9000))" > "$d/.cc/state/owner-due"
+  OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1
+  t 'promise: one run alone parks only itself, so nobody is told' "$(calls '^notify ')" 0
+  OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
+  t 'promise: the second run parks the box, and he hears once, before the reset, of what falls due before it only' \
+    "$(calls '^notify ')$(calls "Hive report (due $(date -d "@$((t9 + 3600))" +%H:%M))")$(calls 'after the reset')$(calls "until $(date -d "@$((t9 + 7200))" +%H:%M), ")" 1101
+  OBS=worker-c; me $((t9 + 120)) check "$d/run5.json" >/dev/null 2>&1
+  me $((t9 + 180)) record @1 alpha >/dev/null 2>&1
+  t 'promise: a third run and a recorded session in the same episode tell him nothing more' \
+    "$(calls '^notify ')$(grep -c . "$d/.cc/state/limit-interrupted")" 11
+  # The reset moves out in the same episode (review of #1910): past the reset he was told of, a run names a later
+  # one, with a second promise due before it. Still the episode he heard about, so nothing more.
+  printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t9 + 14400))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run6.json"
+  printf '%s\tsecond report\n' "$((t9 + 10000))" >> "$d/.cc/state/owner-due"
+  OBS=worker-d; me $((t9 + 7300)) check "$d/run6.json" >/dev/null 2>&1
+  t 'promise: a reset that moves later in the same episode tells him nothing more' "$(calls '^notify ')$(calls 'second report')" 10
+  # Two callers at once (review of #1910): its own fixture, a fresh episode one run has stamped, and then two
+  # more runs that make it the box's in the same instant. Both reach tell(); he hears once.
+  rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/limit-interrupted"; : > "$d/calls"
+  printf '%s\tHive report\n' "$((t9 + 3600))" > "$d/.cc/state/owner-due"
+  OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1
+  # A cat that dawdles over the promise file holds both inside the guard's window, so a guard that is not atomic fails.
+  printf '#!/bin/sh\ncase "$1" in *owner-due) sleep 1;; esac\nexec /bin/cat "$@"\n' > "$d/bin/cat"; chmod +x "$d/bin/cat"
+  for w in worker-b worker-c; do OBS=$w me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1 & done; wait
+  rm -f "$d/bin/cat"
+  t 'promise: two runs parking the box at the same moment tell him once' "$(calls '^notify ')" 1
+  # No promise in the window: its own fixture, a fresh episode whose only promise falls due after the reset.
+  rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/limit-interrupted"; : > "$d/calls"
+  printf '%s\tafter the reset\n' "$((t9 + 9000))" > "$d/.cc/state/owner-due"
+  OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
+  t 'promise: an episode with nothing due in it says nothing' "$(calls '^notify ')" 0
+  # ONE EPISODE IS ONE NOTICE, WHOEVER SEES IT (review of #1910). Each case its own fixture: no stamp, a model.log
+  # switch to corroborate the panes, two panes naming the same clock reset, and one promise due before it.
+  ep(){ rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/limit-interrupted" \
+      "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"; : > "$d/calls"
+    printf '%s\t%s\tswitch\t%s\t%s\n' iso "$(($1 - 60))" claude-opus-5 "2 session(s); test" > "$d/.cc/state/model.log"
+    for p in @1 @2; do printf 'Claude usage limit reached. Your limit will reset at %s\n> \n' \
+      "$(date -u -d "@$(($1 + 7200))" '+%F %H:%MZ')" > "$d/panes/$p"; done
+    printf '%s\tHive report\n' "$(($1 + 3600))" > "$d/.cc/state/owner-due"; }
+  ep "$t9"; me "$t9" record @1 alpha >/dev/null 2>&1; me $((t9 + 60)) record @2 beta >/dev/null 2>&1
+  t 'promise: two panes recording the same unstamped episode tell him once' "$(calls '^notify ')" 1
+  ep "$t9"; me "$t9" record @1 alpha >/dev/null 2>&1; me $((t9 + 600)) record @1 alpha >/dev/null 2>&1
+  t 'promise: recording the same pane again tells him nothing more' "$(calls '^notify ')" 1
+  ep "$t9"; me "$t9" record @1 alpha >/dev/null 2>&1
+  OBS=worker-a; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 120)) check "$d/run5.json" >/dev/null 2>&1
+  t 'promise: a record and then a check in one episode tell him once' "$(calls '^notify ')" 1
+  # A new episode a day later, with the first episode's stamp and marker both expired on file: he hears of it once.
+  ep "$t9"; OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
+  t8=$((t9 + 86400)); : > "$d/calls"; rm -f "$d/.cc/state/limit-interrupted"
+  printf '%s\tHive report\n' "$((t8 + 3600))" > "$d/.cc/state/owner-due"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t8 - 60))" claude-opus-5 "2 session(s); test" > "$d/.cc/state/model.log"
+  for p in @1 @2; do printf 'Claude usage limit reached. Your limit will reset at %s\n> \n' \
+    "$(date -u -d "@$((t8 + 7200))" '+%F %H:%MZ')" > "$d/panes/$p"; done
+  me "$t8" record @1 alpha >/dev/null 2>&1; me $((t8 + 60)) record @2 beta >/dev/null 2>&1
+  t 'promise: a new episode after an expired stamp tells him once' "$(calls '^notify ')$(calls 'Hive report')" 11
+  # A routine `clear` mid-episode (review of #1910): a fallback run reaches the API and clears, and the pane is
+  # recorded again before the reset. Still the episode he heard about.
+  ep "$t9"; me "$t9" record @1 alpha >/dev/null 2>&1; me $((t9 + 600)) clear >/dev/null 2>&1
+  me $((t9 + 900)) record @1 alpha >/dev/null 2>&1
+  t 'promise: a clear between two records of one pane tells him nothing more' "$(calls '^notify ')" 1
+  # A backoff that extends the episode (review of #1910): told of a two-hour reset, then past it a run names no
+  # time (a backoff, which tells nobody), then a run names a later reset with a promise due before it. One episode.
+  ep "$t9"; rm -f "$d/panes/@1" "$d/panes/@2"
+  OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
+  printf '{"is_error":true,"result":"Claude usage limit reached."}\n' > "$d/run9.json"
+  printf '%s\tsecond report\n' "$((t9 + 10000))" >> "$d/.cc/state/owner-due"
+  OBS=worker-a; me $((t9 + 7800)) check "$d/run9.json" >/dev/null 2>&1
+  OBS=worker-a; me $((t9 + 8160)) check "$d/run6.json" >/dev/null 2>&1
+  t 'promise: a backoff between two named resets of one episode tells him nothing more' \
+    "$(calls '^notify ')$(calls 'second report')" 10
+  rm -f "$d/.cc/state/model.log" "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"
+  rm -f "$d/.cc/state/owner-due" "$d/.cc/state/limit-interrupted"
+  # A WEEKLY WALL TOLD DOES NOT SILENCE THE NEXT REAL LIMIT (review of #1910). Each its own fixture: two runs park
+  # the box on a six-day wall with a promise inside it, so he is told; then the wall stops binding — the box moves
+  # to another login, or the account plainly answers and status drops the stamp — and on day 2 a real two-hour limit
+  # parks it again with an owner deadline due before that reset. He hears of the second one too.
+  wk(){ rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/claude-limit.disbelieved" \
+      "$d/.cc/state/limit-interrupted"; rm -rf "$d/.cc/state/spend"; : > "$d/calls"; tw=$((t9 + 10 * 86400))
+    jq -n '{oauthAccount: {accountUuid: "login-a"}}' > "$d/.claude.json"
+    printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+      "$(date -u -d "@$((tw + 6 * 86400))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run7.json"
+    printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+      "$(date -u -d "@$((tw + 86400 + 7200))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run8.json"
+    printf '%s\tweekly review\n%s\tHive report\n' "$((tw + 3600))" "$((tw + 86400 + 3600))" > "$d/.cc/state/owner-due"
+    OBS=worker-a; me "$tw" check "$d/run7.json" >/dev/null 2>&1; OBS=worker-b; me $((tw + 60)) check "$d/run7.json" >/dev/null 2>&1; }
+  day2(){ OBS=worker-a; me $((tw + 86400)) check "$d/run8.json" >/dev/null 2>&1
+    OBS=worker-b; me $((tw + 86460)) check "$d/run8.json" >/dev/null 2>&1; }
+  last2(){ grep '^notify ' "$d/calls" | tail -1 | grep -v 'weekly review' | grep -c "Hive report.*until $(date -d "@$((tw + 93600))" +%H:%M), "; }
+  wk; jq -n '{oauthAccount: {accountUuid: "login-b"}}' > "$d/.claude.json"; day2
+  t 'promise: a weekly wall told, a login switch, then a real limit on day 2 with a deadline in it: he hears of both' \
+    "$(calls '^notify ')$(last2)" 21
+  wk; led $((tw + 400)) 1 claude-opus-5; led $((tw + 500)) 2 claude-opus-5; me $((tw + 600)) status >/dev/null 2>&1; day2
+  t 'promise: a weekly wall told and then disbelieved, then a real limit on day 2 with a deadline in it: he hears of both' \
+    "$(calls '^notify ')$(last2)" 21
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.claude.json" "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" \
+    "$d/.cc/state/claude-limit.disbelieved" "$d/.cc/state/owner-due" "$d/.cc/state/limit-interrupted"
 
   # Its own clear HOME: a cc-model that answers is heard on stderr, one that hangs — and leaves a child holding its
   # output — is given up on inside the bound, and either way stdout says "clear" and the exit is 1.

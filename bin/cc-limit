@@ -22,6 +22,9 @@
 #                      whoever else it killed (see WHAT ELSE THE LIMIT KILLED), and telling the owner in one
 #                      line what the limit stalled and when it went again
 #   cc-limit selfcheck the record/resume state machine, on stubs
+# Promises: ~/.cc/state/owner-due = "<epoch>\t<a few words>" per line, appended by a seat when it promises the owner
+# something by a time (`printf '%s\t%s\n' "$(date -d 14:00 +%s)" "Hive report" >> ~/.cc/state/owner-due`) and deleted
+# when it is delivered. See A PROMISE THE LIMIT WILL MISS.
 # Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>\t<observers>\t<account>" — shared,
 # so a second loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was
 # (may be empty when the message names none); the observers are which RUNS have hit it (see below); the account is
@@ -38,7 +41,7 @@
 #   (test hook: what to arm with — it is called as `<seconds> <unit-name>`; "-" = arm nothing)
 #   · CC_LIMIT_RESUMED (where the ended episode is published — see WHAT ELSE THE LIMIT KILLED) · CC_LIMIT_NOW
 #   · CC_LIMIT_SETTLE (seconds between the Escape that ends a dead turn and the message typed after it)
-#   · CC_LIMIT_BIN · CC_TMUX_SESSION.
+#   · CC_LIMIT_DUE (the promise file, see Promises) · CC_LIMIT_BIN · CC_TMUX_SESSION.
 #
 # RESUMING AN INTERACTIVE SESSION. A headless worker parks and reruns itself at the reset; an interactive session just
 # prints the limit line and sits at its prompt, and the turn it was in the middle of is lost until a human comes back.
@@ -104,6 +107,13 @@
 #   model's family, or any family when the stamp names none) more than five minutes (GRACE) past the moment it
 #   was first seen: nothing answers under a real account-wide limit. Dropping it pushes the owner one line, once per episode
 #   — six hours of dead box against a working account must not happen again without somebody being told.
+# A PROMISE THE LIMIT WILL MISS. 2026-10-23 the limit hit at 04:0xZ and parked every session until 06:00Z, with a
+# report promised to the owner for a call inside that window not yet started. Nothing told him; he heard after the
+# call. No Claude turn can tell him then, so this does: the moment the box parks (`check` sees the second run, or
+# `record` finds a limited session) tell() reads $DUE and, for whatever falls due before the named reset, sends him
+# one cc-notify line, once per episode ($TOLD holds the reset and login of the episode he was told about, and moves out with
+# it, so a reset that moves later in the same episode tells him nothing more).
+# An episode with no promise in it says nothing: a limit is routine, and the box resumes by itself.
 # A pane line alone is not proof — this box's own docs and briefs say "usage limit" too — so a record needs the line
 # AND corroboration: the shared stamp is live, or cc-model itself judged a limit recently — a live
 # ~/.cc/state/model-override, or a switch in ~/.cc/state/model.log inside the last 6 h. Both files are cc-model's;
@@ -118,6 +128,7 @@ NUDGED="${CC_LIMIT_NUDGED:-$HOME/.cc/state/limit-nudged}"; QUIET=1800   # see nu
 RESUMED="${CC_LIMIT_RESUMED:-$HOME/.cc/state/limit-resumed}"   # see WHAT ELSE THE LIMIT KILLED
 SEEN="${CC_LIMIT_SEEN:-$HOME/.cc/state/limit-seen}"; JUDGE=3600         # see first_seen: how long an uncorroborated line stays "not judged yet"
 STOP_RECHECK=900   # see UNDER TIER STOP
+DUE="${CC_LIMIT_DUE:-$HOME/.cc/state/owner-due}"; TOLD="$S.told"   # see A PROMISE THE LIMIT WILL MISS
 DISB="$S.disbelieved"; GRACE=300   # see answering: how long after a limit was first seen a completed call disproves it
 now="${CC_LIMIT_NOW:-$(date -u +%s)}"; DRY=""
 # What a session shows when the limit stopped it. Tighter than cc-model's (which only decides which MODEL to use):
@@ -179,7 +190,7 @@ disbelieve(){   # drop a stamp the account has plainly outlived — ONCE per epi
                 # automatic: no owner post (a debugging engineer reads $DISB's timestamp), the cure for every one
                 # of these used to be a person noticing, four times in two days.
   local was="$first"
-  rm -f "$S"; ends=0
+  rm -f "$S" "$TOLD"; ends=0   # …and the notice that went with it: a real limit after this one is news again
   [ "$(cat "$DISB" 2>/dev/null)" = "$was" ] && return 0
   mkdir -p "$(dirname "$DISB")"; printf '%s\n' "$was" > "$DISB"
   return 0; }
@@ -312,6 +323,32 @@ arm(){   # $1 = the soonest it may fire, in seconds (default 15). One-shot at th
   systemd-run --user --quiet --unit="$unit" --on-active="${secs}s" --timer-property=AccuracySec=5 \
     "$SELF" resume >/dev/null 2>&1 || true; }
 
+tell(){   # $1 = the reset the box is parked until. See A PROMISE THE LIMIT WILL MISS.
+  # One episode is one notice, for every caller: $TOLD holds the reset he was told of and the login it was on, and
+  # until 15 minutes past it (check's own same-episode rule) every caller on that login is in that episode still, so a
+  # later reset moves the marker out. Another login's marker is another episode, as another login's stamp is (a
+  # weekly wall told on Monday must not silence a real limit on Tuesday after the box moved account), and the
+  # marker goes with a stamp disbelieve() drops. `clear` leaves it, because every run that reaches the API clears,
+  # a fallback run in mid-episode too, and the pane recorded next would be told again. Nothing
+  # here is a pane's own sighting or a stamp's first-seen: two panes on one unstamped limit, a pane recorded twice, a
+  # record and then a check all name the same reset (review of #1910). The read of $TOLD to its write is held under a
+  # lock, so two callers at once tell him once; the send runs after the lock is let go, so a hung cc-notify never
+  # holds a later check or record.
+  local due; mkdir -p "$(dirname "$TOLD")"
+  due=$( { flock -w 30 9 || exit 0; local at words due="" told tacc me; me=$(account)
+  IFS=$'\t' read -r told tacc < <(cat "$TOLD" 2>/dev/null); [[ "$told" =~ ^[0-9]+$ ]] || told=0
+  [ "$tacc" = "$me" ] || told=0
+  if [ "$told" -gt $((now - 900)) ]; then [ "$1" -gt "$told" ] && printf '%s\t%s\n' "$1" "$me" > "$TOLD"; exit 0; fi
+  [ -n "${2:-}" ] && exit 0   # quiet: a check that keeps the episode alive without parking the box only moves the marker
+  while IFS=$'\t' read -r at words; do
+    [[ "$at" =~ ^[0-9]+$ ]] && [ "$at" -gt "$now" ] && [ "$at" -le "$1" ] && due+="${due:+; }$words (due $(date -d "@$at" +%H:%M))"
+  done < <(cat "$DUE" 2>/dev/null)
+  # $TOLD is written BEFORE cc-notify runs, on purpose: once per episode, so a send that fails is not retried.
+  [ -n "$due" ] && printf '%s\t%s\n' "$1" "$me" > "$TOLD"; printf '%s' "$due"; } 9>>"$TOLD.lock" )
+  [ -n "$due" ] && "$BIN/cc-notify" --heading "This won't come on time: $due" \
+    "The box hit its usage limit and every session is parked until $(date -d "@$1" +%H:%M), when it carries on by itself." >/dev/null 2>&1
+  return 0; }
+
 record(){   # $1 pane id, or a window id/name to resolve  $2 window name
             # exit 0 = recorded · 2 = the pane is on the limit, this is not a record · 1 = no limit line there
   # `u` and `how` are LOCAL because parse_reset writes them as globals: `check` parses its own reset, then calls
@@ -383,7 +420,7 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
   mkdir -p "$(dirname "$REC")"
   { [ -f "$REC" ] && awk -F'\t' -v p="$pane" '$1!=p' "$REC"
     printf '%s\t%s\t%s\t%s\t%s\n' "$pane" "$win" "$at" "$started" "$tags"; } > "$REC.t"
-  mv "$REC.t" "$REC"; arm
+  mv "$REC.t" "$REC"; arm; tell "$at"
   printf 'recorded %s (%s) until %sZ\n' "$win" "$pane" "$(date -u -d "@$at" +%H:%M)"; }
 
 live_claude(){   # is there an interactive `claude` ANYWHERE under pane pid $1? The DIRECT-child test was wrong here in
@@ -551,5 +588,7 @@ mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$u" "$how" "$firs
 # A limit on the box's primary model moves every session to the fallback (cc-model decides if it was) — but only once
 # a SECOND run has hit the same limit. One worker's word moved every session for six hours on 2026-09-04.
 [ "$(nobs)" -ge 2 ] && [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1
+if [ "$(nobs)" -ge 2 ] && [[ "$how" != backoff:* ]]; then tell "$u"   # the box parks now: a promise due before the reset is missed
+elif [ "$same" = 1 ]; then tell "$u" quiet; fi   # the same episode, extended by a backoff: the marker moves out with it
 scan >/dev/null 2>&1   # the same limit is on every session, not just this run: whatever it interrupted is nudged at the reset
 echo "LIMIT $u"

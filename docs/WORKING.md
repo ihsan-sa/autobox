@@ -55,6 +55,10 @@ step stalls, read what the refusal actually saw (a stale hold, a wrong path, a m
 route first. Park on him only when the answer really is his: "things shouldnt wait on me unless they really have
 to" (owner, 2026-09-30).
 
+When you promise the owner something by a time, add one line to `~/.cc/state/owner-due`, the epoch, a tab and a
+few words (`printf '%s\t%s\n' "$(date -d 14:00 +%s)" "Hive report" >> ~/.cc/state/owner-due`), and delete it once
+it is delivered: if a usage limit parks the box before then, cc-limit tells him with no Claude turn (2026-10-23).
+
 When something needs designing (a diagram set, a UI, a layout, a visual identity), offer the owner a
 Claude Design run and hand over a ready prompt: what it is for, the pieces and how they connect, what
 must read at a glance, the look, and the deliverables. Send it as a file in the thread. It runs in
