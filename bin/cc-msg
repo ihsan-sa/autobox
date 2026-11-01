@@ -348,9 +348,16 @@ live_claude(){   # $1 = window id
 # AND AN @ AT THE START OF A WORD GOES AS AN ESCAPE. Claude Code expands one as a Read that no hook or allow check sees
 # (2.1.316 through this function: first word, after a space and after a tab, while x@, .@, -@, _@, (@ and :@ did not).
 # Anything not plainly inside a word is escaped, so an address and a window name like repo@alias stay as they are.
-type_at(){ local text e i=0; text=$(printf '%s' "$2" | tr '\n' ' ')
-           e=$(printf '%s' "$text" | sed -E 's/(^|[^[:alnum:]._-])@/\1\\u0040/g')
-           [ "$e" = "$text" ] || text="$e (Each \\u0040 above is an at sign.)"
+# AND A CONTROL BYTE IS A KEYPRESS, SO NONE IS TYPED. Ctrl-A then Ctrl-D makes x@/planted into @/planted after the sed has
+# judged it, an arrow then a space splits it, and Esc [ Z leaves the permission mode (2.1.316, all through this function).
+# So newline, CR and tab become a space, every other C0, DEL and C1 go, and only then is the at sign judged.
+# typed() IS WHAT THE BOX HOLDS: the sat stamp and the empty-message test read it, not the spool's text.
+typed(){ local text e
+         text=$(printf '%s' "$1" | tr '\n\r\t' '   ' | LC_ALL=C sed -E 's/[\x01-\x1f\x7f]|\xc2[\x80-\x9f]//g')
+         e=$(printf '%s' "$text" | sed -E 's/(^|[^[:alnum:]._-])@/\1\\u0040/g')
+         [ "$e" = "$text" ] || e="$e (Each \\u0040 above is an at sign.)"
+         printf '%s' "$e"; }
+type_at(){ local text i=0; text=$(typed "$2")
            tmux send-keys -t "$1" -l -- "$text"; sleep "$KEY_WAIT"; tmux send-keys -t "$1" Enter    # two calls
            while :; do
              sleep "$SUBMIT_WAIT"; unsent "$1" "$text" || return 0
@@ -731,9 +738,9 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # and Enter on an empty input box submits nothing, so a perfectly healthy session is byte-identical after it
       # — which is exactly the wedge test's answer for a dead one, and the healthy window would be killed and
       # reopened, every tick, for ever. Whitespace-only is the same message once the newlines are flattened to
-      # spaces. There is nothing here to deliver, so it is dropped and said, like any other line the drain cannot
-      # type. (Reachable: `cc-msg <win> ""` under the timer, and an attachment-only Slack message.)
-      case "$text" in
+      # spaces, and so is one of nothing but control bytes once they are stripped. There is nothing here to deliver,
+      # so it is dropped and said, like any other line the drain cannot type. (Reachable: `cc-msg <win> ""` under the timer, and an attachment-only Slack message.)
+      case "$(typed "$text")" in
         *[![:space:]]*) ;;
         *) spool_pop "$sp"; receipt delivery "$1" "$line" dropped
            msg_log "$1" spool-dropped "nothing to type (its text is empty), so the drain discarded it rather than judge a pane it never touched: ${line:0:200}"
@@ -752,7 +759,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # every later drain until the box lets it go. Through say_wedge(), so the control repo's own planning seat is
       # not sent a request that would spool behind its own full input box (see ctl_seat).
       if [ "$sat" != 0 ]; then
-        printf '%s' "$text" | tr '\n' ' ' > "$satf"
+        typed "$text" > "$satf"
         say_wedge "$1" "$id" sat "[$1] typed but not submitted" \
           "the text sits in the input box and $((SUBMIT_TRIES + 1)) Enters did not send it — press Enter there (tmux select-window -t main:$1). $(spool_n "$1") message(s) wait behind it."
         break
@@ -1661,6 +1668,14 @@ STUB
   k "$(t test "$(wc -l < "$T/keys")" = 2)" "…and takes exactly one Enter: no half a message is submitted as a turn"
   reset; scr "$FREE"; msg 'see @/planted, @"/q r" and a@b.c' >/dev/null
   k "$(t grep -qF -- '-l -- see \u0040/planted, \u0040"/q r" and a@b.c (Each \u0040 above is an at sign.)' "$T/keys")" "an @ that starts a word is typed as an escape and said to be one; an address keeps its @"
+  reset; scr "$FREE"; msg "$(printf 'x@/planted hi\001\004\033[C\177 \302\233D')" >/dev/null   # Ctrl-A, Ctrl-D, an arrow, DEL, a space, C1 CSI
+  k "$(t grep -qF -- '-l -- x@/planted hi[C D' "$T/keys")" "a control byte is not typed: Ctrl-A Ctrl-D can't move x@/planted's @ to a word start after the escape has judged it"
+  reset; scr "$FREE"; msg "$(printf 'a\tb\rc@/planted d@/x')" >/dev/null
+  k "$(t grep -qF -- '-l -- a b c@/planted d@/x' "$T/keys")" "…a tab or CR is a space, so CR can't submit half a message"
+  reset; scr "$FREE"; msg "$(printf 'see repo\001@alias, é and ☃')" >/dev/null
+  k "$(t grep -qF -- '-l -- see repo@alias, é and ☃' "$T/keys")" "…and printable text comes through unchanged, repo@alias and non-ASCII included, with no escape note when none was needed"
+  reset; scr "$FREE"; msg "$(printf '\001\033')" >/dev/null
+  k "$(nt grep -q -- '-l -- ' "$T/keys")" "…and a message of nothing but control bytes types nothing, so it can't read as a wedge"
   reset; scr "$PERM"; msg "$(printf 'first line\nsecond line')" >/dev/null
   k "$(t sh -c "jq -e '.text == \"first line\nsecond line\"' < '$SP'")" "…while the spool keeps the message whole"
 
@@ -1691,6 +1706,15 @@ STUB
   k "$(t sh -c "! grep -q '^notify' '$T/calls' && jq -e '.text == \"second\"' < '$SP'")" "…nothing said again, and 'second' still waits"
   scr "$FREE"; rm -f "$T/swallow"; "$T/bin/cc-msg" --drain "$W"   # a person pressed Enter: the box is empty again
   k "$(t sh -c "grep -q -- '-l -- second$' '$T/keys' && ! test -f '$SP' && ! test -f '$T/.cc/state/$W/inbox.sat'")" "…and once the box lets it go, the drain types 'second' and the stamp is gone"
+
+  # …and THE STAMP HOLDS WHAT THE BOX HOLDS. A stuck message that was escaped or stripped must still match the box, or
+  # the next tick calls it gone and types behind it.
+  for stuck in '@/first word stuck' "$(printf 'st\001uck with a control byte')"; do
+    reset; scr "$FREE"; CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 msg "$stuck" >/dev/null
+    : > "$T/keys"; CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 msg second >/dev/null
+    k "$(nt grep -q -- '-l -- ' "$T/keys")" "a stuck message holds the queue when the box holds it escaped or stripped: nothing is typed behind '${stuck:0:9}'"
+  done
+  rm -f "$T/.cc/state/$W/inbox.sat" "$SP"
 
   # (1d) --turn: TYPED IS NOT HEARD (2026-09-16: rc 0 and silence for three sessions at a spend-limit wall, and a
   # review round that never reached its seat). rc 0 only for a turn; every other ending is non-zero and says why.

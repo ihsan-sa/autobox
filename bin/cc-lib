@@ -75,7 +75,9 @@ boundary reads one file, its own workspace's, and can reach no other.
         prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn. A sandboxed
         worker can write these dirs and the host runs this, so it follows no link: a dir whose memory/, MEMORY.md or
         MEMORY-facts.md is a link or not a regular file is left alone, said on stderr, exit 1, and the other dirs still
-        run; a linked note counts as untyped; writes go through mkstemp, so a planted MEMORY.md.tmp is never opened.
+        run; a linked note, or a line naming a path out of the dir, counts as untyped; a note is read for its first 4096
+        bytes only; writes go to a new temp file of a random name, so a planted MEMORY.md.tmp is never opened. Each dir is
+        opened once and everything goes through that descriptor, so swapping memory/ for a link mid-pass reaches nothing.
   cc-lib index --cold [<days>] [--json]
         WHAT WOULD LEAVE THE HOT INDEX, and nothing leaves (P3, decision 8: dry-run until a person has read it): the
         records of closed bodies — a board row in merged|done|dropped|closed: its journal, its task, its notes, and
@@ -487,10 +489,24 @@ def ts_num(ts):
     return 0
 
 
+def unlinked(path):
+    """What a source's name stands for. A board at ~/.cc/boards/<h>.json may be the one link the host makes (cc-sandbox
+    board_dir, the rule cc-board's _target keeps), to ~/.cc/members/<h>/board/<h>.json, and then that path comes back.
+    Anything else comes back as itself, so a link stays a link for add() and open_regular to refuse: a worker can write
+    its memory directory, and a link it plants there must not put a host file in `ask`."""
+    d, b = os.path.split(path)
+    want = os.path.join(H, ".cc", "members", os.path.splitext(b)[0], "board", b)
+    try:
+        linked = d == os.path.join(H, ".cc", "boards") and os.path.normpath(os.path.join(d, os.readlink(path))) == want
+    except OSError:
+        return path
+    return want if linked else path
+
+
 def open_regular(path):
-    """A binary file object on path, opened O_NONBLOCK|O_NOCTTY and refused unless fstat says a regular file: a FIFO a member
-    puts at its board or a source neither blocks the reader nor is read."""
-    f = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY), "rb")
+    """A binary file object on unlinked(path), opened O_NOFOLLOW|O_NONBLOCK|O_NOCTTY and refused unless fstat says a regular
+    file: a link raises OSError, and a FIFO a member puts at its board or a source neither blocks the reader nor is read."""
+    f = os.fdopen(os.open(unlinked(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY), "rb")
     if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
         f.close()
         raise ValueError("not a regular file")
@@ -511,7 +527,7 @@ def board_in(f, path):
     and parse all read every board, and refused over MEMBER_BOARD_CAP for a member's, BOARD_CAP for the box's."""
     s = os.fstat(f.fileno())
     cap = MEMBER_BOARD_CAP if member(os.path.basename(path)[:-5]) else BOARD_CAP
-    k = (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, cap)   # the cap too: a member's link to the box's board refuses only itself
+    k = (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, cap)   # the cap too: a box board's inode under a member's name refuses only that name
     if k not in BOARDS:
         raw = f.read(cap + 1)
         try:
@@ -554,7 +570,7 @@ def board_rows(reg):
 
 # ── the registry: which files are knowledge, read from the boards and nothing else ────────────────────────────
 def boards():
-    """repo -> (board path, project path). A board that does not parse, or is not shaped like one, is skipped here and named by index()."""
+    """repo -> (board path, project path). A board that does not parse, or is not shaped like one, is skipped here and named by index() (a link registry() refuses is no source, so it is not named)."""
     out = {}
     for p in sorted(glob.glob(os.path.join(H, ".cc", "boards", "*.json"))):
         name = os.path.basename(p)[:-5]
@@ -570,13 +586,14 @@ def boards():
 
 
 def registry():
-    """[(path, skind, repo, track)] — every file this tool may read. Anything not produced here is never opened."""
+    """[(path, skind, repo, track)] — every file this tool may read. Anything not produced here is never opened. A link at a
+    source's own name is not produced (unlinked() has the one exception), so reconcile drops whatever it had indexed there."""
     srcs = []
     seen = set()
 
     def add(p, skind, repo="", track=""):
         p = os.path.abspath(p)
-        if p in seen or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
+        if p in seen or os.path.islink(unlinked(p)) or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
             return
         seen.add(p)
         srcs.append((p, skind, repo, track))
@@ -698,7 +715,7 @@ def slack_twins(path):
                                            glob.escape(os.path.basename(path))))):
         try:
             if not os.path.basename(os.path.dirname(os.path.dirname(p))).startswith("_") and not quarantine_of(p) \
-                    and not excluded(p) and os.path.isfile(p) and os.path.getsize(p) <= MAX_SOURCE:
+                    and not excluded(p) and os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= MAX_SOURCE:
                 out.append(p)
         except OSError:
             pass
@@ -1160,7 +1177,7 @@ def member_tree(path, h):
 
 
 def parse(path, skind, repo, track, rows):
-    with open_regular(path) as f:   # a FIFO swapped in after add()'s isfile neither blocks nor is read
+    with open_regular(path) as f:   # a link or a FIFO swapped in after add()'s checks is not read
         if ws_of(skind, repo) and not member_tree(os.readlink(f"/proc/self/fd/{f.fileno()}"), repo):
             raise ValueError("a member's source that leaves its own tree")
         if skind == "board":
@@ -2573,18 +2590,22 @@ def view(argv):
     return 0
 
 
-def mem_read(path):
-    """A regular file's text, opened without following a link or waiting on a FIFO; OSError for anything else."""
-    with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding="utf-8", errors="replace") as f:
+def mem_read(name, dfd, cap=None):
+    """The text of a regular file in the open directory dfd, opened without following a link or waiting on a FIFO, and
+    only its first `cap` bytes when one is given; OSError for anything else."""
+    with open(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), encoding="utf-8", errors="replace") as f:
         if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
             raise OSError("not a regular file")
-        return f.read()
+        return f.read() if cap is None else f.buffer.read(cap).decode("utf-8", "replace")
 
 
-def mem_type(path):
-    """The `type:` a memory file's frontmatter carries, or '' when the file is missing, a link, unreadable or says none."""
+def mem_type(name, dfd):
+    """The `type:` in the first 4096 bytes of a memory file in dfd, so a huge note can't hold the pass open, or '' when the
+    file is missing, a link, unreadable, says none, or is named by a path that would leave dfd."""
+    if "/" in name:
+        return ""
     try:
-        head = mem_read(path)[:4096]
+        head = mem_read(name, dfd, 4096)
     except OSError:
         return ""
     m = re.search(r"^\s*type:\s*(\w+)", head, re.M)
@@ -2603,86 +2624,100 @@ def memory(argv):
     are the records and were indexed already. WRITES ONLY WHAT CHANGED: a rewrite that changed nothing would still
     move the prompt under a running session's cache, which has turned a smaller prompt into higher spend before.
     FOLLOWS NO LINK: a sandboxed worker can write its memory dir and its project dir, and the host runs this, so a link
-    there would write through to a host file or copy one into text the worker reads (as in cc-memory-dream's dream_dir)."""
+    there would write through to a host file or copy one into text the worker reads (as in cc-memory-dream's dream_dir).
+    HOLDS ITS DIRECTORY: the pass opens
+    memory/ once, refusing a link, and every read, write, rename and remove goes through that descriptor, so swapping
+    memory/ for a link mid-pass can't turn the pass onto another folder's index (a seat's, perms' included)."""
     dry = "--dry-run" in argv
     rc = 0
     for mi in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "MEMORY.md"))):
         mdir = os.path.dirname(mi)
-        fp = os.path.join(mdir, MEM_FACTS)
         try:
-            if os.path.islink(mdir):
-                raise OSError("the directory is a link")
-            cur_loaded = mem_read(mi)
-            try:
-                cur_facts = mem_read(fp)
-            except FileNotFoundError:
-                cur_facts = ""
+            dfd = os.open(mdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as e:
             print(f"cc-lib memory: {tilde(mdir)}: left alone: {e}", file=sys.stderr)
             rc = 1
             continue
-        loaded = cur_loaded.split("\n")
-        facts = [l for l in cur_facts.split("\n") if MEM_LINE.match(l)]
-        keep, move, seen = [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
-        for l in loaded:
-            if l.strip() == MEM_POINTER.strip():
-                continue
-            m = MEM_LINE.match(l)
-            if m and mem_type(os.path.join(mdir, m.group(1))) in ("project", "reference"):
-                move.append(l)
-            else:
-                keep.append(l)
-                if m:
-                    seen.add(m.group(1))
-        stay, listed = [], seen | {MEM_LINE.match(x).group(1) for x in move}
-        for l in facts:
-            fn = MEM_LINE.match(l).group(1)
-            if fn not in listed:
-                stay.append(l)
-                listed.add(fn)
-        while keep and not keep[-1].strip():
-            keep.pop()
-        new_loaded = keep
-        all_facts = stay + move
-        if all_facts:
-            new_loaded += ["", MEM_POINTER]
-        new_loaded_t = "\n".join(new_loaded) + "\n"
-        new_facts_t = ("# Memory facts — not loaded into any prompt; `cc-lib ask --need history \"<words>\"` finds each file's record\n\n"
-                       + "\n".join(all_facts) + "\n") if all_facts else ""
-        moved_b = sum(len(l.encode()) + 1 for l in move)
-        changed = new_loaded_t != cur_loaded or (all_facts and new_facts_t != cur_facts) \
-            or (not all_facts and os.path.lexists(fp))   # nothing left to list: the facts file goes
-        what = (f"cc-lib memory: {tilde(mdir)}: {len(new_loaded) - (2 if all_facts else 0)} rule line(s) stay "
-                f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), "
-                f"{len(stay)} already in {MEM_FACTS}")
-        if dry:
-            print(what + " · DRY-RUN, nothing written")
-            for l in move:
-                print("  would move: " + l[:100])
-            continue
-        if not changed:
-            print(what + " · unchanged, nothing written")
-            continue
         try:
-            for path, txt in ((mi, new_loaded_t), (fp, new_facts_t)):
-                if not txt:
-                    if os.path.lexists(path):
-                        os.remove(path)   # only ever the facts file: the loaded text is never empty (its own lines, or the pointer)
-                    continue
-                fd, tmp = tempfile.mkstemp(dir=mdir, prefix=".memory-index.")
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(txt)
-                    os.replace(tmp, path)
-                except OSError:
-                    os.unlink(tmp)
-                    raise
-        except OSError as e:
-            print(f"cc-lib memory: {tilde(mdir)}: {e}", file=sys.stderr)
-            rc = 1
-            continue
-        print(what + " · written")
+            rc |= memory_dir(mdir, dfd, dry)
+        finally:
+            os.close(dfd)
     return rc
+
+
+def memory_dir(mdir, dfd, dry):
+    """One pass of memory() on the directory open at dfd; mdir only names it in what is printed. The exit code."""
+    try:
+        cur_loaded = mem_read("MEMORY.md", dfd)
+        try:
+            cur_facts, has_facts = mem_read(MEM_FACTS, dfd), True
+        except FileNotFoundError:
+            cur_facts, has_facts = "", False
+    except OSError as e:
+        print(f"cc-lib memory: {tilde(mdir)}: left alone: {e}", file=sys.stderr)
+        return 1
+    loaded = cur_loaded.split("\n")
+    facts = [l for l in cur_facts.split("\n") if MEM_LINE.match(l)]
+    keep, move, seen = [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
+    for l in loaded:
+        if l.strip() == MEM_POINTER.strip():
+            continue
+        m = MEM_LINE.match(l)
+        if m and mem_type(m.group(1), dfd) in ("project", "reference"):
+            move.append(l)
+        else:
+            keep.append(l)
+            if m:
+                seen.add(m.group(1))
+    stay, listed = [], seen | {MEM_LINE.match(x).group(1) for x in move}
+    for l in facts:
+        fn = MEM_LINE.match(l).group(1)
+        if fn not in listed:
+            stay.append(l)
+            listed.add(fn)
+    while keep and not keep[-1].strip():
+        keep.pop()
+    new_loaded = keep
+    all_facts = stay + move
+    if all_facts:
+        new_loaded += ["", MEM_POINTER]
+    new_loaded_t = "\n".join(new_loaded) + "\n"
+    new_facts_t = ("# Memory facts — not loaded into any prompt; `cc-lib ask --need history \"<words>\"` finds each file's record\n\n"
+                   + "\n".join(all_facts) + "\n") if all_facts else ""
+    moved_b = sum(len(l.encode()) + 1 for l in move)
+    changed = new_loaded_t != cur_loaded or (all_facts and new_facts_t != cur_facts) \
+        or (not all_facts and has_facts)   # nothing left to list: the facts file goes
+    what = (f"cc-lib memory: {tilde(mdir)}: {len(new_loaded) - (2 if all_facts else 0)} rule line(s) stay "
+            f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), "
+            f"{len(stay)} already in {MEM_FACTS}")
+    if dry:
+        print(what + " · DRY-RUN, nothing written")
+        for l in move:
+            print("  would move: " + l[:100])
+        return 0
+    if not changed:
+        print(what + " · unchanged, nothing written")
+        return 0
+    try:
+        for name, txt in (("MEMORY.md", new_loaded_t), (MEM_FACTS, new_facts_t)):
+            if not txt:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(name, dir_fd=dfd)   # only ever the facts file: the loaded text is never empty (its own lines, or the pointer)
+                continue
+            tmp = ".memory-index." + os.urandom(8).hex()
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except OSError:
+                os.unlink(tmp, dir_fd=dfd)
+                raise
+    except OSError as e:
+        print(f"cc-lib memory: {tilde(mdir)}: {e}", file=sys.stderr)
+        return 1
+    print(what + " · written")
+    return 0
 
 
 def selfcheck_memory_links(th, ok, run):
@@ -2768,6 +2803,70 @@ def selfcheck_memory_links(th, ok, run):
         os.mkfifo(os.path.join(d, "MEMORY.md"))
     case("a FIFO for MEMORY.md is left alone, not waited on", SECRET, fifo,
          lambda rc, err, d: rc == 1 and "left alone" in err and stat.S_ISFIFO(os.lstat(os.path.join(d, "MEMORY.md")).st_mode))
+
+    def named_away(d, o):
+        real = os.path.join(os.path.dirname(o), "real.md")
+        note(os.path.dirname(o), "real.md", "project")
+        put(os.path.join(d, "MEMORY.md"), f"- [A]({real}) — a\n- [B]({os.path.relpath(real, d)}) — b\n")
+    case("a line naming a path out of the directory is not read for its type: it counts as untyped and stays", SECRET, named_away,
+         lambda rc, err, d: rc == 0 and "[A]" in (t := open(os.path.join(d, "MEMORY.md")).read()) and "[B]" in t
+         and not os.path.lexists(os.path.join(d, MEM_FACTS)))
+
+    def swapped(what, plant, check):
+        """Mid-pass, at its first note, memory/ is moved aside and a link to another folder takes its place. The other folder
+        holds its own index and a fact.md of another type, so its files must stay as they were and the line's type must come
+        from the directory the pass checked. A hook, not a timing: it opens the same window every run."""
+        global mem_type
+        trap, other = os.path.join(root, "-swap"), os.path.join(th, "other")
+        d, aside = os.path.join(trap, "memory"), os.path.join(trap, "aside")
+        KEPT = "- [Kept](kept.md) — another folder's index\n"
+        note(d, "fact.md", "project")
+        note(d, "rule.md", "feedback")
+        note(other, "fact.md", "feedback")
+        put(os.path.join(other, "MEMORY.md"), KEPT)
+        put(os.path.join(other, MEM_FACTS), KEPT)
+        plant(d)
+        before = sorted(os.listdir(other))
+        real = mem_type
+
+        def swap(*a):
+            global mem_type
+            mem_type = real
+            os.rename(d, aside)
+            os.symlink(other, d)
+            return real(*a)
+        mem_type = swap
+        try:
+            rc, _ = run("memory")
+        finally:
+            mem_type = real
+        ok(what, rc == 0 and sorted(os.listdir(other)) == before and open(os.path.join(other, "MEMORY.md")).read() == KEPT
+           and open(os.path.join(other, MEM_FACTS)).read() == KEPT and check(aside))
+        shutil.rmtree(trap)
+        shutil.rmtree(other)
+
+    swapped("memory/ swapped for a link mid-pass: the other folder's files are not written, and the pass finishes in the directory it checked",
+            lambda d: put(os.path.join(d, "MEMORY.md"), "- [R](rule.md) — rule\n- [F](fact.md) — fact\n"),
+            lambda a: "[F]" not in open(os.path.join(a, "MEMORY.md")).read() and "[F]" in open(os.path.join(a, MEM_FACTS)).read())
+
+    def to_remove(d):
+        put(os.path.join(d, "MEMORY.md"), "- [R](rule.md) — rule\n")
+        put(os.path.join(d, MEM_FACTS), "- [R](rule.md) — rule\n")
+    swapped("memory/ swapped for a link mid-pass: the facts file that goes is the checked directory's, not the other folder's", to_remove,
+            lambda a: not os.path.lexists(os.path.join(a, MEM_FACTS)))
+
+    import tracemalloc
+    big = os.path.join(root, "-big", "memory")
+    note(big, "fact.md", "project")
+    os.truncate(os.path.join(big, "fact.md"), 64 << 20)
+    put(os.path.join(big, "MEMORY.md"), "- [F](fact.md) — fact\n")
+    tracemalloc.start()
+    rc, _ = run("memory")
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    ok("a 64 MB note is read only for its first 4096 bytes: the pass holds no more than a few MB, and its type still counts",
+       rc == 0 and peak < 4 << 20 and "[F]" in open(os.path.join(big, MEM_FACTS)).read())
+    shutil.rmtree(os.path.dirname(big))
 
 
 def bench(argv):
@@ -3177,6 +3276,7 @@ def selfcheck():
         selfcheck_run_notes(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
         selfcheck_sources(th, ok, run, w)
+        selfcheck_links(th, ok, run, w)
         selfcheck_ranking(th, ok, run, w)
         selfcheck_quarantine(ok, run)
     finally:
@@ -3972,7 +4072,7 @@ def selfcheck_covers(th, ok, run, w):
         try:
             fn(*args)
             return ""
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             return str(e)
         except TimeoutError:
             return ""
@@ -4107,13 +4207,13 @@ def selfcheck_covers(th, ok, run, w):
     try:
         board_file(bb)
         refused = False
-    except ValueError as e:
-        refused = str(e) == f"over {MEMBER_BOARD_CAP >> 20} MiB"
+    except OSError:
+        refused = True
     try:
         box = board_file(big).get("repo") == "zbox"
     except ValueError:
         box = False
-    ok("covers: a member's board linked to a box board past the member cap refuses only the member's read", refused and box)
+    ok("covers: a member's board linked to a box board refuses only the member's read", refused and box)
     os.remove(bb)
     os.remove(big)
     os.remove(os.path.join(th, ".cc", "members", "wsl", "member-workspace"))
@@ -4352,6 +4452,60 @@ def selfcheck_sources(th, ok, run, w):
         with open(qp, "w") as f:
             f.write(keep_q)
     run("index")
+
+
+def selfcheck_links(th, ok, run, w):
+    """A link at a source's name is never followed, whatever it had indexed there, but for a member's board. Files of its own."""
+    def found(word):
+        return word in run("ask", "--need", "history", word)[1]
+
+    def indexed(p):
+        c = db()
+        n = c.execute("SELECT COUNT(*) FROM sources WHERE path=?", (p,)).fetchone()[0]
+        c.close()
+        return n
+
+    def refuses(fn, *args):
+        try:
+            fn(*args)
+        except OSError:
+            return True
+        return False
+
+    vault = w("lnkvault/credential.txt", "# cred\n\nlnkcanaryplanted\n")
+    w(".claude/projects/-lnk/memory/plain.md", "# plain\n\nlnkcontrolplain\n")
+    planted = os.path.join(th, ".claude", "projects", "-lnk", "memory", "planted.md")
+    os.symlink(vault, planted)
+    run("index")
+    ok("a memory note linked to a host file: ask does not return the file, and a plain note beside it is found",
+       not found("lnkcanaryplanted") and not indexed(planted) and found("lnkcontrolplain"))
+    was = w(".claude/projects/-lnk/memory/was.md", "# was\n\nlnkcanarywas\n")
+    run("index")
+    seen = found("lnkcanarywas") and indexed(was)
+    os.remove(was)
+    os.symlink(w("lnkvault/other.txt", "# other\n\nlnkcanaryother\n"), was)
+    run("index")
+    ok("a source already indexed and now a link: its old rows and its row in sources go, and the new target is not read",
+       seen and not found("lnkcanarywas") and not found("lnkcanaryother") and not indexed(was))
+    ok("open_regular refuses a link swapped in after add()'s check", refuses(open_regular, planted) and refuses(parse, planted, "doc", "", "", {}))
+    mb = w(".cc/members/lnkm/board/lnkm.json", json.dumps({"repo": "lnkm", "log": [], "tracks": {
+        "lnk-row": {"title": "lnkmemberboardrow", "kind": "track", "status": "running"}}}))
+    bj = os.path.join(th, ".cc", "boards", "lnkm.json")
+    os.symlink(mb, bj)
+    run("index")
+    ok("a member's board, the one link the host makes, is still a source", found("lnkmemberboardrow") and indexed(bj))
+    os.remove(mb)
+    os.symlink(w("lnkvault/board.json", json.dumps({"repo": "lnkm", "log": [], "tracks": {
+        "lnk-row": {"title": "lnkcanarychained", "kind": "track", "status": "running"}}})), mb)
+    run("index")
+    ok("that board relinked at its far end to a host file: the file is not read and the board's old rows go",
+       not found("lnkcanarychained") and not found("lnkmemberboardrow") and not indexed(bj))
+    other = os.path.join(th, ".cc", "boards", "lnkx.json")
+    os.symlink(os.path.join(th, "lnkvault", "board.json"), other)
+    run("index")
+    ok("a board name linked straight at a host file is no source", not found("lnkcanarychained") and not indexed(other))
+    for p in (planted, was, bj, other, mb):
+        os.remove(p)
 
 
 def selfcheck_ranking(th, ok, run, w):
