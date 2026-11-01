@@ -670,6 +670,15 @@ def run_selfcheck():
             cmd_thread(["C1", "100.1"])
         check("thread: reads a full cursor page (limit 200), not the OLDEST 50 (M3)",
               [kw for m, kw in acalls2 if m == "conversations.replies"][-1]["limit"] == "200")
+        globals()["api"] = lambda method, token, **kw: ({"user": {"real_name": "Same Name"}} if method == "users.info" else
+                                                        {"messages": [{"ts": "1.0", "user": "UOWNER", "text": "owner-word"},
+                                                                      {"ts": "2.0", "user": "UMEMBER", "text": "member-word"},
+                                                                      {"ts": "3.0", "bot_id": "B1", "username": "UOWNER", "text": "bot-word"}], "has_more": False})
+        with contextlib.redirect_stdout(io.StringIO()) as out_t:
+            cmd_thread(["--owner", "C1", "1.0"])
+        check("thread --owner keeps the owner's messages by user id: a member or a bot with his name is left out",
+              "owner-word" in out_t.getvalue() and "member-word" not in out_t.getvalue() and "bot-word" not in out_t.getvalue())
+        globals()["api"] = stub_api
         pages3 = [{"messages": [{"ts": f"{i}.0", "user": "UOWNER", "text": f"m{i}"} for i in range(60)], "has_more": False}]
         globals()["api"] = lambda method, token, **kw: pages3[0]
         tail3 = replies_tail({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "1.0", 50)

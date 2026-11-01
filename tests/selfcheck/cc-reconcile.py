@@ -3198,6 +3198,9 @@ def selfcheck():
            "investigation  from-the-tick" in quietly(tick, {}, False))
         ok("…and so does the deep fix's", "deep fix   from-the-tick" in quietly(tick, {}, False))
         ok("…and so does the ideas judge's", "ideas  from-the-tick" in quietly(tick, {}, False))
+        scratch(ti, {**NOOP, "cc-limit": 'echo "cc-limit $*" >> "$HOME/limit.calls"; echo "recorded hives"'})
+        ok("THE TICK scans every live session for the limit, so one that parks later is found on the next round",
+           "recorded hives" in quietly(tick, {}, False) and open(f"{ti}/limit.calls").read() == "cc-limit record\n")
     finally:
         restore(); globals().update(STATE=_is, investigate=_inv, deep_fix=_deep, ideas_judge=_ij)
         for k, v in _ie.items():

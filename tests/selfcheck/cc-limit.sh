@@ -19,7 +19,7 @@ set -u; cmd="${1:-}"; shift || true; targ=""; args="$*"
 while [ $# -gt 0 ]; do case "$1" in -t) targ="${2:-}"; shift 2;; *) shift;; esac; done
 case "$cmd" in
   display-message) cat "$CC_FAKE_PANES/$targ.id" 2>/dev/null;;
-  capture-pane) cat "$CC_FAKE_PANES/$targ" 2>/dev/null;;
+  capture-pane) case "$args" in *-pJ*) [ -e "$CC_FAKE_PANES/$targ.J" ] && targ="$targ.J";; esac; cat "$CC_FAKE_PANES/$targ" 2>/dev/null;;
   list-panes) cat "${CC_FAKE_PANELIST:-/dev/null}" 2>/dev/null;;
   send-keys) printf 'keys %s :: %s\n' "$targ" "$args" >> "$CC_FAKE_CALLS"
              case "$args" in *Escape*) grep -v 'esc to interrupt' "$CC_FAKE_PANES/$targ" > "$CC_FAKE_PANES/$targ.t" 2>/dev/null
@@ -243,11 +243,11 @@ EOF
   me "$((t5 + 7200))" resume >/dev/null 2>&1
   t 'and the resume in that same round nudges it — the reset is long past' "$(calls '^msg alpha ')" 1
   # The absolute form was worse: "reset at 3pm" re-read at 16:00 rolled over to TOMORROW's 3pm in one step. In
-  # `record` a clock time already past is "no reset time yet". Real clock: parse_reset's clock times are today's,
-  # and today's 00:00 is the one clock time that is always already past.
-  nowr=$(date -u +%s); mid=$(date -u -d "00:00" +%s)
+  # `record` a clock time already past is "no reset time yet". nowr is six hours past 00:00: too late for a reset just
+  # gone by, too early for tomorrow's to be inside five hours.
+  mid=$(date -u -d "2026-11-03 00:00" +%s); nowr=$((mid + 21600))
   rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"; : > "$d/calls"
-  printf 'Claude usage limit reached. Your limit will reset at 00:00\n> \n' > "$d/panes/@1"
+  printf 'Claude usage limit reached. Your limit will reset at 00:00 (Etc/UTC)\n> \n' > "$d/panes/@1"
   printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((nowr - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
   me "$((mid - 7200))" record @1 alpha >/dev/null 2>&1         # last evening: 00:00 was still ahead
   t 'a clock time still ahead is recorded for today' "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "$mid"
@@ -256,6 +256,245 @@ EOF
     "$rc$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "1$mid"
   me "$nowr" resume >/dev/null 2>&1
   t 'and resume nudges it now, not tomorrow' "$(calls '^msg alpha ')" 1
+
+  # ── THE WORDING CLAUDE CODE PRINTS TODAY. On 2026-11-01 a seat stopped on "You've hit your 5-hour limit · resets
+  # 11:10pm" and sat for 14.5 h. Nothing corroborates these: no stamp, no override, no switch in model.log, because one
+  # seat's limit writes none of them. Each goes through record and then resume, the path the box runs.
+  rm -f "$d/.cc/state/model.log" "$d/.cc/state/model-override" "$d/.cc/state/claude-limit"
+  hit(){   # $1 the clock, $2 the line, $3 the reset it must be recorded for
+    rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"; : > "$d/calls"
+    printf '● a turn\n%s\n\n❯ \n' "$2" > "$d/panes/@1"
+    me "$1" record @1 alpha >/dev/null 2>&1; rc=$?
+    t "recorded on its own word: $2" "$rc $(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "0 $3"
+    me "$((1 + $3 - 2))" resume >/dev/null 2>&1
+    t "…no nudge a second before that reset: $2" "$(calls '^msg alpha ')" 0
+    me "$(($3 + 20))" resume >/dev/null 2>&1
+    t "…and one nudge just after it: $2" "$(calls '^msg alpha ')" 1; }
+  ny=$(TZ=America/New_York date -d '11:10pm 2026-11-02' +%s); la=$(TZ=America/Los_Angeles date -d '10pm 2026-11-02' +%s)
+  wk=$(date -u -d '2026-09-07 17:00' +%s)
+  hit "$((ny - 7200))" "  ⎿  You've hit your 5-hour limit · resets 11:10pm (America/New_York)" "$ny"
+  hit "$((ny - 7200))" "  ⎿  You’ve hit your session limit · resets 11:10pm (America/New_York)" "$ny"
+  hit "$((wk - 86400))" "  ⎿  You've hit your weekly limit · resets Sep 7, 10am (America/Los_Angeles)" "$wk"
+  hit "$((la - 7200))" "  ⎿  You've hit your monthly spend limit · your weekly limit resets 10pm (America/Los_Angeles)" "$la"
+  hit "$((la - 7200))" "  ⎿  You've hit your monthly spend limit · raise it at claude.ai/settings/usage · your weekly limit resets 10pm (America/Los_Angeles)" "$la"
+  TZ=America/New_York hit "$((ny - 7200))" "  ⎿  You've hit your 5-hour limit · resets 11:10pm" "$ny"
+  # cc-model's verdict cannot hold this back: all "not a live limit" leaves is a probe row and a banked hash.
+  printf '%s\t%s\tprobe\t%s\tpane line in alpha was not a live limit\n' iso "$((ny - 7300))" claude-opus-5 > "$d/.cc/state/model.log"
+  printf '%s\n' "$(printf '%s' "alpha  ⎿  You've hit your 5-hour limit · resets 11:10pm (America/New_York)" | md5sum | cut -c1-16)" > "$d/.cc/state/model-seen"
+  hit "$((ny - 7200))" "  ⎿  You've hit your 5-hour limit · resets 11:10pm (America/New_York)" "$ny"
+  rm -f "$d/.cc/state/model.log" "$d/.cc/state/model-seen"
+  # A reset named in the prose above the line is not this line's reset.
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"
+  printf '● it resets at 3am (Asia/Tokyo), I read\n  ⎿  You'"'"'ve hit your 5-hour limit · resets 11:10pm (America/New_York)\n❯ \n' > "$d/panes/@1"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t 'the reset and zone come off the limit line, not the prose above it' "$(cut -f3 "$d/.cc/state/limit-interrupted")" "$ny"
+  # Across midnight, and the three ways a clock already past today can be read.
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"
+  printf '  ⎿  You'"'"'ve hit your 5-hour limit · resets 2am (Etc/UTC)\n❯ \n' > "$d/panes/@1"
+  me "$((mid + 84600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'read at 23:30, "resets 2am" is the limit crossing midnight, not an old screen' \
+    "$rc $(cut -f3 "$d/.cc/state/limit-interrupted")" "0 $((mid + 93600))"
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"
+  me "$((mid + 7800))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'first read ten minutes past its reset, a session that parked late is due now' \
+    "$rc $(cut -f3 "$d/.cc/state/limit-interrupted")" "0 $((mid + 7801))"
+  : > "$d/calls"; me "$((mid + 7820))" resume >/dev/null 2>&1
+  t '…and resume nudges it' "$(calls '^msg alpha ')" 1
+  me "$((mid + 7900))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t '…and the next round does not buy it a second nudge' "$rc $([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" '2 no'
+  rm -f "$d/.cc/state/limit-nudged"
+  me "$((mid + 21600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'hours past its reset it is an old screen: exit 1, nothing recorded' "$rc $([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" '1 no'
+  # Prose that merely mentions a limit stays out, with a live stamp beside it, which is the case that would record it.
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"
+  printf '%s\t%s\t%s\t%s\n' "$((ny + 60))" iso "$((ny - 7300))" fable > "$d/.cc/state/claude-limit"
+  while IFS= read -r line; do
+    printf '%s\n❯ \n' "$line" > "$d/panes/@1"
+    me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+    t "prose stays out: $line" "$rc $([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" '1 no'
+  done <<'PROSE'
+● the fixture ("You've hit your session limit · resets 7am") has the same shape
+⏺ You've hit your 5-hour limit · resets 11:10pm
+> You've hit your 5-hour limit · resets 11:10pm
+  475 LIMIT = """  ⎿  You've hit your session limit · resets 7am (America/New_York)
+A pane carrying the "hit your <period> limit · resets <time>" family is recorded
+You've hit your 5-hour limit · resets 11:10pm
+  You've hit your 5-hour limit · resets 11:10pm (America/New_York)
+     You've hit your 5-hour limit · resets 11:10pm
+       ⎿  You've hit your 5-hour limit · resets 11:10pm
++ ⎿  You've hit your 5-hour limit · resets 11:10pm
+  12 ⎿  You've hit your 5-hour limit · resets 11:10pm
+  ⎿  You've hit your monthly spend limit · raise it at claude.ai/settings/usage
+PROSE
+  rm -f "$d/.cc/state/claude-limit"
+  # ── TEXT ON A SCREEN CANNOT ACT FOR THE BOX. A tool result's first line prints under ⎿ just as the real line does, so
+  # that shape records, and the record reaches that session and nobody else. Each block builds its own state with fresh.
+  L5="  ⎿  You've hit your 5-hour limit · resets 11:10pm (America/New_York)"; ST="$d/.cc/state"; REC1="$ST/limit-interrupted"
+  fresh(){ rm -f "$d/.cc/state/limit-interrupted" "$ST/limit-nudged" "$ST/limit-seen" "$ST/limit-resumed" "$ST/claude-limit" "$ST/owner-due" \
+    "$ST/model.log" "$ST/model-override" "$ST/claude-limit.told" "$d/panes/@1.J" "$d/panes/@2"; : > "$d/calls"; }
+  norec(){ [ -e "$REC1" ] && echo yes || echo no; }
+  # Findings 1, 2, 4: mid-turn, with a promise due. Solo: the nudge only. Witnessed: Escape, the owner told, the episode out.
+  fresh; printf '● a turn\n%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"
+  printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t 'a tool result under the mark records, tagged solo and nothing else' "$(cut -f5 "$REC1")" solo
+  t '…with a promise due, the owner is not told every session is parked' "$(calls '^notify ')" 0
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…at the reset nothing presses Escape into that turn' "$(calls 'Escape')" 0
+  t '…it gets its nudge' "$(calls '^msg alpha ')" 1
+  t '…and no episode is published, so no live mark on any repo goes cold' "$([ -e "$ST/limit-resumed" ] && echo yes || echo no)" no
+  fresh; printf '● a turn\n%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"
+  printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"; echo fallback > "$ST/model-override"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t 'the same line witnessed for the box tells the owner' "$(cut -f5 "$REC1") $(calls '^notify ')" 'working 1'
+  rm -f "$ST/model-override"; me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…ends the dead turn and publishes the episode' "$(calls 'Escape') $(cut -f2 "$ST/limit-resumed")" "1 $ny"
+  # A solo record beside a witnessed one: the episode is the witnessed one's alone.
+  fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  printf '@2\tbeta\t%s\t%s\tindep\n' "$((ny - 60))" "$((ny - 3000))" >> "$REC1"; printf '%s\n❯ \n' "$L5" > "$d/panes/@2"
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t 'a solo record adds nothing to an episode published beside it' "$(cut -f1,2 "$ST/limit-resumed" | tr '\t' ' ')" "$((ny - 3000)) $((ny - 60))"
+  # Lane item 6, and the second witness: a stamp one run hit, or another login's, is not this seat's.
+  fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 7300))" fable abcd1234 > "$ST/claude-limit"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t 'one run'"'"'s stamp sets no reset on this line, and the line is no second witness for it' "$(cut -f3,5 "$REC1" | tr '\t' ' ')" "$ny solo"
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…and it does not hold the nudge back' "$(calls '^msg alpha ')" 1
+  fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 7300))" fable abcd1234,abcd1235 > "$ST/claude-limit"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t 'a stamp two runs hit witnesses the line, and the line still names its own reset' "$(cut -f3,5 "$REC1" | tr '\t' ' ')" "$ny indep"
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…and that stamp, the box'"'"'s, still moves the nudge out' "$(calls '^msg alpha ') $(cut -f3 "$REC1")" "0 $((ny + 3600))"
+  # Finding 3: a far reset records nothing, in any form, and a real line after it is nudged.
+  far(){ fresh; printf '%s\n❯ \n' "$2" > "$d/panes/@1"; [ -z "${3:-}" ] || echo fallback > "$ST/model-override"
+    me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+    t "nothing recorded for $2" "$rc $(norec)" "$1 no"; }
+  far 1 "  ⎿  You've hit your 5-hour limit · resets 2077-01-01 00:00"
+  far 1 "  ⎿  You've hit your 5-hour limit · resets in 99999 hours"
+  far 1 "  ⎿  You've hit your 5-hour limit · resets in 30 minutes"
+  far 2 "Claude usage limit reached. It resets 2077-01-01 00:00" witnessed
+  far 2 "Claude usage limit reached. It resets in 99999 hours" witnessed
+  printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; rm -f "$ST/model-override"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  t '…and a real line after them records for its own reset' "$(cut -f3 "$REC1")" "$ny"
+  fresh; printf "  ⎿  You've hit your weekly limit · resets Nov 14, 10am (America/New_York)\n❯ \n" > "$d/panes/@1"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7100))" record @1 alpha >/dev/null 2>&1
+  t 'a far date inside the fortnight does not hold back a real line under it' "$(cut -f3 "$REC1")" "$ny"
+  # ANSI that reaches the capture as text does not start the line with the mark.
+  fresh; printf '\033[31m%s\033[0m\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a line behind an escape sequence stays out' "$rc $(norec)" '1 no'
+  # Finding 5: at a narrow width only -J gives back the whole line, in record and in resume.
+  fresh; printf "  ⎿  You've hit your 5-hour\n limit · resets 11:10pm (America/New_York)\n❯ \n" > "$d/panes/@1"; printf '%s\n❯ \n' "$L5" > "$d/panes/@1.J"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+  t 'a line the width wrapped is recorded and nudged' "$(calls '^msg alpha ')" 1
+  # Finding 6 and lane item 2: a line left on an idle pane earns one nudge in three days, Escape at most once, though
+  # another pane's sightings churn the file; and the same words under a new turn are a new limit.
+  stale(){ local i tt="$1"; printf '● a turn\n%s\n%s\n' "$L5" "$2" > "$d/panes/@1"; me "$tt" record @1 alpha >/dev/null 2>&1
+    for i in $(seq 1 18); do tt=$((tt + 14400))
+      printf '● a turn\n%s\n%s\n' "$L5" "$2" > "$d/panes/@1"
+      printf '● turn %s\n%s\n❯ \n' "$i" "$L5" > "$d/panes/@2"
+      me "$tt" record @1 alpha >/dev/null 2>&1; me "$tt" record @2 beta >/dev/null 2>&1; me "$tt" resume >/dev/null 2>&1; done; }
+  fresh; stale "$((ny - 7200))" '❯ '
+  t 'a stale line on an idle pane earns one nudge in 72 hours' "$(calls '^msg alpha ')" 1
+  fresh; echo fallback > "$ST/model-override"; stale "$((ny - 7200))" '✻ esc to interrupt'
+  t '…and one Escape, with the footer left on' "$(calls 'Escape')" 1
+  fresh; printf '● a turn\n%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+  : > "$d/calls"; rm -f "$ST/limit-nudged"; me "$((ny + 3600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'read after the next local midnight the same line is an old screen' "$rc $(norec)" '1 no'
+  me "$((ny + 86400 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t '…and the next evening too' "$rc $(norec)" '1 no'
+  printf '● the next day'"'"'s turn\n%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny + 86400 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the same words under a new turn are a new limit' "$rc $(cut -f3 "$REC1")" "0 $((ny + 86400))"
+  fresh; printf '  ⎿  You'"'"'ve hit your 5-hour limit · resets 2am (Etc/UTC)\n❯ \n' > "$d/panes/@1"
+  me "$((mid + 84600))" record @1 alpha >/dev/null 2>&1; me "$((mid + 93620))" resume >/dev/null 2>&1; rm -f "$ST/limit-nudged"
+  me "$((mid + 86400 + 75600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the evening before the next 2am, the old 2am line is an old screen' "$rc $(norec)" '1 no'
+  fresh; printf '● a turn\n%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny + 60))" record @1 alpha >/dev/null 2>&1; me "$((ny + 80))" resume >/dev/null 2>&1
+  : > "$d/calls"; rm -f "$ST/limit-nudged"; me "$((ny + 86400 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a late parker'"'"'s line is an old screen the next evening too' "$rc $(norec)" '1 no'
+  # Lane items 3 and 4: a dated reset just gone by is due now, and hours past it is an old screen.
+  WK="  ⎿  You've hit your weekly limit · resets Sep 7, 10am (America/Los_Angeles)"
+  fresh; printf '%s\n❯ \n' "$WK" > "$d/panes/@1"; me "$((wk + 600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a dated reset first read ten minutes past it is due now' "$rc $(cut -f3 "$REC1")" "0 $((wk + 601))"
+  me "$((wk + 620))" resume >/dev/null 2>&1; t '…and nudged' "$(calls '^msg alpha ')" 1
+  fresh; printf '%s\n❯ \n' "$WK" > "$d/panes/@1"; me "$((wk + 14400))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'hours past a dated reset it is an old screen: exit 1, not the wedge of exit 2' "$rc $(norec)" '1 no'
+  # Lane item 5: tomorrow's 00:30 is 22h50 away on the night the clocks go forward, so a day's arithmetic misreads it.
+  dst=$(TZ=America/New_York date -d '00:30 2026-03-08' +%s)
+  fresh; printf '  ⎿  You'"'"'ve hit your session limit · resets 12:30am (America/New_York)\n❯ \n' > "$d/panes/@1"
+  me "$((dst + 600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'ten minutes past a reset on a daylight-saving night is still ten minutes' "$rc $(cut -f3 "$REC1")" "0 $((dst + 601))"
+  # Round 3, lane item 3 with 5: on that night the next 00:30 comes 23 hours on, and the line left on screen is still old.
+  me "$((dst + 620))" resume >/dev/null 2>&1; t '…and nudged' "$(calls '^msg alpha ')" 1
+  : > "$d/calls"; rm -f "$ST/limit-nudged"; me "$((dst + 82800 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'that evening, 23 hours round the short day, the line is an old screen' "$rc $(norec)" '1 no'
+  me "$((dst + 82800 - 1200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t '…and twenty minutes before the next 00:30 too' "$rc $(norec)" '1 no'
+  # Lane item 1: tmux prints every row, so a real pane ends in empty rows, or in space-only ones under -J (checked on a real
+  # tmux 3.6). Record and resume must both read past them, or the nudge is dropped at the reset.
+  for filler in '' '          '; do
+    fresh; { echo '● a turn'; echo "$L5"; echo '❯ '; printf "$filler%.0s\n" $(seq 1 30); } > "$d/panes/@1"
+    me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?; me "$((ny + 20))" resume >/dev/null 2>&1
+    t "a real line above 30 rows of '$filler' is recorded and nudged at the reset" "$rc $(calls '^msg alpha ')" '0 1'
+  done
+  # Lane items 2 and 8: a solo record the box later witnesses waits for the box's reset, with no Escape guessed for it.
+  fresh; printf '● a turn\n%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 3700))" fable abcd1234,abcd1235 > "$ST/claude-limit"
+  printf '● a turn\n%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"; me "$((ny - 3600))" record @1 alpha >/dev/null 2>&1
+  t 'a solo record later witnessed takes the box episode, and no `working`' "$(cut -f4,5 "$REC1" | tr '\t' ' ')" "$((ny - 3700)) "
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…its nudge waits for the box reset' "$(calls '^msg alpha ') $(cut -f3 "$REC1")" "0 $((ny + 3600))"
+  me "$((ny + 3620))" resume >/dev/null 2>&1
+  t '…then it comes, with no Escape, and the episode goes out' "$(calls '^msg alpha ') $(calls 'Escape') $(cut -f1 "$ST/limit-resumed")" "1 0 $((ny - 3700))"
+  # Perms' follow-up: a leading zero is no octal error that aborts the scan.
+  fresh; printf 'Claude usage limit reached. It resets in 099 hours\n❯ \n' > "$d/panes/@1"; echo fallback > "$ST/model-override"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t '"resets in 099 hours" is 99 hours, not an abort' "$rc $(cut -f3 "$REC1")" "0 $((ny - 7200 + 356400))"
+  # Round 4, the lane's item 1 and perms: an older-wording clock left on screen is an old screen too. A new limit still
+  # records on a live stamp or under another clock.
+  LEG='Claude usage limit reached. Your limit will reset at 11:10pm (America/New_York)'
+  fresh; printf '%s\n❯ \n' "$LEG" > "$d/panes/@1"; echo fallback > "$ST/model-override"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+  me "$((ny + 3600))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'an older-wording line left on screen past midnight is an old screen' "$rc $(norec)" '1 no'
+  me "$((ny + 86400 + 20))" resume >/dev/null 2>&1; t '…so it earns one nudge, not two' "$(calls '^msg alpha ')" 1
+  printf 'Claude usage limit reached. Your limit will reset at 10:10pm (America/New_York)\n❯ \n' > "$d/panes/@1"
+  me "$((ny + 86400 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the same wording under another clock is a new limit' "$rc $(cut -f3 "$REC1")" "0 $((ny + 86400 - 3600))"
+  rm -f "$REC1"; printf '%s\n❯ \n' "$LEG" > "$d/panes/@1"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 86400))" iso "$((ny + 86400 - 7300))" fable abcd1234,abcd1235 > "$ST/claude-limit"
+  me "$((ny + 86400 - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the same words under a live stamp are a new limit' "$rc $(cut -f3 "$REC1")" "0 $((ny + 86400))"
+  # Round 4, perms: "in N" read off a limit line would come due afresh at each read, so a static pane earned a nudge every few rounds.
+  fresh; printf '  ⎿  You'"'"'ve hit your session limit · resets 1 resets in 2 minutes\n❯ \n' > "$d/panes/@1"
+  for i in 0 1 2 3 4 5 6 7 8 9 10 11; do me "$((ny - 7200 + i * 1200))" record @1 alpha >/dev/null 2>&1; rc=$?; me "$((ny - 7200 + i * 1200 + 180))" resume >/dev/null 2>&1; done
+  t 'a limit line naming "in N" records nothing and earns no nudge' "$rc $(norec) $(calls '^msg alpha ')" '1 no 0'
+  # Round 4, the lane's item 2: a one-run stamp over an older-wording line witnesses nothing, so a solo record stays solo.
+  fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 3700))" fable abcd1234 > "$ST/claude-limit"
+  printf 'Claude usage limit reached. Your limit will reset at 11:10pm\n❯ \n' > "$d/panes/@1"; me "$((ny - 3600))" record @1 alpha >/dev/null 2>&1
+  t 'an older-wording line under one run'"'"'s stamp leaves a solo record solo' "$(cut -f5 "$REC1")" solo
+  fresh
+  # A SESSION THAT PARKS AFTER THE LIMIT WAS FIRST RECORDED. The tick's bare `record` is the round that finds it: this
+  # is what it runs, 33 minutes on, with the first session's record already on file.
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"; : > "$d/calls"
+  [ -x "$d/bin/claude" ] || cp "$(readlink -f /bin/bash)" "$d/bin/claude"
+  bash -c "bash -c \"'$d/bin/claude' -c 'sleep 20; true'; true\"; true" </dev/null >/dev/null 2>&1 &
+  deep=$!; sleep 0.6
+  printf '@1 %s alpha\n@2 %s beta\n' "$deep" "$deep" > "$d/panes.list"
+  printf '  ⎿  You'"'"'ve hit your 5-hour limit · resets 11:10pm (America/New_York)\n❯ \n' > "$d/panes/@1"
+  printf '❯ \n' > "$d/panes/@2"
+  me "$((ny - 7200))" record >/dev/null 2>&1
+  t 'the first round records the session already on the limit, and only that one' "$(cut -f1 "$d/.cc/state/limit-interrupted")" '@1'
+  cp "$d/panes/@1" "$d/panes/@2"
+  me "$((ny - 5220))" record >/dev/null 2>&1
+  t 'the next round records the one that parked 33 minutes later' "$(cut -f1 "$d/.cc/state/limit-interrupted" | sort | paste -sd,)" '@1,@2'
+  kill "$deep" 2>/dev/null; wait "$deep" 2>/dev/null
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…and the reset nudges both' "$(calls '^msg alpha ') $(calls '^msg beta ')" '1 1'
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen" "$d/panes/@1" "$d/panes/@2" "$d/panes.list"
 
   # ── WHAT ELSE THE LIMIT KILLED: publishing the episode so a dead subagent's row comes back ──────────────────
   # Own fixture and own clock: a session nudged above must not be what makes any of these pass, and the file
