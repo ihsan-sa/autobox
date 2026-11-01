@@ -28,9 +28,12 @@
 #   6. AFTER. The board row goes merged, the landed card is posted (cc-slack post-approval --landed, what the lander
 #      ran), and the deploy runs: under the repo's git lock (the file the lander and cc-publish lock), ~/dev/<repo>
 #      fast-forwards to origin/<base> and refuses loudly when the checkout was moved; then the installer tests/LANDING-deploy.toml names, a user
-#      daemon-reload and a restart of what `cc-units restart-for` names, which ~/.cc/state/<repo>/deploy-restarts holds
+#      daemon-reload and a restart of what `cc-units restart-for` names, which ~/.cc/state/<repo>/.deploy-restarts holds
 #      from before the installer until each has restarted. A failed installer or a unit that did not restart is a refused
-#      deploy that names it, and the next deploy restarts what the file still holds. tmux-main.service is never restarted. All that runs
+#      deploy that names it, and the next deploy restarts what the file still holds. A link or anything but a plain file at that
+#      list, or a link at its directory, is a refused deploy that leaves the target alone (restart_list), and when it is there
+#      from the start the checkout has not moved either. Only what `restart-for` could name for this tree is restarted from the list, the rest is dropped
+#      and said, and tmux-main.service is never restarted. All that runs
 #      after the fetch has a fixed PATH and no credential-shaped name in its env: the installer links core/bin and
 #      bin-private into ~/bin, so a name a PR added there would otherwise be what the next bare command runs.
 # Every tree that is tested or deployed, and the file list the restarts come from, is read from a sealed fetch (tree_out), never the shared objects: git does
@@ -153,13 +156,42 @@ if rc:
     tree = G.merge_tree(co, base, head)[0]
     print(tree) if tree else sys.exit(3)' "$CORE" "$@"; }
 
+# The dot keeps the list out of the tracks' names, which cc's valid_name starts with a letter, a digit or _: a track dir at
+# this path made the deploy skip its restarts. No test then open: the kernel refuses a link in the open itself.
+restart_list(){   # $1 repo $2 add|get|set, the names on stdin for add and set (set with none removes the list) → get: the list. Refused: exit 1 with the reason on stdout
+  python3 -I -c '
+import os, stat, sys
+state, op = sys.argv[1:]
+name = state + "/.deploy-restarts"
+try:
+    os.makedirs(state, exist_ok=True)
+    d = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = os.open(".deploy-restarts", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=d)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:   # a hard link is a host file by another name
+        sys.exit(f"{name} is not a plain file with one name; take it away to go on")
+    if op == "get":
+        sys.stdout.buffer.write(os.pread(fd, st.st_size, 0))
+        sys.exit(0)
+    names = sys.stdin.buffer.read().strip()
+    if op == "set":
+        os.ftruncate(fd, 0)
+    if names:
+        os.write(fd, names + b"\n")
+    elif op == "set":
+        os.unlink(".deploy-restarts", dir_fd=d)
+except OSError as e:
+    sys.exit(f"{name} will not open as a plain file behind no link ({e.strerror}); take the link away to go on")' "$HOME/.cc/state/$1" "$2" 2>&1; }
+restarted(){ awk -F'\t' '($2 == "restart" || $2 == "rearm") && $1 != "tmux-main.service" { print $1 }'; }   # cc-units restart-for's answer → the units a deploy restarts
+
 deploy(){   # $1 repo $2 base → 0 deployed; 1 refused, said loudly
-  local co="$DEV/$1" lock old tip u inst n pend plan cred=() files=() bad=()
+  local co="$DEV/$1" lock old tip u inst n why list known="" plan cred=() files=() bad=()
   lock="$(cd "$co" && realpath -m "$("${G[@]}" rev-parse --git-common-dir)")/cc-land.lock" || { say "DEPLOY REFUSED — no checkout at $co"; return 1; }
   mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$("${G[@]}" -C "$co" remote get-url origin)" 2>/dev/null)
   (
     flock 8
     [ "$("${G[@]}" -C "$co" symbolic-ref -q --short HEAD)" = "$2" ] || { say "DEPLOY REFUSED — $co is not on $2, so nothing moved; a person put it there"; exit 1; }
+    why=$(restart_list "$1" add </dev/null) || { say "DEPLOY REFUSED — $why; nothing moved"; exit 1; }   # before the checkout moves, so the next deploy still sees this change's files
     old=$("${G[@]}" -C "$co" rev-parse HEAD)
     tip=$("${G[@]}" "${cred[@]}" -C "$co" fetch --porcelain -v --no-tags origin "+refs/heads/$2:refs/remotes/origin/$2" | sent "$2")
     [ -n "$tip" ] && { mapfile -d '' -t files < <(tree_out "$co" "$co" "$old" "$tip"); wait $!; } && "${G[@]}" -C "$co" update-ref "refs/heads/$2" "$tip" "$old" \
@@ -170,18 +202,23 @@ deploy(){   # $1 repo $2 base → 0 deployed; 1 refused, said loudly
     [ -n "$inst" ] || exit 0   # the repo names no installer (tests/LANDING-deploy.toml, as the lander reads it): pulled only
     # what must restart is written down before the installer runs, and a unit leaves the list only once it has restarted,
     # so the next deploy finishes what a failed installer or a failed restart left
-    pend=$HOME/.cc/state/$1/deploy-restarts; mkdir -p "${pend%/*}"
     if [ ${#files[@]} != 0 ] && [ -x "$co/core/bin/cc-units" ]; then
       plan=$("$co/core/bin/cc-units" restart-for --root "$co" "${files[@]}") || { say "DEPLOY REFUSED — cc-units would not say what restarts for: ${files[*]}"; exit 1; }
-      awk -F'\t' '($2 == "restart" || $2 == "rearm") && $1 != "tmux-main.service" { print $1 }' <<<"$plan" >> "$pend"
+      why=$(restarted <<<"$plan" | restart_list "$1" add) || { say "DEPLOY REFUSED — $why"; exit 1; }
     fi
-    (cd "$co" && "./$inst") >/dev/null || { say "DEPLOY REFUSED — $inst failed, and $pend keeps the restarts for the next deploy"; exit 1; }
+    (cd "$co" && "./$inst") >/dev/null || { say "DEPLOY REFUSED — $inst failed, and the restart list keeps the restarts for the next deploy"; exit 1; }
     systemctl --user daemon-reload
-    [ -f "$pend" ] && while read -r u; do
-      if systemctl --user restart "$u"; then say "restarted $u"; else bad+=("$u"); fi
-    done < <(awk '!s[$0]++' "$pend")
-    [ ${#bad[@]} = 0 ] || { printf '%s\n' "${bad[@]}" > "$pend"; say "DEPLOY REFUSED — did not restart: ${bad[*]}, and $pend keeps them for the next deploy"; exit 1; }
-    rm -f "$pend"
+    list=$(restart_list "$1" get) || { say "DEPLOY REFUSED — $list"; exit 1; }
+    # the list is only a note of what is owed: what may restart is what cc-units says for this tree, asked of every file in it
+    if [ -n "$list" ] && [ -x "$co/core/bin/cc-units" ]; then
+      known=$("${G[@]}" -C "$co" ls-files -z | xargs -0 -r "$co/core/bin/cc-units" restart-for --root "$co" | restarted) || { say "DEPLOY REFUSED — cc-units would not say which units this repo restarts, and the restart list keeps its names for the next deploy"; exit 1; }
+    fi
+    while read -r u; do
+      if ! grep -Fxq -- "$u" <<<"$known"; then say "not restarting $u, which was on the restart list: this repo's cc-units would never restart it"
+      elif systemctl --user restart "$u"; then say "restarted $u"; else bad+=("$u"); fi
+    done < <(awk 'NF && !s[$0]++' <<<"$list")
+    why=$(printf '%s\n' "${bad[@]}" | restart_list "$1" set) || { say "DEPLOY REFUSED — $why"; exit 1; }
+    [ ${#bad[@]} = 0 ] || { say "DEPLOY REFUSED — did not restart: ${bad[*]}, and the restart list keeps them for the next deploy"; exit 1; }
   ) 8>"$lock"; }
 
 if [ $# = 2 ] && [ "$1" = catch-up ]; then

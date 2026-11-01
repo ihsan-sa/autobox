@@ -376,9 +376,9 @@ fx lost-kept; BIN=$T/fb; qpr 'waits in the queue' 3
 t 'a kept PR whose note will not write is no failure: it is in the queue, and nothing is recorded' "$(cat "$lg.rc"):$(calls cc-failures)" 3:0
 
 # the deploy's restart list: a repo whose cc-units says what $T/units holds, and a systemctl that fails on a unit in $T/unit.fail
-unitfx(){ fx "$1"; (cd "$T/dev/r" && mkdir -p core/bin && printf '#!/bin/sh\n[ ! -f "%s/plan.no" ] || exit 2\ncat "%s/units"\n' "$T" "$T" > core/bin/cc-units && chmod +x core/bin/cc-units \
+unitfx(){ fx "$1"; (cd "$T/dev/r" && mkdir -p core/bin && printf '#!/bin/sh\n[ ! -f "%s/plan.no" ] || exit 2\ncase " $* " in *" a.txt "*) cat "%s/tree-units";; *) cat "%s/units";; esac\n' "$T" "$T" "$T" > core/bin/cc-units && chmod +x core/bin/cc-units \
   && printf '#!/bin/sh\necho installed >> "%s/calls"\n[ ! -f "%s/inst.no" ]\n' "$T" "$T" > inst.sh && chmod +x inst.sh && printf 'installer = "inst.sh"\n' > tests/LANDING-deploy.toml && git add -A && git commit -qm i && git push -q origin main)
-  printf 'a.service\trestart\nb.timer\trearm\nc.service\towner\ntmux-main.service\trestart\n' > "$T/units"; PEND=$T/home/.cc/state/r/deploy-restarts
+  printf 'a.service\trestart\nb.timer\trearm\nc.service\towner\ntmux-main.service\trestart\n' > "$T/units"; cp "$T/units" "$T/tree-units"; PEND=$T/home/.cc/state/r/.deploy-restarts
   printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls"\n[ "$2" = restart ] && grep -qx "$3" "%s/unit.fail" 2>/dev/null && exit 1\nexit 0\n' "$T" "$T" > "$T/fb/systemctl"; chmod +x "$T/fb/systemctl"; }
 nextpr(){ (cd "$T/dev/r" && git fetch -q origin && git checkout -q -B track/x origin/track/x && echo y > y.txt && git add -A && git commit -qm y && git push -q origin track/x && git checkout -q main); : > "$T/units"; }
 sys(){ calls "systemctl --user restart $1"; }
@@ -402,6 +402,47 @@ t '…and the next deploy finishes that list once, and clears it' "$rc:$(sys a.s
 unitfx plan-fails; touch "$T/plan.no"; rc=$(run)
 t 'a cc-units that will not answer is a refused deploy naming the files, not a silent no-restart' \
   "$rc:$(tail -1 "$T/out" | grep -c 'cc-units would not say what restarts for: x.txt'):$(calls installed)" '0:1:0'
+
+# …and the list is not to be trusted: a link there, a name planted in it, a track of the old name. The fake cc-units answers
+# tree-units when it is asked of the whole tree (a.txt is never in a change) and units for the change.
+refused(){ grep -c "DEPLOY REFUSED — .*$1" "$T/out"; }
+moved(){ [ "$(git -C "$T/dev/r" rev-parse HEAD)" = "$(git -C "$T/o/r.git" rev-parse main)" ] && echo moved || echo still; }
+unitfx link-at-list; mkdir -p "${PEND%/*}"; echo keep > "$T/victim"; ln -s "$T/victim" "$PEND"; rc=$(run)
+t 'a link at the restart list: its target is untouched, the deploy refuses and says why, and nothing moved, installed or restarted' \
+  "$rc:$(cat "$T/victim"):$(refused 'deploy-restarts will not open.*symbolic links'):$(moved):$(calls installed):$(calls 'systemctl --user')" '0:keep:1:still:0:0'
+rm "$PEND"; rc=$(cu)
+t '…and with the link gone the next deploy loses nothing: it installs and restarts what that change owed' "$rc:$(moved):$(calls installed):$(sys a.service):$(sys b.timer):$(pend)" '0:moved:1:1:1:gone'
+unitfx dangling-at-list; mkdir -p "${PEND%/*}"; ln -s "$T/nowhere" "$PEND"; run >/dev/null
+t 'a dangling link at the list creates nothing where it points' "$(refused 'will not open'):$([ -e "$T/nowhere" ] && echo made || echo none)" '1:none'
+unitfx link-at-dir; mkdir -p "$T/home/.cc/state" "$T/elsewhere"; echo keep > "$T/elsewhere/.deploy-restarts"; ln -s "$T/elsewhere" "${PEND%/*}"; run >/dev/null
+t 'a link at the list'"'"'s directory: the list behind it is untouched, and the deploy refuses' "$(cat "$T/elsewhere/.deploy-restarts"):$(refused 'will not open.*Not a directory'):$(moved):$(calls 'systemctl --user')" 'keep:1:still:0'
+unitfx dangling-at-dir; mkdir -p "$T/home/.cc/state"; ln -s "$T/nowhere" "${PEND%/*}"   # the catch-up, since the merge's own check log needs that directory first
+(cd "$T/dev/r" && git checkout -q -b h && echo h > h.txt && git add h.txt && git commit -qm h && git push -q origin h:main && git checkout -q main && git branch -qD h); cu >/dev/null
+t 'a dangling link at its directory makes nothing where it points, and the deploy refuses' "$(refused 'will not open'):$([ -e "$T/nowhere" ] && echo made || echo none)" '1:none'
+unitfx hard-link; mkdir -p "${PEND%/*}"; echo keep > "$T/victim"; ln "$T/victim" "$PEND"; run >/dev/null
+t 'a hard link at the list is refused and its other name is untouched' "$(cat "$T/victim"):$(refused 'one name'):$(moved)" 'keep:1:still'
+unitfx fifo-at-list; mkdir -p "${PEND%/*}"; mkfifo "$PEND"; run >/dev/null
+t 'a FIFO at the list is refused, and holds nothing up' "$(refused 'not a plain file'):$(moved)" '1:still'
+unitfx link-mid-deploy; echo keep > "$T/victim"
+(cd "$T/dev/r" && printf '#!/bin/sh\nrm -f "%s"; ln -s "%s" "%s"\n' "$PEND" "$T/victim" "$PEND" > inst.sh && git add inst.sh && git commit -qm plant && git push -q origin main && git checkout -q track/x && git merge -q main && git push -q origin track/x && git checkout -q main); run >/dev/null
+t 'a link planted as the installer runs: the restarts refuse and its target is untouched' "$(cat "$T/victim"):$(refused 'will not open'):$(calls 'systemctl --user restart')" 'keep:1:0'
+unitfx planted-names; mkdir -p "${PEND%/*}"; printf 'tmux-main.service\nevil.service\n-x\nc.service\na.service\n\n' > "$PEND"; : > "$T/units"; rc=$(run)
+t 'a planted list: tmux-main, an unknown name and an owner unit never restart, each is said, a unit of this repo does, and the list goes' \
+  "$rc:$(calls 'systemctl --user restart tmux-main'):$(calls 'systemctl --user restart evil'):$(calls 'systemctl --user restart -x'):$(sys c.service):$(sys a.service):$(grep -c '^cc-merge: not restarting ' "$T/out"):$(pend)" '0:0:0:0:0:1:4:gone'
+unitfx tree-silent; mkdir -p "${PEND%/*}"; echo a.service > "$PEND"; : > "$T/units"; rm "$T/tree-units"; rc=$(run)
+t 'a cc-units that will not say what the tree restarts: refused, nothing restarted, and the list keeps its name' "$rc:$(refused 'which units this repo restarts'):$(calls 'systemctl --user restart'):$(pend)" '0:1:0:a.service '
+unitfx no-units-tool; (cd "$T/dev/r" && git rm -q core/bin/cc-units && git commit -qm gone && git push -q origin main && git checkout -q track/x && git merge -q main && git push -q origin track/x && git checkout -q main); mkdir -p "${PEND%/*}"; echo a.service > "$PEND"; rc=$(run)
+t 'a repo that no longer has cc-units restarts nothing from a list, and the list goes' "$rc:$(calls 'systemctl --user restart'):$(grep -c 'not restarting a.service' "$T/out"):$(pend)" '0:0:1:gone'
+unitfx track-of-the-name; dir=${PEND%/*}/deploy-restarts; mkdir -p "$dir"; echo keep > "$dir/progress.md"; rc=$(run)
+t 'a track named deploy-restarts: the deploy restarts the same units, and its dir is untouched' \
+  "$rc:$(sys a.service):$(sys b.timer):$(grep -c 'DEPLOY REFUSED' "$T/out"):$(cat "$dir/progress.md"):$(ls -A "$dir"):$(pend)" '0:1:1:0:keep:progress.md:gone'
+# the real cc-units: the whole-tree question names a declared unit no change touched, and no unit of another policy
+fx real-units; (cd "$T/dev/r" && mkdir -p core/bin core/config/systemd-user core/svc && cp "$HERE/bin/cc-units" core/bin/ && echo s > core/svc/s \
+  && printf '{"units":[{"unit":"u.service","enable":"required","start":"now","health":"active","restart":"restart","paths":["svc/"]},{"unit":"o.service","enable":"required","start":"now","health":"active","restart":"owner","paths":["svc/"]},{"unit":"tmux-main.service","enable":"required","start":"now","health":"active","restart":"restart","paths":["svc/"]}]}\n' > core/config/units.json \
+  && printf '#!/bin/sh\n' > inst.sh && chmod +x inst.sh && printf 'installer = "inst.sh"\n' > tests/LANDING-deploy.toml && git add -A && git commit -qm i && git push -q origin main && git checkout -q track/x && git merge -q main && git push -q origin track/x && git checkout -q main)
+printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls"\n' "$T" > "$T/fb/systemctl"; chmod +x "$T/fb/systemctl"; mkdir -p "$T/home/.cc/state/r"; printf 'u.service\no.service\ntmux-main.service\nz.service\n' > "$T/home/.cc/state/r/.deploy-restarts"; rc=$(run)
+t 'with the real cc-units a planted list restarts only the unit this tree restarts' \
+  "$rc:$(calls 'systemctl --user restart u.service'):$(calls 'systemctl --user restart'):$(grep -c 'DEPLOY REFUSED' "$T/out")" '0:1:1:0'
 
 # the gates: tests/check.sh runs what its discovery finds, judged by the tally; lander check selects by the manifest
 eval "$(sed -n '/^tally_line(){/p;/^tally_ok(){/p;/^ships_selfcheck(){/,/; }$/p' "$HERE/tests/check.sh")"
