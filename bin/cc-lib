@@ -68,8 +68,9 @@ boundary reads one file, its own workspace's, and can reach no other.
         session's prompt at start — keeps the lines whose file is a RULE (frontmatter type feedback or user: a session
         cannot search for a rule it does not know it is breaking) and moves the lines whose file is a FACT (type project
         or reference) to MEMORY-facts.md beside it, which nothing loads, with one pointer line last saying `cc-lib ask`
-        finds them. A line whose file is missing or untyped is not classified and stays; a facts line whose file now
-        says feedback comes back, once, and the facts file goes when nothing is left in it. The memory files are never
+        finds them. A line whose file is missing or untyped is not classified and stays. A line in MEMORY-facts.md stays
+        there whatever its file's type, so a seat that moves rule lines there to trim the index keeps the trim; moved
+        back by hand it leaves the facts file, which goes when nothing is left in it. The memory files are never
         touched: they are the records, indexed already (the two index files are not sources). Writes ONLY when the content differs — a no-op rewrite would still move the
         prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn.
   cc-lib index --cold [<days>] [--json]
@@ -258,7 +259,6 @@ ID_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 ID_CHAN = re.compile(r"\bC0[A-Z0-9]{8,10}\b")
 ID_SLACK = re.compile(r"^[CDG]0[A-Z0-9]{8,10}$|^\d{10}\.\d{6}$")   # a chat id or a message ts, as --object
 MEM_LINE = re.compile(r"^- \[[^\]]*\]\(([^)]+\.md)\)")   # one MEMORY.md line: `- [Title](file.md) — hook`
-MEM_KEEP = ("feedback", "user")   # the types that are RULES and stay in the loaded text; project and reference are facts
 MEM_FACTS = "MEMORY-facts.md"
 MEM_POINTER = ("- Facts (project and reference memories) are not loaded: `cc-lib ask --need history \"<words>\"` finds them; "
                "the list is memory/" + MEM_FACTS + ".")
@@ -2586,7 +2586,9 @@ def memory(argv):
     user) stay — a session cannot search for a rule it does not know it is breaking; the lines whose file is a FACT
     (type project, reference) move to MEMORY-facts.md beside it, which nothing loads, and one pointer line at the end
     says where facts are found (`cc-lib ask`). A line whose file is missing or carries no type is not classified and
-    stays. A facts line whose file now says feedback or user comes back. The files themselves are never touched; they
+    stays. A line in MEMORY-facts.md stays there whatever its file's type: moving a rule line there is how a seat trims
+    the index, and bringing it back undid every such trim at the next Stop of any seat (2026-11-01). A line the loaded
+    text also carries leaves the facts file. The files themselves are never touched; they
     are the records and were indexed already. WRITES ONLY WHAT CHANGED: a rewrite that changed nothing would still
     move the prompt under a running session's cache, which has turned a smaller prompt into higher spend before."""
     dry = "--dry-run" in argv
@@ -2606,7 +2608,7 @@ def memory(argv):
                 facts = [l for l in f.read().split("\n") if MEM_LINE.match(l)]
         except OSError:
             facts = []
-        keep, move, back, seen = [], [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
+        keep, move, seen = [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
         for l in loaded:
             if l.strip() == MEM_POINTER.strip():
                 continue
@@ -2617,18 +2619,15 @@ def memory(argv):
                 keep.append(l)
                 if m:
                     seen.add(m.group(1))
-        stay = []
+        stay, listed = [], seen | {MEM_LINE.match(x).group(1) for x in move}
         for l in facts:
             fn = MEM_LINE.match(l).group(1)
-            if mem_type(os.path.join(mdir, fn)) in MEM_KEEP:
-                if fn not in seen:   # a line the loaded text already carries is not brought back a second time
-                    back.append(l)
-                    seen.add(fn)
-            elif fn not in {MEM_LINE.match(x).group(1) for x in move} and fn not in {MEM_LINE.match(x).group(1) for x in stay}:
+            if fn not in listed:
                 stay.append(l)
+                listed.add(fn)
         while keep and not keep[-1].strip():
             keep.pop()
-        new_loaded = keep + back
+        new_loaded = keep
         all_facts = stay + move
         if all_facts:
             new_loaded += ["", MEM_POINTER]
@@ -2643,14 +2642,12 @@ def memory(argv):
         changed = (new_loaded_t != open(mi, encoding="utf-8", errors="replace").read()) or (all_facts and new_facts_t != cur_facts) \
             or (not all_facts and os.path.exists(fp))   # nothing left to list: the facts file goes, or a stale one brings lines back
         what = (f"cc-lib memory: {tilde(mdir)}: {len(new_loaded) - (2 if all_facts else 0)} rule line(s) stay "
-                f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), {len(back)} come back, "
+                f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), "
                 f"{len(stay)} already in {MEM_FACTS}")
         if dry:
             print(what + " · DRY-RUN, nothing written")
             for l in move:
                 print("  would move: " + l[:100])
-            for l in back:
-                print("  would bring back: " + l[:100])
             continue
         if not changed:
             print(what + " · unchanged, nothing written")
@@ -3225,15 +3222,22 @@ def selfcheck_p3(th, ok, run, w):
     w(md + "api-ref.md", "---\nname: api-ref\ndescription: the routing API dashboard URL\nmetadata:\n  type: feedback\n---\n\nnow a rule.\n")
     rc, o = run("memory")
     loaded, facts = open(mi).read(), open(fp).read()
-    ok("…a facts line whose file now says feedback comes back to the loaded text; the other fact stays out",
-       rc == 0 and "1 come back" in o and "[API]" in loaded and "[API]" not in facts and "[Dashboard]" in facts and "[Dashboard]" not in loaded)
+    ok("…a facts line whose file now says feedback stays there: moving a rule line there is a trim, and the next pass keeps it",
+       rc == 0 and "unchanged, nothing written" in o and "[API]" in facts and "[API]" not in loaded and "[Dashboard]" in facts)
+    with open(mi, "a") as f:
+        f.write("- [API](api-ref.md) — the routing API dashboard URL\n")
+    rc, o = run("memory")
+    loaded, facts = open(mi).read(), open(fp).read()
+    ok("…a rule line a seat puts back in the loaded text leaves the facts file, so it is listed once",
+       rc == 0 and loaded.count("[API]") == 1 and "[API]" not in facts and "[Dashboard]" in facts)
     w(md + "dashboard.md", "---\nname: dashboard\ndescription: orch dashboard\nmetadata:\n  type: feedback\n---\n\nnow a rule too.\n")
+    with open(mi, "a") as f:
+        f.write("- [Dashboard](dashboard.md) — orch dashboard, channel and packet paths\n")
     run("memory")
     rc, o = run("memory")
     loaded = open(mi).read()
-    ok("…when the last fact comes back, the facts file and the pointer line go with it, and a further pass brings nothing back and writes "
-       "nothing: each line is in the loaded text ONCE (a stale facts file once brought the same line back every pass)",
-       rc == 0 and "unchanged, nothing written" in o and "0 come back" in o and loaded.count("[API]") == 1 and loaded.count("[Dashboard]") == 1
+    ok("…when the last line leaves the facts file, the file and the pointer line go with it, and a further pass writes nothing",
+       rc == 0 and "unchanged, nothing written" in o and loaded.count("[API]") == 1 and loaded.count("[Dashboard]") == 1
        and "cc-lib ask" not in loaded and not os.path.exists(fp))
 
     # ---- inbound Slack, archived by the daemon per target/chat/month, found by channel, thread and ts

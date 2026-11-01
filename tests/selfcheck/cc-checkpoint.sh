@@ -1452,6 +1452,12 @@ SH
   o=$(HOME="$LH" "$bin/cc-lib" ask --need history "capybara packet" 2>/dev/null)
   k "$(grep -q 'under state/dash' <<<"$o" && grep -q 'OUTCOME answered' <<<"$o" && echo 0 || echo 1)" \
     "…and the fact that left the loaded text is found by cc-lib ask, indexed by the same hook" "$o"
+  # A TRIM STICKS: a rule line a seat moved to MEMORY-facts.md stays there through the hook, though its note says feedback.
+  printf -- '---\nname: quokka-rule\ndescription: d\nmetadata:\n  type: feedback\n---\n\nquokka.\n' > "$LH/.claude/projects/-x/memory/quokka-rule.md"
+  printf -- '- [Quokka rule](quokka-rule.md) — d\n' >> "$LH/.claude/projects/-x/memory/MEMORY-facts.md"
+  ( cd "$T" && HOME="$LH" "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 )
+  eq "hook: a rule line trimmed to MEMORY-facts.md stays there" \
+    "$(grep -c 'Quokka rule' "$LH/.claude/projects/-x/memory/MEMORY.md"):$(grep -c 'Quokka rule' "$LH/.claude/projects/-x/memory/MEMORY-facts.md")" "0:1"
   printf '\n## 2026-09-11T10:40Z iter 3\nwritten inside a member boundary.\n' >> "$LH/.cc/state/r1/t1/progress.md"
   ( cd "$T" && HOME="$LH" CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 )
   eq "…and NOT inside a member's boundary: the workspace's knowledge-base file is the host's, read-only, so that hook indexes nothing (the host's next pass finds the journal stale)" \
