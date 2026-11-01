@@ -579,6 +579,11 @@ class TestReview(Case):
         self.assertNotIn("@", sent)
         self.assertIn("\\u0040/planted", sent)
 
+    def test_a_read_tells_a_literal_escape_from_an_at_sign(self):
+        body = R.noat("-x = 'a@b'\n+x = 'a\\u0040b'\n+y = 'c\\u005cu0040d'\n").split("\n\n", 1)[1]
+        self.assertEqual(body, "-x = 'a\\u0040b'\n+x = 'a\\u005cu0040b'\n+y = 'c\\u005cu005cu0040d'\n")
+        self.assertIn("\\u005cu0040 is the six characters", R.noat(""))
+
     def test_a_big_diff_goes_on_stdin_cut_never_into_argv(self):
         big = DIFF + "+x\n" * 200_000
         box = self.box(claude=claude_says("LAND"), **{"git diff": name_only("x.py", diff=big)})

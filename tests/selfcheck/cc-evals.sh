@@ -145,6 +145,10 @@ FAKE
   out=$(A '{"is_error":false,"result":"a\\u0040b.c","total_cost_usd":0}' ask <<<'read @/planted')
   k "$(t sh -c '! grep -q @ "$1" && grep -qF "\u0040/planted" "$1"' sh "$d/calls.in")" "ask's prompt carries no @ for Claude Code to expand"
   k "$(t test "$out" = a@b.c)" "…and a reply that copies the escape reads as an at sign"
+  out=$(A '{"is_error":false,"structured_output":{"q":"a\\u0040b"},"total_cost_usd":0}' ask <<<'q')
+  k "$(t test "$(jq -r .q <<<"$out")" = 'a\u0040b')" "…but a structured reply holding a literal escape stays valid JSON and keeps it"
+  out=$(A '{"is_error":false,"result":"{\"q\":\"a\\\\u0040b\"}","total_cost_usd":0}' ask <<<'q')
+  k "$(t test "$(jq -r .q <<<"$out")" = 'a\u0040b')" "…and so does a JSON reply that came back as text"
   # THE NOTICE, on its own fixture: a question that cost $0.90 against a $0.50 figure still answers, and says so once
   : > "$d/calls"; : > "$d/argv"
   out=$(A '{"is_error":false,"result":"PRICEY","total_cost_usd":0.90}' ask <<<'q')

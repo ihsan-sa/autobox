@@ -1275,8 +1275,12 @@ def streamed(out):
 
 
 def noat(text):
-    """Claude Code expands an @path in a prompt as a Read no hook or allow check sees, so none reaches it (cc-approve)."""
-    return "Every at sign below is written \\u0040, so read it as one, and write a real at sign in your reply.\n\n" + text.replace("@", "\\u0040")
+    """Claude Code expands an @path in a prompt as a Read no hook or allow check sees, so none reaches it (cc-approve).
+    A literal \\u0040 in the text is told apart from a rewritten @, or a diff between the two would read as no change."""
+    text = re.sub(r"\\u(0040|005c)", r"\\u005cu\1", text).replace("@", "\\u0040")
+    return ("Every at sign below is written \\u0040, so read it as one, and write a real at sign in your reply. "
+            "A backslash that starts a literal \\u0040 or \\u005c in the text is written \\u005c, so \\u005cu0040 is the six "
+            "characters backslash, u, 0, 0, 4, 0 and not an at sign. A change between the two is a real change.\n\n" + text)
 
 
 def ask(text, repo, pr, digest, model=None):

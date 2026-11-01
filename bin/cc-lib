@@ -72,7 +72,10 @@ boundary reads one file, its own workspace's, and can reach no other.
         there whatever its file's type, so a seat that moves rule lines there to trim the index keeps the trim; moved
         back by hand it leaves the facts file, which goes when nothing is left in it. The memory files are never
         touched: they are the records, indexed already (the two index files are not sources). Writes ONLY when the content differs — a no-op rewrite would still move the
-        prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn.
+        prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn. A sandboxed
+        worker can write these dirs and the host runs this, so it follows no link: a dir whose memory/, MEMORY.md or
+        MEMORY-facts.md is a link or not a regular file is left alone, said on stderr, exit 1, and the other dirs still
+        run; a linked note counts as untyped; writes go through mkstemp, so a planted MEMORY.md.tmp is never opened.
   cc-lib index --cold [<days>] [--json]
         WHAT WOULD LEAVE THE HOT INDEX, and nothing leaves (P3, decision 8: dry-run until a person has read it): the
         records of closed bodies — a board row in merged|done|dropped|closed: its journal, its task, its notes, and
@@ -206,6 +209,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 H = os.path.expanduser("~")
@@ -2569,11 +2573,18 @@ def view(argv):
     return 0
 
 
+def mem_read(path):
+    """A regular file's text, opened without following a link or waiting on a FIFO; OSError for anything else."""
+    with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding="utf-8", errors="replace") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise OSError("not a regular file")
+        return f.read()
+
+
 def mem_type(path):
-    """The `type:` a memory file's frontmatter carries, or '' when the file is missing, unreadable or says none."""
+    """The `type:` a memory file's frontmatter carries, or '' when the file is missing, a link, unreadable or says none."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            head = f.read(4096)
+        head = mem_read(path)[:4096]
     except OSError:
         return ""
     m = re.search(r"^\s*type:\s*(\w+)", head, re.M)
@@ -2590,24 +2601,28 @@ def memory(argv):
     the index, and bringing it back undid every such trim at the next Stop of any seat (2026-11-01). A line the loaded
     text also carries leaves the facts file. The files themselves are never touched; they
     are the records and were indexed already. WRITES ONLY WHAT CHANGED: a rewrite that changed nothing would still
-    move the prompt under a running session's cache, which has turned a smaller prompt into higher spend before."""
+    move the prompt under a running session's cache, which has turned a smaller prompt into higher spend before.
+    FOLLOWS NO LINK: a sandboxed worker can write its memory dir and its project dir, and the host runs this, so a link
+    there would write through to a host file or copy one into text the worker reads (as in cc-memory-dream's dream_dir)."""
     dry = "--dry-run" in argv
     rc = 0
     for mi in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "MEMORY.md"))):
         mdir = os.path.dirname(mi)
         fp = os.path.join(mdir, MEM_FACTS)
         try:
-            with open(mi, encoding="utf-8", errors="replace") as f:
-                loaded = f.read().split("\n")
+            if os.path.islink(mdir):
+                raise OSError("the directory is a link")
+            cur_loaded = mem_read(mi)
+            try:
+                cur_facts = mem_read(fp)
+            except FileNotFoundError:
+                cur_facts = ""
         except OSError as e:
-            print(f"cc-lib memory: {tilde(mi)}: {e}", file=sys.stderr)
+            print(f"cc-lib memory: {tilde(mdir)}: left alone: {e}", file=sys.stderr)
             rc = 1
             continue
-        try:
-            with open(fp, encoding="utf-8", errors="replace") as f:
-                facts = [l for l in f.read().split("\n") if MEM_LINE.match(l)]
-        except OSError:
-            facts = []
+        loaded = cur_loaded.split("\n")
+        facts = [l for l in cur_facts.split("\n") if MEM_LINE.match(l)]
         keep, move, seen = [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
         for l in loaded:
             if l.strip() == MEM_POINTER.strip():
@@ -2634,13 +2649,9 @@ def memory(argv):
         new_loaded_t = "\n".join(new_loaded) + "\n"
         new_facts_t = ("# Memory facts — not loaded into any prompt; `cc-lib ask --need history \"<words>\"` finds each file's record\n\n"
                        + "\n".join(all_facts) + "\n") if all_facts else ""
-        try:
-            cur_facts = open(fp, encoding="utf-8", errors="replace").read()
-        except OSError:
-            cur_facts = ""
         moved_b = sum(len(l.encode()) + 1 for l in move)
-        changed = (new_loaded_t != open(mi, encoding="utf-8", errors="replace").read()) or (all_facts and new_facts_t != cur_facts) \
-            or (not all_facts and os.path.exists(fp))   # nothing left to list: the facts file goes, or a stale one brings lines back
+        changed = new_loaded_t != cur_loaded or (all_facts and new_facts_t != cur_facts) \
+            or (not all_facts and os.path.lexists(fp))   # nothing left to list: the facts file goes
         what = (f"cc-lib memory: {tilde(mdir)}: {len(new_loaded) - (2 if all_facts else 0)} rule line(s) stay "
                 f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), "
                 f"{len(stay)} already in {MEM_FACTS}")
@@ -2655,19 +2666,108 @@ def memory(argv):
         try:
             for path, txt in ((mi, new_loaded_t), (fp, new_facts_t)):
                 if not txt:
-                    if os.path.exists(path):
+                    if os.path.lexists(path):
                         os.remove(path)   # only ever the facts file: the loaded text is never empty (its own lines, or the pointer)
                     continue
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(txt)
-                os.replace(tmp, path)
+                fd, tmp = tempfile.mkstemp(dir=mdir, prefix=".memory-index.")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(txt)
+                    os.replace(tmp, path)
+                except OSError:
+                    os.unlink(tmp)
+                    raise
         except OSError as e:
             print(f"cc-lib memory: {tilde(mdir)}: {e}", file=sys.stderr)
             rc = 1
             continue
         print(what + " · written")
     return rc
+
+
+def selfcheck_memory_links(th, ok, run):
+    """A link planted in a memory dir: nothing outside is written or copied, and a dir refused stops no other dir.
+    Each case builds its own dirs and removes them. `-zz` sorts after `-trap`, so it shows the pass went on."""
+    import io
+    import shutil
+    root = os.path.join(th, ".claude", "projects")
+    SECRET = "- [Stolen](stolen.md) — TOPSECRET\n"
+
+    def put(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def note(d, name, typ):
+        put(os.path.join(d, name), f"---\nname: {name}\nmetadata:\n  type: {typ}\n---\n\nbody\n")
+
+    def link(d, name, target):
+        path = os.path.join(d, name)
+        if os.path.lexists(path):
+            os.remove(path)
+        os.symlink(target, path)
+
+    def case(what, secret, plant, check, facts=True):
+        """A dir with a rule line and (facts) a fact line, a secret outside it, then `plant(d, outside)`; check gets the
+        rc, stderr, the dir and the outside file, and the secret must stay intact and in no regular file of the dir."""
+        trap, zz, outdir = os.path.join(root, "-trap"), os.path.join(root, "-zz"), os.path.join(th, "outside")
+        d, outside = os.path.join(trap, "memory"), os.path.join(outdir, "secret")
+        put(outside, secret)
+        for x in (d, os.path.join(zz, "memory")):
+            note(x, "fact.md", "project")
+            note(x, "rule.md", "feedback")
+            put(os.path.join(x, "MEMORY.md"), "- [R](rule.md) — rule\n" + ("- [F](fact.md) — fact\n" if facts or x != d else ""))
+        plant(d, outside)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = run("memory")
+        regular = [p for p in (os.path.join(dp, f) for dp, _, fs in os.walk(trap) for f in fs) if stat.S_ISREG(os.lstat(p).st_mode)]
+        ok(what, check(rc, err.getvalue(), d) and open(outside).read() == secret
+           and not any("TOPSECRET" in open(p).read() for p in regular)
+           and "[F]" in open(os.path.join(zz, "memory", MEM_FACTS)).read())
+        for x in (trap, zz, outdir):
+            shutil.rmtree(x)
+
+    def refused(rc, err, d, name):
+        return rc == 1 and "-trap" in err and "left alone" in err and os.path.islink(os.path.join(d, name))
+
+    case("a linked MEMORY.md is left alone and said on stderr: its target is not copied in, and the next dir still runs", SECRET,
+         lambda d, o: link(d, "MEMORY.md", o), lambda rc, err, d: refused(rc, err, d, "MEMORY.md"))
+    case("a linked MEMORY-facts.md is left alone: its lines are not copied into the dir, and MEMORY.md keeps its fact line", SECRET,
+         lambda d, o: link(d, MEM_FACTS, o),
+         lambda rc, err, d: refused(rc, err, d, MEM_FACTS) and "[F]" in open(os.path.join(d, "MEMORY.md")).read())
+    case("a linked MEMORY-facts.md with nothing to list is not removed", "TOPSECRET\n",
+         lambda d, o: link(d, MEM_FACTS, o), lambda rc, err, d: refused(rc, err, d, MEM_FACTS), facts=False)
+
+    def temps(d, o):
+        link(d, "MEMORY.md.tmp", o)
+        link(d, MEM_FACTS + ".tmp", o)
+    case("a planted MEMORY.md.tmp and MEMORY-facts.md.tmp are not written through, the lines still move, and no temp file stays", SECRET, temps,
+         lambda rc, err, d: rc == 0 and not err and "[F]" not in open(os.path.join(d, "MEMORY.md")).read()
+         and "[F]" in open(os.path.join(d, MEM_FACTS)).read()
+         and sorted(os.listdir(d)) == sorted(["MEMORY.md", MEM_FACTS, "MEMORY.md.tmp", MEM_FACTS + ".tmp", "fact.md", "rule.md"]))
+
+    def linked_dir(d, o):
+        out = os.path.dirname(o)
+        note(out, "fact.md", "project")
+        put(os.path.join(out, "MEMORY.md"), "- [F](fact.md) — fact\n")
+        shutil.rmtree(d)
+        os.symlink(out, d)
+    case("a memory directory that is itself a link is left alone: nothing is rewritten or created in its target", SECRET, linked_dir,
+         lambda rc, err, d: rc == 1 and "left alone" in err and open(os.path.join(d, "MEMORY.md")).read() == "- [F](fact.md) — fact\n"
+         and not os.path.lexists(os.path.join(d, MEM_FACTS)))
+
+    def linked_note(d, o):
+        note(os.path.dirname(o), "real.md", "project")
+        link(d, "fact.md", os.path.join(os.path.dirname(o), "real.md"))
+    case("a linked note is not followed for its type: it counts as untyped and its line stays", SECRET, linked_note,
+         lambda rc, err, d: rc == 0 and "[F]" in open(os.path.join(d, "MEMORY.md")).read() and not os.path.lexists(os.path.join(d, MEM_FACTS)))
+
+    def fifo(d, o):
+        os.remove(os.path.join(d, "MEMORY.md"))
+        os.mkfifo(os.path.join(d, "MEMORY.md"))
+    case("a FIFO for MEMORY.md is left alone, not waited on", SECRET, fifo,
+         lambda rc, err, d: rc == 1 and "left alone" in err and stat.S_ISFIFO(os.lstat(os.path.join(d, "MEMORY.md")).st_mode))
 
 
 def bench(argv):
@@ -3239,6 +3339,7 @@ def selfcheck_p3(th, ok, run, w):
     ok("…when the last line leaves the facts file, the file and the pointer line go with it, and a further pass writes nothing",
        rc == 0 and "unchanged, nothing written" in o and loaded.count("[API]") == 1 and loaded.count("[Dashboard]") == 1
        and "cc-lib ask" not in loaded and not os.path.exists(fp))
+    selfcheck_memory_links(th, ok, run)
 
     # ---- inbound Slack, archived by the daemon per target/chat/month, found by channel, thread and ts
     w(".cc/slack/archive/r1/C0AAAAAAAA1/2026-09.jsonl",
