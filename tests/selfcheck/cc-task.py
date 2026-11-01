@@ -72,6 +72,17 @@ def selfcheck():
            100 in [p["pid"] for p in took] and launch_run(wrapper) == [(100, 100)]
            and launch_owner(window_held, wrapper, owner(wrapper)) == owner(wrapper)
            and launch_owner(window_held, took, owner(wrapper)) == window_held["owner"])
+        fake(110, 12, "bash", ["bash", str(BIN / "cc")]); fake(111, 110, "bash", ["bash", str(BIN / "cc")])
+        pair = ancestry(111, proc); pair_held = {"owner": owner(pair), "ended_at": None}; outer_cc = ancestry(110, proc)
+        old = {"owner": dict(pair_held["owner"], ancestry=[{k: v for k, v in x.items() if k != "cc"} for x in pair_held["owner"]["ancestry"]]), "ended_at": None}
+        ok("L2: a claim recorded with the `cc` flag runs up through an all-`cc` chain to the outer `cc`; one recorded "
+           "without it stops at its owner",
+           launch_owner(pair_held, outer_cc, owner(outer_cc)) == pair_held["owner"]
+           and launch_owner(old, outer_cc, owner(outer_cc)) == owner(outer_cc))
+        fake(120, 12, "bash", ["bash", str(BIN / "cc"), "__run"]); fake(121, 120, "bash", ["bash", str(BIN / "cc")])
+        under = ancestry(121, proc); under_held = {"owner": dict(owner(ancestry(120, proc)), process=under[0], ancestry=under), "ended_at": None}
+        ok("L3: a walk up a run of `cc` stops at a `cc __run` wrapper by what it is, even with a `cc` directly under it",
+           under[1]["wrapper"] and launch_owner(under_held, ancestry(120, proc), owner(ancestry(120, proc))) != under_held["owner"])
     with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
         env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
         def run(*args):

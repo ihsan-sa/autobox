@@ -182,7 +182,7 @@ def retire(repo, row, unmerged=False):
         rec, rc = fds[2], fds[4]
         with os.fdopen(regular("delivery.json", os.O_RDONLY, rec)) as f:
             try: d = json.load(f)
-            except ValueError: d = None
+            except (ValueError, RecursionError): d = None
             tid = d.get("task_id") if isinstance(d, dict) else None
             tid = str(uuid.uuid4()) if tid is None else tid
             if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(tid)):
@@ -197,7 +197,7 @@ def retire(repo, row, unmerged=False):
                 else:
                     q = f".quarantine.{uuid.uuid4()}"; os.rename(name, q, src_dir_fd=rc, dst_dir_fd=rc)
                     try: unlock(q, rc); shutil.rmtree(q, dir_fd=rc)
-                    except OSError: pass
+                    except (OSError, RecursionError): pass
                 raise ValueError(f"{repo}/{row}'s record was swapped for another file before the move — refused")
         if unmerged and isinstance(d, dict) and d.get("closed") is None:
             d["closed"] = {"status": "unmerged", "at": stamp()}
@@ -256,6 +256,7 @@ def ancestry(pid, proc="/proc"):
         except (OSError, ValueError, IndexError): break
         p["command"] = Path(argv[0]).name if argv[0] else ""
         p["cc"] = any(os.path.realpath(x) in (str(BIN / "cc"), str(BIN / "cc-native")) for x in argv[:2] if x)
+        p["wrapper"] = p["cc"] and "__run" in argv[1:4]
         if comm in ("systemd", "(sd-pam)") or p["command"] == "systemd":
             chain.append({**p, "systemd": True}); break
         chain.append(p); pid = p["ppid"]
@@ -297,9 +298,11 @@ def launch_owner(held, chain, who):
     launch's, and the call acts as the owner that claim names. Only the ancestry up to that owner counts, and the
     run of `cc` it sits in when the owner is a `cc` itself (a `$(…)` copy under the outer `cc`, nothing above them):
     above a seat's claude sit its own window and its `cc __run` wrapper, in every claim the seat takes, and a call
-    that wrapper makes is not the launch. The run extends only while each next process is a `cc`, so it would reach
-    the wrapper if a `cc` ever sat directly under `cc __run`; today a seat's claude and Bash always sit between.
-    A claim recorded before the `cc` flag existed has none, and its run stops at the recorded owner until it ends.
+    that wrapper makes is not the launch. The run extends only while each next process is a `cc` and not a `cc __run`
+    wrapper (the `wrapper` flag), so it stops below the wrapper even if a `cc` ever sits directly under it.
+    A claim recorded before the `cc` or `wrapper` flag existed has none: without `cc` its run stops at the recorded
+    owner until it ends, and without `wrapper` it walks as it did before.
+    An owner that matches no ancestry entry counts the whole ancestry.
     Returns that owner, or `who` unchanged."""
     if not held or held.get("ended_at"): return who
     o = held.get("owner") or {}
@@ -307,7 +310,7 @@ def launch_owner(held, chain, who):
     mine = launch_run(chain)
     anc, me = o.get("ancestry") or [], o.get("process") or {}
     top = next((i for i, p in enumerate(anc) if (p.get("pid"), p.get("start_ticks")) == (me.get("pid"), me.get("start_ticks"))), len(anc))
-    while top + 1 < len(anc) and anc[top].get("cc") and anc[top + 1].get("cc"): top += 1
+    while top + 1 < len(anc) and anc[top].get("cc") and anc[top + 1].get("cc") and not anc[top + 1].get("wrapper"): top += 1
     seen = {(p.get("pid"), p.get("start_ticks")) for p in anc[:top + 1]}
     return o if mine and any(m in seen for m in mine) else who
 
