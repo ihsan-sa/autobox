@@ -138,7 +138,8 @@ every round. Only a bare number names a prior row (row_number()). Anything else 
 row to name) is carried as written, whatever the verdict word, so a sentence there holds the PR (perms' read of
 #2160); advice goes in `advisory`, or for a prior row in `moot`, and a hold on one the reader meant as advice (#2137)
 is the planning seat's or perms' to release (carried_hold()). A row the read calls moot lands on the read's word, as
-one it leaves out does: only another read could say the head still has it and blocks on it.
+one it leaves out does: only another read could say the head still has it and blocks on it, so the review comment
+names the rows it called moot (marker()).
 
 A SECURITY PATH needs perms' security read (perms, after #1265: a tunnel unit and the Cloudflare door merged with
 no security read, and the read after found a HIGH). When the plan names a changed file on the base's
@@ -297,7 +298,8 @@ def keys(job, diff):
 # --- the markers ---------------------------------------------------------------------------------------------------
 
 def marker(v: T.Verdict, base, head, by):
-    """The comment body recording `v`: the marker line, then the findings as numbered rows."""
+    """The comment body recording `v`: the marker line, the prior rows it called moot by number alone (a sentence names
+    no row, and its lines could read as findings to imported()), then the findings as numbered rows."""
     rows = [f"{i}. {b}" for i, b in enumerate(v.blocking, 1)]
     rows += [f"{i}. [other] {a}" for i, a in enumerate(v.advisory, len(rows) + 1)]
     by = re.sub(r"[^A-Za-z0-9._@-]+", "-", by or "lander")
@@ -308,6 +310,9 @@ def marker(v: T.Verdict, base, head, by):
                                                       else "at its usage limit)")
                                                    if r.get("stood_in_for") else "")
             for r in (v.extra or {}).get("readers") or []]
+    moot = {row_number(m) for m in (v.extra or {}).get("moot") or []} - {row_number(u) for u in v.unresolved} - {None}
+    if moot:
+        said.append(f"Earlier rows this read called moot, which hold nothing: {', '.join(sorted(moot, key=int))}")
     return "\n".join([head_, f"**lander review** — `{head[:12]}`, read by `{v.model or by}`", "",
                       f"**VERDICT: {v.verdict}**", ""] + (said + [""] if said else [])
                      + (["Light path: every blocker is below high, so they go to a follow-up row.", ""]
@@ -751,8 +756,8 @@ def pinned(v, prior):
 def row_number(name):
     """A prior row's number as a read names it ('2', '#2', 'blocker 2'), or None (Opus read of #1227: a bare match
     lost '#2' its [security] tag). Nothing else names a row: 'x.py:1 is only advice' once cleared security row 1
-    (perms' read of #2160)."""
-    m = re.fullmatch(r"\s*(?:#|blocker)?\s*(\d+)\s*", str(name), re.I)
+    (perms' read of #2160), nor do more digits than a row number has: int() raises past 4300 (perms' read of #2163)."""
+    m = re.fullmatch(r"\s*(?:#|blocker)?\s*(\d{1,9})\s*", str(name), re.I)
     return m.group(1) if m else None
 
 
@@ -2038,6 +2043,9 @@ def combined(reads):
                                **({"stood_in_for": x.extra["stood_in_for"]} if x.extra.get("stood_in_for") else {}),
                                **({"timed_out": True} if x.extra.get("stood_in_why", "").startswith(TIMED_OUT) else {}))
                           for m, x in reads]
+    moot = [m for _, x in reads for m in x.extra.get("moot") or []]
+    if moot:
+        v.extra["moot"] = moot
     if subs:
         v.extra["stood_in"] = subs
     return v

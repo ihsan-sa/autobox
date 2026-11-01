@@ -668,6 +668,47 @@ class TestReview(Case):
             self.assertEqual(self.delta(rows, resolved=[name]).verdict, T.LAND, name)
         self.assertIsNone(R.row_number("x.py:1 is only advice"))
 
+    def test_a_row_name_too_long_for_int_is_a_sentence_not_a_fault(self):
+        # perms' read of #2163: past 4300 digits int() raises, and the job was held as a fault
+        huge = "9" * 5000
+        self.assertIsNone(R.row_number(huge))
+        v = self.delta(["1. [scope] x.py — add a guard"], resolved=["1"], unresolved=[huge])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, [f"still open from the earlier read: {huge}"]))
+        self.assertEqual(self.delta(["1. [scope] x.py — add a guard"], moot=[huge]).verdict, T.LAND)
+
+    def test_a_sentence_in_resolved_or_moot_leaves_the_row_out(self):
+        # what delta.md says it does: the row counts as left out, so only a [security] one stays open
+        for said in ({"resolved": ["x.py:1 is only advice"]}, {"moot": ["x.py:1 is moot"]}):
+            self.assertEqual(self.delta(["1. [scope] x.py — add a guard"], **said).verdict, T.LAND, said)
+            self.assertEqual(self.delta(["1. [security] x.py — leaks"], **said).verdict, T.HANDBACK_VERDICT, said)
+
+    def test_the_prompts_say_what_each_list_does_with_a_sentence(self):
+        delta = " ".join(R.load_prompt("delta.md").split())
+        self.assertIn("the prior blockers' bare numbers, as strings, and nothing else", delta)
+        self.assertIn("A sentence in `unresolved` holds the PR back.", delta)
+        self.assertIn("One in `resolved` or `moot` names no row, so that row counts as left out: a `[security]` row "
+                      "stays open and any other holds nothing.", delta)
+        self.assertIn("Anything you write in `unresolved` holds the PR back.",
+                      " ".join(R.load_prompt("review.md").split()))
+
+    def test_the_review_comment_names_the_rows_called_moot(self):
+        line = "Earlier rows this read called moot, which hold nothing: "
+        v = self.delta(["1. [scope] a", "2. [scope] b", "3. [scope] c"], moot=["#2", "1", "2", "x.py:3 is moot"])
+        body = R.marker(v, BASE, HEAD, "lander")
+        self.assertIn(line + "1, 2\n", body)
+        self.assertNotIn("x.py:3", body)   # a sentence names no row, and its own lines could read as findings
+        back = R.imported(body)
+        self.assertEqual((back.verdict, back.blocking, back.advisory), (T.LAND, [], []))
+        self.assertNotIn(line, R.marker(self.delta(["1. [scope] a"], resolved=["1"]), BASE, HEAD, "lander"))
+        # a row also named as still open, or pinned as [security], is not shown as moot
+        v = self.delta(["1. [scope] a", "2. [security] b"], moot=["#1", "2"], unresolved=["1"])
+        self.assertNotIn(line, R.marker(v, BASE, HEAD, "lander"))
+
+    def test_the_rows_called_moot_survive_two_readers(self):
+        said = lambda *moot: T.Verdict(verdict=T.LAND, digest="d", extra={"moot": list(moot)})  # noqa: E731
+        v = R.combined([("a", said("1")), ("b", said("2"))])
+        self.assertIn("called moot, which hold nothing: 1, 2", R.marker(v, BASE, HEAD, "lander"))
+
     def test_a_security_row_called_advice_stays_pinned(self):
         v = self.delta(["1. [security] x.py — the token leaks"], moot=["1"],
                        advisory=[{"where": "x.py", "what": "still true, but advice"}])

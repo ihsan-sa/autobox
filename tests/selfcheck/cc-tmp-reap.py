@@ -39,6 +39,7 @@ def selfcheck():
         fresh_inside = mk("cc-slack-selfcheck-in5ide77", ("a", "b"))
         for p in (young, f"{young}/f", f"{fresh_inside}/b"):
             os.utime(p, (now, now))
+        snap_live, snap_dead = mk(f"cc-loop-journal.{os.getpid()}.quiet123"), mk("cc-loop-journal.999999996.gone1234")
         unnamed = [mk("tmp.AbCdEf1234"), mk("abcdefgh12"), mk("notes"), mk("dash-src-")]
         # a user service's PrivateTmp=yes /tmp and snap's: old, unheld, unnamed, ours, and never taken
         private = [mk("systemd-private-0123456789abcdef0123456789abcdef-box-cal.service-AbCdEf"),
@@ -194,6 +195,8 @@ def selfcheck():
         later = reap(False, when=now + 2 * 86400)[0]
         ok("…and after 72 h an unnamed dir nothing holds or names goes (an ended session's scratch)",
            set(unnamed) <= later)
+        ok("a live loop's snapshot directory stays however quiet, and a dead loop's goes by age like any other name",
+           snap_live not in later and snap_dead in later)
         ok("…but never a service's private /tmp (systemd-private-*), at any age", private[0] not in later)
         ok("…nor snap's (snap-private-tmp, snap-private-tmp.*), at any age", not later.intersection(private[1:]))
         buf = io.StringIO()

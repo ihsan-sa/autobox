@@ -47,7 +47,7 @@
 #   foreground Bash call by 10 minutes, so a half hour of silence is a stuck process, never a long gate. Until
 #   2026-10-20 every iteration was killed at one hour of wall clock, live or not: 67 of 513 died there.
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
-# Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it; a link there stops the loop, exit 2, see jopen)
+# Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it; a link or a non-regular file there stops the loop, exit 2, see jopen)
 # PR body:    ~/.cc/state/<repo>/<track>/pr-body.md   (worker writes it before DONE: what changed, why, how it was tested. cc done makes it the PR's description and links the brief under it,
 #             and a later cc done (a repair round) patches the open PR when the file changed;
 #             'Closes <row>[, <row>][ and <row>]' in the body closes those board rows when the PR lands)
@@ -460,13 +460,15 @@ sp_worker(){   # $1 the base branch → the whole system prompt a headless worke
 # host-side loop runs beside it, and `>>` or `cp` would follow it: loop text into any file the box's user owns, or a
 # secret back into a file or a prompt the worker reads. A test and then an open leaves the gap between them, so nothing
 # here tests: dd opens with O_NOFOLLOW, as cc-checkpoint's own appends do, and the kernel refuses a link in that one call.
+# O_NONBLOCK keeps a FIFO from holding that open. The snapshot goes through say_io, whose open refuses anything but a plain file.
 # $ST itself cannot be swapped, because it is the sandbox's mount point. journal_cut and its greps still open it by name,
 # because they run after the iteration's closing jsnap has passed and its pid namespace has died (cc-sandbox --unshare-pid).
-jopen(){ dd oflag=append,nofollow conv=notrunc bs=64K status=none of="$ST/progress.md" 2>&1; }   # stdin → the journal's end, creating it; the error on stdout
+jopen(){ dd oflag=append,nofollow,nonblock conv=notrunc bs=64K status=none of="$ST/progress.md" 2>&1; }   # stdin → the journal's end, creating it; the error on stdout
 jadd(){ local e; e=$(jopen) || log "refused to write the journal, so this line is lost: $e"; }
-jsnap(){   # $1 a file of the loop's own → the journal copied there, or the loop stops: an iteration never runs on a journal it cannot trust
-  local e; e=$(jopen </dev/null && dd iflag=nofollow bs=64K status=none if="$ST/progress.md" of="$1" 2>&1) ||
-    stop 2 "journal refused" "refused $ST/progress.md, and the loop stops before it touches it again: $e. Take the link away to go on."; }
+jsnap(){   # $1 a file of the loop's own, $2 the opening snapshot's JFROM when this is the closing one → the journal copied there, or the loop stops: an iteration never runs on a journal it cannot trust
+  local e; e=$(jopen </dev/null && say_io jsnap "$ST" "$1" "${2:-}" 2>&1) ||
+    stop 2 "journal refused" "refused $ST/progress.md, and the loop stops before it touches it again: $e. Take the link away to go on."
+  JFROM=$e; }
 journal_cut(){   # $1 a line number: it comes out of the journal, by way of a fresh temp, since a fixed name in $ST is the worker's to plant a link at (cc-sandbox binds $ST read-write)
   local t; t=$(mktemp "$ST/.progress.XXXXXX") && awk -v n="$1" 'NR!=n' "$ST/progress.md" > "$t" && chmod --reference="$ST/progress.md" "$t" && mv -f "$t" "$ST/progress.md"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
@@ -872,6 +874,15 @@ try:
             w = [y for x in argv(q) for y in (x.split() if any(c.isspace() for c in x) else [x])]   # one string is words too
             if any(is_(x, "cc-loop") and w[i + 1:i + 3] == [r, t] for i, x in enumerate(w)): sys.exit(0)
         sys.exit(1)
+    if op == "jsnap":   # $3 a file of the loop's own  $4 where the opening snapshot started, on a closing one → the journal from there into $3, and where it started on stdout
+        # All of it up to 8 MiB. Past that, its newest 8 MiB, and the closing snapshot starts at the same byte, so this_iteration still lines the two up and an old STATUS line stays old. A closing one more than 16 MiB on keeps only its newest 8, all of it new.
+        fd = fopen("progress.md", os.O_RDONLY)
+        if fd is None: raise Refused("%s/progress.md is gone" % st)
+        size, cap, frm = os.fstat(fd).st_size, 8 << 20, sys.argv[4]
+        start = int(frm) if frm and int(frm) <= size and size - int(frm) <= 2 * cap else max(0, size - cap)
+        with os.fdopen(fd, "rb") as f, open(sys.argv[3], "wb") as o:
+            f.seek(start); o.write(f.read(size - start))
+        print(start); sys.exit(0)
     if op == "pidw":   # $3 the pid → loop.pid holds it
         fd = fopen("loop.pid", os.O_WRONLY, create=True); os.ftruncate(fd, 0); os.write(fd, ("%s\n" % sys.argv[3]).encode()); sys.exit(0)
     if op == "pidrm":   # $3 the pid → loop.pid is gone when it still names that pid (a link is not followed, only refused)
@@ -1733,7 +1744,7 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
     [ "$c" = dn ] && echo '{}' > "$lh/.cc/state/lp/$c/delivery.json"
     : > "$d/lb.n"
     ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_DONE="$lb/cc-land" CC_MERGE="$lb/ccmerge" CC_FAILURES="$d/lb.fl" ${lgreen:+CC_GREEN=$lgreen} ${ltmp:+TMPDIR=$ltmp} ${FK_MRC:+FK_MRC="$FK_MRC"} ${FK_MOUT:+FK_MOUT="$FK_MOUT"} \
-        FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" FK_PLANT="${lplant:-}" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
+        FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" FK_PLANT="${lplant:-}" ${ltime:+timeout "$ltime"} "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
   lrun it '- did one step, more to do' 0 --max-iter 1 --no-extend
   t "the worker's own print run gets the background-wait ceiling removed, so a subagent still running at turn end does not kill the iteration at 600s (hung_watch still ends one that goes silent)" \
@@ -1758,10 +1769,40 @@ inject|--no-start|--source|loop|titled|loop: titled/t1 done — worker stop reac
     "$rc|$(cat "$d/victim-w")|$(grep -c 'refused .*progress.md' "$(lst jw)/loop.log")|$(grep -c 'iter 2/2 start' "$(lst jw)/loop.log")" '2|keep|1|0'
   ln -s "$d/nowhere" "$(lst jd)/progress.md"; lrun jd '' 0 --max-iter 1 --no-extend; rc=$?
   t 'a dangling link at progress.md creates nothing where it points' "$rc|$([ -e "$d/nowhere" ] && echo made || echo none)" '2|none'
+  # A FIFO. With no reader it used to block jopen's open for good, and with a process holding it open it blocked the copy. The timeout makes either one a red instead of a hung selfcheck.
+  mkfifo "$(lst jf)/progress.md"; ltime=30 lrun jf '' 0 --max-iter 1 --no-extend; rc=$?
+  t 'a FIFO at progress.md: the loop refuses it and stops, with no model call' \
+    "$rc|$(grep -c 'refused .*progress.md' "$(lst jf)/loop.log")|$([ -e "$(lst jf)/argv" ] && echo ran || echo none)" '2|1|none'
+  mkfifo "$(lst jg)/progress.md"; sleep 60 <>"$(lst jg)/progress.md" & jgh=$!
+  ltime=30 lrun jg '' 0 --max-iter 1 --no-extend; rc=$?; kill "$jgh" 2>/dev/null; wait "$jgh" 2>/dev/null
+  t '…and so does one a process holds open, which the append alone lets through' \
+    "$rc|$(grep -c 'refused .*progress.md.*not a plain file' "$(lst jg)/loop.log")|$([ -e "$(lst jg)/argv" ] && echo ran || echo none)" '2|1|none'
+  # A BIG JOURNAL: the snapshot holds 8 MiB of it at most, and this_iteration still finds only what the iteration added.
+  jb=$(lst jb); truncate -s 41943040 "$jb/progress.md"; printf 'STATUS: DONE\n' >> "$jb/progress.md"
+  ( ST="$jb"; jsnap "$d/jb.snap"; printf 'iter: more\n' >> "$ST/progress.md"; jsnap "$d/jb.now" "$JFROM"; this_iteration "$d/jb.snap" "$d/jb.now" > "$d/jb.new" ) 2>/dev/null
+  t 'a journal over the cap: its snapshot is the newest 8 MiB, ending at the journal end' \
+    "$(wc -c < "$d/jb.snap")|$(tail -n 1 "$d/jb.snap")" '8388608|STATUS: DONE'
+  t '…and an old STATUS line in that tail is not this iteration'"'"'s, while what it added is' "$(cat "$d/jb.new")" 'iter: more'
+  ( ST="$jb"; jsnap "$d/jb.snap"; printf 'STATUS: DONE\n' >> "$ST/progress.md"; jsnap "$d/jb.now" "$JFROM"; this_iteration "$d/jb.snap" "$d/jb.now" > "$d/jb.new" ) 2>/dev/null
+  t '…and a STATUS line it wrote this iteration is seen, though the text is the same' "$(cat "$d/jb.new")" 'STATUS: DONE'
+  ( ST="$jb"; jsnap "$d/jb.snap"; truncate -s +33554432 "$ST/progress.md"; printf 'STATUS: DONE\n' >> "$ST/progress.md"; jsnap "$d/jb.now" "$JFROM"; this_iteration "$d/jb.snap" "$d/jb.now" | tail -n 1 > "$d/jb.new" ) 2>/dev/null
+  t '…and an iteration that wrote more than the closing cap keeps its newest 8 MiB, with its STATUS line' "$(wc -c < "$d/jb.now")|$(cat "$d/jb.new")" '8388608|STATUS: DONE'
+  printf 'one\ntwo\n' > "$(lst jh)/progress.md"; ( ST="$(lst jh)"; jsnap "$d/jh.snap"; echo "$JFROM" > "$d/jh.from" ) 2>/dev/null
+  t 'a healthy journal: the snapshot is the whole of it, byte for byte, from the start' "$(cmp "$d/jh.snap" "$(lst jh)/progress.md" && cat "$d/jh.from")" 0
+  truncate -s 20971520 "$(lst jn)/progress.md"; printf '## last entry\nNEWEST-TEXT\n' >> "$(lst jn)/progress.md"; ltime=60 lrun jn '- step' 0 --max-iter 1 --no-extend
+  t 'a whole loop on a big journal runs its iteration, and the prompt has the newest text' \
+    "$(grep -c 'iter 1 end .*journal=updated' "$(lst jn)/loop.log")|$(grep -c NEWEST-TEXT "$(lst jn)/argv")" '1|1'
   echo keep > "$d/victim-s"; echo 'JOURNAL-TEXT' > "$(lst js)/progress.md"; ln -s "$d/victim-s" "$(lst js)/.progress.snap"; mkdir -p "$d/jt"; ltmp="$d/jt" lrun js '' 0 --max-iter 1 --no-extend
   t 'a link at .progress.snap: the snapshot is the loop'"'"'s own now, so the journal never goes through it and the iteration runs' \
     "$(cat "$d/victim-s")|$(grep -c 'iter 1/1 start' "$(lst js)/loop.log")|$(grep -c JOURNAL-TEXT "$(lst js)/argv")|$(grep -c 'refused .*\(progress.md\|snap\)' "$(lst js)/loop.log")" 'keep|1|1|0'
   t '…and the loop leaves no private snapshot behind' "$(find "$d/jt" -maxdepth 1 -name '*cc-loop-journal*' | wc -l)" 0
+  # The reaper reads this very name: a live loop's dir carries its pid (cc-tmp-reap's LOOP_SNAP). The dir is gone at exit, so the case reads what mktemp was asked for.
+  mkdir -p "$d/mtb" "$d/ju"; printf '#!/bin/sh
+case "$*" in *cc-loop-journal*) echo "$*" > "%s";; esac
+exec /usr/bin/mktemp "$@"
+' "$d/ju.seen" > "$d/mtb/mktemp"; chmod +x "$d/mtb/mktemp"
+  lpath="$d/mtb:/usr/bin:/bin" ltmp="$d/ju" lrun ju '' 0 --max-iter 1 --no-extend
+  t 'a live loop names its snapshot directory with its own pid, which is what keeps cc-tmp-reap off it'     "$(grep -cE '/cc-loop-journal\.[0-9]+\.XXXXXX$' "$d/ju.seen")" 1
   echo keep > "$d/victim-l"; ln -s "$d/victim-l" "$(lst jl)/loop.log"; lrun jl '' 0 --max-iter 1 --no-extend; rc=$?
   t 'a link at loop.log: no loop text reaches its target, the planner hears it, and no iteration runs' \
     "$rc|$(cat "$d/victim-l")|$(grep -c '^--ask|.*refused .*loop.log' "$d/lb.n")|$([ -e "$(lst jl)/argv" ] && echo ran || echo none)" '2|keep|1|none'
@@ -2703,7 +2744,7 @@ CC_AGENT_NO=${AGENTNO:-$("$BIN/cc-agent-number" next worker "$repo/$track" $$ 2>
 [ -n "$CC_AGENT_NO" ] && "$BOARD" set "$repo" "$track" agent_no "$CC_AGENT_NO" >/dev/null 2>&1
 orch_record; dispatch_receipt; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
 pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
-JD=$(mktemp -d "${TMPDIR:-/tmp}/cc-loop-journal.XXXXXX") || { log "cc-loop: no private directory for the journal's snapshot"; exit 2; }   # outside anything the sandbox binds
+JD=$(mktemp -d "${TMPDIR:-/tmp}/cc-loop-journal.$$.XXXXXX") || { log "cc-loop: no private directory for the journal's snapshot"; exit 2; }   # outside anything the sandbox binds; the pid in its name keeps cc-tmp-reap off it while this loop lives
 SNAP="$JD/snap"; NOW="$JD/now"
 # …and only the loop's own exit removes it: a child signalled just after its fork can run this trap, and took the snapshot out from under a live loop.
 trap '[ -n "${qsleep:-}" ] && kill "$qsleep" 2>/dev/null; say_io pidrm "$ST" $$; [ "$BASHPID" != $$ ] || rm -rf -- "${JD:?}"' EXIT   # a quota wait's sleep ends with the loop; only a loop.pid that is still this loop's, and never through a link (say_io)
@@ -2960,7 +3001,7 @@ while [ $i -lt "$MAXI" ]; do
   "$BIN/cc-refusals" collect "$repo" "$track" >/dev/null 2>&1 || true
   ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
   push_host   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
-  after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); jsnap "$NOW"; after_prog=$(md5sum "$NOW" | cut -c1-8)
+  after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); jsnap "$NOW" "$JFROM"; after_prog=$(md5sum "$NOW" | cut -c1-8)
   moved=no; { [ "$before_head" != "$after_head" ] || [ "$before_prog" != "$after_prog" ]; } && moved=yes
   log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost$costsrc total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
   [ "$QUIET" = 1 ] || jq -r '.result // ""' "$out" 2>/dev/null | tail -c 600 | sed 's/^/  │ /' >&2

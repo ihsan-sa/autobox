@@ -297,6 +297,38 @@ def selfcheck():
             b = journal("r", "t")
         finally:
             globals().update(STATE=_st)
+    with tempfile.TemporaryDirectory() as jd:   # the journal's name is the worker's: a link or a FIFO is refused, and a big one reads its newest text
+        _st = STATE; globals().update(STATE=jd)
+        class Hung(BaseException):
+            pass
+        def on_alarm(*_):
+            raise Hung
+        def unhung(fn):
+            signal.signal(signal.SIGALRM, on_alarm); signal.alarm(5)
+            try:
+                return fn()
+            except Hung:
+                return "hung"
+            finally:
+                signal.alarm(0)
+        for t in ("link", "fifo", "big", "plain"):
+            os.makedirs(f"{jd}/r/{t}")
+        open(f"{jd}/secret", "w").write("STATUS: BLOCKED: FAKE-SECRET\nexit 9: FAKE-SECRET\n")
+        os.symlink(f"{jd}/secret", f"{jd}/r/link/progress.md"); os.symlink(f"{jd}/secret", f"{jd}/r/link/loop.log")
+        os.mkfifo(f"{jd}/r/fifo/progress.md"); os.mkfifo(f"{jd}/r/fifo/loop.log")
+        with open(f"{jd}/r/big/progress.md", "wb") as fh:
+            fh.write(b"STATUS: BLOCKED: too old to read\n"); fh.truncate(STATE_FILE_CAP * 2); fh.seek(0, 2); fh.write(b"\nSTATUS: BLOCKED: newest\n")
+        open(f"{jd}/r/plain/progress.md", "w").write("- x\nSTATUS: BLOCKED: which?\n")
+        try:
+            ok("a link at a journal reads as no journal: no text of its target reaches the board or a seat",
+               journal("r", "link") == (None, "") and "FAKE-SECRET" not in stuck_line("r", "link", {}) and loop_end("r", "link") == "")
+            ok("a FIFO at a journal or a loop.log blocks no tick",
+               unhung(lambda: (journal("r", "fifo"), stuck_line("r", "fifo", {}) != "hung", loop_end("r", "fifo"))) == ((None, ""), True, ""))
+            ok("a journal over the cap keeps its newest STATUS line, read in no more than the cap",
+               journal("r", "big") == ("BLOCKED", "newest") and len("".join(state_lines("r", "big", "progress.md"))) <= STATE_FILE_CAP)
+            ok("…and the journal beside them reads as it always did", journal("r", "plain") == ("BLOCKED", "which?"))
+        finally:
+            globals().update(STATE=_st)
     ok("a cc-loop STATUS: RESUMED line after a BLOCKED one ends the wait, and a BLOCKED after it starts a new one",
        a == (None, "") and b == ("BLOCKED", "which port?"))
     ok("nothing is ever inferred from prose: a journal that merely TALKS about waiting declares nothing",

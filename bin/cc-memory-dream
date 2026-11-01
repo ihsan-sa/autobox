@@ -81,6 +81,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -419,12 +420,25 @@ def recent_inputs(repo, now):
     if not repo:
         return "", ""
     js, n = [], 0
-    for p in sorted(glob.glob(home(".cc", "state", repo, "*", "progress.md")), key=os.path.getmtime, reverse=True):
-        if now - os.path.getmtime(p) > RECENT or n > INPUT_CAP:
+    def mtime(p):   # the name's own: a dangling link has no target to stat
+        try:
+            return os.lstat(p).st_mtime
+        except OSError:
+            return 0
+    for p in sorted(glob.glob(home(".cc", "state", repo, "*", "progress.md")), key=mtime, reverse=True):
+        if now - mtime(p) > RECENT or n > INPUT_CAP:
             break
-        with open(p, "rb") as f:
-            f.seek(max(0, os.path.getsize(p) - JOURNAL_TAIL))
-            t = f.read().decode("utf-8", "replace")
+        # The name is the worker's (the sandbox binds its state dir rw), and this text goes to a model. A link or a FIFO is refused in the open, and the other journals go on.
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            f.seek(max(0, st.st_size - JOURNAL_TAIL))
+            t = f.read(JOURNAL_TAIL).decode("utf-8", "replace")
         js.append(f"--- {p}\n{t}")
         n += len(t)
     led, n = [], 0
@@ -1119,6 +1133,36 @@ def selfcheck():
         det = glob.glob(os.path.join(tmp, "state", "*", "*.md"))
         ok(det and "Proposed lessons" in read(det[0]), "proposals land in the detail file")
 
+    # 6b. a journal is the worker's to plant: a link, a dangling link or a FIFO is skipped, and the journal beside it still reads
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HOME"], was = tmp, os.environ.get("HOME", "")
+        st = os.path.join(tmp, ".cc", "state", "demo")
+        for t in ("good", "link", "dang", "fifo"):
+            os.makedirs(os.path.join(st, t))
+        with open(os.path.join(tmp, "secret"), "w") as fh:
+            fh.write("FAKE-SECRET\n")
+        with open(os.path.join(st, "good", "progress.md"), "w") as fh:
+            fh.write("x" * JOURNAL_TAIL + "GOOD-TAIL\n")
+        os.symlink(os.path.join(tmp, "secret"), os.path.join(st, "link", "progress.md"))
+        os.symlink(os.path.join(tmp, "nowhere"), os.path.join(st, "dang", "progress.md"))
+        os.mkfifo(os.path.join(st, "fifo", "progress.md"))
+
+        class Hung(BaseException):
+            pass
+
+        def on_alarm(*_):
+            raise Hung
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(5)
+        try:
+            js = recent_inputs("demo", time.time())[0]
+        except (Hung, OSError) as e:
+            js = f"failed: {e!r}"
+        signal.alarm(0)
+        os.environ["HOME"] = was
+        ok("GOOD-TAIL" in js and "FAKE-SECRET" not in js and js.count("--- ") == 1,
+           f"a journal link, a dangling link and a FIFO are refused, and the plain journal still reads: {js[:80]!r}")
+
     # 7. the hook commits in a dir with .git, and leaves a dir without one, and anything outside, alone
     with tempfile.TemporaryDirectory() as tmp:
         root, d = fixture(tmp)
@@ -1206,7 +1250,6 @@ def selfcheck():
                           MEMORY_DREAM_INDEX_CAP="8192")
 
     # 9. a hook with no space in its first 90 characters is hard-cut once, so trimming ends
-    import signal
 
     def alarm(*_):
         raise TimeoutError

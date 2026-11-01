@@ -124,7 +124,7 @@ CC_RECOVER_SETTLE (15 s from a claude coming up to its catch-up). Fixtures only:
 CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_ROLES, CC_RECOVER_HOSTNAME, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
 CC_RECOVER_RESTORE_CMD, CC_RECOVER_MANAGER_CMD.
 """
-import calendar, fcntl, json, math, os, random, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
+import calendar, fcntl, json, math, os, random, re, shlex, shutil, signal, socket, stat, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 # Box-owned, like ~/.cc/lander and ~/.cc/steward: never under ~/.cc/state/<name>, because a member workspace binds
@@ -1151,11 +1151,15 @@ def by_name(name):
 
 
 def tail_lines(f, n=65536):
+    """The file's last n bytes as lines. Its name is the worker's (the sandbox binds a state dir rw), so a link or a FIFO
+    is refused in the open and reads as no lines."""
     try:
-        with open(f, "rb") as h:
+        with os.fdopen(os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as h:
+            if not stat.S_ISREG(os.fstat(h.fileno()).st_mode):
+                return []
             h.seek(0, 2)
             h.seek(max(0, h.tell() - n))
-            return h.read().decode(errors="replace").splitlines()
+            return h.read(n).decode(errors="replace").splitlines()
     except OSError:
         return []
 
@@ -2113,6 +2117,30 @@ def selfcheck():
         except RuntimeError:
             loose = "refused"
         check("state: a state directory others can write is refused", loose == "refused" and not os.path.exists(path("live.json")))
+
+        # 8b. a journal or loop.log is the worker's to plant: a link or a FIFO reads as no lines, and the next track still restarts
+        d = fixture()
+        lim = "2026-10-11T01:10:00Z exit 8: The Claude usage limit lasts until 09:00.\n"
+        for t in ("jlink", "jfifo", "lfifo", "good"):
+            os.makedirs(f"{CCSTATE}/r1/{t}")
+            if t != "lfifo":
+                open(f"{CCSTATE}/r1/{t}/loop.log", "w").write(lim)
+        open(f"{d}/secret", "w").write("STATUS: DONE\n")
+        os.symlink(f"{d}/secret", f"{CCSTATE}/r1/jlink/progress.md")
+        os.mkfifo(f"{CCSTATE}/r1/jfifo/progress.md"); os.mkfifo(f"{CCSTATE}/r1/lfifo/loop.log")
+        open(f"{CCSTATE}/r1/good/progress.md", "w").write("x" * 70000 + "\nSTATUS: DONE\n")
+        class Hung(BaseException):
+            pass
+        def on_alarm(*_):
+            raise Hung
+        signal.signal(signal.SIGALRM, on_alarm); signal.alarm(5)
+        try:
+            restart = sorted(r["track"] for r in limit_stopped(set(), set()))
+        except Hung:
+            restart = "hung"
+        signal.alarm(0)
+        check("a journal link's text decides nothing, a FIFO at a journal or a loop.log hangs nothing, and a plain journal still reads its tail",
+              restart == ["jfifo", "jlink"])
 
         # 9. bring-up: unpause, relaunch what is missing, restart limit-stopped workers, list dialogs, ask seats to resume
         def bringup_box(d):

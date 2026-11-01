@@ -4,6 +4,7 @@
   cc-guard-argv judge      the raw command on stdin; prints nothing (allowed) or ONE line `deny<TAB>why` (needs the
                            owner) or `never<TAB>why`, exit 0. Exit 3 + stderr on an internal error (cc-guard refuses).
   cc-guard-argv parse      the command on stdin as JSON lines: verb, argv, redirects, cwd after cd, nested-in, via.
+  cc-guard-argv view       the command on stdin with the text it never runs cut out (see view), for cc-guard's text rules.
   cc-guard-argv selfcheck  parser unit cases + every line of core/tests/guard-replay{,-pending}.jsonl in a fixture HOME.
 Env: GUARD_ROLE worker|member|pf (anything else: allowed; pf = the ungated tier, see below), HOME (or GUARD_HOME),
 GUARD_CWD, GUARD_ROOT (the tree this session writes, ':'-separated), GUARD_MWS (member workspace), GUARD_INB=1 (inside a member boundary: only then are ~/.cc/slack and ~/.cc/library/owner a member's to read), GUARD_PSEAT=1 (the permission seat).
@@ -23,6 +24,10 @@ literals of an interpreter's -c/-e code (python perl ruby node php…: each lite
 so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
 does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
 reads an interpreter's -c/-e (or stdin heredoc) body and awk/sed program text.
+A `$D` or `$D/x` whose D this command set once, to a literal with no blank or glob in it, is that path to the recursive
+delete rule and to view; every other rule still reads it as computed. What a
+compound or a function reads on stdin (`{ bash; } <<EOF`, `… | while read l; do bash -c "$l"; done`, `f <<EOF`) is fed to
+each statement inside it, and a shell -c, eval or verb that is only a `$` beside fed text runs that text.
 
 Rules for both gated roles:
 - root: sudo doas su runuser pkexec sudoedit                                                        -> never
@@ -42,7 +47,7 @@ Rules for both gated roles:
 - credentials: an argv word (or its @file / =value part) or `<` source resolving to secret_all (worker) or
   secret_path (member), or anything under ~/.cc/secrets or any credentials.json / .credentials.json / *.token under
   ~, for any verb but echo/printf; or one of those path names (ccbox/env, .credentials.json, credentials.json,
-  .cc/secrets, .codex/auth.json, cursor/auth.json; member also .cc/config .ssh .claude/settings.json .cc/sandbox) as text inside
+  .cc/secrets, .cc/backup (gated roles: the backup key, by its path and where that resolves), .codex/auth.json, cursor/auth.json; member also .cc/config .ssh .claude/settings.json .cc/sandbox) as text inside
   a python/perl/ruby/node/php -c/-e body or awk/sed program (so a commit message or grep pattern still passes) -> never
   (a member's computed word — `~/.cc/$d`, `$d/x`, `~/.cc/$(..)`, backticks — is read, and fenced as a write target,
   as the glob it could match: dynpat)
@@ -138,7 +143,7 @@ Member only:
 Not here (cc-guard keeps them, they need /proc or the tool input): tmux kill-server/kill-session, pattern kills,
 the member kill fence, the Write/Edit rules.
 """
-import fnmatch, glob, json, os, pwd, re, shlex, shutil, sys, tempfile
+import fnmatch, glob, itertools, json, os, pwd, re, shlex, shutil, sys, tempfile
 
 class ParseError(Exception):
     pass
@@ -244,6 +249,7 @@ CMDCFG = re.compile(r'core\.(pager|editor|sshcommand|askpass|fsmonitor)|pager\..
                     r'(gpg|credential)\.(program|helper)|.*\.(textconv|clean|smudge|process)', re.I)
 READERS = {'cat', 'tac', 'nl', 'head', 'tail', 'sed', 'cut', 'grep', 'tee', 'sort', 'uniq'} | AWKS   # print a file's lines
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash'}
+OPENER = {'{': '}', 'if': 'fi', 'while': 'done', 'until': 'done', 'for': 'done', 'select': 'done', 'case': 'esac'}
 # run what sits in the directory they are pointed at (the cwd, -C/--prefix/--cwd or a path argument): a member's build
 # files and tests are its code
 # per interpreter family: (the options whose value is code, so nothing on disk runs; the options that take the next word)
@@ -316,9 +322,9 @@ RMOPTS = {'tee': (), 'rm': (), 'rmdir': (), 'unlink': (), 'shred': {'-n', '--ite
 
 # ---------------------------------------------------------------------------------------------------------- lexer
 class Word:
-    __slots__ = ('v', 'raw', 'q', 'dyn', 'glob', 'brace', 'subs')
+    __slots__ = ('v', 'raw', 'q', 'dyn', 'glob', 'brace', 'subs', 'span', 'known')
     def __init__(w, v='', dyn=False, glob=False):
-        w.v, w.raw, w.q, w.dyn, w.glob, w.brace, w.subs = v, v, False, dyn, glob, False, []
+        w.v, w.raw, w.q, w.dyn, w.glob, w.brace, w.subs, w.span, w.known = v, v, False, dyn, glob, False, [], None, None
     def like(w, v):   # a part of this word (of=X, --x=X) keeps what is known about it
         n = Word(v, w.dyn, w.glob); n.q = w.q; return n
 
@@ -457,11 +463,12 @@ def lex(s, home):
             j = s.find('\n', i); i = n if j < 0 else j; continue
         if c == '\n':
             toks.append(('OP', '\n')); i += 1
-            for r in pend: i = body(s, i, r)
+            for r in pend:
+                st = i; i = body(s, i, r); r['span'] = (st, i)
             pend = []; continue
         op = None if (c in '<>' and s[i + 1:i + 2] == '(') else next((o for o in OPS if s.startswith(o, i)), None)
         if op is None:
-            w, i = word(s, i, home)
+            st = i; w, i = word(s, i, home); w.span = (st, i)
             if re.fullmatch(r'\d+|\{\w+\}', w.raw) and s[i:i + 1] in ('<', '>'): fd = w.raw; continue   # an fd number
             toks.append(('W', w)); continue
         i += len(op)
@@ -484,6 +491,29 @@ def body(s, i, r):
         lines.append(cmp)
     else: raise ParseError('a heredoc that never ends')   # bash runs to EOF on it; fail closed rather than guess
     r['body'] = '\n'.join(lines); return i
+
+def compounds(toks):   # [(opener index, closer index)] of each compound command in the tokens
+    out, st, at = [], [], True
+    for k, t in enumerate(toks):
+        if t[0] == 'W' and not t[1].q and (at or t[1].v == '{'):   # `function f {` opens one after two words
+            if t[1].v in OPENER: st.append((t[1].v, k))
+            elif st and OPENER.get(st[-1][0]) == t[1].v: out.append((st.pop()[1], k))
+        elif t == ('OP', '('): st.append(('(', k))
+        elif t == ('OP', ')') and st and st[-1][0] == '(': out.append((st.pop()[1], k))
+        at = t[0] == 'OP' or (t[0] == 'R' and at) or (t[0] == 'W' and not t[1].q and t[1].v in ('then', 'do', 'else', 'elif', '{', 'if', 'while', 'until', '!'))
+    return out
+
+LITVAR = re.compile(r'"?\$(\{)?([A-Za-z_]\w*)(?(1)\})(/[^$`"\'*?\[\]{}\s]*)?"?')
+def herestr(t): return {'op': '<<<', 'w': Word(t), 'body': None, 'qd': True, 'fd': ''}
+def stdinrs(rs):   # the redirects among rs that feed stdin
+    return [r for r in rs if r['op'] in ('<<', '<<-', '<<<', '<') and (r['fd'] or '0') == '0']
+
+def inject(toks, spans):   # [(a, b, redirects)]: each statement in toks[a..b] also carries the redirects (they end at an operator)
+    ins = {}
+    for a, b, rs in spans:
+        for k in range(a, b + 1):
+            if toks[k][0] == 'OP': ins.setdefault(k, []).extend(('R', r) for r in rs)
+    return [x for k, t in enumerate(toks) for x in ins.get(k, []) + [t]]
 
 def bexp(s):   # bash brace expansion of one word: {a,b} only
     for i, c in enumerate(s):
@@ -531,8 +561,9 @@ class Guard:
         g.out, g.dirs, g._names, g.vars, g.vout = [], [], None, {}, {}
         g.headmove = g.cddyn = g.bypass = False
         g._mp = None
-        g.written, g.alias = {}, {}   # files this command writes (path -> text), and its aliases
+        g.written, g.alias, g.funcs = {}, {}, {}   # files this command writes (path -> text), its aliases, its functions (name -> tokens)
         g.cfgs = set()   # where this command copies or links cc-config to
+        g.vset = {}   # how many times this command sets each variable
         g.vsrc = {}   # a variable set from a substitution: its source text, read as a computed verb's words
         nt = env.get('GUARD_NEVER_TOUCH') or os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'config', 'never-touch.txt')
         g.nt = set()
@@ -555,6 +586,8 @@ class Guard:
         if env.get('GH_CONFIG_DIR'): g.fixed.append((g.absp(env['GH_CONFIG_DIR'], g.base), "$GH_CONFIG_DIR (gh's config and aliases)"))
         g.secx = [H + '/.cc/secrets']   # every role: the box's tokens, and any credentials.json / *.token under ~ (SECBASE)
         names = ['.credentials.json', 'credentials.json', 'ccbox/env', '.codex/auth.json', 'cursor/auth.json', '.cc/secrets']   # as body text
+        if g.role != 'pf':   # the off-site backup's key, by its path and where that resolves when the dir is a symlink
+            g.secx += [H + '/.cc/backup', os.path.realpath(H + '/.cc/backup')]; names.append('.cc/backup')
         names += ['.cc/config', '.ssh', '.claude/settings.json', '.cc/sandbox'] if g.role == 'member' else []
         names += ['.cc/slack', '.cc/library/owner'] if g.role == 'member' and not g.inb else []
         g.secn = re.compile(r'(?<![\w.-])(' + '|'.join(map(re.escape, names)) + r')(?![\w.-])')
@@ -632,7 +665,10 @@ class Guard:
 
     def script(g, text, cwd, nested, depth):
         if depth > 8: raise ParseError('nested too deep')
-        start, toks, cmds, stack, k = len(g.out), lex(text, g.home), [], [], 0
+        start, toks, cmds, stack, k = len(g.out), text if isinstance(text, list) else lex(text, g.home), [], [], 0
+        # a redirect on a compound's closer is the stdin of each statement in it: `{ bash; } <<EOF`, `done <<EOF`
+        toks = inject(toks, [(a, b, rs) for a, b in compounds(toks)
+                             for rs in [stdinrs(r[1] for r in itertools.takewhile(lambda t: t[0] == 'R', toks[b + 1:]))] if rs])
         cwdl, cur = [cwd], {'words': [], 'redirs': [], 'pipe': None}
         def end(pipe=False):
             nonlocal cur
@@ -654,12 +690,22 @@ class Guard:
                     k += 2; stack.append(['casepat']); continue
                 if not cur['words'] and not w.q and w.v == 'esac' and top and top[0] == 'casecmd':
                     stack.pop(); continue
+                if not w.q and w.v == '{' and len(cur['words']) == 2 and cur['words'][0].v == 'function': g.funcdef(cur['words'][1], toks, k - 1)
                 cur['words'].append(w)
             elif t[0] == 'R': cur['redirs'].append(t[1])
-            elif t[1] in ('|', '|&'): end(True)
+            elif t[1] in ('|', '|&'):
+                end(True)   # `… | { bash; }`, `… | while …`: what is piped in is the stdin of each statement in the compound
+                a = k
+                while a < len(toks) and toks[a] == ('OP', '\n'): a += 1
+                if a < len(toks) and (toks[a] == ('OP', '(') or (toks[a][0] == 'W' and toks[a][1].v in OPENER)):
+                    for b in [b for x, b in compounds(toks) if x == a]:
+                        toks = inject(toks, [(a, b, [herestr(g.produced((cmds, cur)))])])
             elif t[1] == '(':
+                if (nested or '').endswith(' code') and cur['words'] and toks[k:k + 1] != [('OP', ')')] \
+                        and cur['words'][-1].v not in KW and cur['words'][-1].v not in ('for', 'time'):
+                    raise ParseError('a word before (')   # a syntax error in bash, so a string like this (a JS regex, a call) is data
                 if cur['words'] and k < len(toks) and toks[k] == ('OP', ')'):   # f() { ..; }: the name goes
-                    k += 1; cur['words'] = []; continue
+                    k += 1; g.funcdef(cur['words'][-1], toks, k); cur['words'] = []; continue
                 end(); stack.append(['sub', cwdl[0]])
             elif t[1] == ')':
                 end()
@@ -674,12 +720,24 @@ class Guard:
         if any(e[0] == 'sub' for e in stack): raise ParseError('unclosed (')
         return g.out[start:]
 
+    def funcdef(g, name, toks, k):   # a function whose compound starts at or after toks[k]: kept to run with what a call feeds it
+        while k < len(toks) and toks[k] == ('OP', '\n'): k += 1
+        for a, b in compounds(toks):
+            if a == k: g.funcs[name.v] = toks[a:b + 1]
+
+    def lit(g, w):   # `D=/tmp/x; rm -rf $D/y`: a word that is a variable this command set to a plain literal is that path
+        m = LITVAR.fullmatch(w.raw) if w.dyn and not w.subs else None
+        val = g.vars.get(m.group(2)) if m and g.vset.get(m.group(2)) == 1 else None
+        if val and val.startswith('~/'): val = g.home + val[1:]   # bash expands it in the assignment
+        if val and not re.search(r'[\s*?[\]{}$`~]', val): w.known = val + (m.group(3) or '')
+
     def finish(g, cur, cwdl, nested, depth, cmds):
         for w in cur['words'] + [r['w'] for r in cur['redirs']]:
             for sub in w.subs: g.script(sub, cwdl[0], '$()', depth + 1)
         for r in cur['redirs']:
             if r['body'] and not r['qd']:
                 for sub in subs_in(r['body']): g.script(sub, cwdl[0], '$()', depth + 1)
+        for w in cur['words'] + [r['w'] for r in cur['redirs'] if r['op'] not in ('<<', '<<-')]: g.lit(w)
         ws = []
         for w in cur['words']:
             ws += [w.like(x) for x in bexp(w.v) if x] if w.brace else [w]   # bash drops an empty result
@@ -692,6 +750,7 @@ class Guard:
             for w in ws[i - len(assigns):i]:
                 k, _, val = w.v.partition('=')
                 g.vars[k.rstrip('+')] = None if (w.dyn or w.glob or k.endswith('+')) else val
+                g.vset[k.rstrip('+')] = g.vset.get(k.rstrip('+'), 0) + 1
                 if w.dyn: g.vsrc[k.rstrip('+')] = w.raw.partition('=')[2]   # `X=$(echo docker)`: the text it is built from
                 if w.dyn and w.subs and re.fullmatch(r'"?\$\(.*\)"?', w.raw.partition('=')[2], re.S) and depth < 8:
                     try: sv = ' '.join(g.data(r) for sub in w.subs for r in g.script(sub, cwdl[0], '$()', depth + 1))
@@ -703,6 +762,8 @@ class Guard:
             for R in cur['rs']: R['from'] = src
         for R in cur['rs']:
             if R['verb'] in ('cd', 'pushd', 'popd') and not R['via']: cwdl[0] = g.cd(R, cwdl[0])
+            if R['verb'] in ('read', 'for', 'select', 'unset', 'mapfile', 'readarray', 'getopts'):   # no longer the literal it was set to
+                for x in R['args']: g.vars.pop(x, None)
             if R['verb'] in ('export', 'declare', 'typeset', 'readonly', 'local'):
                 for w in R['argw']:
                     if ASSIGN.match(w.raw):
@@ -735,12 +796,17 @@ class Guard:
                 [g.emit('', ws[1:], redirs, cwd, assigns, via, nested, raw)]
         if not w0.dyn and w0.v in g.alias and depth < 8:   # `alias d=docker; d run x`: the verb is docker
             return g.expand([Word(x) for x in shlex.split(g.alias.pop(w0.v))] + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx)
+        if not w0.dyn and w0.v in g.funcs and depth < 8:   # `f <<EOF`, `… | f`: the function's statements read that stdin
+            rs = stdinrs(redirs) + ([herestr(g.produced(ctx))] if ctx[1]['pipe'] is not None else [])
+            if rs:
+                ft = g.funcs[w0.v]; g.script(inject(ft, [(0, len(ft) - 1, rs)]), cwd, 'function', depth + 1)
         if w0.dyn and w0.subs and not m and depth < 8:   # `… | $(echo bash)`: the verb is what the substitution prints
             try: val = ' '.join(g.data(r) for sub in w0.subs for r in g.script(sub, cwd, '$()', depth + 1)).split()
             except ParseError: val = []
             if val: return g.expand([Word(x) for x in val] + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx)
         if w0.dyn:
             out = [g.emit(None, ws[1:], redirs, cwd, assigns, via, nested, raw + [g.vsrc.get(m.group(2), '') if m else ''])]
+            g.runfed(redirs, cwd, 'stdin>$', depth)
             if m and g.vout.get(m.group(2)) and depth < 8:
                 out += g.expand([Word(x) for x in g.vout[m.group(2)].split()] + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx)
             for n, rest in ([] if m else g.vcands(w0.raw)):
@@ -851,6 +917,12 @@ class Guard:
             if r['op'] == '<<<' and r['w'].subs: out += ['\n'.join(g.data(x) for x in g.script(t, cwd, '$()', depth + 1)) for t in r['w'].subs]   # `<<< "$(cat f)"`: what it prints
         return out
 
+    def runfed(g, redirs, cwd, via, depth):   # `while read l; do bash -c "$l"; done <<EOF`: a computed command beside fed text may run any of it
+        for t in g.feed(redirs, '0', cwd, depth):
+            n = len(g.out)
+            try: g.script(t, cwd, via, depth + 1)
+            except ParseError: del g.out[n:]
+
     def fed(g, subs, cwd, via, depth, *argv):   # what a <( ) prints, read as the script a shell or `source` runs with argv
         out = []
         for sub in subs:
@@ -895,6 +967,7 @@ class Guard:
             if a[k:k + 1] == ['--']: k += 1
             if c:   # `sh -n -c '…'` only parses the string
                 if k < len(a) and not nx: out += g.script(a[k], cwd, b + ' -c', depth + 1)
+                if k + 1 < len(ws) and ws[k + 1].dyn and not nx: g.runfed(R['redirs'], cwd, b + ' -c', depth)
                 if k + 1 < len(ws) and ws[k + 1].subs and not nx:   # bash -c "$(…)" $0 ARGS: the text runs with ARGS
                     out += g.fed(ws[k + 1].subs, cwd, b + ' -c', depth, a[k + 2:])
             elif k < len(a) and not s and (not fdof(a[k]) or ws[k + 1].subs):   # `bash core/bin/cc-publish`: a script file that IS one of the gated tools runs as it
@@ -964,6 +1037,7 @@ class Guard:
             R['sshrem'] = [t for t in rem if t.strip()]
         elif b == 'eval' and a:
             out += g.script(' '.join(a), cwd, 'eval', depth + 1)
+            if any(w.dyn for w in ws[1:]): g.runfed(R['redirs'], cwd, 'eval', depth)
         elif b == 'alias':
             for x in a:
                 if '=' in x: g.alias[x.split('=', 1)[0]] = x.split('=', 1)[1]
@@ -1262,6 +1336,9 @@ class Guard:
             named = g.namesonly(R)
             for w in R['argw'] + [r['w'] for r in R['redirs'] if r['op'] in ('<', '<>')]:
                 if any(w is x for x in named): continue
+                if v == 'rsync' and w is R['argw'][-1] and not w.glob and sum(not x.v.startswith('-') for x in R['argw']) > 1 and any(
+                        (g.absp(w.v, R['cwd']) + '/').startswith(d + '/') for d in g.secx[1:]):
+                    continue   # rsync's last word is where it writes, and the backup key is guarded against reads: no read of it
                 dyn = w.dyn and g.role == 'member'   # a member's computed word is judged as the glob it could be
                 if w.dyn and not dyn and not w.v.startswith(g.home): continue
                 cands = {w.v} | ({w.v.split('=', 1)[1]} if '=' in w.v else set()) | ({w.v.split('@', 1)[1]} if '@' in w.v else set())
@@ -1448,12 +1525,12 @@ class Guard:
             return 'never', 'systemctl on another host or machine (-H / -M)'
         if v == 'rm' and any(re.fullmatch(r'-[a-zA-Z]*[rR][a-zA-Z]*|--recursive', x) for x in a):
             for w in pos(R['argw']):
-                q = os.path.normpath(g.absp(re.split(r'[*?[]', w.v)[0] if w.glob else w.v, R['cwd']))
+                q = os.path.normpath(g.absp(re.split(r'[*?[]', w.v)[0] if w.glob else w.known or w.v, R['cwd']))
                 inside = any(q.startswith(d.rstrip('/') + '/') and not (w.glob and q == d.rstrip('/')) for d in g.allow)
                 free = any(q.startswith(d + '/') for d in ((g.home + '/.cc/state', g.home + '/.cc/tmp', g.home + '/.cache') if (q + '/').startswith(g.home + '/')
                                                            else ('/tmp', '/var/tmp')))
                 if free and g.role == 'member' and q.startswith(g.home + '/.cc/state/'): free = g.ownstate(w, R['cwd'])
-                if w.dyn or not (inside or free):
+                if (w.dyn and not w.known) or not (inside or free):
                     return 'never', f'recursive delete outside the worktree ({w.v})'
         h = g.secread(R, mem)
         if h: return h
@@ -1822,6 +1899,41 @@ def parse(text, env):
     return [{'verb': R['verb'], 'argv': R['args'], 'redirects': [[r['op'], r['w'].v] for r in R['redirs']],
              'cwd': R['cwd'], 'nested': R['nested'], 'via': R['via']} for R in g.out]
 
+# THE TEXT A COMMAND NEVER RUNS, CUT OUT, for cc-guard's text rules (the seat's state, the sandbox key), which have no parser
+# of their own. Nothing is cut from a command that holds anything able to run or reach that text: a shell, interpreter,
+# wrapper, computed verb or word, verb named by a path, a function, or an assignment on PATH and the like. Otherwise a
+# heredoc body fed to cat, tee, git, gh or the box's own tools, the words of echo and printf, what a read-only tool names, a quoted phrase given to git's
+# message verbs, gh or the box's own tools, and the file gh api --input reads are all data. Every write target stays, and judge
+# reads each of them whatever this cuts.
+VIEWREAD = {'cat', 'head', 'tail', 'grep', 'egrep', 'ls', 'stat', 'wc', 'jq', 'diff', 'cmp', 'realpath', 'readlink', 'test', '[',
+            'md5sum', 'sha256sum', 'file', 'du', 'cc-lib', 'basename', 'dirname', 'cut', 'tr', 'nl'}
+VIEWRUN = SHELLS | AWKS | set(WRAP) | {'eval', 'source', '.', 'exec', 'find', 'ssh', 'tmux', 'make', 'alias', 'trap', 'at', 'batch', 'crontab', 'script'}
+
+def view(text, env):
+    g = Guard(dict(env, GUARD_ROLE='pf'))
+    try: g.script(text, g.base, None, 0)
+    except ParseError: return text
+    if g.funcs or any(x in g.vars for x in ('PATH', 'IFS', 'ENV', 'BASH_ENV')): return text
+    cuts = []
+    for R in g.out:
+        v = R['verb']
+        words = R['argw'] + [r['w'] for r in R['redirs'] if r['op'] not in ('<<', '<<-')]
+        if v is None or v in VIEWRUN or INTERP.fullmatch(v) or R['via'] or (v and R['assigns']) or '/' in (R['raw'] or [''])[0] \
+                or any((w.dyn and not w.known) or w.subs for w in words): return text
+        sedread = v == 'sed' and R['args'][:1] == ['-n'] and re.fullmatch(r'[\d,$;p\s]+', ''.join(R['args'][1:2]))
+        if v == 'sed' and not sedread: return text
+        if R['nested'] is not None: continue
+        if v in ('cat', 'tee', 'git', 'gh', 'cc') or v.startswith('cc-'):
+            cuts += [r['span'] for r in R['redirs'] if r.get('span') and (r['qd'] or not re.search(r'[$`\\]', r['body']))]
+        if v in VIEWREAD or v in ('echo', 'printf') or sedread: cuts += [w.span for w in R['argw']]
+        else:
+            ws = gitparse(R['argw'])[2] if v == 'git' and gitparse(R['argw'])[1] in ('commit', 'log', 'tag', 'show', 'notes', 'grep') else \
+                R['argw'] if v == 'gh' or v == 'cc' or v.startswith('cc-') else []
+            cuts += [w.span for w in ws if w.q and re.search(r'\s', w.v)]
+            if v == 'gh': cuts += [w.span for x, w in zip(R['argw'], R['argw'][1:]) if x.v == '--input']
+    for a, b in sorted({c for c in cuts if c}, reverse=True): text = text[:a] + text[b:]
+    return text
+
 SEATWHY = ("only the permission seat writes its state (~/.cc/state/<repo>/perms and its handoff record): whoever writes "
            "its brief.md controls the next permission-skipping session")
 
@@ -2150,10 +2262,11 @@ def selfcheck():
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ''
     if mode == 'selfcheck': sys.exit(selfcheck())
-    if mode not in ('judge', 'parse'):
-        print('usage: cc-guard-argv judge|parse|selfcheck  (command on stdin)', file=sys.stderr); sys.exit(2)
+    if mode not in ('judge', 'parse', 'view'):
+        print('usage: cc-guard-argv judge|parse|view|selfcheck  (command on stdin)', file=sys.stderr); sys.exit(2)
     text = sys.stdin.read()
     try:
+        if mode == 'view': sys.stdout.write(view(text, os.environ)); return
         if mode == 'parse':
             try: rows = parse(text, os.environ)
             except ParseError as e: print(json.dumps({'error': str(e)})); return

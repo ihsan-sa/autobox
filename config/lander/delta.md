@@ -58,7 +58,8 @@ WHAT TO DO:
 ANSWER with the JSON object the schema asks for and nothing else:
 - `verdict` — `LAND` when every prior blocker is resolved or moot and there is no new one, else `HANDBACK`.
 - `resolved`, `moot`, `unresolved` — the prior blockers' bare numbers, as strings, and nothing else: an opinion goes
-  in `advisory`. A sentence in `unresolved` holds the PR back, and one in `resolved` or `moot` clears nothing.
+  in `advisory`. A sentence in `unresolved` holds the PR back. One in `resolved` or `moot` names no
+  row, so that row counts as left out: a `[security]` row stays open and any other holds nothing.
 - `blocking` — the NEW blockers only, same fields as the first read: `kind`, `severity`, `where`, `what`, `input`, `fix`.
 - `advisory` — `where`, `what`.
 

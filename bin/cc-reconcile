@@ -650,12 +650,26 @@ def tmux_live(ppids, sessions=()):
     return panes(out.stdout.splitlines(), ppids, sessions)
 
 
+STATE_FILE_CAP = 8 << 20   # far past any healthy journal, and the newest text of a bigger one is the part read
+
+
+def state_lines(repo, track, name):
+    """The last STATE_FILE_CAP bytes of a file in a track's state dir, as lines. Its name is the worker's (the sandbox binds
+    that dir rw) and every tick reads it, so a link or a FIFO is refused in the open: OSError, and the tick goes on."""
+    with os.fdopen(os.open(f"{STATE}/{repo}/{track}/{name}", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{name} is not a regular file")
+        f.seek(max(0, st.st_size - STATE_FILE_CAP))
+        return f.read(STATE_FILE_CAP).decode(errors="replace").splitlines()
+
+
 def journal(repo, track):
     """(kind, text) from the LAST STATUS line in the journal, and only that one: an earlier BLOCKED that a later
     round settled (a later DONE, or cc-loop's RESUMED) never raises `waiting`. A line may carry markdown or a timestamp before STATUS.
     The only reader of a track's STATUS line: the board's waiting reconcile and the watchdog both take it from here."""
     try:
-        body = open(f"{STATE}/{repo}/{track}/progress.md", errors="replace").read().splitlines()
+        body = state_lines(repo, track, "progress.md")
     except OSError:
         return (None, "")
     for ln in reversed(body):
@@ -672,7 +686,7 @@ def journal(repo, track):
 def loop_end(repo, track):
     """cc-loop's last word, only if it came after the last iteration it started."""
     try:
-        body = open(f"{STATE}/{repo}/{track}/loop.log", errors="replace").read().splitlines()[-200:]
+        body = state_lines(repo, track, "loop.log")[-200:]
     except OSError:
         return ""
     for ln in reversed(body):
@@ -1318,7 +1332,7 @@ def pending(f, state):
 def stuck_line(repo, track, f):
     """What a seat reads about a stuck PR: its row, the last red or conflict on its board notes or journal, and its link."""
     try:
-        body = open(f"{STATE}/{repo}/{track}/progress.md", errors="replace").read().splitlines()
+        body = state_lines(repo, track, "progress.md")
     except OSError:
         body = []
     why = next((m.group(1) for m in map(NOT_MERGED.search, reversed(body + list(f.get("notes") or []))) if m),
