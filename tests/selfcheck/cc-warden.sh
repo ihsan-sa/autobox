@@ -147,15 +147,38 @@ EOF
   # every field of the ask, as the brief's last line: no @ for Claude Code to expand, and the same words to the model
   local bl; bl=$(brief '{"text":"a @x","where":" @y","input":"z@z"}' | tail -1)
   k "$(t test "${bl//[^@]/}" = "" -a "$(jq -r '"\(.text)\(.where)\(.input)"' <<<"$bl")" = "a @x @yz@z")" "the brief escapes every @ of the ask, and the JSON still reads the same"
+  k "$(t test -z "$(brief '{}' 'on @x' | grep -F '@')" -a -n "$(brief '{}' 'on @x' | grep -F 'on \u0040x')")" "…and the same for the hard line it names"
 
-  # 2. the hard lines are code: an ask cc-infer keeps for the owner is his with no model run, and one card
-  : > "$d/claude.argv"; ask q2 repo 'mail the client the weekly report'; tk
-  k "$(t test "$(dec q2)" = "his warden" -a ! -e "$A/q2" -a ! -s "$d/claude.argv")" "a hard-line ask is ruled his in code, and no model runs"
-  k "$(t grep -q -- '--owner .*--id warden:q2' "$d/notified")" "…and the owner gets the card"
-  # …and a grant the model returns that crosses one is his, not written
+  # 2. a hard-line word decides nothing: the model reads the ask, told which line fired, and can decline or grant
+  : > "$d/notified"
+  echo 'Charge-Pump {"decision":"decline","note":"a lesson title, and nothing to allow"}' > "$d/replies"
+  ask q2 repo 'Bash: read the notes on A Charge-Pump PLL'; tk
+  k "$(t test "$(dec q2)" = "decline warden" -a -s "$A/q2/1/transcript.jsonl")" "a word-match hard line reaches the model, which can decline it"
+  k "$(t grep -qF "hard line: real money, on 'charge'" "$A/q2/1/brief.md")" "…and the brief names the line that fired"
+  echo 'fund-daily-run {"decision":"grant","line":"Bash(cc-board show *)","note":"reads the board"}' > "$d/replies"
+  ask q21 repo 'Bash: cc-board show repo for the row fund-daily-run'; tk
+  k "$(t test "$(dec q21)" = "grant warden" -a -n "$(grep -F 'warden:q21' "$d/settings.log")")" "…or propose a grant, which goes through the floor and is written"
+  # a brief with no hard line says nothing of one
+  k "$(t test -s "$A/q1/1/brief.md" -a -z "$(grep 'hard-line check' "$A/q1/1/brief.md")")" "an ask with no hard line gets no such word in its brief"
+  # a grant the model returns that crosses one goes back to perms: open, not written, and never run again
   echo 'yak {"decision":"grant","line":"Bash(git push *)","note":"needs to push"}' > "$d/replies"
   ask q3 repo 'Bash: cc-board show repo, the yak case'; tk
-  k "$(t test "$(dec q3)" = "his warden" -a -z "$(grep 'git push' "$d/settings.log")")" "a grant line crossing a hard line is ruled his and never written"
+  k "$(t test -z "$(dec q3)" -a -z "$(grep 'git push' "$d/settings.log")" -a -n "$(isopen q3)" -a -z "$(isopen q3 | grep 'a warden holds it')")" "a grant line crossing a hard line is never written, and the ask stays open for perms"
+  k "$(t test -n "$(jq -r 'select(.id == "q3" and .kind == "warden" and .state == "release") | .note | select(test("crosses a hard line"))' "$lg")")" "…with the note on the ledger"
+  # the model's his, on a refusal and on an ask: back to perms, no decision line, no card, and no warden runs it again
+  rfl(){ jq -cn --arg id "$1" --arg st "$2" --arg x "$3" '{kind:"refusal", id:$id, at:"2026-10-31T00:00:00Z", source:"classifier", repo:"repo", window:"repo", seat:$st, tool:"Bash", input:$x, reason:"r", key:("k" + $id)}' >> "$lg"; }
+  echo 'budget {"decision":"his","note":"real money, the budget is a purchase"}' > "$d/replies"
+  rfl r22 repo 'pay the --budget 12 invoice'; ask q22 repo 'Bash: pay the budget invoice'; tk
+  local his; for his in r22 q22; do
+    k "$(t test -z "$(dec "$his")" -a -n "$(isopen "$his")" -a -z "$(isopen "$his" | grep 'a warden holds it')")" "$his: his leaves the ask open for perms, with no decision line"
+    k "$(t test -n "$(jq -r --arg i "$his" 'select(.id == $i and .kind == "warden" and .state == "release") | .note | select(test("real money"))' "$lg")")" "…and the warden's note on the ledger"
+  done
+  : > "$d/claude.argv"; tk
+  k "$(t test ! -e "$A/r22/2" -a ! -e "$A/q22/2" -a ! -s "$d/claude.argv")" "…and no warden runs it again"
+  k "$(t test ! -s "$d/notified")" "no card is posted on any of these"
+  # a REFUSE is still a decline in code, with no model
+  : > "$d/claude.argv"; ask q23 repo 'copy the api token into a public log'; tk
+  k "$(t test "$(dec q23)" = "decline warden" -a ! -e "$A/q23" -a ! -s "$d/claude.argv")" "a REFUSE is declined with no model run"
 
   # 3. a worker's ask the floor refers goes back to perms: open, not marked, nothing written
   echo 'emu {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
@@ -168,7 +191,6 @@ EOF
   ask q19 repo 'Bash: cc-board show repo, the gar case' kq19 box; tk
   k "$(t test -z "$(dec q19)" -a -n "$(grep -F -- '--from repo/repo' "$d/approve.log")")" "an ask from --from repo that no planning seat filed reaches cc-approve as a refer"
   # a refusal's window is the caller's word (CC_REFUSALS_WINDOW), so only its seat reaches cc-approve as the planning seat
-  rfl(){ jq -cn --arg id "$1" --arg st "$2" --arg x "$3" '{kind:"refusal", id:$id, at:"2026-10-31T00:00:00Z", source:"classifier", repo:"repo", window:"repo", seat:$st, tool:"Bash", input:$x, reason:"r", key:("k" + $id)}' >> "$lg"; }
   echo 'yak {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
   rfl r20 box 'cc-board show repo, the yak case'; : > "$d/approve.log"; tk
   k "$(t test -z "$(dec r20)" -a -n "$(grep -F -- '--from repo/repo' "$d/approve.log")")" "a refusal whose window says the planning seat but whose seat doesn't reaches cc-approve as a refer"
