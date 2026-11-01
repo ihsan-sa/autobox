@@ -169,6 +169,8 @@
 #     LD_*, PATH, HOME and the rest of env_reserved). The value goes into the boundary over a pipe and a /bin/sh that exports
 #     it, never on an argv, which every process on the host can read. With no file named, the command says what VAR is
 #     granted from; --revoke removes it. Rotate in the file. A CC_MEMBER_V2=1 launch carries no grant, and says so in one line on stderr.
+#     `cc-sandbox member <workspace> --env VAR[,VAR...] -- <cmd...>` starts that session with only the named grants, for a
+#     run that needs fewer than the workspace holds. It narrows and never adds: a named VAR with no grant is simply not set.
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -316,6 +318,7 @@ set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); EGRESS="$BIN/cc-egress"
 MEMBER_MARK=/.cc-member-boundary   # at the root, where the host user cannot make a file; the member bwrap binds it
 TREE=""   # `member … --tree <dir>`: one host tree bound into the boundary as the working directory (a landing's gates)
+ENVONLY=""   # `member … --env VAR[,VAR...]`: the only grants env_bind hands this launch; empty is all of them
 TUTOR=""   # `member … --tutor 0|1`: VITE_TUTOR inside, which --clearenv drops (a lessons build run with no wrapper to set it)
 TMPSZ=(--size "${CC_SANDBOX_TMP_SIZE:-2147483648}")   # EVERY tmpfs A SESSION CAN FILL HAS A SIZE (2 GiB, bytes): tmpfs pages are RAM that belong to no process, so a
 # runaway writing into /tmp or ~ gets ENOSPC instead of filling memory and swap (a worker's test wrote 16 GB on 2026-10-24)
@@ -1982,6 +1985,7 @@ env_bind(){   # $1 handle → the globals EW (a wrapper command, or nothing) and
   EW=(); EV=""; local names=()
   for g in "$H/.cc/members/$1/env"/*; do
     [ -L "$g" ] || continue; v=$(basename "$g")
+    [ -z "$ENVONLY" ] || [[ ",$ENVONLY," == *",$v,"* ]] || continue
     if ! [[ "$v" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] || env_reserved "$v" || ! f=$(env_secret "$g" 2>/dev/null); then
       echo "cc-sandbox: ~/dev/$1 is granted $v, but the grant or its file is not one this launch honours — it is not set (cc-sandbox env $1 $v says where it points)" >&2; continue; fi
     IFS= read -r line < "$f" || [ -n "$line" ] || continue
@@ -3149,6 +3153,20 @@ selfcheck_secretenv(){   # A SECRET GRANTED AS AN ENVIRONMENT VARIABLE (cc-sandb
   t 'env: while the workspace session runs, no argv on the host carries the value' \
     "$(hostargv)" 0
   wait "$pid" 2>/dev/null
+  # ── --env: of two grants, the launch has the named one alone; naming only the other leaves this one out; bare has both
+  ( umask 077; echo other-value > "$fh/.cc/secrets/other.token" ); env HOME="$fh" "$SELF" env "$h" OTHER_KEY "$fh/.cc/secrets/other.token" >/dev/null 2>&1
+  local ep='echo xai=${XAI_API_KEY:+set}; echo other=${OTHER_KEY:+set}'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$ep" 2>&1)
+  t 'env: --env fixture: a bare launch has both grants' "$(g xai)/$(g other)" set/set
+  out=$(env HOME="$fh" "$SELF" member "$h" --env XAI_API_KEY,NOT_GRANTED -- sh -c "$ep" 2>&1)
+  t 'env: --env hands the named grant and not the other' "$(g xai)/$(g other)" set/
+  out=$(env HOME="$fh" "$SELF" member "$h" --env OTHER_KEY -- sh -c "$ep" 2>&1)
+  t 'env: --env naming the other grant leaves the first out' "$(g xai)/$(g other)" /set
+  out=$(env HOME="$fh" "$SELF" member "$h" --env "" -- sh -c "$ep" 2>&1); rc=$?
+  t 'env: an empty --env is refused, never read as all of them' "$rc/$(g xai)" 2/
+  out=$(env HOME="$fh" CC_MEMBER_V2=1 "$fh/v2/cc-sandbox" member "$h" --env XAI_API_KEY -- true 2>&1); rc=$?
+  t 'env: a CC_MEMBER_V2=1 launch refuses --env' "$rc/$(grep -c V2RAN <<<"$out")" 2/0
+  env HOME="$fh" "$SELF" env "$h" OTHER_KEY --revoke >/dev/null 2>&1
   # ── A TRACK OF THE WORKSPACE is a worker the grant does not name
   git -C "$dev" worktree add -q -b track/t "$fh/.cc/worktrees/$h/t" >/dev/null 2>&1 || return 1
   out=$(env HOME="$fh" "$SELF" member "$h" t -- sh -c "$probe" _ "$va" "$vb" "$sec" "$gd" 2>&1)
@@ -4730,15 +4748,16 @@ case "${1:-}" in selfcheck) export CC_MF_ROOT="${TMPDIR:-/tmp}/cc-sandbox-selfch
   web) shift; web "${1:-}"; exit $?;;
   github) shift; github "$@"; exit $?;;
   env) shift; env_grant "${1:-}" "${2:-}" "${3:-}"; exit $?;;
-  member) h="${2:?handle}"; shift 2; tr=""; case "${1:-}" in --|--tree|--tutor) ;; *) tr="${1:-}"; shift;; esac   # <handle> [<track>|""] [--tree <dir>] [--tutor 0|1] [--] cmd
-          while :; do case "${1:-}" in   # --tree and --tutor, in either order
+  member) h="${2:?handle}"; shift 2; tr=""; case "${1:-}" in --|--tree|--tutor|--env) ;; *) tr="${1:-}"; shift;; esac   # <handle> [<track>|""] [--tree <dir>] [--tutor 0|1] [--env VAR,...] [--] cmd
+          while :; do case "${1:-}" in   # --tree, --tutor and --env, in any order
             --tree) TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; };;
             --tutor) case "${2:-}" in 0|1) TUTOR=$2; shift 2;; *) echo "cc-sandbox: --tutor takes 0 or 1, not '${2:-}'" >&2; exit 2;; esac;;
+            --env) ENVONLY="${2:-}"; shift 2 || shift; [ -n "$ENVONLY" ] || { echo "cc-sandbox: --env takes VAR[,VAR...]" >&2; exit 2; };;
             *) break;; esac; done
           [ "${1:-}" = -- ] && shift
-          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] [--tutor 0|1] -- <cmd...>" >&2; exit 2; }
+          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] [--tutor 0|1] [--env VAR[,VAR...]] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
-            for f in ${TREE:+--tree} ${TUTOR:+--tutor}; do echo "cc-sandbox: $f is not a cc-member-v2 option" >&2; exit 2; done
+            for f in ${TREE:+--tree} ${TUTOR:+--tutor} ${ENVONLY:+--env}; do echo "cc-sandbox: $f is not a cc-member-v2 option" >&2; exit 2; done
             ! handle_ok "$h" || ! ev=$(env_names "$h") \
               || echo "cc-sandbox: ~/dev/$h is granted $ev (cc-sandbox env), but a CC_MEMBER_V2=1 launch does not carry grants — this session runs without them" >&2
             BIN=$(dirname "$SELF"); exec "$BIN/cc-member-v2" run "$h" "${tr:-$h}" -- "$@"
