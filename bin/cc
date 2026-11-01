@@ -1841,23 +1841,27 @@ PY
   rc=1; [ ! -e "$R/r/$L/delivery.json" ] && compgen -G "$R/.receipts/r/*.$(csid 14).json" >/dev/null && rc=0
   t "…and so is a 255-character row, whose receipt name would pass the 255-byte limit if it carried the row's name" "$rc"
   # perms' read of #1976: the member swaps its delivery.json for a link to an owner file between retire's open and
-  # its rename, so the receipts would hold the link. A rename-over each turn puts a fresh record, then a link, there.
-  mkdir -p "$R/r/s"; printf '{}\n' > "$R/own/secret"
-  cat > "$T/rc/swaprec.py" <<'PY'
-import os, sys
-d, target, stop = sys.argv[1:4]
-while not os.path.exists(stop):
-    with open(f"{d}/rec.tmp", "w") as f: f.write('{}\n')
-    os.rename(f"{d}/rec.tmp", f"{d}/delivery.json")
-    try: os.unlink(f"{d}/lnk.tmp")
-    except FileNotFoundError: pass
-    os.symlink(target, f"{d}/lnk.tmp"); os.rename(f"{d}/lnk.tmp", f"{d}/delivery.json")
-PY
-  python3 "$T/rc/swaprec.py" "$R/r/s" "$R/own/secret" "$T/rc/stop2" & sp=$!
-  ( HOME="$T/rc/h"; STBASE="$R"; repo=r; track=s; for _ in $(seq 200); do retire; done ) >/dev/null 2>&1
-  : > "$T/rc/stop2"; wait "$sp"
-  rc=0; for f in "$R"/.receipts/r/s.*.json; do [ -L "$f" ] && rc=1; done; compgen -G "$R/.receipts/r/s.*.json" >/dev/null || rc=1
+  # its rename, so the receipts would hold the link. Holding the row lock parks retire in that window: cc-task's
+  # retire (what `retire` above runs) opens delivery.lock only once delivery.json is open, in its own process, so
+  # when the lock shows in /proc/<pid>/fd the swap lands after the open every run. lswap <cc-task> <dir> runs that
+  # on a fresh state root and prints "refused" if retire refused at the move, "link" for a link in the receipts.
+  lswap(){ local h="$T/rc/$2" s="$T/rc/$2/.cc/state" sp f
+    mkdir -p "$s/r/s" "$s/own"; printf '{}\n' > "$s/own/secret"; printf '{}\n' > "$s/r/s/delivery.json"
+    exec 7>"$s/r/s/delivery.lock"; flock 7
+    HOME="$h" "$1" retire r s 2>"$h/err" 7>&- & sp=$!   # 7>&-: the fd the poll looks for is its own
+    for _ in $(seq 300); do readlink "/proc/$sp/fd/"* 2>/dev/null | grep -q 'delivery\.lock$' && break; sleep 0.1; done
+    ln -s "$s/own/secret" "$s/r/s/lnk.tmp"; mv -T "$s/r/s/lnk.tmp" "$s/r/s/delivery.json"; exec 7>&-
+    wait "$sp"; grep -q 'swapped for another file' "$h/err" && echo refused
+    for f in "$s"/.receipts/r/s.*.json; do [ -L "$f" ] && echo link; done; [ -f "$s/own/secret" ] || echo lost; }
+  [ "$(lswap "$BIN/cc-task" sw)" = refused ] && printf '{}\n' > "$T/rc/sw/.cc/state/r/s/delivery.json" \
+    && HOME="$T/rc/sw" "$BIN/cc-task" retire r s 2>/dev/null && compgen -G "$T/rc/sw/.cc/state/.receipts/r/s.*.json" >/dev/null; rc=$?
   t "…and a record the member swaps for a link just before the move never leaves a link in the receipts" "$rc"
+  # The reverse check: the same case on a copy of cc-task with the inode check after the move taken out must leave
+  # the link there. If the sed stops matching, the copy keeps the check and this reads red.
+  sed 's/if (moved.st_dev, moved.st_ino) != (held.st_dev, held.st_ino) or not stat.S_ISREG(moved.st_mode):/if False:/' \
+    "$BIN/cc-task" > "$T/rc/cc-task-nocheck"; chmod +x "$T/rc/cc-task-nocheck"
+  rc=1; [ "$(lswap "$T/rc/cc-task-nocheck" sw-nocheck)" = link ] && rc=0
+  t "…and without retire's inode check that same swap does leave a link there, so the case above can fail" "$rc"
   # A REVIEW THAT NARROWS THE OWNER'S DESIGN IS SHOWN TO HIM (owner-sees-a-review-narrowing-his-design). Each case is
   # its own row under $T/nw, with a stub cc-slack that logs its posts; the reservation and the brief writer are stubbed.
   mkdir -p "$T/nw"; printf '#!/bin/bash\necho "$*" >> %q/nw/posts\n' "$T" > "$T/nw/slack"; chmod +x "$T/nw/slack"
