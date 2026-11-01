@@ -225,6 +225,43 @@ esac''')):
         polled(10, -60, 30)
         t("pace: a fresh now.json whose window has reset falls back too", "90%" in why_not(), True)
 
+        # Ultra (2026-10-30): an account that reports no five-hour window is paced on the week instead
+        d = fixture("weekly", margin=10)
+        os.makedirs(f"{d}/usage")
+        usage(d, 90, 3 * 3600, "old.json")   # a session's last redraw, still showing a five-hour window
+        def weekly(used, left_s, five=None):
+            return {"at": time.time(), "five_hour": five or {"used_percentage": None, "resets_at": None},
+                    "seven_day": {"used_percentage": used, "resets_at": time.time() + left_s}}
+        json.dump(weekly(30, 4 * 86400), open(f"{d}/usage/now.json", "w"))   # 3 of 7 days gone = 43%
+        t("pace: no five-hour window, 30% of the week used at 43% gone is room, the 90% five-hour file aside",
+          why_not(), "")
+        # ahead of the week slows launches and never holds one: a weighing, not a gate (no-hard-caps)
+        os.environ["CC_ROOM_TRICKLE"] = "600"
+        os.makedirs(f"{d}/room", exist_ok=True)
+        def started(ago):
+            open(f"{d}/room/started", "w").close()
+            os.utime(f"{d}/room/started", (time.time() - ago,) * 2)
+        json.dump(weekly(70, 4 * 86400), open(f"{d}/usage/now.json", "w"))
+        started(60)
+        t("pace: 70% of the week used at 43% gone, a worker started 60s ago, waits on the weekly figure",
+          ("weekly usage is at 70%" in why_not(), "30% left" in why_not(), "one launch every 600s" in why_not()),
+          (True, True, True))
+        started(900)
+        t("pace: …and with none started for 600s the next one runs: the week slows launches, it never holds them",
+          why_not(), "")
+        started(60)
+        os.environ["CC_ROOM_TRICKLE"] = "0"
+        t("pace: …and CC_ROOM_TRICKLE=0 lets the week hold none", why_not(), "")
+        os.environ["CC_ROOM_TRICKLE"] = "600"
+        json.dump(weekly(70, 4 * 86400, {"used_percentage": 20, "resets_at": time.time() + 3 * 3600}),
+                  open(f"{d}/usage/now.json", "w"))
+        t("pace: while a five-hour window is still reported it is the one paced", why_not(), "")
+        os.unlink(f"{d}/usage/now.json")
+        os.unlink(f"{d}/sl/old.json")
+        json.dump({"raw": {"rate_limits": weekly(90, 4 * 86400)}}, open(f"{d}/sl/w.json", "w"))
+        t("pace: a statusline file with only a weekly window is paced on it", "weekly usage is at 90%" in why_not(),
+          True)
+
         # the queued launch runs on its own once room frees, and not before
         d = fixture("frees", cap=1)
         h = holder("r/held")
