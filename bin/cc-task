@@ -140,14 +140,24 @@ def save(state, record):
 
 def unlock(name, fd):
     """Give the folder <name> under <fd>, and every folder in it, u+rwx, through fds and never through a link, so a
-    0555 or 000 folder a member swapped in cannot block its own removal (O_PATH needs no read permission)."""
-    p = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    0555 or 000 folder a member swapped in cannot block its own removal (O_PATH needs no read permission). A loop that
+    moves each folder up to sit directly under <name>, so no depth can exhaust the stack or the fds, here or in the
+    rmtree after it. A folder needs write on itself to change parent, so it is opened up before it moves."""
+    def opened(e, at):
+        p = os.open(e, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=at)
+        try: os.chmod(f"/proc/self/fd/{p}", 0o700); return os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=p)
+        finally: os.close(p)
+    folders = lambda d: [e.name for e in os.scandir(d) if e.is_dir(follow_symlinks=False)]
+    top = opened(name, fd)
     try:
-        os.chmod(f"/proc/self/fd/{p}", 0o700); d = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=p)
-        try: subs = [e.name for e in os.scandir(d) if e.is_dir(follow_symlinks=False)]
-        finally: os.close(d)
-        for e in subs: unlock(e, p)
-    finally: os.close(p)
+        todo = folders(top)
+        while todo:
+            d = opened(todo.pop(), top)
+            try:
+                for e in folders(d):
+                    os.close(opened(e, d)); up = str(uuid.uuid4()); os.rename(e, up, src_dir_fd=d, dst_dir_fd=top); todo.append(up)
+            finally: os.close(d)
+    finally: os.close(top)
 
 def retire(repo, row, unmerged=False):
     """Move <row>'s record to ~/.cc/state/.receipts/<repo>/<row>.<task id>.json, as `cc rm` and `cc --go` retire it.

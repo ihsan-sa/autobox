@@ -659,4 +659,28 @@ def selfcheck():
         ok("the launcher is the outer cc, not the `$(…)` copy of it that runs cc-task",
            launcher(ancestry(60, proc)) == {"pid": 50, "start_ticks": 9})
         ok("…and cc-task run by anything but cc has none", launcher(ancestry(70, proc)) is None)
+    import resource
+    for fds in (resource.getrlimit(resource.RLIMIT_NOFILE)[0], 64):   # perms' read of #2099: past the recursion limit, then past a walk that holds each parent open
+        with tempfile.TemporaryDirectory(prefix="cctask-deep-", ignore_cleanup_errors=True) as home:
+            row = Path(home, ".cc/state/r/deep"); row.mkdir(parents=True); (row / "delivery.json").write_text("{}\n")
+            outside = Path(home, "outside"); outside.mkdir(); outside.chmod(0o750); (outside / "keep").write_text("keep\n")
+            tree = row / "dir.tmp"; tree.mkdir(); os.symlink(outside, tree / "link")
+            d = os.open(tree, os.O_RDONLY)
+            for i in range(sys.getrecursionlimit() + 100):
+                os.mkdir("d", dir_fd=d); below = os.open("d", os.O_RDONLY, dir_fd=d)
+                if i: os.fchmod(d, 0)   # the top stays writable, as a folder must be for retire's move to take it
+                os.close(d); d = below
+            os.symlink(outside, "link", dir_fd=d); os.close(d)
+            class Swapping(Lock):   # the member's swap, landing between retire's open and its move
+                def __enter__(self):
+                    held = super().__enter__(); os.rename(row / "delivery.json", row / "old"); os.rename(tree, row / "delivery.json"); return held
+            real, home_was, limit = Lock, os.environ["HOME"], resource.getrlimit(resource.RLIMIT_NOFILE)
+            globals()["Lock"] = Swapping; os.environ["HOME"] = home; resource.setrlimit(resource.RLIMIT_NOFILE, (fds, limit[1]))
+            try: retire("r", "deep"); ended = "no refusal"
+            except Exception as e: ended = repr(e)
+            finally: globals()["Lock"] = real; os.environ["HOME"] = home_was; resource.setrlimit(resource.RLIMIT_NOFILE, limit)
+            ok(f"a swapped folder nested past the recursion limit, with {fds} fds, is refused as swapped and removed: {ended[:60]}",
+               ended.startswith("ValueError") and "swapped" in ended and os.listdir(Path(home, ".cc/state/.receipts/r")) == [])
+            ok("…and a link inside it never reaches what it points at",
+               (outside / "keep").read_text() == "keep\n" and stat.S_IMODE(outside.stat().st_mode) == 0o750)
     print(f"cc-task selfcheck: {n} failed"); return 1 if n else 0
