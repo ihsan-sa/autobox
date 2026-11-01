@@ -72,6 +72,7 @@
 # needs two observers on the stamp. first_seen() is keyed on the LINE, so two episodes whose message reads exactly
 # alike inside a day share one sighting and the second gets no tag — what that gives back is the old answer (two
 # observers, or the pane scan), which is the safe way for this to be wrong.
+# Since ONE SEAT'S LINE covers every wording, only a stamp two runs hit gets this tag at all, so a pane no longer is that second run.
 # WHAT ELSE THE LIMIT KILLED. A nudge puts a SESSION back on its work; the subagents it had out when the 429 came
 # are gone, and the board rows they were working still carry the `agent` mark that says somebody is doing them.
 # That mark holds a row for six hours (cc-reconcile mark_why), so a row whose subagent died at
@@ -120,12 +121,15 @@
 # this reads them and writes neither. The hashes in ~/.cc/state/model-seen are NOT corroboration: cc-model banks one
 # for every probe it adjudicated, "was not a live limit" included.
 # ONE SEAT'S LINE. A seat that stops alone leaves no stamp and no switch, so HIT_RE's line records with no second witness
-# (2026-11-01, a seat parked 14.5 h). But a tool result can print those words too, so unless the limit is witnessed for the box (a
-# stamp two runs hit, or an override or a switch with no lesser stamp live) the record is tagged `solo` and touches that session only: it gets its nudge
-# at the reset and nothing else. No Escape, no notice to the owner, no episode in $RESUMED, no witness for cc-model, and
-# no other run's stamp moves it. A real lone seat stuck mid-turn pays for that: its nudge spools until the turn ends.
-# Such a line stays on screen after the nudge, and its clock comes round again each day. first_seen keeps the sighting
-# while the line is on screen, so a clock later than the one the line meant when first seen is that old screen and exit 1.
+# (2026-11-01, a seat parked 14.5 h). But a tool result prints under the same mark in the same words, so any line, in any
+# wording, is witnessed for the box only by a live stamp two runs hit on this login. An override or a switch doesn't witness
+# it: either one stands for hours, and a line printed meanwhile can be anybody's. Otherwise the record is tagged `solo` and
+# touches that session only: it gets its nudge at the reset and nothing else. No Escape, no notice to the owner, no episode
+# in $RESUMED, no witness for cc-model, and no other run's stamp moves it. A real lone seat stuck mid-turn pays for that: its
+# nudge spools until the turn ends.
+# Such a line stays on screen after the nudge, and its clock comes round again each day. first_seen keeps the sighting, with
+# the lines above it, while that screen stands, so a clock later than the one the line meant when first seen is that old
+# screen and exit 1, however many days it stands. The same words under new lines are a new limit.
 # A solo record the box later witnesses becomes an ordinary one: a box stamp holds its nudge and it joins the episode.
 set -uo pipefail
 SELF=$(readlink -f "$0")
@@ -143,8 +147,10 @@ now="${CC_LIMIT_NOW:-$(date -u +%s)}"; DRY=""
 # this one ends in a message typed at a human's session, so prose that merely mentions limits must not match.
 # HIT_RE is the line Claude Code prints today, whole: at most two spaces, the ⎿ mark, the words, then a clock or a date. So
 # a reply, a quote or tool output further in does not match. The bare form is the dialog, which cc-msg's sweep answers and
-# nothing can be typed at. `.{0,3}` is the apostrophe, in bytes or as a letter.
-HIT_RE='^ {0,2}⎿[[:space:]]+you.{0,3}ve hit your [a-z0-9 -]*limit ·.*resets ((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? +)?[0-9]'
+# nothing can be typed at. `.{0,3}` is the apostrophe, in bytes or as a letter. The mark is followed by a space and a
+# no-break space (read off 2.1.316's own screen), which [[:space:]] doesn't cover in any locale.
+NBSP=$'\xc2\xa0'
+HIT_RE="^ {0,2}⎿[[:space:]$NBSP]+you.{0,3}ve hit your [a-z0-9 -]*limit ·.*resets ((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? +)?[0-9]"
 PANE_RE="usage limit reached|out of usage credits|limit will reset|limit reached.*reset|$HIT_RE"
 FIVE_H=18000   # see record: the longest wait a reset read off a clock alone can mean
 TAIL=15   # the pane's LAST 15 visible lines (capture-pane piped through tail). A session STOPPED by the limit
@@ -284,9 +290,8 @@ corroborated(){   # $1 pane, $2 window (unused — kept for the callers). The st
   awk -F'\t' -v c=$((now - 21600)) '$3=="switch" && ($2+0)>c{f=1} END{exit !f}' \
     "$HOME/.cc/state/model.log" 2>/dev/null; }
 
-witnessed(){   # corroborated, and for the box rather than for one run: a stamp binds the box at two observers, on this login
-  corroborated || return 1; stamp; [ "$ends" -le "$now" ] && return 0
-  ! elsewhere && [ "$(nobs)" -ge 2 ]; }
+witnessed(){   # for the box rather than for one run: see ONE SEAT'S LINE
+  stamp; [ "$ends" -gt "$now" ] && ! elsewhere && [ "$(nobs)" -ge 2 ]; }
 
 first_seen(){   # $1 pane, $2 the limit line -> the epoch THIS sighting of THAT line was first seen (stamped on first
                 # sight, not in --dry). It bounds the window in which nothing corroborates the line yet: cc-model
@@ -300,14 +305,15 @@ first_seen(){   # $1 pane, $2 the limit line -> the epoch THIS sighting of THAT 
                 # which is the case review-171b closed. The line's own text separates the two: a new limit prints a
                 # new line, and that is a new sighting with its own hour. A row goes a day after the line was LAST read,
                 # so it lasts while the line is on screen.
+                # The tick, the wake and check overlap, and a row one of them lost would make a stale line a new sighting: hence the lock.
   local k t
-  k="$1:$(printf '%s' "$2" | md5sum | cut -c1-16)"
-  t=$(awk -F'\t' -v k="$k" '$1==k{print $2+0; exit}' "$SEEN" 2>/dev/null)
-  [ -n "$t" ] || t=$now
-  [ -n "$DRY" ] || { mkdir -p "$(dirname "$SEEN")"
-    { [ -f "$SEEN" ] && awk -F'\t' -v k="$k" -v c=$((now - 86400)) '$1!=k && ($3+0)>c' "$SEEN"
+  k="$1:$(printf '%s' "$2" | md5sum | cut -c1-16)"; mkdir -p "$(dirname "$SEEN")"
+  { [ -n "$DRY" ] || flock -w 30 9
+    t=$(awk -F'\t' -v k="$k" '$1==k{print $2+0; exit}' "$SEEN" 2>/dev/null)
+    [ -n "$t" ] || t=$now
+    [ -n "$DRY" ] || { { [ -f "$SEEN" ] && awk -F'\t' -v k="$k" -v c=$((now - 86400)) '$1!=k && ($3+0)>c' "$SEEN"
       printf '%s\t%s\t%s\n' "$k" "$t" "$now"; } > "$SEEN.t"; mv "$SEEN.t" "$SEEN"; }
-  echo "$t"; }
+    echo "$t"; } 9>>"$SEEN.lock"; }
 nudged_recently(){   # $1 pane. The limit line does not leave the pane when the session comes back, so the SAME stale
                     # line would be read as a fresh interruption on the next round and buy a second nudge. One nudge
                     # per pane per half hour, then; a genuine new limit is hours away, far outside this window.
@@ -377,7 +383,7 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
   # `u` and `how` are LOCAL because parse_reset writes them as globals: `check` parses its own reset, then calls
   # scan -> record at the end, and without this line that record's parse_reset overwrites the epoch check is about
   # to print — "LIMIT 0", and the owner is told the limit resumes at 00:00Z (review of #171).
-  local pane="$1" win="$2" scr cap line at old p u how rolled past from_pane=0
+  local pane="$1" win="$2" scr cap line at p u how rolled past from_pane=0
   # A window id or a window name is accepted and resolved to the PANE id first: the record is keyed on the pane, so
   # cc-reconcile's wake (which holds window ids) and scan (which holds pane ids) write one record for a session, not two — and
   # two records for one session is two nudges.
@@ -389,11 +395,9 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
   nudged_recently "$pane" && return 2
   # HIT_RE's line needs no second witness, and its reset is read off that line alone: see ONE SEAT'S LINE. Its sighting
   # carries the lines above it, because the same words printed by a new limit tomorrow sit under different ones.
-  local said="$cap" sight="$line" hit="" solo="" seen_at
-  if grep -qiE "$HIT_RE" <<<"$line"; then
-    said="$line"; hit=1; sight=$(grep -B3 -iE "$HIT_RE" <<<"$scr" | tail -4)
-    witnessed || solo=1
-  fi
+  local said="$cap" sight="$line" ctx hit="" solo="" seen_at clock_at
+  ctx=$(grep -B3 -Fx -- "$line" <<<"$scr" | tail -4)
+  if grep -qiE "$HIT_RE" <<<"$line"; then said="$line"; hit=1; sight="$ctx"; fi
   seen_at=$(first_seen "$pane" "$sight")
   if [ -z "$hit" ] && ! corroborated "$cap" "$win"; then
     # Nothing corroborates the line. For its first hour that means "cc-model has not judged it yet" — exit 2, no
@@ -402,6 +406,7 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
     [ $((now - seen_at)) -lt "$JUDGE" ] && return 2
     return 1
   fi
+  witnessed || solo=1
   # A reset the stamp only GUESSED is not a reset. `check` writes src=backoff:N when the message named no time, and
   # a nudge at that guess reaches a session that is still limited — and spends the one nudge that was owed at the
   # real time. So a backoff stamp is passed over and the pane's own wording is read instead.
@@ -411,6 +416,8 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
     parse_reset "$said" "$zone"; from_pane=1
     # HIT_RE's line names an absolute reset. If parse_reset read "in N" off it, that isn't the reset, and read again it never comes due.
     [ -n "$hit" ] && [ "$how" = in ] && return 1
+    # An older line's "in 30 minutes" counts from when it was first seen, or every read would make it another 30 minutes away.
+    if [ "$how" = in ]; then u=$((seen_at + u - now)); [ "$u" -le "$now" ] && past="$u"; fi
     # A reset the pane names that is already past is NOT the next one. parse_reset rolls it over because `check` hands it
     # a fresh message; a screen is of unknown age, and the rollover recorded a session for a day out (review-171c). A
     # pane whose ONLY named reset is past is safe to type at: exit 1, not 2 — exit 2 kept the pulse away from that session
@@ -420,14 +427,20 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
     local due=0; if [ "$past" -gt 0 ] && [ $((now - past)) -lt "$QUIET" ]; then u="$past"; due=1; fi
     # A clock later than the one this line meant when first seen is the line left on screen. It is read again as of that
     # sighting, on the zone's calendar, because a day can be 23 hours: past then and not within a 5-hour wait, it meant the one gone by.
-    if [ "$how" = at ] && [ "$u" -gt "$(now="$seen_at"; parse_reset "$said" "$zone"
-        if [ "$past" -gt 0 ] && [ $((u - seen_at)) -gt "$FIVE_H" ]; then echo "$past"; else echo "$u"; fi)" ]; then return 1; fi
+    # An older line's own sighting is the bare line, so that a footer can't restart its hour above; this one needs the lines above it too.
+    clock_at="$seen_at"; if [ "$how" = at ] && [ -z "$hit" ]; then clock_at=$(first_seen "$pane" "$ctx"); fi
+    if [ "$how" = at ] && [ "$u" -gt "$(now="$clock_at"; parse_reset "$said" "$zone"
+        if [ "$past" -gt 0 ] && [ $((u - clock_at)) -gt "$FIVE_H" ]; then echo "$past"; else echo "$u"; fi)" ]; then return 1; fi
     if [ "$due" = 1 ]; then at=$((now + 1))
     elif [ "$past" -gt 0 ] && { [ "$rolled" = 0 ] || { [ "$how" = at ] && [ $((u - now)) -gt "$FIVE_H" ]; }; }; then return 1
     elif [ "$u" -gt "$now" ]; then at="$u"; fi
   fi
   [ "$at" -gt "$now" ] || { [ -n "$hit" ] && return 1; return 2; }   # limited, but no reset time yet: whoever looks next records it once there is one. HIT_RE's line always names one, so that is no limit
-  old=0; [ -f "$REC" ] && old=$(awk -F'\t' -v p="$pane" '$1==p{print $3+0; exit}' "$REC")
+  # Split by LINE, not by `IFS=$'\t' read`: tab is IFS whitespace, so an empty tags field would fold away and
+  # slide nothing into $ot — the same trap the stamp's empty model field sprang on 2026-09-04.
+  local old=0 os=0 ot=""
+  [ -f "$REC" ] && { IFS= read -r old; IFS= read -r os; IFS= read -r ot; } < <(awk -F'\t' -v p="$pane" '$1==p{print $3+0; print $4+0; print $5; exit}' "$REC")
+  [ -n "$hit" ] || { [ -n "$solo" ] && [ "$ot" = solo ] && at="$old"; }   # an older line moves no solo record: see ONE SEAT'S LINE
   # A pane re-read never moves a record out: its line is stale text, and "in 30 minutes" is 30 minutes from whenever
   # it is read — every round pushed the record past its own due time and the nudge was never sent (review-171c).
   # Only a live stamp, a reset the API itself named, moves an existing record — and never shorter.
@@ -445,24 +458,17 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
   #   or after $first, i.e. inside this episode (see A RECORD IS NOT ALWAYS A SECOND WITNESS).
   local started tags=""
   grep -qF "$WORK_MARK" <<<"$cap" && tags=working
-  # The stamp's first-seen is the box's own answer to "when did this episode begin". Where there is no stamp —
-  # corroborated by a model-override or a `switch` cc-model wrote — this pane's own line is: it went up when this
-  # session took its 429, which is the moment its subagents died.
-  started="$first"; [ "$started" -le 0 ] && started="$seen_at"
+  # The stamp's first-seen is the box's own answer to "when did this episode begin". With no stamp the record is solo,
+  # and a solo record publishes no episode.
+  started="$first"
   # …and `indep` needs a stamp to be independent OF: cc-model's rule is about a stamp with one observer on it, and
   # a sighting inside that episode is the second witness. No stamp, no claim — cc-model wants a live one anyway.
   [ "$first" -gt 0 ] && [ "$seen_at" -ge "$first" ] && tags="${tags:+$tags,}indep"
   [ -n "$solo" ] && tags=solo
-  if [ -f "$REC" ]; then   # an existing record's own first sighting stands
-    # Split by LINE, not by `IFS=$'\t' read`: tab is IFS whitespace, so an empty tags field would fold away and
-    # slide nothing into $ot — the same trap the stamp's empty model field sprang on 2026-09-04.
-    local os="" ot=""
-    { IFS= read -r os; IFS= read -r ot; } < <(awk -F'\t' -v p="$pane" '$1==p{print $4+0; print $5; exit}' "$REC")
-    # …but a solo record the box has since witnessed takes this read's answers, without `working`: the solo record kept
-    # no word of its first sighting's turn, and a wrong guess there is Escape pressed into a live turn.
-    [ "$ot" = solo ] && [ -n "$hit" ] && [ -z "$solo" ] && { os=0; tags="${tags#working}"; tags="${tags#,}"; }
-    [ "${os:-0}" != 0 ] && { started="$os"; tags="$ot"; }
-  fi
+  # An existing record's own first sighting stands, but a solo record the box has since witnessed takes this read's answers,
+  # without `working`: the solo record kept no word of its first sighting's turn, and a wrong guess there is Escape pressed into a live turn.
+  [ "$ot" = solo ] && [ -z "$solo" ] && { os=0; tags="${tags#working}"; tags="${tags#,}"; }
+  [ "${os:-0}" != 0 ] && { started="$os"; tags="$ot"; }
   [ -n "$DRY" ] && { printf 'would record %s (%s) until %sZ\n' "$win" "$pane" "$(date -u -d "@$at" +%H:%M)"; return 0; }
   mkdir -p "$(dirname "$REC")"
   { [ -f "$REC" ] && awk -F'\t' -v p="$pane" '$1!=p' "$REC"
@@ -488,7 +494,12 @@ live_claude(){   # is there an interactive `claude` ANYWHERE under pane pid $1? 
 read_pane(){   # $1 pane -> what record and resume both read. -J: a line the pane's width wrapped reads whole, but it keeps the
               # spaces a row was written with. -S -3: the lines above, for record's sighting. tmux prints every row of the
               # pane, so empty and space-only rows at the bottom go first, or $TAIL lines of them hide the line above.
-  tmux capture-pane -pJ -S -3 -t "$1" 2>/dev/null | awk '/[^[:space:]]/{l=NR} {a[NR]=$0} END{for(i=1;i<=l;i++) print a[i]}'; }
+              # Claude Code wraps its own text with real line breaks and five spaces (seen on 2.1.316), which -J can't rejoin,
+              # so the limit line takes the rows indented under it. Only that line: joining every tool result would widen $TAIL.
+  tmux capture-pane -pJ -S -3 -t "$1" 2>/dev/null | awk '/[^[:space:]]/{l=NR} {a[NR]=$0}
+    END{for(i=1;i<=l;i++){s=a[i]
+      if(tolower(s) ~ /^ ? ?⎿.*ve hit your /) while(i<l && a[i+1] ~ /^     [^ ]/){t=a[++i]; sub(/ +$/,"",s); sub(/^ +/,"",t); s=s " " t}
+      print s}}'; }
 
 scan(){   # every live INTERACTIVE session under this tmux session
   local id pp name rc=1 r

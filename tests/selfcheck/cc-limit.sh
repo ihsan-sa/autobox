@@ -8,6 +8,7 @@ selfcheck(){   # stubs only: its own HOME, a stub tmux and cc-msg, and a clock i
   local d n=0 bad=0 t0=1000000000 t1 t2 t3 t4 rc h out deep work OBS=runA cutoff firstseen
   d=$(mktemp -d) || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  box(){ printf '%s\t%s\t%s\t%s\t%s\n' "$1" iso "$2" fable abcd1234,abcd1235 > "$d/.cc/state/claude-limit"; }   # a stamp two runs hit: $1 its reset, $2 first seen
   mkdir -p "$d/bin" "$d/.cc/state" "$d/panes"
   cat > "$d/bin/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -75,7 +76,7 @@ EOF
   me "$t0" record @1 alpha >/dev/null 2>&1
   t 'a limit line ALONE is not recorded (this box says "usage limit" in its own docs)' \
     "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
-  printf '%s\t%s\t%s\t%s\n' "$((t0 + 1800))" iso "$t0" fable > "$d/.cc/state/claude-limit"
+  box "$((t0 + 1800))" "$t0"
   out=$(me "$t0" record --dry @1 alpha 2>&1)
   t '--dry says what it would record and writes nothing' \
     "$(grep -c would <<<"$out")$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" 1no
@@ -114,7 +115,7 @@ EOF
   # The banked hash in model-seen does NOT — it is written for every adjudicated probe, "not a live limit" included.
   t1=$((t0 + 7200))   # the rest of the cases are a later episode: past the quiet window the nudge above opened
   h=$(printf '%s' "alpha$(grep -iE "$PANE_RE" "$d/panes/@1" | tail -1)" | md5sum | cut -c1-16)
-  printf '%s\n' "$h" > "$d/.cc/state/model-seen"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted"
+  printf '%s\n' "$h" > "$d/.cc/state/model-seen"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-seen"
   me "$t1" record @1 alpha >/dev/null 2>&1
   t 'the banked probe hash alone corroborates nothing: adjudicated is not limited' \
     "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
@@ -142,7 +143,7 @@ EOF
   # FINDING 1 (review of #171): two sessions, two resets. The one-shot that fires for the first has to leave a timer
   # behind for the second — an arming that stopped the unit it was running in would SIGTERM this shell before it got
   # there, and the second session would wait for a pulse that may never come. Each arming names its own unit.
-  t2=$((t1 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/claude-limit" "$d/.cc/state/limit-nudged"
+  t2=$((t1 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/claude-limit" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
   printf 'Claude usage limit reached. Your limit will reset in 60 minutes\n> \n' > "$d/panes/%7"
   printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t2 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
@@ -158,7 +159,7 @@ EOF
 
   # FINDING 2: `check` writes a 5-minute GUESS into the stamp (src=backoff:N) when the message named no time. A nudge
   # at a guess reaches a session that is still limited, and spends the one nudge that was owed at the real reset.
-  t3=$((t2 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"; : > "$d/calls"
+  t3=$((t2 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"; : > "$d/calls"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
   printf '%s\t%s\t%s\t%s\n' "$((t3 + 300))" backoff:5 "$t3" fable > "$d/.cc/state/claude-limit"
   printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t3 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
@@ -238,8 +239,8 @@ EOF
   printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t5 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
   me "$t5" record @1 alpha >/dev/null 2>&1                     # recorded at T for T+1800
   me "$((t5 + 7200))" record @1 alpha >/dev/null 2>&1; rc=$?   # the same unchanged pane, two hours later
-  t 'a record re-read from the same stale pane two hours on still says its ORIGINAL reset' \
-    "$rc$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "0$((t5 + 1800))"
+  t 'a record re-read from the same stale pane two hours on still says its ORIGINAL reset, and that reset is gone by: exit 1' \
+    "$rc$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "1$((t5 + 1800))"
   me "$((t5 + 7200))" resume >/dev/null 2>&1
   t 'and the resume in that same round nudges it — the reset is long past' "$(calls '^msg alpha ')" 1
   # The absolute form was worse: "reset at 3pm" re-read at 16:00 rolled over to TOMORROW's 3pm in one step. In
@@ -329,7 +330,7 @@ PROSE
   rm -f "$d/.cc/state/claude-limit"
   # ── TEXT ON A SCREEN CANNOT ACT FOR THE BOX. A tool result's first line prints under ⎿ just as the real line does, so
   # that shape records, and the record reaches that session and nobody else. Each block builds its own state with fresh.
-  L5="  ⎿  You've hit your 5-hour limit · resets 11:10pm (America/New_York)"; ST="$d/.cc/state"; REC1="$ST/limit-interrupted"
+  L5="  ⎿ ${NBSP}You've hit your 5-hour limit · resets 11:10pm (America/New_York)"; ST="$d/.cc/state"; REC1="$ST/limit-interrupted"
   fresh(){ rm -f "$d/.cc/state/limit-interrupted" "$ST/limit-nudged" "$ST/limit-seen" "$ST/limit-resumed" "$ST/claude-limit" "$ST/owner-due" \
     "$ST/model.log" "$ST/model-override" "$ST/claude-limit.told" "$d/panes/@1.J" "$d/panes/@2"; : > "$d/calls"; }
   norec(){ [ -e "$REC1" ] && echo yes || echo no; }
@@ -344,10 +345,10 @@ PROSE
   t '…it gets its nudge' "$(calls '^msg alpha ')" 1
   t '…and no episode is published, so no live mark on any repo goes cold' "$([ -e "$ST/limit-resumed" ] && echo yes || echo no)" no
   fresh; printf '● a turn\n%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"
-  printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"; echo fallback > "$ST/model-override"
+  printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"; box "$ny" "$((ny - 7300))"
   me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
-  t 'the same line witnessed for the box tells the owner' "$(cut -f5 "$REC1") $(calls '^notify ')" 'working 1'
-  rm -f "$ST/model-override"; me "$((ny + 20))" resume >/dev/null 2>&1
+  t 'the same line witnessed for the box tells the owner' "$(cut -f5 "$REC1") $(calls '^notify ')" 'working,indep 1'
+  me "$((ny + 20))" resume >/dev/null 2>&1
   t '…ends the dead turn and publishes the episode' "$(calls 'Escape') $(cut -f2 "$ST/limit-resumed")" "1 $ny"
   # A solo record beside a witnessed one: the episode is the witnessed one's alone.
   fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
@@ -398,7 +399,7 @@ PROSE
       me "$tt" record @1 alpha >/dev/null 2>&1; me "$tt" record @2 beta >/dev/null 2>&1; me "$tt" resume >/dev/null 2>&1; done; }
   fresh; stale "$((ny - 7200))" '❯ '
   t 'a stale line on an idle pane earns one nudge in 72 hours' "$(calls '^msg alpha ')" 1
-  fresh; echo fallback > "$ST/model-override"; stale "$((ny - 7200))" '✻ esc to interrupt'
+  fresh; box "$ny" "$((ny - 7300))"; stale "$((ny - 7200))" '✻ esc to interrupt'
   t '…and one Escape, with the footer left on' "$(calls 'Escape')" 1
   fresh; printf '● a turn\n%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
   : > "$d/calls"; rm -f "$ST/limit-nudged"; me "$((ny + 3600))" record @1 alpha >/dev/null 2>&1; rc=$?
@@ -476,6 +477,61 @@ PROSE
   printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 3700))" fable abcd1234 > "$ST/claude-limit"
   printf 'Claude usage limit reached. Your limit will reset at 11:10pm\n❯ \n' > "$d/panes/@1"; me "$((ny - 3600))" record @1 alpha >/dev/null 2>&1
   t 'an older-wording line under one run'"'"'s stamp leaves a solo record solo' "$(cut -f5 "$REC1")" solo
+  # ── THE LIMIT FOLLOW-UPS. Each block builds its own state with fresh.
+  # The line as Claude Code 2.1.316 draws it, off a real screen at 46 columns: a space and a no-break space after the mark, and
+  # its own line breaks, which no -J can rejoin.
+  fresh; printf '● a turn\n  ⎿ %sYou'"'"'ve hit your weekly limit · resets Sep\n     7, 10am (America/Los_Angeles)\n     /upgrade to increase your usage limit.\n❯ \n' "$NBSP" > "$d/panes/@1"
+  me "$((wk - 86400))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the real mark, wrapped through the date, records at the whole date' "$rc $(cut -f3,5 "$REC1" | tr '\t' ' ')" "0 $wk solo"
+  me "$((wk + 20))" resume >/dev/null 2>&1; t '…and the resume reads it the same way and nudges' "$(calls '^msg alpha ')" 1
+  fresh; printf '  ⎿ %sYou'"'"'ve hit your 5-hour limit · resets 11:10pm\n     (America/New_York)\n❯ \n' "$NBSP" > "$d/panes/@1"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; t 'a zone wrapped onto the next row still sets the zone' "$(cut -f3 "$REC1")" "$ny"
+  fresh; printf '  ⎿ %sdone\n     You'"'"'ve hit your 5-hour limit · resets 11:10pm\n❯ \n' "$NBSP" > "$d/panes/@1"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; rc=$?; t 'another tool row indented under the mark is not the line' "$rc $(norec)" '1 no'
+  # Item 1: under an override, "in 30 minutes" mid-turn used to earn a nudge and an Escape every round.
+  fresh; echo fallback > "$ST/model-override"; printf 'Claude usage limit reached. It resets in 30 minutes\n✻ esc to interrupt\n' > "$d/panes/@1"
+  me "$ny" record @1 alpha >/dev/null 2>&1; me "$((ny + 600))" record @1 alpha >/dev/null 2>&1
+  t '"in 30 minutes" counts from when it was first seen' "$(cut -f3 "$REC1")" "$((ny + 1800))"
+  for i in $(seq 1 216); do tt=$((ny + i * 1200)); me "$tt" record @1 alpha >/dev/null 2>&1; me "$tt" resume >/dev/null 2>&1; done
+  t 'that line earns one nudge and no Escape in three days of rounds' "$(calls '^msg alpha ') $(calls 'Escape')" '1 0'
+  # Item 2: an older line moves no solo reset, and a witnessed one does.
+  fresh; printf '%s\n❯ \n' "$L5" > "$d/panes/@1"; me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$((ny + 3600))" iso "$((ny - 3700))" fable abcd1234 > "$ST/claude-limit"
+  printf 'Claude usage limit reached. Your limit will reset at 2am\n❯ \n' > "$d/panes/@1"; me "$((ny - 3600))" record @1 alpha >/dev/null 2>&1
+  t 'an older line under one run'"'"'s stamp does not move a solo reset' "$(cut -f3,5 "$REC1" | tr '\t' ' ')" "$ny solo"
+  box "$((ny + 3600))" "$((ny - 3700))"; me "$((ny - 3600))" record @1 alpha >/dev/null 2>&1
+  t '…a stamp two runs hit makes it an ordinary record at that stamp'"'"'s reset' "$(cut -f3,5 "$REC1" | tr '\t' ' ')" "$((ny + 3600)) indep"
+  # Item 3: the old-screen verdict holds while the screen stands and no longer: new lines above are a new limit, days on or not.
+  fresh; echo fallback > "$ST/model-override"; printf '● a turn\n%s\n❯ \n' "$LEG" > "$d/panes/@1"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9; do me "$((ny + i * 28800))" record @1 alpha >/dev/null 2>&1; rc=$?; done
+  t 'an older line'"'"'s screen left three days reads as old' "$rc $(norec)" '1 no'
+  printf '● another turn\n%s\n❯ \n' "$LEG" > "$d/panes/@1"; tt=$((ny + 3 * 86400 - 7200)); me "$tt" record @1 alpha >/dev/null 2>&1; rc=$?
+  t '…the same words and clock under new lines are a new limit' "$rc $(cut -f3 "$REC1")" "0 $((ny + 3 * 86400))"
+  # Item 4: a bare older line under a stamp one run hit.
+  fresh; printf '● a turn\nusage limit reached\n✻ esc to interrupt\n' > "$d/panes/@1"; printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$ny" iso "$((ny - 7300))" fable abcd1234 > "$ST/claude-limit"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; t 'a bare line under one run'"'"'s stamp records solo and tells nobody' "$(cut -f3,5 "$REC1" | tr '\t' ' ') $(calls '^notify ')" "$ny solo 0"
+  me "$((ny + 20))" resume >/dev/null 2>&1
+  t '…at the reset: no Escape, no episode, one nudge' "$(calls 'Escape') $(norec) $([ -e "$ST/limit-resumed" ] && echo yes || echo no) $(calls '^msg alpha ')" '0 no no 1'
+  # Item 5: an override or a switch stands for hours, and a line printed meanwhile can be anybody's.
+  for how in override switch; do
+    fresh; printf '● a turn\n%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"; printf '%s\tHive report\n' "$((ny - 3600))" > "$ST/owner-due"
+    case "$how" in override) echo fallback > "$ST/model-override";; *) printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((ny - 7300))" claude-opus-5 test > "$ST/model.log";; esac
+    me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+    t "a line under a $how alone earns no Escape and no alert" "$(calls 'Escape') $(calls '^notify ') $([ -e "$ST/limit-resumed" ] && echo yes || echo no) $(calls '^msg alpha ')" '0 0 no 1'
+  done
+  # Item 7: overlapping runs keep every row, or a stale line would read as a new sighting.
+  fresh; for i in $(seq 1 24); do printf 'usage limit reached %s\n❯ \n' "$i" > "$d/panes/%%$i"; done
+  for i in $(seq 1 24); do me "$ny" record "%%$i" w >/dev/null 2>&1 & done; wait
+  t 'overlapping runs lose no row of the seen file' "$(wc -l < "$ST/limit-seen")" 24
+  rm -f "$d"/panes/%%*
+  # Item 8: what a lone seat mid-turn gets, and the doc that says so.
+  fresh; printf '%s\n✻ esc to interrupt\n' "$L5" > "$d/panes/@1"; printf '@1\n' > "$d/panes/alpha.win"
+  me "$((ny - 7200))" record @1 alpha >/dev/null 2>&1; me "$((ny + 20))" resume >/dev/null 2>&1
+  t 'a lone seat mid-turn gets no Escape, so its nudge spools' "$(calls 'Escape') $(calls '^spool alpha ')" '0 1'
+  rm -f "$d/panes/alpha.win"
+  t '…and USAGE.md says so' "$(grep -c 'no Escape, so its nudge spools' "$(dirname "$SELF")/../templates/home/USAGE.md")" 1
   fresh
   # A SESSION THAT PARKS AFTER THE LIMIT WAS FIRST RECORDED. The tick's bare `record` is the round that finds it: this
   # is what it runs, 33 minutes on, with the first session's record already on file.
@@ -503,7 +559,7 @@ PROSE
   ta=$((t5 + 43200)); rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" \
     "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen" "$d/.cc/state/limit-resumed"; : > "$d/calls"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((ta - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  box "$((ta + 1800))" "$ta"
   me "$ta" record @1 alpha >/dev/null 2>&1
   me $((ta + 60)) resume >/dev/null 2>&1
   t 'no episode is published before the reset: the limit is still on and its subagents are not dead yet' \
@@ -516,7 +572,7 @@ PROSE
   # dead in the middle of a limit that is still standing.
   tb=$((ta + 7200)); rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" \
     "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen" "$d/.cc/state/limit-resumed"; : > "$d/calls"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((tb - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  box "$((tb + 1800))" "$tb"
   me "$tb" record @1 alpha >/dev/null 2>&1                                          # recorded for tb+1800
   printf '%s\t%s\t%s\t%s\n' "$((tb + 3600))" iso "$tb" fable > "$d/.cc/state/claude-limit"   # …the API moved it to tb+3600
   me $((tb + 1900)) resume >/dev/null 2>&1
@@ -530,7 +586,7 @@ PROSE
   # A pane that came back by itself is not nudged — but the subagents it had out still died on the 429.
   tc=$((tb + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" \
     "$d/.cc/state/limit-seen" "$d/.cc/state/limit-resumed"; : > "$d/calls"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((tc - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  box "$((tc + 1800))" "$tc"
   me "$tc" record @1 alpha >/dev/null 2>&1
   printf '> \n' > "$d/panes/@1"   # it moved on: no limit line left on the screen
   me $((tc + 1900)) resume >/dev/null 2>&1
@@ -541,11 +597,10 @@ PROSE
   # would be read as older than the limit and a live subagent called dead.
   td=$((tc + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" \
     "$d/.cc/state/limit-seen" "$d/.cc/state/limit-resumed"; : > "$d/calls"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((td - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
   printf 'Claude usage limit reached. Your limit will reset in 90 minutes\n> \n' > "$d/panes/@2"
-  me "$td" record @2 beta >/dev/null 2>&1                 # the LATER reset first, so the last row read is the
-  me $((td + 120)) record @1 alpha >/dev/null 2>&1        # EARLIER one — and two minutes later, so two starts
+  box "$((td + 5400))" "$td"; me "$td" record @2 beta >/dev/null 2>&1                         # the LATER reset first, so the last row read is the
+  box "$((td + 1800))" "$((td + 120))"; me $((td + 120)) record @1 alpha >/dev/null 2>&1      # EARLIER one — and two minutes later, so two starts
   me $((td + 5500)) resume >/dev/null 2>&1
   t 'two records, one episode: the LATEST reset is published, not the last row read' \
     "$(cut -f2 <<<"$(rez)")" $((td + 5400))
@@ -572,11 +627,11 @@ PROSE
   rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen" \
     "$d/.cc/state/claude-limit" "$d/.cc/state/limit-resumed"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
-  printf '%s\t%s\t%s\t%s\t%s\n' $((tg - 3600)) iso $((tg - 7200)) fable aaaaaaaa > "$d/.cc/state/claude-limit"
+  box $((tg - 3600)) $((tg - 7200))
   me $((tg - 7200)) record @1 alpha >/dev/null 2>&1   # the morning's episode: that line is first seen HERE
   rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"
-  printf '%s\t%s\t%s\t%s\t%s\n' $((tg + 1800)) iso "$tg" fable bbbbbbbb > "$d/.cc/state/claude-limit"
-  me $((tg + 60)) record @1 alpha >/dev/null 2>&1     # …and hours later a fresh stamp, one observer, same screen
+  box $((tg + 1800)) "$tg"
+  me $((tg + 60)) record @1 alpha >/dev/null 2>&1     # …and hours later a fresh stamp, same screen
   t 'a stale limit line under a fresh stamp is still recorded — that session IS stopped — but not as an
      independent sighting: it is the witness the stamp already is, so cc-model still wants two observers' \
     "$(awk -F'\t' '$2=="alpha"{print $3 "/" $5}' "$d/.cc/state/limit-interrupted")" "$((tg + 1800))/"
@@ -783,7 +838,7 @@ PROSE
   ta=$((t0 + 400000)); : > "$d/calls"; : > "$d/panes.list"
   rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" \
     "$d/.cc/state/limit-seen"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((ta - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  box "$((ta + 1800))" "$ta"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n✻ Thinking… (esc to interrupt)\n' > "$d/panes/@1"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/%7"
   printf '%s\n' '%7' > "$d/panes/@5.id"
@@ -810,12 +865,12 @@ PROSE
   # and mid-turn still (the case that must), so neither can pass on the other's state.
   tf=$((ta + 7200)); : > "$d/calls"
   rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((tf - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  box "$((tf + 1800))" "$tf"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n✻ Thinking… (esc to interrupt)\n' > "$d/panes/%7"
   me "$tf" record @1 alpha >/dev/null 2>&1; me "$tf" record @5 beta >/dev/null 2>&1
   t 'the record says which of the two was mid-turn when it was written, and only that one' \
-    "$(awk -F'\t' '{printf "%s=%s ", $2, $5}' "$d/.cc/state/limit-interrupted")" 'alpha= beta=working '
+    "$(awk -F'\t' '{printf "%s=%s ", $2, $5}' "$d/.cc/state/limit-interrupted")" 'alpha=indep beta=working,indep '
   # …and now the OTHER way round at the reset: alpha has started a fresh turn, beta is still in the old one.
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n✻ Thinking… (esc to interrupt)\n' > "$d/panes/@1"
   me $((tf + 1900)) resume >/dev/null 2>&1
@@ -877,11 +932,11 @@ PROSE
   printf '%s\tafter the reset\n' "$((t9 + 9000))" > "$d/.cc/state/owner-due"
   OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
   t 'promise: an episode with nothing due in it says nothing' "$(calls '^notify ')" 0
-  # ONE EPISODE IS ONE NOTICE, WHOEVER SEES IT (review of #1910). Each case its own fixture: no stamp, a model.log
-  # switch to corroborate the panes, two panes naming the same clock reset, and one promise due before it.
+  # ONE EPISODE IS ONE NOTICE, WHOEVER SEES IT (review of #1910). Each case its own fixture: a stamp two runs hit
+  # to witness the panes, two panes naming the same clock reset, and one promise due before it.
   ep(){ rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.told" "$d/.cc/state/claude-limit.cleared" "$d/.cc/state/limit-interrupted" \
       "$d/.cc/state/limit-seen" "$d/.cc/state/limit-nudged"; : > "$d/calls"
-    printf '%s\t%s\tswitch\t%s\t%s\n' iso "$(($1 - 60))" claude-opus-5 "2 session(s); test" > "$d/.cc/state/model.log"
+    box "$((($1 + 7200) / 60 * 60))" "$1"   # the minute the panes name
     for p in @1 @2; do printf 'Claude usage limit reached. Your limit will reset at %s\n> \n' \
       "$(date -u -d "@$(($1 + 7200))" '+%F %H:%MZ')" > "$d/panes/$p"; done
     printf '%s\tHive report\n' "$(($1 + 3600))" > "$d/.cc/state/owner-due"; }
@@ -896,7 +951,7 @@ PROSE
   ep "$t9"; OBS=worker-a; me "$t9" check "$d/run5.json" >/dev/null 2>&1; OBS=worker-b; me $((t9 + 60)) check "$d/run5.json" >/dev/null 2>&1
   t8=$((t9 + 86400)); : > "$d/calls"; rm -f "$d/.cc/state/limit-interrupted"
   printf '%s\tHive report\n' "$((t8 + 3600))" > "$d/.cc/state/owner-due"
-  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t8 - 60))" claude-opus-5 "2 session(s); test" > "$d/.cc/state/model.log"
+  box "$(((t8 + 7200) / 60 * 60))" "$t8"
   for p in @1 @2; do printf 'Claude usage limit reached. Your limit will reset at %s\n> \n' \
     "$(date -u -d "@$((t8 + 7200))" '+%F %H:%MZ')" > "$d/panes/$p"; done
   me "$t8" record @1 alpha >/dev/null 2>&1; me $((t8 + 60)) record @2 beta >/dev/null 2>&1
