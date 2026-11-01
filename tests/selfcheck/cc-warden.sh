@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2154,SC2034
 # cc-warden's selfcheck cases. bin/cc-warden sources this file and calls selfcheck() in its own shell, so BIN and
 # SELF are that tool's. A stub model, stub tools (cc-approve, cc-settings, cc-notify, cc-msg, cc-limit) and a fixture ledger;
-# the real cc-refusals, cc-infer and cc-config run against fixture paths. The live ledger is never read.
+# the real cc-refusals, cc-infer and cc-config run against fixture paths, and the real cc-msg in the one case with no perms window. The real cc-approve is never reached. The live ledger is never read.
 
 selfcheck(){
   local d n=0 f=0 lg st wcg
@@ -14,7 +14,8 @@ selfcheck(){
   # …whose release fails while release.fail exists
   printf '#!/bin/sh\n[ "$1$4" = wardenrelease ] && [ -e %s/release.fail ] && exit 1\nCC_REFUSALS_CG=%s CC_REFUSALS_PERMS_LIVE=1 CC_BOX=box1 CC_REFUSALS_CTL=nobody CC_REFUSALS_NOTIFY=%s/t/cc-notify exec %s/cc-refusals "$@"\n' \
     "$d" "$wcg" "$d" "$BIN" > "$d/t/cc-refusals"
-  printf '#!/bin/sh\nexec %s/cc-infer "$@"\n' "$BIN" > "$d/t/cc-infer"
+  # cc-infer, dead on a grant line while infer.dead exists
+  printf '#!/bin/sh\ncase "$3" in Bash\\(*) [ -e %s/infer.dead ] && exit 1;; esac\nexec %s/cc-infer "$@"\n' "$d" "$BIN" > "$d/t/cc-infer"
   printf '#!/bin/sh\nCC_CONFIG=%s/config exec %s/cc-config "$@"\n' "$d" "$BIN" > "$d/t/cc-config"
   # cc-approve applies a line listed in approve.ok asked by a planning seat, and refers the rest
   printf '#!/bin/sh\necho "$*" >> %s/approve.log\necho "pin=$APPROVER_REPO" >> %s/approve.env\ncase "$5" in */*) echo "{\\"verdict\\":\\"refer\\",\\"reason\\":\\"not a planning seat\\"}"; exit 1;; esac\ngrep -qxF -- "$3" %s/approve.ok 2>/dev/null && { echo "{\\"verdict\\":\\"apply\\"}"; exit 0; }\necho "{\\"verdict\\":\\"refer\\",\\"reason\\":\\"no grant\\"}"; exit 1\n' "$d" "$d" "$d" > "$d/t/cc-approve"
@@ -137,7 +138,7 @@ EOF
       and ((.input.command // .input.file_path // .input.path) == $w) and ($p == "" or .input.pattern == $p)) | .id] as $ids
     | [.[] | select(.type == "user") | .message.content | arrays | .[] | select(.type == "tool_result" and (.tool_use_id | IN($ids[])))]
     | if length == 1 then (if .[0].is_error | not then "ran" elif .[0].content | tostring | contains("a warden runs only") then "refused" else "denied" end) else "no result" end' "$A/q30/1/transcript.jsonl"; }
-  k "$(t test -s "$A/q30/1/transcript.jsonl" -a "$(cat "$A/q30/1/done" 2>/dev/null)" = "ok: tribunal")" "the real claude runs on the unit's own flags and returns its decision"
+  k "$(t test -s "$A/q30/1/transcript.jsonl" -a -n "$(grep '^ok: handed back to perms: tribunal' "$A/q30/1/done")")" "the real claude runs on the unit's own flags and returns its decision"
   for c in "${yes[@]}"; do k "$(t test "$(got Bash "$c")" = ran)" "resolved: its Bash runs $c"; done
   for c in "${no[@]}"; do k "$(t test "$(got Bash "$c")" = refused)" "resolved: the real claude refuses $(lbl "$c")"; done
   k "$(t test "$(got Bash "cc-board show guard-blocks-this")" = denied)" "resolved: the guard still blocks a call the hook lets on"
@@ -174,6 +175,7 @@ EOF
   ask q3 repo 'Bash: cc-board show repo, the yak case'; tk
   k "$(t test -z "$(dec q3)" -a -z "$(grep 'git push' "$d/settings.log")" -a -n "$(isopen q3)" -a -z "$(isopen q3 | grep 'a warden holds it')")" "a grant line crossing a hard line is never written, and the ask stays open for perms"
   k "$(t test -n "$(jq -r 'select(.id == "q3" and .kind == "warden" and .state == "release") | .note | select(test("crosses a hard line"))' "$lg")")" "…with the note on the ledger"
+  k "$(t grep -q '^ok: handed back to perms: his: cc-infer: the grant crosses' "$A/q3/1/done")" "…and done says it went back, not that it was granted"
   # the model's his, on a refusal and on an ask: back to perms, no decision line, no card, and no warden runs it again
   rfl(){ jq -cn --arg id "$1" --arg st "$2" --arg x "$3" '{kind:"refusal", id:$id, at:"2026-10-31T00:00:00Z", source:"classifier", repo:"repo", window:"repo", seat:$st, tool:"Bash", input:$x, reason:"r", key:("k" + $id)}' >> "$lg"; }
   echo 'budget {"decision":"his","note":"real money, the budget is a purchase"}' > "$d/replies"
@@ -186,6 +188,7 @@ EOF
   k "$(t test ! -e "$A/r22/2" -a ! -e "$A/q22/2" -a ! -s "$d/claude.argv")" "…and no warden runs it again"
   k "$(t test ! -s "$d/notified")" "no card is posted on any of these"
   k "$(t test "$(msgs r22)" = 1 -a "$(msgs q22)" = 1)" "…and perms gets exactly one message naming each, over two ticks"
+  k "$(t test ! -e "$A/r22/wake" -a ! -e "$A/q22/wake")" "…and a sent wake is cleared"
   k "$(t test -z "$(grep 'real money' "$d/msg.log")")" "…which carries no word of the model's"
   # a REFUSE is still a decline in code, with no model
   : > "$d/claude.argv"; ask q23 repo 'copy the api token into a public log'; tk
@@ -197,6 +200,7 @@ EOF
   k "$(t test -z "$(dec q4)" -a -n "$(isopen q4)" -a -z "$(isopen q4 | grep 'a warden holds it')")" "a grant the floor refers is released to perms, still open"
   k "$(t grep -qF -- '--from repo/worker:t1' "$d/approve.log")" "…because a worker's window reaches cc-approve as <repo>/<window>"
   k "$(t test "$(grep -c 'warden:q4' "$d/settings.log")" = 0)" "…and cc-settings is never called for it"
+  k "$(t grep -q '^ok: handed back to perms: cc-approve referred' "$A/q4/1/done")" "…and done says the floor referred it, not that it was granted"
   # an ask whose --from names the planning seat but which cc-refusals read from another asker is not the seat's
   echo 'gar {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
   ask q19 repo 'Bash: cc-board show repo, the gar case' kq19 box; tk
@@ -283,10 +287,24 @@ EOF
   echo WARDEN_PER_HOUR=100 > "$d/config"; tk
   k "$(t test "$(dec q14)" = "decline warden")" "…and below it the ask runs"
 
-  # 9. a message perms doesn't get: the ask stays open and unmarked, with no second message and no second run
+  # 9. a wake perms doesn't get is kept and tried again on later ticks, with no second run; the ask stays open and unmarked
   touch "$d/msg.fail"; echo 'tern {"decision":"his","note":"his"}' > "$d/replies"
-  ask q41 repo 'Bash: cc-board show repo, the tern case'; tk; tk; rm -f "$d/msg.fail"
-  k "$(t test -e "$A/q41/released" -a -n "$(isopen q41)" -a -z "$(isopen q41 | grep 'a warden holds it')" -a "$(msgs q41)" = 1 -a ! -e "$A/q41/2")" "a message that isn't delivered leaves the ask open and unmarked, tried once"
+  ask q41 repo 'Bash: cc-board show repo, the tern case'; tk; tk
+  k "$(t test -e "$A/q41/released" -a -e "$A/q41/wake" -a -n "$(isopen q41)" -a -z "$(isopen q41 | grep 'a warden holds it')" -a ! -e "$A/q41/2")" "a wake that isn't delivered is kept, and the ask is open and unmarked"
+  local tries; tries=$(msgs q41); tk; rm -f "$d/msg.fail"
+  k "$(t test "$(msgs q41)" -gt "$tries")" "…and each later tick tries it again"
+  tries=$(msgs q41); tk
+  k "$(t test "$(msgs q41)" = "$((tries + 1))" -a ! -e "$A/q41/wake")" "…until a send works, which clears it"
+  tries=$(msgs q41); tk
+  k "$(t test "$(msgs q41)" = "$tries")" "…and then it is not sent again"
+  # the real cc-msg with no perms window, in a fixture home with no tmux server: it says so with rc 1, so the wake is kept
+  mkdir -p "$d/msghome" "$d/msgbin"; printf '#!/bin/sh\nexit 1\n' > "$d/msgbin/tmux"; chmod +x "$d/msgbin/tmux"
+  mv "$d/t/cc-msg" "$d/cc-msg.stub"; printf '#!/bin/sh\nHOME=%s/msghome PATH=%s/msgbin:$PATH exec %s/cc-msg "$@"\n' "$d" "$d" "$BIN" > "$d/t/cc-msg"; chmod +x "$d/t/cc-msg"
+  echo 'hare {"decision":"his","note":"his"}' > "$d/replies"
+  ask q49 repo 'Bash: cc-board show repo, the hare case'; tk; tk
+  k "$(t test -e "$A/q49/released" -a -e "$A/q49/wake")" "the real cc-msg, with no window to reach, fails and the wake is kept"
+  mv "$d/cc-msg.stub" "$d/t/cc-msg"; tk
+  k "$(t test ! -e "$A/q49/wake" -a "$(msgs q49)" = 1)" "…and the next send that works clears it"
 
   # 10. a release the ledger doesn't take is tried again with no model run, and reaches perms once it takes
   touch "$d/release.fail"; echo 'wren {"decision":"his","note":"the wren note"}' > "$d/replies"
@@ -300,14 +318,22 @@ EOF
   ask q43 repo 'Bash: cc-board show repo, the mole case'; tk; touch -d '2 days ago' "$A/q43/1/brief.md"; tk; rm -f "$d/release.fail"
   k "$(t test -n "$(grep 'warden:q43.*still shows' "$d/notified")" -a ! -e "$A/q43/2")" "a release that fails for a day still gets its card, with no run"
 
+  # a refer whose release fails is no ok, and the note doesn't call it a grant
+  touch "$d/release.fail"; echo 'newt {"decision":"grant","line":"Bash(cc-board show *)","note":"x"}' > "$d/replies"
+  ask q50 worker:t1 'Bash: cc-board show repo, the newt case'; tk; rm -f "$d/release.fail"
+  k "$(t grep -q '^failed: the ledger did not take the handback: cc-approve referred' "$A/q50/1/done")" "a refer whose release fails is recorded as failed, and says so"
+  tk
+
   # 11. a decision the ledger won't sign (the command it decides holds a newline) isn't ok, goes back to perms and never runs again
   printf '%s\n' 'lynx {"decision":"grant","line":"Bash(cc-board show *)","note":"reads the board"}' 'stag {"decision":"decline","note":"no"}' > "$d/replies"
   rfl q44 repo $'cc-board show repo,\nthe lynx case'; rfl q45 repo $'cc-board show repo,\nthe stag case'; tk; tk; tk
   local fd; for fd in q44 q45; do
-    k "$(t test -z "$(dec "$fd")" -a "$(cat "$A/$fd/1/done")" = "failed: the decision did not take")" "$fd: a failed decide is no decision and isn't recorded as ok"
+    k "$(t test -z "$(dec "$fd")" -a -n "$(grep '^failed: handed back to perms: the ledger did not take' "$A/$fd/1/done")")" "$fd: a failed decide is no decision and isn't recorded as ok"
     k "$(t test ! -e "$A/$fd/2" -a "$(msgs "$fd")" = 1 -a -n "$(isopen "$fd")" -a -z "$(isopen "$fd" | grep 'a warden holds it')")" "…no run follows, and it goes back to perms with one message"
   done
   k "$(t test "$(grep -c 'warden:q44' "$d/settings.log")" = 1)" "…and the grant is written once"
+  k "$(t grep -q 'this grant, so its line is written but unrecorded' "$A/q44/1/done")" "a failed grant's note says its line is written"
+  k "$(t test -n "$(grep 'this decline, so nothing is decided' "$A/q45/1/done")" -a -z "$(jq -r 'select(.id == "q45" and .kind == "warden" and .state == "release") | .note' "$lg" | grep -E 'grant|written')")" "…and a failed decline's note says nothing of a grant"
 
   # 12. every reason reaches the model: a decoy word can't hide the line beside it
   echo 'koala {"decision":"decline","note":"no"}' > "$d/replies"
@@ -318,7 +344,27 @@ EOF
   # 13. the floor would pass this line and the second read catches it
   echo 'Bash(git push *)' >> "$d/approve.ok"; echo 'puma {"decision":"grant","line":"Bash(git push *)","note":"needs to push"}' > "$d/replies"
   ask q48 repo 'Bash: cc-board show repo, the puma case'; tk
-  k "$(t test -z "$(dec q48)" -a -z "$(grep 'git push' "$d/settings.log")" -a -n "$(isopen q48)" -a "$(msgs q48)" = 1)" "a grant the floor passes but cc-infer's second read catches is never written, and goes back to perms"
+  tk; k "$(t test -z "$(dec q48)" -a -z "$(grep 'git push' "$d/settings.log")" -a -n "$(isopen q48)" -a "$(msgs q48)" = 1)" "a grant the floor passes but cc-infer's second read catches is never written, and goes back to perms"
+
+  # 14. cc-infer dies on the grant line: the floor would pass it, and it goes back to perms unwritten
+  echo 'Bash(cc-board show dead *)' >> "$d/approve.ok"; echo 'mink {"decision":"grant","line":"Bash(cc-board show dead *)","note":"x"}' > "$d/replies"
+  touch "$d/infer.dead"; ask q51 repo 'Bash: cc-board show repo, the mink case'; tk; rm -f "$d/infer.dead"; tk
+  k "$(t test -z "$(dec q51)" -a -z "$(grep 'show dead' "$d/settings.log")" -a -n "$(isopen q51)" -a "$(msgs q51)" = 1)" "cc-infer giving no verdict on a grant line writes no grant, and the ask goes back to perms"
+  k "$(t grep -q '^ok: handed back to perms: cc-infer gave no verdict' "$A/q51/1/done")" "…and done says so"
+
+  # 15. a tick that releases many wakes perms once: asks already on the ledger whose decline can't be signed, with no model
+  : > "$d/msg.log"; : > "$d/claude.argv"; local fl5
+  for fl5 in 1 2 3 4 5; do rfl "q6$fl5" repo $'copy the api token into a public log,\nflood case '"$fl5"; done; tk
+  k "$(t test "$(grep -c . "$d/msg.log")" = 1 -a "$(ls "$A"/q6?/released | wc -l)" = 5 -a ! -s "$d/claude.argv")" "five releases with no model run in one tick send perms one message"
+  k "$(t grep -qE '5 permission ask.* q61 q62 q63 q64 q65 ' "$d/msg.log")" "…which counts and names them"
+  tk; k "$(t test "$(grep -c . "$d/msg.log")" = 1)" "…and the next tick sends none"
+
+  # 16. the same flood through a worker's spool: collect cleans the input, so the decline is signed and nobody is woken
+  : > "$d/msg.log"; mkdir -p "$st/repo/t9"
+  for fl5 in 1 2 3; do jq -cn --arg i $'copy the api token into a public log,\nspool case '"$fl5" '{tool:"Bash", input:$i, reason:"r"}'; done > "$st/repo/t9/refusals.spool.jsonl"
+  CC_REFUSALS_ROOT=$st "$d/t/cc-refusals" collect repo t9 >/dev/null; tk
+  k "$(t test "$(jq -r 'select(.kind == "refusal" and .window == "worker:t9" and (.input | contains("\n") | not)) | .id' "$lg" | wc -l)" = 3)" "collect leaves no newline in a spooled input"
+  k "$(t test "$(jq -r 'select(.kind == "refusal" and .window == "worker:t9") | .id' "$lg" | while read -r i; do dec "$i"; done | sort -u)" = "decline warden" -a ! -s "$d/msg.log")" "…so each is declined and signed, and perms is not woken"
 
   rm -rf "${d:?}"
   echo "cc-warden selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]

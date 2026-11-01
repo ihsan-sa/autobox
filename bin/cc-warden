@@ -20,7 +20,8 @@
 # AUTHORITY STAYS IN CODE.
 #   - cc-infer reads the ask first: a REFUSE is declined with no model. A hard line (who "owner") decides nothing, since
 #     it is a word match over the whole ask, so the model reads the ask and is told which line fired. A grant line the
-#     model returns is read by cc-infer again, so a warden can't vote a hard line away.
+#     model returns is read by cc-infer again, so a warden can't vote a hard line away, and if that read gives no verdict
+#     the ask goes back to perms and nothing is written.
 #   - A grant is written only through cc-approve's floor and judge (a planning seat's ask or refusal, read by cc-refusals
 #     from the asker's process when it was filed and never from its --from or window, and an allow line the owner's merged grants
 #     cover) and then cc-settings grant, the one door into permissions.allow. A refer goes back to perms.
@@ -29,9 +30,12 @@
 # CLAIMED ONCE. Before a run starts, the unit writes a claim line in the ledger (`cc-refusals warden … claim`), and
 # `cc-refusals open` marks that id "(a warden holds it)" for the perms seat to leave. his, tribunal, a grant line that
 # crosses a hard line, a refer, a decision the ledger won't take and an ask given up on are released back to perms, open,
-# with the note on the ledger and one message to its window. That message names only the id: perms skips permissions, so
-# no word of the ask or the model is typed at it, and if it isn't delivered the ask is still open and unmarked in
-# `cc-refusals open`. A release the ledger doesn't take stays marked, and each tick tries it again with no model run.
+# with the note on the ledger. The end of each tick sends perms' window one message for everything released since the
+# last one that went, whether a run or the tick released it, so a burst of releases is one wake. A tick stopped by the
+# usage limit or a pause sends nothing and the next one does. The message holds only a count and ids: perms skips
+# permissions, so no word of the ask or the model is typed at it. A send cc-msg fails is tried again on the next tick, and
+# meanwhile the asks are open and unmarked in `cc-refusals open`. A release the ledger doesn't take stays marked, and
+# each tick tries it again with no model run. An attempt's done file says what happened, not what the model answered.
 # FAILURE. A run over 20 min is killed and counts as failed; a malformed decision counts as failed; a run parked on a
 # usage limit doesn't count, and no run starts while cc-limit says the limit binds or `cc-pause is <repo>`. After 3 failed attempts or 24 h the
 # ask is released and the owner gets one card, still if the release didn't take. The same want (the ledger's key) asked again within the hour shares the
@@ -54,11 +58,19 @@ cfg(){ local v; v=$("$T/cc-config" get "$1" "" 2>/dev/null); printf '%s\n' "${v:
 rf(){ "$T/cc-refusals" "$@"; }
 one(){ tr '\n\r' '  ' <<<"$1" | cut -c1-500; }               # a ledger note is one line (cc-refusals signs no newline)
 # release <id> <note>: the ask goes back to the perms seat, and no warden runs it again. handback holds the note for the
-# tick to try again until the ledger takes it; only then is the ask released and perms told.
+# tick to try again until the ledger takes it; only then is the ask released, and its wake file waits for the tick's wake.
 release(){ local note; note=$(one "$2"); mkdir -p "$W/$1"; printf '%s\n' "$note" > "$W/$1/handback"
   rf warden "$REPO" "$1" release "$note" || return 1
-  touch "$W/$1/released"
-  "$T/cc-msg" perms "A warden handed permission ask $1 back to you, and it's open: cc-refusals show $REPO $1" >/dev/null 2>&1 || true; }
+  touch "$W/$1/released" "$W/$1/wake"; }
+# hand <id> <note>: release, and did says what became of it, for the attempt's done file
+hand(){ local note; note=$(one "$2")
+  if release "$1" "$note"; then did="handed back to perms: $note"; else did="the ledger did not take the handback: $note"; return 1; fi; }
+# wake: one message for every ask waiting to be told, and only a send that worked clears the ones it counted
+wake(){ local f ids
+  mapfile -t f < <(find "$W" -mindepth 2 -maxdepth 2 -name wake 2>/dev/null); [ "${#f[@]}" -gt 0 ] || return 0
+  ids=$(printf '%s\n' "${f[@]%/wake}" | sed 's|.*/||' | sort | head -20 | tr '\n' ' ')
+  "$T/cc-msg" perms "Wardens handed ${#f[@]} permission ask(s) back to you, among them $ids- the ones still open are in: cc-refusals open $REPO" >/dev/null 2>&1 \
+    && rm -f -- "${f[@]}"; }
 why(){ jq -r '.reasons | join("; ")' <<<"$1"; }               # every reason cc-infer gave, since one can hide another
 card(){ "$T/cc-notify" --owner -t warden --heading "$1" --id "warden:$2" -- "$3" >/dev/null 2>&1; }
 SCHEMA='{"type":"object","additionalProperties":false,"required":["decision","note"],"properties":{"decision":{"enum":["grant","decline","his","tribunal"]},"line":{"type":"string"},"note":{"type":"string"}}}'
@@ -89,7 +101,9 @@ apply(){ local id=$1 dec=$2 line=$3 note; note=$(one "$4")
     v=$("$T/cc-infer" decide --ask "$line" 2>/dev/null)
     who=$(jq -r '"\(.verdict) \(.who // "")"' <<<"$v" 2>/dev/null)
     case $who in "ASK-OWNER owner") dec=his note="cc-infer: the grant crosses a hard line ($(one "$(why "$v")"))";;
-                 REFUSE*) dec=decline note="cc-infer: $(one "$(why "$v")")";; esac
+                 REFUSE*) dec=decline note="cc-infer: $(one "$(why "$v")")";;
+                 "GRANT "|"GRANT+WATCH "|"ASK-OWNER "*) ;;
+                 *) hand "$id" "cc-infer gave no verdict on $line, so it was not written"; return;; esac
   fi
   case $dec in
     grant) # only a planning seat's ask or refusal can pass cc-approve: its seat, which cc-refusals read from the asker
@@ -97,17 +111,20 @@ apply(){ local id=$1 dec=$2 line=$3 note; note=$(one "$4")
            frm=$(jq -r '.seat // ""' <<<"$5")
            [ "$frm" = "$REPO" ] || frm="$REPO/$(jq -r '.window // ""' <<<"$5")"
            v=$("$T/cc-approve" judge allow "$line" --from "$frm" --why "$note" 2>/dev/null) \
-             || { release "$id" "cc-approve referred $line: $(jq -r '.reason // "no answer"' <<<"$v" 2>/dev/null)"; return 0; }
+             || { hand "$id" "cc-approve referred $line: $(jq -r '.reason // "no answer"' <<<"$v" 2>/dev/null)"; return; }
            "$T/cc-settings" grant allow "$line" --by warden --card "warden:$id" >/dev/null 2>&1 \
-             || { release "$id" "cc-settings did not write $line"; return 1; }
+             || { hand "$id" "cc-settings did not write $line"; return 1; }
            note="$line — $note" ;;
     decline) ;;
-    *) release "$id" "$dec: $note"; return ;;
+    *) hand "$id" "$dec: $note"; return ;;
   esac
-  rf decide "$REPO" "$id" "$dec" "$(one "$note")" >/dev/null \
-    || { release "$id" "the ledger did not take this decision, so a grant's line is written but unrecorded: $dec: $note"; return 1; }; }
+  did=$dec
+  rf decide "$REPO" "$id" "$dec" "$(one "$note")" >/dev/null && return
+  if [ "$dec" = grant ]; then hand "$id" "the ledger did not take this grant, so its line is written but unrecorded: $note"
+  else hand "$id" "the ledger did not take this decline, so nothing is decided: $note"; fi
+  return 1; }
 
-attempt(){ local id=$1 n=$2 a rec sc out res dec line note
+attempt(){ local id=$1 n=$2 a rec sc out res dec line note did
   a=$W/$id/$n; [ -d "$a" ] || exit 2; rec=$(ask_of "$id"); [ -n "$rec" ] || { echo "failed: not open" > "$a/done"; exit 0; }
   echo "$$" > "$a/pid"
   sc=$(mktemp -d "${TMPDIR:-/tmp}/cc-warden.XXXXXX") || { echo "failed: no scratch dir" > "$a/done"; exit 1; }
@@ -129,8 +146,8 @@ attempt(){ local id=$1 n=$2 a rec sc out res dec line note
   { [ -z "$dec" ] || [ -z "$note" ] || { [ "$(jq -r .decision <<<"$dec")" = grant ] && ! grep -qE "$RULE" <<<"$line"; }; } \
     && { echo "failed: malformed decision" > "$a/done"; exit 0; }
   printf '%s\n' "$dec" > "$a/decision.json"
-  if apply "$id" "$(jq -r .decision <<<"$dec")" "$line" "$note" "$rec"; then echo "ok: $(jq -r .decision <<<"$dec")" > "$a/done"
-  else echo "failed: the decision did not take" > "$a/done"; fi; }
+  if apply "$id" "$(jq -r .decision <<<"$dec")" "$line" "$note" "$rec"; then echo "ok: $did" > "$a/done"
+  else echo "failed: $did" > "$a/done"; fi; }
 
 # Claude Code expands ' @path' in a prompt as a Read that no hook or allow check sees, and this brief is the prompt. So every @ of
 # the ask goes in as its JSON escape: the model reads the same words, and Claude Code finds no @ to expand.
@@ -215,7 +232,7 @@ tick(){ local id rec d last n k f now per started v who hit gave back s
     "$SELF" attempt "$id" "$n" </dev/null >/dev/null 2>&1 9>&- &   # not holding the tick's lock: the next tick runs
     started=$((started + 1))
   done < <(rf open "$REPO" 2>/dev/null)
-  true; }   # the runs outlive the tick: the unit is KillMode=process
+  wake; true; }   # the runs outlive the tick (the unit is KillMode=process), so what they release wakes perms next tick
 
 case "${1:-}" in
   tick) tick ;;

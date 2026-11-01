@@ -64,6 +64,11 @@ selfcheck(){
   sc collect repo t2 >/dev/null
   k "$(t jq -e 'select(.window == "worker:t2" and .repo == "repo" and (.input | contains("echo sandboxed")))' "$lg")" "collect moves it into the ledger under worker:<track>, whatever the spool claimed"
   k "$(t test ! -e "$d/state/repo/t2/refusals.spool.jsonl")" "…and empties the spool"
+  # a spool is the worker's to write: a newline in its input, or an object jq prints over several lines, would make a decision on it unsignable
+  fresh; mkdir -p "$d/state/repo/t2"
+  { jq -cn '{tool:"Bash", input:"one\ntwo\u001b[31m", reason:"r"}'; jq -cn '{tool:"Bash", input:{command:"three"}, reason:"r"}'; } > "$d/state/repo/t2/refusals.spool.jsonl"
+  sc collect repo t2 >/dev/null
+  k "$(t test "$(jq -r 'select(.kind == "refusal") | .input | select(([explode[] | select(. < 32)] == []) and (contains("one") or contains("three")))' "$lg" | wc -l)" = 2)" "collect cleans control characters out of a spooled input, in both shapes"
   # 3e. a record the ledger did not take (its lock held past the wait) stays in the spool for the next collect
   fresh; jq -c . "$d/sbx/repo/t2/refusals.spool.jsonl" > "$d/state/repo/t2/refusals.spool.jsonl"
   ( exec 9>"$lg.lock"; flock 9; exec sleep 30 ) & local hold=$!
