@@ -42,6 +42,10 @@ ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as
                               The weekly pace is a weighing, not a gate (no-hard-caps): ahead of it, a launch
                               still starts once no worker has started here for CC_ROOM_TRICKLE seconds, so the
                               week slows launches and never stops them; CC_ROOM_TRICKLE=0 lets the week hold none.
+                              The one hold is a week already spent: a reading under CC_USAGE_FRESH (180) s old
+                              with the seven-day window at SPENT (99.5)% or more holds every launch until that
+                              window resets, since a session started then dies at the limit at once. A staler
+                              reading never holds; it is weighed as above.
                               No such file, or a window already over, is room — a reading nobody has is never
                               the reason a worker waits.
   the box is not busy       the lander's own overloaded() (core/lander/admission.py): memory or cpu pressure, or a
@@ -162,6 +166,7 @@ except Exception as e:   # a broken lander is a crash (2), never "queued" (1): c
     print(f"cc-room: {type(e).__name__}: {e}", file=sys.stderr)
     sys.exit(2)
 WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}   # seconds; pick() tries them in this order
+SPENT = 99.5   # weekly used% at which a launch would die at the limit at once (the header)
 
 
 def room_dir():
@@ -314,14 +319,18 @@ def pick(rl, now):
     return None
 
 
+def fresh():
+    return float(os.environ.get("CC_USAGE_FRESH") or 180)
+
+
 def usage_window(now):
-    """pick() of cc-usage-poll's now.json while it is under CC_USAGE_FRESH (180) s old, else of the freshest
-    statusline file that has a window open, else None."""
+    """(pick(), the reading, its age in s) of cc-usage-poll's now.json while it is under CC_USAGE_FRESH (180) s old,
+    else of the freshest statusline file that has a window open (its age is the file's), else None."""
     try:
         u = json.load(open(f"{os.environ.get('CC_USAGE_DIR') or HOME + '/.cc/state/usage'}/now.json"))
-        hit = now - float(u["at"]) < float(os.environ.get("CC_USAGE_FRESH") or 180) and pick(u, now)
+        hit = now - float(u["at"]) < fresh() and pick(u, now)
         if hit:
-            return hit
+            return hit, u, now - float(u["at"])
     except (OSError, ValueError, KeyError, TypeError):
         pass   # no poller, or a reading it has not made: the statusline files, as before it existed
     d = os.environ.get("CC_STATUSLINE_DIR") or f"{HOME}/.cc/state/statusline"
@@ -329,29 +338,38 @@ def usage_window(now):
                    reverse=True)
     for p in files[:200]:
         try:
-            hit = pick(json.load(open(p))["raw"]["rate_limits"], now)
+            rl = json.load(open(p))["raw"]["rate_limits"]
+            hit = pick(rl, now)
+            if hit:
+                return hit, rl, now - os.path.getmtime(p)
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if hit:
-            return hit
     return None
 
 
 def pace(now=None):
-    """(window, the pace line, ahead): how far the paced window's usage runs against its clock, or ("", "", False)
-    unread"""
+    """(window, the pace line, ahead, spent): how far the paced window's usage runs against its clock, and the line
+    that holds every launch while a fresh reading has the week spent (SPENT), or ("", "", False, "") unread"""
     now = now or time.time()
-    hit = usage_window(now)
-    if not hit:
-        return "", "", False
-    w, used, resets = hit
+    got = usage_window(now)
+    if not got:
+        return "", "", False, ""
+    (w, used, resets), rl, age = got
+    spent = ""
+    try:
+        wu, wr = float(rl["seven_day"]["used_percentage"]), float(rl["seven_day"]["resets_at"])
+        if age < fresh() and wu >= SPENT and wr > now:
+            spent = (f"the weekly limit is spent ({wu:.0f}% used), so launches wait until it resets at "
+                     f"{time.strftime('%a %H:%M', time.localtime(wr))}; a session started now would stop at once")
+    except (ValueError, KeyError, TypeError):
+        pass
     margin = cfg("CC_WORKER_PACE_MARGIN", 10)
     elapsed = max(0.0, min(100.0, 100.0 * (WINDOWS[w] - (resets - now)) / WINDOWS[w]))
     word = {"five_hour": "five-hour", "seven_day": "weekly"}[w]
     line = (f"{word} usage is at {used:.0f}% with {elapsed:.0f}% of the window gone, {max(0.0, 100 - used):.0f}% "
             f"left; it resets at {time.strftime('%a %H:%M' if w == 'seven_day' else '%H:%M', time.localtime(resets))}")
     # the brief: "usage not running ahead of the window's elapsed time, beyond a margin"
-    return w, line, used > elapsed + margin
+    return w, line, used > elapsed + margin, spent
 
 
 PEER_REST = 600
@@ -427,15 +445,18 @@ def place(now=None, movable=True):
 
 def pace_why(now=None):
     """"" while the paced window's usage is not running ahead of its clock, else why. Ahead of the week only
-    spaces launches CC_ROOM_TRICKLE seconds apart: a weighing, not a hold."""
-    w, line, ahead = pace(now)
-    if not ahead:
-        return ""
+    spaces launches CC_ROOM_TRICKLE seconds apart: a weighing, not a hold. A spent week (SPENT) holds."""
+    w, line, ahead, spent = pace(now)
+    if spent or not ahead:
+        return spent
     why = f"{line}; more than {cfg('CC_WORKER_PACE_MARGIN', 10)} points ahead (CC_WORKER_PACE_MARGIN)"
     if w != "seven_day":
         return why
-    every = cfg("CC_ROOM_TRICKLE", 600)
-    return f"{why}, so one launch every {every:.0f}s (CC_ROOM_TRICKLE)" if since_start() < every else ""
+    # the spacing counts from `started`, which only a launch on this host stamps: with a peer configured (none is,
+    # 2026-11-01) a launch the peer takes, from this queue or its own, does not space the next one
+    every, since = cfg("CC_ROOM_TRICKLE", 600), since_start()
+    return (f"{why}, so one launch every {every:.0f}s (CC_ROOM_TRICKLE), the next in {every - since:.0f}s"
+            if since < every else "")
 
 
 def write_entry(sub, name, what, extra=None):
@@ -1025,7 +1046,7 @@ def status():
         q = live("heavy-queue")
         for p in ordered("heavy-queue"):
             print(f"heavy queued {q[p][1]} (pid {q[p][0]}){priority_note(p)}")
-    _, line, _ = pace()
+    line = pace()[1]
     print(f"pace: {line or 'no usage reading'}")
     spot, w = place()
     print({"here": "room: yes", "peer": "room: on the peer"}.get(spot, f"room: no — {w}"))

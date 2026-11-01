@@ -238,14 +238,15 @@ esac''')):
         # ahead of the week slows launches and never holds one: a weighing, not a gate (no-hard-caps)
         os.environ["CC_ROOM_TRICKLE"] = "600"
         os.makedirs(f"{d}/room", exist_ok=True)
+        t("pace: the room the weekly cases stamp is the one since_start() reads", room_dir(), f"{d}/room")
         def started(ago):
             open(f"{d}/room/started", "w").close()
             os.utime(f"{d}/room/started", (time.time() - ago,) * 2)
         json.dump(weekly(70, 4 * 86400), open(f"{d}/usage/now.json", "w"))
         started(60)
         t("pace: 70% of the week used at 43% gone, a worker started 60s ago, waits on the weekly figure",
-          ("weekly usage is at 70%" in why_not(), "30% left" in why_not(), "one launch every 600s" in why_not()),
-          (True, True, True))
+          ("weekly usage is at 70%" in why_not(), "30% left" in why_not(), "one launch every 600s" in why_not(),
+           "the next in 54" in why_not()), (True, True, True, True))
         started(900)
         t("pace: …and with none started for 600s the next one runs: the week slows launches, it never holds them",
           why_not(), "")
@@ -261,6 +262,41 @@ esac''')):
         json.dump({"raw": {"rate_limits": weekly(90, 4 * 86400)}}, open(f"{d}/sl/w.json", "w"))
         t("pace: a statusline file with only a weekly window is paced on it", "weekly usage is at 90%" in why_not(),
           True)
+        os.unlink(f"{d}/sl/w.json")
+        # a spent week holds every launch until it resets: a session started then dies at the limit at once
+        started(900)
+        json.dump(weekly(99, 4 * 86400), open(f"{d}/usage/now.json", "w"))
+        t("spent: 99% of the week used is weighed as before, so with none started for 600s the next one runs",
+          why_not(), "")
+        json.dump(weekly(100, 4 * 86400), open(f"{d}/usage/now.json", "w"))
+        t("spent: 100% of the week used holds the launch until the week resets, trickle or not",
+          ("the weekly limit is spent (100% used)" in why_not(), "until it resets at" in why_not()), (True, True))
+        json.dump(weekly(100, 4 * 86400, {"used_percentage": 20, "resets_at": time.time() + 3 * 3600}),
+                  open(f"{d}/usage/now.json", "w"))
+        t("spent: …and holds it while a five-hour window is still reported too",
+          "the weekly limit is spent" in why_not(), True)
+        u = weekly(100, 4 * 86400)
+        json.dump(dict(u, at=time.time() - 600), open(f"{d}/usage/now.json", "w"))
+        json.dump({"raw": {"rate_limits": u}}, open(f"{d}/sl/w.json", "w"))
+        os.utime(f"{d}/sl/w.json", (time.time() - 600,) * 2)
+        t("spent: a stale reading at 100% never holds; it is weighed as before", why_not(), "")
+        os.unlink(f"{d}/sl/w.json")
+        json.dump(weekly(100, -60), open(f"{d}/usage/now.json", "w"))
+        t("spent: once the week has reset, launches resume", why_not(), "")
+        # one launch per CC_ROOM_TRICKLE ahead of the week: the first waiter stamps `started` under the lock, so a
+        # second queued with it waits
+        json.dump(weekly(70, 4 * 86400), open(f"{d}/usage/now.json", "w"))
+        two = [subprocess.Popen([sys.executable, __file__, "admit", f"r/two{i}", "--", "touch", f"{d}/two{i}"],
+                                stderr=subprocess.DEVNULL) for i in (0, 1)]
+        procs.extend(two)
+        time.sleep(3)
+        t("pace: two waiters queued ahead of the week with none started for 600s: one runs, one waits",
+          sorted(x.poll() for x in two if x.poll() is not None) + [os.path.exists(f"{d}/two0") +
+                                                                   os.path.exists(f"{d}/two1")], [0, 1])
+        for x in two:
+            x.kill()
+            x.wait()
+        os.environ["CC_ROOM_TRICKLE"] = "0"   # the fixture default, so no later case leans on the 600 above
 
         # the queued launch runs on its own once room frees, and not before
         d = fixture("frees", cap=1)
