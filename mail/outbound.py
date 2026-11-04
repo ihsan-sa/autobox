@@ -105,6 +105,9 @@ CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
                          it: its cold mail comes From <channel>@MAIL_DOMAIN, the address the router already
                          maps back to that channel, so an answer lands in that channel's mirror thread
                          (session_channel, cold_from; owner, 2026-09-10)
+      MAIL_SEND_ONLY_FROM  set only on an install whose worker lets it use one From (the worker's SEND_FROM_<NAME>):
+                         every mail, cold or a reply, comes From this address whatever the session's channel or
+                         the address it was mailed at. Malformed or off MAIL_DOMAIN, nothing can be sent
       MAIL_OUT_PER_HOUR  6 mails per mirror thread per hour, and 6 cold mails an hour for the whole box
       MAIL_OUT_PER_DAY   30 mails per recipient per day, counted across both paths
       MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file is refused before the upload
@@ -395,8 +398,13 @@ def cold_from(cfg, channel=""):
     Without one: MAIL_SEND_FROM when it is set and on our own domain — the worker refuses any other From
     anyway, so an address off the domain is caught here where the reason can be said. Unset, it is
     home@<MAIL_DOMAIN>: the address the door already receives on, so an answer to a cold mail comes back
-    through the door and is routed like any other mail rather than bouncing off an address nothing listens to."""
+    through the door and is routed like any other mail rather than bouncing off an address nothing listens to.
+
+    MAIL_SEND_ONLY_FROM outranks all of that, because the worker would refuse every other address from this install."""
     domain = (cfg.get("MAIL_DOMAIN") or "").strip().lower().lstrip("@")
+    if (cfg.get("MAIL_SEND_ONLY_FROM") or "").strip():
+        only = _norm(cfg["MAIL_SEND_ONLY_FROM"])
+        return only if only and ours(only, domain) else ""
     channel = (channel or "").strip().lstrip("#").lower()
     if channel and domain:
         return channel + "@" + domain
@@ -849,7 +857,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts="", same=None):
     if not rec:
         return ""
     domain = cfg.get("MAIL_DOMAIN") or ""
-    from_a = from_addr(rec, domain)
+    from_a = cold_from(cfg) if (cfg.get("MAIL_SEND_ONLY_FROM") or "").strip() else from_addr(rec, domain)
     to, cc = recipients(rec, domain)
     if not from_a or not to + cc:
         log("%s: not sent — %s" % (rec.get("id"), "no address of ours to send from" if not from_a

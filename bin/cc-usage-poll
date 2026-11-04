@@ -26,7 +26,9 @@ other origin is _TEST_ORIGIN, a global only the selfcheck sets, in this process;
 
 ON ANY FAILURE now.json stays as it was and error.json beside it names the exception's type (and an HTTP status),
 never its message; a good read removes it. A 429's Retry-After (seconds or a date, at most RETRY_CAP) is kept there
-as `retry_after`, and every run before it skips without a request.
+as `retry_after`, and every run before it skips without a request. The wait is at least MIN_WAIT, longer than the
+timer's tick, and doubles with each 429 in a row (`strikes`): a Retry-After shorter than the tick, or none, used to
+end before the next run, which asked again and drew the next 429, so every other run was one (stage 4, 11-04).
 PLANS (2026-10-31, the owner pays for four and the box ran one to its weekly wall). `cc-config get
 WORKER_CLAUDE_LOGIN_COPY` may list several copies of the plans' logins, space-separated. Each is read the same way,
 into login-<its name>.json (login-claude-login.max1.json for claude-login.max1.json) and login-<name>.error.json,
@@ -40,6 +42,7 @@ URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"   # Claude Code's own OAuth beta header value
 WINDOWS = ("five_hour", "seven_day")
 RETRY_CAP = 3600            # a Retry-After further out than this is read as this
+MIN_WAIT = 300              # a 429 waits at least this, doubled per 429 in a row: over the timer's 120 s tick
 _TEST_ORIGIN = None         # selfcheck only: its loopback fake endpoint, "http://127.0.0.1:<port>"
 
 
@@ -95,16 +98,20 @@ def opener():
     return urllib.request.build_opener(NoRedirect()), URL
 
 
-def retry_after(v, now):
-    """a 429's Retry-After (delta seconds or an HTTP date) as the epoch to wait until, capped at now + RETRY_CAP"""
+def retry_after(v, now, strikes=1):
+    """a 429's Retry-After (delta seconds or an HTTP date) as the epoch to wait until: never sooner than
+    MIN_WAIT * 2**(strikes-1), so the next tick skips, and capped at now + RETRY_CAP"""
     try:
         t = now + float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             t = email.utils.parsedate_to_datetime(v).timestamp()
-        except (TypeError, ValueError):
-            t = now + 60   # a 429 with no readable Retry-After still waits one tick
-    return min(max(t, now), now + RETRY_CAP)
+        except (TypeError, ValueError, OverflowError):
+            t = now   # no readable Retry-After: the floor below is the wait
+    if t != t:
+        t = now   # a NaN Retry-After
+    floor = now + MIN_WAIT * 2 ** min(max(strikes, 1) - 1, 16)
+    return min(max(t, floor), now + RETRY_CAP)
 
 
 def copies():
@@ -118,9 +125,10 @@ def poll(cred=None, name="now"):
     now = time.time()
     errf = "error.json" if name == "now" else f"{name}.error.json"
     try:
-        until = json.load(open(os.path.join(usage_dir(), errf))).get("retry_after")
+        last = json.load(open(os.path.join(usage_dir(), errf)))
+        until = last.get("retry_after")
     except (OSError, ValueError, AttributeError):
-        until = None
+        last, until = {}, None
     if isinstance(until, (int, float)) and now < until:
         return 0   # the endpoint asked us to wait: no request until then, and the files stay as they are
     err = {"at": now}
@@ -136,7 +144,9 @@ def poll(cred=None, name="now"):
         if isinstance(e, urllib.error.HTTPError):
             err["status"] = e.code
             if e.code == 429:
-                err["retry_after"] = retry_after(e.headers.get("Retry-After"), now)
+                n = last.get("strikes") if last.get("status") == 429 else 0
+                err["strikes"] = (n if isinstance(n, int) and n > 0 else 0) + 1
+                err["retry_after"] = retry_after(e.headers.get("Retry-After"), now, err["strikes"])
     else:
         write(f"{name}.json", rec)
         try:

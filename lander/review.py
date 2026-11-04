@@ -135,7 +135,7 @@ prior blocker left unresolved is carried into the verdict as a blocking row with
 kind tag in front, "[security] still open from the earlier read: …" (carried()), whatever the reader's verdict
 word and whether or not it named new blockers, so pinned() finds the [security] row again in the round after, and
 every round. Only a bare number names a prior row (row_number()). Anything else in `unresolved` (a first read has no
-row to name) is carried as written, whatever the verdict word, so a sentence there holds the PR (perms' read of
+row to name) is carried as written, whatever the verdict word, and with no cap on the list, so a sentence there holds the PR (perms' read of
 #2160); advice goes in `advisory`, or for a prior row in `moot`, and a hold on one the reader meant as advice (#2137)
 is the planning seat's or perms' to release (carried_hold()). A row the read calls moot lands on the read's word, as
 one it leaves out does: only another read could say the head still has it and blocks on it, so the review comment
@@ -718,7 +718,8 @@ def parse(answer, digest, model="", tokens=0):
     # a prior blocker the read marks moot, or outside the diff and already true, holds nothing; one it also calls
     # unresolved stays unresolved, so a contradictory answer keeps the stop
     unresolved = [str(x) for x in j.get("unresolved") or []]
-    moot = [str(x) for x in j.get("moot") or [] if str(x) not in unresolved]
+    still = set(unresolved)
+    moot = [str(x) for x in j.get("moot") or [] if str(x) not in still]
     verdict = j["verdict"]
     # LIGHT FIX: every blocker below high and none a security one, and no earlier blocker left open
     light = all(isinstance(f, dict) and f.get("severity") in LIGHT and f.get("kind") != "security"
@@ -741,14 +742,15 @@ def pinned(v, prior):
     else a LAND passes it by)."""
     sec = {str(i) for i, b in enumerate(prior, 1) if "[security]" in b}
     moot = (v.extra or {}).get("moot") or []
-    done = {row_number(r) for r in v.resolved if r not in moot}
-    back = sorted(sec - done - {row_number(u) for u in v.unresolved}, key=int)
+    said_moot = set(moot)
+    done = {row_number(r) for r in v.resolved if r not in said_moot}
+    back = sec - done - {row_number(u) for u in v.unresolved}
     if not back:
         return v
     if moot:
         v.extra["moot"] = [m for m in moot if row_number(m) not in back]
     v.resolved = [r for r in v.resolved if row_number(r) not in back]
-    v.unresolved = v.unresolved + back
+    v.unresolved = v.unresolved + sorted(back, key=int)
     v.verdict = T.HANDBACK_VERDICT   # carried() writes each one's row, its [security] tag in front
     return v
 
@@ -757,7 +759,7 @@ def row_number(name):
     """A prior row's number as a read names it ('2', '#2', 'blocker 2'), or None (Opus read of #1227: a bare match
     lost '#2' its [security] tag). Nothing else names a row: 'x.py:1 is only advice' once cleared security row 1
     (perms' read of #2160), nor do more digits than a row number has: int() raises past 4300 (perms' read of #2163)."""
-    m = re.fullmatch(r"\s*(?:#|blocker)?\s*(\d{1,9})\s*", str(name), re.I)
+    m = re.fullmatch(r"\s*(?:(?:#|blocker)\s*)?(\d{1,9})\s*", str(name), re.I)
     return m.group(1) if m else None
 
 
@@ -770,14 +772,16 @@ def carried(v, prior):
     the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
     still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
     as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
-    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. Zero padding is
-    dropped here and only here: '0000000001' keeps row 1's [security] tag, so carried_hold() can't release it (perms'
-    read of #2171), while in `resolved` a padded name still clears nothing. `prior` is the prior verdict's blocking
-    rows, as pinned() takes them. Running it twice on one verdict adds nothing."""
+    prior row's number ('2', '#2', 'blocker 2': row_number()) is carried as the reader wrote it. Zero padding and
+    digits of any script are read as plain digits here and only here: '0000000001' or ten Arabic-Indic digits keep row
+    1's [security] tag, so carried_hold() can't release it (perms' reads of #2171 and #2173), while in `resolved` such
+    a name still clears nothing. `prior` is the prior verdict's blocking rows, as pinned() takes them. A name repeated
+    is one row, and running it twice on one verdict adds nothing."""
     rows = list(prior or [])
     out = []
     for x in v.unresolved:
-        n = row_number(re.sub(r"(?<!\d)0+(?=\d)", "", x))
+        plain = "".join(str(unicodedata.digit(c, c)) for c in x)
+        n = row_number(re.sub(r"(?<!\d)0+(?=\d)", "", plain))
         row = rows[int(n) - 1] if n and 1 <= int(n) <= len(rows) else x
         m = KIND_TAG.match(row)
         tag, row = (m.group(0), row[m.end():]) if m else ("", row)
@@ -785,7 +789,7 @@ def carried(v, prior):
         out.append(f"{tag}{STILL_OPEN}{row}")
     if out:
         v.verdict = T.HANDBACK_VERDICT
-        v.blocking = out + [b for b in v.blocking if b not in out]   # no cap: a cut would drop a [security] pin
+        v.blocking = list(dict.fromkeys(out + v.blocking))   # no cap: a cut would drop a [security] pin
     return v
 
 
@@ -2035,12 +2039,12 @@ def combined(reads):
         return reads[0][1]
     by = lambda m, x: f"{m} for {x.extra['stood_in_for']}" if x.extra.get("stood_in_for") else m  # noqa: E731
     tag = lambda attr: [f"{r} (read by {by(m, x)})" for m, x in reads for r in getattr(x, attr)]  # noqa: E731
-    unresolved = sorted({u for _, x in reads for u in x.unresolved})
+    unresolved = {u for _, x in reads for u in x.unresolved}
     first = reads[0][1]
     v = T.Verdict(verdict=T.HANDBACK_VERDICT if any(x.verdict == T.HANDBACK_VERDICT for _, x in reads) else T.LAND,
                   digest=first.digest, blocking=tag("blocking"), advisory=tag("advisory"),
                   model="+".join(m for m, _ in reads), tokens=sum(x.tokens for _, x in reads),
-                  resolved=[r for r in first.resolved if r not in unresolved], unresolved=unresolved)
+                  resolved=[r for r in first.resolved if r not in unresolved], unresolved=sorted(unresolved))
     v.extra["readers"] = [dict({"model": m, "verdict": x.verdict},
                                **({"stood_in_for": x.extra["stood_in_for"]} if x.extra.get("stood_in_for") else {}),
                                **({"timed_out": True} if x.extra.get("stood_in_why", "").startswith(TIMED_OUT) else {}))

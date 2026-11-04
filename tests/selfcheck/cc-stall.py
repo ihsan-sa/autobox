@@ -49,6 +49,13 @@ def selfcheck():
     with q: run(t, True, 1000)
     k(t.keys == [(w, "2")], "usage-limit prompt: the digit 2, once, at any window (perms' too)")
     k(raised() == [], "…and raises no row")
+    # 1c the same prompt as Claude Code words it since 2026-11: the paid options changed, and 2 still means wait
+    reworded = LIMIT.replace("     3. Add funds to continue with usage credits\n", "     3. Switch to usage credits\n     4. Upgrade your plan\n")
+    k(reworded != LIMIT, "…the reworded fixture really differs")
+    fresh(); t = Fake(); w = t.add("perms", reworded, after=READY)
+    with q: run(t, True, 1000)
+    k(t.keys == [(w, "2")], "reworded usage-limit prompt: still the digit 2, once")
+    k(raised() == [], "…and raises no row")
     # 2 …but not at a DEAD pane that still shows it (the 2026-09-23 loop pressed into exactly that)
     fresh(); t = Fake(); t.add("box", DEV + "\nclaude exited (1) - restarting in 15s\n", live=False)
     with q: run(t, True, 1000)

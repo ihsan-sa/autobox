@@ -102,11 +102,15 @@ def selfcheck():
               (rc, [p for p, _ in seen[k:]], (read("error.json") or {}).get("status")),
               (1, ["/api/oauth/usage"], code))
 
-        # a 429 waits out its Retry-After: runs before it ask nothing and change nothing
+        # a 429 waits out its Retry-After, but never less than MIN_WAIT: the timer ticks every 120 s (up to 60 s
+        # late, systemd's default AccuracySec), and a shorter wait ended before the next run, which then asked again
+        # and drew the next 429, so every other run was one. Runs before it ask nothing and change nothing
+        t("429: MIN_WAIT is longer than the timer's tick and its accuracy", MIN_WAIT > 120 + 60, True)
         reply[0] = (429, "", {"Retry-After": "120"})
         rc, e = run(), read("error.json") or {}
-        t("429: exit 1, Retry-After kept as the time to wait until",
-          (rc, e.get("status"), 119 <= e.get("retry_after", 0) - time.time() <= 121), (1, 429, True))
+        t("429: exit 1, a Retry-After shorter than MIN_WAIT waits MIN_WAIT, the first 429 in a row",
+          (rc, e.get("status"), e.get("strikes"), MIN_WAIT - 1 <= e.get("retry_after", 0) - time.time() <= MIN_WAIT + 1),
+          (1, 429, 1, True))
         reply[0] = (200, json.dumps({"five_hour": {"utilization": 70, "resets_at": None}}), {})
         k = len(seen)
         t("429: a run inside the wait skips, asks nothing, keeps both files",
@@ -122,9 +126,43 @@ def selfcheck():
         os.unlink(f"{base}/usage/error.json")
         reply[0] = (429, "", {"Retry-After": "soon"})
         run()
-        t("429: an unreadable Retry-After still waits a minute",
-          55 <= (read("error.json") or {}).get("retry_after", 0) - time.time() <= 61, True)
+        t("429: an unreadable Retry-After still waits MIN_WAIT",
+          MIN_WAIT - 5 <= (read("error.json") or {}).get("retry_after", 0) - time.time() <= MIN_WAIT + 1, True)
         os.unlink(f"{base}/usage/error.json")
+        reply[0] = (429, "", {"Retry-After": str(MIN_WAIT + 200)})
+        run()
+        t("429: a Retry-After longer than MIN_WAIT is kept as it is",
+          MIN_WAIT + 199 <= (read("error.json") or {}).get("retry_after", 0) - time.time() <= MIN_WAIT + 201, True)
+        reply[0] = (429, "", {})
+        for want in (2, 3):
+            e = read("error.json") or {}
+            e["retry_after"] = time.time() - 1
+            json.dump(e, open(f"{base}/usage/error.json", "w"))
+            run()
+            e = read("error.json") or {}
+            t(f"429: the {want}th 429 in a row doubles the wait",
+              (e.get("strikes"), MIN_WAIT * 2 ** (want - 1) - 5 <= e.get("retry_after", 0) - time.time()
+               <= MIN_WAIT * 2 ** (want - 1) + 1), (want, True))
+        for _ in range(8):
+            e["retry_after"] = time.time() - 1
+            json.dump(e, open(f"{base}/usage/error.json", "w"))
+            run()
+            e = read("error.json") or {}
+        t("429: doubling stops at RETRY_CAP", e.get("retry_after", 0) - time.time() <= RETRY_CAP, True)
+        e["retry_after"], e["status"] = time.time() - 1, 500
+        json.dump(e, open(f"{base}/usage/error.json", "w"))
+        run()
+        t("429: strikes count only 429s in a row, so one after another failure starts again at 1",
+          (read("error.json") or {}).get("strikes"), 1)
+        e = read("error.json") or {}
+        e["retry_after"] = time.time() - 1
+        json.dump(e, open(f"{base}/usage/error.json", "w"))
+        reply[0] = (200, json.dumps({"five_hour": {"utilization": 70, "resets_at": None}}), {})
+        t("429: a good read ends the run of 429s (error.json and its strikes go)",
+          (run(), os.path.exists(f"{base}/usage/error.json")), (0, False))
+        t("429: Retry-After oddities are still a wait, never sooner than MIN_WAIT",
+          all(MIN_WAIT - 1 <= retry_after(v, 1e9) - 1e9 <= RETRY_CAP for v in ("-5", "nan", "inf", "1e999", "", None)),
+          True)
 
         creds(-60)
         k = len(seen)

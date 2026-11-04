@@ -1240,7 +1240,7 @@ def cmd_show(opt):
 # The keys the cold send reads. NOT in CONF_KEYS: the server never sends, so it has no reason to hold a send
 # secret in memory for the life of a process that answers a public tunnel. `send` reads them per run instead,
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
-SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
+SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ONLY_FROM", "MAIL_SEND_ALLOW",
              "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES",
              "MAIL_WORKSPACE", "MAIL_PDF_ATTACH")   # MAIL_WORKSPACE: its `addr=owner` rows say who gets a signed-in PDF link (outbound.pdf_links)
 SEND_JSON_KEYS = ("to", "bcc", "subject", "body", "attachments", "thread", "html", "images")

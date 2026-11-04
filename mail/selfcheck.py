@@ -275,30 +275,51 @@ class FakeWorker:
 # Runs the Worker's OWN fetch() handler — the send half — with the send_email binding stubbed, and writes down
 # what it answered and what it tried to send.
 SEND_HARNESS = r"""import fs from "node:fs";
-import worker from "./worker.mjs";
+import worker, { SendCount } from "./worker.mjs";
 
 const cases = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const out = {};
 for (const c of cases) {
   const sent = [];
   const env = { SEND_SECRET: c.secret === undefined ? "s3cret" : c.secret, SEND_DOMAIN: c.domain === undefined ? "box.example" : c.domain };
+  Object.assign(env, c.env || {});
+  // The real SendCount over a memory store. The queue stands in for the input gate Cloudflare gives a Durable Object.
+  const store = {};
+  if (c.used !== undefined) store.count = { day: c.oldDay ? "2000-01-01" : c.newerDay ? "2999-12-31" : new Date().toISOString().slice(0, 10), used: c.used };
+  if (c.env && !c.noCounts) {
+    const counter = new SendCount({ storage: { get: async (k) => store[k], put: async (k, v) => { store[k] = v; } } });
+    let queue = Promise.resolve();
+    env.SEND_COUNTS = {
+      idFromName: (n) => n,
+      get: () => ({
+        fetch: (url, init) => {
+          if (c.countsThrow) throw new Error("counter down");
+          if (c.countsStatus) return Promise.resolve(new Response("x", { status: c.countsStatus }));
+          const run = queue.then(() => counter.fetch(new Request(url, init)));
+          queue = run.then(() => {}, () => {});
+          return run;
+        },
+      }),
+    };
+  }
   if (!c.noBinding) {
     env.SEND = { send: async (m) => { if (c.refuse && c.refuse.includes(m.to)) throw new Error("not verified"); sent.push({ from: m.from, to: m.to, raw: m.raw }); } };
   }
   const headers = {};
   if (c.auth !== null) headers["Authorization"] = "Bearer " + (c.auth === undefined ? "s3cret" : c.auth);
-  const req = new Request(c.url || "https://w.example/send", {
+  const request = () => new Request(c.url || "https://w.example/send", {
     method: c.method || "POST", headers, body: c.body === undefined ? JSON.stringify(c.json) : c.body,
   });
   let res, answer = null;
   try {
-    res = await worker.fetch(req, env);
+    if (c.parallel) await Promise.all(Array.from({ length: c.parallel - 1 }, () => worker.fetch(request(), env)));
+    res = await worker.fetch(request(), env);
     answer = await res.json();
   } catch (err) {
     out[c.name] = { threw: String(err) };
     continue;
   }
-  out[c.name] = { status: res.status, answer, sent };
+  out[c.name] = { status: res.status, answer, sent, counted: store.count ? store.count.used : null };
 }
 fs.writeFileSync(process.argv[3], JSON.stringify(out));
 """
@@ -2598,6 +2619,26 @@ def run():
         k([ln for ln in logged() if "not sent" in ln and "refused every recipient" in ln]
           and not [ln for ln in logged() if ": sent from=" in ln],
           "…and out.log says it was refused, never `sent`")
+        # An install the worker holds to one From answers from it, not from the address it was mailed at.
+        fresh()
+        pinned = conv()
+        with FakeWorker(200, {"ok": True, "sent": ["friend@allowed.example"], "failed": []}) as w:
+            cp = dict(conf(w), MAIL_SEND_ONLY_FROM="alpha@box.example")
+            outbound.send(cp, "C-mem", "1700.1", ts="1700.1", text="done")
+        k(len(w.calls) == 1 and w.calls[0]["from"] == "alpha@box.example",
+          "with MAIL_SEND_ONLY_FROM set, a reply comes From that address and not the one the mail was sent to")
+        fresh()
+        pinned = conv()
+        with FakeWorker(200, {"ok": True, "sent": [], "failed": []}) as w:
+            outbound.send(dict(conf(w), MAIL_SEND_ONLY_FROM="alpha@elsewhere.example"), "C-mem", "1700.1", ts="1700.1", text="done")
+        k(not w.calls, "…and one off the mail domain sends nothing, rather than falling back to the address mailed")
+        k(outbound.cold_from({"MAIL_DOMAIN": "box.example", "MAIL_SEND_ONLY_FROM": "alpha@box.example"}, "chan")
+          == "alpha@box.example"
+          and outbound.cold_from({"MAIL_DOMAIN": "box.example", "MAIL_SEND_ONLY_FROM": "alpha@elsewhere.example"}, "chan") == ""
+          and outbound.cold_from({"MAIL_DOMAIN": "box.example", "MAIL_SEND_ONLY_FROM": "not an address"}, "chan") == ""
+          and outbound.cold_from({"MAIL_DOMAIN": "box.example"}, "chan") == "chan@box.example",
+          "…and a cold mail from a session with a channel uses it too, a malformed one sends nothing, and an install "
+          "without it is unchanged")
         # …while (g)'s partial refusal still counts as a send for the one it reached
         fresh()
         some = conv()
@@ -2659,6 +2700,181 @@ def run():
           and [x["to"] for x in v["one-refused"]["sent"]] == ["a@x.example"]
           and [f["to"] for f in v["one-refused"]["answer"]["failed"]] == ["b@x.example"],
           "one recipient Cloudflare refuses does not cost the others theirs, and comes back named")
+
+    # ------------------------------------------------ 18b. a caller that is not the box (a caller) on the send half
+    ALPHA = {"SEND_CALLERS": "ALPHA, BETA", "SEND_SECRET_ALPHA": "alpha-lock", "SEND_FROM_ALPHA": "alpha@box.example",
+          "SEND_NAME_ALPHA": "Alpha Desk", "SEND_CAP_ALPHA": "50", "SEND_CAP_BETA": "50",
+          "SEND_TO_ALPHA": "owner@x.example, b@x.example", "SEND_SECRET_BETA": "beta-lock",
+          "SEND_FROM_BETA": "beta@box.example", "SEND_TO_BETA": "owner@x.example"}
+
+    def alpha_case(name, head=b"From: alpha@box.example\r\n\r\nbody", frm="alpha@box.example", to=("owner@x.example",),
+                env=ALPHA, auth="alpha-lock"):
+        return {"name": name, "auth": auth, "env": env,
+                "json": {"from": frm, "to": list(to), "raw": base64.b64encode(head).decode()}}
+    alpha_refused_raw = {
+        "other-header-from": b"From: boss@box.example\r\n\r\nbody",
+        "two-froms": b"From: alpha@box.example\r\nFrom: boss@box.example\r\n\r\nbody",
+        "second-address": b"From: alpha@box.example, boss@box.example\r\n\r\nbody",
+        "folded-second": b"From: alpha@box.example\r\n , boss@box.example\r\n\r\nbody",
+        "from-only-in-body": b"Subject: hi\r\n\r\nFrom: alpha@box.example\r\n",
+        "sender": b"From: alpha@box.example\r\nSender: boss@box.example\r\n\r\nbody",
+        "resent-from": b"From: alpha@box.example\r\nResent-From: boss@box.example\r\n\r\nbody",
+        "space-before-colon": b"From: alpha@box.example\r\nFrom : boss@box.example\r\n\r\nbody",
+        "bare-cr": b"From: alpha@box.example\rFrom: boss@box.example\r\n\r\nbody",
+        "early-lf-blank": b"From: alpha@box.example\n\nFrom: boss@box.example\r\n\r\nbody",
+        "leading-blank": b"\r\nFrom: boss@box.example\r\nFrom: alpha@box.example\r\n\r\nbody",
+        "leading-fold": b" From: boss@box.example\r\nFrom: alpha@box.example\r\n\r\nbody",
+        "not-a-header": b"From boss@box.example\r\nFrom: alpha@box.example\r\n\r\nbody",
+        "nul": b"X: \x00\r\nFrom: alpha@box.example\r\n\r\nbody",
+        "other-name": b"From: Some Person <alpha@box.example>\r\n\r\nbody",
+        "nel-in-header": b"From: alpha@box.example\r\nSubject: a\xc2\x85From: boss@box.example\r\n\r\nbody",
+        "reply-to-other": b"From: alpha@box.example\r\nReply-To: boss@box.example\r\n\r\nbody",
+        "reply-to-two": b"From: alpha@box.example\r\nReply-To: alpha@box.example\r\n"
+                        b"Reply-To: alpha+a1@box.example\r\n\r\nbody",
+        "reply-to-list": b"From: alpha@box.example\r\nReply-To: alpha@box.example, boss@box.example\r\n\r\nbody",
+        "reply-to-empty-tag": b"From: alpha@box.example\r\nReply-To: alpha+@box.example\r\n\r\nbody",
+        "reply-to-tag-other-domain": b"From: alpha@box.example\r\nReply-To: alpha+a1@evil.test\r\n\r\nbody",
+        "reply-to-odd-tag": b"From: alpha@box.example\r\nReply-To: alpha+x@evil.test,y@box.example\r\n\r\nbody",
+        "cc-outside": b"From: alpha@box.example\r\nCc: stranger@x.test\r\n\r\nbody",
+        "to-outside-named": b"From: alpha@box.example\r\nTo: Owner <stranger@x.test>\r\n\r\nbody",
+        "to-second-outside": b"From: alpha@box.example\r\nTo: owner@x.example, stranger@x.test\r\n\r\nbody",
+        "to-folded-outside": b"From: alpha@box.example\r\nTo: owner@x.example,\r\n stranger@x.test\r\n\r\nbody",
+        "to-group": b"From: alpha@box.example\r\nTo: list:stranger@x.test;\r\n\r\nbody",
+        "to-comment": b"From: alpha@box.example\r\nTo: owner@x.example (stranger@x.test)\r\n\r\nbody",
+        "to-unclosed": b"From: alpha@box.example\r\nTo: <owner@x.example\r\n\r\nbody",
+        "to-empty": b"From: alpha@box.example\r\nTo:\r\n\r\nbody",
+        "wrapped-message": b"From: alpha@box.example\r\nContent-Type: message/rfc822\r\n\r\nFrom: boss@box.example\r\n",
+        "wrapped-comment": b"From: alpha@box.example\r\nContent-Type: (x) Message/RFC822; a=b\r\n\r\nbody",
+        "wrapped-comment-semicolon": b"From: alpha@box.example\r\nContent-Type: (a;b) message/rfc822\r\n\r\nbody",
+        "wrapped-nested-comment": b"From: alpha@box.example\r\nContent-Type: (a(b)c) message/rfc822\r\n\r\nbody",
+        "wrapped-comment-inside": b"From: alpha@box.example\r\nContent-Type: message(c)/rfc822\r\n\r\nbody",
+        "wrapped-space": b"From: alpha@box.example\r\nContent-Type: message /rfc822\r\n\r\nbody",
+        "wrapped-folded": b"From: alpha@box.example\r\nContent-Type: message\r\n /rfc822\r\n\r\nbody",
+        "digest": b"From: alpha@box.example\r\nContent-Type: multipart/digest; boundary=b\r\n\r\nbody",
+        "two-types": b"From: alpha@box.example\r\nContent-Type: text/plain\r\nContent-Type: message/rfc822\r\n\r\nb",
+        "unclosed-comment": b"From: alpha@box.example\r\nContent-Type: (x text/plain\r\n\r\nbody",
+        "mail-reply-to": b"From: alpha@box.example\r\nMail-Reply-To: boss@x.test\r\n\r\nbody",
+        "mail-followup-to": b"From: alpha@box.example\r\nMail-Followup-To: boss@x.test\r\n\r\nbody",
+        "disposition-to": b"From: alpha@box.example\r\nDisposition-Notification-To: boss@x.test\r\n\r\nbody",
+        "return-receipt-to": b"From: alpha@box.example\r\nReturn-Receipt-To: boss@x.test\r\n\r\nbody",
+        "errors-to": b"From: alpha@box.example\r\nErrors-To: boss@x.test\r\n\r\nbody",
+        "author": b"From: alpha@box.example\r\nAuthor: boss@x.test\r\n\r\nbody",
+        "x-original-from": b"From: alpha@box.example\r\nX-Original-From: boss@x.test\r\n\r\nbody",
+        "bcc": b"From: alpha@box.example\r\nBcc: boss@x.test\r\n\r\nbody",
+        "name-is-address": b"From: boss@box.example <alpha@box.example>\r\n\r\nbody",
+        "name-encoded": b"From: =?utf-8?b?Ym9zc0Bib3guZXhhbXBsZQ==?= <alpha@box.example>\r\n\r\nbody",
+        "name-unbalanced": b"From: \"ALPHA <alpha@box.example>\r\n\r\nbody",
+        "no-blank-line": b"From: alpha@box.example\r\n",
+    }
+    v = send_verdicts([
+        alpha_case("alpha-ok"),
+        alpha_case("alpha-reply-to", head=b"From: alpha@box.example\r\nReply-To: alpha@box.example\r\n\r\nbody"),
+        alpha_case("alpha-reply-to-tag", head=b"From: alpha@box.example\r\nReply-To: <alpha+ab12@box.example>\r\n\r\nbody"),
+        alpha_case("beta-unnamed-shows-name", auth="beta-lock", frm="beta@box.example",
+                   head=b"From: Beta Desk <beta@box.example>\r\n\r\nbody"),
+        dict(alpha_case("cap-room", to=("owner@x.example", "b@x.example")), used=48),
+        dict(alpha_case("cap-over", to=("owner@x.example", "b@x.example")), used=49),
+        dict(alpha_case("cap-new-day"), used=50, oldDay=True),
+        dict(alpha_case("cap-parallel", env=dict(ALPHA, SEND_CAP_ALPHA="3")), parallel=50),
+        dict(alpha_case("cap-straggler-room"), used=5, newerDay=True),
+        dict(alpha_case("cap-straggler-full"), used=50, newerDay=True),
+        dict(alpha_case("cap-odd-answer"), countsStatus=500),
+        dict(alpha_case("cap-down"), countsThrow=True),
+        alpha_case("type-html", head=b"From: alpha@box.example\r\nContent-Type: text/html; charset=utf-8\r\n\r\nb"),
+        alpha_case("type-mixed", head=b"From: alpha@box.example\r\nContent-Type: Multipart/Mixed; boundary=\"(b)\"\r\n\r\nb"),
+        alpha_case("type-related", head=b"From: alpha@box.example\r\nContent-Type: multipart/related; boundary=b\r\n\r\nb"),
+        alpha_case("type-comment", head=b"From: alpha@box.example\r\nContent-Type: text/plain (plain words)\r\n\r\nb"),
+        alpha_case("to-cc-allowed", to=("owner@x.example", "b@x.example"),
+                   head=b"From: alpha@box.example\r\nTo: Owner Name <owner@x.example>, alpha@box.example\r\n"
+                        b"Cc: b@x.example\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody"),
+        dict(alpha_case("cap-no-binding"), noCounts=True),
+        alpha_case("cap-unset", env={k: x for k, x in ALPHA.items() if k != "SEND_CAP_ALPHA"}),
+        dict(alpha_case("cap-bad-to-not-counted", to=("stranger@x.example",)), used=1),
+        alpha_case("real-build", head=outbound.build({}, "alpha@box.example", ["owner@x.example"], [], "caf\u00e9",
+                                                     subject="caf\u00e9 \u2713", reply_to="alpha+ab12@box.example")[0]),
+        alpha_case("real-build-html", to=("owner@x.example", "b@x.example"),
+                   head=outbound.build({"message_ids": ["<prev@x.example>"], "references": "<first@x.example>"},
+                                       "alpha@box.example", ["owner@x.example"], ["b@x.example"], "x", subject="s",
+                                       html="<p>x</p>")[0]),
+        alpha_case("alpha-named", head=b"from: \"Alpha Desk\" <alpha@box.example>\r\nSubject: hi\r\n\r\nFrom: anyone@x.test\r\n"),
+        alpha_case("alpha-lf", head=b"From: Alpha Desk <alpha@box.example>\nSubject: hi\n\nbody\n"),
+        alpha_case("alpha-other-from-on-domain", frm="boss@box.example"),
+        alpha_case("alpha-betas-from", frm="beta@box.example", head=b"From: beta@box.example\r\n\r\nbody"),
+        alpha_case("alpha-one-stranger", to=("owner@x.example", "stranger@x.example")),
+        alpha_case("beta-alphas-list", auth="beta-lock", frm="beta@box.example", head=b"From: beta@box.example\r\n\r\nbody",
+                to=("b@x.example",)),
+        alpha_case("no-from-var", env={k: x for k, x in ALPHA.items() if k != "SEND_FROM_ALPHA"}),
+        alpha_case("no-to-var", env={k: x for k, x in ALPHA.items() if k != "SEND_TO_ALPHA"}),
+        alpha_case("alpha-foreign-from", frm="alpha@elsewhere.example",
+                env=dict(ALPHA, SEND_FROM_ALPHA="alpha@elsewhere.example"), head=b"From: alpha@elsewhere.example\r\n\r\nb"),
+        alpha_case("revoked", env={k: x for k, x in ALPHA.items() if k != "SEND_SECRET_ALPHA"}),
+        alpha_case("unlisted", env=dict(ALPHA, SEND_CALLERS="BETA")),
+        alpha_case("empty-bearer", auth="", env=dict(ALPHA, SEND_SECRET_ALPHA="")),
+        alpha_case("box-beside-callers", auth="s3cret", frm="mem@box.example", to=("a@x.example",), head=b"x"),
+        alpha_case("only-callers", env=dict(ALPHA, SEND_CALLERS="ALPHA")) | {"secret": None},
+        alpha_case("tie-goes-to-box", auth="s3cret", frm="mem@box.example", to=("a@x.example",), head=b"x",
+                env=dict(ALPHA, SEND_SECRET_ALPHA="s3cret")),
+    ] + [alpha_case(n, head=r) for n, r in alpha_refused_raw.items()])
+    if v is None:
+        print("  (no node on PATH: a caller's limits on the Worker's send half are not checked here)")
+    elif v:
+        k(v["alpha-ok"]["status"] == 200 and [x["to"] for x in v["alpha-ok"]["sent"]] == ["owner@x.example"]
+          and v["alpha-ok"]["sent"][0]["from"] == "alpha@box.example",
+          "a caller with its own secret sends as its own From to a recipient on its list")
+        k(v["alpha-named"]["status"] == 200 and v["alpha-lf"]["status"] == 200,
+          "…with a plain display name, LF endings, and a From-looking line in the body all allowed")
+        k(v["alpha-other-from-on-domain"]["status"] == 403 and not v["alpha-other-from-on-domain"]["sent"]
+          and v["alpha-betas-from"]["status"] == 403 and not v["alpha-betas-from"]["sent"]
+          and v["alpha-foreign-from"]["status"] == 403 and not v["alpha-foreign-from"]["sent"],
+          "a caller cannot use another From, even one on the domain, and its own must still pass the domain check")
+        k(v["alpha-one-stranger"]["status"] == 403 and not v["alpha-one-stranger"]["sent"]
+          and v["beta-alphas-list"]["status"] == 403 and not v["beta-alphas-list"]["sent"],
+          "one recipient off a caller's own list refuses the whole call, and one caller's list is not another's")
+        k(v["no-from-var"]["status"] == 403 and not v["no-from-var"]["sent"]
+          and v["no-to-var"]["status"] == 403 and not v["no-to-var"]["sent"],
+          "a caller with no From or no recipient list set can send nothing")
+        k(all(v["revoked"][f] == w for f, w in (("status", 401), ("sent", [])))
+          and v["unlisted"]["status"] == 401 and not v["unlisted"]["sent"]
+          and v["empty-bearer"]["status"] == 401 and not v["empty-bearer"]["sent"],
+          "deleting a caller's secret, or leaving it out of SEND_CALLERS, is a 401, and an empty secret never matches")
+        k(v["box-beside-callers"]["status"] == 200 and v["tie-goes-to-box"]["status"] == 200,
+          "the box's own secret keeps its old reach beside the callers, and wins a tie")
+        k(v["alpha-reply-to"]["status"] == 200 and v["alpha-reply-to-tag"]["status"] == 200,
+          "a caller's Reply-To may be its own address or its own +tag")
+        k(v["real-build"]["status"] == 200 and len(v["real-build"]["sent"]) == 1
+          and v["real-build-html"]["status"] == 200 and len(v["real-build-html"]["sent"]) == 2,
+          "messages outbound.build really makes pass the check: a non-ASCII subject, a tagged Reply-To, a thread, HTML, a Cc")
+        k(v["beta-unnamed-shows-name"]["status"] == 403 and not v["beta-unnamed-shows-name"]["sent"],
+          "a caller with no display name set cannot show one")
+        k(v["cap-room"]["status"] == 200 and v["cap-room"]["counted"] == 50,
+          "a caller's day count rises by its recipients")
+        k(v["cap-over"]["status"] == 429 and not v["cap-over"]["sent"] and v["cap-over"]["counted"] == 49,
+          "a call that would pass a caller's day cap sends to nobody")
+        k(v["cap-straggler-room"]["status"] == 200 and v["cap-straggler-room"]["counted"] == 6
+          and v["cap-straggler-full"]["status"] == 429 and v["cap-straggler-full"]["counted"] == 50,
+          "a call from before midnight counts against the new day and does not reset it")
+        k(v["cap-odd-answer"]["status"] == 503 and not v["cap-odd-answer"]["sent"],
+          "a counter answering anything but yes or over sends nothing")
+        k(all(v[n]["status"] == 200 for n in ("type-html", "type-mixed", "type-related", "type-comment")),
+          "the types outbound.build makes pass, whatever their case, parameters or comments")
+        k(v["to-cc-allowed"]["status"] == 200,
+          "To and Cc may show the caller and its allowed recipients, a display name and a text Content-Type included")
+        k(v["cap-new-day"]["status"] == 200 and v["cap-new-day"]["counted"] == 1,
+          "a new UTC day starts the count again")
+        k(v["cap-parallel"]["status"] == 429 and len(v["cap-parallel"]["sent"]) == 3
+          and v["cap-parallel"]["counted"] == 3,
+          "50 parallel calls at a cap of 3 send exactly 3, given Cloudflare's one-at-a-time object: %r"
+          % len(v["cap-parallel"]["sent"]))
+        k(all(v[n]["status"] in w and not v[n]["sent"] for n, w in (
+              ("cap-down", (503,)), ("cap-no-binding", (503,)), ("cap-unset", (403,)))),
+          "with no cap set, no binding, or a count it cannot read, a caller sends nothing")
+        k(v["cap-bad-to-not-counted"]["status"] == 403 and v["cap-bad-to-not-counted"]["counted"] == 1,
+          "a refused call spends none of a caller's count")
+        k(v["only-callers"]["status"] == 200,
+          "a caller's secret works on a worker with no box secret set")
+        bad_raw = [n for n in alpha_refused_raw if v[n]["status"] != 403 or v[n]["sent"]]
+        k(not bad_raw, "a caller's message cannot show any From but its own, however the headers are written: %s"
+          % (bad_raw or "all refused"))
 
     # ------------------------------------------- 19. a mail the box STARTS (what `cc-mail send` runs)
     # The same fixture Cloudflare gets in section 17, and no conversation anywhere: there is no mail behind a

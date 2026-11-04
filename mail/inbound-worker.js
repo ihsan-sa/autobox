@@ -30,6 +30,16 @@
  *   SEND_SECRET  SECRET — the other direction's lock: what proves a caller of `fetch()` is the box. A
  *                         DIFFERENT value from MAIL_SECRET on purpose — one secret doing both jobs means a
  *                         leak in either direction costs both.
+ *   SEND_CALLERS var    — optional: a comma list of other callers of `fetch()`, such as ALPHA,BETA: letters, digits
+ *                         and underscores, because a name with a hyphen is ignored. Each one holds its
+ *                         own lock and may send only as itself, to its own list:
+ *   SEND_SECRET_<NAME> SECRET — that caller's bearer. Delete it to revoke that caller alone.
+ *   SEND_FROM_<NAME>   var    — its one From, on SEND_DOMAIN. Unset, it can send nothing.
+ *   SEND_TO_<NAME>     var    — a comma list of the exact recipients it may name. Unset, it can send nothing.
+ *   SEND_NAME_<NAME>   var    — optional: the one display name its From may show. Unset, it shows none.
+ *   SEND_CAP_<NAME>    var    — how many recipients it may send to per UTC day. Unset, it can send nothing.
+ *   SEND_COUNTS  Durable Object binding, class SendCount — where those day counts live. Without it no caller
+ *                         can send; the box can. It needs a migration: docs/2026-09-08-email.md step 4.
  *   SEND_DOMAIN  var    — the box's mail domain. A From that is not on it is refused, so this worker can only
  *                         ever send AS the box and never as anybody else.
  *   SEND         send_email binding — `[[send_email]] name = "SEND"` in wrangler.toml. Without it `fetch()`
@@ -52,6 +62,14 @@ import { EmailMessage } from "cloudflare:email";
 // PERMANENT SMTP error and is deliberately not used here). So the throw is the safe side of an unknown either
 // way: at worst the sender gets a bounce and knows, where returning quietly loses the mail with no trace.
 const FINAL = new Set([200, 400, 413, 429]);
+
+// All a caller's message may carry at its top level. A list of what is allowed rather than of what is not, because
+// clients answer to more headers than anyone lists (Mail-Reply-To, Errors-To, Disposition-Notification-To…), and an
+// outside address in one of them is a way to draw an answer away from the caller's own address.
+const CALLER_HEADERS = new Set(["from", "to", "cc", "reply-to", "subject", "date", "message-id", "in-reply-to",
+  "references", "mime-version", "content-type", "content-transfer-encoding"]);
+// And the only types its message may be at the top level. A wrapped message or a digest can show a From of its own.
+const CALLER_TYPES = new Set(["text/plain", "text/html", "multipart/mixed", "multipart/alternative", "multipart/related"]);
 
 export default {
   async email(message, env, ctx) {
@@ -155,6 +173,10 @@ export default {
    * A FAILURE PER RECIPIENT, NOT FOR THE CALL. `send_email` refuses an address the account has not verified,
    * and a mail to four people where one is unverified should still reach the other three; the refusal comes
    * back named, the box logs it and shows it in the thread, and nothing is dropped quietly.
+   *
+   * A CALLER THAT IS NOT THE BOX (SEND_CALLERS) is held to its own From and recipients, and here `raw` IS read:
+   * the reader sees the From inside the message, not the envelope's, so a caller could otherwise keep its own
+   * envelope and show anyone's name. Recipients still never come out of `raw`. See callerRefusal.
    */
   async fetch(request, env) {
     const bad = (status, error) => new Response(JSON.stringify({ ok: false, error }), {
@@ -163,9 +185,10 @@ export default {
     if (new URL(request.url).pathname !== "/send") return bad(404, "not found");
     if (request.method !== "POST") return bad(405, "POST only");
     // The secret is the whole authentication. Compared without an early exit, so the answer's timing says
-    // nothing about how much of a guess was right.
+    // nothing about how much of a guess was right, or about whose it was.
     const offered = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-    if (!env.SEND_SECRET || !sameSecret(offered, env.SEND_SECRET)) return bad(401, "unauthorized");
+    const caller = whoIsCalling(offered, env);
+    if (!caller) return bad(401, "unauthorized");
     if (!env.SEND) return bad(503, "this worker has no send_email binding");
 
     let body;
@@ -200,6 +223,14 @@ export default {
     }
     if (!raw) return bad(400, "raw is empty");
 
+    // All or nothing: a caller naming one address it may not use sends to none of them.
+    if (caller.name) {
+      const refusal = callerRefusal(caller.name, from, to, raw, env);
+      if (refusal) return bad(403, refusal);
+      const over = await capRefusal(caller.name, to.length, env);
+      if (over) return bad(over.status, over.error);
+    }
+
     const sent = [], failed = [];
     for (const rcpt of to) {
       try {
@@ -216,6 +247,131 @@ export default {
     });
   },
 };
+
+// Who holds the offered secret: {box: true}, {name} for a SEND_CALLERS entry, or null. Every secret is compared
+// whatever an earlier one answered. A listed caller with no secret set matches nothing, which is how it is revoked.
+function whoIsCalling(offered, env) {
+  let who = null;
+  for (const name of commaList(env.SEND_CALLERS).filter((n) => /^\w+$/.test(n))) {
+    const secret = env[`SEND_SECRET_${name}`];
+    if (secret && sameSecret(offered, secret) && !who) who = { name };
+  }
+  if (env.SEND_SECRET && sameSecret(offered, env.SEND_SECRET)) who = { box: true };
+  return who;
+}
+
+function commaList(value) {
+  return String(value || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+// Why this caller may not send this, or null. Each limit fails closed: a var that is not set allows nothing.
+function callerRefusal(name, from, to, raw, env) {
+  const own = String(env[`SEND_FROM_${name}`] || "").trim();
+  if (!own || from !== own) return `${name} may only send from its own address`;
+  const allowed = commaList(env[`SEND_TO_${name}`]);
+  const stranger = to.find((a) => !allowed.includes(a));
+  if (stranger) return `${name} may not send to ${stranger}`;
+  return headerRefusal(raw, own, String(env[`SEND_NAME_${name}`] || "").trim(), allowed);
+}
+
+// One count per caller per UTC day, taken before the send and never handed back, so a failed send still counts:
+// the point is that one caller cannot spend what the account shares. A KV counter would not hold this, because its
+// reads may be stale. SendCount holds each caller's count in one object.
+async function capRefusal(name, count, env) {
+  const cap = Number(env[`SEND_CAP_${name}`]);
+  if (!Number.isInteger(cap) || cap < 1) return { status: 403, error: `${name} has no send cap set` };
+  if (!env.SEND_COUNTS) return { status: 503, error: "this worker has no SEND_COUNTS binding" };
+  const day = new Date().toISOString().slice(0, 10);
+  try {
+    const counter = env.SEND_COUNTS.get(env.SEND_COUNTS.idFromName(name));
+    const res = await counter.fetch("https://send-count/take", {
+      method: "POST", body: JSON.stringify({ day, count, cap }),
+    });
+    if (res.status === 200) return null;
+    if (res.status === 429) return { status: 429, error: `${name} has reached its ${cap} recipients for today` };
+  } catch (err) {
+    console.log(`send count failed for ${name}: ${err}`);
+  }
+  return { status: 503, error: `${name}'s send count could not be updated, so nothing was sent` };
+}
+
+// A Durable Object takes one event at a time across a storage call (its input gate), so nothing can come between the
+// get and the put below. Don't put another kind of await between them, because that opens the gate.
+export class SendCount {
+  constructor(state) {
+    this.storage = state.storage;
+  }
+
+  async fetch(request) {
+    const { day, count, cap } = await request.json();
+    const held = await this.storage.get("count");
+    // A call that set out before midnight and arrives after it counts against the newer day and never resets it.
+    const current = held && held.day >= day ? held : { day, used: 0 };
+    if (current.used + count > cap) return new Response("over", { status: 429 });
+    await this.storage.put("count", { day: current.day, used: current.used + count });
+    return new Response("ok");
+  }
+}
+
+// The type alone: comments out (they nest, and may hold a `;`), then what comes before the parameters. Anything left
+// that isn't exactly a type, such as a space around the slash, then matches nothing on the list.
+function contentType(value) {
+  let text = value, before;
+  do {
+    before = text;
+    text = text.replace(/\([^()]*\)/g, "");
+  } while (text !== before);
+  return text.split(";")[0].trim().toLowerCase();
+}
+
+// The message's own headers must show exactly one From, and that From is `own`, under the one display name it
+// was given if it shows one. A Reply-To must lead back to `own`. This reads strictly, and refuses
+// what mail parsers disagree on, because the parser that matters is the reader's and not this one: a message that
+// mixes line endings has two possible header blocks, and only one of them would have been checked here.
+function headerRefusal(raw, own, ownName, allowed) {
+  const crlf = raw.includes("\r");
+  const end = raw.indexOf(crlf ? "\r\n\r\n" : "\n\n");
+  if (end < 0) return "the message's headers do not end in a blank line";
+  const block = raw.slice(0, end);
+  if (crlf && /\r(?!\n)|(?<!\r)\n/.test(block)) return "the message's headers mix line endings";
+  // raw is bytes here, so this also catches a NEL or any other multibyte character. An encoded word is plain ASCII.
+  if (/[^\t\r\n\x20-\x7e]/.test(block)) return "the message's headers must be plain ASCII";
+
+  const froms = [], replyTos = [];
+  for (const line of block.replace(/\r?\n[ \t]+/g, " ").split(/\r?\n/)) {
+    const m = line.match(/^([\x21-\x39\x3b-\x7e]+)[ \t]*:(.*)$/);
+    if (!m) return "the message has a line in its headers that is not a header";
+    const header = m[1].toLowerCase();
+    if (!CALLER_HEADERS.has(header)) return `the message may not carry ${m[1]}`;
+    if (header === "from") froms.push(m[2].trim());
+    if (header === "reply-to") replyTos.push(m[2].trim());
+    if (header === "content-type" && !CALLER_TYPES.has(contentType(m[2]))) return "the message's Content-Type is not one a caller may use";
+    // A reply-all goes to whoever these show, so they hold the caller and its recipients and nobody else.
+    if ((header === "to" || header === "cc") && !m[2].split(",").every((item) => {
+      const shown = item.trim().match(/^(?:[^<>@,;:"()]*<)?([^\s<>@,;:"()]+@[^\s<>@,;:"()]+)(>?)$/);
+      return shown && (shown[2] === ">") === item.includes("<") && (shown[1] === own || allowed.includes(shown[1]));
+    })) return `the message's ${m[1]} may only show ${own} and its allowed recipients`;
+  }
+  if (froms.length !== 1) return "the message must carry exactly one From";
+
+  // `Name <addr>` or the bare address, and the name can only be the one this caller was given: a free choice of
+  // plain words would still let it show a person's name over its own address.
+  const named = froms[0].match(/^([^<>]*)<([^<>]*)>$/);
+  const addr = named ? named[2] : froms[0];
+  const shown = named ? named[1].trim().replace(/^"(.*)"$/, "$1") : "";
+  if (addr !== own || (shown && shown !== ownName)) return `the message's From must be ${own} under its own name`;
+
+  // An answer has to come back to this caller: its own address, or its own +tag on it (what a cold mail carries).
+  if (replyTos.length > 1) return "the message may carry only one Reply-To";
+  if (replyTos.length) {
+    const at = own.lastIndexOf("@");
+    const value = replyTos[0].replace(/^<(.*)>$/, "$1");
+    const tag = value.startsWith(own.slice(0, at) + "+") && value.endsWith(own.slice(at))
+      ? value.slice(at + 1, value.length - (own.length - at)) : null;
+    if (value !== own && !(tag && /^[A-Za-z0-9._-]+$/.test(tag))) return `the message's Reply-To must lead to ${own}`;
+  }
+  return null;
+}
 
 // Equal-length, no early exit. Two strings of different lengths are not equal and that much the timing may say.
 function sameSecret(a, b) {

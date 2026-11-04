@@ -688,6 +688,42 @@ class TestReview(Case):
         self.assertEqual(v.blocking, ["[scope] still open from the earlier read: b",   # a real zero is not padding
                                       "still open from the earlier read: 0"])
 
+    def test_a_row_name_in_any_scripts_digits_keeps_the_rows_security_tag(self):
+        # perms' read of #2173: these missed row_number() and carried bare, and a seat could release the hold
+        rows = ["1. [security] x.py — the token leaks"]
+        pin = ["[security] still open from the earlier read: x.py — the token leaks"]
+        arabic, full = "\u0660" * 9 + "\u0661", "\uff10" * 9 + "\uff11"
+        for name in (arabic, full, "\u0660" + "0" * 9 + "1", "\u00b9", f"#{arabic}", f"blocker {full}"):
+            v = self.delta(rows, resolved=["1"], unresolved=[name])
+            self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, pin), name)
+            self.assertFalse(R.carried_hold(v), name)
+            self.assertEqual(self.delta(rows, resolved=[name]).verdict, T.HANDBACK_VERDICT, name)   # clears nothing
+        said = "x.py:\u0661 is still open"   # a sentence with such a digit in it is no row, and stays as written
+        self.assertEqual(self.delta(rows, resolved=["1"], unresolved=[said]).blocking,
+                         [f"still open from the earlier read: {said}"])
+
+    def test_a_very_large_or_odd_answer_is_read_fast_and_keeps_every_row(self):
+        # perms' read of #2173: quadratic in a run of spaces and in the lists, so one answer could stall a read
+        began = time.monotonic()
+        self.assertIsNone(R.row_number(" " * 100_000 + "x"))
+        self.assertEqual(R.row_number(" " * 1000 + "#" + " " * 1000 + "1" + " " * 1000), "1")
+        n = 100_000
+        names = [f"name {i}" for i in range(n)]
+        prior = [f"[security] x.py:{i} — the token leaks" for i in range(n)]
+        answer = json.dumps({"verdict": "LAND", "unresolved": names, "moot": [f"m {i}" for i in range(n)],
+                             "resolved": [f"r {i}" for i in range(n)]})
+        v = R.carried(R.pinned(R.parse(answer, "d"), prior), prior)
+        both = R.combined([("a", v), ("b", R.parse(answer, "d"))])
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)   # held, with nothing cut
+        self.assertEqual(len(v.blocking), 2 * n)
+        self.assertEqual(len(v.unresolved), 2 * n)
+        self.assertEqual(both.verdict, T.HANDBACK_VERDICT)
+        self.assertEqual(len(both.unresolved), 2 * n)
+        again = R.parse(json.dumps({"verdict": "LAND", "unresolved": ["1"] * n}), "d")   # one row, n times
+        self.assertEqual(R.carried(again, prior[:1]).blocking, ["[security] still open from the earlier read: x.py:0 — "
+                                                                "the token leaks"])
+
     def test_a_padded_resolved_name_still_clears_nothing(self):
         # the padding is only read to keep a tag: it must not turn a hold into a LAND
         rows = ["1. [security] x.py — the token leaks"]
